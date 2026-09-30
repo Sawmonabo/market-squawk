@@ -184,6 +184,12 @@ pub use catalog::{
     OfficialOptionsReferenceSurface, official_options_reference_object_binding_digest,
 };
 pub use catalog::{
+    PortfolioPlanningCatalogCapability, PortfolioPlanningChainHead, PortfolioPlanningCompletion,
+    PortfolioPlanningCompletionEntry, PortfolioPlanningError, PortfolioPlanningHead,
+    PortfolioPlanningKind, PortfolioPlanningSavedEntry,
+};
+
+pub use catalog::{
     ModelInventoryCatalogCapability, ModelInventoryEntry, ModelInventoryError, ModelInventoryHead,
     ModelInventoryRecord,
 };

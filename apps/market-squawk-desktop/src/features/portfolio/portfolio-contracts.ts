@@ -409,6 +409,8 @@ const portfolioScenarioResultSchema = portfolioScenarioInputSchema.extend({
 })
 
 const planningReportFields = {
+  calculationToken: z.string().uuid(),
+  calculatedAtUnixNanos: unixNanosSchema,
   accountId: z.string().min(1),
   snapshotToken: z.string().uuid(),
   effectiveAtUnixNanos: unixNanosSchema,
@@ -542,6 +544,8 @@ const candidateCostSchema = z.discriminatedUnion("state", [
 ])
 
 const portfolioCandidateImpactSchema = z.strictObject({
+  calculationToken: z.string().uuid(),
+  calculatedAtUnixNanos: unixNanosSchema,
   accountToken: portfolioAccountSummarySchema.shape.accountToken,
   accountId: z.string().min(1),
   snapshotToken: z.string().uuid(),

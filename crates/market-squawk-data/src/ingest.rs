@@ -3037,6 +3037,11 @@ impl AnalyticalDataService {
         crate::ModelInventoryCatalogCapability::new(Arc::clone(&self.authority))
     }
 
+    /// Returns durable portfolio planning completions and saved-result markers.
+    pub fn portfolio_planning(&self) -> crate::PortfolioPlanningCatalogCapability {
+        crate::PortfolioPlanningCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Returns fair-value persistence authority over this service's sole catalog writer.
     pub fn fair_value_catalog(&self) -> crate::FairValueCatalogCapability {
         crate::FairValueCatalogCapability::new(Arc::clone(&self.authority))

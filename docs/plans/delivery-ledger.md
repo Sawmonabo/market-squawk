@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-## Active stock admission and saved-planning wave — 2026-09-30
+## Completed stock admission and saved-planning implementation wave — 2026-09-30
 
 Refresh base `505685e667a4650506556ee5725cc8ec3e8bcabb`, clean and pushed; contention checkpoint
 completed with four critical cases and live startup/read evidence (PR #43 comment 5909800002).
@@ -41,8 +41,8 @@ claim an installed full-backup journey. The existing LocalProduct restart/import
 exact original-result reopening after later import. Its first run exposed fixture initialization/stack setup and a real
 saved-result metadata mismatch: Save/List now use non-source storage metadata, while Get requires
 the retained original source evidence. The fixture initializes storage before writing imports and
-uses the installed service entry point's existing 8 MiB thread stack. Native runtime and Desktop
-bridge check follows, serialized. Native cancellation custody, exact account rebinding and
+uses the installed service entry point's existing 8 MiB thread stack. The native Desktop library
+check passed with locked/offline dependencies and one compiler job. Native cancellation custody, exact account rebinding and
 candidate-impact evidence each passed their focused existing lib case. The formatted equity
 admission catalog case passed again. No new harness, CI, release build or whole-app RAM measurement
 is scheduled.
@@ -50,10 +50,18 @@ is scheduled.
 Schema changes update V1 in place. Existing live roots are preserved; matching pre-change debug
 programs are retained under `.agents/tmp/v1-first-stock/pre-planning-schema-505685e6-binaries/`.
 A later new-schema live journey uses a fresh root, not a migration or rewrite of old evidence.
-Stock admission is critically verified and ready for its separate integration commit; saved planning
-has passed persistence, backup and Desktop critical checks, with native bridge compilation pending.
-Neither outcome is yet live verified on the updated schema. After both pushed checkpoints, the next
-dependency is fresh-root live stock discovery through the complete saved Investment Brief workflow.
+Stock admission is critically verified and pushed as `9e4bef63`. Saved planning is critically verified
+through real LocalProduct restart/import, saved/unsaved artifact backup, original candidate evidence,
+Desktop Save/reopen/read cancellation, final TypeScript typecheck and native Desktop bridge check;
+its separate integration checkpoint contains this ledger update. All worker ownership is released.
+Evidence logs are under `.agents/tmp/v1-first-stock/`: `equity-admission-critical.log`,
+`native-account-{custody,rebind}-critical.log`, `saved-planning-{restart,backup,candidate,desktop}-critical.log`,
+`saved-planning-typecheck.log` and `saved-planning-native-bridge-check.log`.
+
+These outcomes are implemented and critically verified, not live or installed-workflow complete on
+the updated schema. The next dependency is fresh-root live stock discovery through the complete
+saved Investment Brief workflow. Preserve the old live root and matching binaries; do not migrate
+or rewrite earlier evidence. No additional review quarter, broad gate or resource measurement was run.
 
 ## Completed native-identity contention wave — 2026-09-30
 

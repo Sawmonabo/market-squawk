@@ -124,7 +124,7 @@ class TauriTransport implements ProductTransport, SystemTransport {
     const value =
       request.query === "analysisSettings"
         ? await this.read("analytical_product", {}, options)
-        : request.query === "marketSessionContext"
+        : ["marketSessionContext", "portfolioSavePlanningResult"].includes(request.query)
           ? await invoke("dashboard_query", { request })
           : await this.read("dashboard_query", { request }, options)
     return applicationResultSchema.parse(value)

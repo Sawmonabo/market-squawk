@@ -1,12 +1,22 @@
 //! Workspace-backup adapter for paired portfolio and transaction authority.
 
-use std::{fmt, io::Write};
+use std::{
+    fmt,
+    io::{Read, Write},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
+use market_squawk_data::PortfolioPlanningCatalogCapability;
 use market_squawk_domain::{SchemaVersion, SourceIdentifier};
+use market_squawk_services::ArtifactRepository;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
+mod planning;
+
+use crate::ResearchService;
 use crate::application::backup::{
     ProductBackupComponentKind, ProductBackupComponentSchema, ProductBackupError,
     ProductBackupSensitivity, ProductBackupSnapshot,
@@ -25,12 +35,16 @@ use super::workspace_backup::{
 /// Paired Portfolios and Transactions owner backed by one portfolio mutation authority.
 pub(crate) struct PortfolioWorkspaceBackupAuthority {
     portfolio: PortfolioBackupAuthority,
+    research: Arc<ResearchService>,
     descriptors: [WorkspaceComponentDescriptor; 2],
 }
 
 impl PortfolioWorkspaceBackupAuthority {
     /// Binds both components to the exact same portfolio owner capability.
-    pub(super) fn try_new(portfolio: PortfolioBackupAuthority) -> Result<Self, ProductBackupError> {
+    pub(super) fn try_new(
+        portfolio: PortfolioBackupAuthority,
+        research: Arc<ResearchService>,
+    ) -> Result<Self, ProductBackupError> {
         let producer = SourceIdentifier::try_from(PORTFOLIO_BACKUP_PRODUCER)
             .map_err(|_| ProductBackupError::InvalidComponent)?;
         let portfolio_schema = ProductBackupComponentSchema::try_new(
@@ -45,6 +59,7 @@ impl PortfolioWorkspaceBackupAuthority {
         )?;
         Ok(Self {
             portfolio,
+            research,
             descriptors: [
                 WorkspaceComponentDescriptor::try_new(
                     ProductBackupComponentKind::Portfolios,
@@ -83,21 +98,40 @@ impl WorkspaceComponentSnapshotAuthority for PortfolioWorkspaceBackupAuthority {
             .portfolio
             .retain(cancellation)
             .map_err(map_portfolio_backup_error)?;
+        let (catalog, artifacts) = self
+            .portfolio
+            .planning_storage()
+            .map_err(map_portfolio_backup_error)?;
+        let planning = planning::RetainedPlanning::retain(
+            catalog,
+            Arc::clone(&self.research),
+            artifacts,
+            retained.authority_revision_sha256(),
+            cancellation,
+        )
+        .await?;
+        self.portfolio
+            .revalidate_snapshot(&retained, cancellation)
+            .map_err(map_portfolio_backup_error)?;
         Ok(Box::new(RetainedPortfolioWorkspaceSnapshot {
+            portfolio: self.portfolio.clone(),
             descriptors: self.descriptors.clone(),
             retained,
+            planning,
             snapshot: None,
-            emitted: [false; 2],
+            emitted: [None; 2],
             revalidated: [false; 2],
         }))
     }
 }
 
 struct RetainedPortfolioWorkspaceSnapshot {
+    portfolio: PortfolioBackupAuthority,
     descriptors: [WorkspaceComponentDescriptor; 2],
     retained: RetainedPortfolioBackupSnapshot,
+    planning: planning::RetainedPlanning,
     snapshot: Option<ProductBackupSnapshot>,
-    emitted: [bool; 2],
+    emitted: [Option<WorkspaceComponentSnapshotReceipt>; 2],
     revalidated: [bool; 2],
 }
 
@@ -124,14 +158,14 @@ impl WorkspaceComponentSnapshotLease for RetainedPortfolioWorkspaceSnapshot {
             return Err(ProductBackupError::Cancelled);
         }
         self.bind_snapshot(snapshot)?;
+        self.portfolio
+            .revalidate_snapshot(&self.retained, cancellation)
+            .map_err(map_portfolio_backup_error)?;
         let (component, index) = component(kind)?;
-        if self.emitted[index] {
+        if self.emitted[index].is_some() {
             return Err(ProductBackupError::SnapshotMismatch);
         }
         let bytes = self.retained.bytes(component);
-        writer
-            .write_all(bytes)
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
         let byte_length =
             u64::try_from(bytes.len()).map_err(|_| ProductBackupError::InvalidComponent)?;
         let sha256 = Sha256::digest(bytes).into();
@@ -139,9 +173,27 @@ impl WorkspaceComponentSnapshotLease for RetainedPortfolioWorkspaceSnapshot {
         self.retained
             .validate_emitted(component, authority_revision, byte_length, sha256)
             .map_err(map_portfolio_backup_error)?;
-        let receipt =
-            WorkspaceComponentSnapshotReceipt::try_new(authority_revision, byte_length, sha256)?;
-        self.emitted[index] = true;
+        let receipt = match component {
+            PortfolioBackupComponent::Portfolios => {
+                self.planning.write(bytes, writer, cancellation).await?
+            }
+            PortfolioBackupComponent::Transactions => {
+                self.planning.revalidate(cancellation).await?;
+                writer
+                    .write_all(bytes)
+                    .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
+                self.planning.revalidate(cancellation).await?;
+                WorkspaceComponentSnapshotReceipt::try_new(
+                    self.planning.authority_revision(),
+                    byte_length,
+                    sha256,
+                )?
+            }
+        };
+        self.emitted[index] = Some(receipt);
+        self.portfolio
+            .revalidate_snapshot(&self.retained, cancellation)
+            .map_err(map_portfolio_backup_error)?;
         Ok(receipt)
     }
 
@@ -157,7 +209,7 @@ impl WorkspaceComponentSnapshotLease for RetainedPortfolioWorkspaceSnapshot {
         }
         self.bind_snapshot(snapshot)?;
         let (component, index) = component(kind)?;
-        if !self.emitted[index] || self.revalidated[index] {
+        if self.emitted[index].is_none() || self.revalidated[index] {
             return Err(ProductBackupError::SnapshotMismatch);
         }
         let bytes = self.retained.bytes(component);
@@ -165,17 +217,42 @@ impl WorkspaceComponentSnapshotLease for RetainedPortfolioWorkspaceSnapshot {
             u64::try_from(bytes.len()).map_err(|_| ProductBackupError::InvalidComponent)?;
         let sha256 = Sha256::digest(bytes).into();
         let authority_revision = self.retained.authority_revision_sha256();
-        let expected =
-            WorkspaceComponentSnapshotReceipt::try_new(authority_revision, byte_length, sha256)?;
-        if receipt != expected {
+        if self.emitted[index] != Some(receipt) {
             return Err(ProductBackupError::ArtifactMismatch);
         }
         self.retained
             .validate_emitted(component, authority_revision, byte_length, sha256)
             .map_err(map_portfolio_backup_error)?;
+        self.planning.revalidate(cancellation).await?;
+        self.portfolio
+            .revalidate_snapshot(&self.retained, cancellation)
+            .map_err(map_portfolio_backup_error)?;
         self.revalidated[index] = true;
         Ok(())
     }
+}
+
+/// Reads the framed portfolio payload and restores every indexed completed planning artifact.
+pub(super) async fn restore_portfolio_component(
+    reader: &mut (dyn Read + Send),
+    catalog: &PortfolioPlanningCatalogCapability,
+    research: &ResearchService,
+    artifacts: &dyn ArtifactRepository,
+    maximum_portfolio_bytes: usize,
+    maximum_artifact_bytes: NonZeroUsize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, ProductBackupError> {
+    planning::restore(
+        reader,
+        catalog,
+        research,
+        artifacts,
+        maximum_portfolio_bytes,
+        maximum_artifact_bytes,
+        cancellation,
+    )
+    .await
+    .map(|(portfolios, _head)| portfolios)
 }
 
 impl RetainedPortfolioWorkspaceSnapshot {

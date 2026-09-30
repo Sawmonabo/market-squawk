@@ -122,6 +122,9 @@ export type ProductQuery =
       snapshotToken: string
       proposal: Record<string, unknown>
     }
+  | { query: "portfolioSavePlanningResult"; accountToken: string; calculationToken: string; confirmed: boolean }
+  | { query: "portfolioPlanningResults"; accountToken: string; cursor?: string; limit: number }
+  | { query: "portfolioPlanningResult"; accountToken: string; savedResultToken: string }
   | { query: "portfolioRisk" | "portfolioPerformance"; accountToken: string }
   | {
       query: "portfolioRevisions"

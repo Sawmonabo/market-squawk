@@ -3,7 +3,9 @@
 use std::fmt;
 use std::sync::Arc;
 
+use market_squawk_data::PortfolioPlanningCatalogCapability;
 use market_squawk_platform::LocalPaths;
+use market_squawk_services::ArtifactRepository;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +34,24 @@ pub(crate) struct PortfolioBackupAuthority {
 }
 
 impl PortfolioBackupAuthority {
+    /// Returns the existing planning owners for a paged immutable-artifact backup.
+    pub(crate) fn planning_storage(
+        &self,
+    ) -> Result<
+        (
+            PortfolioPlanningCatalogCapability,
+            Arc<dyn ArtifactRepository>,
+        ),
+        PortfolioApplicationServiceError,
+    > {
+        let planning = self
+            .runtime
+            .planning
+            .get()
+            .ok_or(PortfolioApplicationServiceError::Authority)?;
+        Ok((planning.catalog.clone(), Arc::clone(&planning.artifacts)))
+    }
+
     /// Freezes one consistent portfolio/transaction revision under the import mutation gate.
     pub(crate) fn retain(
         &self,
@@ -45,11 +65,31 @@ impl PortfolioBackupAuthority {
             .authority
             .lock()
             .map_err(|_| PortfolioApplicationServiceError::Authority)?;
-        let snapshot = authority.backup_snapshot(&self.runtime.artifacts)?;
+        let mut snapshot = authority.backup_snapshot(&self.runtime.artifacts)?;
+        snapshot.image = Some(self.runtime.image.load_full());
         if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
             return Err(PortfolioApplicationServiceError::Cancelled);
         }
         Ok(snapshot)
+    }
+
+    /// A planning artifact must not outpace the paired import evidence retained for this backup.
+    pub(crate) fn revalidate_snapshot(
+        &self,
+        snapshot: &RetainedPortfolioBackupSnapshot,
+        cancellation: &CancellationToken,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        let image = snapshot
+            .image
+            .as_ref()
+            .ok_or(PortfolioApplicationServiceError::SnapshotUnavailable)?;
+        if !Arc::ptr_eq(image, &self.runtime.image.load_full()) {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        Ok(())
     }
 
     /// Restores both paired components only into a freshly prepared workspace and reopens the
@@ -75,6 +115,7 @@ pub(crate) struct RetainedPortfolioBackupSnapshot {
     authority_revision_sha256: [u8; 32],
     portfolios: Arc<[u8]>,
     transactions: Arc<[u8]>,
+    image: Option<Arc<super::PortfolioReadImage>>,
 }
 
 impl RetainedPortfolioBackupSnapshot {
@@ -97,6 +138,7 @@ impl RetainedPortfolioBackupSnapshot {
             authority_revision_sha256,
             portfolios: portfolios.into(),
             transactions: transactions.into(),
+            image: None,
         })
     }
 

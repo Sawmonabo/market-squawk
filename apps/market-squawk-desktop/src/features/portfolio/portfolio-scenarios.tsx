@@ -12,9 +12,10 @@ import type { ProductTransport } from "@/lib/transport"
 import { formatUnixNanos } from "../opportunities/format"
 import { CursorNavigation } from "../shared/cursor-navigation"
 
+import { PlanningSaveControl } from "./planning-save-control"
 import { investmentDisplayName } from "./portfolio-format"
 import { portfolioScenarioInputSchema } from "./portfolio-contracts"
-import type { PortfolioAccountSummary, PortfolioHolding, PortfolioScenarioResult } from "./portfolio-contracts"
+import type { PortfolioAccountSummary, PortfolioHolding, PortfolioScenarioReport, PortfolioScenarioResult } from "./portfolio-contracts"
 import { usePortfolioScenarioCalculation, usePortfolioPlanningPositions } from "./use-portfolio"
 
 type ScenarioProps = { account: PortfolioAccountSummary; bootstrap: DesktopBootstrap; transport: ProductTransport }
@@ -159,17 +160,26 @@ function StressRead({ account, bootstrap, transport, refresh }: ScenarioProps & 
       {calculation.pending ? <p role="status" className="text-xs text-muted-foreground">Calculating your selected assumptions…</p> : null}
       {calculation.cancelled ? <p role="status" className="text-xs text-muted-foreground">Stress calculation cancelled. No result is shown.</p> : null}
       {calculation.error ? <StressError title="Stress calculation could not be completed" detail={calculation.error} /> : null}
-      {calculation.result ? <section className="space-y-4" aria-label="Stress calculation results">
-        <h3 className="text-sm font-semibold">Hypothetical position-value change</h3>
-        <p className="text-xs leading-5 text-muted-foreground">
-          Selected portfolio observation: {formatUnixNanos(calculation.result.effectiveAtUnixNanos)}.
-          {" Information available: "}{calculation.result.availableAtUnixNanos === null ? "Not recorded" : formatUnixNanos(calculation.result.availableAtUnixNanos)}.
-          {" Limited data confidence. These results apply only to the assumptions shown below. Unshocked positions and cash are unchanged; fees are not included."}
-        </p>
-        {calculation.result.scenarios.map((scenario) => <ScenarioResult key={scenario.id} scenario={scenario} />)}
-      </section> : null}
+      {calculation.result ? <>
+        <PortfolioScenarioReportView report={calculation.result} />
+        <PlanningSaveControl key={calculation.result.calculationToken} accountToken={account.accountToken}
+          calculation={calculation.result} kind={"scenario" in calculation.result ? "scenario" : "scenario_batch"}
+          bootstrap={bootstrap} transport={transport} />
+      </> : null}
     </div>
   )
+}
+
+export function PortfolioScenarioReportView({ report }: { report: PortfolioScenarioReport }) {
+  return <section className="space-y-4" aria-label="Stress calculation results">
+    <h3 className="text-sm font-semibold">Hypothetical position-value change</h3>
+    <p className="text-xs leading-5 text-muted-foreground">
+      Selected portfolio observation: {formatUnixNanos(report.effectiveAtUnixNanos)}.
+      {" Information available: "}{report.availableAtUnixNanos === null ? "Not recorded" : formatUnixNanos(report.availableAtUnixNanos)}.
+      {" Limited data confidence. These results apply only to the assumptions shown below. Unshocked positions and cash are unchanged; fees are not included."}
+    </p>
+    {report.scenarios.map((scenario) => <ScenarioResult key={scenario.id} scenario={scenario} />)}
+  </section>
 }
 
 function ScenarioFields({ scenario, index, holdings, positionsReady, change, nextKey, remove }: {

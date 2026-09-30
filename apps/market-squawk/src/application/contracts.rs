@@ -76,6 +76,9 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Portfolio.EvaluateScenario"
             | "Portfolio.EvaluateScenarioBatch"
             | "Portfolio.ProposeRebalance"
+            | "Portfolio.SavePlanningResult"
+            | "Portfolio.ListPlanningResults"
+            | "Portfolio.GetPlanningResult"
             | "Portfolio.EvaluateCandidateImpact"
             | "Portfolio.SelectAnalysisPrerequisites"
             | "Portfolio.ReadAnalysisPrerequisites"
@@ -887,6 +890,14 @@ const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[
     PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
     ArgumentSpec::required("snapshotToken", ArgumentKind::Uuid),
     ArgumentSpec::required("proposal", ArgumentKind::Object),
+];
+const PORTFOLIO_PLANNING_SAVE_ARGUMENTS: &[ArgumentSpec] = &[
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    ArgumentSpec::required("calculationToken", ArgumentKind::Uuid),
+];
+const PORTFOLIO_PLANNING_GET_ARGUMENTS: &[ArgumentSpec] = &[
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    ArgumentSpec::required("savedResultToken", ArgumentKind::Uuid),
 ];
 const PORTFOLIO_CANDIDATE_ARGUMENTS: &[ArgumentSpec] = &[
     PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
@@ -2339,6 +2350,33 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Portfolio,
         PORTFOLIO_CANDIDATE_SCOPE,
         PORTFOLIO_CANDIDATE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    OperationSpec {
+        destructive: false,
+        ..idempotent_mutation(
+            "Portfolio.SavePlanningResult",
+            "Save a completed portfolio calculation with its original assumptions and evidence.",
+            ServiceDomain::Portfolio,
+            PORTFOLIO_SCOPE,
+            PORTFOLIO_PLANNING_SAVE_ARGUMENTS,
+            ToolAuthorization::LocalConfirmation,
+        )
+    },
+    read(
+        "Portfolio.ListPlanningResults",
+        "List saved calculations for the selected portfolio, one page at a time.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_POSITION_PAGE_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Portfolio.GetPlanningResult",
+        "Reopen a saved portfolio calculation without changing its original assumptions or evidence.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_PLANNING_GET_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
     read_analysis(

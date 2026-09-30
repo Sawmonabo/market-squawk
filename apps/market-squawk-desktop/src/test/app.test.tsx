@@ -985,6 +985,7 @@ describe("Market Squawk desktop boundary", () => {
     let scenarioSignal: AbortSignal | undefined
     let resolveScenario: ((value: ApplicationResult) => void) | undefined
     const scenarioResult = (request: Extract<ProductQuery, { query: "portfolioScenario" }>) => result({
+      calculationToken: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", calculatedAtUnixNanos: "1780000000000000004",
       accountId: cashReport.accountId, snapshotToken: request.snapshotToken,
       effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos, availableAtUnixNanos: cashReport.availableAtUnixNanos,
       dataConfidence: "limited", scenario: { ...request.scenario,
@@ -997,6 +998,7 @@ describe("Market Squawk desktop boundary", () => {
     let rebalanceSignal: AbortSignal | undefined
     let resolveRebalance: ((value: ApplicationResult) => void) | undefined
     const rebalanceResult = (request: Extract<ProductQuery, { query: "portfolioRebalance" }>) => result({
+      calculationToken: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", calculatedAtUnixNanos: "1780000000000000004",
       accountId: cashReport.accountId, snapshotToken: request.snapshotToken,
       effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos, availableAtUnixNanos: cashReport.availableAtUnixNanos,
       dataConfidence: "limited", proposal: request.proposal,
@@ -1009,6 +1011,24 @@ describe("Market Squawk desktop boundary", () => {
         currentValue: { amount: "25", currency: "USD" }, valueChange: { amount: "390.625", currency: "USD" },
         projectedValue: { amount: "415.625", currency: "USD" },
       }], projectedCash: { amount: "500", currency: "USD" }, turnoverPercent: "23.25581395348837209302325581", constrained: true,
+    })
+    let resolveSave: ((value: ApplicationResult) => void) | undefined
+    let saveOptions: { signal?: AbortSignal } | undefined
+    let savedDetailSignal: AbortSignal | undefined
+    let resolveSavedDetail: ((value: ApplicationResult) => void) | undefined
+    let savedDetailReads = 0
+    const planningReads: ProductQuery[] = []
+    const savedSummary = {
+      savedResultToken: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      calculationToken: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", accountToken: second,
+      kind: "rebalance", snapshotToken: cashReport.snapshotToken,
+      portfolioEffectiveAtUnixNanos: cashReport.effectiveAtUnixNanos,
+      portfolioAvailableAtUnixNanos: cashReport.availableAtUnixNanos,
+      calculatedAtUnixNanos: "1780000000000000004", savedAtUnixNanos: "1790000000000000004",
+    }
+    const savedDetail = () => result({ summary: savedSummary,
+      request: { operation: "Portfolio.ProposeRebalance", arguments: rebalanceReads[0] },
+      result: rebalanceResult(rebalanceReads[0]!).data,
     })
     const exposureReads: { account: string; cursor?: string }[] = []
     const baselineSnapshot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
@@ -1072,7 +1092,25 @@ describe("Market Squawk desktop boundary", () => {
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions", "portfolio_scenario", "portfolio_scenario_batch", "portfolio_rebalance"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions", "portfolio_scenario", "portfolio_scenario_batch", "portfolio_rebalance", "portfolio_planning_save", "portfolio_planning_list", "portfolio_planning_get"] }, undefined, async (request, options) => {
+          if (request.query === "portfolioSavePlanningResult") {
+            planningReads.push(request)
+            saveOptions = options
+            return new Promise<ApplicationResult>((resolve) => { resolveSave = resolve })
+          }
+          if (request.query === "portfolioPlanningResults") {
+            planningReads.push(request)
+            return result({ results: [savedSummary], pageCursor: "saved-first-page", nextCursor: null })
+          }
+          if (request.query === "portfolioPlanningResult") {
+            planningReads.push(request)
+            savedDetailReads += 1
+            if (savedDetailReads > 1) {
+              savedDetailSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveSavedDetail = resolve })
+            }
+            return savedDetail()
+          }
           if (request.query === "portfolioRebalance") {
             rebalanceReads.push(request)
             if (rebalanceReads.length > 1) {
@@ -1317,6 +1355,12 @@ describe("Market Squawk desktop boundary", () => {
         ], maxTurnoverPercent: "100", minimumCash: { amount: "500", currency: "USD" }, allowShort: false,
       },
     }])
+    expect(planningReads).toEqual([])
+    await user.click(rebalancePanel.getByRole("button", { name: "Save planning result" }))
+    await waitFor(() => expect(planningReads).toHaveLength(1))
+    expect(planningReads[0]).toEqual({ query: "portfolioSavePlanningResult", accountToken: second,
+      calculationToken: savedSummary.calculationToken, confirmed: true })
+    expect(saveOptions?.signal).toBeUndefined()
     fireEvent.change(rebalancePanel.getByLabelText("Minimum cash reserve"), { target: { value: "600" } })
     expect(screen.queryByLabelText("Rebalance calculation results")).toBeNull()
     await user.click(rebalancePanel.getByRole("button", { name: "Calculate rebalance" }))
@@ -1324,6 +1368,19 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(rebalanceToggle)
     await waitFor(() => expect(rebalanceSignal?.aborted).toBe(true))
     resolveRebalance?.(rebalanceResult(rebalanceReads[1]!))
+    await waitFor(() => expect(screen.queryByText("Rebalance investment")).toBeNull())
+    resolveSave?.(result({ summary: savedSummary }))
+    await user.click(screen.getByText("Saved planning results", { selector: "summary" }))
+    await user.click(await screen.findByRole("button", { name: /Open saved rebalance plan calculated/ }))
+    expect(await screen.findByText("Rebalance investment")).toBeTruthy()
+    expect(screen.getByText("USD 109.375")).toBeTruthy()
+    expect(rebalanceReads).toHaveLength(2)
+    await user.click(screen.getByRole("button", { name: "Close saved result" }))
+    await user.click(screen.getByRole("button", { name: /Open saved rebalance plan calculated/ }))
+    await waitFor(() => expect(savedDetailSignal).toBeDefined())
+    await user.click(screen.getByRole("button", { name: "Close saved result" }))
+    await waitFor(() => expect(savedDetailSignal?.aborted).toBe(true))
+    resolveSavedDetail?.(savedDetail())
     await waitFor(() => expect(screen.queryByText("Rebalance investment")).toBeNull())
   })
 
@@ -1338,6 +1395,7 @@ describe("Market Squawk desktop boundary", () => {
       metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } })
     const amount = (amount: string) => ({ amount, currency: "USD" })
     const impact = (request: Extract<ProductQuery, { query: "portfolioCandidateImpact" }>) => result({
+      calculationToken: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", calculatedAtUnixNanos: "1780000000000000004",
       accountToken: request.accountToken, accountId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       instrumentId, snapshotToken: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       portfolioEffectiveAtUnixNanos: "1780000000000000000",

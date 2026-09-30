@@ -49,6 +49,7 @@ use super::{
     backup::ManagedBackupRepository,
     configuration_backup::restore_configuration_component_absent,
     jobs_backup::restore_jobs_component_fresh,
+    portfolio_backup::restore_portfolio_component,
     settings::SettingsLifecycleAuthority,
     source_data_backup::restore_source_data_fresh,
     workspace_backup::{
@@ -499,22 +500,72 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             crate::ResearchService::from_analytical(&self.paths, Arc::clone(&analytical))
                 .map_err(|_| ProductBackupError::RestoreComponents)?,
         );
-        let source_data = self
-            .components
-            .get_mut(&ProductBackupComponentKind::SourceData)
-            .ok_or(ProductBackupError::IncompleteComponents)?;
-        source_data.verify_and_rewind(cancellation)?;
-        let source_result = restore_source_data_fresh(
-            &mut source_data.file,
-            self.snapshot,
-            &self.paths,
-            Arc::clone(&research),
-            Arc::clone(&artifacts),
-            NonZeroUsize::new(crate::paper_bot::LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)
-                .ok_or(ProductBackupError::InvalidRestoreTarget)?,
-            self.policy.maximum_controlled_artifact_bytes,
-            cancellation,
-        )
+        let authority_result: Result<(), ProductBackupError> = async {
+            let source_data = self
+                .components
+                .get_mut(&ProductBackupComponentKind::SourceData)
+                .ok_or(ProductBackupError::IncompleteComponents)?;
+            source_data.verify_and_rewind(cancellation)?;
+            let source_result = restore_source_data_fresh(
+                &mut source_data.file,
+                self.snapshot,
+                &self.paths,
+                Arc::clone(&research),
+                Arc::clone(&artifacts),
+                NonZeroUsize::new(crate::paper_bot::LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)
+                    .ok_or(ProductBackupError::InvalidRestoreTarget)?,
+                self.policy.maximum_controlled_artifact_bytes,
+                cancellation,
+            )
+            .await;
+            source_result.inspect_err(|_| {
+                tracing::warn!(
+                    component = "source_data",
+                    "workspace component restore failed"
+                )
+            })?;
+
+            ensure_live(cancellation)?;
+            let transactions =
+                self.read_component(ProductBackupComponentKind::Transactions, cancellation)?;
+            let maximum_portfolio_bytes = self
+                .policy
+                .maximum_buffered_component_bytes
+                .get()
+                .checked_sub(transactions.len())
+                .ok_or(ProductBackupError::RestoreComponents)?;
+            let staged_portfolios = self
+                .components
+                .get_mut(&ProductBackupComponentKind::Portfolios)
+                .ok_or(ProductBackupError::IncompleteComponents)?;
+            staged_portfolios.verify_and_rewind(cancellation)?;
+            let portfolios = restore_portfolio_component(
+                &mut staged_portfolios.file,
+                &analytical.portfolio_planning(),
+                &research,
+                artifacts.as_ref(),
+                maximum_portfolio_bytes,
+                self.policy.maximum_controlled_artifact_bytes,
+                cancellation,
+            )
+            .await?;
+            let _portfolio = PortfolioBackupAuthority::restore_fresh(
+                &self.paths,
+                self.policy.portfolio_limits,
+                &portfolios,
+                &transactions,
+            )
+            .inspect_err(|_| {
+                tracing::warn!(
+                    component = "portfolios",
+                    "workspace component restore failed"
+                )
+            })
+            .map_err(|_| ProductBackupError::RestoreComponents)?;
+            drop((portfolios, transactions));
+
+            Ok(())
+        }
         .await;
         research.begin_owned_io_shutdown();
         let shutdown_deadline = std::time::Instant::now()
@@ -525,39 +576,7 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
         // owner's Drop joins unavoidable native completion if its bounded drain timed out.
         drop(research);
         shutdown.map_err(|_| ProductBackupError::RestoreWorker)?;
-        source_result.inspect_err(|_| {
-            tracing::warn!(
-                component = "source_data",
-                "workspace component restore failed"
-            )
-        })?;
-
-        ensure_live(cancellation)?;
-        let portfolios =
-            self.read_component(ProductBackupComponentKind::Portfolios, cancellation)?;
-        let transactions =
-            self.read_component(ProductBackupComponentKind::Transactions, cancellation)?;
-        if portfolios
-            .len()
-            .checked_add(transactions.len())
-            .is_none_or(|combined| combined > self.policy.maximum_buffered_component_bytes.get())
-        {
-            return Err(ProductBackupError::RestoreComponents);
-        }
-        let _portfolio = PortfolioBackupAuthority::restore_fresh(
-            &self.paths,
-            self.policy.portfolio_limits,
-            &portfolios,
-            &transactions,
-        )
-        .inspect_err(|_| {
-            tracing::warn!(
-                component = "portfolios",
-                "workspace component restore failed"
-            )
-        })
-        .map_err(|_| ProductBackupError::RestoreComponents)?;
-        drop((portfolios, transactions));
+        authority_result?;
 
         ensure_live(cancellation)?;
         let models = self

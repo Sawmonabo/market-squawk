@@ -39,10 +39,14 @@ pub(crate) async fn dashboard_query(
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
-    let read = if matches!(&request, DashboardQueryCommand::MarketSessionContext { .. }) {
+    let read = if matches!(
+        &request,
+        DashboardQueryCommand::MarketSessionContext { .. }
+            | DashboardQueryCommand::PortfolioSavePlanningResult { .. }
+    ) {
         if request_id.is_some() || product_session_token.is_some() {
             return Err(DesktopCommandError::invalid_request(
-                "A connection change cannot use screen-read cancellation.",
+                "A saved change cannot use screen-read cancellation.",
             ));
         }
         None
@@ -280,6 +284,39 @@ pub(crate) async fn dashboard_query(
                 json!(baseline_snapshot_token),
             );
             ("Portfolio.GetAttribution", arguments)
+        }
+        DashboardQueryCommand::PortfolioSavePlanningResult {
+            account_token,
+            calculation_token,
+            confirmed,
+        } => {
+            let mut arguments = account_token_arguments(account_token);
+            arguments.insert("calculationToken".to_owned(), json!(calculation_token));
+            return invoke_narrow(
+                "Portfolio.SavePlanningResult",
+                arguments,
+                true,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await;
+        }
+        DashboardQueryCommand::PortfolioPlanningResults {
+            account_token,
+            cursor,
+            limit,
+        } => (
+            "Portfolio.ListPlanningResults",
+            portfolio_page_arguments(account_token, cursor, limit)?,
+        ),
+        DashboardQueryCommand::PortfolioPlanningResult {
+            account_token,
+            saved_result_token,
+        } => {
+            let mut arguments = account_token_arguments(account_token);
+            arguments.insert("savedResultToken".to_owned(), json!(saved_result_token));
+            ("Portfolio.GetPlanningResult", arguments)
         }
         DashboardQueryCommand::PortfolioScenario {
             account_token,

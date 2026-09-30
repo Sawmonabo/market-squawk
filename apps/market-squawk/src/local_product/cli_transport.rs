@@ -1471,6 +1471,41 @@ async fn portfolio(
             read_json_object(&request)?,
             "hypothetical position impact calculated",
         ),
+        PortfolioCommand::SavePlanningResult {
+            account,
+            calculation_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Portfolio.SavePlanningResult",
+                json_object(json!({
+                    "accountToken": account, "calculationToken": calculation_token, "confirm": true,
+                }))?,
+                "portfolio calculation saved",
+            )
+        }
+        PortfolioCommand::PlanningResults {
+            account,
+            cursor,
+            limit,
+        } => {
+            let mut arguments = product_page_arguments(cursor, limit, 512)?;
+            arguments.insert("accountToken".to_owned(), json!(account));
+            (
+                "Portfolio.ListPlanningResults",
+                arguments,
+                "saved portfolio calculations listed",
+            )
+        }
+        PortfolioCommand::PlanningResult {
+            account,
+            saved_result_token,
+        } => (
+            "Portfolio.GetPlanningResult",
+            json_object(json!({"accountToken": account, "savedResultToken": saved_result_token}))?,
+            "saved portfolio calculation reopened",
+        ),
         PortfolioCommand::Performance { request } => (
             "Portfolio.GetPerformance",
             read_json_object(&request)?,

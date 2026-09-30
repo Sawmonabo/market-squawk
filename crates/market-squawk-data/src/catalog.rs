@@ -14,6 +14,7 @@ mod market_data_instruments;
 mod market_recovery;
 mod migration_preflight;
 mod model_inventory;
+mod portfolio_planning;
 mod observed_revisions;
 mod official_options_reference;
 mod official_options_reference_stage;
@@ -44,6 +45,12 @@ pub use self::chart_projection::{
 pub use self::model_inventory::{
     ModelInventoryCatalogCapability, ModelInventoryEntry, ModelInventoryError, ModelInventoryHead,
     ModelInventoryRecord,
+};
+
+pub use self::portfolio_planning::{
+    PortfolioPlanningCatalogCapability, PortfolioPlanningChainHead, PortfolioPlanningCompletion,
+    PortfolioPlanningCompletionEntry, PortfolioPlanningError, PortfolioPlanningHead,
+    PortfolioPlanningKind, PortfolioPlanningSavedEntry,
 };
 
 pub(crate) use self::authority::exact_catalog_file_binding;

@@ -11,6 +11,7 @@ import type { ProductTransport } from "@/lib/transport"
 import { formatUnixNanos } from "../opportunities/format"
 import { CursorNavigation } from "../shared/cursor-navigation"
 
+import { PlanningSaveControl } from "./planning-save-control"
 import { investmentDisplayName } from "./portfolio-format"
 import { portfolioRebalanceInputSchema } from "./portfolio-contracts"
 import type { PortfolioAccountSummary, PortfolioHolding, PortfolioRebalanceReport } from "./portfolio-contracts"
@@ -166,11 +167,15 @@ function RebalanceRead({ account, bootstrap, transport, refresh }: RebalanceProp
     {calculation.pending ? <p role="status" className="text-xs text-muted-foreground">Calculating your rebalance assumptions…</p> : null}
     {calculation.cancelled ? <p role="status" className="text-xs text-muted-foreground">Rebalance calculation cancelled. No result is shown.</p> : null}
     {calculation.error ? <RebalanceError title="Rebalance calculation could not be completed" detail={calculation.error} /> : null}
-    {calculation.result ? <RebalanceResult report={calculation.result} targets={targets} /> : null}
+    {calculation.result ? <>
+      <PortfolioRebalanceReportView report={calculation.result} targets={targets} />
+      <PlanningSaveControl key={calculation.result.calculationToken} accountToken={account.accountToken}
+        calculation={calculation.result} kind="rebalance" bootstrap={bootstrap} transport={transport} />
+    </> : null}
   </div>
 }
 
-function RebalanceResult({ report, targets }: { report: PortfolioRebalanceReport; targets: DraftTarget[] }) {
+export function PortfolioRebalanceReportView({ report, targets = [] }: { report: PortfolioRebalanceReport; targets?: DraftTarget[] }) {
   return <section className="space-y-4 rounded-lg border border-border bg-background/25 p-4" aria-label="Rebalance calculation results">
     <h4 className="text-sm font-semibold">Hypothetical rebalance value changes</h4>
     <p className="text-xs leading-5 text-muted-foreground">

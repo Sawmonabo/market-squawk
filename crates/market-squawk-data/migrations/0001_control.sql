@@ -438,3 +438,50 @@ CREATE TRIGGER forecast_inventory_vintages_immutable_update BEFORE UPDATE ON for
 CREATE TRIGGER forecast_inventory_vintages_immutable_delete BEFORE DELETE ON forecast_inventory_vintages BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;
 CREATE TRIGGER forecast_inventory_outcomes_immutable_update BEFORE UPDATE ON forecast_inventory_outcomes BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;
 CREATE TRIGGER forecast_inventory_outcomes_immutable_delete BEFORE DELETE ON forecast_inventory_outcomes BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;
+
+-- Completed calculations retain immutable artifact coordinates; Save adds a separate marker.
+CREATE TABLE portfolio_planning_completions (
+    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+    calculation_token TEXT NOT NULL UNIQUE,
+    account_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    snapshot_token TEXT NOT NULL,
+    calculated_at_ns INTEGER NOT NULL,
+    portfolio_effective_at_ns INTEGER NOT NULL,
+    portfolio_available_at_ns INTEGER,
+    artifact_id TEXT NOT NULL,
+    artifact_sha256 BLOB NOT NULL CHECK (length(artifact_sha256) = 32),
+    artifact_byte_length INTEGER NOT NULL CHECK (artifact_byte_length > 0),
+    artifact_media_type TEXT NOT NULL,
+    record_sha256 BLOB NOT NULL CHECK (length(record_sha256) = 32),
+    chain_sha256 BLOB NOT NULL CHECK (length(chain_sha256) = 32),
+    UNIQUE (calculation_token, account_id)
+) STRICT;
+CREATE TABLE portfolio_planning_saves (
+    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+    calculation_token TEXT NOT NULL UNIQUE,
+    account_id TEXT NOT NULL,
+    saved_at_ns INTEGER NOT NULL,
+    record_sha256 BLOB NOT NULL CHECK (length(record_sha256) = 32),
+    chain_sha256 BLOB NOT NULL CHECK (length(chain_sha256) = 32),
+    FOREIGN KEY (calculation_token, account_id)
+        REFERENCES portfolio_planning_completions(calculation_token, account_id)
+) STRICT;
+CREATE INDEX portfolio_planning_saves_account_sequence
+ON portfolio_planning_saves(account_id, sequence);
+CREATE TRIGGER portfolio_planning_completions_immutable_update
+BEFORE UPDATE ON portfolio_planning_completions BEGIN
+    SELECT RAISE(ABORT, 'portfolio planning completions are immutable');
+END;
+CREATE TRIGGER portfolio_planning_completions_immutable_delete
+BEFORE DELETE ON portfolio_planning_completions BEGIN
+    SELECT RAISE(ABORT, 'portfolio planning completions are immutable');
+END;
+CREATE TRIGGER portfolio_planning_saves_immutable_update
+BEFORE UPDATE ON portfolio_planning_saves BEGIN
+    SELECT RAISE(ABORT, 'portfolio planning saves are immutable');
+END;
+CREATE TRIGGER portfolio_planning_saves_immutable_delete
+BEFORE DELETE ON portfolio_planning_saves BEGIN
+    SELECT RAISE(ABORT, 'portfolio planning saves are immutable');
+END;

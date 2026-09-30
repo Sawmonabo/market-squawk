@@ -937,6 +937,10 @@ impl LocalProduct {
             PortfolioApplicationLimits::standard(),
         )?);
         portfolio.register_instrument_reader(research.market_data_instruments())?;
+        portfolio.register_planning_storage(
+            research.analytical().portfolio_planning(),
+            artifact_repository.clone(),
+        )?;
         let product_policy = market_squawk_decisions::RecommendationPolicy::v1()
             .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
         let product_mark_age_nanos =

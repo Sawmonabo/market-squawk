@@ -1740,6 +1740,85 @@ impl PortfolioCandidateImpactPreview {
         })
     }
 
+    /// Private durable evidence; ordinary saved-result reads expose only the original product.
+    fn retained_evidence(&self) -> Value {
+        let identity = |digest: EvidenceDigest| {
+            json!({
+                "algorithm": match digest.algorithm() {
+                    DigestAlgorithm::Sha256 => "sha256", DigestAlgorithm::Blake3 => "blake3",
+                },
+                "digest": hex(&digest.bytes()),
+            })
+        };
+        let cost = |cost: &PortfolioCandidateAvailability<PortfolioCandidateCost>| match cost {
+            PortfolioCandidateAvailability::Available(cost) => json!({
+                "state": "available", "amount": money_value(cost.amount),
+                "evidence": identity(cost.evidence_digest),
+            }),
+            PortfolioCandidateAvailability::Unavailable(reason) => json!({
+                "state": "unavailable", "reason": reason.as_str(),
+            }),
+        };
+        let authority = match &self.setup.authority {
+            PortfolioCandidateAccountAuthority::ExplicitAccount => {
+                json!({"kind": "explicit_current_account"})
+            }
+            PortfolioCandidateAccountAuthority::Recommendation {
+                setup_revision,
+                setup_digest,
+                configuration_digest,
+                profile_digest,
+                catalog_digest,
+            } => json!({
+                "kind": "recommendation_setup", "setupRevision": setup_revision.to_string(),
+                "setupDigest": hex(setup_digest), "configurationDigest": hex(configuration_digest),
+                "profileDigest": hex(profile_digest), "catalogDigest": identity(*catalog_digest),
+            }),
+        };
+        let observation = &self.market_evidence.observation;
+        let selection = &self.market_evidence.selection;
+        let terms = self.market_evidence.execution_terms;
+        json!({
+            "schemaVersion": CANDIDATE_IMPACT_EVIDENCE_SCHEMA_VERSION,
+            "policy": CANDIDATE_IMPACT_POLICY, "portfolioValueBasis": PORTFOLIO_VALUE_BASIS,
+            "scenarioScope": SCENARIO_SCOPE, "authorityBinding": AUTHORITY_BINDING,
+            "evidenceDigest": identity(self.evidence_digest),
+            "revisionToken": hex(&self.revision.bytes()),
+            "portfolioSourceId": self.portfolio_source_id.as_str(),
+            "portfolioSourceCoverage": self.portfolio_source_coverage.iter().map(SourceId::as_str).collect::<Vec<_>>(),
+            "portfolioArtifactSha256": hex(&self.portfolio_artifact_sha256),
+            "positionState": self.position_state.as_str(),
+            "setup": { "accountId": self.setup.account_id.to_string(),
+                "accountToken": self.setup.account_token, "reportingCurrency": self.setup.reporting_currency.as_str(),
+                "portfolioRevision": hex(&self.setup.portfolio_revision.bytes()), "authority": authority },
+            "observation": { "instrumentId": observation.instrument_id.to_string(),
+                "unitMark": money_value(observation.unit_mark), "markKind": observation.mark_kind.as_str(),
+                "quality": observation.quality, "sourceId": observation.source_id.as_str(),
+                "evidence": identity(observation.observation_digest),
+                "observedAtUnixNanos": observation.observed_at.unix_nanos().to_string(),
+                "availableAtUnixNanos": observation.available_at.unix_nanos().to_string(),
+                "freshUntilUnixNanos": observation.fresh_until.unix_nanos().to_string() },
+            "selection": { "instrumentId": selection.instrument_id.to_string(), "sourceId": selection.source_id.as_str(),
+                "policyRevision": selection.policy_revision, "policyDigest": identity(selection.policy_digest),
+                "receiptDigest": identity(selection.receipt_digest),
+                "sourceStateRevision": selection.source_state_revision.map(|revision| revision.to_string()),
+                "selectedAtUnixNanos": selection.selected_at.unix_nanos().to_string() },
+            "executionTerms": { "instrumentId": terms.instrument_id().to_string(),
+                "definitionRevision": terms.definition_revision().get().to_string(),
+                "priceTick": terms.price_tick().as_decimal().to_string(), "lotSize": terms.lot_size().as_decimal().to_string(),
+                "quoteCurrency": terms.quote_currency().as_str(),
+                "settlementDenomination": denomination_value(terms.settlement_denomination()),
+                "contractMultiplier": terms.contract_multiplier().to_string() },
+            "fees": cost(&self.market_evidence.fees), "slippage": cost(&self.market_evidence.slippage),
+            "marketPortfolioRevision": hex(&self.market_evidence.portfolio_revision.bytes()),
+            "advisory": { "outcome": "indeterminate_at_evaluation",
+                "evaluated": self.advisory.evaluated.iter().map(|check| check.as_str()).collect::<Vec<_>>(),
+                "unavailable": self.advisory.unavailable.iter().map(|check| check.as_str()).collect::<Vec<_>>(),
+                "evaluatedAtUnixNanos": self.advisory.evaluated_at.unix_nanos().to_string(),
+                "digest": identity(self.advisory.digest) },
+        })
+    }
+
     fn canonical_evidence_digest(&self) -> EvidenceDigest {
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/portfolio-candidate-impact-evidence/v1\0");
@@ -1941,6 +2020,7 @@ pub(super) async fn call_resolved_candidate_impact(
     request: &TypedToolRequest,
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    let original_request = request;
     ensure_read_live(&reader.runtime, context.deadline(), context.cancellation())?;
     let instrument_id = request
         .arguments()
@@ -2017,8 +2097,23 @@ pub(super) async fn call_resolved_candidate_impact(
         json!({"state": "available", "confidence": "limited"}),
     )
     .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-    TypedToolResult::try_new(preview.structured_content(), 1, metadata, context.limits())
-        .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)
+    let result =
+        TypedToolResult::try_new(preview.structured_content(), 1, metadata, context.limits())
+            .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
+    let mut evidence = preview.retained_evidence();
+    evidence
+        .as_object_mut()
+        .ok_or(PortfolioApplicationServiceError::CorruptPublication)?
+        .insert(
+            "resolutionCatalogDigest".to_owned(),
+            json!({
+                "algorithm": match expected.catalog.digest().algorithm() {
+                    DigestAlgorithm::Sha256 => "sha256", DigestAlgorithm::Blake3 => "blake3",
+                }, "digest": hex(&expected.catalog.digest().bytes()),
+            }),
+        );
+    super::saved_planning::complete(&reader.runtime, original_request, result, evidence, context)
+        .await
 }
 
 fn explicit_account_binding(
@@ -2879,6 +2974,14 @@ mod tests {
         assert_eq!(exit_content["price"]["freshUntilUnixNanos"], "120");
         assert_eq!(exit_content["portfolioEffectiveAtUnixNanos"], "90");
         assert_eq!(exit_content["portfolioAvailableAtUnixNanos"], "95");
+        let retained = exit_preview.retained_evidence();
+        assert_eq!(
+            retained["portfolioArtifactSha256"],
+            hex(&published_b.artifact_sha256)
+        );
+        assert_eq!(retained["selection"]["sourceId"], source_id.as_str());
+        assert_eq!(retained["observation"]["availableAtUnixNanos"], "105");
+        assert_eq!(retained["observation"]["freshUntilUnixNanos"], "120");
         let descriptor = crate::application::application_capabilities().unwrap();
         use market_squawk_services::{
             JsonStructureLimits, ServiceLimits, ToolResultMetadata, TypedToolResult,
@@ -2891,8 +2994,13 @@ mod tests {
             JsonStructureLimits::try_new(32, 65536, 10000, 2000).unwrap(),
         )
         .unwrap();
+        // Completion identity is added by the durable application boundary, not the pure kernel.
+        let mut completed_content = exit_content;
+        completed_content["calculationToken"] =
+            serde_json::json!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        completed_content["calculatedAtUnixNanos"] = serde_json::json!("115");
         TypedToolResult::try_new(
-            exit_content,
+            completed_content,
             1,
             ToolResultMetadata::try_complete(
                 serde_json::json!({"scope": "portfolio_candidate"}),

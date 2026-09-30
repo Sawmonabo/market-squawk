@@ -14,10 +14,12 @@ mod paper;
 mod product;
 mod read;
 mod recommendation;
+mod saved_planning;
 mod snapshot_page;
 mod transactions;
 
 pub(crate) use paper::PaperPortfolioPublishCapability;
+pub(crate) use saved_planning::artifact_reference as planning_artifact_reference;
 
 pub(crate) use account_catalog::{
     PortfolioAccountCatalogError, PortfolioAccountCatalogReadCapability,
@@ -264,6 +266,7 @@ impl PortfolioApplicationService {
                 image: ArcSwap::from(Arc::new(image)),
                 instruments: OnceLock::new(),
                 candidate_resolution: OnceLock::new(),
+                planning: OnceLock::new(),
                 accepting: AtomicBool::new(true),
                 cancellation: CancellationToken::new(),
                 active: AtomicUsize::new(0),
@@ -287,6 +290,18 @@ impl PortfolioApplicationService {
         self.runtime
             .instruments
             .set(instruments)
+            .map_err(|_| PortfolioApplicationServiceError::Authority)
+    }
+
+    /// Attaches the sole catalog and controlled immutable artifact owner for completed planning.
+    pub(crate) fn register_planning_storage(
+        &self,
+        catalog: market_squawk_data::PortfolioPlanningCatalogCapability,
+        artifacts: Arc<dyn market_squawk_services::ArtifactRepository>,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        self.runtime
+            .planning
+            .set(saved_planning::SavedPlanningStorage { catalog, artifacts })
             .map_err(|_| PortfolioApplicationServiceError::Authority)
     }
 
@@ -646,6 +661,7 @@ struct Runtime {
     image: ArcSwap<PortfolioReadImage>,
     instruments: OnceLock<MarketDataInstrumentReadCapability>,
     candidate_resolution: OnceLock<Arc<dyn PortfolioCandidateResolutionAuthority>>,
+    planning: OnceLock<saved_planning::SavedPlanningStorage>,
     accepting: AtomicBool,
     cancellation: CancellationToken,
     active: AtomicUsize,
@@ -748,6 +764,17 @@ impl ApplicationDomainService for PortfolioApplicationService {
         }
         if matches!(
             request.name(),
+            "Portfolio.SavePlanningResult"
+                | "Portfolio.ListPlanningResults"
+                | "Portfolio.GetPlanningResult"
+        ) {
+            let _guard = guard;
+            return saved_planning::call(&self.runtime, &request, &context)
+                .await
+                .map_err(|error| error.as_service_error());
+        }
+        if matches!(
+            request.name(),
             "Portfolio.GetHoldings"
                 | "Portfolio.GetExposure"
                 | "Portfolio.GetTransactions"
@@ -758,8 +785,11 @@ impl ApplicationDomainService for PortfolioApplicationService {
                 | "Portfolio.ProposeRebalance"
         ) {
             let runtime = Arc::clone(&self.runtime);
-            return tokio::task::spawn_blocking(move || {
-                let _guard = guard;
+            let worker_request = request.clone();
+            let worker_context = context.clone();
+            let (result, evidence, _guard) = tokio::task::spawn_blocking(move || {
+                let request = worker_request;
+                let context = worker_context;
                 ensure_live(&runtime, &context)?;
                 let read = match request.name() {
                     "Portfolio.ListRevisions" | "Portfolio.GetAttribution" => history::call,
@@ -769,19 +799,37 @@ impl ApplicationDomainService for PortfolioApplicationService {
                     | "Portfolio.ProposeRebalance" => read::call,
                     _ => holdings::call,
                 };
+                let image = runtime.image.load();
                 let result = read(
-                    &runtime.image.load(),
+                    &image,
                     &request,
                     &context,
                     runtime.limits,
                     runtime.instruments.get(),
                 )?;
+                let evidence = if saved_planning::is_calculation(request.name()) {
+                    Some(saved_planning::portfolio_evidence(
+                        &image,
+                        &request,
+                        &context,
+                        runtime.limits,
+                    )?)
+                } else {
+                    None
+                };
                 ensure_live(&runtime, &context)?;
-                Ok(result)
+                Ok((result, evidence, guard))
             })
             .await
             .map_err(|_| ServiceError::Internal)?
-            .map_err(|error: PortfolioApplicationServiceError| error.as_service_error());
+            .map_err(|error: PortfolioApplicationServiceError| error.as_service_error())?;
+            return if let Some(evidence) = evidence {
+                saved_planning::complete(&self.runtime, &request, result, evidence, &context)
+                    .await
+                    .map_err(|error| error.as_service_error())
+            } else {
+                Ok(result)
+            };
         }
         let _guard = guard;
         read::call(

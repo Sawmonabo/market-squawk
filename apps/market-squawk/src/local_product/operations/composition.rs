@@ -114,6 +114,7 @@ pub(crate) fn try_compose_installed_workspace_backup(
         )?),
         Arc::new(PortfolioWorkspaceBackupAuthority::try_new(
             product.portfolio().backup_authority(),
+            product.research(),
         )?),
         Arc::new(ModelWorkspaceBackupAuthority::try_new(
             product

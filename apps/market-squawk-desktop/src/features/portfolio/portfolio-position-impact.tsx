@@ -10,6 +10,8 @@ import { productLookupCategory, type ProductTransport } from "@/lib/transport"
 import { useLookup, type ProductLookupMatch } from "../lookup/use-lookup"
 import { formatUnixNanos } from "../opportunities/format"
 
+import { PlanningSaveControl } from "./planning-save-control"
+import { investmentDisplayName } from "./portfolio-format"
 import { portfolioCandidateImpactInputSchema } from "./portfolio-contracts"
 import type { PortfolioAccountSummary, PortfolioCandidateImpact } from "./portfolio-contracts"
 import { formatPortfolioRate } from "./portfolio-format"
@@ -122,11 +124,15 @@ export function PortfolioPositionImpact({ account, bootstrap, transport }: {
     {calculation.pending ? <p role="status" className="text-xs text-muted-foreground">Calculating your position comparison…</p> : null}
     {calculation.cancelled ? <p role="status" className="text-xs text-muted-foreground">Position comparison cancelled. No result is shown.</p> : null}
     {calculation.error ? <ComparisonError title="Position comparison could not be completed" detail={calculation.error} /> : null}
-    {calculation.result && investment ? <ComparisonResult report={calculation.result} investmentLabel={investment.title} /> : null}
+    {calculation.result && investment ? <>
+      <PortfolioPositionReportView report={calculation.result} investmentLabel={investment.title} />
+      <PlanningSaveControl key={calculation.result.calculationToken} accountToken={account.accountToken}
+        calculation={calculation.result} kind="position_comparison" bootstrap={bootstrap} transport={transport} />
+    </> : null}
   </section>
 }
 
-function ComparisonResult({ report, investmentLabel }: { report: PortfolioCandidateImpact; investmentLabel: string }) {
+export function PortfolioPositionReportView({ report, investmentLabel = investmentDisplayName(null, report.instrumentId) }: { report: PortfolioCandidateImpact; investmentLabel?: string }) {
   return <section className="space-y-4 rounded-lg border border-border bg-background/25 p-4" aria-label="Position comparison results">
     <h3 className="text-sm font-semibold">{investmentLabel} · {report.positionState === "new" ? "New position" : "Existing position"}</h3>
     <p className="text-xs leading-5 text-muted-foreground">
@@ -138,14 +144,14 @@ function ComparisonResult({ report, investmentLabel }: { report: PortfolioCandid
       <Fact label="Portfolio information available" value={formatUnixNanos(report.portfolioAvailableAtUnixNanos)} />
       <Fact label="Original target total quantity" value={report.assumptions.proposedQuantity} />
       <Fact label="Original price change" value={`${report.assumptions.scenarioShockPercent}%`} />
-      <Fact label="Current quantity" value={groupDecimal(report.currentQuantity)} />
+      <Fact label="Quantity at calculation" value={groupDecimal(report.currentQuantity)} />
       <Fact label="Calculated target quantity" value={groupDecimal(report.proposedQuantity)} />
     </dl>
     <div className="overflow-x-auto"><table className="w-full text-left text-xs">
-      <caption className="sr-only">Current and proposed position comparison</caption>
+      <caption className="sr-only">Original and proposed position comparison</caption>
       <thead className="border-b border-border text-muted-foreground"><tr>
         <th scope="col" className="px-3 py-3 font-medium">Measure</th>
-        <th scope="col" className="px-3 py-3 font-medium">Current</th>
+        <th scope="col" className="px-3 py-3 font-medium">Original</th>
         <th scope="col" className="px-3 py-3 font-medium">Proposed</th>
         <th scope="col" className="px-3 py-3 font-medium">Change</th>
       </tr></thead>

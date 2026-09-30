@@ -651,8 +651,9 @@ impl ResearchService {
     ///
     /// The closure must retain only the exact data capabilities it needs, never an Arc to this
     /// service, and must check the supplied cancellation token and original deadline. Its typed
-    /// result is returned only after the original blocking handle joins. Domain errors carried
-    /// by `T` are operation results, separate from failure to join the worker itself.
+    /// result normally follows the blocking handle; interruption leaves cleanup with the worker
+    /// owner. Use the joined variant when a caller-held lease must outlive that cleanup. Domain
+    /// errors carried by `T` remain separate from worker scheduling errors.
     pub(crate) async fn run_owned_research_io<T, F>(
         &self,
         deadline: Instant,
@@ -665,6 +666,23 @@ impl ResearchService {
     {
         self.provider_capture_worker
             .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Runs one synchronous operation and drains its admitted handle before returning on
+    /// cancellation or deadline, keeping the caller's authority lease alive through completion.
+    pub(crate) async fn run_owned_research_io_joined<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.provider_capture_worker
+            .run_with_job_context(Some(cancellation), deadline, cancellation, operation)
             .await
     }
 

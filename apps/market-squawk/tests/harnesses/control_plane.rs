@@ -81,11 +81,12 @@ mod portfolio_application {
 
     use bytes::Bytes;
     use market_squawk::application::{ApplicationDomainService, application_capabilities};
-    use market_squawk::{AppPaths, PortfolioApplicationLimits, PortfolioApplicationService};
+    use market_squawk::{AppPaths, LocalProduct};
     use market_squawk_domain::{
         DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
         SourceId, SourceIdentifier, Timestamp,
     };
+    use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
     use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
     use market_squawk_sources::{
         AvailabilityEvidence, DiscoveryRequest, ExtractionBatch, ExtractionRecord,
@@ -97,10 +98,38 @@ mod portfolio_application {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
-    #[tokio::test]
-    async fn portfolio_import_atomically_publishes_the_queried_revision() -> TestResult {
+    #[test]
+    fn portfolio_import_atomically_publishes_the_queried_revision() -> TestResult {
+        // Full composition uses the same stack as the installed service entry point.
+        std::thread::Builder::new()
+            .name("portfolio-restart".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| -> Result<(), String> {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?
+                    .block_on(Box::pin(portfolio_import_restart_scenario()))
+                    .map_err(|error| error.to_string())
+            })?
+            .join()
+            .map_err(|_| "portfolio restart thread failed")?
+            .map_err(Into::into)
+    }
+
+    async fn portfolio_import_restart_scenario() -> TestResult {
         let temporary = tempfile::tempdir()?;
         let paths = AppPaths::prepare(temporary.path())?;
+        let environment = std::collections::BTreeMap::new();
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &environment,
+            ConfigOverrides {
+                data_dir: Some(temporary.path().to_path_buf()),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let product = Box::pin(LocalProduct::try_new(config.clone())).await?;
         let batch = account_and_holding_batch(1, 100, "50")?;
         let mut artifact = paths
             .artifacts()?
@@ -109,8 +138,7 @@ mod portfolio_application {
         serde_json::to_writer(&mut artifact, &batch)?;
         artifact.flush()?;
 
-        let service =
-            PortfolioApplicationService::try_new(&paths, PortfolioApplicationLimits::standard())?;
+        let service = product.portfolio();
         let imported = service
             .call(
                 admitted(
@@ -699,9 +727,102 @@ mod portfolio_application {
                 .get("timeWeightedReturn")
                 .is_none()
         );
+        let planning_limits = json!({"maximumItems":16,"maximumBytes":65536});
+        let list_arguments = json!({"accountToken":token,"resultLimits":planning_limits});
+        let unsaved = service
+            .call(
+                admitted("Portfolio.ListPlanningResults", list_arguments.clone())?,
+                context(42)?,
+            )
+            .await?;
+        assert_eq!(unsaved.structured_content()["results"], json!([]));
+        let mut saved_results = Vec::new();
+        for original in [&scenario, &rebalance] {
+            let save_arguments = json!({"accountToken":token,
+                "calculationToken":original.structured_content()["calculationToken"],
+                "confirm":true,"resultLimits":planning_limits});
+            let saved = service
+                .call(
+                    admitted("Portfolio.SavePlanningResult", save_arguments.clone())?,
+                    context(43)?,
+                )
+                .await?;
+            saved.validate_for(
+                application_capabilities()?
+                    .find("Portfolio.SavePlanningResult")
+                    .ok_or("save descriptor missing")?,
+            )?;
+            let repeated = service
+                .call(
+                    admitted("Portfolio.SavePlanningResult", save_arguments)?,
+                    context(44)?,
+                )
+                .await?;
+            assert_eq!(saved.structured_content(), repeated.structured_content());
+            saved_results.push(saved.structured_content()["summary"]["savedResultToken"].clone());
+        }
+        let listed = service
+            .call(
+                admitted("Portfolio.ListPlanningResults", list_arguments.clone())?,
+                context(45)?,
+            )
+            .await?;
+        listed.validate_for(
+            application_capabilities()?
+                .find("Portfolio.ListPlanningResults")
+                .ok_or("list descriptor missing")?,
+        )?;
+        assert_eq!(
+            listed.structured_content()["results"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        let mut saved_page_arguments = list_arguments;
+        saved_page_arguments["limit"] = json!(1);
+        let saved_page = service
+            .call(
+                admitted(
+                    "Portfolio.ListPlanningResults",
+                    saved_page_arguments.clone(),
+                )?,
+                context(48)?,
+            )
+            .await?;
+        assert_eq!(
+            saved_page.structured_content()["results"][0]["savedResultToken"],
+            saved_results[0]
+        );
+        assert_eq!(
+            saved_page.structured_content()["results"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(saved_page.structured_content()["nextCursor"].is_string());
+        saved_page_arguments["cursor"] = saved_page.structured_content()["nextCursor"].clone();
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(10))
+                .await
+                .is_complete()
+        );
         drop(service);
-        let reopened =
-            PortfolioApplicationService::try_new(&paths, PortfolioApplicationLimits::standard())?;
+        drop(product);
+        let reopened_product = Box::pin(LocalProduct::try_new(config)).await?;
+        let reopened = reopened_product.portfolio();
+        let saved_next = reopened
+            .call(
+                admitted("Portfolio.ListPlanningResults", saved_page_arguments)?,
+                context(49)?,
+            )
+            .await?;
+        assert_eq!(
+            saved_next.structured_content()["results"][0]["savedResultToken"],
+            saved_results[1]
+        );
+        assert!(saved_next.structured_content()["nextCursor"].is_null());
         let retained = reopened
             .call(
                 admitted("Portfolio.GetPerformance", arguments)?,
@@ -769,26 +890,42 @@ mod portfolio_application {
                 context(26)?,
             )
             .await?;
-        let retained_scenario = reopened
-            .call(
-                admitted("Portfolio.EvaluateScenario", scenario_arguments)?,
-                context(39)?,
-            )
-            .await?;
-        assert_eq!(
-            retained_scenario.structured_content(),
-            scenario.structured_content()
-        );
-        let retained_rebalance = reopened
-            .call(
-                admitted("Portfolio.ProposeRebalance", rebalance_arguments)?,
-                context(41)?,
-            )
-            .await?;
-        assert_eq!(
-            retained_rebalance.structured_content(),
-            rebalance.structured_content()
-        );
+        for (saved_token, original, request) in [
+            (&saved_results[0], &scenario, &scenario_arguments),
+            (&saved_results[1], &rebalance, &rebalance_arguments),
+        ] {
+            let get_arguments = json!({"accountToken":token,"savedResultToken":saved_token,"resultLimits":planning_limits});
+            let retained = reopened
+                .call(
+                    admitted("Portfolio.GetPlanningResult", get_arguments.clone())?,
+                    context(46)?,
+                )
+                .await?;
+            retained.validate_for(
+                application_capabilities()?
+                    .find("Portfolio.GetPlanningResult")
+                    .ok_or("get descriptor missing")?,
+            )?;
+            assert_eq!(
+                &retained.structured_content()["result"],
+                original.structured_content()
+            );
+            assert_eq!(
+                &retained.structured_content()["request"]["arguments"],
+                request
+            );
+            let mut wrong_account = get_arguments;
+            wrong_account["accountToken"] = json!("portfolio_bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb");
+            assert!(
+                reopened
+                    .call(
+                        admitted("Portfolio.GetPlanningResult", wrong_account)?,
+                        context(47)?
+                    )
+                    .await
+                    .is_err()
+            );
+        }
         let mut pinned_history_arguments = history_arguments;
         pinned_history_arguments["cursor"] = history.structured_content()["pageCursor"].clone();
         let retained_history = reopened
@@ -846,6 +983,13 @@ mod portfolio_application {
             assert_eq!(retained.structured_content(), expected);
         }
 
+        assert!(
+            reopened_product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(10))
+                .await
+                .is_complete()
+        );
         Ok(())
     }
 

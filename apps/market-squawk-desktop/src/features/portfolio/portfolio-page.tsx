@@ -15,6 +15,7 @@ import { AccountPerformance } from "./account-performance"
 import { PortfolioHistory } from "./portfolio-history"
 import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import { PortfolioPlanning } from "./portfolio-planning"
+import { SavedPlanningResults } from "./saved-planning-results"
 import { PortfolioScenarios } from "./portfolio-scenarios"
 import { RecommendationSetup } from "./recommendation-setup"
 import { CursorNavigation } from "../shared/cursor-navigation"
@@ -176,6 +177,9 @@ function SelectedPortfolio({
       </DemandPanel>
       <DemandPanel title="Stress tests" className="rounded-xl border border-border bg-card/30 p-4">
         <PortfolioScenarios account={account} bootstrap={bootstrap} transport={transport} />
+      </DemandPanel>
+      <DemandPanel title="Saved planning results" className="rounded-xl border border-border bg-card/30 p-4">
+        <SavedPlanningResults account={account} bootstrap={bootstrap} transport={transport} />
       </DemandPanel>
       <DemandPanel title="History and planning" className="group rounded-xl border border-border bg-card/20 p-4">
         <p className="mt-2 text-xs leading-5 text-muted-foreground">

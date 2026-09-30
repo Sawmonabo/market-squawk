@@ -389,6 +389,41 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Portfolio.GetExposure" => portfolio_exposure(),
         "Portfolio.GetRisk" => portfolio_risk(),
         "Portfolio.GetAttribution" => portfolio_attribution(),
+        "Portfolio.SavePlanningResult" => {
+            closed_complete(vec![("summary", portfolio_planning_summary())])
+        }
+        "Portfolio.ListPlanningResults" => closed_complete(vec![
+            ("results", array(portfolio_planning_summary())),
+            ("pageCursor", bounded_text(512)),
+            ("nextCursor", nullable(bounded_text(512))),
+        ]),
+        "Portfolio.GetPlanningResult" => closed_complete(vec![
+            ("summary", portfolio_planning_summary()),
+            (
+                "request",
+                closed_complete(vec![
+                    (
+                        "operation",
+                        enumeration(&[
+                            "Portfolio.EvaluateScenario",
+                            "Portfolio.EvaluateScenarioBatch",
+                            "Portfolio.ProposeRebalance",
+                            "Portfolio.EvaluateCandidateImpact",
+                        ]),
+                    ),
+                    ("arguments", record()),
+                ]),
+            ),
+            (
+                "result",
+                one_of(vec![
+                    portfolio_scenario(false),
+                    portfolio_scenario(true),
+                    portfolio_rebalance(),
+                    portfolio_candidate_impact(),
+                ]),
+            ),
+        ]),
         "Portfolio.EvaluateScenario" => portfolio_scenario(false),
         "Portfolio.EvaluateScenarioBatch" => portfolio_scenario(true),
         "Portfolio.ProposeRebalance" => portfolio_rebalance(),
@@ -6592,8 +6627,39 @@ fn portfolio_evaluated_scenario() -> Value {
     ])
 }
 
-fn portfolio_scenario(batch: bool) -> Value {
+fn portfolio_planning_summary() -> Value {
+    closed_complete(vec![
+        ("savedResultToken", uuid()),
+        ("calculationToken", uuid()),
+        ("accountToken", text()),
+        (
+            "kind",
+            enumeration(&[
+                "scenario",
+                "scenario_batch",
+                "rebalance",
+                "position_comparison",
+            ]),
+        ),
+        ("snapshotToken", uuid()),
+        ("portfolioEffectiveAtUnixNanos", integer_text()),
+        ("portfolioAvailableAtUnixNanos", nullable(integer_text())),
+        ("calculatedAtUnixNanos", integer_text()),
+        ("savedAtUnixNanos", integer_text()),
+    ])
+}
+
+fn portfolio_planning_report_fields() -> Vec<(&'static str, Value)> {
     let mut fields = portfolio_report_fields();
+    fields.extend([
+        ("calculationToken", uuid()),
+        ("calculatedAtUnixNanos", integer_text()),
+    ]);
+    fields
+}
+
+fn portfolio_scenario(batch: bool) -> Value {
+    let mut fields = portfolio_planning_report_fields();
     if batch {
         fields.push(("scenarios", array(portfolio_evaluated_scenario())));
     } else {
@@ -6603,7 +6669,7 @@ fn portfolio_scenario(batch: bool) -> Value {
 }
 
 fn portfolio_rebalance() -> Value {
-    let mut fields = portfolio_report_fields();
+    let mut fields = portfolio_planning_report_fields();
     fields.extend([
         (
             "proposal",
@@ -6651,6 +6717,8 @@ fn portfolio_advanced_report() -> Value {
 
 fn portfolio_candidate_impact() -> Value {
     closed_complete(vec![
+        ("calculationToken", uuid()),
+        ("calculatedAtUnixNanos", integer_text()),
         ("accountId", text()),
         ("accountToken", text()),
         ("snapshotToken", uuid()),

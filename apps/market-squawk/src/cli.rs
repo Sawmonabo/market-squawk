@@ -943,6 +943,39 @@ pub enum PortfolioCommand {
         /// Confined JSON request with accountToken, instrumentId, proposedQuantity and scenarioShockPercent.
         request: PathBuf,
     },
+    /// Save an existing completed calculation without recalculating it.
+    SavePlanningResult {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Original calculation token returned by a planning operation.
+        #[arg(long)]
+        calculation_token: Uuid,
+        /// Confirm saving this result locally.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// List the selected portfolio's saved calculations.
+    PlanningResults {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Continue the same saved-result listing.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Saved calculations per page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=32))]
+        limit: u16,
+    },
+    /// Reopen the original saved assumptions and calculation.
+    PlanningResult {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Saved result token returned by save or list.
+        #[arg(long)]
+        saved_result_token: Uuid,
+    },
     /// Measure point-in-time portfolio performance.
     Performance {
         /// Confined JSON request file.
