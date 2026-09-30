@@ -139,9 +139,10 @@ export type ProductQuery =
     }
   | {
       query: "portfolioCandidateImpact"
+      accountToken: string
       instrumentId: string
       proposedQuantity: string
-      scenarioShock: string
+      scenarioShockPercent: string
     }
   | {
       query:

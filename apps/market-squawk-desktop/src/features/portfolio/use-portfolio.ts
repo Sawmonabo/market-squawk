@@ -6,8 +6,8 @@ import { hasProductCapability } from "@/lib/product-capabilities"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
 import type { ProductQuery, ProductTransport } from "@/lib/transport"
 import { useCursorNavigation } from "../shared/cursor-navigation"
-import { parsePortfolioAccountPage, parsePortfolioAttribution, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance, parsePortfolioRevisions, parsePortfolioRebalanceReport, parsePortfolioScenarioReport, parsePortfolioTransactions } from "./portfolio-contracts"
-import type { PortfolioExposurePage, PortfolioHoldingsPage, PortfolioRebalanceInput, PortfolioRebalanceReport, PortfolioScenarioInput, PortfolioScenarioReport } from "./portfolio-contracts"
+import { parsePortfolioAccountPage, parsePortfolioAttribution, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance, parsePortfolioRevisions, parsePortfolioRebalanceReport, parsePortfolioScenarioReport, parsePortfolioTransactions, parsePortfolioCandidateImpact } from "./portfolio-contracts"
+import type { PortfolioExposurePage, PortfolioHoldingsPage, PortfolioRebalanceInput, PortfolioRebalanceReport, PortfolioScenarioInput, PortfolioScenarioReport, PortfolioCandidateImpact, PortfolioCandidateImpactInput } from "./portfolio-contracts"
 
 // Both account consumers share raw native responses and the same summary
 // projection. Navigation retains only cursor identities and the current page.
@@ -175,7 +175,7 @@ export function usePortfolioPlanningPositions(
 function usePortfolioCalculation<Result>(
   transport: ProductTransport,
   accountToken: string,
-  selection: PortfolioPlanningSelection | null,
+  snapshotToken: string | null,
   failureMessage: string,
 ) {
   const active = useRef<AbortController | null>(null)
@@ -194,7 +194,7 @@ function usePortfolioCalculation<Result>(
       active.current = null
       controller?.abort()
     }
-  }, [accountToken, selection?.snapshotToken, transport])
+  }, [accountToken, snapshotToken, transport])
 
   const invalidate = () => {
     retire()
@@ -205,7 +205,6 @@ function usePortfolioCalculation<Result>(
     setState({ pending: false, result: null, error: null, cancelled: true })
   }
   const calculate = async (request: ProductQuery, parse: (response: ApplicationResult) => Result) => {
-    if (!selection) return
     retire()
     const controller = new AbortController()
     active.current = controller
@@ -231,7 +230,7 @@ export function usePortfolioScenarioCalculation(
   accountToken: string,
   selection: PortfolioPlanningSelection | null,
 ) {
-  const calculation = usePortfolioCalculation<PortfolioScenarioReport>(transport, accountToken, selection,
+  const calculation = usePortfolioCalculation<PortfolioScenarioReport>(transport, accountToken, selection?.snapshotToken ?? null,
     "The stress calculation could not be completed. Try again.")
   return { ...calculation, calculate: async (scenarios: PortfolioScenarioInput[], batch: boolean) => {
     if (!selection) return
@@ -247,12 +246,26 @@ export function usePortfolioRebalanceCalculation(
   accountToken: string,
   selection: PortfolioPlanningSelection | null,
 ) {
-  const calculation = usePortfolioCalculation<PortfolioRebalanceReport>(transport, accountToken, selection,
+  const calculation = usePortfolioCalculation<PortfolioRebalanceReport>(transport, accountToken, selection?.snapshotToken ?? null,
     "The rebalance calculation could not be completed. Try again.")
   return { ...calculation, calculate: async (proposal: PortfolioRebalanceInput) => {
     if (!selection) return
     await calculation.calculate({ query: "portfolioRebalance", accountToken, snapshotToken: selection.snapshotToken, proposal },
       (response) => parsePortfolioRebalanceReport(response, selection, proposal))
+  } }
+}
+
+// Position impact selects current account and market evidence when requested.
+// It shares calculation cancellation without claiming a historical snapshot pin.
+export function usePortfolioCandidateImpactCalculation(
+  transport: ProductTransport,
+  accountToken: string,
+) {
+  const calculation = usePortfolioCalculation<PortfolioCandidateImpact>(transport, accountToken, null,
+    "The position comparison could not be completed. Try again.")
+  return { ...calculation, calculate: async (input: PortfolioCandidateImpactInput) => {
+    await calculation.calculate({ query: "portfolioCandidateImpact", accountToken, ...input },
+      (response) => parsePortfolioCandidateImpact(response, accountToken, input))
   } }
 }
 

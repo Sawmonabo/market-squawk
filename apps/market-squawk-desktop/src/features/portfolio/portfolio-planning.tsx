@@ -1,25 +1,12 @@
-import * as React from "react"
-import { Target } from "lucide-react"
-
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { DemandPanel } from "../shared/demand-panel"
+
+import type { PortfolioAccountSummary } from "./portfolio-contracts"
+import { PortfolioPositionImpact } from "./portfolio-position-impact"
 import { PortfolioRebalance } from "./portfolio-rebalance"
 
-import type {
-  PortfolioAccountSummary,
-  PortfolioPositionChoice,
-} from "./portfolio-contracts"
-import { investmentDisplayName } from "./portfolio-format"
-import { PreparedChoiceDetails } from "./prepared-choice-details"
-
-export function PortfolioPlanning({
-  positionChoices,
-  account,
-  bootstrap,
-  transport,
-}: {
-  positionChoices: PortfolioPositionChoice[] | null
+export function PortfolioPlanning({ account, bootstrap, transport }: {
   account: PortfolioAccountSummary
   bootstrap: DesktopBootstrap
   transport: ProductTransport
@@ -32,105 +19,19 @@ export function PortfolioPlanning({
         </p>
         <h2 className="mt-2 text-lg font-semibold">Portfolio planning</h2>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Review a position choice or enter your rebalance assumptions before making a decision. Planning cannot
+          Enter your position or rebalance assumptions before making a decision. Planning cannot
           place an order, and no choice is selected automatically.
         </p>
       </header>
       <div className="mt-5 space-y-4">
-        <PositionPlanner choices={positionChoices} />
+        <DemandPanel title="Compare a position change" className="rounded-lg border border-border bg-background/25 p-4">
+          <PortfolioPositionImpact key={`${bootstrap.productSessionToken}:${account.accountToken}`}
+            account={account} bootstrap={bootstrap} transport={transport} />
+        </DemandPanel>
         <DemandPanel title="Rebalance plan" className="rounded-lg border border-border bg-background/25 p-4">
           <PortfolioRebalance account={account} bootstrap={bootstrap} transport={transport} />
         </DemandPanel>
       </div>
     </section>
-  )
-}
-
-function PositionPlanner({ choices }: { choices: PortfolioPositionChoice[] | null }) {
-  const [selectedToken, setSelectedToken] = React.useState("")
-  const selected = choices?.find((choice) => choice.actionToken === selectedToken) ?? null
-  React.useEffect(() => setSelectedToken(""), [choices])
-
-  return (
-    <PlanningChoice
-      icon={Target}
-      title="Compare a position change"
-      unavailable={
-        !choices || choices.length === 0
-          ? "No complete position choices are available. Market Squawk will not assume an investment, quantity, price, or cost."
-          : null
-      }
-    >
-      {choices && choices.length > 0 ? (
-        <>
-          <ChoiceSelect
-            label="Position choice"
-            value={selectedToken}
-            options={choices.map((choice) => ({
-              token: choice.actionToken,
-              label: `${investmentDisplayName(choice.investment)} · ${choice.title}`,
-            }))}
-            select={setSelectedToken}
-          />
-          {selected ? <PreparedChoiceDetails choice={selected} /> : null}
-        </>
-      ) : null}
-    </PlanningChoice>
-  )
-}
-
-function PlanningChoice({
-  icon: Icon,
-  title,
-  unavailable,
-  children,
-}: {
-  icon: typeof Target
-  title: string
-  unavailable: string | null
-  children: React.ReactNode
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-background/25 p-4">
-      <div className="flex items-center gap-2">
-        <Icon className="size-4 text-primary" aria-hidden="true" />
-        <h3 className="text-sm font-semibold">{title}</h3>
-      </div>
-      {unavailable ? (
-        <p className="mt-3 text-xs leading-5 text-muted-foreground">{unavailable}</p>
-      ) : (
-        children
-      )}
-    </div>
-  )
-}
-
-function ChoiceSelect({
-  label,
-  value,
-  options,
-  select,
-}: {
-  label: string
-  value: string
-  options: { token: string; label: string }[]
-  select: (token: string) => void
-}) {
-  return (
-    <label className="mt-4 grid gap-1.5 text-xs">
-      <span className="font-semibold">{label}</span>
-      <select
-        value={value}
-        onChange={(event) => select(event.target.value)}
-        className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <option value="">Choose an option</option>
-        {options.map((option) => (
-          <option key={option.token} value={option.token}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
   )
 }

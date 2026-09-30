@@ -6657,6 +6657,25 @@ fn portfolio_advanced_report() -> Value {
 fn portfolio_candidate_impact() -> Value {
     closed_complete(vec![
         ("accountId", text()),
+        ("accountToken", text()),
+        ("snapshotToken", uuid()),
+        ("portfolioEffectiveAtUnixNanos", integer_text()),
+        ("portfolioAvailableAtUnixNanos", integer_text()),
+        ("evidenceDigest", sha256()),
+        (
+            "assumptions",
+            closed_complete(vec![
+                ("proposedQuantity", text()),
+                ("scenarioShockPercent", text()),
+                ("quantityMeaning", constant("target_total")),
+                ("fundingAssumption", constant("cash_transfer_before_costs")),
+                (
+                    "portfolioValueBasis",
+                    constant("source_reported_holdings_with_selected_candidate_revalued"),
+                ),
+                ("scenarioScope", constant("candidate_position_only")),
+            ]),
+        ),
         ("instrumentId", text()),
         ("positionState", enumeration(&["new", "existing"])),
         ("currentQuantity", text()),
@@ -6713,6 +6732,7 @@ fn portfolio_product_candidate_price() -> Value {
     closed_complete(vec![
         ("amount", money()),
         ("asOfUnixNanos", text()),
+        ("freshUntilUnixNanos", integer_text()),
         ("state", constant("current")),
         ("method", enumeration(&["Last trade", "Bid-ask midpoint"])),
         ("confidence", portfolio_confidence()),

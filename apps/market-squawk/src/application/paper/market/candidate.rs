@@ -22,7 +22,7 @@ use crate::{
         PortfolioAnalysisSetupSnapshot, PortfolioApplicationServiceError,
         PortfolioCandidateAvailability, PortfolioCandidateMarketEvidence,
         PortfolioCandidateResolution, PortfolioCandidateResolutionAuthority,
-        PortfolioCandidateUnavailableReason,
+        PortfolioCandidateSetupBinding, PortfolioCandidateUnavailableReason,
     },
     research_service::ResearchService,
 };
@@ -96,38 +96,48 @@ struct ProductionPortfolioCandidateResolutionAuthority {
 impl PortfolioCandidateResolutionAuthority for ProductionPortfolioCandidateResolutionAuthority {
     async fn resolve(
         &self,
+        binding: &PortfolioCandidateSetupBinding,
         instrument_id: InstrumentId,
         as_of: Timestamp,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<PortfolioCandidateResolution, PortfolioApplicationServiceError> {
         ensure_before(as_of, deadline, &cancellation)?;
-        let setup = match self
-            .resolve_analysis_setup(as_of, deadline, cancellation.clone())
-            .await?
+        if !binding.is_explicit_account() {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let catalog = self
+            .catalog
+            .snapshot_current(deadline, &cancellation)
+            .map_err(map_catalog_error)?;
+        let head = catalog
+            .head(binding.account_id())
+            .ok_or(PortfolioApplicationServiceError::StateChanged)?;
+        if head.revision() != binding.portfolio_revision()
+            || head.reporting_currency() != binding.reporting_currency()
         {
-            PortfolioAnalysisSetupResolution::Ready(setup) => setup,
-            PortfolioAnalysisSetupResolution::SetupRequired { .. } => {
-                return Err(PortfolioApplicationServiceError::InvalidRequest);
-            }
-        };
-        let markets = self
-            .resolve_analysis_markets(
-                &setup,
-                &[instrument_id],
-                as_of,
-                deadline,
-                cancellation.clone(),
-            )
-            .await?;
-        let entry = markets
-            .entry(instrument_id)
-            .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        let receipt = self
+            .markets
+            .read(instrument_id, as_of, deadline, cancellation.clone())
+            .await
+            .map_err(map_market_error)?
+            .ok_or(PortfolioApplicationServiceError::Authority)?;
+        let entry = portfolio_market_entry(binding.portfolio_revision(), &receipt)?;
         let PortfolioAnalysisMarketAvailability::Available { market, .. } = entry.availability()
         else {
             return Err(PortfolioApplicationServiceError::Authority);
         };
-        let result = PortfolioCandidateResolution::try_from_parts(setup, market.clone())?;
+        self.catalog
+            .recheck(&catalog, deadline, &cancellation)
+            .map_err(map_catalog_error)?;
+        let result = PortfolioCandidateResolution::try_from_explicit_account(
+            binding.clone(),
+            catalog,
+            market.clone(),
+            as_of,
+        )?;
         ensure_before(as_of, deadline, &cancellation)?;
         Ok(result)
     }
@@ -140,12 +150,15 @@ impl PortfolioCandidateResolutionAuthority for ProductionPortfolioCandidateResol
         cancellation: CancellationToken,
     ) -> Result<(), PortfolioApplicationServiceError> {
         ensure_before(as_of, deadline, &cancellation)?;
-        if expected.setup().as_of() != as_of {
+        if expected.evaluated_at() != as_of {
             return Err(PortfolioApplicationServiceError::InvalidRequest);
         }
-        self.recheck_setup(expected, as_of, deadline, &cancellation)?;
+        self.catalog
+            .recheck(expected.catalog(), deadline, &cancellation)
+            .map_err(map_catalog_error)?;
         let current = self
             .resolve(
+                expected.binding(),
                 expected.market().observation().instrument_id(),
                 as_of,
                 deadline,
@@ -214,7 +227,9 @@ impl PortfolioCandidateResolutionAuthority for ProductionPortfolioCandidateResol
                 .await
                 .map_err(map_market_error)?;
             entries.push(match selected {
-                Some(receipt) => portfolio_market_entry(setup, &receipt)?,
+                Some(receipt) => {
+                    portfolio_market_entry(setup.setup().current_head().revision(), &receipt)?
+                }
                 None => PortfolioAnalysisMarketEntry::unavailable(
                     *instrument_id,
                     PortfolioAnalysisMarketUnavailableReason::NoEligibleSelectedSource,
@@ -271,7 +286,7 @@ impl PortfolioCandidateResolutionAuthority for ProductionPortfolioCandidateResol
 }
 
 fn portfolio_market_entry(
-    setup: &PortfolioAnalysisSetupSnapshot,
+    revision: &market_squawk_portfolio::PortfolioRevisionToken,
     receipt: &MarketInvestmentReadReceipt,
 ) -> Result<PortfolioAnalysisMarketEntry, PortfolioApplicationServiceError> {
     let observation = receipt
@@ -290,7 +305,7 @@ fn portfolio_market_entry(
         terms,
         PortfolioCandidateAvailability::Unavailable(PortfolioCandidateUnavailableReason::Fees),
         PortfolioCandidateAvailability::Unavailable(PortfolioCandidateUnavailableReason::Slippage),
-        setup.setup().current_head().revision().clone(),
+        revision.clone(),
     )?;
     let liquidity = match receipt
         .event()
@@ -361,23 +376,6 @@ fn map_market_error(error: ServiceError) -> PortfolioApplicationServiceError {
         | ServiceError::NotFound
         | ServiceError::Unavailable
         | ServiceError::Internal => PortfolioApplicationServiceError::Authority,
-    }
-}
-
-impl ProductionPortfolioCandidateResolutionAuthority {
-    fn recheck_setup(
-        &self,
-        expected: &PortfolioCandidateResolution,
-        as_of: Timestamp,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<(), PortfolioApplicationServiceError> {
-        self.catalog
-            .recheck(expected.catalog(), deadline, cancellation)
-            .map_err(map_catalog_error)?;
-        self.setup
-            .recheck(expected.setup(), expected.catalog(), as_of)
-            .map_err(map_setup_error)
     }
 }
 

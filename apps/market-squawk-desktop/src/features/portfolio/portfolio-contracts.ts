@@ -375,22 +375,6 @@ export const riskSchema = z
   })
   .strict()
 
-const preparedDecisionSchema = z
-  .object({
-    actionToken: portfolioActionTokenSchema,
-    title: productNameSchema,
-    action: productNameSchema,
-    horizon: productNameSchema,
-    range: productTextSchema,
-    reasons: z.array(productTextSchema).min(1).max(8),
-    risks: z.array(productTextSchema).min(1).max(8),
-    assumptions: z.array(productTextSchema).min(1).max(8),
-    expiresAt: productTimeSchema,
-    invalidators: z.array(productTextSchema).min(1).max(8),
-    uncertainty: productTextSchema,
-  })
-  .strict()
-
 export const portfolioScenarioInputSchema = z.strictObject({
   id: z.string().min(1).max(512)
     .refine((value) => new TextEncoder().encode(value).length <= 512
@@ -471,10 +455,6 @@ export function parsePortfolioScenarioReport(
   return { ...report, scenarios }
 }
 
-export const positionChoiceSchema = preparedDecisionSchema
-  .extend({ investment: investmentDisplaySchema })
-  .strict()
-
 export const portfolioRebalanceInputSchema = z.strictObject({
   targets: z.array(z.strictObject({
     instrumentId: z.string().uuid(),
@@ -550,6 +530,100 @@ export function parsePortfolioRebalanceReport(
   return report
 }
 
+export const portfolioCandidateImpactInputSchema = z.strictObject({
+  instrumentId: z.string().uuid(),
+  proposedQuantity: exactDecimalSchema,
+  scenarioShockPercent: exactDecimalSchema,
+})
+
+const candidateCostSchema = z.discriminatedUnion("state", [
+  z.strictObject({ state: z.literal("available"), amount: moneySchema }),
+  z.strictObject({ state: z.literal("not_available") }),
+])
+
+const portfolioCandidateImpactSchema = z.strictObject({
+  accountToken: portfolioAccountSummarySchema.shape.accountToken,
+  accountId: z.string().min(1),
+  snapshotToken: z.string().uuid(),
+  portfolioEffectiveAtUnixNanos: unixNanosSchema,
+  portfolioAvailableAtUnixNanos: unixNanosSchema,
+  evidenceDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  instrumentId: z.string().uuid(),
+  positionState: z.enum(["new", "existing"]),
+  currentQuantity: exactDecimalSchema,
+  proposedQuantity: exactDecimalSchema,
+  currentMarketValue: moneySchema,
+  proposedMarketValue: moneySchema,
+  capitalChange: moneySchema,
+  portfolioValue: moneySchema,
+  instrumentTerms: z.strictObject({
+    priceTick: exactDecimalSchema,
+    lotSize: exactDecimalSchema,
+    quoteCurrency: currencySchema,
+    contractMultiplier: exactDecimalSchema,
+  }),
+  costs: z.strictObject({ fees: candidateCostSchema, slippage: candidateCostSchema }),
+  concentration: z.strictObject({ current: exactDecimalSchema, proposed: exactDecimalSchema, change: exactDecimalSchema }),
+  scenario: z.strictObject({
+    shock: exactDecimalSchema,
+    currentImpact: moneySchema,
+    proposedImpact: moneySchema,
+    marginalImpact: moneySchema,
+  }),
+  price: z.strictObject({
+    amount: moneySchema,
+    asOfUnixNanos: unixNanosSchema,
+    freshUntilUnixNanos: unixNanosSchema,
+    state: z.literal("current"),
+    method: z.enum(["Last trade", "Bid-ask midpoint"]),
+    confidence: z.enum(["limited", "moderate", "strong"]),
+  }),
+  assumptions: z.strictObject({
+    proposedQuantity: exactDecimalSchema,
+    scenarioShockPercent: exactDecimalSchema,
+    quantityMeaning: z.literal("target_total"),
+    fundingAssumption: z.literal("cash_transfer_before_costs"),
+    portfolioValueBasis: z.literal("source_reported_holdings_with_selected_candidate_revalued"),
+    scenarioScope: z.literal("candidate_position_only"),
+  }),
+  missingInformation: z.array(z.string().min(1)),
+  riskAssessment: z.strictObject({
+    state: z.literal("incomplete"),
+    evaluatedAtUnixNanos: unixNanosSchema,
+    checksCompleted: z.number().int().nonnegative(),
+    checksUnavailable: z.number().int().nonnegative(),
+  }),
+  updatedAtUnixNanos: unixNanosSchema,
+  analysisOnly: z.literal(true),
+}).superRefine((report, context) => {
+  const amounts = [report.currentMarketValue, report.proposedMarketValue, report.capitalChange,
+    report.portfolioValue, report.price.amount, report.scenario.currentImpact,
+    report.scenario.proposedImpact, report.scenario.marginalImpact]
+  for (const cost of [report.costs.fees, report.costs.slippage]) {
+    if (cost.state === "available") amounts.push(cost.amount)
+  }
+  if (amounts.some((amount) => amount.currency !== report.instrumentTerms.quoteCurrency)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Position comparison currencies are inconsistent." })
+  }
+})
+
+export function parsePortfolioCandidateImpact(
+  result: ApplicationResult,
+  accountToken: string,
+  submitted: PortfolioCandidateImpactInput,
+): PortfolioCandidateImpact {
+  if (result.metadata.returnedItems !== 1 || result.metadata.availableItems !== 1) {
+    throw new Error("The position comparison is incomplete.")
+  }
+  const report = parsePortfolioResult(result, portfolioCandidateImpactSchema)
+  if (report.accountToken !== accountToken || report.instrumentId !== submitted.instrumentId
+    || report.assumptions.proposedQuantity !== submitted.proposedQuantity
+    || report.assumptions.scenarioShockPercent !== submitted.scenarioShockPercent) {
+    throw new Error("The position comparison does not match your selected portfolio and assumptions.")
+  }
+  return report
+}
+
 const importPositionChoiceSchema = z
   .object({
     choiceToken: portfolioActionTokenSchema,
@@ -619,9 +693,10 @@ export type PortfolioAttribution = z.infer<typeof portfolioAttributionSchema>
 export type PortfolioScenarioInput = z.infer<typeof portfolioScenarioInputSchema>
 export type PortfolioScenarioResult = z.infer<typeof portfolioScenarioResultSchema>
 export type PortfolioScenarioReport = z.infer<typeof portfolioScenarioBatchReportSchema>
-export type PortfolioPositionChoice = z.infer<typeof positionChoiceSchema>
 export type PortfolioRebalanceInput = z.infer<typeof portfolioRebalanceInputSchema>
 export type PortfolioRebalanceReport = z.infer<typeof portfolioRebalanceReportSchema>
+export type PortfolioCandidateImpactInput = z.infer<typeof portfolioCandidateImpactInputSchema>
+export type PortfolioCandidateImpact = z.infer<typeof portfolioCandidateImpactSchema>
 export type PortfolioImportPreview = z.infer<typeof portfolioImportPreviewSchema>
 export type PortfolioImportTransaction = z.infer<typeof portfolioImportTransactionSchema>
 export type PortfolioImportCommit = z.infer<typeof portfolioImportCommitSchema>

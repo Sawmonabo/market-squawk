@@ -889,9 +889,10 @@ const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("proposal", ArgumentKind::Object),
 ];
 const PORTFOLIO_CANDIDATE_ARGUMENTS: &[ArgumentSpec] = &[
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
     ArgumentSpec::required("instrumentId", ArgumentKind::Identifier),
     ArgumentSpec::required("proposedQuantity", ArgumentKind::Decimal),
-    ArgumentSpec::required("scenarioShock", ArgumentKind::Decimal),
+    ArgumentSpec::required("scenarioShockPercent", ArgumentKind::Decimal),
 ];
 const MODEL_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("modelId", ArgumentKind::Identifier)];

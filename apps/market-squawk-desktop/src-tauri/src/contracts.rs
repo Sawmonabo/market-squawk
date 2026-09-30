@@ -529,9 +529,10 @@ pub(crate) enum DashboardQueryCommand {
         proposal: Map<String, Value>,
     },
     PortfolioCandidateImpact {
+        account_token: String,
         instrument_id: Uuid,
         proposed_quantity: String,
-        scenario_shock: String,
+        scenario_shock_percent: String,
     },
     Forecasts {
         cursor: Option<String>,

@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
+import { QueryClientProvider } from "@tanstack/react-query"
+import { createProductQueryClient } from "@/app/query-client"
 import { describe, expect, it, vi } from "vitest"
 
 import { App } from "@/app/app"
@@ -9,7 +11,6 @@ import { lookupRoute } from "@/features/lookup/lookup-surface"
 import { lookupResultSchema } from "@/features/lookup/schemas"
 import type { MarketProductRow } from "@/features/markets/market-product"
 import { parseInvestmentAnalysis, type InvestmentAnalysis } from "@/features/opportunities/contracts"
-import type { PortfolioPositionChoice } from "@/features/portfolio/portfolio-contracts"
 import { PortfolioPlanning } from "@/features/portfolio/portfolio-planning"
 import type { PortfolioRiskReport } from "@/features/risk/contracts"
 import {
@@ -512,25 +513,6 @@ function macroContextResult(cutoffs = {
       availableItems: macroIndicatorDefinitions.length,
     },
   }
-}
-
-const portfolioPositionChoice: PortfolioPositionChoice = {
-  actionToken: "position_choice_add_three_shares",
-  title: "Add three shares",
-  action: "Review adding three shares",
-  horizon: "Next 30 days",
-  range: "Two to three shares",
-  reasons: ["The position remains within the prepared concentration range."],
-  risks: ["The investment may fall before the review expires."],
-  assumptions: ["The available cash balance remains unchanged."],
-  expiresAt: "2026-09-01T14:30:00Z",
-  invalidators: ["The prepared risk review changes."],
-  uncertainty: "Price and portfolio conditions may change before action.",
-  investment: {
-    name: "Example Company",
-    symbol: "EXM",
-    typeLabel: "Stock",
-  },
 }
 
 describe("Market Squawk desktop boundary", () => {
@@ -1346,33 +1328,77 @@ describe("Market Squawk desktop boundary", () => {
 
   it("keeps portfolio planning explicit and analysis-only", async () => {
     const user = userEvent.setup()
-    render(
+    const accountToken = "portfolio_11111111111111111111111111111111"
+    const instrumentId = "22222222-2222-4222-8222-222222222222"
+    const reads: Extract<ProductQuery, { query: "portfolioCandidateImpact" }>[] = []
+    let pendingSignal: AbortSignal | undefined
+    let resolvePending: ((result: ApplicationResult) => void) | undefined
+    const result = (data: unknown): ApplicationResult => ({ data,
+      metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } })
+    const amount = (amount: string) => ({ amount, currency: "USD" })
+    const impact = (request: Extract<ProductQuery, { query: "portfolioCandidateImpact" }>) => result({
+      accountToken: request.accountToken, accountId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      instrumentId, snapshotToken: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      portfolioEffectiveAtUnixNanos: "1780000000000000000",
+      portfolioAvailableAtUnixNanos: "1780000000000000001", evidenceDigest: "a".repeat(64),
+      assumptions: { proposedQuantity: request.proposedQuantity, scenarioShockPercent: request.scenarioShockPercent,
+        quantityMeaning: "target_total", fundingAssumption: "cash_transfer_before_costs",
+        portfolioValueBasis: "source_reported_holdings_with_selected_candidate_revalued", scenarioScope: "candidate_position_only" },
+      positionState: "existing", currentQuantity: "0.5", proposedQuantity: "0",
+      currentMarketValue: amount("50"), proposedMarketValue: amount("0"), capitalChange: amount("-50"),
+      portfolioValue: amount("1000"),
+      instrumentTerms: { priceTick: "0.01", lotSize: "1", quoteCurrency: "USD", contractMultiplier: "1" },
+      costs: { fees: { state: "not_available" }, slippage: { state: "not_available" } },
+      concentration: { current: "0.05", proposed: "0", change: "-0.05" },
+      scenario: { shock: "-0.1", currentImpact: amount("-5"), proposedImpact: amount("0"), marginalImpact: amount("5") },
+      price: { amount: amount("100"), asOfUnixNanos: "1780000000000000002", freshUntilUnixNanos: "1780000001000000000",
+        state: "current", method: "Last trade", confidence: "limited" },
+      missingInformation: ["Portfolio-wide current prices"],
+      riskAssessment: { state: "incomplete", evaluatedAtUnixNanos: "1780000000000000003", checksCompleted: 1, checksUnavailable: 4 },
+      updatedAtUnixNanos: "1780000000000000003", analysisOnly: true,
+    })
+    const product = transport(blockedBootstrap, undefined, async (request, options) => {
+      if (request.query === "lookup") return result({ query: request.text, matches: [{
+        category: "investment", title: "Example Company", subtitle: "Stock · USD",
+        destination: { action: "open_investment", instrumentId, selectionToken: marketSelectionToken },
+      }], categories: [{ category: "investment", state: "available" }], truncated: false })
+      if (request.query !== "portfolioCandidateImpact") throw new Error("Unexpected planning read")
+      reads.push(request)
+      if (reads.length > 1) {
+        pendingSignal = options?.signal
+        return new Promise<ApplicationResult>((resolve) => { resolvePending = resolve })
+      }
+      return impact(request)
+    }).product
+    render(<QueryClientProvider client={createProductQueryClient()}>
       <PortfolioPlanning
-        positionChoices={[portfolioPositionChoice]}
-        account={{ accountToken: "portfolio_11111111111111111111111111111111", displayName: "Portfolio 1", currency: "USD", holdings: 2, dataIssues: 0 }}
-        bootstrap={{ productSessionToken: blockedBootstrap.productSessionToken, capabilities: [] }}
-        transport={transport().product}
-      />,
-    )
-
-    const choice = screen.getByLabelText("Position choice")
-    expect(choice).toBeInstanceOf(HTMLSelectElement)
-    if (!(choice instanceof HTMLSelectElement)) {
-      throw new Error("The position choice control is absent")
-    }
-    expect(choice.value).toBe("")
-    expect(screen.queryByText("Review adding three shares")).toBeNull()
-
-    await user.selectOptions(choice, portfolioPositionChoice.actionToken)
-
-    expect(screen.getByText("Review adding three shares")).toBeTruthy()
-    expect(screen.getByText("Next 30 days")).toBeTruthy()
-    expect(screen.getByText("Two to three shares")).toBeTruthy()
-    expect(
-      screen.getByText(
-        /Planning cannot place an order, and no choice is selected automatically\./,
-      ),
-    ).toBeTruthy()
+        account={{ accountToken, displayName: "Portfolio 1", currency: "USD", holdings: 2, dataIssues: 0 }}
+        bootstrap={{ productSessionToken: blockedBootstrap.productSessionToken, capabilities: ["portfolio_candidate_impact", "investment_lookup"] }}
+        transport={product}
+      />
+    </QueryClientProvider>)
+    const toggle = screen.getByText("Compare a position change")
+    await user.click(toggle)
+    expect(reads).toHaveLength(0)
+    expect((screen.getByLabelText("Target total quantity") as HTMLInputElement).value).toBe("")
+    expect((screen.getByLabelText("Price change (%)") as HTMLInputElement).value).toBe("")
+    await user.type(screen.getByLabelText("Find an investment for comparison"), "Example")
+    await user.click(await screen.findByRole("button", { name: "Choose Example Company" }))
+    await user.type(screen.getByLabelText("Target total quantity"), "0.00")
+    await user.type(screen.getByLabelText("Price change (%)"), "-10.0")
+    await user.click(screen.getByRole("button", { name: "Compare position" }))
+    const report = await screen.findByLabelText("Position comparison results")
+    expect(reads).toEqual([{ query: "portfolioCandidateImpact", accountToken, instrumentId,
+      proposedQuantity: "0.00", scenarioShockPercent: "-10.0" }])
+    expect(within(report).getAllByText(/50/).length).toBeGreaterThan(0)
+    fireEvent.change(screen.getByLabelText("Price change (%)"), { target: { value: "-20" } })
+    expect(screen.queryByLabelText("Position comparison results")).toBeNull()
+    await user.click(screen.getByRole("button", { name: "Compare position" }))
+    await waitFor(() => expect(reads).toHaveLength(2))
+    await user.click(toggle)
+    await waitFor(() => expect(pendingSignal?.aborted).toBe(true))
+    resolvePending?.(impact(reads[1]!))
+    await waitFor(() => expect(screen.queryByLabelText("Position comparison results")).toBeNull())
   })
 
   it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {

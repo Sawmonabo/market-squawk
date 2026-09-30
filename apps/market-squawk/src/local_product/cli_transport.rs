@@ -1450,6 +1450,11 @@ async fn portfolio(
             read_json_object(&request)?,
             "hypothetical allocation changes calculated",
         ),
+        PortfolioCommand::PositionImpact { request } => (
+            "Portfolio.EvaluateCandidateImpact",
+            read_json_object(&request)?,
+            "hypothetical position impact calculated",
+        ),
         PortfolioCommand::Performance { request } => (
             "Portfolio.GetPerformance",
             read_json_object(&request)?,

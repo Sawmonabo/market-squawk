@@ -914,6 +914,11 @@ pub enum PortfolioCommand {
         /// Confined JSON request containing accountToken, snapshotToken and explicit proposal.
         request: PathBuf,
     },
+    /// Compare a target position using the selected account and current price evidence.
+    PositionImpact {
+        /// Confined JSON request with accountToken, instrumentId, proposedQuantity and scenarioShockPercent.
+        request: PathBuf,
+    },
     /// Measure point-in-time portfolio performance.
     Performance {
         /// Confined JSON request file.

@@ -31,7 +31,7 @@ use super::import::hex;
 use super::model::PublishedRevision;
 use super::{PortfolioAccountCatalogSnapshot, PortfolioApplicationServiceError, Runtime};
 
-const CANDIDATE_IMPACT_POLICY: &str = "selected_market_candidate_impact_v3";
+const CANDIDATE_IMPACT_POLICY: &str = "selected_market_candidate_impact_v4";
 const CANDIDATE_IMPACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 const PORTFOLIO_VALUE_BASIS: &str = "source_reported_holdings_with_selected_candidate_revalued";
 const SCENARIO_SCOPE: &str = "candidate_position_only";
@@ -394,17 +394,26 @@ impl PortfolioCandidateCost {
     }
 }
 
-/// Exact setup identity resolved by the server; clients never provide an account or revision.
+/// Exact account identity resolved by the server from product selection or recommendation setup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioCandidateSetupBinding {
     account_id: AccountId,
     portfolio_revision: PortfolioRevisionToken,
     reporting_currency: market_squawk_domain::Currency,
-    setup_revision: u64,
-    setup_digest: [u8; 32],
-    configuration_digest: [u8; 32],
-    profile_digest: [u8; 32],
-    catalog_digest: EvidenceDigest,
+    account_token: Box<str>,
+    authority: PortfolioCandidateAccountAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PortfolioCandidateAccountAuthority {
+    ExplicitAccount,
+    Recommendation {
+        setup_revision: u64,
+        setup_digest: [u8; 32],
+        configuration_digest: [u8; 32],
+        profile_digest: [u8; 32],
+        catalog_digest: EvidenceDigest,
+    },
 }
 
 impl PortfolioCandidateSetupBinding {
@@ -431,12 +440,50 @@ impl PortfolioCandidateSetupBinding {
             account_id: head.account_id(),
             portfolio_revision: head.revision().clone(),
             reporting_currency: head.reporting_currency(),
-            setup_revision: setup.authority_revision(),
-            setup_digest: setup.authority_digest(),
-            configuration_digest: setup.configuration_digest(),
-            profile_digest: profile.digest(),
-            catalog_digest: setup.catalog_digest(),
+            account_token: super::product::account_binding(head.account_id(), 1)?
+                .token()
+                .into(),
+            authority: PortfolioCandidateAccountAuthority::Recommendation {
+                setup_revision: setup.authority_revision(),
+                setup_digest: setup.authority_digest(),
+                configuration_digest: setup.configuration_digest(),
+                profile_digest: profile.digest(),
+                catalog_digest: setup.catalog_digest(),
+            },
         })
+    }
+
+    pub(crate) fn is_explicit_account(&self) -> bool {
+        matches!(
+            &self.authority,
+            PortfolioCandidateAccountAuthority::ExplicitAccount
+        )
+    }
+
+    fn canonical_authority(&self, digest: &mut Sha256) {
+        digest.update(self.account_id.as_uuid().as_bytes());
+        digest.update(self.portfolio_revision.bytes());
+        canonical_text(digest, self.reporting_currency.as_str());
+        canonical_text(digest, &self.account_token);
+        match &self.authority {
+            PortfolioCandidateAccountAuthority::ExplicitAccount => {
+                canonical_text(digest, "explicit_current_account");
+            }
+            PortfolioCandidateAccountAuthority::Recommendation {
+                setup_revision,
+                setup_digest,
+                configuration_digest,
+                profile_digest,
+                catalog_digest,
+            } => {
+                canonical_text(digest, "recommendation_setup");
+                digest.update(setup_revision.to_be_bytes());
+                digest.update(setup_digest);
+                digest.update(configuration_digest);
+                digest.update(profile_digest);
+                canonical_evidence_identity(digest, *catalog_digest);
+            }
+        }
     }
 
     pub(crate) const fn account_id(&self) -> AccountId {
@@ -750,9 +797,10 @@ pub(crate) struct PortfolioCandidateMarketEvidence {
 /// Server-resolved setup, selected-market observation, and exact financial terms.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioCandidateResolution {
-    setup: ResolvedRecommendationSetup,
+    binding: PortfolioCandidateSetupBinding,
     catalog: PortfolioAccountCatalogSnapshot,
     market: PortfolioCandidateMarketEvidence,
+    evaluated_at: Timestamp,
 }
 
 /// Exact durable recommendation setup and complete current account catalog.
@@ -990,64 +1038,40 @@ impl PortfolioAnalysisMarketSet {
 }
 
 impl PortfolioCandidateResolution {
-    pub(crate) fn try_from_parts(
-        setup: PortfolioAnalysisSetupSnapshot,
-        market: PortfolioCandidateMarketEvidence,
-    ) -> Result<Self, PortfolioApplicationServiceError> {
-        let setup_binding = PortfolioCandidateSetupBinding::try_from_resolved_setup(&setup.setup)?;
-        if market.observation.instrument_id != market.selection.instrument_id
-            || market.portfolio_revision != setup_binding.portfolio_revision
-        {
-            return Err(PortfolioApplicationServiceError::InvalidRequest);
-        }
-        Ok(Self {
-            setup: setup.setup,
-            catalog: setup.catalog,
-            market,
-        })
-    }
-
-    /// Builds the only production candidate input from already-resolved typed authorities.
-    pub(crate) fn try_from_authorities(
-        setup: ResolvedRecommendationSetup,
+    pub(crate) fn try_from_explicit_account(
+        binding: PortfolioCandidateSetupBinding,
         catalog: PortfolioAccountCatalogSnapshot,
-        receipt: &MarketSelectionReceipt,
-        observation: MarketInvestmentObservation<'_, '_>,
-        execution_terms: InstrumentExecutionTerms,
-        fees: PortfolioCandidateAvailability<PortfolioCandidateCost>,
-        slippage: PortfolioCandidateAvailability<PortfolioCandidateCost>,
+        market: PortfolioCandidateMarketEvidence,
+        evaluated_at: Timestamp,
     ) -> Result<Self, PortfolioApplicationServiceError> {
-        let setup_binding = PortfolioCandidateSetupBinding::try_from_resolved_setup(&setup)?;
-        let current_head = catalog
-            .head(setup_binding.account_id())
-            .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
-        if setup.as_of().unix_nanos() <= 0
-            || setup.catalog_digest() != catalog.digest()
-            || setup.available_accounts() != catalog.account_count()
-            || setup.current_head() != current_head
-            || current_head.revision() != setup_binding.portfolio_revision()
-            || current_head.reporting_currency() != setup_binding.reporting_currency()
+        let head = catalog
+            .head(binding.account_id())
+            .ok_or(PortfolioApplicationServiceError::StateChanged)?;
+        if !binding.is_explicit_account()
+            || head.revision() != binding.portfolio_revision()
+            || head.reporting_currency() != binding.reporting_currency()
+            || market.portfolio_revision() != binding.portfolio_revision()
+            || head.effective_at() > evaluated_at
+            || head
+                .available_at()
+                .is_none_or(|available| available > evaluated_at)
         {
-            return Err(PortfolioApplicationServiceError::InvalidRequest);
+            return Err(PortfolioApplicationServiceError::StateChanged);
         }
-        let market = PortfolioCandidateMarketEvidence::try_from_market_selection(
-            receipt,
-            observation,
-            execution_terms,
-            fees,
-            slippage,
-            setup_binding.portfolio_revision.clone(),
-        )?;
         Ok(Self {
-            setup,
+            binding,
             catalog,
             market,
+            evaluated_at,
         })
     }
 
-    /// Returns the complete durable setup joined at the exact evaluation instant.
-    pub(crate) const fn setup(&self) -> &ResolvedRecommendationSetup {
-        &self.setup
+    pub(crate) const fn binding(&self) -> &PortfolioCandidateSetupBinding {
+        &self.binding
+    }
+
+    pub(crate) const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
     }
 
     /// Returns every ordered account head used to resolve the selected setup.
@@ -1062,13 +1086,14 @@ impl PortfolioCandidateResolution {
 
 /// Injected least-authority seam that resolves and rechecks server-owned candidate evidence.
 ///
-/// Implementations join the durable selected-account setup, complete current account catalog,
-/// unified market selection, exact [`MarketInvestmentObservation`], and instrument terms. They
-/// must not inspect a paper account or create execution state.
+/// Candidate previews join explicit account selection to current market evidence. Investment
+/// prerequisites retain their independent recommendation setup resolution. Neither path creates
+/// execution state.
 #[async_trait]
 pub(crate) trait PortfolioCandidateResolutionAuthority: Send + Sync {
     async fn resolve(
         &self,
+        binding: &PortfolioCandidateSetupBinding,
         instrument_id: InstrumentId,
         as_of: Timestamp,
         deadline: Instant,
@@ -1217,6 +1242,8 @@ pub(crate) struct PortfolioCandidateImpactRequest {
     instrument_id: InstrumentId,
     proposed_quantity: Decimal,
     scenario_shock: Decimal,
+    submitted_quantity: String,
+    submitted_shock_percent: String,
     evaluated_at: Timestamp,
     market_evidence: PortfolioCandidateMarketEvidence,
 }
@@ -1254,6 +1281,12 @@ impl PortfolioCandidateImpactRequest {
             instrument_id,
             proposed_quantity: proposed_quantity.normalize(),
             scenario_shock: scenario_shock.normalize(),
+            submitted_quantity: proposed_quantity.normalize().to_string(),
+            submitted_shock_percent: scenario_shock
+                .checked_mul(Decimal::from(100_u32))
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
+                .normalize()
+                .to_string(),
             evaluated_at,
             market_evidence,
         })
@@ -1266,7 +1299,10 @@ impl PortfolioCandidateImpactRequest {
         scenario_shock: Decimal,
         evaluated_at: Timestamp,
     ) -> Result<Self, PortfolioApplicationServiceError> {
-        let setup = PortfolioCandidateSetupBinding::try_from_resolved_setup(&resolution.setup)?;
+        if resolution.evaluated_at != evaluated_at {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let setup = resolution.binding;
         let instrument_id = resolution.market.observation.instrument_id;
         Self::try_new(
             setup,
@@ -1436,10 +1472,7 @@ impl ImportedPortfolioRiskAdvisory {
         };
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/imported-portfolio-risk-advisory/v1\0");
-        digest.update(request.setup.setup_digest);
-        digest.update(request.setup.configuration_digest);
-        digest.update(request.setup.profile_digest);
-        digest.update(request.setup.catalog_digest.bytes());
+        request.setup.canonical_authority(&mut digest);
         digest.update(
             request
                 .market_evidence
@@ -1477,6 +1510,9 @@ pub(crate) struct PortfolioCandidateImpactPreview {
     setup: PortfolioCandidateSetupBinding,
     account_id: AccountId,
     revision: PortfolioRevisionToken,
+    snapshot_token: String,
+    submitted_quantity: String,
+    submitted_shock_percent: String,
     portfolio_effective_at: Timestamp,
     portfolio_available_at: Timestamp,
     portfolio_source_id: SourceId,
@@ -1653,6 +1689,19 @@ impl PortfolioCandidateImpactPreview {
         });
         json!({
             "accountId": self.account_id.to_string(),
+            "accountToken": self.setup.account_token,
+            "snapshotToken": self.snapshot_token,
+            "portfolioEffectiveAtUnixNanos": self.portfolio_effective_at.unix_nanos().to_string(),
+            "portfolioAvailableAtUnixNanos": self.portfolio_available_at.unix_nanos().to_string(),
+            "evidenceDigest": hex(&self.evidence_digest.bytes()),
+            "assumptions": {
+                "proposedQuantity": self.submitted_quantity,
+                "scenarioShockPercent": self.submitted_shock_percent,
+                "quantityMeaning": "target_total",
+                "fundingAssumption": "cash_transfer_before_costs",
+                "portfolioValueBasis": PORTFOLIO_VALUE_BASIS,
+                "scenarioScope": SCENARIO_SCOPE,
+            },
             "instrumentId": self.instrument_id.to_string(),
             "positionState": match self.position_state {
                 PortfolioCandidatePositionState::ZeroPosition => "new",
@@ -1671,6 +1720,7 @@ impl PortfolioCandidateImpactPreview {
             "price": {
                 "amount": money_value(observation.unit_mark),
                 "asOfUnixNanos": observation.observed_at.unix_nanos().to_string(),
+                "freshUntilUnixNanos": observation.fresh_until.unix_nanos().to_string(),
                 "state": "current",
                 "method": match observation.mark_kind {
                     PortfolioCandidateMarkKind::LastTrade => "Last trade",
@@ -1707,11 +1757,12 @@ impl PortfolioCandidateImpactPreview {
         }
         canonical_text(&mut digest, AUTHORITY_BINDING);
         digest.update(self.account_id.as_uuid().as_bytes());
-        digest.update(self.setup.setup_revision.to_be_bytes());
-        digest.update(self.setup.setup_digest);
-        digest.update(self.setup.configuration_digest);
-        digest.update(self.setup.profile_digest);
-        canonical_evidence_identity(&mut digest, self.setup.catalog_digest);
+        self.setup.canonical_authority(&mut digest);
+        canonical_text(&mut digest, &self.snapshot_token);
+        canonical_text(&mut digest, &self.submitted_quantity);
+        canonical_text(&mut digest, &self.submitted_shock_percent);
+        canonical_text(&mut digest, "target_total");
+        canonical_text(&mut digest, "cash_transfer_before_costs");
         digest.update(self.revision.bytes());
         digest.update(self.portfolio_effective_at.unix_nanos().to_be_bytes());
         digest.update(self.portfolio_available_at.unix_nanos().to_be_bytes());
@@ -1784,6 +1835,43 @@ pub(crate) struct PortfolioCandidateImpactReadCapability {
 }
 
 impl PortfolioCandidateImpactReadCapability {
+    fn select_current_account(
+        &self,
+        account_token: &str,
+        evaluated_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PortfolioCandidateSetupBinding, PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_read_live(&self.runtime, deadline, cancellation)?;
+        let image = self.runtime.image.load_full();
+        let binding = explicit_account_binding(&image, account_token, evaluated_at)?;
+        ensure_read_live(&self.runtime, deadline, cancellation)?;
+        if !Arc::ptr_eq(&image, &self.runtime.image.load_full()) {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        Ok(binding)
+    }
+
+    fn recheck_current_account(
+        &self,
+        expected: &PortfolioCandidateSetupBinding,
+        evaluated_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let current = self.select_current_account(
+            &expected.account_token,
+            evaluated_at,
+            deadline,
+            cancellation,
+        )?;
+        if &current != expected {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        Ok(())
+    }
+
     /// Evaluates one candidate against the exact current immutable portfolio revision.
     ///
     /// The method fails closed if the portfolio revision changed, the mark is stale or mismatched,
@@ -1810,7 +1898,9 @@ impl PortfolioCandidateImpactReadCapability {
         {
             return Err(PortfolioApplicationServiceError::CorruptPublication);
         }
-        let state = CandidatePortfolioState::from_revision(revision, request)?;
+        let state = CandidatePortfolioState::from_revision(revision, request, || {
+            ensure_read_live(&self.runtime, deadline, cancellation)
+        })?;
         let preview = calculate_preview(state, request)?;
         ensure_read_live(&self.runtime, deadline, cancellation)?;
         let final_image = self.runtime.image.load_full();
@@ -1859,36 +1949,53 @@ pub(super) async fn call_resolved_candidate_impact(
         .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
         .parse::<InstrumentId>()
         .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
-    let proposed_quantity = request
+    let account_token = request
+        .arguments()
+        .get("accountToken")
+        .and_then(Value::as_str)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    let quantity_text = request
         .arguments()
         .get("proposedQuantity")
         .and_then(Value::as_str)
-        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
-        .parse::<Decimal>()
-        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
-    let scenario_shock = request
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    let shock_text = request
         .arguments()
-        .get("scenarioShock")
+        .get("scenarioShockPercent")
         .and_then(Value::as_str)
-        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
-        .parse::<Decimal>()
-        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    let proposed_quantity = super::advanced::parse_decimal(quantity_text)?;
+    let scenario_shock = super::advanced::parse_percentage(shock_text)?.value();
     let evaluated_at = current_timestamp()?;
+    let binding = reader.select_current_account(
+        account_token,
+        evaluated_at,
+        context.deadline(),
+        context.cancellation(),
+    )?;
     let resolution = authority
         .resolve(
+            &binding,
             instrument_id,
             evaluated_at,
             context.deadline(),
             context.cancellation().clone(),
         )
         .await?;
+    if resolution.binding() != &binding
+        || resolution.market().observation().instrument_id() != instrument_id
+    {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
     let expected = resolution.clone();
-    let request = PortfolioCandidateImpactRequest::try_from_resolution(
+    let mut request = PortfolioCandidateImpactRequest::try_from_resolution(
         resolution,
         proposed_quantity,
         scenario_shock,
         evaluated_at,
     )?;
+    request.submitted_quantity = quantity_text.to_owned();
+    request.submitted_shock_percent = shock_text.to_owned();
     let preview = reader.preview_current(&request, context.deadline(), context.cancellation())?;
     authority
         .recheck(
@@ -1898,6 +2005,12 @@ pub(super) async fn call_resolved_candidate_impact(
             context.cancellation().clone(),
         )
         .await?;
+    reader.recheck_current_account(
+        &binding,
+        evaluated_at,
+        context.deadline(),
+        context.cancellation(),
+    )?;
     ensure_read_live(&reader.runtime, context.deadline(), context.cancellation())?;
     let metadata = ToolResultMetadata::try_complete(
         json!({"scope": "portfolio_candidate"}),
@@ -1908,10 +2021,45 @@ pub(super) async fn call_resolved_candidate_impact(
         .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)
 }
 
+fn explicit_account_binding(
+    image: &super::model::PortfolioReadImage,
+    account_token: &str,
+    evaluated_at: Timestamp,
+) -> Result<PortfolioCandidateSetupBinding, PortfolioApplicationServiceError> {
+    let catalog = super::product::account_catalog(image)?;
+    let account_id = super::product::resolve_account_token(&catalog, account_token)?;
+    let revision = image
+        .accounts
+        .get(&account_id)
+        .and_then(|history| history.revisions.last())
+        .ok_or(PortfolioApplicationServiceError::NotFound)?;
+    if image
+        .revisions
+        .head(account_id)
+        .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?
+        != revision.token()
+        || revision.account.account_id() != account_id
+        || revision.effective_at > evaluated_at
+        || revision
+            .available_at
+            .is_none_or(|available| available > evaluated_at)
+    {
+        return Err(PortfolioApplicationServiceError::StateChanged);
+    }
+    Ok(PortfolioCandidateSetupBinding {
+        account_id,
+        portfolio_revision: revision.token(),
+        reporting_currency: revision.account.currency(),
+        account_token: account_token.into(),
+        authority: PortfolioCandidateAccountAuthority::ExplicitAccount,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CandidatePortfolioState {
     account_id: AccountId,
     revision: PortfolioRevisionToken,
+    snapshot_token: String,
     effective_at: Timestamp,
     available_at: Timestamp,
     source_id: SourceId,
@@ -1928,7 +2076,9 @@ impl CandidatePortfolioState {
     fn from_revision(
         revision: &PublishedRevision,
         request: &PortfolioCandidateImpactRequest,
+        mut check_live: impl FnMut() -> Result<(), PortfolioApplicationServiceError>,
     ) -> Result<Self, PortfolioApplicationServiceError> {
+        check_live()?;
         let evidence = &request.market_evidence;
         let currency = revision.account.currency();
         let available_at = revision
@@ -1957,6 +2107,7 @@ impl CandidatePortfolioState {
             return Err(PortfolioApplicationServiceError::CorruptPublication);
         }
         for holding in &revision.holdings {
+            check_live()?;
             if holding.currency() != currency || holding.market_value().currency() != currency {
                 return Err(PortfolioApplicationServiceError::Analytics);
             }
@@ -1967,12 +2118,8 @@ impl CandidatePortfolioState {
                 seen_candidate = true;
                 position_state = PortfolioCandidatePositionState::ExistingHolding;
                 current_quantity = holding.quantity().as_decimal();
-                if holding.lot_size() != evidence.execution_terms.lot_size()
-                    || !is_lot_aligned(
-                        current_quantity,
-                        evidence.execution_terms.lot_size().as_decimal(),
-                    )
-                {
+                // Imported units do not acquire current execution-lot restrictions.
+                if !is_lot_aligned(current_quantity, holding.lot_size().as_decimal()) {
                     return Err(PortfolioApplicationServiceError::Analytics);
                 }
                 current_market_value = marked_value(
@@ -1994,6 +2141,7 @@ impl CandidatePortfolioState {
         Ok(Self {
             account_id: request.account_id(),
             revision: revision.token(),
+            snapshot_token: super::read::snapshot_token(revision),
             effective_at: revision.effective_at,
             available_at,
             source_id: revision.source_id.clone(),
@@ -2061,6 +2209,9 @@ fn calculate_preview(
         setup: request.setup.clone(),
         account_id: request.account_id(),
         revision: state.revision,
+        snapshot_token: state.snapshot_token,
+        submitted_quantity: request.submitted_quantity.clone(),
+        submitted_shock_percent: request.submitted_shock_percent.clone(),
         portfolio_effective_at: state.effective_at,
         portfolio_available_at: state.available_at,
         portfolio_source_id: state.source_id,
@@ -2529,6 +2680,7 @@ mod tests {
         let state = CandidatePortfolioState {
             account_id,
             revision: revision.clone(),
+            snapshot_token: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee".to_owned(),
             effective_at: Timestamp::from_unix_nanos(90),
             available_at: Timestamp::from_unix_nanos(95),
             source_id: portfolio_source.clone(),
@@ -2563,7 +2715,7 @@ mod tests {
         assert_eq!(content["riskAssessment"]["state"], "incomplete");
         assert_eq!(content["instrumentTerms"]["lotSize"], "1");
         let encoded = serde_json::to_string(&content).expect("serialize product result");
-        for forbidden in ["sourceId", "artifactSha256", "revisionId", "evidenceDigest"] {
+        for forbidden in ["sourceId", "artifactSha256", "revisionId"] {
             assert!(!encoded.contains(forbidden));
         }
         let repeated =
@@ -2636,6 +2788,148 @@ mod tests {
             Err(PortfolioApplicationServiceError::InvalidRequest)
         ));
 
+        // Product selection follows the chosen account even when it is not first/default.
+        let other_account = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            .parse::<AccountId>()
+            .unwrap();
+        let published_a = published(account_id, instrument_id, currency);
+        let published_b = published(other_account, instrument_id, currency);
+        let image = crate::portfolio_application::model::PortfolioReadImage::try_from_accounts(
+            std::collections::BTreeMap::from([
+                (
+                    account_id,
+                    crate::portfolio_application::model::AccountHistory {
+                        revisions: vec![published_a],
+                    },
+                ),
+                (
+                    other_account,
+                    crate::portfolio_application::model::AccountHistory {
+                        revisions: vec![published_b.clone()],
+                    },
+                ),
+            ]),
+            crate::PortfolioApplicationLimits::standard(),
+        )
+        .unwrap();
+        let token_b =
+            crate::portfolio_application::product::account_binding(other_account, 2).unwrap();
+        let binding = super::explicit_account_binding(
+            &image,
+            token_b.token(),
+            Timestamp::from_unix_nanos(115),
+        )
+        .unwrap();
+        assert_eq!(binding.account_id(), other_account);
+        assert!(binding.is_explicit_account());
+        assert!(
+            super::explicit_account_binding(
+                &image,
+                "portfolio_unrecognized",
+                Timestamp::from_unix_nanos(115),
+            )
+            .is_err()
+        );
+        let mut exit_request = PortfolioCandidateImpactRequest::try_new(
+            binding,
+            instrument_id,
+            crate::portfolio_application::advanced::parse_decimal("0.00").unwrap(),
+            crate::portfolio_application::advanced::parse_percentage("-20.000")
+                .unwrap()
+                .value(),
+            Timestamp::from_unix_nanos(115),
+            evidence(
+                instrument_id,
+                source_id.clone(),
+                instrument_id,
+                source_id.clone(),
+                currency,
+                published_b.token(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        exit_request.submitted_quantity = "0.00".to_owned();
+        exit_request.submitted_shock_percent = "-20.000".to_owned();
+        let fractional_state =
+            CandidatePortfolioState::from_revision(&published_b, &exit_request, || Ok(()))
+                .expect("source fractional holding remains valid with whole-share execution lots");
+        let exit_preview = calculate_preview(fractional_state.clone(), &exit_request).unwrap();
+        assert_eq!(exit_preview.current_quantity(), Decimal::new(15, 1));
+        assert_eq!(
+            exit_preview.current_market_value().amount(),
+            Decimal::new(375, 1)
+        );
+        assert_eq!(exit_preview.proposed_quantity(), Decimal::ZERO);
+        assert_eq!(
+            exit_preview.capital_change().amount(),
+            Decimal::new(-375, 1)
+        );
+        assert_eq!(
+            exit_preview.marginal_scenario_impact().amount(),
+            Decimal::new(75, 1)
+        );
+        let exit_content = exit_preview.structured_content();
+        assert_eq!(exit_content["accountToken"], token_b.token());
+        assert_eq!(exit_content["assumptions"]["proposedQuantity"], "0.00");
+        assert_eq!(
+            exit_content["assumptions"]["scenarioShockPercent"],
+            "-20.000"
+        );
+        assert_eq!(exit_content["price"]["freshUntilUnixNanos"], "120");
+        assert_eq!(exit_content["portfolioEffectiveAtUnixNanos"], "90");
+        assert_eq!(exit_content["portfolioAvailableAtUnixNanos"], "95");
+        let descriptor = crate::application::application_capabilities().unwrap();
+        use market_squawk_services::{
+            JsonStructureLimits, ServiceLimits, ToolResultMetadata, TypedToolResult,
+        };
+        let limits = ServiceLimits::try_new(
+            65536,
+            16,
+            65536,
+            16,
+            JsonStructureLimits::try_new(32, 65536, 10000, 2000).unwrap(),
+        )
+        .unwrap();
+        TypedToolResult::try_new(
+            exit_content,
+            1,
+            ToolResultMetadata::try_complete(
+                serde_json::json!({"scope": "portfolio_candidate"}),
+                serde_json::json!({"state": "available", "confidence": "limited"}),
+            )
+            .unwrap(),
+            limits,
+        )
+        .unwrap()
+        .validate_for(
+            descriptor
+                .find("Portfolio.EvaluateCandidateImpact")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            CandidatePortfolioState::from_revision(&published_b, &exit_request, || Err(
+                PortfolioApplicationServiceError::Cancelled
+            ),),
+            Err(PortfolioApplicationServiceError::Cancelled)
+        ));
+        let mut wrong_account_request = exit_request.clone();
+        wrong_account_request.setup.account_id = account_id;
+        assert!(calculate_preview(fractional_state, &wrong_account_request).is_err());
+        let precise = "-0.00000000000000000000000001";
+        let parsed = crate::portfolio_application::advanced::parse_percentage(precise).unwrap();
+        assert_eq!(
+            parsed.value().checked_mul(Decimal::from(100_u32)),
+            Some(Decimal::from_str_exact(precise).unwrap())
+        );
+        assert!(
+            crate::portfolio_application::advanced::parse_percentage(
+                "0.0000000000000000000000000001"
+            )
+            .is_err()
+        );
+
         let wrong_revision_request = request(
             account_id,
             instrument_id,
@@ -2656,6 +2950,104 @@ mod tests {
             calculate_preview(state, &wrong_revision_request),
             Err(PortfolioApplicationServiceError::InvalidRequest)
         ));
+    }
+
+    fn published(
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        currency: Currency,
+    ) -> super::PublishedRevision {
+        use crate::portfolio_application::model::{
+            AccountObservation, BasisResolution, HoldingObservation, SignedQuantity,
+        };
+        use market_squawk_data::{
+            DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest,
+        };
+        use market_squawk_domain::SourceIdentifier;
+        use market_squawk_portfolio::{
+            PortfolioLedger, PortfolioLimitInput, PortfolioLimits, RevisionEvidence, ValuationSet,
+        };
+        let limits = PortfolioLimits::try_new(PortfolioLimitInput {
+            max_accounts: 2,
+            max_instruments: 2,
+            max_lots: 2,
+            max_transactions: 2,
+            max_factors: 2,
+            max_scenarios: 2,
+            max_history: 2,
+            max_results: 16,
+            max_retained_bytes: 1_048_576,
+        })
+        .unwrap();
+        let at = Timestamp::from_unix_nanos(90);
+        let dataset = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from("candidate-preview-test").unwrap(),
+            1,
+            DatasetSchemaRegistry::local()
+                .canonical_research_observations()
+                .unwrap(),
+            Sha256Digest::new([5; 32]),
+        )
+        .unwrap();
+        let source = SourceIdentifier::try_from("candidate-portfolio").unwrap();
+        let mut ledger = PortfolioLedger::try_new(account_id, currency, limits).unwrap();
+        let core = ledger
+            .try_apply(
+                Vec::new(),
+                None,
+                ValuationSet::try_new(
+                    currency,
+                    at,
+                    dataset.clone(),
+                    Sha256Digest::new([5; 32]),
+                    Vec::new(),
+                    Vec::new(),
+                    limits,
+                )
+                .unwrap(),
+                RevisionEvidence::try_new(
+                    at,
+                    dataset,
+                    Sha256Digest::new([5; 32]),
+                    Sha256Digest::new([6; 32]),
+                    vec![source.clone()],
+                    Vec::new(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let source_id = SourceId::try_from("candidate-portfolio").unwrap();
+        super::PublishedRevision {
+            core,
+            account: AccountObservation {
+                account_id,
+                currency,
+                cash_balance: Money::new(Decimal::from(1000), currency),
+                settlement_available_cash: None,
+                as_of: at,
+                source_reference: source.clone(),
+            },
+            holdings: vec![HoldingObservation {
+                account_id,
+                instrument_id,
+                currency,
+                quantity: SignedQuantity(Decimal::new(15, 1)),
+                lot_size: LotSize::try_from_decimal(Decimal::new(1, 1)).unwrap(),
+                market_value: Money::new(Decimal::from(30), currency),
+                as_of: at,
+                basis: BasisResolution::Missing,
+                source_reference: source,
+            }],
+            transactions: Vec::new(),
+            discrepancies: Vec::new(),
+            source_id: source_id.clone(),
+            source_coverage: vec![source_id],
+            effective_at: at,
+            available_at: Some(Timestamp::from_unix_nanos(95)),
+            artifact_sha256: [6; 32],
+            native_paper: None,
+        }
     }
 
     fn evidence(
@@ -2708,11 +3100,18 @@ mod tests {
                 account_id,
                 portfolio_revision: revision,
                 reporting_currency: currency,
-                setup_revision: 1,
-                setup_digest: [11; 32],
-                configuration_digest: [12; 32],
-                profile_digest: [13; 32],
-                catalog_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [14; 32]),
+                account_token: crate::portfolio_application::product::account_binding(
+                    account_id, 1,
+                )?
+                .token()
+                .into(),
+                authority: super::PortfolioCandidateAccountAuthority::Recommendation {
+                    setup_revision: 1,
+                    setup_digest: [11; 32],
+                    configuration_digest: [12; 32],
+                    profile_digest: [13; 32],
+                    catalog_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [14; 32]),
+                },
             },
             instrument_id,
             Decimal::from(10),

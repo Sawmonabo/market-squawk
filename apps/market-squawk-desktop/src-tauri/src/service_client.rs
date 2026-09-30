@@ -312,14 +312,19 @@ pub(crate) async fn dashboard_query(
             ("Portfolio.ProposeRebalance", arguments)
         }
         DashboardQueryCommand::PortfolioCandidateImpact {
+            account_token,
             instrument_id,
             proposed_quantity,
-            scenario_shock,
+            scenario_shock_percent,
         } => {
             let mut arguments = Map::new();
+            arguments.insert("accountToken".to_owned(), json!(account_token));
             arguments.insert("instrumentId".to_owned(), json!(instrument_id));
             arguments.insert("proposedQuantity".to_owned(), json!(proposed_quantity));
-            arguments.insert("scenarioShock".to_owned(), json!(scenario_shock));
+            arguments.insert(
+                "scenarioShockPercent".to_owned(),
+                json!(scenario_shock_percent),
+            );
             ("Portfolio.EvaluateCandidateImpact", arguments)
         }
         DashboardQueryCommand::Forecasts { cursor, limit } => (

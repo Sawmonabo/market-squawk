@@ -1,5 +1,89 @@
 # Market Squawk Delivery Ledger
 
+## Position-impact integration — 2026-09-30
+
+Audit base: pushed `d151c37f777fb0acd6369c3a5264c303be7e05a5`, then a clean primary worktree.
+Acceptance 4/5/6 defect: Portfolio supplied `positionChoices={null}`, and the existing candidate
+operation used recommendation setup rather than the displayed account. The integrated change
+replaces that placeholder with explicit investment selection, total quantity and percentage inputs,
+using the selected current account and the existing shared financial calculation.
+
+| Owner | Scope | Finish evidence |
+| --- | --- | --- |
+| Astra High | Read-only `portfolio_application/candidate.rs`, `recommendation.rs`, `service/portfolio_analysis.rs` and direct contracts/tests | Exact smallest change to reuse candidate calculation with explicit product selection, financial assumptions and evidence; identify existing critical check. No edits/builds/Git. |
+| GPT-6.1 Sol High | Read-only Portfolio planning, investment selection, product transport and candidate projection consumers | Reusable selection/rendering path, precise missing bindings and proposed disjoint Desktop files. No edits/builds/Git. |
+| Lead | Shared contracts/authority, ledger and integration | Freeze coherent producer/consumer contract after traces, then assign bounded implementation; serialize checks and commit/push. |
+
+DAG: independent authority/UI traces → frozen contract and file ownership → parallel implementation
+→ integrated critical verification → pushed checkpoint. Saved planning persistence/reopening remains
+required after calculation contracts; first live stock journey remains independently required.
+
+Contract frozen after traces: `Portfolio.EvaluateCandidateImpact` takes explicit `accountToken`,
+canonical `instrumentId`, exact-string `proposedQuantity` (total desired quantity, zero means exit),
+and `scenarioShockPercent`. Backend converts percent; no defaults or client arithmetic. This is
+a fresh-evidence calculation, not a historical stress snapshot. Resolve the chosen current account
+without changing recommendation settings, retain current market freshness/rechecks and reuse the
+existing financial calculation. Source-admitted fractional holdings must not be rejected merely
+because the current execution lot size differs; proposed quantities retain their explicit policy.
+
+Existing output remains, adding `accountToken`, UUID `snapshotToken`,
+`portfolioEffectiveAtUnixNanos`, `portfolioAvailableAtUnixNanos`, SHA-256 `evidenceDigest`,
+`assumptions:{proposedQuantity,scenarioShockPercent,quantityMeaning:"target_total",
+fundingAssumption:"cash_transfer_before_costs",
+portfolioValueBasis:"source_reported_holdings_with_selected_candidate_revalued",
+scenarioScope:"candidate_position_only"}` and `price.freshUntilUnixNanos`. Projection must describe cash-funded capital transfer and omitted
+costs/settlement authority honestly. Financial authority retains original evidence for subsequent saving.
+
+Implementation ownership supersedes read-only entries above: Astra owns `portfolio_application/candidate.rs`
+and `application/paper/market/candidate.rs`, with existing local critical cases; lead owns shared
+exports/factory/composition and contracts. Sol owns Portfolio `portfolio-planning.tsx`, new
+`portfolio-position-impact.tsx`, `portfolio-contracts.ts`, `use-portfolio.ts`, `portfolio-page.tsx`.
+Lead owns all shared TS/native transport, CLI, existing app/service harnesses, verification and Git.
+No overlapping edits or independent builds. Inline investment lookup reuses the admitted canonical
+investment result, supports new and held investments, and shares calculation cancellation lifecycle.
+
+Implementation handoffs are integrated and ownership released. Lead inspected the affected
+financial authority, Desktop consumers, native/CLI contracts and shared metadata. Superseded
+prepared-choice UI and unused recommendation-bound candidate constructors were removed. The
+independent investment-analysis setup authority remains intact. MCP uses the same updated
+application contract; no second calculator or financial frontend arithmetic was introduced.
+
+Critical verification:
+- Existing candidate case passes (1 test): explicit non-default account, original decimal inputs,
+  fractional existing holding with a different execution lot, zero-quantity exit, financial values,
+  cancellation/mismatched evidence and actual output-contract validation. Initial fixture metadata
+  was corrected to match production source evidence; the operation schema was not weakened.
+- Existing selected-portfolio/planning UI checks pass (2 tests): real canonical lookup selection,
+  exact account/assumption request, returned financial values, edit invalidation, close cancellation
+  and discarded late replies. No new component harness was added.
+- Desktop TypeScript and the native Desktop library check passed. Existing unrelated warnings
+  remain; `git diff --check` passed. All Rust checks used one job and disabled incremental state.
+Logs: `.agents/tmp/v1-first-stock/portfolio-position-{math,ui,typecheck,native}.log`.
+
+This is an implemented, critically checked calculation slice; saving/reopening planning results,
+current-build live position calculation and full installed acceptance remain required. Next product
+dependency is common saved planning evidence/reopening. Native setup and first-stock input admission
+continue independently. No full CI/release gate or whole-app RAM measurement ran.
+
+Native setup with owner present: the supplied local unlock was accepted through the existing
+CLI bootstrap and provider-store unlock operations. A separately started existing service now
+reports ready against the preserved `.market-squawk/v1-owner-test` root. The protected one-time
+credential import completed for 17 provider entries: eight credentials stored but unverified,
+nine awaiting probes. Receipt: `.agents/tmp/v1-first-stock/native-provider-import.json` (redacted
+operation output only). No credential values were written to documentation or shell arguments.
+Alpaca's live verification then returned 31 IEX daily bars across 31 dates, and admitted latest
+quote, UTC calendar and WebSocket checks; snapshot-batch coverage was degraded. Lifecycle
+availability remains indeterminate. Receipt: `.agents/tmp/v1-first-stock/native-alpaca-verify.json`.
+This proves the named live probes, not durable analytical inputs or installed workflow completion.
+
+The prior Desktop cached its initial bootstrap state after an external CLI unlock. Restarting that
+Desktop also ended its child service in this execution environment. Lead therefore started the
+existing service separately, unlocked both stores, imported the bundle and reopened Desktop to
+connect to that ready service. No new build or data reset was used. Native activation returned
+success, but an on-screen product window has not yet been independently confirmed. Astra's
+read-only startup diagnosis is complete; ownership is released. Native reconnect behavior after
+external unlock remains a concrete lifecycle gap to reconcile with the current source.
+
 ## Model-routing correction — 2026-09-29
 
 Before resuming, the owner replaced every future GPT-6 Sol assignment with **GPT-6.1 Sol High**
