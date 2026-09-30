@@ -77,11 +77,14 @@
         let mut harness = HealthHarness::new("trusted-time-health-epoch")?;
         harness.accept_health(10, 20, 30, 1_000)?;
         harness.set_time(40, 40)?;
-        harness
-            .session
-            .lease
-            .health_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        harness.session.lease.health.rcu(|health| {
+            let mut updated = (**health).clone();
+            updated.epoch = u64::MAX;
+            if let Some(current) = &mut updated.current {
+                current.epoch = u64::MAX;
+            }
+            updated
+        });
         let source_id = harness.session.source_id().clone();
         let health = harness
             .registry
@@ -159,11 +162,14 @@
     fn terminal_health_epoch_requires_new_source_epoch_and_generation_to_recover() -> TestResult {
         let mut harness = HealthHarness::new("terminal-health-recovery")?;
         harness.accept_health(10, 20, 30, 1_000)?;
-        harness
-            .session
-            .lease
-            .health_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        harness.session.lease.health.rcu(|health| {
+            let mut updated = (**health).clone();
+            updated.epoch = u64::MAX;
+            if let Some(current) = &mut updated.current {
+                current.epoch = u64::MAX;
+            }
+            updated
+        });
         let source_id = harness.session.source_id().clone();
         harness
             .registry
@@ -199,6 +205,12 @@
             harness.timestamp(50)?,
         )?;
         assert!(replacement.epoch > harness.registered.epoch);
+        harness.registry.record_provider_identities(
+            &replacement,
+            &harness.identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let successor = harness.registry.begin_session(
             &replacement,
             SessionId::new(SourceIdentifier::try_from("session-2")?),
@@ -234,11 +246,14 @@
         harness.accept_health(10, 20, 30, 1_000)?;
         harness.registered.epoch = u64::MAX;
         harness.session.epoch = u64::MAX;
-        harness
-            .session
-            .lease
-            .health_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        harness.session.lease.health.rcu(|health| {
+            let mut updated = (**health).clone();
+            updated.epoch = u64::MAX;
+            if let Some(current) = &mut updated.current {
+                current.epoch = u64::MAX;
+            }
+            updated
+        });
         let source_id = harness.session.source_id().clone();
         let entry = harness
             .registry

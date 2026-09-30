@@ -7,6 +7,7 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::Duration;
 
+    use arc_swap::ArcSwap;
     use bytes::Bytes;
     use market_squawk_domain::{
         AggressorSide, ConnectionGeneration, DataQuality, InstrumentId, IntegrityRule,
@@ -16,8 +17,8 @@ mod tests {
 
     use super::{
         AuthoritativeSourceRegistry, BoundedVec, MAX_AUTHORITY_SOURCES, PersistedSourceAuthority,
-        RawFrameFactory, RegistryAuthorityState, RegistryError, SessionLeaseState,
-        SourceAuthorityHistory, UnconfiguredAuthorizationSubjectResolver,
+        RawFrameFactory, RegistryAuthorityState, RegistryError, SessionHealthQualification,
+        SessionLeaseState, SourceAuthorityHistory, UnconfiguredAuthorizationSubjectResolver,
         validate_observation_profile,
     };
     use crate::authority_time::{
@@ -29,7 +30,8 @@ mod tests {
     use crate::registry::test_support::{
         TestResult, direct_metadata, direct_metadata_with_provider_and_limit,
         direct_metadata_with_quality, direct_metadata_with_revision_evidence, exact_evidence,
-        extraction_metadata, freshness_policy, healthy_snapshot, source_identifier,
+        extraction_metadata, fixture_identity_authority, freshness_policy, healthy_snapshot,
+        source_identifier,
     };
     use crate::{
         BudgetDecision, BudgetUnavailableReason, ChecksumValidationProfile, CurrentHealthReporter,
@@ -210,6 +212,7 @@ mod tests {
         registered: super::RegisteredSource,
         session: CurrentSourceSession,
         reporter: CurrentHealthReporter,
+        identity_requests: Vec<crate::ProviderNativeIdentityRequest>,
         clock: Arc<ManualRegistryClock>,
         wall_origin: Timestamp,
         monotonic_origin: RegistryMonotonicInstant,
@@ -227,14 +230,24 @@ mod tests {
                 wall_origin,
                 monotonic_origin,
             )));
+            let metadata = direct_metadata_with_quality(source, "revision-1", quality_ceiling)?;
+            let [instrument] = metadata.coverage().instruments().instruments() else {
+                return Err("health fixture requires one covered instrument".into());
+            };
+            let (identity_authority, identity_requests) =
+                fixture_identity_authority(&[(*instrument, "BTC-USD")], wall_origin)?;
             let mut registry =
                 AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_clock_for_diagnostics(
                     super::RegistryAuthorityState::empty(),
                     clock.clone(),
-                )?;
-            let registered = registry.register(
-                direct_metadata_with_quality(source, "revision-1", quality_ceiling)?,
-                wall_origin,
+                )?
+                .with_provider_identity_authority(identity_authority)?;
+            let registered = registry.register(metadata, wall_origin)?;
+            registry.record_provider_identities(
+                &registered,
+                &identity_requests,
+                std::time::Instant::now() + Duration::from_secs(2),
+                &tokio_util::sync::CancellationToken::new(),
             )?;
             let session = registry.begin_session(
                 &registered,
@@ -252,6 +265,7 @@ mod tests {
                 registered,
                 session,
                 reporter,
+                identity_requests,
                 clock,
                 wall_origin,
                 monotonic_origin,
@@ -353,10 +367,7 @@ mod tests {
 
         fn epoch_and_cursor(&self) -> (u64, i64) {
             (
-                self.session
-                    .lease
-                    .health_epoch
-                    .load(std::sync::atomic::Ordering::Acquire),
+                self.session.lease.health.load().epoch,
                 self.session
                     .lease
                     .last_health_observed_nanos
@@ -429,11 +440,7 @@ mod tests {
         let lease = Arc::new(SessionLeaseState {
             current: AtomicBool::new(true),
             terminal: AtomicBool::new(false),
-            live_qualified: AtomicBool::new(false),
-            health_epoch: AtomicU64::new(0),
-            minimum_valid_health_epoch: AtomicU64::new(0),
-            valid_from_nanos: AtomicI64::new(i64::MAX),
-            valid_until_nanos: AtomicI64::new(i64::MIN),
+            health: ArcSwap::from_pointee(SessionHealthQualification::default()),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
             frame_ordinal: AtomicU64::new(u64::MAX),
             continuity: clock.continuity().clone(),

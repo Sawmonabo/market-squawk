@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
     ConnectionGeneration, CoverageConsolidation, CoverageDelay, DeliveryEvidence,
@@ -49,15 +50,25 @@ struct ActiveSessionKey {
 struct SessionLeaseState {
     current: AtomicBool,
     terminal: AtomicBool,
-    live_qualified: AtomicBool,
-    health_epoch: AtomicU64,
-    minimum_valid_health_epoch: AtomicU64,
-    valid_from_nanos: AtomicI64,
-    valid_until_nanos: AtomicI64,
+    health: ArcSwap<SessionHealthQualification>,
     last_health_observed_nanos: AtomicI64,
     frame_ordinal: AtomicU64,
     continuity: AuthorityTimeContinuity,
     started_at: TrustedRegistryTime,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HealthEpochInterval {
+    epoch: u64,
+    valid_from: Timestamp,
+    valid_until: Timestamp,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionHealthQualification {
+    epoch: u64,
+    current: Option<HealthEpochInterval>,
+    previous: Option<HealthEpochInterval>,
 }
 
 #[derive(Debug)]
@@ -84,10 +95,10 @@ impl RegistrationLeaseState {
 impl SessionLeaseState {
     fn invalidate(&self) {
         self.current.store(false, Ordering::Release);
-        self.live_qualified.store(false, Ordering::Release);
-        if self.advance_health_epoch().is_none() {
-            self.valid_until_nanos.store(i64::MIN, Ordering::Release);
-        }
+        self.health.rcu(|health| SessionHealthQualification {
+            epoch: health.epoch.saturating_add(1),
+            ..SessionHealthQualification::default()
+        });
     }
 
     fn is_current(&self) -> bool {
@@ -101,20 +112,19 @@ impl SessionLeaseState {
     }
 
     fn terminally_invalidate_health_authority(&self) {
-        self.live_qualified.store(false, Ordering::Release);
-        self.minimum_valid_health_epoch
-            .store(u64::MAX, Ordering::Release);
-        self.valid_from_nanos.store(i64::MAX, Ordering::Release);
-        self.valid_until_nanos.store(i64::MIN, Ordering::Release);
         self.current.store(false, Ordering::Release);
         self.terminal.store(true, Ordering::Release);
+        self.health.rcu(|health| SessionHealthQualification {
+            epoch: health.epoch,
+            ..SessionHealthQualification::default()
+        });
     }
 
     fn next_health_epoch(&self) -> Option<u64> {
         if self.is_terminal() {
             return None;
         }
-        self.health_epoch.load(Ordering::Acquire).checked_add(1)
+        self.health.load().epoch.checked_add(1)
     }
 
     fn commit_live_qualification(
@@ -124,53 +134,45 @@ impl SessionLeaseState {
         valid_from: Option<Timestamp>,
         valid_until: Option<Timestamp>,
     ) {
-        self.live_qualified.store(false, Ordering::Release);
-        let previous_epoch = self.health_epoch.load(Ordering::Acquire);
-        self.valid_from_nanos.store(
-            valid_from.map_or(i64::MAX, Timestamp::unix_nanos),
-            Ordering::Release,
-        );
-        self.valid_until_nanos.store(
-            valid_until.map_or(i64::MIN, Timestamp::unix_nanos),
-            Ordering::Release,
-        );
-        // A routine healthy refresh overlaps the immediately preceding immutable authority until
-        // that authority's own deadline. This lets already-admitted FIFO work drain without
-        // treating a freshness renewal as data loss. An unhealthy update publishes no overlap,
-        // and the next healthy update cannot resurrect an older qualified epoch.
-        let minimum_valid_epoch = if qualified && previous_epoch != 0 {
-            previous_epoch
-        } else {
-            epoch
+        let current = match (qualified, valid_from, valid_until) {
+            (true, Some(valid_from), Some(valid_until)) => Some(HealthEpochInterval {
+                epoch,
+                valid_from,
+                valid_until,
+            }),
+            _ => None,
         };
-        self.minimum_valid_health_epoch
-            .store(minimum_valid_epoch, Ordering::Release);
-        self.health_epoch.store(epoch, Ordering::Release);
-        self.live_qualified.store(qualified, Ordering::Release);
-    }
-
-    fn is_live_qualified(&self) -> bool {
-        self.live_qualified.load(Ordering::Acquire)
+        // Publish one coherent snapshot. Queued work retains the immediately preceding epoch's
+        // original interval; a renewal neither rebases its timestamp nor briefly dequalifies it.
+        // An unhealthy update removes both intervals, so later recovery cannot revive either.
+        let previous = current.and_then(|_| self.health.load().current);
+        self.health.store(Arc::new(SessionHealthQualification {
+            epoch,
+            current,
+            previous,
+        }));
     }
 
     fn validate_health_epoch(&self, epoch: u64, at: Timestamp) -> bool {
-        let current_epoch = self.health_epoch.load(Ordering::Acquire);
-        let minimum_epoch = self.minimum_valid_health_epoch.load(Ordering::Acquire);
+        let health = self.health.load();
         self.is_current()
-            && self.is_live_qualified()
-            && epoch >= minimum_epoch
-            && epoch <= current_epoch
-            && at.unix_nanos() >= self.valid_from_nanos.load(Ordering::Acquire)
-            && at.unix_nanos() <= self.valid_until_nanos.load(Ordering::Acquire)
+            && health
+                .current
+                .iter()
+                .chain(health.previous.iter())
+                .any(|interval| {
+                    epoch == interval.epoch
+                        && at >= interval.valid_from
+                        && at <= interval.valid_until
+                })
     }
 
-    fn advance_health_epoch(&self) -> Option<u64> {
-        self.health_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .ok()
-            .and_then(|previous| previous.checked_add(1))
+    fn shared_allocation_charge() -> Option<usize> {
+        let health = market_squawk_domain::checked_arc_value_allocation_bytes::<
+            SessionHealthQualification,
+        >(0)
+        .ok()?;
+        market_squawk_domain::checked_arc_value_allocation_bytes::<Self>(health).ok()
     }
 
     fn next_frame_id(&self) -> Result<crate::FrameId, crate::SourceError> {

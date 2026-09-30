@@ -5347,6 +5347,7 @@ dependencies = [
 name = "market-squawk-sources"
 version = "1.0.0"
 dependencies = [
+ "arc-swap",
  "blake3",
  "bytes",
  "crc32fast",

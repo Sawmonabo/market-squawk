@@ -10,15 +10,15 @@ unlock and credential import succeeded. Desktop/service are currently stopped af
 
 | Owner | Exclusive scope | Outcome, verification and next dependency |
 | --- | --- | --- |
-| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | Prior CLI/service rebuild and same-root unlock passed. Current event and health fixes are implemented but await critical checks/rebuild/live UI verification. TypeScript passed; Rust check stopped for machine pressure. Cleanup is complete; no build runs. |
+| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | Prior CLI/service rebuild and same-root unlock passed. Health renewal is critically verified; Desktop event metadata is implemented with TypeScript passed. The installed-service critical check is running at low priority with one compiler job; native rebuild and rendered-page verification follow. Cleanup is complete. |
 | GPT-6.1 Sol `desktop_bootstrap_trace` — released; lead implements | Lead: installed source/governance/MCP descriptors, MCP cache key and existing installed-service critical case | Native inspector proves bootstrap succeeds but staged CLI unlock emits an operation missing from the Desktop event index; native Apply also emits wrong-case source domain. Correct producer metadata and preserve private CLI/ticket authority, then prove actual Desktop admission. Same confirmed gap affects governance and MCP control: use canonical domains and the existing operations cache. |
-| Astra `stock_capture_trace` — frozen/released | `crates/market-squawk-sources/src/registry.rs`, required private registry initializers/callers, existing `tests/registry_authority/pre_feed_cases.rs` only | Acceptance 1/7: healthy qualification renewal incorrectly rejects queued prior-epoch work. Publish coherent current/previous validity, retain genuine expiry/revocation and extend existing critical queued-lease case. No build/Git; request additional ownership if needed. |
+| Astra `stock_capture_trace` — released; lead verified | Registry health snapshot and existing unit/integration health cases; shared explicit native-identity fixture | Healthy renewal atomically retains the preceding epoch's original interval; unhealthy/terminal transitions revoke it. Queued-time, second-renewal, expiry, unhealthy recovery and three exhaustion/recovery cases passed. No deadline extension or weakened native-identity admission. Live continuity awaits rebuilt service. |
 | Astra `native_setup_current` — released | Native fund catalog admission plus existing catalog case | Pushed `4139b2a1`: remove the artificial new-ETF rejection; derive Equity/Fund from the official listing; preserve existing issuer and native identity evidence. Critical catalog creation/conflict/revocation/reopen/replay case passed (1 test). Native Retry now passed this admission edge on the rebuilt service; live continuity still fails downstream. |
 | GPT-6.1 Sol `brief_pattern_projection` — released; lead integrated schema | Saved Brief status projection and one existing-module critical case | Pushed `60bdf071`: actual retained disposition now supplies required `pricePattern.state/outcome/summary`; reasons reuse its explanation. Whole projected Brief passes its published descriptor for expired and unevaluated evidence; missing/contradictory outcome fails. One critical case passed. Shared Rust schema matches existing strict Desktop fields. No new compatibility path. |
 | GPT-6.1 Sol `live_input_recipe` — released | Read-only SEC producer/consumer handoff | Exact company/security and fiscal wiring gaps below; no implementation or live completion claimed. |
 | Astra `harmonic_status_v1` — released | Read-only full harmonic status/geometry contract | Forming and terminal geometry preservation remain required, beyond this Brief decoding fix. Lead must freeze shared declarations before disjoint producer/renderer edits. |
 
-Resource interruption: the owner reported machine pressure during verification. Lead stopped
+Earlier resource interruption: the owner reported machine pressure during verification. Lead stopped
 the sole Cargo build (exit 130); no compiler remains. Snapshot: `target/` 32 GiB,
 `.agents/tmp/` 56 GiB (52 GiB in historical `resume-2026-09-15`), 63 GiB disk free.
 Concurrent renderer Vitest workers belong to the separate `ai-sidekicks` Claude session;
@@ -36,6 +36,13 @@ Exact removal inventory: `.agents/tmp/v1-first-stock/stale-artifact-cleanup-2026
 The subsequent refresh showed a machine restart and renewed unrelated renderer-test pressure;
 no Market Squawk service/compiler remains running. Builds await safe execution capacity;
 this is not a completed installed workflow or a passed interrupted check.
+
+Current recovery: memory pressure returned to normal; the separate session remains untouched.
+Four focused source cases passed: `health-renewal-critical.log` (1),
+`health-epoch-critical.log` (2) and `source-epoch-critical.log` (1). They exercise queued work
+across healthy renewal while retaining expiry, unhealthy revocation and terminal exhaustion.
+The shared fixture now supplies explicit native identity evidence to both existing test owners.
+The interrupted Desktop authority check is being rerun, not counted as passed.
 
 Critical evidence under `.agents/tmp/v1-first-stock/`: `fund-admission-critical.log`
 (1 passed, 7 filtered), `brief-pattern-contract-critical.log` (1 passed, 132 filtered),

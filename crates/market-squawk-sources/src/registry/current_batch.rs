@@ -359,10 +359,7 @@ impl CurrentSourceAuthorityLease {
             .clock
             .shared_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
-        let session = std::mem::size_of::<SessionLeaseState>()
-            .checked_add(crate::conservative_arc_control_block_charge::<
-                SessionLeaseState,
-            >())
+        let session = SessionLeaseState::shared_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
         let capture = self
             .capture

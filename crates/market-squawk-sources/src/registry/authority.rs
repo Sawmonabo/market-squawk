@@ -523,7 +523,7 @@ impl FrameSessionLease {
     }
 
     pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        market_squawk_domain::checked_arc_value_allocation_bytes::<SessionLeaseState>(0).ok()
+        SessionLeaseState::shared_allocation_charge()
     }
 
     #[cfg(test)]
@@ -534,11 +534,7 @@ impl FrameSessionLease {
         let lease = Arc::new(SessionLeaseState {
             current: AtomicBool::new(true),
             terminal: AtomicBool::new(false),
-            live_qualified: AtomicBool::new(false),
-            health_epoch: AtomicU64::new(0),
-            minimum_valid_health_epoch: AtomicU64::new(0),
-            valid_from_nanos: AtomicI64::new(i64::MAX),
-            valid_until_nanos: AtomicI64::new(i64::MIN),
+            health: ArcSwap::from_pointee(SessionHealthQualification::default()),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
             frame_ordinal: AtomicU64::new(0),
             continuity: receipt.continuity().clone(),

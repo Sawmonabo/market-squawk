@@ -1,10 +1,11 @@
 #[test]
 fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> TestResult {
-    fn record_qualified_health(
+    fn record_health(
         registry: &mut AuthoritativeSourceRegistry,
         session: &market_squawk_sources::CurrentSourceSession,
         reporter: &mut market_squawk_sources::CurrentHealthReporter,
         observed_at: i64,
+        integrity: StreamIntegrityState,
     ) -> TestResult {
         let observed = Timestamp::from_unix_nanos(observed_at);
         let valid_until = observed.checked_add_nanos(10_000_000_000)?;
@@ -24,7 +25,7 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
                 1_000_000_000,
                 100_000_000,
             )?,
-            StreamIntegrityState::Healthy,
+            integrity,
             CaptureIntegrityState::Healthy,
             AuthorizationHealth::Valid {
                 evidence: exact_evidence(21),
@@ -53,9 +54,14 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         market_squawk_sources::CaptureAdmissionIssuer,
         market_squawk_sources::RawFrameFactory,
     )> {
-        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-        let registered = registry.register(
-            direct_metadata("source-a", "revision-a", 0, None)?,
+        let metadata = direct_metadata("source-a", "revision-a", 0, None)?;
+        let [instrument] = metadata.coverage().instruments().instruments() else {
+            return Err("health fixture requires one covered instrument".into());
+        };
+        let native_routes = [(*instrument, "BTC-USD")];
+        let (mut registry, registered) = crate::common::register_fixture_source(
+            metadata,
+            &native_routes,
             Timestamp::from_unix_nanos(1),
         )?;
         let session = registry.begin_session(
@@ -81,11 +87,12 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         _first_frames,
     ) = setup()?;
     let first_at = now_timestamp()?;
-    record_qualified_health(
+    record_health(
         &mut first,
         &first_session,
         &mut first_reporter,
         first_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
     )?;
     let lease = {
         let current = first.validate_current_authority(&first_session)?;
@@ -97,25 +104,37 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
     assert!(lease.validate_at(first_at).is_ok());
     assert!(lease.validate_at(first_at.checked_sub_nanos(1)?).is_err());
     let refreshed_at = next_timestamp_after(first_at)?;
-    record_qualified_health(
+    record_health(
         &mut first,
         &first_session,
         &mut first_reporter,
         refreshed_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
     )?;
+    // An admitted FIFO batch keeps its original validation timestamp across renewal.
+    assert!(lease.validate_at(first_at).is_ok());
+    assert!(lease.validate_at(first_at.checked_sub_nanos(1)?).is_err());
+    assert!(
+        lease
+            .validate_at(lease.valid_until().checked_add_nanos(1)?)
+            .is_err()
+    );
     assert!(lease.validate_at(refreshed_at).is_ok());
     let refreshed = first
         .validate_current_authority(&first_session)?
         .try_current_lease()?;
     assert!(refreshed.health_epoch() > lease.health_epoch());
     let second_refresh_at = next_timestamp_after(refreshed_at)?;
-    record_qualified_health(
+    record_health(
         &mut first,
         &first_session,
         &mut first_reporter,
         second_refresh_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
     )?;
     assert!(lease.validate_at(second_refresh_at).is_err());
+    assert!(lease.validate_at(first_at).is_err());
+    assert!(refreshed.validate_at(refreshed_at).is_ok());
     assert!(refreshed.validate_at(second_refresh_at).is_ok());
 
     let (
@@ -127,11 +146,12 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         _second_frames,
     ) = setup()?;
     let second_at = now_timestamp()?;
-    record_qualified_health(
+    record_health(
         &mut second,
         &second_session,
         &mut second_reporter,
         second_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
     )?;
     let second_lease = second
         .validate_current_authority(&second_session)?
@@ -143,6 +163,30 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
             .shares_allocation_with(second_lease.binding())
     );
 
+    let degraded_at = next_timestamp_after(second_at)?;
+    record_health(
+        &mut second,
+        &second_session,
+        &mut second_reporter,
+        degraded_at.unix_nanos(),
+        StreamIntegrityState::GapDetected,
+    )?;
+    assert!(second_lease.validate_at(second_at).is_err());
+    let recovered_at = next_timestamp_after(degraded_at)?;
+    record_health(
+        &mut second,
+        &second_session,
+        &mut second_reporter,
+        recovered_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
+    )?;
+    second
+        .validate_current_authority(&second_session)?
+        .try_current_lease()?
+        .validate_at(recovered_at)?;
+    assert!(second_lease.validate_at(second_at).is_err());
+    assert!(second_lease.validate_at(recovered_at).is_err());
+
     let (
         mut exiting,
         exiting_session,
@@ -152,11 +196,12 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         mut exiting_frames,
     ) = setup()?;
     let exiting_at = now_timestamp()?;
-    record_qualified_health(
+    record_health(
         &mut exiting,
         &exiting_session,
         &mut exiting_reporter,
         exiting_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
     )?;
     let exiting_lease = exiting
         .validate_current_authority(&exiting_session)?
