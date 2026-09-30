@@ -2,16 +2,22 @@
 
 ## Active saved-planning and live-input wave — 2026-09-30
 
-Current outcome: secure startup and provider unlock are live verified; native SPY/VTI reference
-publication is live verified at `a63d286b`. The next market-data write failed because the existing
-SQL schema fingerprint was stale. That V1 definition is corrected in place; the existing
-market-event publication/restart test and the focused custody/cleanup regression both pass.
-The next barrier is rebuilding CLI/service and a fresh-root live run. Preserve the previous
-`.market-squawk/v1-owner-test` roots and matching binaries under
-`.agents/tmp/v1-first-stock/pre-schema-a63d286b-binaries`; do not rewrite its schema history.
-Use `.market-squawk/v1-owner-test-current` for fresh corrected-schema verification. All agents have
-released their files; lead owns build, live operations and integration. Saved-planning implementation
-has not begun. No live-stock or installed-workflow completion claim is established.
+Current outcome: secure startup, protected credential import, fresh doctor verification and live
+Alpaca market-runtime Start all succeeded with `88cf3ff1` in the fresh corrected-schema roots
+`.market-squawk/v1-owner-test-current`. The active runtime has stored eight successful market-event
+generations (32 cumulative rows) plus the 23-row exchange calendar; the fingerprint repair is now
+live verified. Desktop is running on those roots. Market search still returns no SPY result and the
+runtime reports zero qualified records, so a usable stock selection/analysis is not yet proven.
+Lead owns live operations/integration; GPT-6.1 Sol `live_input_recipe` has a bounded read-only trace
+of this selection/qualification gap from actual retained evidence, with no edits/builds/Git or
+credential access. Other agents are complete and no writers overlap. Saved-planning implementation
+has not begun. No full installed-workflow completion claim is established.
+
+Pushed checkpoint: `88cf3ff1`; PR #43 comment `5908352575`. CLI/service build passed. Live evidence:
+`.agents/tmp/v1-first-stock/current-live-publication-evidence.json`, `current-live-alpaca-start.json`,
+`current-live-alpaca-status.json`, `current-live-spy-search.json`, and `current-live-service.log`.
+Prior `.market-squawk/v1-owner-test` roots and matching binaries under
+`.agents/tmp/v1-first-stock/pre-schema-a63d286b-binaries` remain preserved, not migrated or rewritten.
 
 Recovery checkpoint pushed: `44ba9cb6`; PR #43 evidence comment `5907711371`.
 Next concrete defect: native Alpaca asset-reference publication registers a source only when absent,
