@@ -1,5 +1,17 @@
 # Market Squawk Delivery Ledger
 
+## Model-routing correction and execution hold — 2026-09-29
+
+Before resuming, the owner replaced every future GPT-6 Sol assignment with **GPT-6.1 Sol High**
+(`gpt-6.1-sol`, High effort). Unversioned Sol labels in older plans/handoffs mean this current
+selection. **GPT-6 Astra High** (`gpt-6-astra`) and all task boundaries, ownership, review,
+verification and stopping rules remain unchanged. Historical agent provenance is not rewritten.
+The tracked goal, execution plans, project memory and live goal attachment carry this correction.
+Implementation remains on hold pending owner resume; this documentation update starts no agents,
+builds or product changes. Existing uncommitted rebalance work is preserved and is not accepted
+or included in the documentation checkpoint. Both attempted rebalance agents stopped at the usage
+limit before producing changes; their listed scopes are reservations for resumption, not active work.
+
 ## Integrated stress-scenario calculation — 2026-09-29
 
 Acceptance 4/5/6, refreshed at `005037da`: stress UI is an unconditional prepared-choice

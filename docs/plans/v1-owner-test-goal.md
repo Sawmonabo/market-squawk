@@ -121,6 +121,11 @@ change.
 
 ## Delivery sequence and integration ownership
 
+Model routing correction: all future Sol assignments use **GPT-6.1 Sol High**
+(`gpt-6.1-sol`, High effort), including references inherited from older goals, plans and handoffs.
+**GPT-6 Astra High** (`gpt-6-astra`) retains its existing financial/advanced task assignments.
+This substitution does not resume implementation or change any other delivery rule.
+
 On explicit resumption, perform a short refresh of the acceptance map against the actual branch.
 Locate existing behavior before assigning work; do not restart an infrastructure audit or rebuild
 completed capabilities.
@@ -134,7 +139,7 @@ before proving the first stock journey, and do not drop those sources from final
 
 - Use `feature/v1-installed-product-experience` and its current primary worktree. Create no additional branches or worktrees without explicit owner approval. Keep main/release unchanged.
 - Maintain one current execution table in `docs/plans/delivery-ledger.md`: concrete outcome, dependencies, exact file ownership, required critical evidence, blocker/next dependency and pushed commit. Historical handoffs are evidence, not competing task queues.
-- Start with provider integration, financial workflow and Desktop implementation lanes. Add parallel work only when dependencies and disjoint ownership support it. Use bounded briefs with `fork_turns="none"`. Use GPT-6 Astra High for advanced forecasting/modeling, harmonics, financial algorithms, backtesting, difficult debugging and advanced optimization; GPT-6 Sol High for other tasks.
+- Start with provider integration, financial workflow and Desktop implementation lanes. Add parallel work only when dependencies and disjoint ownership support it. Use bounded briefs with `fork_turns="none"`. Use GPT-6 Astra High for advanced forecasting/modeling, harmonics, financial algorithms, backtesting, difficult debugging and advanced optimization; GPT-6.1 Sol High for other tasks.
 - The lead owns shared authority/contracts, schemas, manifests, lockfiles, application composition, shared transport, integration acceptance, Git and build/test scheduling. Helpers may trace wiring or prepare assigned changes; they do not create branches/worktrees, run competing builds or independently change shared files.
 - Assign each agent a finishable outcome, explicit files, dependencies and the smallest relevant critical check. Inspect actual changes and affected consumers; a completion message is not proof. If a lane stalls, identify the concrete dependency and split genuinely independent work rather than repeatedly replacing or restarting it.
 - Integrate producer and consumer changes together. Run the relevant critical checks, commit and push the coherent checkpoint, update delivery/PR evidence, and release ownership before accumulating replacement work. Do not hold an independently coherent result behind unrelated work or grow another unnecessarily broad uncommitted batch.

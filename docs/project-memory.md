@@ -175,8 +175,14 @@ documentation checker scripts, prose tests, or new Rust test targets for documen
 
 ### Agent model and effort — owner correction, 2026-09-29
 
+For every future assignment, use `gpt-6.1-sol` with High effort wherever older goals, plans,
+handoffs or briefs specify GPT-6 Sol (`gpt-6-sol`) or unversioned Sol. Historical execution
+records retain the model actually used; they do not authorize the superseded selection.
+Astra remains `gpt-6-astra` with High effort under the same task boundaries below.
+This model substitution changes no scope, ownership, review or execution/pause rule.
+
 Use GPT-6 Astra High for advanced forecasting/modeling, harmonics, financial algorithms,
-backtesting, difficult debugging and advanced optimization. Use GPT-6 Sol High for other tasks.
+backtesting, difficult debugging and advanced optimization. Use GPT-6.1 Sol High for other tasks.
 Use bounded briefs with `fork_turns="none"`, explicit dependencies, exclusive files and a
 finishable outcome. This supersedes older Astra Medium and xhigh instructions. If the task changes
 category, coordinate a bounded ownership handoff rather than silently expanding the lane.
