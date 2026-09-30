@@ -41,6 +41,21 @@ focus or screen. Use the optional development-only embedded WebDriver path docum
 service. Do not resume global keystrokes or foreground automation while the owner works. Native
 dialog and external OAuth interaction require separate evidence; WebView checks do not prove them.
 
+## Owner correction: application lock is opt-in — 2026-09-30
+
+A configured personal installation opens and reuses its saved provider credentials/sessions without
+an application-password prompt, including after service restart or development rebuild. Do not
+force the encrypted-file unlock workflow merely because the executable is a development build.
+The owner permits use of their local credential configuration file; older one-time-import-only
+instructions do not require repeated interactive import or unlock. Preserve private filesystem
+access and secret redaction; never embed a default password or expose credentials to React/logs.
+
+Application locking is an explicit user choice. When enabled, support remembered OS-secured access,
+explicit Lock/Forget controls and an optional user-selected reauthentication interval; impose no
+arbitrary interval by default. Locking provider secrets must leave ordinary screens and saved
+results usable. Provider OAuth expiry, revocation and key replacement remain connection-specific
+recovery, separate from application locking. This is required behavior, not implementation evidence.
+
 ## Owner correction: whole-application memory and complete capability — 2026-09-28
 
 The owner clarified the intended RAM range as **500 MB to 1.5 GB, with a 2 GB maximum**

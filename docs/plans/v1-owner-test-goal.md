@@ -85,11 +85,14 @@ model-family and platform requirements remain in scope.
    independent durable job.
 
 7. **Installed lifecycle and recovery:** Installation and managed runtime setup, service start,
-   native onboarding/unlock, credential import/OAuth where required, real workflows, clean
+   native onboarding, optional application locking, saved credential reuse/OAuth where required, real workflows, clean
    shutdown/restart, saved-result reopening, backup/restore and stale-credential rejection/fresh
    reconnect work. Missing or expired provider credentials produce recoverable connection states
    and do not block ordinary application launch. The owner does not need a developer
    Python/runtime setup.
+   Application locking is opt-in: configured connections reopen without an app password across
+   launches/rebuilds. Optional locking supports remembered OS-secured access, explicit Lock/Forget
+   and a user-selected reauthentication interval. Provider expiry/key replacement remains separate.
 
 Track each item as missing implementation, implemented but unproven, critically verified, live
 verified or installed-workflow complete, with evidence and explicit remaining gaps. Do not infer

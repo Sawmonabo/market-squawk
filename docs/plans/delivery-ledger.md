@@ -2,13 +2,48 @@
 
 ## Active previous-close and startup delivery wave — 2026-09-30
 
+Owner security correction: application locking is opt-in, not a startup requirement. Configured
+connections must reuse saved credentials across ordinary launches/rebuilds without an app password;
+provider expiry/key replacement affects only that connection. If enabled, locking supports remembered
+OS-secured access, explicit Lock/Forget and optional reauthentication interval. No arbitrary default
+interval. This supersedes the earlier always-locked development fallback and any conflicting
+one-time-import-only wording for the owner's configured credential-file use. Never log credentials.
+
+Security change DAG: inspect existing store/startup ownership → define one default-unlocked and
+optional-lock contract → integrate service/provider/Desktop consumers → verify restart and explicit
+lock behavior. Lead reserves shared service composition, manifests, contracts, Git and builds.
+Astra `startup_bootstrap_trace` owns read-only store/policy design; Sol `starter_market_ui` owns
+read-only Settings/startup consumer inventory. No implementation agents write security files until
+the shared contract is resolved. Existing Research verification continues independently.
+
+Current verification: the five-operation installed case fails at preparation options with typed
+Unavailable (`startup-research-preparation-critical.log`, 21.08s). Do not weaken the new assertion;
+trace the producer before accepting Research. Astra `research_options_failure` owns read-only
+failure diagnosis in dataset preparation/analytical reads; lead retains edits and build scheduling.
+Current security design owners are Astra `optional_lock_backend` and Sol `optional_lock_ui`;
+earlier session helpers are no longer running. Both are read-only until contract handoff.
+
+Native evidence after preparation worker change: Research 8/8 concurrent rounds pass; full route
+sweep is running. Live source retry still fails calendar replay: new diagnostic is exactly
+`calendar-native-replay-currentness: Stale`, not catalog selection or response freshness.
+Astra `calendar_currentness_failure` owns read-only trace of that synchronous authority check and
+source Retry lifetime. No relaxation of revocation/currentness. Lead owns resulting shared edits.
+
+Opt-in lock implementation boundary: Astra `optional_lock_backend` owns platform secret access
+only (`secrets.rs`, `secrets/preferred.rs`, existing encrypted store, a cohesive secrets/access.rs
+if needed, existing platform secrets tests). Implement reusable automatic private-key retention
+for the existing encrypted vault plus policy-controlled optional lock/remember/Forget using existing
+OS keyring and crash-consistent vault rotation. No new cryptography/dependency/credential database.
+Lead owns service transport/provider composition, commands/status, provider drain/restoration and
+all Git/builds. Desktop follows the agreed redacted policy contract; no UI-only unlocking shortcut.
+
 Current continuation ownership (same branch/worktree):
 
 | Owner | Bounded outcome and exact files | Dependency / critical evidence |
 | --- | --- | --- |
-| Lead | Commit the verified instance/startup, authenticated predecessor recovery and unlock-label changes; shared composition and all Git/build/native actions | Installed-service restart case passes; duplicate launch leaves startup bytes unchanged; native unlock reaches Ready. |
-| Astra `macro_restart_digest` | Research first-load diagnosis and correction in `application/research.rs` and `application/research/macro_context/board.rs` only | Reuse the existing owned research I/O worker for bypassing reads; lead updates async dispatch callers and proves concurrent native initial reads. No broad catalog locking changes. |
-| Astra `stock_capture_trace` | Read-only trace of display-history failure before per-instrument acquisition | Inspect current source/runtime/calendar selection and retained live evidence; return exact failing boundary and minimal correction. No provider actions, builds, Git or edits. |
+| Lead | Research concurrent initial reads: returned `research.rs`, `research/dataset_preparation.rs`, `research/macro_context/board.rs`; existing installed critical case; all builds, native actions and Git | Five concurrent operations in the existing service/restart case, then actual native route and repeated Research reads. Startup ownership checkpoint already pushed. |
+| Astra `macro_restart_digest`, returned | All three Research files released to lead | Existing owned I/O worker reused; no additional runtime or nested worker acquisition. Verification pending. |
+| Astra `stock_capture_trace`, diagnostics returned | `market_calendar/read.rs` and `market_calendar/alpaca/completed.rs` released; subsequent lock trace read-only | Closed diagnostics distinguish runtime lookup from native replay currentness failure. Caller catalog locks are released before native replay; await live evidence before changing authority behavior. |
 
 Settled native sweep: all 17 routes have Ready System/Product state; 16 have no active query
 errors. Research has one `Macro.GetContext` rejection, while the same CLI read succeeds. Real
@@ -16,8 +51,31 @@ source Retry now succeeds but optional display history remains unavailable befor
 acquisition. No real-price or complete-screen claim is made. Evidence:
 `startup-resolved-settled-routes.json`, `startup-macro-context.json`, `history-resolved-retry.json`.
 
+Live Research reproduction: economic context succeeds 8/8 times alone, but fails 6/8 alongside
+its actual active screen queries (`research-concurrent-before.json`). The returned two-file fix
+queues dataset discovery and rolling interest-rate origin reads on the existing research I/O owner;
+lead extended the existing installed concurrent-read case with Macro/ListDatasets. One serialized
+critical build is active (`startup-research-history-critical.log`). Display-history diagnosis
+excludes the proposed timestamp/freshness cause: its v5 calendar is fresh and cutoff-admitted.
+Closed pre-acquisition stage diagnostics will identify the remaining failure; no timestamps,
+freshness or integrity rules were relaxed. Both Astra helpers released ownership.
 
-This checkpoint acquires the service instance before writing startup state/logs, retains its lock
+The expanded installed critical case passes (70.20s). A fresh native sweep reaches Ready on all
+17 routes with zero active query errors (`startup-research-routes.json`), but the stronger
+concurrent screen check still fails Macro 3/8 times (`research-concurrent-after.json`). Therefore
+Research is not yet accepted. The remaining preparation-choices reads bypass the same worker.
+Astra `macro_restart_digest` exclusively owns `application/research/dataset_preparation.rs`:
+queue its catalog page and leaf observation query on that owner, using the existing captured
+runtime-handle pattern; no nested research-worker acquisition, new runtime or catalog mutex across
+await. Lead owns the existing critical check/dispatch integration and all builds. Its earlier two
+files are released. Astra `stock_capture_trace` owns closed diagnostic additions only in
+`application/market_calendar/read.rs` and `application/market_calendar/alpaca/completed.rs`:
+log suppressed runtime lookup/native replay unavailability and synchronous currentness failure;
+no authorization behavior changes. Calendar selection diagnosis: new live diagnostics prove selection returns None,
+after successful publication (`history-diagnostic-retry.json`, `startup-research-live-service.log`).
+
+
+Pushed checkpoint `d6162c6b` acquires the service instance before writing startup state/logs, retains its lock
 through final drain, restores authenticated crash predecessors using retained subject evidence,
 and labels expected locked startup as Unlock required. The existing installed-service critical
 case passes (68.07s), platform lifetime case passes, authenticated recovery case passes, and
