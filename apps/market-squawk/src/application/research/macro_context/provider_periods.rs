@@ -379,7 +379,7 @@ fn source_receipt(
         source_id: output.source_id().clone(),
         manifest: output.output().manifest().clone(),
         object_graph_digest: require_sha256(output.output().object_graph_digest())?,
-        query_identity: require_sha256(output.output().query_identity())?,
+        semantic_query_identity: require_sha256(output.output().semantic_query_identity())?,
         result_digest: require_sha256(output.output().result_digest())?,
         selection_digest: require_sha256(output.selection_digest())?,
         native_binding_digest: Some(require_sha256(binding)?),

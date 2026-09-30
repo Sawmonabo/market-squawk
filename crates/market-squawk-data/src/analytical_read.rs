@@ -3346,7 +3346,7 @@ fn macro_latest_known_selection_digest(
     hash.update(b"market-squawk/analytical-macro-latest-known-selection/v1");
     hash_manifest(&mut hash, request.manifest());
     hash_evidence(&mut hash, output.object_graph_digest());
-    hash_evidence(&mut hash, output.query_identity());
+    hash_evidence(&mut hash, output.semantic_query_identity());
     hash_evidence(&mut hash, output.result_digest());
     hash_str(&mut hash, request.source_id.as_str());
     hash_timestamp(&mut hash, request.knowledge_cutoff);
@@ -3692,7 +3692,7 @@ fn macro_provider_period_latest_known_selection_digest(
     hash.update(b"market-squawk/analytical-macro-provider-period-latest-known-selection/v1");
     hash_manifest(&mut hash, request.manifest());
     hash_evidence(&mut hash, output.object_graph_digest());
-    hash_evidence(&mut hash, output.query_identity());
+    hash_evidence(&mut hash, output.semantic_query_identity());
     hash_evidence(&mut hash, output.result_digest());
     hash_str(&mut hash, request.source_series.source_id.as_str());
     hash_timestamp(&mut hash, request.knowledge_cutoff);

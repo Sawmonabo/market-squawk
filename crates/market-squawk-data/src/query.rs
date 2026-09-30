@@ -325,10 +325,15 @@ impl QueryRequest {
         })
     }
 
-    /// Computes the exact SHA-256 identity of manifest, SQL, and every execution limit.
-    pub fn artifact_identity(&self, limits: &QueryLimits) -> EvidenceDigest {
+    /// Identifies the exact manifest, row schema, and SQL independently of execution admission.
+    pub fn semantic_identity(&self) -> EvidenceDigest {
         let mut identity = sha2::Sha256::new();
-        identity.update(b"market-squawk/query-artifact-request/v4");
+        identity.update(b"market-squawk/query-semantics/v1");
+        self.hash_manifest_and_sql(&mut identity);
+        EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into())
+    }
+
+    fn hash_manifest_and_sql(&self, identity: &mut sha2::Sha256) {
         identity.update(
             u64::try_from(self.manifest.dataset_id().as_str().len())
                 .unwrap_or(u64::MAX)
@@ -351,6 +356,13 @@ impl QueryRequest {
                 .to_be_bytes(),
         );
         identity.update(self.sql.as_bytes());
+    }
+
+    /// Computes the exact SHA-256 identity of manifest, SQL, and every execution limit.
+    pub fn artifact_identity(&self, limits: &QueryLimits) -> EvidenceDigest {
+        let mut identity = sha2::Sha256::new();
+        identity.update(b"market-squawk/query-artifact-request/v4");
+        self.hash_manifest_and_sql(&mut identity);
         identity.update(limits.max_rows.to_be_bytes());
         identity.update(limits.max_inline_bytes.to_be_bytes());
         identity.update(limits.max_bytes.to_be_bytes());
@@ -601,11 +613,13 @@ impl ResearchQueryEngine {
         let manifest = dataset.manifest().clone();
         let object_graph_digest = pinned_object_graph_digest(dataset);
         let query_identity = request.artifact_identity(&limits);
+        let semantic_query_identity = request.semantic_identity();
         let executed = self.execute(request, limits, cancellation, None).await?;
         Ok(PinnedQueryOutput::new(
             manifest,
             object_graph_digest,
             query_identity,
+            semantic_query_identity,
             executed.result_digest,
             executed.result,
         ))
@@ -627,6 +641,7 @@ impl ResearchQueryEngine {
         let manifest = dataset.manifest().clone();
         let object_graph_digest = pinned_object_graph_digest(dataset);
         let query_identity = request.artifact_identity(&limits);
+        let semantic_query_identity = request.semantic_identity();
         let executed = self
             .execute(request, limits, cancellation, Some(&mut consume))
             .await?;
@@ -634,6 +649,7 @@ impl ResearchQueryEngine {
             manifest,
             object_graph_digest,
             query_identity,
+            semantic_query_identity,
             executed.result_digest,
             executed.result,
         ))

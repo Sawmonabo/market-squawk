@@ -333,3 +333,16 @@ Squawk behavior.
 | [Apache Parquet format documentation](https://parquet.apache.org/docs/) | Durable columnar file and metadata semantics | 2026-07-23 |
 | [Apache DataFusion SQL reference](https://datafusion.apache.org/user-guide/sql/) | Embedded analytical SQL surface; Market Squawk applies a smaller read-only grammar and stricter local bounds | 2026-07-23 |
 | [SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html) | Transaction and single-writer semantics for local catalog authority | 2026-07-23 |
+
+## Stable selected evidence and execution admission
+
+A pinned query retains two identities from the shared manifest/schema/SQL encoding. Its semantic
+identity describes the exact immutable data and query; its artifact admission identity additionally
+binds every execution limit for reservation and execution validation. Macro selections and consumed
+financial evidence use the semantic identity together with the actual result, selected observations,
+cutoffs, object graph and native publication binding. A different remaining request deadline cannot
+change otherwise identical financial evidence after reopening the application.
+
+Request deadlines, cancellation with joined termination, row/byte/memory/spill limits and artifact
+reservation checks remain enforced independently. This changes the active V1 implementation in place;
+it adds no stored-schema migration or alternate compatibility path.

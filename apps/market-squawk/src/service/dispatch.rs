@@ -102,6 +102,7 @@ impl InstalledApplicationDispatcher {
             .collect::<Vec<_>>();
         operations.extend(governance.desktop_capabilities());
         operations.extend(InstalledProviderSetup::desktop_capabilities());
+        operations.extend(InstalledMcpControl::desktop_capabilities());
         let provider_setup = InstalledProviderSetup::new(
             product,
             runtime,

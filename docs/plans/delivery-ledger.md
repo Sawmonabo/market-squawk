@@ -5,29 +5,30 @@
 Refresh base `1572f4fb19d18add8bcd73eee7d2f69ff2834fcf`; execution remains authorized.
 One primary worktree and only the three approved local/origin branches were verified live.
 Old roots and matching binaries are preserved; the old service/Desktop stopped normally.
-Current live root: `.market-squawk/v1-owner-test-stock/{data,installation}`. Protected startup,
-unlock and credential import succeeded. Desktop/service are currently stopped after a machine restart.
+Preserved diagnostic root: `.market-squawk/v1-owner-test-stock/{data,installation}`. Its protected
+startup, unlock and credential import previously succeeded; the post-reboot identity failure is
+recorded below. Corrected V1 native verification uses a fresh
+`.market-squawk/v1-owner-test-stable-endpoints/{data,installation}` root. No migration or stored
+binding rewrite is authorized or implemented.
 
 | Owner | Exclusive scope | Outcome, verification and next dependency |
 | --- | --- | --- |
-| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | Prior CLI/service rebuild and same-root unlock passed. Health renewal is critically verified; Desktop event metadata is implemented with TypeScript passed. The installed-service check passed setup/event assertions, then failed an obsolete whole-artifact history assertion. Rebuilt ordinary service now fails saved artifact/catalog identity after reboot; both concrete blockers are assigned below. Native rendered-page verification remains pending. Cleanup is complete. |
+| GPT-6.1 Sol `starter_market_trace` — read-only | Current startup/source activation, catalog population, Home/Markets and existing preference persistence | Owner requires a default keep/remove collection with genuine quotes/details on first launch, including TSLA. Locate the smallest complete existing producer-to-screen path and exact gaps; no edits, Git or builds. Lead freezes the shared contract after this handoff; implementation follows integration of the pending Desktop/restart correction. |
+| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | Pushed healthy-renewal fix `be143bf1` and persistent endpoint fix `028248c8`, with focused critical checks passed. Desktop event metadata and complete paged-history verification are implemented; TypeScript passed. The service check passed setup events and paged history, then exposed timing-dependent macro evidence after restart. Its shared semantic-identity correction passed the query identity case; the full installed-service case passed, including exact restart equality and later publication. Fresh normal service startup and native Home rendering passed; the full native route sweep/restart remains pending background automation. Cleanup is complete. |
 | GPT-6.1 Sol `desktop_bootstrap_trace` — released; lead implements | Lead: installed source/governance/MCP descriptors, MCP cache key and existing installed-service critical case | Native inspector proves bootstrap succeeds but staged CLI unlock emits an operation missing from the Desktop event index; native Apply also emits wrong-case source domain. Correct producer metadata and preserve private CLI/ticket authority, then prove actual Desktop admission. Same confirmed gap affects governance and MCP control: use canonical domains and the existing operations cache. |
-| Astra `restart_catalog_identity` — released; lead verifies | Platform persistent endpoint helper/export; data catalog and Parquet authority callers only | Confirmed transient device-number change across reboot. Implement shared macOS volume-UUID/file-ID binding with safe locked Foundation APIs, retaining live replacement checks. Lead owns manifests/lock, integration and critical checks; no stored-root rewrite, migration, build or Git. |
-| GPT-6.1 Sol `board_history_contract` — released; lead inspected | Existing `production_mcp_composition.rs` history helpers/callers only; preserve lead event additions | Replace stale whole-artifact assertions with complete cursor-paged evidence and exact restart comparison. Producer already returns bounded pages. No new harness, production changes, build or Git; root freezes this test file until handoff. |
+| Astra `macro_restart_digest` — released; lead verifies | `crates/market-squawk-data/src/query.rs`, `query/receipt.rs`, `query/tests.rs`, `analytical_read.rs`, and application `research/macro_context.rs` plus `macro_context/{census,energy,provider_periods}.rs` receipt selection | Variable remaining deadlines entered durable financial evidence. Implemented shared semantic manifest/schema/SQL identity alongside unchanged execution/admission identity, covering Board and Treasury together. Existing identity case passed. Lead renamed the receipt field explicitly and corrected three additional Census/energy/provider-period producers plus the shared provider-period selection digest after compilation exposed missed consumers. Full installed-service equality, later publication and original-cutoff preservation passed. All limits and artifact reservation identity remain unchanged; no hash-version stack or migration. Lead owns builds/Git. |
+| Astra `restart_catalog_identity` — released; lead verifies | Platform persistent endpoint helper/export; data catalog and Parquet authority callers only | Confirmed transient device-number change across reboot. Shared macOS volume-UUID/file-ID binding is pushed with replacement checks retained. Platform identity and three storage cases passed. Lead added a scoped Foundation autorelease pool for Rust worker threads; its identity critical case passed again. Final service/native verification is pending; old roots remain untouched. |
+| GPT-6.1 Sol `board_history_contract` — released; lead inspected | Existing `production_mcp_composition.rs` history helpers/callers only; preserve lead event additions | Handoff inspected: existing service case consumes all 1,100 complete observations through cursors, checking bounds, duplicates and exact evidence after restart. The production paged contract is unchanged. Passed in the single-job service check; no new harness or separate build. |
 | Astra `stock_capture_trace` — released; lead verified | Registry health snapshot and existing unit/integration health cases; shared explicit native-identity fixture | Healthy renewal atomically retains the preceding epoch's original interval; unhealthy/terminal transitions revoke it. Queued-time, second-renewal, expiry, unhealthy recovery and three exhaustion/recovery cases passed. No deadline extension or weakened native-identity admission. Live continuity awaits rebuilt service. |
 | Astra `native_setup_current` — released | Native fund catalog admission plus existing catalog case | Pushed `4139b2a1`: remove the artificial new-ETF rejection; derive Equity/Fund from the official listing; preserve existing issuer and native identity evidence. Critical catalog creation/conflict/revocation/reopen/replay case passed (1 test). Native Retry now passed this admission edge on the rebuilt service; live continuity still fails downstream. |
 | GPT-6.1 Sol `brief_pattern_projection` — released; lead integrated schema | Saved Brief status projection and one existing-module critical case | Pushed `60bdf071`: actual retained disposition now supplies required `pricePattern.state/outcome/summary`; reasons reuse its explanation. Whole projected Brief passes its published descriptor for expired and unevaluated evidence; missing/contradictory outcome fails. One critical case passed. Shared Rust schema matches existing strict Desktop fields. No new compatibility path. |
 | GPT-6.1 Sol `live_input_recipe` — released | Read-only SEC producer/consumer handoff | Exact company/security and fiscal wiring gaps below; no implementation or live completion claimed. |
 | Astra `harmonic_status_v1` — released | Read-only full harmonic status/geometry contract | Forming and terminal geometry preservation remain required, beyond this Brief decoding fix. Lead must freeze shared declarations before disjoint producer/renderer edits. |
 
-Earlier resource interruption: the owner reported machine pressure during verification. Lead stopped
-the sole Cargo build (exit 130); no compiler remains. Snapshot: `target/` 32 GiB,
-`.agents/tmp/` 56 GiB (52 GiB in historical `resume-2026-09-15`), 63 GiB disk free.
-Concurrent renderer Vitest workers belong to the separate `ai-sidekicks` Claude session;
-not terminated here. Desktop event TypeScript check passed; installed-service test is
-interrupted, not passed. Health critical fixture was corrected after `LiveScopeNotCovered`;
-its rerun remains pending. Preserve source and recovery evidence; resume compilation
-only after current machine contention clears.
+Earlier resource interruption (historical): the lead stopped the sole Cargo build (exit 130)
+after machine pressure; that check did not pass. Concurrent renderer Vitest workers belong to the
+separate `ai-sidekicks` Claude session and remain untouched, as directed. Memory pressure later
+returned to normal; current compilation remains single-job and low priority.
 
 Authorized stale-artifact cleanup completed: removed 123 obsolete September live-test
 executable copies, 23 disposable hashed build/test executables and 3,026 compiler intermediates.
@@ -35,9 +36,8 @@ executable copies, 23 disposable hashed build/test executables and 3,026 compile
 increased from 63 to 121 GiB. Original session/recovery backup, patches, logs, data roots,
 current top-level executables and explicitly retained prior-schema binary pairs remain.
 Exact removal inventory: `.agents/tmp/v1-first-stock/stale-artifact-cleanup-20260930.json`.
-The subsequent refresh showed a machine restart and renewed unrelated renderer-test pressure;
-no Market Squawk service/compiler remains running. Builds await safe execution capacity;
-this is not a completed installed workflow or a passed interrupted check.
+Current build output is needed for the native verification below; these cleanup measurements
+are not whole-application performance acceptance.
 
 The rebuilt service accepted secure unlock but failed composition with
 `analytical artifact root belongs to a different catalog`. Read-only comparison reproduced both
@@ -51,7 +51,24 @@ Four focused source cases passed: `health-renewal-critical.log` (1),
 `health-epoch-critical.log` (2) and `source-epoch-critical.log` (1). They exercise queued work
 across healthy renewal while retaining expiry, unhealthy revocation and terminal exhaustion.
 The shared fixture now supplies explicit native identity evidence to both existing test owners.
-The subsequent Desktop authority check passed its new setup/event assertions but failed the stale Board history artifact expectation. The existing case now consumes all 1,100 complete rows through opaque cursors and compares the same evidence after restart; rerun awaits the frozen startup correction. The new persistent endpoint critical case passed (1 test, real Foundation lookup plus mount-number/replacement checks). Three existing storage cases also passed: second-catalog exclusion, catalog replacement between opens, and replacement directory rejection. Evidence: `persistent-endpoint-critical.log`, `catalog-root-isolation-critical.log`, `catalog-replacement-critical.log`, `artifact-replacement-critical.log`. This is critical implementation evidence; fresh native startup and screen/restart verification remain pending.
+The subsequent Desktop authority check passed its new setup/event assertions but failed the stale Board history artifact expectation. The existing case now consumes all 1,100 complete rows through opaque cursors and compares the same evidence after restart; rerun includes the frozen startup correction and scoped Foundation autorelease pool. The new persistent endpoint critical case passed (1 test, real Foundation lookup plus mount-number/replacement checks). Three existing storage cases also passed: second-catalog exclusion, catalog replacement between opens, and replacement directory rejection. Evidence: `persistent-endpoint-critical.log`, `catalog-root-isolation-critical.log`, `catalog-replacement-critical.log`, `artifact-replacement-critical.log`. This is critical implementation evidence; fresh native startup and screen/restart verification remain pending.
+
+Fresh normal service composition on `v1-owner-test-stable-endpoints` succeeded after protected
+bootstrap. Native Home visibly rendered “Workspace ready”; protected CLI unlock also succeeded
+while Desktop was open. Evidence: `stable-endpoints-live-{service,desktop}.log`,
+`stable-endpoints-live-status.json`, `stable-endpoints-native-ready.png`. The full 17-route capture
+is not yet established: Mac foreground focus changed during automation, so no input was sent when
+the focus guard failed. Owner requested focus-free automation; foreground automation is stopped. Home is not counted as all-screen acceptance. Owner approved the recommended development-only embedded WebDriver integration; lead owns manifests, native registration and its background proof.
+
+The next installed-service attempt passed source/MCP event assertions, complete cursor history and
+catalog reopening, then failed exact H.15 consumed/investment digest equality. Only those two fields
+differed: variable remaining execution time entered the query admission hash. The shared query
+receipt now also carries semantic manifest/schema/SQL identity for successful macro evidence;
+artifact admission encoding, limits and cancellation remain unchanged. The existing identity case
+passed (1 test); the full service/restart case also passed (1 test, 33 filtered, 72.88s). Reactivation reuses retained provider verification; its stale second-doctor expectation was corrected without weakening later-publication or exact cutoff/evidence checks. Preserved failing evidence:
+`desktop-event-authority-before-semantic-identity.log`; current checks:
+`semantic-query-identity-critical.log`, `desktop-event-authority-critical.log`.
+The pending Desktop/restart integration is critically verified; this is not full native-screen or complete stock-workflow acceptance.
 
 Critical evidence under `.agents/tmp/v1-first-stock/`: `fund-admission-critical.log`
 (1 passed, 7 filtered), `brief-pattern-contract-critical.log` (1 passed, 132 filtered),

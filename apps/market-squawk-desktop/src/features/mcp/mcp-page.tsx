@@ -60,7 +60,7 @@ function McpWorkspace({
   const queryClient = useQueryClient()
   const [pending, setPending] = React.useState<McpClientControlRequest | null>(null)
   const [announcement, setAnnouncement] = React.useState("")
-  const queryKey = [...productKeys.domain(bootstrap.productSessionToken, "mcp"), "clients"] as const
+  const queryKey = [...productKeys.domain(bootstrap.productSessionToken, "operations"), "mcp-clients"] as const
   const status = useQuery({
     queryKey,
     queryFn: () => transport.mcpClients(),

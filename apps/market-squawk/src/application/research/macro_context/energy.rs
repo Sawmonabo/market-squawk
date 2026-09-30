@@ -240,7 +240,7 @@ pub(super) fn project_energy(
         source_id: read.receipt.source_id().clone(),
         manifest: output.manifest().clone(),
         object_graph_digest: require_sha256(output.object_graph_digest())?,
-        query_identity: require_sha256(output.query_identity())?,
+        semantic_query_identity: require_sha256(output.semantic_query_identity())?,
         result_digest: require_sha256(output.result_digest())?,
         selection_digest: require_sha256(read.receipt.selection_digest())?,
         native_binding_digest: Some(require_sha256(read.receipt.evidence().binding_digest())?),

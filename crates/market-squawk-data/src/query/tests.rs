@@ -70,9 +70,28 @@ fn query_artifact_identity_binds_exact_row_schema() -> TestResult {
             .artifact_identity(&limits.with_spill_bytes(1024)?)
     );
 
+    let request = QueryRequest::try_new(first.clone(), "SELECT 1")?;
+    let reopened = QueryRequest::try_new(first.clone(), "SELECT 1")?;
+    let different_schema = QueryRequest::try_new(second, "SELECT 1")?;
+    let different_sql = QueryRequest::try_new(first, "SELECT 2")?;
+    let mut later_limits = limits;
+    later_limits.deadline = Duration::from_nanos(999_999_999);
     assert_ne!(
-        QueryRequest::try_new(first, "SELECT 1")?.artifact_identity(&limits),
-        QueryRequest::try_new(second, "SELECT 1")?.artifact_identity(&limits)
+        request.artifact_identity(&limits),
+        reopened.artifact_identity(&later_limits)
+    );
+    assert_eq!(request.semantic_identity(), reopened.semantic_identity());
+    assert_ne!(
+        request.semantic_identity(),
+        different_schema.semantic_identity()
+    );
+    assert_ne!(
+        request.semantic_identity(),
+        different_sql.semantic_identity()
+    );
+    assert_ne!(
+        request.artifact_identity(&limits),
+        different_schema.artifact_identity(&limits)
     );
     Ok(())
 }
@@ -126,6 +145,7 @@ async fn fixed_width_feature_query_issues_exact_monetary_receipt() -> TestResult
         manifest,
         EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
         EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [4; 32]),
         EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
         result,
     );

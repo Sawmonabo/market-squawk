@@ -22,10 +22,10 @@ use market_squawk_runtime::{
     AppRequestEnvelope, ClientCredentialRegistration, ClientId, CredentialError,
     CredentialRegistry, InstallationId, NamedClient, OperationEffect, RuntimeIdentity, WorkspaceId,
 };
-use market_squawk_services::RequestContext;
+use market_squawk_services::{RequestContext, ServiceDomain};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -368,8 +368,43 @@ impl InstalledMcpControl {
         }
     }
 
-    /// Closed operation effect used by the installed dispatcher without advertising this native
-    /// control surface through CLI or MCP capability discovery.
+    /// Private installed descriptors also identify mutations in the native event stream.
+    /// These do not enter the public MCP/tool registry or grant other clients access.
+    pub(super) fn desktop_capabilities() -> Vec<Value> {
+        [
+            STATUS_OPERATION,
+            ACTIVATE_OPERATION,
+            ROTATE_OPERATION,
+            REVOKE_OPERATION,
+        ]
+        .into_iter()
+        .map(|name| {
+            let read_only = name == STATUS_OPERATION;
+            json!({
+                "name": name,
+                "version": "1.0.0",
+                "description": "Installed Desktop MCP access and runtime authority.",
+                "inputSchema": if read_only {
+                    json!({"type": "object", "additionalProperties": false})
+                } else {
+                    json!({"type": "object", "additionalProperties": false,
+                        "required": ["client"],
+                        "properties": {"client": {"enum": ["claude_code", "codex"]}}})
+                },
+                "outputSchema": {"type": "object"},
+                "contract": {
+                    "domain": ServiceDomain::Operations,
+                    "authorization": if read_only { "read_only" } else { "local_confirmation" },
+                },
+                "metadata": {"privateInstalledClient": true},
+                "effects": {"readOnly": read_only, "destructive": !read_only,
+                    "idempotent": read_only, "openWorld": false},
+            })
+        })
+        .collect()
+    }
+
+    /// Closed operation effect used by the installed dispatcher.
     pub(super) fn effect(operation: &str) -> Option<OperationEffect> {
         match operation {
             STATUS_OPERATION => Some(OperationEffect::Read),

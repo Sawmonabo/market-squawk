@@ -90,27 +90,31 @@ fn endpoint_changed() -> io::Error {
 fn macos_volume_uuid(path: &Path, directory: bool) -> io::Result<uuid::Uuid> {
     use objc2_foundation::{NSArray, NSString, NSURL};
 
-    let unavailable = || {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "persistent volume identity unavailable",
-        )
-    };
-    let url = NSURL::from_path(path, directory, None).ok_or_else(unavailable)?;
-    // Apple's Foundation declares this exact raw resource-key value in NSURL.swift.
-    // Use the safe dictionary API rather than an unsafe extern-static or output-pointer read.
-    // https://github.com/swiftlang/swift-corelibs-foundation/blob/00cf342ad7a43ae7059149a87f49c696c1e50219/Foundation/NSURL.swift
-    let key = NSString::from_str("NSURLVolumeUUIDStringKey");
-    let values = url
-        .resourceValuesForKeys_error(&NSArray::from_slice(&[&*key]))
-        .map_err(|_| unavailable())?;
-    let value = values.objectForKey(&key).ok_or_else(unavailable)?;
-    let value = value.downcast_ref::<NSString>().ok_or_else(unavailable)?;
-    let volume = uuid::Uuid::parse_str(&value.to_string()).map_err(|_| unavailable())?;
-    if volume.is_nil() {
-        return Err(unavailable());
-    }
-    Ok(volume)
+    // Rust worker threads do not own an AppKit autorelease pool. Drain Foundation temporaries
+    // here; only owned Rust values leave the scope.
+    objc2::rc::autoreleasepool(|_| {
+        let unavailable = || {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "persistent volume identity unavailable",
+            )
+        };
+        let url = NSURL::from_path(path, directory, None).ok_or_else(unavailable)?;
+        // Apple's Foundation declares this exact raw resource-key value in NSURL.swift.
+        // Use the safe dictionary API rather than an unsafe extern-static or output-pointer read.
+        // https://github.com/swiftlang/swift-corelibs-foundation/blob/00cf342ad7a43ae7059149a87f49c696c1e50219/Foundation/NSURL.swift
+        let key = NSString::from_str("NSURLVolumeUUIDStringKey");
+        let values = url
+            .resourceValuesForKeys_error(&NSArray::from_slice(&[&*key]))
+            .map_err(|_| unavailable())?;
+        let value = values.objectForKey(&key).ok_or_else(unavailable)?;
+        let value = value.downcast_ref::<NSString>().ok_or_else(unavailable)?;
+        let volume = uuid::Uuid::parse_str(&value.to_string()).map_err(|_| unavailable())?;
+        if volume.is_nil() {
+            return Err(unavailable());
+        }
+        Ok(volume)
+    })
 }
 
 #[cfg(all(not(target_os = "macos"), any(unix, windows)))]

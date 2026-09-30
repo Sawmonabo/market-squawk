@@ -1,3 +1,5 @@
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use std::collections::BTreeSet;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -236,6 +238,85 @@ async fn run_installed_service_authority_scenario(
         assert_eq!(events[0]["operation"], "Source.Register");
         assert_eq!(cursor.sequence(), 1);
 
+        // A protected CLI setup mutation must remain private while its change event is
+        // discoverable by Desktop; otherwise unlocking credentials closes every page.
+        let setup = serde_json::to_vec(&json!({
+            "schema": "market-squawk.provider-setup.v1",
+            "request": {"action": "start", "surfaceId": "coinbase.public-market-data"},
+        }))?;
+        let admission = InputAdmission::try_sha256(
+            "market-squawk.provider-setup.v1",
+            u64::try_from(setup.len())?,
+            Sha256::digest(&setup).into(),
+        )?;
+        let ticket = cli
+            .stage_input(admission, &mut setup.as_slice(), CancellationToken::new())
+            .await?;
+        let staged_input = json!({"inputTicketId": ticket.id(), "confirm": true});
+        let unauthorized = desktop
+            .invoke_operation(
+                RequestId::try_string("desktop-cannot-use-cli-setup")?,
+                "Source.Onboarding.ApplyStaged",
+                staged_input.clone(),
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(unauthorized.result()["ok"], false);
+        let setup_result = cli
+            .invoke_operation(
+                RequestId::try_string("installed-staged-setup")?,
+                "Source.Onboarding.ApplyStaged",
+                staged_input,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(
+            setup_result.result()["ok"],
+            true,
+            "{}",
+            setup_result.result()
+        );
+        assert_eq!(
+            setup_result.result()["value"]["data"]["outcome"],
+            "completed"
+        );
+        let (setup_events, _) = desktop
+            .read_events(
+                Some(cursor),
+                EventPageLimit::try_new(4)?,
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(setup_events.len(), 1);
+        assert_eq!(
+            setup_events[0]["operation"],
+            "Source.Onboarding.ApplyStaged"
+        );
+        let descriptors = bootstrap["application"]["operations"]
+            .as_array()
+            .context("read native operation descriptors")?;
+        for (operation, domain) in [
+            ("Source.Onboarding.Apply", "source"),
+            ("Source.Onboarding.ApplyStaged", "source"),
+            ("Governance.ProvisionPrincipalSet", "operations"),
+            ("Governance.AuthenticateAction", "operations"),
+            ("Decision.CommitGovernanceAction", "decision"),
+            ("FairValue.CommitGovernanceAction", "fair_value"),
+            ("Mcp.ActivateCredential", "operations"),
+            ("Mcp.RotateCredential", "operations"),
+            ("Mcp.RevokeCredential", "operations"),
+        ] {
+            let descriptor = descriptors
+                .iter()
+                .find(|value| value["name"] == operation)
+                .context("setup mutation omitted from Desktop event index")?;
+            assert_eq!(descriptor["contract"]["domain"], domain);
+            assert_eq!(descriptor["effects"]["readOnly"], false);
+            assert_eq!(descriptor["metadata"]["privateInstalledClient"], true);
+        }
+
         let jobs = cli
             .invoke_operation(
                 RequestId::try_string("installed-job-list")
@@ -293,6 +374,17 @@ async fn run_installed_service_authority_scenario(
             .await
             .context("revoke Codex credential through desktop authority")?;
         assert_eq!(revoked.result()["value"]["accessRevoked"], true);
+
+        let (events, _) = desktop
+            .read_events(
+                None,
+                EventPageLimit::try_new(128)?,
+                CancellationToken::new(),
+            )
+            .await?;
+        for operation in ["Mcp.RotateCredential", "Mcp.RevokeCredential"] {
+            assert!(events.iter().any(|event| event["operation"] == operation));
+        }
 
         if let Some(path) = real_alpaca_bundle_path.as_deref() {
             real_alpaca_evidence = Some(
@@ -1388,7 +1480,7 @@ struct InstalledMacroContextEvidence {
 #[derive(Debug)]
 struct InstalledBoardEvidence {
     manifest: Value,
-    history_artifact: Value,
+    history_stable: Value,
     dashboard_stable: Value,
     macro_context: InstalledMacroContextEvidence,
     full_history: InstalledFullHistoryEvidence,
@@ -1797,21 +1889,8 @@ async fn exercise_installed_board_vertical(
     );
     assert_eq!(manifest["objectCount"], 1);
 
-    let history = invoke_installed_board(
-        client,
-        "history",
-        "Research.GetHistory",
-        json!({
-            "dataset": board_analytical_dataset,
-            "resultLimits": {
-                "maximumItems": BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
-                "maximumBytes": INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES
-            },
-        }),
-    )
-    .await?;
-    assert_eq!(history["manifest"], manifest["manifest"]);
-    let history_artifact = stable_installed_board_history(&history)?;
+    let history_stable =
+        stable_installed_board_history(client, "history", &manifest["manifest"]).await?;
 
     let dashboard = installed_board_dashboard(client, "initial").await?;
     assert_installed_board_dashboard(&dashboard)?;
@@ -1864,7 +1943,7 @@ async fn exercise_installed_board_vertical(
 
     Ok(InstalledBoardEvidence {
         manifest,
-        history_artifact,
+        history_stable,
         dashboard_stable,
         macro_context,
         full_history,
@@ -2028,6 +2107,7 @@ async fn assert_installed_full_history_later_publication(
     acceptance: &H15InstalledAcceptance,
     first: &InstalledFullHistoryEvidence,
 ) -> TestResult {
+    let doctor_responses = fixture.transport_counters().doctor_responses();
     fixture.advance_provider_clock(Duration::from_secs(60))?;
     let activated = invoke_installed_board(
         client,
@@ -2041,7 +2121,11 @@ async fn assert_installed_full_history_later_publication(
     )
     .await?;
     assert_eq!(activated["outcome"], "completed");
-    assert_eq!(fixture.transport_counters().doctor_responses(), 2);
+    assert_eq!(
+        fixture.transport_counters().doctor_responses(),
+        doctor_responses,
+        "reactivation must reuse retained provider verification"
+    );
     fixture.advance_provider_clock(Duration::from_secs(60))?;
     let second = acceptance
         .publish()
@@ -2156,23 +2240,10 @@ async fn assert_installed_board_restored(
     )
     .await?;
     assert_eq!(manifest, evidence.manifest);
-    let history = invoke_installed_board(
-        client,
-        "history-after-restart",
-        "Research.GetHistory",
-        json!({
-            "dataset": board_analytical_dataset,
-            "resultLimits": {
-                "maximumItems": BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
-                "maximumBytes": INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES
-            },
-        }),
-    )
-    .await?;
-    assert_eq!(
-        stable_installed_board_history(&history)?,
-        evidence.history_artifact
-    );
+    let history_stable =
+        stable_installed_board_history(client, "history-after-restart", &manifest["manifest"])
+            .await?;
+    assert_eq!(history_stable, evidence.history_stable);
     let dashboard = installed_board_dashboard(client, "after-restart").await?;
     assert_installed_board_dashboard(&dashboard)?;
     assert_eq!(
@@ -2546,43 +2617,105 @@ fn stable_installed_board_dashboard(dashboard: &Value) -> Value {
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-fn stable_installed_board_history(history: &Value) -> TestResult<Value> {
-    let artifact = history["artifact"]
-        .as_object()
-        .context("Board history did not publish its bounded Parquet artifact")?;
+async fn stable_installed_board_history(
+    client: &LoopbackApplicationClient,
+    request_suffix: &str,
+    manifest: &Value,
+) -> TestResult<Value> {
+    const PAGE_LIMIT: usize = 100;
+    let mut cursor: Option<String> = None;
+    let mut pages = 0_usize;
+    let mut row_count = 0_u64;
+    let mut seen_rows = BTreeSet::new();
+    let mut rows_digest = Sha256::new();
+    loop {
+        let mut arguments = json!({
+            "dataset": manifest["datasetId"],
+            "limit": PAGE_LIMIT,
+            "projection": "complete",
+            "resultLimits": {
+                "maximumItems": PAGE_LIMIT,
+                "maximumBytes": INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES,
+            },
+        });
+        if let Some(cursor) = &cursor {
+            arguments["cursor"] = Value::String(cursor.clone());
+        }
+        let response = client
+            .invoke_operation(
+                RequestId::try_string(format!("installed-board-{request_suffix}-{pages}"))
+                    .context("construct installed Board history page request ID")?,
+                "Research.GetHistory",
+                arguments,
+                INSTALLED_MCP_SERVICE_TIMEOUT,
+                CancellationToken::new(),
+            )
+            .await
+            .context("read installed Board history page")?;
+        assert_eq!(response.result()["ok"], true, "{}", response.result());
+        let envelope = &response.result()["value"];
+        assert!(serde_json::to_vec(envelope)?.len() <= INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES);
+        let history = &envelope["data"];
+        assert_eq!(&history["manifest"], manifest);
+        let rows = history["rows"]
+            .as_array()
+            .context("Board history page did not return complete observation rows")?;
+        assert!(!rows.is_empty() && rows.len() <= PAGE_LIMIT);
+        assert!(
+            history["arrowIpcBytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert_eq!(envelope["metadata"]["completeness"], "complete");
+        assert_eq!(envelope["metadata"]["returnedItems"], rows.len());
+        assert_eq!(envelope["metadata"]["availableItems"], rows.len());
+        for row in rows {
+            let bytes = serde_json::to_vec(row)?;
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            assert!(
+                seen_rows.insert(digest),
+                "Board history repeated an observation"
+            );
+            // Frame every complete row so restart equality covers all values and provenance
+            // in physical occurrence order, without retaining the whole history in memory.
+            rows_digest.update(u64::try_from(bytes.len())?.to_be_bytes());
+            rows_digest.update(&bytes);
+            row_count += 1;
+        }
+        assert!(
+            row_count <= BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
+        );
+        pages += 1;
+        let has_more = history["hasMore"]
+            .as_bool()
+            .context("Board history page omitted its continuation state")?;
+        if !has_more {
+            assert!(history["nextCursor"].is_null());
+            break;
+        }
+        let next = history["nextCursor"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("Board history page omitted its continuation cursor")?;
+        assert_ne!(
+            cursor.as_deref(),
+            Some(next),
+            "Board history cursor did not advance"
+        );
+        cursor = Some(next.to_owned());
+    }
     assert!(
-        artifact
-            .get("artifactId")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+        pages > 1,
+        "Board history did not exercise cursor continuation"
     );
     assert_eq!(
-        artifact.get("mediaType"),
-        Some(&json!("application/vnd.apache.parquet"))
+        row_count,
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
     );
-    assert_eq!(
-        artifact.get("rowCount"),
-        Some(&json!(
-            BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT
-        ))
-    );
-    assert!(
-        artifact
-            .get("byteCount")
-            .and_then(Value::as_u64)
-            .is_some_and(|value| value > 0)
-    );
-    assert!(artifact.get("sha256").and_then(Value::as_str).is_some_and(
-        |value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    ));
     Ok(json!({
-        "manifest": history["manifest"],
-        "artifact": {
-            "sha256": artifact["sha256"],
-            "byteCount": artifact["byteCount"],
-            "mediaType": artifact["mediaType"],
-            "rowCount": artifact["rowCount"],
-        },
+        "manifest": manifest,
+        "rowCount": row_count,
+        "rowsSha256": format!("{:x}", rows_digest.finalize()),
     }))
 }
 

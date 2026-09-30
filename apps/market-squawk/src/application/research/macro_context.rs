@@ -1815,7 +1815,7 @@ struct MacroContextSourceReceipt {
     source_id: SourceId,
     manifest: DatasetManifestRef,
     object_graph_digest: EvidenceDigest,
-    query_identity: EvidenceDigest,
+    semantic_query_identity: EvidenceDigest,
     result_digest: EvidenceDigest,
     selection_digest: EvidenceDigest,
     native_binding_digest: Option<EvidenceDigest>,
@@ -1828,7 +1828,7 @@ impl MacroContextSourceReceipt {
     ) -> Result<Self, ServiceError> {
         let pinned = output.output();
         let object_graph_digest = require_sha256(pinned.object_graph_digest())?;
-        let query_identity = require_sha256(pinned.query_identity())?;
+        let semantic_query_identity = require_sha256(pinned.semantic_query_identity())?;
         let result_digest = require_sha256(pinned.result_digest())?;
         let selection_digest = require_sha256(output.selection_digest())?;
         Ok(Self {
@@ -1836,7 +1836,7 @@ impl MacroContextSourceReceipt {
             source_id: output.source_id().clone(),
             manifest: pinned.manifest().clone(),
             object_graph_digest,
-            query_identity,
+            semantic_query_identity,
             result_digest,
             selection_digest,
             native_binding_digest: None,
@@ -1895,9 +1895,9 @@ fn compare_source_receipts(
                 .cmp(&right.object_graph_digest.bytes())
         })
         .then_with(|| {
-            left.query_identity
+            left.semantic_query_identity
                 .bytes()
-                .cmp(&right.query_identity.bytes())
+                .cmp(&right.semantic_query_identity.bytes())
         })
         .then_with(|| left.result_digest.bytes().cmp(&right.result_digest.bytes()))
         .then_with(|| {
@@ -1943,7 +1943,7 @@ fn hash_source_receipt(hasher: &mut Sha256, source: &MacroContextSourceReceipt) 
     hash_text(hasher, source.source_id.as_str());
     hash_manifest(hasher, &source.manifest);
     hash_digest(hasher, source.object_graph_digest);
-    hash_digest(hasher, source.query_identity);
+    hash_digest(hasher, source.semantic_query_identity);
     hash_digest(hasher, source.result_digest);
     hash_digest(hasher, source.selection_digest);
     if let Some(binding) = source.native_binding_digest {

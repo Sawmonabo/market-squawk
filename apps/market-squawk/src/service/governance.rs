@@ -15,7 +15,9 @@ use std::{
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::{SecretStore, SecretValue};
 use market_squawk_runtime::{ClientId, RuntimeIdentity};
-use market_squawk_services::{RequestContext, ServiceError, ToolResultMetadata, TypedToolResult};
+use market_squawk_services::{
+    RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolResult,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -737,7 +739,11 @@ impl InstalledGovernanceOperations {
                 "inputSchema": {"type": "object", "additionalProperties": false},
                 "outputSchema": {"type": "object"},
                 "contract": {
-                    "domain": "Governance",
+                    "domain": match name {
+                        PREVIEW_DECISION_ACTION | COMMIT_DECISION_ACTION => ServiceDomain::Decision,
+                        PREVIEW_FAIR_VALUE_ACTION | COMMIT_FAIR_VALUE_ACTION => ServiceDomain::FairValue,
+                        _ => ServiceDomain::Operations,
+                    },
                     "authorization": if read_only { "read_only" } else { "local_confirmation" },
                 },
                 "metadata": {"privateInstalledClient": true},

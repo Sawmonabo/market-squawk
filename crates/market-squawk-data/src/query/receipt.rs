@@ -68,6 +68,7 @@ pub struct PinnedQueryOutput {
     manifest: DatasetManifestRef,
     object_graph_digest: EvidenceDigest,
     query_identity: EvidenceDigest,
+    semantic_query_identity: EvidenceDigest,
     result_digest: EvidenceDigest,
     result: QueryResult,
 }
@@ -77,6 +78,7 @@ impl PinnedQueryOutput {
         manifest: DatasetManifestRef,
         object_graph_digest: EvidenceDigest,
         query_identity: EvidenceDigest,
+        semantic_query_identity: EvidenceDigest,
         result_digest: EvidenceDigest,
         result: QueryResult,
     ) -> Self {
@@ -84,6 +86,7 @@ impl PinnedQueryOutput {
             manifest,
             object_graph_digest,
             query_identity,
+            semantic_query_identity,
             result_digest,
             result,
         }
@@ -102,6 +105,12 @@ impl PinnedQueryOutput {
     /// Returns the manifest, SQL, and execution-limit identity.
     pub const fn query_identity(&self) -> EvidenceDigest {
         self.query_identity
+    }
+
+    /// Returns the exact manifest, row-schema, and SQL identity without execution limits.
+    /// Successful typed selections use this identity so retries retain the same evidence.
+    pub const fn semantic_query_identity(&self) -> EvidenceDigest {
+        self.semantic_query_identity
     }
 
     /// Returns the exact Arrow IPC result digest.

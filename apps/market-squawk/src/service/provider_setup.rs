@@ -8,14 +8,17 @@ use market_squawk_platform::SecretValue;
 use market_squawk_runtime::{
     ClientId, InputStager, InputTicketId, OperationEffect, RuntimeIdentity,
 };
-use market_squawk_services::{RequestContext, ServiceError, ToolResultMetadata, TypedToolResult};
+use market_squawk_services::{
+    RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolResult,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
 use crate::application::source::{
     SourceLifecycleAction, SourceLifecycleAuthority, SourceLifecycleCommand,
-    SourceLifecycleCommandInput, SourceLifecycleDisposition, SourceLifecycleError, SourceLifecycleState,
+    SourceLifecycleCommandInput, SourceLifecycleDisposition, SourceLifecycleError,
+    SourceLifecycleState,
 };
 use crate::provider_onboarding::{
     OnboardingNextAction, ProviderOnboardingError, ProviderOnboardingRequest,
@@ -70,10 +73,10 @@ impl InstalledProviderSetup {
         }
     }
 
-    // These native-only actions are intentionally absent from the MCP/tool registry. The shared
+    // These private installed-client actions are absent from the MCP/tool registry. The shared
     // runtime still authenticates client/generation, limits requests, and fences mutation replay.
     pub(super) fn desktop_capabilities() -> Vec<Value> {
-        [(GET_STATE, true), (APPLY, false)]
+        [(GET_STATE, true), (APPLY, false), (APPLY_STAGED, false)]
             .into_iter()
             .map(|(name, read_only)| {
                 json!({
@@ -82,6 +85,14 @@ impl InstalledProviderSetup {
                     "description": "Native connection setup using the installed source authority.",
                     "inputSchema": if read_only {
                 json!({"type": "object", "additionalProperties": false, "properties": {"sessionId": {"type": "string", "format": "uuid"}}})
+            } else if name == APPLY_STAGED {
+                json!({"type": "object", "additionalProperties": false,
+                    "required": ["inputTicketId", "confirm"],
+                    "properties": {
+                        "inputTicketId": {"type": "string", "format": "uuid"},
+                        "confirm": {"const": true}
+                    }
+                })
             } else {
                 json!({"type": "object", "additionalProperties": false,
                     "required": ["request", "confirm"],
@@ -95,7 +106,7 @@ impl InstalledProviderSetup {
             },
                     "outputSchema": {"type": "object"},
                     "contract": {
-                        "domain": "Source",
+                        "domain": ServiceDomain::Source,
                         "authorization": if read_only { "read_only" } else { "local_confirmation" },
                     },
                     "metadata": {"privateInstalledClient": true},
@@ -455,10 +466,14 @@ impl InstalledProviderSetup {
             && status.fields().runtime_generation_digest.is_none()
             && status.fields().blocker.is_none()
             && lease.as_ref().is_some_and(|lease| {
-                status.fields().configuration_session_id.is_none_or(|id| id == lease.session_id())
-                    && status.fields().public_configuration_digest.is_none_or(|digest| {
-                        digest == lease.public_configuration_digest()
-                    })
+                status
+                    .fields()
+                    .configuration_session_id
+                    .is_none_or(|id| id == lease.session_id())
+                    && status
+                        .fields()
+                        .public_configuration_digest
+                        .is_none_or(|digest| digest == lease.public_configuration_digest())
             });
         let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
             provider,
