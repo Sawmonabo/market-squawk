@@ -29,6 +29,8 @@ use super::{
 
 const AUTHENTICATED_CONTROL_MESSAGE_CAPACITY: usize = 64;
 const AUTHENTICATED_CONTROL_BYTE_CAPACITY: usize = 64 * 1024;
+pub(crate) const ALPACA_IEX_LIVE_AUTHORITY_KEY: &str = "alpaca-basic-iex-live";
+pub(crate) const ALPACA_OPTIONS_LIVE_AUTHORITY_KEY: &str = "alpaca-basic-indicative-options-live";
 
 /// Closed provider set selectable by the production application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,8 +361,8 @@ impl ProductionConnectorProfile {
         match self {
             Self::Coinbase(_) => "coinbase-exchange-public",
             Self::Kraken(profile) => profile.source_key(),
-            Self::AlpacaIex { .. } => "alpaca-basic-iex-live",
-            Self::AlpacaOptions { .. } => "alpaca-basic-indicative-options-live",
+            Self::AlpacaIex { .. } => ALPACA_IEX_LIVE_AUTHORITY_KEY,
+            Self::AlpacaOptions { .. } => ALPACA_OPTIONS_LIVE_AUTHORITY_KEY,
         }
     }
 

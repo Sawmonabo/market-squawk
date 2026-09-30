@@ -134,6 +134,7 @@ use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
 use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
+use crate::live_source::{ALPACA_IEX_LIVE_AUTHORITY_KEY, ALPACA_OPTIONS_LIVE_AUTHORITY_KEY};
 use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
 use crate::provider_activation::{
     FredPointInTimeReadCapability, publish_fred_latest_known, publish_treasury_latest_known,
@@ -680,6 +681,9 @@ impl LocalProduct {
         #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
+        let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
+            Arc::new(provider_rate.clone());
+
         // The installation-global guard proves that no predecessor service can still own this
         // selected workspace. Reconcile each configured live authority once, before any runtime
         // can be constructed. Ordinary in-process source starts retain the strict predecessor
@@ -687,28 +691,39 @@ impl LocalProduct {
         if let SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) =
             &source_authority_startup_policy
         {
+            // Saved Alpaca profiles are restored after secure unlock; static configuration is
+            // not proof that either retained authority is absent. Recover both under the same
+            // exclusive installation capability before any account runtime can start.
+            for key in [ALPACA_IEX_LIVE_AUTHORITY_KEY, ALPACA_OPTIONS_LIVE_AUTHORITY_KEY] {
+                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                    selected_workspace,
+                    key,
+                    Arc::clone(&authorization_subject_resolver),
+                )?;
+            }
             if config.coinbase().is_some() {
                 AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
                     selected_workspace,
                     COINBASE_LIVE_AUTHORITY_KEY,
+                    Arc::clone(&authorization_subject_resolver),
                 )?;
             }
             if config.kraken().is_some() {
                 AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
                     selected_workspace,
                     KRAKEN_LIVE_AUTHORITY_KEY,
+                    Arc::clone(&authorization_subject_resolver),
                 )?;
             }
             if schwab_oauth_installation.is_some() {
                 AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
                     selected_workspace,
                     SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
+                    Arc::clone(&authorization_subject_resolver),
                 )?;
             }
         }
 
-        let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
-            Arc::new(provider_rate.clone());
         let source_registry = match &source_authority_startup_policy {
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
                 let source_store = LocalAuthorityStateStore::try_open(

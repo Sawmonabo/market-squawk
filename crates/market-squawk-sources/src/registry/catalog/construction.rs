@@ -196,7 +196,8 @@ impl AuthoritativeSourceRegistry {
     /// installation-bound workspace guard, advances a structurally valid orphaned run, and then
     /// publishes a clean terminal marker before any live runtime is constructed. Ordinary live
     /// constructors continue to reject unclean predecessors, so an in-process retry cannot use
-    /// this operation to overlap a producer that may still be alive.
+    /// this operation to overlap a producer that may still be alive. Retained authenticated
+    /// policies use the existing durable subject resolver without unlocking credentials.
     ///
     /// # Errors
     ///
@@ -206,6 +207,7 @@ impl AuthoritativeSourceRegistry {
     pub fn reconcile_live_authority_for_exclusive_installed_service_replacement(
         selected_workspace: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
         source_key: &str,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<(), RegistryError> {
         if !is_safe_live_authority_key(source_key) {
             return Err(RegistryError::AuthorityPersistence);
@@ -221,7 +223,7 @@ impl AuthoritativeSourceRegistry {
         let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
         let registry = Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
             store,
-            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+            resolver,
             Arc::new(SystemRawRegistryClock::try_new()?),
             None,
             UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,

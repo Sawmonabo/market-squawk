@@ -15,8 +15,8 @@ use market_squawk::{
     AppConfig,
     service::{
         EphemeralVerificationRoot, InstalledSecretBackendPolicy, InstalledService,
-        InstalledServiceLogging, InstalledServiceRunOutcome, TerminalLogFormat,
-        complete_foreground_keyring_bootstrap_at_installation_root,
+        InstalledServiceInstance, InstalledServiceLogging, InstalledServiceRunOutcome,
+        TerminalLogFormat, complete_foreground_keyring_bootstrap_at_installation_root,
     },
     termination::TerminationSignals,
 };
@@ -123,9 +123,12 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     } else {
         None
     };
-    let startup = Some(ServiceStartupEvidenceWriter::try_open(
-        &installation_data_root,
-    )?);
+    let instance = match ephemeral_verification_root {
+        Some(root) => InstalledServiceInstance::try_acquire_ephemeral(root)?,
+        None => InstalledServiceInstance::try_acquire(&installation_data_root)?,
+    };
+    let _instance_lifetime = instance.retain_until_shutdown();
+    let startup = Some(ServiceStartupEvidenceWriter::try_open(instance.root())?);
     publish_startup(
         startup.as_ref(),
         ServiceStartupState::Starting {
@@ -181,8 +184,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     let result = run_installed_service(
         config,
         logging.store(),
-        &installation_data_root,
-        ephemeral_verification_root,
+        instance,
         secret_backend_policy,
         startup.as_ref(),
     )
@@ -211,8 +213,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
 async fn run_installed_service(
     config: AppConfig,
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
-    installation_data_root: &Path,
-    ephemeral_verification_root: Option<EphemeralVerificationRoot>,
+    instance: InstalledServiceInstance,
     secret_backend_policy: InstalledSecretBackendPolicy,
     startup: Option<&ServiceStartupEvidenceWriter>,
 ) -> Result<InstalledServiceRunOutcome> {
@@ -232,28 +233,12 @@ async fn run_installed_service(
             );
         }
     };
-    let mut starting = Box::pin(async move {
-        match ephemeral_verification_root {
-            Some(ephemeral_root) => {
-                InstalledService::start_ephemeral_verification_with_logging_store_at_installation_root(
-                    config,
-                    ephemeral_root,
-                    logs,
-                    secret_backend_policy,
-                )
-                .await
-            }
-            None => {
-                InstalledService::start_with_logging_store_at_installation_root(
-                    config,
-                    installation_data_root,
-                    logs,
-                    secret_backend_policy,
-                )
-                    .await
-            }
-        }
-    });
+    let mut starting = Box::pin(InstalledService::start_with_logging_store(
+        config,
+        instance,
+        logs,
+        secret_backend_policy,
+    ));
     let service_result = tokio::select! {
         result = &mut starting => result,
         signal = termination.wait() => {

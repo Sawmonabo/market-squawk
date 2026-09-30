@@ -868,15 +868,49 @@ mod tests {
 
     #[test]
     fn exclusive_installed_replacement_restores_nonempty_state_rejected_by_default() -> TestResult {
+        #[derive(Debug)]
+        struct RecoverySubjectResolver {
+            subject: SourceIdentifier,
+        }
+
+        impl crate::AuthorizationSubjectResolver for RecoverySubjectResolver {
+            fn resolve_subject_record(
+                &self,
+                mode: crate::AuthorizationMode,
+                evidence: market_squawk_domain::EvidenceDigest,
+            ) -> Result<SourceIdentifier, crate::AuthorizationSubjectResolutionError> {
+                if mode != crate::AuthorizationMode::UserAuthorized
+                    || evidence != exact_evidence(2).content_digest()
+                {
+                    return Err(crate::AuthorizationSubjectResolutionError::EvidenceUnresolved);
+                }
+                Ok(self.subject.clone())
+            }
+        }
+
         let at = Timestamp::from_unix_nanos(1_000_000_000);
         let crashed_store = Arc::new(FailingAuthorityStore::default());
-        let metadata = direct_metadata_with_provider_and_limit(
+        let mut wire = serde_json::to_value(direct_metadata_with_provider_and_limit(
             "installed-crash-recovery",
             "revision-1",
             "installed-crash-recovery-provider",
             2,
+        )?)?;
+        wire["source_class"] = serde_json::json!("broker");
+        wire["coverage"]["delivery"] = serde_json::json!("authorized_broker");
+        wire["authorization"]["mode"] = serde_json::json!("user_authorized");
+        wire["authorization"]["basis"] = serde_json::json!("installed-recovery-account");
+        wire["budget"]["scope"]["authorization_account"] =
+            serde_json::json!("installed-recovery-account");
+        let metadata: crate::SourceMetadata = serde_json::from_value(wire)?;
+        let resolver: Arc<dyn crate::AuthorizationSubjectResolver> =
+            Arc::new(RecoverySubjectResolver {
+                subject: source_identifier("installed-recovery-subject")?,
+            });
+        let mut crashed = AuthoritativeSourceRegistry::try_new_durable_with_store_and_authorization_subject_resolver(
+            crashed_store.clone(),
+            Arc::clone(&resolver),
         )?;
-        let mut crashed = durable_registry_with_test_store(crashed_store.clone())?;
         let registered = crashed.register_or_resume_exact(metadata.clone(), at)?;
         let expected = crashed.export_authority_state()?;
         assert!(!expected.sources.is_empty());
@@ -913,8 +947,17 @@ mod tests {
             .clone()
             .ok_or("rejected authority payload was absent")?;
         let predecessor_envelope: serde_json::Value = serde_json::from_slice(&rejected_payload)?;
-        let mut replacement = durable_registry_with_test_store_for_exclusive_installed_replacement(
+        let unresolved_store = Arc::new(FailingAuthorityStore {
+            payload: Mutex::new(Some(rejected_payload)),
+            ..FailingAuthorityStore::default()
+        });
+        assert!(matches!(
+            durable_registry_with_test_store_for_exclusive_installed_replacement(unresolved_store),
+            Err(RegistryError::AuthorizationSubjectResolution)
+        ));
+        let mut replacement = AuthoritativeSourceRegistry::try_new_durable_with_store_for_exclusive_installed_replacement_for_test(
             replacement_store.clone(),
+            resolver,
         )?;
         let recovered_payload = replacement_store
             .payload

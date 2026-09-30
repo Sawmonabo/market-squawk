@@ -2,7 +2,7 @@ import { Fragment } from "react"
 import { ChevronsUpDown, LockKeyhole } from "lucide-react"
 import { Link, useLocation } from "react-router-dom"
 
-import { useProduct } from "@/app/product-context"
+import { useProduct, useSystem } from "@/app/product-context"
 import marketSquawkMarkUrl from "@/assets/market-squawk-mark.svg"
 import {
   Sidebar,
@@ -28,19 +28,24 @@ export function AppSidebar() {
   const location = useLocation()
   const current = navigationForPath(location.pathname)
   const product = useProduct()
+  const system = useSystem()
   const navigationDisabled = product.status === "loading"
   const localStatus =
-    product.status === "ready"
-      ? "Ready"
-      : product.status === "loading"
-        ? "Starting"
-        : "Unavailable"
+    system.status === "recovery_required"
+      ? "Unlock required"
+      : product.status === "ready"
+        ? "Ready"
+        : product.status === "loading"
+          ? "Starting"
+          : "Unavailable"
   const localStatusColor =
-    product.status === "ready"
-      ? "bg-[var(--success)]"
-      : product.status === "error"
-        ? "bg-destructive"
-        : "bg-[var(--warning)]"
+    system.status === "recovery_required"
+      ? "bg-[var(--warning)]"
+      : product.status === "ready"
+        ? "bg-[var(--success)]"
+        : product.status === "error"
+          ? "bg-destructive"
+          : "bg-[var(--warning)]"
 
   return (
     <Sidebar collapsible="icon" className="border-sidebar-border">

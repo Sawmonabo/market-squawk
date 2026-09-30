@@ -2,7 +2,35 @@
 
 ## Active previous-close and startup delivery wave — 2026-09-30
 
-Current pushed checkpoint: `38d1203e` — every locked startup route renders secure recovery,
+Current continuation ownership (same branch/worktree):
+
+| Owner | Bounded outcome and exact files | Dependency / critical evidence |
+| --- | --- | --- |
+| Lead | Commit the verified instance/startup, authenticated predecessor recovery and unlock-label changes; shared composition and all Git/build/native actions | Installed-service restart case passes; duplicate launch leaves startup bytes unchanged; native unlock reaches Ready. |
+| Astra `macro_restart_digest` | Research first-load diagnosis and correction in `application/research.rs` and `application/research/macro_context/board.rs` only | Reuse the existing owned research I/O worker for bypassing reads; lead updates async dispatch callers and proves concurrent native initial reads. No broad catalog locking changes. |
+| Astra `stock_capture_trace` | Read-only trace of display-history failure before per-instrument acquisition | Inspect current source/runtime/calendar selection and retained live evidence; return exact failing boundary and minimal correction. No provider actions, builds, Git or edits. |
+
+Settled native sweep: all 17 routes have Ready System/Product state; 16 have no active query
+errors. Research has one `Macro.GetContext` rejection, while the same CLI read succeeds. Real
+source Retry now succeeds but optional display history remains unavailable before per-instrument
+acquisition. No real-price or complete-screen claim is made. Evidence:
+`startup-resolved-settled-routes.json`, `startup-macro-context.json`, `history-resolved-retry.json`.
+
+
+This checkpoint acquires the service instance before writing startup state/logs, retains its lock
+through final drain, restores authenticated crash predecessors using retained subject evidence,
+and labels expected locked startup as Unlock required. The existing installed-service critical
+case passes (68.07s), platform lifetime case passes, authenticated recovery case passes, and
+Desktop typecheck passes. Native unlock and duplicate-process exclusion pass. These checks ran
+in the integrated working tree with the pending history slice; this ordinary checkpoint is not
+an unchanged full-candidate release approval. Research initial-read and price evidence remain open.
+
+Previous pushed checkpoint: `01ca6478` — exclusive structured-log writer ownership prevents
+rejected duplicate service launches from corrupting retained log sequences. The focused log
+retention/reopen case passes. PR #43:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5920788849.
+
+Earlier pushed checkpoint: `38d1203e` — every locked startup route renders secure recovery,
 retaining the original URL and resuming it after unlock. PR #43:
 https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5920710814.
 
@@ -40,8 +68,54 @@ under `.market-squawk/recovery/pre-log-sequence-20260930/`; all 99 event values 
 with only the last five duplicate/overlapping sequence numbers and their hashes repaired offline.
 The existing critical log pipeline case now checks second-owner rejection and reopened sequencing;
 the focused case passes (0.06s), and the history-directory case still passes after the owned-task fix.
-The service rebuild is running; actual extraction and fresh native startup remain unproven. Lead owns native reproduction and integration. These failures
+That service rebuild passed; actual extraction and fresh native startup remain unproven. Lead owns native reproduction and integration. These failures
 block live market-data completion; do not substitute the successful fixtures for that proof.
+
+Current live dependencies after the recovery rebuild: native locked Home renders the correct form,
+but submitting it starts the service then reports a post-unlock handoff failure. Astra
+`startup_bootstrap_trace` owns read-only diagnosis and, if needed, closed sanitized diagnostics in
+Desktop `src-tauri/src/service.rs`/`bridge.rs`. Live Retry no longer reaches extraction because source
+startup reports “source authority predecessor did not shut down cleanly” after the earlier abort.
+Astra `startup_source_authority` owns a read-only trace of that exact crash-recovery boundary; no
+state deletion/reset. Lead owns all live actions and compilation. Both failures remain open.
+
+Startup correction ownership: lead owns `service/mod.rs`, the service binary, and the platform
+instance guard. Dependency: acquire the existing installation capability before startup evidence
+or logging, pass that same capability into composition, retain only its lifetime through final
+status/log drain; workspace binding remains consuming and non-cloneable. Astra
+`startup_bootstrap_trace` supplies read-only API/caller analysis. Lead also owns the two Alpaca live
+key constants and startup reconciliation in `local_product/mod.rs`. The retained predecessor is
+integrity-valid and terminalized by strict admission; recover it through the existing exclusive
+replacement operation, never delete/reset it. Critical evidence: second-owner rejection throughout
+shutdown, existing installed-service critical case, then real locked-native unlock and source Retry.
+
+The duplicate-process live proof passes: refusal preserves startup-state bytes exactly
+(`startup-owned-duplicate-proof.json`). First unlock exposed authenticated recovery using an
+unconfigured subject resolver. Lead corrected the existing recovery method to take the durable
+subject resolver; it reads retained integrity-checked account mappings without accessing secrets.
+The temporary recovery registry issues no request authority. Both Alpaca keys and existing crypto/
+Schwab callers now use that same resolver. Astra `startup_source_authority` extended the existing
+critical recovery case with authenticated retained state and missing-resolver rejection; it passes
+(0.01s, `startup-authenticated-recovery-test.log`) with quota/history/generation assertions intact.
+
+The installed critical case failed in its child during journal replay: measured startup poll frames
+plus replay left only 5,424 bytes of the existing stack for runtime frames. Astra
+`stock_capture_trace` completed the read-only diagnosis; lead heap-owned the existing large startup
+composition future, reducing duplication through callers without changing scheduling or limits.
+The existing installed-service case is recompiling for recheck. Its failed predecessor run is
+retained in `startup-instance-service-critical-test.log`; no acceptance is inferred from it.
+
+GPT-6.1 Sol `starter_market_ui` returned only `components/app-sidebar.tsx` and `status-rail.tsx`:
+locked recovery now says Unlock required instead of generic Unavailable. Loading, genuine failure
+and readiness behavior remain intact. Desktop typecheck passes (`startup-unlock-label-typecheck.log`).
+All helper ownership is released; lead owns current build/live/native verification and integration.
+
+The rebuilt installed-service critical case passes (68.07s; `startup-instance-service-critical-recheck.log`).
+Native unlock reaches Ready and Home now loads. The first route sweep overlapped startup, so its
+first five routes are not acceptance evidence. Settled Research exposed one real `Macro.GetContext`
+operation rejection. Astra `macro_restart_digest` owns read-only diagnosis of that exact query and
+its persisted macro consumers; lead owns further native/CLI reproduction. Real Alpaca Retry is
+running after both local stores unlocked; provider history remains unproven until publication/read.
 
 Outcome being integrated: real completed-session closes in the shared nine-investment collection,
 retained across restart, plus the evidenced concurrent-workspace-read defect. No fabricated prices,

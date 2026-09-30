@@ -7,7 +7,7 @@ mod recovery;
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
@@ -36,14 +36,14 @@ pub struct LocalAuthorityStateStore {
 /// code-owned `installed-service/instance` authority beneath a prepared control root. Holding it
 /// proves that no other service process owns that installation authority for the guard's lifetime.
 pub struct InstalledServiceInstanceGuard {
-    _store: LocalAuthorityStateStore,
+    store: Arc<LocalAuthorityStateStore>,
 }
 
 /// One installation-global service instance bound linearly to one selected workspace.
 ///
-/// The private fields and consuming bind prevent a caller from retaining the unbound installation
-/// lock, substituting a second workspace, or supplying an unrelated source-authority store after
-/// the workspace has been selected.
+/// The private fields and consuming bind prevent a caller from binding a second workspace or
+/// supplying an unrelated source-authority store. A lifetime-only hold may retain the same lock
+/// through process teardown, but cannot select or bind a workspace.
 pub struct InstalledServiceSelectedWorkspaceGuard {
     _instance: InstalledServiceInstanceGuard,
     workspace_paths: LocalPaths,
@@ -77,7 +77,15 @@ impl InstalledServiceInstanceGuard {
                 .join(SERVICE_DIRECTORY)
                 .join(INSTANCE_DIRECTORY),
         )?;
-        Ok(Self { _store: store })
+        Ok(Self {
+            store: Arc::new(store),
+        })
+    }
+
+    /// Keeps this exact instance locked through final status publication and log drain.
+    /// The returned hold has no workspace-binding or authority-state access.
+    pub fn retain_until_shutdown(&self) -> impl Send + Sync + use<> {
+        Arc::clone(&self.store)
     }
 
     /// Consumes the installation instance and binds it to one already selected workspace.

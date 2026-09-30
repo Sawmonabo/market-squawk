@@ -1,10 +1,11 @@
 import * as React from "react"
 
-import { useProduct } from "@/app/product-context"
+import { useProduct, useSystem } from "@/app/product-context"
 import { GlobalLookup } from "@/features/lookup/global-lookup"
 
 export function StatusRail() {
   const product = useProduct()
+  const system = useSystem()
 
   return (
     <section
@@ -14,11 +15,13 @@ export function StatusRail() {
       <StatusFact
         label="Workspace"
         value={
-          product.status === "loading"
-            ? "Starting"
-            : product.status === "ready"
-              ? "Ready"
-              : "Unavailable"
+          system.status === "recovery_required"
+            ? "Unlock required"
+            : product.status === "loading"
+              ? "Starting"
+              : product.status === "ready"
+                ? "Ready"
+                : "Unavailable"
         }
         ready={product.status === "ready"}
       />

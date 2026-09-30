@@ -2,7 +2,10 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, Barrier};
 
-use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
+use market_squawk_platform::{
+    InstalledServiceInstanceGuard, LocalAuthorityStateStore, LocalAuthorityStateStoreError,
+    LocalPaths,
+};
 
 const SLOT_A_FILE: &str = "authority-state-a.bin";
 const SLOT_B_FILE: &str = "authority-state-b.bin";
@@ -151,6 +154,24 @@ fn lifetime_lock_rejects_a_second_store_until_the_first_owner_drops() -> TestRes
     ));
     drop(first);
     let _successor = LocalAuthorityStateStore::try_open(directory.path())?;
+
+    let installation = LocalPaths::prepare(directory.path().join("installation"))?;
+    let workspace = LocalPaths::prepare(directory.path().join("workspace"))?;
+    let guard = InstalledServiceInstanceGuard::try_acquire(installation.control_root()?)?;
+    let process_lifetime = guard.retain_until_shutdown();
+    let selected = guard.bind_selected_workspace(workspace)?;
+    assert!(matches!(
+        InstalledServiceInstanceGuard::try_acquire(installation.control_root()?),
+        Err(LocalAuthorityStateStoreError::AlreadyLocked)
+    ));
+    drop(selected);
+    // Final status/log drain outlive the selected workspace and must still exclude a successor.
+    assert!(matches!(
+        InstalledServiceInstanceGuard::try_acquire(installation.control_root()?),
+        Err(LocalAuthorityStateStoreError::AlreadyLocked)
+    ));
+    drop(process_lifetime);
+    let _next = InstalledServiceInstanceGuard::try_acquire(installation.control_root()?)?;
     Ok(())
 }
 

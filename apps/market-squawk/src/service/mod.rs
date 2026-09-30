@@ -13,6 +13,7 @@ mod forecast_preparation;
 mod governance;
 mod governance_persistence;
 mod historical_study;
+mod instance;
 mod jobs;
 mod lifecycle;
 mod logging;
@@ -90,6 +91,7 @@ pub use crypto_installed_fixture::{
 
 use mcp_client::InstalledMcpRelayTransport;
 
+pub use instance::InstalledServiceInstance;
 use lifecycle::InstalledServiceLifecycle;
 pub use lifecycle::InstalledServiceRunOutcome;
 pub use logging::{InstalledServiceLogging, InstalledServiceLoggingError, TerminalLogFormat};
@@ -456,11 +458,9 @@ impl InstalledService {
         )
     }
 
-    /// Composes every installed-product authority, proves the bound route is ready, then publishes
-    /// the authenticated rendezvous as the final startup step.
+    /// Composes every installed-product authority and publishes authenticated readiness last.
     pub async fn start(config: AppConfig) -> Result<Self, InstalledServiceError> {
-        let logs = logging::open_installation_log_store()?;
-        Self::start_with_logging_store(config, logs).await
+        Self::start_at_installation_root(config, default_installation_data_root()?).await
     }
 
     /// Composes the service at an explicitly selected absolute installation authority root.
@@ -468,64 +468,32 @@ impl InstalledService {
         config: AppConfig,
         installation_root: impl AsRef<Path>,
     ) -> Result<Self, InstalledServiceError> {
-        let installation_paths = prepare_installation_paths(installation_root.as_ref())?;
-        let logs = logging::open_log_store(&installation_paths)?;
-        Self::start_with_logging_store_at_prepared_root(
+        let instance = InstalledServiceInstance::try_acquire(installation_root)?;
+        let logs = logging::open_log_store(&instance.paths)?;
+        Self::start_with_logging_store(
             config,
-            installation_paths,
+            instance,
             logs,
             InstalledSecretBackendPolicy::EncryptedFileOnly,
         )
         .await
     }
 
-    /// Composes the installed service over the process-owned structured-log store.
+    /// Composes the service with an already acquired instance and process-owned logging.
     pub async fn start_with_logging_store(
         config: AppConfig,
-        logs: Arc<crate::application::logs::StructuredLogStore>,
-    ) -> Result<Self, InstalledServiceError> {
-        let installation_paths = LocalPaths::prepare(default_installation_data_root()?)?;
-        Self::start_with_logging_store_at_prepared_root(
-            config,
-            installation_paths,
-            logs,
-            InstalledSecretBackendPolicy::EncryptedFileOnly,
-        )
-        .await
-    }
-
-    /// Composes the service with process-owned logging at an explicit installation root.
-    pub async fn start_with_logging_store_at_installation_root(
-        config: AppConfig,
-        installation_root: impl AsRef<Path>,
-        logs: Arc<crate::application::logs::StructuredLogStore>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
-    ) -> Result<Self, InstalledServiceError> {
-        let installation_paths = prepare_installation_paths(installation_root.as_ref())?;
-        Self::start_with_logging_store_at_prepared_root(
-            config,
-            installation_paths,
-            logs,
-            secret_backend_policy,
-        )
-        .await
-    }
-
-    async fn start_with_logging_store_at_prepared_root(
-        config: AppConfig,
-        installation_paths: LocalPaths,
+        instance: InstalledServiceInstance,
         logs: Arc<crate::application::logs::StructuredLogStore>,
         secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let secret_store = runtime_secret_store(&installation_paths, secret_backend_policy)?;
+        let secret_store = runtime_secret_store(&instance.paths, secret_backend_policy)?;
         Self::start_prepared(
             config,
-            installation_paths,
+            instance,
             workspace_paths,
             secret_store,
             logs,
-            false,
             secret_backend_policy,
         )
         .await
@@ -540,16 +508,15 @@ impl InstalledService {
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let installation_paths =
-            LocalPaths::prepare(deterministic_installation_root(&workspace_paths)?)?;
-        let logs = logging::open_log_store(&installation_paths)?;
+        let instance =
+            InstalledServiceInstance::try_acquire(deterministic_installation_root(&workspace_paths)?)?;
+        let logs = logging::open_log_store(&instance.paths)?;
         Self::start_prepared(
             config,
-            installation_paths,
+            instance,
             workspace_paths,
             secret_store,
             logs,
-            false,
             InstalledSecretBackendPolicy::EncryptedFileOnly,
         )
         .await
@@ -567,12 +534,12 @@ impl InstalledService {
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let installation_paths =
-            LocalPaths::prepare(deterministic_installation_root(&workspace_paths)?)?;
-        let logs = logging::open_log_store(&installation_paths)?;
+        let instance =
+            InstalledServiceInstance::try_acquire(deterministic_installation_root(&workspace_paths)?)?;
+        let logs = logging::open_log_store(&instance.paths)?;
         Self::start_prepared_with_board_fixture(
             config,
-            installation_paths,
+            instance,
             workspace_paths,
             secret_store,
             logs,
@@ -582,46 +549,20 @@ impl InstalledService {
         .await
     }
 
-    /// Composes a verification-only service whose exact credential generations are retired and
-    /// proven absent on every graceful shutdown or startup unwind.
-    ///
-    pub async fn start_ephemeral_verification_with_logging_store_at_installation_root(
-        config: AppConfig,
-        installation_root: EphemeralVerificationRoot,
-        logs: Arc<crate::application::logs::StructuredLogStore>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
-    ) -> Result<Self, InstalledServiceError> {
-        let installation_paths = prepare_installation_paths(installation_root.as_path())?;
-        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let secret_store = runtime_secret_store(&installation_paths, secret_backend_policy)?;
-        Self::start_prepared(
-            config,
-            installation_paths,
-            workspace_paths,
-            secret_store,
-            logs,
-            true,
-            secret_backend_policy,
-        )
-        .await
-    }
-
     async fn start_prepared(
         config: AppConfig,
-        installation_paths: LocalPaths,
+        instance: InstalledServiceInstance,
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
-        ephemeral_verification_credentials: bool,
         secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         Self::start_prepared_inner(
             config,
-            installation_paths,
+            instance,
             legacy_workspace_paths,
             secret_store,
             logs,
-            ephemeral_verification_credentials,
             secret_backend_policy,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
@@ -632,7 +573,7 @@ impl InstalledService {
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     async fn start_prepared_with_board_fixture(
         config: AppConfig,
-        installation_paths: LocalPaths,
+        instance: InstalledServiceInstance,
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
@@ -641,11 +582,10 @@ impl InstalledService {
     ) -> Result<Self, InstalledServiceError> {
         Self::start_prepared_inner(
             config,
-            installation_paths,
+            instance,
             legacy_workspace_paths,
             secret_store,
             logs,
-            false,
             secret_backend_policy,
             Some(board_fixture),
         )
@@ -654,17 +594,20 @@ impl InstalledService {
 
     async fn start_prepared_inner(
         config: AppConfig,
-        installation_paths: LocalPaths,
+        instance: InstalledServiceInstance,
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
-        ephemeral_verification_credentials: bool,
         secret_backend_policy: InstalledSecretBackendPolicy,
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
     ) -> Result<Self, InstalledServiceError> {
-        let instance_guard = runtime::acquire_instance(&installation_paths)?;
+        let InstalledServiceInstance {
+            paths: installation_paths,
+            guard: instance_guard,
+            ephemeral_verification_credentials,
+        } = instance;
         let installation_id = runtime::installation_id(&installation_paths)?
             .map_or_else(|| InstallationId::try_from_uuid(Uuid::new_v4()), Ok)?;
         let workspace_selector = Arc::new(
@@ -678,7 +621,9 @@ impl InstalledService {
         let failed_startup_selection = selection.clone();
         let cleanup_paths = installation_paths.clone();
         let cleanup_store = Arc::clone(&secret_store);
-        let result = async move {
+        // Keep the large composition future out of each forwarding caller's inline state.
+        // Ownership, startup cleanup and polling stay on this same supervised startup task.
+        let result = Box::pin(async move {
             let mut runtime = loop {
                 match PreparedRuntime::prepare(
                     &installation_paths,
@@ -933,7 +878,7 @@ impl InstalledService {
                 _workspace_selector: workspace_selector,
                 _selected_workspace_guard: selected_workspace_guard,
             })
-        }
+        })
         .await;
         let credential_cleanup = if ephemeral_verification_credentials && result.is_err() {
             retire_and_verify_ephemeral_credentials(&cleanup_paths, cleanup_store.as_ref())

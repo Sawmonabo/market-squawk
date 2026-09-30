@@ -33,6 +33,7 @@ pub use direct::{
 pub(crate) use kraken_level3::{KrakenLevel3LiveRuntime, KrakenLevel3RuntimeError};
 pub(crate) use instruments::ProductionCatalogSelection;
 pub use provider::ProductionSourceProvider;
+pub(crate) use provider::{ALPACA_IEX_LIVE_AUTHORITY_KEY, ALPACA_OPTIONS_LIVE_AUTHORITY_KEY};
 #[cfg(feature = "release-evidence")]
 pub(crate) use release_support::{CoinbaseReleaseEvidence, run_coinbase_release_evidence};
 pub(crate) use schwab_rest::{
