@@ -1,21 +1,28 @@
 import * as React from "react"
-import { ArrowRightLeft, Target } from "lucide-react"
+import { Target } from "lucide-react"
 
-import { formatMoney } from "@/lib/formatters"
+import type { DesktopBootstrap } from "@/lib/schemas"
+import type { ProductTransport } from "@/lib/transport"
+import { DemandPanel } from "../shared/demand-panel"
+import { PortfolioRebalance } from "./portfolio-rebalance"
 
 import type {
+  PortfolioAccountSummary,
   PortfolioPositionChoice,
-  PortfolioRebalanceChoice,
 } from "./portfolio-contracts"
 import { investmentDisplayName } from "./portfolio-format"
 import { PreparedChoiceDetails } from "./prepared-choice-details"
 
 export function PortfolioPlanning({
   positionChoices,
-  rebalanceChoices,
+  account,
+  bootstrap,
+  transport,
 }: {
   positionChoices: PortfolioPositionChoice[] | null
-  rebalanceChoices: PortfolioRebalanceChoice[] | null
+  account: PortfolioAccountSummary
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
 }) {
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
@@ -25,13 +32,15 @@ export function PortfolioPlanning({
         </p>
         <h2 className="mt-2 text-lg font-semibold">Portfolio planning</h2>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Review complete position and rebalance choices before making a decision. Planning cannot
+          Review a position choice or enter your rebalance assumptions before making a decision. Planning cannot
           place an order, and no choice is selected automatically.
         </p>
       </header>
       <div className="mt-5 space-y-4">
         <PositionPlanner choices={positionChoices} />
-        <RebalancePlanner choices={rebalanceChoices} />
+        <DemandPanel title="Rebalance plan" className="rounded-lg border border-border bg-background/25 p-4">
+          <PortfolioRebalance account={account} bootstrap={bootstrap} transport={transport} />
+        </DemandPanel>
       </div>
     </section>
   )
@@ -64,57 +73,6 @@ function PositionPlanner({ choices }: { choices: PortfolioPositionChoice[] | nul
             select={setSelectedToken}
           />
           {selected ? <PreparedChoiceDetails choice={selected} /> : null}
-        </>
-      ) : null}
-    </PlanningChoice>
-  )
-}
-
-function RebalancePlanner({ choices }: { choices: PortfolioRebalanceChoice[] | null }) {
-  const [selectedToken, setSelectedToken] = React.useState("")
-  const selected = choices?.find((choice) => choice.actionToken === selectedToken) ?? null
-  React.useEffect(() => setSelectedToken(""), [choices])
-
-  return (
-    <PlanningChoice
-      icon={ArrowRightLeft}
-      title="Review a rebalance plan"
-      unavailable={
-        !choices || choices.length === 0
-          ? "No complete rebalance choices are available. Market Squawk will not assume allocation targets, turnover, cash, costs, or concentration limits."
-          : null
-      }
-    >
-      {choices && choices.length > 0 ? (
-        <>
-          <ChoiceSelect
-            label="Rebalance choice"
-            value={selectedToken}
-            options={choices.map((choice) => ({
-              token: choice.actionToken,
-              label: choice.title,
-            }))}
-            select={setSelectedToken}
-          />
-          {selected ? (
-            <>
-              <PreparedChoiceDetails choice={selected} />
-              <dl className="mt-4 grid gap-3 sm:grid-cols-2">
-                <PlanFact
-                  label="Estimated turnover"
-                  value={selected.estimatedTurnover?.display ?? "Not available"}
-                />
-                <PlanFact
-                  label="Estimated costs"
-                  value={
-                    selected.estimatedCosts
-                      ? formatMoney(selected.estimatedCosts)
-                      : "Not available"
-                  }
-                />
-              </dl>
-            </>
-          ) : null}
         </>
       ) : null}
     </PlanningChoice>
@@ -174,14 +132,5 @@ function ChoiceSelect({
         ))}
       </select>
     </label>
-  )
-}
-
-function PlanFact({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd className="mt-1 font-mono text-sm tabular-nums">{value}</dd>
-    </div>
   )
 }

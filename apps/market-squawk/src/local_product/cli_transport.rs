@@ -1445,6 +1445,11 @@ async fn portfolio(
             read_json_object(&request)?,
             "hypothetical portfolio changes compared",
         ),
+        PortfolioCommand::Rebalance { request } => (
+            "Portfolio.ProposeRebalance",
+            read_json_object(&request)?,
+            "hypothetical allocation changes calculated",
+        ),
         PortfolioCommand::Performance { request } => (
             "Portfolio.GetPerformance",
             read_json_object(&request)?,

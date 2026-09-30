@@ -160,6 +160,7 @@ pub(super) fn call(
             | "Portfolio.GetRisk"
             | "Portfolio.EvaluateScenario"
             | "Portfolio.EvaluateScenarioBatch"
+            | "Portfolio.ProposeRebalance"
     ) {
         ReadScope::from_product_request(image, request, limits)?
     } else {
@@ -167,7 +168,9 @@ pub(super) fn call(
     };
     let revision = if matches!(
         request.name(),
-        "Portfolio.EvaluateScenario" | "Portfolio.EvaluateScenarioBatch"
+        "Portfolio.EvaluateScenario"
+            | "Portfolio.EvaluateScenarioBatch"
+            | "Portfolio.ProposeRebalance"
     ) {
         let token = request
             .arguments()

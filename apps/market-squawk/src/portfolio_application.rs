@@ -755,6 +755,7 @@ impl ApplicationDomainService for PortfolioApplicationService {
                 | "Portfolio.GetAttribution"
                 | "Portfolio.EvaluateScenario"
                 | "Portfolio.EvaluateScenarioBatch"
+                | "Portfolio.ProposeRebalance"
         ) {
             let runtime = Arc::clone(&self.runtime);
             return tokio::task::spawn_blocking(move || {
@@ -763,7 +764,9 @@ impl ApplicationDomainService for PortfolioApplicationService {
                 let read = match request.name() {
                     "Portfolio.ListRevisions" | "Portfolio.GetAttribution" => history::call,
                     "Portfolio.GetTransactions" => transactions::call,
-                    "Portfolio.EvaluateScenario" | "Portfolio.EvaluateScenarioBatch" => read::call,
+                    "Portfolio.EvaluateScenario"
+                    | "Portfolio.EvaluateScenarioBatch"
+                    | "Portfolio.ProposeRebalance" => read::call,
                     _ => holdings::call,
                 };
                 let result = read(

@@ -5275,6 +5275,7 @@ dependencies = [
  "market-squawk-data",
  "market-squawk-domain",
  "market-squawk-platform",
+ "num-bigint",
  "proptest",
  "rusqlite",
  "rust_decimal",

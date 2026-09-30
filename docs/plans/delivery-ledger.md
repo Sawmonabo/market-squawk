@@ -1,16 +1,81 @@
 # Market Squawk Delivery Ledger
 
-## Model-routing correction and execution hold — 2026-09-29
+## Model-routing correction — 2026-09-29
 
 Before resuming, the owner replaced every future GPT-6 Sol assignment with **GPT-6.1 Sol High**
 (`gpt-6.1-sol`, High effort). Unversioned Sol labels in older plans/handoffs mean this current
 selection. **GPT-6 Astra High** (`gpt-6-astra`) and all task boundaries, ownership, review,
 verification and stopping rules remain unchanged. Historical agent provenance is not rewritten.
 The tracked goal, execution plans, project memory and live goal attachment carry this correction.
-Implementation remains on hold pending owner resume; this documentation update starts no agents,
-builds or product changes. Existing uncommitted rebalance work is preserved and is not accepted
-or included in the documentation checkpoint. Both attempted rebalance agents stopped at the usage
-limit before producing changes; their listed scopes are reservations for resumption, not active work.
+The documentation-only checkpoint `edbce3b2` started no agents, builds or product changes and
+preserved the unfinished rebalance work. Its execution hold ended with the subsequent active goal
+resumption below. Earlier quota-stopped rebalance attempts produced no edits; the resumed financial
+and Desktop lanes use the corrected model routing.
+
+## Integrated rebalance calculation — 2026-09-30
+
+Execution resumed through the active goal continuation after model-routing commit `edbce3b2`.
+The earlier documentation hold is lifted. Refreshed source confirms the same duplicate cash-scaling
+defect and unchanged local contract WIP. Reassign the reserved financial/Desktop files below;
+previous quota-stopped attempts produced no edits. The lead retains all shared-file and check ownership.
+
+Acceptance 4/5/6 at `5e0e2ee6`: planning renders null prepared choices. Two active implementations
+compute buy capacity from unscaled sales, then scale both buys and sales; cash 100, holdings
+200/100, targets 25%/75%, reserve 50 wrongly fails though scale 0.5 is feasible. Integrate one
+shared financial calculation and snapshot-bound explicit planning across clients.
+
+| Owner | Exact exclusive files | Dependency and finish evidence |
+| --- | --- | --- |
+| Astra High financial | `crates/market-squawk-portfolio/src/rebalance.rs`, existing `tests/analytics.rs`; `apps/market-squawk/src/portfolio_application/advanced/planning.rs` | Correct cash/turnover constrained common value calculation, reuse from existing revision-bound proposal and application. No fabricated ledger revision. Historical display, original assumptions, cancellation. Existing critical rebalance case; no builds/Git. |
+| GPT-6.1 Sol High Desktop | Desktop `src/features/portfolio/portfolio-planning.tsx`, new cohesive `portfolio-rebalance.tsx`, `portfolio-contracts.ts`, `use-portfolio.ts`, `portfolio-page.tsx` | Replace obsolete prepared rebalance choices with explicit form; reuse snapshot-pinned paged holdings lifecycle from stress without copying it. Demand load, exact strings, clear assumptions/cost gaps and cancellation. Position-impact remains separately unfinished. No builds/Git. |
+| Lead | Portfolio crate public export only; application advanced routing/read/service; shared contracts and TS/native transports; CLI/docs; existing critical service/UI journey; ledger/Git/PR | Freeze input/output below; integrate shared financial authority and consumers; serialize critical checks, push coherent checkpoint. |
+
+ProposeRebalance: `accountToken`, `snapshotToken`, `proposal:{targets:[{instrumentId,targetPercent}],
+maxTurnoverPercent,minimumCash:{amount,currency},allowShort}`. Percentages and amounts are exact
+strings, no frontend financial conversion; every held instrument needs one explicit target, totaling
+100% of portfolio value including cash. Backend evaluates reserve/turnover constraints and reports
+partial progress honestly. No default targets, reserve, turnover or permission to retain shorts.
+Output: standard account/snapshot/clocks/confidence plus original `proposal`, `totalValue` money,
+`trades:[{instrumentId,investment:null|{name,symbol},currentValue,valueChange,projectedValue}]`,
+`projectedCash` money, `turnoverPercent` string, `constrained` boolean. Values are hypothetical
+adjustments, not executable quantities/orders; fees and current execution prices are not estimated.
+
+DAG: contract → disjoint financial/Desktop work → lead integration and existing critical checks
+→ commit/push and release ownership. Shared kernel API/export is settled with financial owner
+before application integration. No independent builds, CI, resource measurement or review rounds.
+Saved planning result persistence/reopening follows the calculation contracts; remains required.
+
+Financial and Desktop handoffs are implemented and inspected; ownership is released to the lead
+for verification/integration. One `RebalanceCalculation` serves both real revision-bound proposals
+and source-observation planning. Exact integer intermediates constrain net cash and half-gross
+turnover; conservative representational rounding preserves conservation and cannot create new
+shorts. Original input strings, selected snapshot and historical display are retained. Report row
+paging defaults no longer limit the number of required allocation targets. Existing request/result
+byte and publication bounds remain; no inputs are truncated or fabricated.
+
+Desktop uses the shared pinned position selector and transient calculation cancellation for stress
+and rebalance. Targets survive cursor navigation; every policy input is explicit. Root consolidated
+exact percent parsing and investment labels, updated the CLI/native/MCP producers and consumers,
+and inspected the short-position precision boundary. Position-impact and saved planning/reopening
+remain separate required work, not claimed complete by this calculation checkpoint.
+
+Critical verification passed on the integrated source:
+
+- Existing financial case `analytics_reports_are_policy_explicit_bounded_and_revision_bound`:
+  1 passed; covers feasible reserve scaling, nonterminating ratios, conservation and turnover.
+- Existing service case `portfolio_import_atomically_publishes_the_queried_revision`: 1 passed;
+  original snapshot, submitted assumptions and rebalance result survive restart and newer imports.
+- Existing Desktop selected-portfolio and explicit-planning cases: 2 passed, 7 skipped; explicit
+  inputs, cursor-spanning targets, backend results, edit invalidation and late-response cancellation.
+- Desktop TypeScript and native library compilation passed. Existing unrelated warnings remain.
+
+Logs are under `.agents/tmp/v1-first-stock/portfolio-rebalance-{math,service,ui,typecheck,native}.log`.
+Rust compilation was serialized with one job. Reproducible application package debug output cleanup
+removed 16.8 GiB before compilation (target fell from 29 GB to 13 GB). No CI, release build,
+whole-app memory measurement or extra review round ran. This is implemented and critically verified;
+live verification and installed workflow completion are not established by these checks.
+Next dependency: complete position-impact calculation and common saved planning evidence/reopening;
+the first live stock journey remains independently required. All lane ownership is released.
 
 ## Integrated stress-scenario calculation — 2026-09-29
 

@@ -12,7 +12,10 @@ use market_squawk_services::{RequestContext, TypedToolRequest, TypedToolResult};
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 
-use super::{base_report, instrument_dimension, money_value, parse_instrument, required_string};
+use super::{
+    base_report, instrument_dimension, money_value, parse_instrument, parse_percentage,
+    required_string,
+};
 use crate::portfolio_application::PortfolioApplicationServiceError;
 use crate::portfolio_application::model::{HoldingObservation, PublishedRevision};
 use crate::portfolio_application::read::{
@@ -153,15 +156,7 @@ fn admit_scenario<'request>(
         if holding.market_value().currency() != revision.account.currency() {
             return Err(PortfolioApplicationServiceError::Analytics);
         }
-        let percent = Decimal::from_str_exact(required_string(shock, "percentChange")?)
-            .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
-        let rate = ExactRate::try_new(percent, ExactDecimalScale::Percent)
-            .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
-        // Decimal division may round at its precision boundary; an exact assumption must survive
-        // conversion back to the submitted percentage without losing any decimal places.
-        if rate.value().checked_mul(Decimal::from(100_u32)) != Some(percent) {
-            return Err(PortfolioApplicationServiceError::InvalidRequest);
-        }
+        let rate = parse_percentage(required_string(shock, "percentChange")?)?;
         shocks.push(
             ScenarioShock::try_new(&instrument_dimension(instrument_id), rate)
                 .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?,

@@ -297,6 +297,41 @@ mod portfolio_application {
                 .await
                 .is_err()
         );
+        // A proposal retains explicit assumptions and the selected observation across restart.
+        let rebalance_arguments = json!({"accountToken":token,"snapshotToken":snapshot,
+            "proposal":{"targets":[
+                {"instrumentId":"11111111-1111-4111-8111-111111111111","targetPercent":"25.0"},
+                {"instrumentId":"22222222-2222-4222-8222-222222222222","targetPercent":"75"}
+            ],"maxTurnoverPercent":"100","minimumCash":{"amount":"500","currency":"USD"},
+                "allowShort":false},"resultLimits":{"maximumItems":16,"maximumBytes":65536}});
+        let rebalance = service
+            .call(
+                admitted("Portfolio.ProposeRebalance", rebalance_arguments.clone())?,
+                context(40)?,
+            )
+            .await?;
+        rebalance.validate_for(
+            application_capabilities()?
+                .find("Portfolio.ProposeRebalance")
+                .ok_or("rebalance descriptor missing")?,
+        )?;
+        let proposal = rebalance.structured_content();
+        assert_eq!(proposal["snapshotToken"], snapshot);
+        assert_eq!(proposal["proposal"], rebalance_arguments["proposal"]);
+        assert_eq!(
+            proposal["totalValue"],
+            json!({"amount":"1075","currency":"USD"})
+        );
+        assert_eq!(
+            proposal["projectedCash"],
+            json!({"amount":"500","currency":"USD"})
+        );
+        assert_eq!(proposal["constrained"], true);
+        assert_eq!(proposal["trades"].as_array().map(Vec::len), Some(2));
+        assert_eq!(proposal["trades"][0]["currentValue"]["amount"], "50");
+        assert_eq!(proposal["trades"][0]["valueChange"]["amount"], "109.375");
+        assert_eq!(proposal["trades"][0]["projectedValue"]["amount"], "159.375");
+        assert_eq!(proposal["trades"][1]["valueChange"]["amount"], "390.625");
         let first_page_arguments = json!({"accountToken": token,
             "cursor": holdings.structured_content()["pageCursor"], "limit": 1,
             "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
@@ -743,6 +778,16 @@ mod portfolio_application {
         assert_eq!(
             retained_scenario.structured_content(),
             scenario.structured_content()
+        );
+        let retained_rebalance = reopened
+            .call(
+                admitted("Portfolio.ProposeRebalance", rebalance_arguments)?,
+                context(41)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_rebalance.structured_content(),
+            rebalance.structured_content()
         );
         let mut pinned_history_arguments = history_arguments;
         pinned_history_arguments["cursor"] = history.structured_content()["pageCursor"].clone();

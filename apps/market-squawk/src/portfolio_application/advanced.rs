@@ -3,6 +3,7 @@
 mod planning;
 mod scenario;
 
+use market_squawk_analytics::{ExactDecimalScale, ExactRate};
 use market_squawk_data::MarketDataInstrumentReadCapability;
 use market_squawk_domain::{Currency, InstrumentId, Money};
 use market_squawk_services::{RequestContext, TypedToolRequest, TypedToolResult};
@@ -27,7 +28,9 @@ pub(super) fn call(
         "Portfolio.EvaluateScenarioBatch" => {
             scenario::evaluate_batch(revision, scope, request, context, instruments)
         }
-        "Portfolio.ProposeRebalance" => planning::rebalance(revision, scope, request, context),
+        "Portfolio.ProposeRebalance" => {
+            planning::rebalance(revision, scope, request, context, instruments)
+        }
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
 }
@@ -73,10 +76,21 @@ pub(super) fn parse_money(value: &Value) -> Result<Money, PortfolioApplicationSe
 }
 
 pub(super) fn parse_decimal(value: &str) -> Result<Decimal, PortfolioApplicationServiceError> {
-    value
-        .parse::<Decimal>()
+    Decimal::from_str_exact(value)
         .map(|decimal| decimal.normalize())
         .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)
+}
+
+/// Preserve every submitted percentage digit when converting to a unit rate.
+pub(super) fn parse_percentage(value: &str) -> Result<ExactRate, PortfolioApplicationServiceError> {
+    let percent = Decimal::from_str_exact(value)
+        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+    let rate = ExactRate::try_new(percent, ExactDecimalScale::Percent)
+        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+    if rate.value().checked_mul(Decimal::from(100_u32)) != Some(percent) {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    Ok(rate)
 }
 
 pub(super) fn required_string<'value>(

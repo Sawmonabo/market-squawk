@@ -909,6 +909,11 @@ pub enum PortfolioCommand {
         /// Confined JSON request containing accountToken, snapshotToken and scenarios.
         request: PathBuf,
     },
+    /// Calculate hypothetical allocation changes against a selected saved portfolio.
+    Rebalance {
+        /// Confined JSON request containing accountToken, snapshotToken and explicit proposal.
+        request: PathBuf,
+    },
     /// Measure point-in-time portfolio performance.
     Performance {
         /// Confined JSON request file.

@@ -116,6 +116,12 @@ export type ProductQuery =
       snapshotToken: string
       scenarios: unknown[]
     }
+  | {
+      query: "portfolioRebalance"
+      accountToken: string
+      snapshotToken: string
+      proposal: Record<string, unknown>
+    }
   | { query: "portfolioRisk" | "portfolioPerformance"; accountToken: string }
   | {
       query: "portfolioRevisions"
@@ -191,11 +197,7 @@ export type SystemQuery =
       provider: string
       dataset: string
     }
-  | {
-      query: "portfolioRebalance"
-      accountId: string
-      proposal: Record<string, unknown>
-    }
+
   | { query: "fairValueWorkspace"; measurementToken?: string; at: string }
   | {
       query: "latestValidForecast"

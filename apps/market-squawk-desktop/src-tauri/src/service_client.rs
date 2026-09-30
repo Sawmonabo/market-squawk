@@ -302,10 +302,12 @@ pub(crate) async fn dashboard_query(
             ("Portfolio.EvaluateScenarioBatch", arguments)
         }
         DashboardQueryCommand::PortfolioRebalance {
-            account_id,
+            account_token,
+            snapshot_token,
             proposal,
         } => {
-            let mut arguments = account_arguments(account_id);
+            let mut arguments = account_token_arguments(account_token);
+            arguments.insert("snapshotToken".to_owned(), json!(snapshot_token));
             arguments.insert("proposal".to_owned(), Value::Object(proposal));
             ("Portfolio.ProposeRebalance", arguments)
         }

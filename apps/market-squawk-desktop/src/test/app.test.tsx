@@ -1010,6 +1010,23 @@ describe("Market Squawk desktop boundary", () => {
         total: { amount: "-900719925474099.301", currency: "USD" },
       },
     })
+    const rebalanceReads: Extract<ProductQuery, { query: "portfolioRebalance" }>[] = []
+    let rebalanceSignal: AbortSignal | undefined
+    let resolveRebalance: ((value: ApplicationResult) => void) | undefined
+    const rebalanceResult = (request: Extract<ProductQuery, { query: "portfolioRebalance" }>) => result({
+      accountId: cashReport.accountId, snapshotToken: request.snapshotToken,
+      effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos, availableAtUnixNanos: cashReport.availableAtUnixNanos,
+      dataConfidence: "limited", proposal: request.proposal,
+      totalValue: { amount: "1075", currency: "USD" },
+      trades: [{ instrumentId: "11111111-1111-4111-8111-111111111111",
+        investment: { name: "Rebalance investment", symbol: null },
+        currentValue: { amount: "50", currency: "USD" }, valueChange: { amount: "109.375", currency: "USD" },
+        projectedValue: { amount: "159.375", currency: "USD" },
+      }, { instrumentId: "22222222-2222-4222-8222-222222222222", investment: null,
+        currentValue: { amount: "25", currency: "USD" }, valueChange: { amount: "390.625", currency: "USD" },
+        projectedValue: { amount: "415.625", currency: "USD" },
+      }], projectedCash: { amount: "500", currency: "USD" }, turnoverPercent: "23.25581395348837209302325581", constrained: true,
+    })
     const exposureReads: { account: string; cursor?: string }[] = []
     const baselineSnapshot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     const historyPage = {
@@ -1072,7 +1089,15 @@ describe("Market Squawk desktop boundary", () => {
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions", "portfolio_scenario", "portfolio_scenario_batch"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions", "portfolio_scenario", "portfolio_scenario_batch", "portfolio_rebalance"] }, undefined, async (request, options) => {
+          if (request.query === "portfolioRebalance") {
+            rebalanceReads.push(request)
+            if (rebalanceReads.length > 1) {
+              rebalanceSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveRebalance = resolve })
+            }
+            return rebalanceResult(request)
+          }
           if (request.query === "portfolioScenario") {
             scenarioReads.push(request)
             if (scenarioReads.length > 1) {
@@ -1286,6 +1311,37 @@ describe("Market Squawk desktop boundary", () => {
     if (lateScenario?.query === "portfolioScenario") resolveScenario?.(scenarioResult(lateScenario))
     await waitFor(() => expect(screen.queryByText("Stress investment")).toBeNull())
 
+    expect(rebalanceReads).toEqual([])
+    await user.click(screen.getByText("History and planning", { selector: "summary" }))
+    const rebalanceToggle = await screen.findByText("Rebalance plan", { selector: "summary" })
+    await user.click(rebalanceToggle)
+    const rebalancePanel = within(rebalanceToggle.parentElement!)
+    await user.type(await rebalancePanel.findByLabelText(/^Target for/), "25.0")
+    await user.click(rebalancePanel.getByRole("button", { name: "Next" }))
+    await user.type(await rebalancePanel.findByLabelText(/^Target for/), "75")
+    await user.type(rebalancePanel.getByLabelText("Maximum turnover (%)"), "100")
+    await user.type(rebalancePanel.getByLabelText("Minimum cash reserve"), "500")
+    await user.selectOptions(rebalancePanel.getByLabelText("Reserve currency"), "USD")
+    await user.selectOptions(rebalancePanel.getByLabelText("Short positions"), "exclude")
+    await user.click(rebalancePanel.getByRole("button", { name: "Calculate rebalance" }))
+    expect(await screen.findByText("Rebalance investment")).toBeTruthy()
+    expect(screen.getByText("USD 109.375")).toBeTruthy()
+    expect(rebalanceReads).toEqual([{ query: "portfolioRebalance", accountToken: second,
+      snapshotToken: cashReport.snapshotToken, proposal: {
+        targets: [
+          { instrumentId: "11111111-1111-4111-8111-111111111111", targetPercent: "25.0" },
+          { instrumentId: "22222222-2222-4222-8222-222222222222", targetPercent: "75" },
+        ], maxTurnoverPercent: "100", minimumCash: { amount: "500", currency: "USD" }, allowShort: false,
+      },
+    }])
+    fireEvent.change(rebalancePanel.getByLabelText("Minimum cash reserve"), { target: { value: "600" } })
+    expect(screen.queryByLabelText("Rebalance calculation results")).toBeNull()
+    await user.click(rebalancePanel.getByRole("button", { name: "Calculate rebalance" }))
+    await waitFor(() => expect(rebalanceReads).toHaveLength(2))
+    await user.click(rebalanceToggle)
+    await waitFor(() => expect(rebalanceSignal?.aborted).toBe(true))
+    resolveRebalance?.(rebalanceResult(rebalanceReads[1]!))
+    await waitFor(() => expect(screen.queryByText("Rebalance investment")).toBeNull())
   })
 
   it("keeps portfolio planning explicit and analysis-only", async () => {
@@ -1293,7 +1349,9 @@ describe("Market Squawk desktop boundary", () => {
     render(
       <PortfolioPlanning
         positionChoices={[portfolioPositionChoice]}
-        rebalanceChoices={null}
+        account={{ accountToken: "portfolio_11111111111111111111111111111111", displayName: "Portfolio 1", currency: "USD", holdings: 2, dataIssues: 0 }}
+        bootstrap={{ productSessionToken: blockedBootstrap.productSessionToken, capabilities: [] }}
+        transport={transport().product}
       />,
     )
 
@@ -1313,11 +1371,6 @@ describe("Market Squawk desktop boundary", () => {
     expect(
       screen.getByText(
         /Planning cannot place an order, and no choice is selected automatically\./,
-      ),
-    ).toBeTruthy()
-    expect(
-      screen.getByText(
-        "No complete rebalance choices are available. Market Squawk will not assume allocation targets, turnover, cash, costs, or concentration limits.",
       ),
     ).toBeTruthy()
   })

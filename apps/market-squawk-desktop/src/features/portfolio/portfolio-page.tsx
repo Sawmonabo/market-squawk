@@ -184,7 +184,7 @@ function SelectedPortfolio({
         </p>
         <div className="mt-4 space-y-4">
           <PortfolioHistory account={account} bootstrap={bootstrap} transport={transport} />
-          <PortfolioPlanning positionChoices={null} rebalanceChoices={null} />
+          <PortfolioPlanning positionChoices={null} account={account} bootstrap={bootstrap} transport={transport} />
 
         </div>
       </DemandPanel>

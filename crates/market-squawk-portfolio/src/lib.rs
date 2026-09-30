@@ -43,8 +43,8 @@ pub use performance::{
     CashFlowTiming, MoneyWeightedMethod, PerformancePeriod, PerformancePolicy, PerformanceReport,
 };
 pub use rebalance::{
-    ProposedTrade, RebalanceConstraintInput, RebalanceConstraints, RebalanceProposal,
-    RebalanceTarget,
+    ProposedTrade, RebalanceCalculation, RebalanceConstraintInput, RebalanceConstraints,
+    RebalanceProposal, RebalanceTarget,
 };
 pub use reconcile::{
     ReconciliationDiscrepancy, ReconciliationField, ReconciliationTolerance, SourcePortfolioTotals,

@@ -524,7 +524,8 @@ pub(crate) enum DashboardQueryCommand {
         scenarios: Vec<Value>,
     },
     PortfolioRebalance {
-        account_id: String,
+        account_token: String,
+        snapshot_token: String,
         proposal: Map<String, Value>,
     },
     PortfolioCandidateImpact {

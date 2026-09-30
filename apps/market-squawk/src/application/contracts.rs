@@ -884,7 +884,8 @@ const PORTFOLIO_SCENARIO_BATCH_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("scenarios", ArgumentKind::Array),
 ];
 const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    ArgumentSpec::required("snapshotToken", ArgumentKind::Uuid),
     ArgumentSpec::required("proposal", ArgumentKind::Object),
 ];
 const PORTFOLIO_CANDIDATE_ARGUMENTS: &[ArgumentSpec] = &[

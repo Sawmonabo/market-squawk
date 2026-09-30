@@ -13,6 +13,7 @@ autotests = false
 market-squawk-analytics = { workspace = true }
 market-squawk-data = { workspace = true }
 market-squawk-domain = { workspace = true }
+num-bigint.workspace = true
 rust_decimal.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }

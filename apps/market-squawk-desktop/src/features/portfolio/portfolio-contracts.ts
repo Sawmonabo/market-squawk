@@ -424,7 +424,7 @@ const portfolioScenarioResultSchema = portfolioScenarioInputSchema.extend({
   }
 })
 
-const scenarioReportFields = {
+const planningReportFields = {
   accountId: z.string().min(1),
   snapshotToken: z.string().uuid(),
   effectiveAtUnixNanos: unixNanosSchema,
@@ -432,10 +432,10 @@ const scenarioReportFields = {
   dataConfidence: z.literal("limited"),
 }
 const portfolioScenarioReportSchema = z.strictObject({
-  ...scenarioReportFields, scenario: portfolioScenarioResultSchema,
+  ...planningReportFields, scenario: portfolioScenarioResultSchema,
 })
 const portfolioScenarioBatchReportSchema = z.strictObject({
-  ...scenarioReportFields, scenarios: z.array(portfolioScenarioResultSchema).min(1),
+  ...planningReportFields, scenarios: z.array(portfolioScenarioResultSchema).min(1),
 })
 
 export function parsePortfolioScenarioReport(
@@ -475,12 +475,80 @@ export const positionChoiceSchema = preparedDecisionSchema
   .extend({ investment: investmentDisplaySchema })
   .strict()
 
-export const rebalanceChoiceSchema = preparedDecisionSchema
-  .extend({
-    estimatedTurnover: percentageSchema.nullable(),
-    estimatedCosts: moneySchema.nullable(),
-  })
-  .strict()
+export const portfolioRebalanceInputSchema = z.strictObject({
+  targets: z.array(z.strictObject({
+    instrumentId: z.string().uuid(),
+    targetPercent: exactDecimalSchema,
+  })),
+  maxTurnoverPercent: exactDecimalSchema,
+  minimumCash: moneySchema,
+  allowShort: z.boolean(),
+}).superRefine((proposal, context) => {
+  const instruments = proposal.targets.map((target) => target.instrumentId)
+  if (new Set(instruments).size !== instruments.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Enter each investment target once." })
+  }
+})
+
+const portfolioRebalanceReportSchema = z.strictObject({
+  ...planningReportFields,
+  proposal: portfolioRebalanceInputSchema,
+  totalValue: moneySchema,
+  trades: z.array(z.strictObject({
+    instrumentId: z.string().uuid(),
+    investment: z.strictObject({ name: z.string().nullable(), symbol: z.string().nullable() }).nullable(),
+    currentValue: moneySchema,
+    valueChange: moneySchema,
+    projectedValue: moneySchema,
+  })),
+  projectedCash: moneySchema,
+  turnoverPercent: exactDecimalSchema,
+  constrained: z.boolean(),
+}).superRefine((report, context) => {
+  const instruments = new Set<string>()
+  const targets = new Set(report.proposal.targets.map((target) => target.instrumentId))
+  if (report.projectedCash.currency !== report.totalValue.currency
+    || report.proposal.minimumCash.currency !== report.totalValue.currency) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Rebalance currencies are inconsistent." })
+  }
+  for (const trade of report.trades) {
+    if (!targets.has(trade.instrumentId) || instruments.has(trade.instrumentId)
+      || trade.currentValue.currency !== report.totalValue.currency
+      || trade.valueChange.currency !== report.totalValue.currency
+      || trade.projectedValue.currency !== report.totalValue.currency) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Rebalance investment evidence is inconsistent." })
+    }
+    instruments.add(trade.instrumentId)
+  }
+})
+
+export function parsePortfolioRebalanceReport(
+  result: ApplicationResult,
+  selection: { snapshotToken: string; effectiveAtUnixNanos: string; availableAtUnixNanos: string | null; accountId?: string },
+  submitted: PortfolioRebalanceInput,
+): PortfolioRebalanceReport {
+  if (result.metadata.returnedItems !== 1 || result.metadata.availableItems !== 1) {
+    throw new Error("The rebalance calculation is incomplete.")
+  }
+  const report = parsePortfolioResult(result, portfolioRebalanceReportSchema)
+  const original = report.proposal
+  if (report.snapshotToken !== selection.snapshotToken
+    || report.effectiveAtUnixNanos !== selection.effectiveAtUnixNanos
+    || report.availableAtUnixNanos !== selection.availableAtUnixNanos
+    || (selection.accountId !== undefined && report.accountId !== selection.accountId)
+    || original.allowShort !== submitted.allowShort
+    || original.maxTurnoverPercent !== submitted.maxTurnoverPercent
+    || original.minimumCash.amount !== submitted.minimumCash.amount
+    || original.minimumCash.currency !== submitted.minimumCash.currency
+    || original.targets.length !== submitted.targets.length
+    || original.targets.some((target, index) => {
+      const input = submitted.targets[index]
+      return !input || target.instrumentId !== input.instrumentId || target.targetPercent !== input.targetPercent
+    })) {
+    throw new Error("The rebalance calculation does not match your selected portfolio and assumptions.")
+  }
+  return report
+}
 
 const importPositionChoiceSchema = z
   .object({
@@ -552,7 +620,8 @@ export type PortfolioScenarioInput = z.infer<typeof portfolioScenarioInputSchema
 export type PortfolioScenarioResult = z.infer<typeof portfolioScenarioResultSchema>
 export type PortfolioScenarioReport = z.infer<typeof portfolioScenarioBatchReportSchema>
 export type PortfolioPositionChoice = z.infer<typeof positionChoiceSchema>
-export type PortfolioRebalanceChoice = z.infer<typeof rebalanceChoiceSchema>
+export type PortfolioRebalanceInput = z.infer<typeof portfolioRebalanceInputSchema>
+export type PortfolioRebalanceReport = z.infer<typeof portfolioRebalanceReportSchema>
 export type PortfolioImportPreview = z.infer<typeof portfolioImportPreviewSchema>
 export type PortfolioImportTransaction = z.infer<typeof portfolioImportTransactionSchema>
 export type PortfolioImportCommit = z.infer<typeof portfolioImportCommitSchema>

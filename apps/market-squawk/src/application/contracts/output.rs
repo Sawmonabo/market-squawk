@@ -6585,10 +6585,13 @@ fn portfolio_evaluated_scenario() -> Value {
     closed_complete(vec![
         ("id", text()),
         ("composition", enumeration(&["additive", "compounded"])),
-        ("shocks", array(closed_complete(vec![
-            ("instrumentId", text()),
-            ("percentChange", text()),
-        ]))),
+        (
+            "shocks",
+            array(closed_complete(vec![
+                ("instrumentId", text()),
+                ("percentChange", text()),
+            ])),
+        ),
         ("contributions", array(portfolio_contribution())),
         ("total", money()),
     ])
@@ -6608,14 +6611,33 @@ fn portfolio_rebalance() -> Value {
     let mut fields = portfolio_report_fields();
     fields.extend([
         (
+            "proposal",
+            closed_complete(vec![
+                (
+                    "targets",
+                    array(closed_complete(vec![
+                        ("instrumentId", text()),
+                        ("targetPercent", text()),
+                    ])),
+                ),
+                ("maxTurnoverPercent", text()),
+                ("minimumCash", money()),
+                ("allowShort", boolean()),
+            ]),
+        ),
+        ("totalValue", money()),
+        (
             "trades",
             array(closed_complete(vec![
                 ("instrumentId", text()),
+                ("investment", nullable(portfolio_investment_display())),
+                ("currentValue", money()),
                 ("valueChange", money()),
+                ("projectedValue", money()),
             ])),
         ),
         ("projectedCash", money()),
-        ("turnover", text()),
+        ("turnoverPercent", text()),
         ("constrained", boolean()),
     ]);
     closed_complete(fields)
