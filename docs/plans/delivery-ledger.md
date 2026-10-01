@@ -5373,3 +5373,163 @@ three current fiscal operations now dispatch through existing dataset/forecast o
 source population returns the complete nine-target unavailable plan. Positive fiscal forecasts
 still require SEC issuer population and an admitted model runtime; no complete analysis claim.
 Source metadata/backpressure and saved-price diagnostics remain separate uncommitted work.
+
+### Saved-price rights correction — base `7062fb5a`
+
+Confirmed: source ingestion admits operation rights but no downstream use grant; the previous-close
+reader requests LocalAnalysis instead of Display. Separately, connection doctor expiry is copied
+into retained personal-use rights. Existing reobservation preserves custody but cannot select a
+new current authorization for original immutable payloads. These prevent saved price display.
+
+| Owner | Exact ownership | Dependency and critical evidence |
+| --- | --- | --- |
+| Astra calendar_currentness_failure | `crates/market-squawk-data/src/research_use/` and `crates/market-squawk-data/src/ingest.rs` only | Existing grant admission and exact-payload current authorization; preserve original lineage, selected grant pinning, revocation and actual policy expiry. Extend existing critical rights tests only. No builds/Git. |
+| Lead | Application policy in `provider_activation/mod.rs`, `market_config.rs`, shared `research_service.rs` integration, display projection use/error mapping; runtime/build/Git | Policy expiry separate from doctor freshness; explicit grants restricted to authorized operations. Saved prices and live prices verified separately in retained workspace. |
+
+DAG: data authority API fix + application policy/display wiring → critical authorization checks →
+retained workspace previous-close and live feed → coherent commit/push. No database reset, schema
+migration, provenance rewrite, permission bypass or expiry extension of an old rights decision.
+The already frozen metadata/backpressure changes are being exercised with the rebuilt service.
+
+Rights wave ownership extends to existing data `tests/publication_recovery.rs` critical cases;
+lead also owns `research/source_errors.rs` and chart-history `projection.rs` shared display
+authorization. Preserve corrupt-authority errors while mapping genuine denied rights to recoverable
+unauthorized state. Fiscal checkpoint pushed as `7062fb5a`.
+
+Astra research_options_failure follows the rebuilt live service read-only: automatic Alpaca
+recovery reports activation-busy / calendar publication unavailable after restart. Identify first
+closed failure from new `overview-rebuilt-service.log`; no edits, builds, runtime actions or secret
+reads. Lead keeps policy integration and service lifecycle ownership.
+
+Lead owns the new cohesive `research_service/retained_use.rs` policy composition and its
+existing `research_service.rs` owner, plus data public reexports. Logical market/valuation
+consumers will use that shared owner; no independently copied permission checks.
+
+Live failure diagnostic ownership: Astra research_options_failure may edit only
+`application/research/market_history/native_sessions.rs` and
+`application/research/calendar/alpaca/durable.rs` to retain closed stage/error identity at the
+confirmed failing boundaries. No payload/credential values, changed admission or new tests.
+These diagnostics join the next serialized build; no separate diagnostic rebuild.
+
+Lead logical-consumer ownership: `application/market_selection/investment.rs`,
+`application/fair_value/automatic.rs` and its `forecast.rs`/`financial.rs` callers. Shared retained
+policy authorization runs through existing owned Research I/O; no new runtime or detached worker.
+Correct diagnostic calendar path is `application/market_calendar/alpaca/durable.rs`.
+
+Direct saved-history evidence: VTI original receipt/anchor/run completion agree, but catalog
+availability is 13.127ms later; all source/object/capture identities match. Astra
+research_options_failure owns correction in native_sessions.rs and identical corporate-actions
+`applicable/anchor.rs` consumer. Data lane released ingest.rs; only a necessary generation-clock
+accessor hunk there transfers to the clock lane. Retained-use methods remain frozen. Evidence:
+`.agents/tmp/v1-first-stock/native-history-clock-diagnosis.json`.
+
+Lead owns canonical `migrations/0008_research_use_authority.sql` and its `src/migrations.rs`
+checksum: existing triggers must preserve original lineage while validating selected current
+exact-payload rights. No new migration/version or compatibility path. Retained development catalog
+requires an explicit backed-up in-place trigger/index correction after critical checks; it has
+not been modified yet. Clock lane also owns only necessary origin-clock query fields in data
+`manifest/catalog.rs`. Existing complete-history restart case supplies regression assertions.
+
+Saved-price critical checks: `provider_market_event_publication_is_restart_queryable` PASS1/1
+(7.68s), `complete_alpaca_history_is_exact_clock_safe_and_restart_selectable` PASS1/1 (2.11s).
+The physical derived-data restart case initially reached `Parquet(RootAuthorityAlreadyOwned)`:
+the fixture retained `historical_v1` and its disk-backed row-index owner across the new reopen.
+After releasing that finished read, the existing physical restart case PASS1/1 (3.76s).
+All three selected data checks now pass. No retained catalog or running binary changed,
+and live dashboard price delivery remains unverified. Next: application compilation/checks,
+backed-up canonical development schema correction, then live Overview and restart verification.
+
+Live-price followup: Astra research_options_failure traces `freshness_only=true, causes=4112`
+from the retained service log to exact health flags and fatal/recoverable handling. Read-only,
+no builds/runtime actions; lead keeps all edits/integration ownership until a concrete cause.
+Application metadata critical compilation is active in the single-job queue.
+
+Confirmed live-feed failure: received stale provider timestamps become terminal health errors
+(`4112` = source freshness + current-data deadline). Astra research_options_failure owns only
+`live_source/sink.rs` for Alpaca nonterminal stale-data disposition and next-data requalification,
+preserving captured publication and withholding current-price authority. Crypto rendezvous unchanged.
+Application compile was stopped after explicit private-import errors; corrected import uses public
+source exports. No compiler remains active while this sink correction is integrated.
+
+Alpaca stale-data correction frozen: process_data now returns without live publication/readiness
+for freshness-only rejection while retaining the existing pending durable handoff. It clears cached
+qualification so the next batch rechecks current health; other failures and crypto unchanged.
+Lead inspected the exact disposition and custody callers. Current serialized command is
+`cargo build --locked --offline -p market-squawk --bin market-squawk-service` (one job),
+log `.agents/tmp/v1-first-stock/saved-price-service-build.log`. This prioritizes the actual live
+Desktop verification; application unit check was not passed or claimed. Offline schema dry-run
+proves only two authority triggers and one selected-payload index differ; apply has not run.
+
+Live verification: service build PASS (6m42s); offline schema correction applied after clean
+shutdown, full catalog backup at `.market-squawk/recovery/pre-retained-rights-7062fb5a/catalog.sqlite3`.
+992 source-rights rows, 876 runs, 11 generations and 3 history publications preserved.
+Live startup FAILED with stack overflow during automatic Alpaca doctor/source restoration.
+Crash report `market-squawk-service-2026-10-01-144420.ips` confirms the nested
+restore_live_sources → execute_owned → continue_account_transition → doctor → HTTP stack.
+Astra live_stack_failure owns read-only diagnosis of that exact path and smallest fix; no builds,
+Git, runtime actions or edits until ownership proposal. Lead owns runtime/native verification.
+
+Stack diagnosis measured exact current binary: 17 active frames consume 2,026,160 bytes on
+a 2 MiB worker, before remaining HTTP/runtime frames. Largest: execute_prepared_commit422,768;
+restore_live_sources354,736; execute_owned245,760; startup closure209,056;
+continue_account_transition193,376. Astra live_stack_failure now owns only
+`local_product/source_lifecycle.rs` for the narrow heap-owned transition-future boundary;
+preserve control/cancellation and existing owner, no thread-stack increases or new runtime.
+Lead will rebuild once, compare generated frame sizes and exercise normal startup.
+
+Stack fix frozen: a non-inlined constructor owns the existing execute_prepared_commit future
+on the heap; its existing body/control flow remains unchanged in the private inner method.
+Lead inspected the15-line boundary and started one-job service rebuild; log
+`.agents/tmp/v1-first-stock/saved-price-stack-build.log`. Native test app was stopped to prevent
+repeated crashes. Post-crash catalog integrity is ok, zero FK violations, history rows preserved.
+
+Screen resilience followup (2026-10-01): refreshed official Tauri process model, Tokio blocking
+work, SQLite WAL and TanStack cached-query guidance against current code. Previous goal turn
+produced new evidence: Markets discards cached market data on refresh error, and individual
+instrument unexpected errors can abort collection aggregation. No blanket error swallowing.
+
+| Owner | Exclusive files | Outcome and check |
+| --- | --- | --- |
+| GPT-6.1 Sol High screen_refresh | Desktop `src/features/markets/market-collection.tsx` only | Keep matching saved market data visible during refresh failure, clearly mark freshness/recovery; no stale identity reuse. Lead typecheck/native verification. |
+| Lead | Runtime, shared backend contracts/aggregation, ledger, Git and builds | Verify completed stack build at normal stack size, then actual retained price reads and startup stability. Inspect per-instrument failure boundary before changing shared contracts. |
+
+Dependencies: stack build completed (5m14s) -> generated frame inspection -> normal service startup
+and native reads. UI presentation is independent, no extra build by agent. Integrate only after
+actual diff inspection and critical checks; no new branches/worktrees or quarter review.
+
+Live rebuilt service remains running through restoration (normal Tokio worker stack). Generated
+execute_prepared_owned frame dropped to 61,232 bytes; exact binary UUID E477343A-E4F6-3D66-98ED-0E1DF4F019E9.
+New live evidence now isolates calendar publication rejection: account-currentness-activation-lock
+reports activation-busy during calendar_ingest (IngestError discriminant34). Astra
+calendar_currentness_failure owns read-only trace of account.rs currentness, calendar durable
+publication and source_lifecycle transition guard, to propose exact smallest shared-guard fix.
+No edits/builds/Git; lead owns runtime and shared integration.
+
+Further live result supersedes initial liveness observation: service PID19996 aborted exit134
+with another Tokio stack overflow after calendar retry attempts. Native client restarted service;
+lead stopped background Desktop to avoid retry churn. Astra live_stack_failure now owns exact
+new crash diagnosis and may edit only source_lifecycle.rs plus propose other necessary boundaries
+before editing them. Same single-job rebuild after both stack and calendar corrections freeze.
+
+Calendar diagnosis correction: discriminant34 is catalog AuthorityBusy. Existing calendar
+publication already reuses its held activation read guard; adjacent activation-busy warnings do
+not prove self-contention. Two redundant one-shot catalog acquisitions in provider reobservation
+are the direct failure sites. Astra calendar_currentness_failure now exclusively owns data
+ingest.rs, app research_service.rs and calendar durable.rs for initial-reconciliation reuse and
+existing owned-worker publication with deadline/cancel checks; no competing builds.
+
+Stack ownership adds source_lifecycle/public_preparation.rs to live_stack_failure: measured
+73,576-byte prepare_public_command and 73,216-byte scalar live.start future variants keep
+restoration parents large. Isolate those canonical child constructions without increasing stacks.
+Lead owns existing Desktop app.test.tsx extension: first unavailable -> real cached fixture price
+-> failed refresh preserves price/time and disables changes -> recovery. Initial focused run
+failed before Markets loaded during cold lazy transformation; real route preloaded for the
+read-lifecycle regression, no product timing assertion loosened. Typecheck passed.
+
+Independent screen-refresh checkpoint: shared Home/Markets collection preserves matching cached
+choices/prices/timestamps when refresh fails, marks freshness unverified and disables collection
+changes until choices recover. Existing market journey PASS1/1 (2.75s), including initial absence,
+remove/restore, successful price read, both refresh failures, preserved timestamp and recovery.
+TypeScript check passed. This is critical fixture evidence, not native/live startup completion.
+Only its two Desktop files plus ledger are checkpointed; backend WIP remains explicitly pending.
+Git inventory: one primary worktree, local and origin main/release/feature only. No cleanup needed.

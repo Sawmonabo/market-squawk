@@ -659,9 +659,13 @@ describe("Market Squawk desktop boundary", () => {
   })
 
   it("renders one provider-neutral market journey with current price and explicit selection", async () => {
+    // Load the real lazy route before timing UI assertions; Vite's cold transform is not app latency.
+    await import("@/features/markets")
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     let collectionRevision = 3
+    let marketRefreshFails = true
+    let collectionRefreshFails = false
     let collectionChoices = ["SPY", "QQQ", "DIA", "IWM", "VTI", "AAPL", "MSFT", "NVDA", "TSLA"]
       .map((symbol) => ({ symbol, kept: symbol !== "QQQ" }))
     const historyToken = "history_0123456789abcdef0123456789abcdef"
@@ -692,9 +696,17 @@ describe("Market Squawk desktop boundary", () => {
           transport={transport(readyBootstrap, undefined, async (request, options) => {
             issuedQueries.push(request)
             if (request.query === "marketCollection") {
-              if (request.includeMarket === true) throw new Error("Current market evidence could not be read.")
+              if (collectionRefreshFails || (request.includeMarket === true && marketRefreshFails)) {
+                throw new Error("Current market evidence could not be read.")
+              }
               return {
-                data: { revision: collectionRevision.toString(), entries: collectionChoices.map((choice) => ({ ...choice, market: null })) },
+                data: { revision: collectionRevision.toString(), entries: collectionChoices.map((choice) => ({
+                  ...choice,
+                  market: request.includeMarket && choice.symbol === "SPY" ? {
+                    ...marketOverviewRow,
+                    identity: { symbol: "SPY", name: "S&P 500 fund", assetClass: "fund" },
+                  } : null,
+                })) },
                 metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
               }
             }
@@ -742,7 +754,7 @@ describe("Market Squawk desktop boundary", () => {
     for (const choice of collectionChoices) expect(collection.getByText(choice.symbol)).toBeTruthy()
     expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false)
     expect((collection.getByRole("button", { name: "Keep QQQ in your collection" }) as HTMLButtonElement).disabled).toBe(false)
-    expect(collection.queryByText("68000.15 USD")).toBeNull()
+    expect(collection.queryByText("USD 68,000.15")).toBeNull()
     expect(issuedQueries).toContainEqual({ query: "marketCollection", includeMarket: true })
     await user.click(collection.getByRole("button", { name: "Remove SPY from your collection" }))
     const restore = await collection.findByRole("button", { name: "Keep SPY in your collection" })
@@ -755,6 +767,26 @@ describe("Market Squawk desktop boundary", () => {
       { query: "marketSetCollectionChoice", expectedRevision: "4", symbol: "SPY", kept: true, confirmed: true },
     ])
     expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
+
+    // A failed background read must preserve the last matching price, without claiming it is live.
+    marketRefreshFails = false
+    await user.click(collection.getByRole("button", { name: "Refresh collection" }))
+    expect(await collection.findByText("USD 68,000.15")).toBeTruthy()
+    const priceTime = screen.getByRole("region", { name: "Your market collection" }).querySelector("time")?.dateTime
+    expect(priceTime).toBe(marketObservedAt)
+    marketRefreshFails = true
+    collectionRefreshFails = true
+    await user.click(collection.getByRole("button", { name: "Refresh collection" }))
+    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(true))
+    expect(await collection.findByText("Saved collection could not be refreshed")).toBeTruthy()
+    expect(collection.getByText(/Saved price · Freshness not checked/)).toBeTruthy()
+    expect(collection.getByText("USD 68,000.15")).toBeTruthy()
+    expect(collection.queryByText(/^Current/)).toBeNull()
+    expect(screen.getByRole("region", { name: "Your market collection" }).querySelector("time")?.dateTime).toBe(priceTime)
+    collectionRefreshFails = false
+    marketRefreshFails = false
+    await user.click(collection.getByRole("button", { name: "Refresh collection" }))
+    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false))
 
     await user.click(marketCard)
     await waitFor(() => {

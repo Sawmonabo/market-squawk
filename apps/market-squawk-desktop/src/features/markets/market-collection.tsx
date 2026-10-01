@@ -43,7 +43,7 @@ export function useMarketCollection(transport: ProductTransport, scope: ProductS
   })
   const marketInformation = useQuery({
     queryKey: productKeys.operation(scope, "market", "Market.GetCollection", marketInformationInput),
-    enabled: collection.isSuccess,
+    enabled: collection.data !== undefined,
     queryFn: async ({ signal }) => parseMarketCollectionResult(await transport.query(marketInformationInput, { signal })),
   })
   const refresh = () => queryClient.invalidateQueries({
@@ -54,7 +54,9 @@ export function useMarketCollection(transport: ProductTransport, scope: ProductS
     mutationKey: productKeys.operation(scope, "market", "Market.SetCollectionChoice", {}),
     mutationFn: async (input: { symbol: string; kept: boolean }) => {
       const snapshot = collection.data
-      if (!snapshot || collection.isError) throw new Error("Reload your collection before changing it.")
+      if (!snapshot || collection.isError || collection.isFetching) {
+        throw new Error("Reload your collection before changing it.")
+      }
       const result = choicesSchema.parse((await transport.query({
         query: "marketSetCollectionChoice", expectedRevision: snapshot.revision,
         symbol: input.symbol, kept: input.kept, confirmed: true,
@@ -82,7 +84,7 @@ export function MarketCollection({
 }) {
   const { collection, marketInformation, choice } = state
   const savedCollection = collection.data
-  const marketCollection = marketInformation.isSuccess ? marketInformation.data : null
+  const marketCollection = marketInformation.data ?? null
   const marketInformationMatches = savedCollection !== undefined && marketCollection !== null
     && savedCollection.revision === marketCollection.revision
     && savedCollection.entries.length === marketCollection.entries.length
@@ -97,35 +99,44 @@ export function MarketCollection({
   const kept = entries.filter((entry) => entry.kept)
   const removed = entries.filter((entry) => !entry.kept)
   const busy = choice.isPending || collection.isFetching || collection.isError
+  const marketInformationUnverified = collection.isError || collection.isFetching
+    || marketInformation.isError || marketInformation.isFetching
 
   return <section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Your market collection">
     <div className="flex items-start justify-between gap-3">
       <div>
-        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Current context</p>
+        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Market context</p>
         <h2 className="mt-1 text-base font-semibold">Your market collection</h2>
         <p className="mt-2 text-xs leading-5 text-muted-foreground">Keep the investments you want to see on Home and Markets. You can restore any removed investment below.</p>
       </div>
       <Activity className="size-5 shrink-0 text-primary" aria-hidden="true" />
     </div>
     {collection.isPending ? <Skeleton className="mt-5 h-40 rounded-lg" />
-      : collection.isError ? <Alert className="mt-5">
+      : collection.isError && savedCollection === undefined ? <Alert className="mt-5">
         <CircleAlert aria-hidden="true" /><AlertTitle>Your market collection is unavailable</AlertTitle>
         <AlertDescription>Reload to check your saved choices.</AlertDescription>
       </Alert>
         : <>
+          {collection.isError ? <Alert className="mt-5">
+            <CircleAlert aria-hidden="true" /><AlertTitle>Saved collection could not be refreshed</AlertTitle>
+            <AlertDescription>Showing your last saved choices. Refresh before changing your collection.</AlertDescription>
+          </Alert> : null}
           {marketInformation.isError ? <Alert className="mt-5">
-            <CircleAlert aria-hidden="true" /><AlertTitle>Market information is unavailable</AlertTitle>
-            <AlertDescription>Your saved collection is available. Prices and investment details could not be checked. Refresh to try again.</AlertDescription>
-          </Alert> : marketInformation.isSuccess && !marketInformationMatches ? <Alert className="mt-5">
+            <CircleAlert aria-hidden="true" /><AlertTitle>{marketInformationMatches ? "Market information could not be refreshed" : "Market information is unavailable"}</AlertTitle>
+            <AlertDescription>{marketInformationMatches
+              ? "Showing saved prices and investment details. Their freshness could not be checked. Refresh to try again."
+              : "Your saved collection is available. Prices and investment details could not be checked. Refresh to try again."}</AlertDescription>
+          </Alert> : marketCollection !== null && !marketInformationMatches ? <Alert className="mt-5">
             <CircleAlert aria-hidden="true" /><AlertTitle>Market information needs refreshing</AlertTitle>
             <AlertDescription>The market information does not match your latest saved collection. Refresh to check again.</AlertDescription>
-          </Alert> : marketInformation.isFetching ? <p role="status" className="mt-4 text-xs text-muted-foreground">Checking market information…</p> : null}
+          </Alert> : collection.isFetching || marketInformation.isFetching
+            ? <p role="status" className="mt-4 text-xs text-muted-foreground">Checking your saved choices and market information…</p> : null}
           {kept.length === 0 ? <p className="mt-5 rounded-lg border border-dashed border-border p-5 text-xs text-muted-foreground">Your collection is empty. Keep an investment below to show it here again.</p>
             : <ul className={layout === "grid" ? "mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3" : "mt-5 divide-y divide-border"}>
               {kept.map((entry) => <li key={entry.symbol} className={layout === "grid" ? "rounded-lg border border-border bg-background/35 p-3" : "py-3 first:pt-0 last:pb-0"}>
                 <div className="flex items-center gap-3">
                   <div className="min-w-0 flex-1">
-                    <CollectionInvestment symbol={entry.symbol} market={entry.market} onSelect={onSelect} />
+                    <CollectionInvestment symbol={entry.symbol} market={entry.market} unverified={marketInformationUnverified} onSelect={onSelect} />
                   </div>
                   <Button type="button" size="xs" variant="ghost" disabled={busy}
                     aria-label={`Remove ${entry.symbol} from your collection`}
@@ -151,16 +162,17 @@ export function MarketCollection({
       <Button type="button" size="sm" variant="outline" disabled={collection.isFetching || choice.isPending}
         onClick={() => {
           void collection.refetch()
-          if (collection.isSuccess) void marketInformation.refetch()
+          if (savedCollection !== undefined) void marketInformation.refetch()
         }}>Refresh collection</Button>
       <Button asChild size="sm" variant="outline"><Link to="/markets">Explore markets</Link></Button>
     </div>
   </section>
 }
 
-function CollectionInvestment({ symbol, market, onSelect }: {
+function CollectionInvestment({ symbol, market, unverified, onSelect }: {
   symbol: string
   market: MarketProductRow | null
+  unverified: boolean
   onSelect?: (selectionToken: string) => void
 }) {
   const label = <><span className="block text-xs font-medium">{symbol}</span>
@@ -172,7 +184,7 @@ function CollectionInvestment({ symbol, market, onSelect }: {
     {market === null ? <p className="mt-2 text-[10px] text-muted-foreground">Investment details are not available yet.</p>
       : <div className="mt-2 text-[10px] text-muted-foreground">
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
-        <p>{availabilityLabel(market)}{market.changePercent !== null ? ` · ${market.changePercent}%` : ""}</p>
+        <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : availabilityLabel(market)}{market.changePercent !== null ? ` · ${market.changePercent}%` : ""}</p>
         {market.asOf ? <time dateTime={market.asOf}>{new Date(market.asOf).toLocaleString()}</time> : null}
       </div>}
   </>
