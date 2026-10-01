@@ -1,12 +1,15 @@
 //! Bounded ownership for the Kraken durable-publication source handoff.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 
 use market_squawk_adapter_kraken::KrakenPendingPublication;
 use market_squawk_domain::Timestamp;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
-use super::publication_admission::PublicationReservation;
+use super::publication_admission::{
+    PublicationDrainError, PublicationReservation, drain_admitted_publications,
+};
 
 /// Exact captured frame plus its one-use typed single-decode result.
 #[derive(Debug)]
@@ -28,6 +31,7 @@ impl KrakenCapturedPublicationInput {
 pub(super) struct KrakenCapturedPublicationIngress {
     sender: mpsc::Sender<KrakenCapturedPublicationInput>,
     frames: Arc<Semaphore>,
+    frame_capacity: NonZeroUsize,
 }
 
 impl KrakenCapturedPublicationIngress {
@@ -37,9 +41,28 @@ impl KrakenCapturedPublicationIngress {
     ) -> (Self, KrakenCapturedPublicationReceiver) {
         let (sender, receiver) = mpsc::channel(capacity.get());
         (
-            Self { sender, frames },
+            Self {
+                sender,
+                frames,
+                frame_capacity: capacity,
+            },
             KrakenCapturedPublicationReceiver { receiver },
         )
+    }
+
+    pub(super) async fn drain_admitted(
+        &self,
+        deadline: Instant,
+        forced: &CancellationToken,
+    ) -> Result<(), PublicationDrainError> {
+        drain_admitted_publications(
+            &self.sender,
+            &self.frames,
+            self.frame_capacity,
+            deadline,
+            forced,
+        )
+        .await
     }
 
     pub(super) fn is_closed(&self) -> bool {

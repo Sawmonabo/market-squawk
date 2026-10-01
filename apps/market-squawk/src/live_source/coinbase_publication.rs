@@ -1,6 +1,6 @@
 //! Bounded ownership for the public Coinbase durable-publication handoff.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 
 use market_squawk_adapter_coinbase::{
     CoinbaseMarketHandoff, CoinbaseMarketPublicationContext, CoinbaseMarketSealRejoin,
@@ -8,8 +8,11 @@ use market_squawk_adapter_coinbase::{
 use market_squawk_domain::Timestamp;
 use market_squawk_sources::ProviderCaptureSealRequest;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
-use crate::live_source::publication_admission::PublicationReservation;
+use crate::live_source::publication_admission::{
+    PublicationDrainError, PublicationReservation, drain_admitted_publications,
+};
 
 /// Closed live qualification result; raw custody is retained for either disposition.
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +52,7 @@ impl CoinbaseCapturedPublicationInput {
 pub(in crate::live_source) struct CoinbaseCapturedPublicationIngress {
     sender: mpsc::Sender<CoinbaseCapturedPublicationInput>,
     frames: Arc<Semaphore>,
+    frame_capacity: NonZeroUsize,
 }
 
 impl CoinbaseCapturedPublicationIngress {
@@ -58,9 +62,28 @@ impl CoinbaseCapturedPublicationIngress {
     ) -> (Self, CoinbaseCapturedPublicationReceiver) {
         let (sender, receiver) = mpsc::channel(capacity.get());
         (
-            Self { sender, frames },
+            Self {
+                sender,
+                frames,
+                frame_capacity: capacity,
+            },
             CoinbaseCapturedPublicationReceiver { receiver },
         )
+    }
+
+    pub(in crate::live_source) async fn drain_admitted(
+        &self,
+        deadline: Instant,
+        forced: &CancellationToken,
+    ) -> Result<(), PublicationDrainError> {
+        drain_admitted_publications(
+            &self.sender,
+            &self.frames,
+            self.frame_capacity,
+            deadline,
+            forced,
+        )
+        .await
     }
 
     pub(in crate::live_source) fn is_closed(&self) -> bool {

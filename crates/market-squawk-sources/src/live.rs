@@ -452,6 +452,19 @@ pub trait RawMarketSink: Send {
         Box::pin(async { Ok(()) })
     }
 
+    /// Finishes accepted publications before a cancelled stream releases its request authority.
+    ///
+    /// The adapter must retain its transport/request permit across this call. The sink decides
+    /// whether cancellation requests an orderly drain or immediate revocation; a forced stop
+    /// must not wait for new publication. Sinks without asynchronous publication have no drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an orderly drain fails or exceeds its original shutdown deadline.
+    fn finish_stream_cancellation(&mut self) -> BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Binds an exact provider request or established transport to this live stream's health.
     ///
     /// Sources call this once after the transport handshake and before publishing the first

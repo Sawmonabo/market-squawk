@@ -993,6 +993,7 @@ impl ProductionLiveSourceComposition {
                 }
             }
         };
+        let graceful_shutdown = CancellationToken::new();
         let owner = if let Some(catalog) = catalog.as_ref() {
             match installation {
                 ProductionSourceInstallation::Single(profile) => {
@@ -1025,7 +1026,9 @@ impl ProductionLiveSourceComposition {
                     match supervisor {
                         Ok(supervisor) => {
                             ProductionSupervisorOwner::start_single(
-                                supervisor.with_completion(completion.clone()),
+                                supervisor
+                                    .with_completion(completion.clone())
+                                    .with_graceful_shutdown(graceful_shutdown.clone()),
                                 cancellation,
                             )
                             .await
@@ -1090,9 +1093,12 @@ impl ProductionLiveSourceComposition {
                                         );
                                             match trade_supervisor {
                                     Ok(trade_supervisor) => KrakenPublicSupervisorSet::start(
-                                        book_supervisor.with_completion(completion.clone()),
-                                        trade_supervisor.with_completion(completion.clone()),
+                                        book_supervisor.with_completion(completion.clone())
+                                            .with_graceful_shutdown(graceful_shutdown.clone()),
+                                        trade_supervisor.with_completion(completion.clone())
+                                            .with_graceful_shutdown(graceful_shutdown.clone()),
                                         cancellation,
+                                        graceful_shutdown.clone(),
                                         source_shutdown,
                                         currentness,
                                     )
@@ -1172,7 +1178,11 @@ impl ProductionLiveSourceComposition {
             let deadline = Instant::now()
                 .checked_add(source_shutdown)
                 .unwrap_or_else(Instant::now);
-            let supervisor = owner.shutdown(source_shutdown).await.err().map(Box::new);
+            let supervisor = owner
+                .shutdown(source_shutdown, false)
+                .await
+                .err()
+                .map(Box::new);
             let publication = match publication.take() {
                 Some(publication) => publication.shutdown(deadline).await.err(),
                 None => None,
@@ -1193,6 +1203,7 @@ impl ProductionLiveSourceComposition {
         }
         Ok(ProductionLiveSourceRuntime {
             supervisor: owner,
+            graceful_shutdown,
             completion,
             publication,
             live,
@@ -1247,13 +1258,19 @@ impl ProductionSupervisorOwner {
         }
     }
 
-    async fn shutdown(self, timeout: Duration) -> Result<(), ProductionLiveSourceRuntimeError> {
+    async fn shutdown(
+        self,
+        timeout: Duration,
+        graceful: bool,
+    ) -> Result<(), ProductionLiveSourceRuntimeError> {
         match self {
             Self::Single {
                 cancellation,
                 mut task,
             } => {
-                cancellation.cancel();
+                if !graceful {
+                    cancellation.cancel();
+                }
                 match tokio::time::timeout(timeout, &mut task).await {
                     Ok(Ok(Ok(()))) => Ok(()),
                     Ok(Ok(Err(error))) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
@@ -1270,7 +1287,7 @@ impl ProductionSupervisorOwner {
                     .checked_add(timeout)
                     .ok_or(ProductionLiveSourceRuntimeError::SupervisorShutdownDeadline)?;
                 supervisors
-                    .shutdown(deadline)
+                    .shutdown(deadline, graceful)
                     .await
                     .map_err(map_kraken_supervisor_error)
             }
@@ -1362,6 +1379,7 @@ impl PublicSourceCompletion {
 pub struct ProductionLiveSourceRuntime {
     // Declared first so owner drop cancels every source before the live runtime is dropped.
     supervisor: ProductionSupervisorOwner,
+    graceful_shutdown: CancellationToken,
     completion: Option<Arc<PublicSourceCompletion>>,
     publication: Option<CryptoPublicationSupervisor>,
     live: ProductionLiveRuntimeOwner,
@@ -1369,6 +1387,11 @@ pub struct ProductionLiveSourceRuntime {
 }
 
 impl ProductionLiveSourceRuntime {
+    /// Stops network admission while preserving authority for already accepted publications.
+    pub(crate) fn begin_graceful_shutdown(&self) {
+        self.graceful_shutdown.cancel();
+    }
+
     pub(crate) fn completed_incarnation(&self) -> Option<uuid::Uuid> {
         self.completion
             .as_ref()
@@ -1432,14 +1455,16 @@ impl ProductionLiveSourceRuntime {
     /// lifecycle barriers. A supervisor deadline aborts the task, making durable authority restart
     /// fail closed rather than detaching a producer.
     pub async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
+        self.begin_graceful_shutdown();
         let Self {
             supervisor,
+            graceful_shutdown: _,
             completion: _,
             publication,
             live,
             source_shutdown,
         } = self;
-        let supervisor_result = supervisor.shutdown(source_shutdown).await.err();
+        let supervisor_result = supervisor.shutdown(source_shutdown, true).await.err();
         let publication_result = match publication {
             Some(publication) => {
                 let deadline = Instant::now()

@@ -148,64 +148,79 @@ impl CoinbaseExchangeSource {
     {
         self.validate_generation()?;
         sink.bind_active_request_budget(permit.active_lease())?;
-        let limits = self.config.transport_limits();
-        for subscription in self.config.subscriptions() {
-            send_with_deadline(
-                &mut socket,
-                Message::Text(subscription.as_ref().into()),
-                &cancellation,
-                limits.io_timeout(),
-            )
-            .await?;
-        }
-        let mut provider_message_observed = false;
-        loop {
-            let message = read_with_deadline(
-                &mut socket,
-                sink,
-                &cancellation,
-                limits.io_timeout(),
-                limits.max_frame_bytes(),
-            )
-            .await?;
-            match message {
-                Message::Text(text) => {
-                    let payload = text.as_bytes();
-                    ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
-                    let frame = self
-                        .authority
-                        .frames_mut()?
-                        .try_frame(TransportFrameKind::Text, Bytes::copy_from_slice(payload))?;
-                    sink.try_publish(frame)?;
-                    record_first_provider_message(&self.budget, &mut provider_message_observed)?;
+        let result = async {
+            let limits = self.config.transport_limits();
+            for subscription in self.config.subscriptions() {
+                send_with_deadline(
+                    &mut socket,
+                    Message::Text(subscription.as_ref().into()),
+                    &cancellation,
+                    limits.io_timeout(),
+                )
+                .await?;
+            }
+            let mut provider_message_observed = false;
+            loop {
+                let message = read_with_deadline(
+                    &mut socket,
+                    sink,
+                    &cancellation,
+                    limits.io_timeout(),
+                    limits.max_frame_bytes(),
+                )
+                .await?;
+                match message {
+                    Message::Text(text) => {
+                        let payload = text.as_bytes();
+                        ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
+                        let frame = self
+                            .authority
+                            .frames_mut()?
+                            .try_frame(TransportFrameKind::Text, Bytes::copy_from_slice(payload))?;
+                        sink.try_publish(frame)?;
+                        record_first_provider_message(
+                            &self.budget,
+                            &mut provider_message_observed,
+                        )?;
+                    }
+                    Message::Binary(payload) => {
+                        ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
+                        let frame = self
+                            .authority
+                            .frames_mut()?
+                            .try_frame(TransportFrameKind::Binary, payload)?;
+                        sink.try_publish(frame)?;
+                        record_first_provider_message(
+                            &self.budget,
+                            &mut provider_message_observed,
+                        )?;
+                    }
+                    Message::Ping(payload) => {
+                        send_with_deadline(
+                            &mut socket,
+                            Message::Pong(payload),
+                            &cancellation,
+                            limits.io_timeout(),
+                        )
+                        .await?;
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(frame) => {
+                        let _provider_close = frame;
+                        flush_with_deadline(&mut socket, &cancellation, limits.io_timeout())
+                            .await?;
+                        return Err(SourceError::ProviderUnavailable);
+                    }
+                    Message::Frame(_) => return Err(SourceError::InvalidProtocolState),
                 }
-                Message::Binary(payload) => {
-                    ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
-                    let frame = self
-                        .authority
-                        .frames_mut()?
-                        .try_frame(TransportFrameKind::Binary, payload)?;
-                    sink.try_publish(frame)?;
-                    record_first_provider_message(&self.budget, &mut provider_message_observed)?;
-                }
-                Message::Ping(payload) => {
-                    send_with_deadline(
-                        &mut socket,
-                        Message::Pong(payload),
-                        &cancellation,
-                        limits.io_timeout(),
-                    )
-                    .await?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(frame) => {
-                    let _provider_close = frame;
-                    flush_with_deadline(&mut socket, &cancellation, limits.io_timeout()).await?;
-                    return Err(SourceError::ProviderUnavailable);
-                }
-                Message::Frame(_) => return Err(SourceError::InvalidProtocolState),
             }
         }
+        .await;
+        if matches!(result, Err(SourceError::Cancelled)) {
+            sink.finish_stream_cancellation().await?;
+        }
+        drop(permit);
+        result
     }
 
     #[cfg(test)]

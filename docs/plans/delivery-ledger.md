@@ -4963,3 +4963,44 @@ claimed. This proves the prior selected-row contract failure is fixed; checkpoin
 Next bounded Astra read-only diagnosis owns shutdown/publication ordering trace; lead retains
 all mutation/integration/build/Git authority. Preserve cancellation and revocation guarantees;
 do not turn arbitrary publication failures into successful shutdown.
+
+Pushed `6340c552`; first market/publication/readback now passes, shutdown remains blocked.
+Confirmed shutdown dependency: public source cleanup drops route senders, cancels actors,
+ends the registry session and invalidates capture before the separately owned publication worker
+is cancelled/joined. Queued committed evidence consequently fails its correct revocation check.
+
+Next bounded ownership: Astra `research_options_failure` implements graceful public publication
+drain in `live_source/{publication_admission.rs,coinbase_publication.rs,kraken_publication.rs,
+sink.rs,supervisor.rs}` only, reusing the existing end-to-end frame permits. Keep sink/route/session/
+capture alive until admitted work completes; retain immediate failure/revocation behavior and all
+actual worker outcomes. No new queues, builds, Git or broad tests. Lead owns composition, shared
+contracts, integration, any critical existing-test extension and real lifecycle verification.
+
+Graceful-drain integration is frozen for verification. The adapter retains its transport request
+permit/decoder session through the shared sink cancellation hook; explicit orderly shutdown stops
+network admission, drains the existing frame semaphore, then joins source/publication owners.
+Forced cancellation and publication failure still revoke/fail. Kraken channel owners disarm their
+Drop cancellation only after their original task is joined, so one clean channel cannot cancel its
+sibling. Astra ownership additionally covered `live_source/kraken.rs` for that concrete integration
+finding and is now released; lead owns remaining verification/Git.
+
+The existing Coinbase cancellation test now exercises cancellation after subscriptions and proves
+the request permit remains held across the async drain, then releases afterward: PASS 1/1
+(`graceful-adapter-test.log`, build1m04s, test0.33s). This closes the uncovered authority-lifetime
+regression without adding a test harness. Serialized application build and unchanged real installed
+public-source restart test remain pending; no successful restart claim yet.
+
+Graceful-drain application build PASS6m37s (`graceful-public-drain-build.log`). Real installed
+public test FAIL249.80s (`graceful-public-drain-live.log`), now after completing the entire Coinbase
+journey: genuine typed live publication, clean shutdown, resumed publication after restart, exact
+original evidence equality, explicit Source.Stop and stopped-state persistence across a third
+service start. Sequential test control flow reaches Kraken only after all those assertions pass.
+This is installed-service/typed Desktop transport evidence, not native WebView or whole-V1 proof.
+
+Kraken stops before its first publication because official instrument reference preparation returns
+unavailable. Astra read-only trace identified a protocol mismatch: reference transport checks
+`/result/success` although the [official v2 instrument response](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument)
+and existing adapter message contract use top-level `/success`. Lead independently confirmed the
+source/schema contradiction. Checkpoint the verified Coinbase drain separately; next lead-owned
+change is the exact reference lookup correction and unchanged live recheck. No endpoint/deadline,
+identity, credential or financial evidence checks will be weakened.

@@ -11,6 +11,7 @@ pub(crate) use alpaca_publication::{
 use std::{
     collections::{HashMap, VecDeque},
     mem::size_of,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -21,7 +22,7 @@ use super::{
     },
     kraken_publication::{KrakenCapturedPublicationIngress, KrakenCapturedPublicationInput},
     provider::{ProductionDecodeOutcome, ProductionMarketDecoder, StartupReadinessPolicy},
-    publication_admission::PublicationReservation,
+    publication_admission::{PublicationDrainError, PublicationReservation},
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{
         GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
@@ -46,6 +47,7 @@ use market_squawk_sources::{
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 /// Input capabilities consumed by one exact-generation production sink.
 #[derive(Debug)]
@@ -122,6 +124,7 @@ pub(super) struct ProductionRawMarketSink<'a> {
     decoder: Option<ProductionMarketDecoder>,
     publication: ProductionCapturedPublicationIngress,
     publication_permit: Option<CapturedPublicationPermit>,
+    stream_shutdown: Option<StreamShutdownDrain>,
     metadata: SourceMetadata,
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
@@ -143,6 +146,13 @@ pub(super) struct ProductionRawMarketSink<'a> {
     acknowledgement_evidence: Option<ExactPayloadEvidence>,
     active_request_budget: Option<BudgetPermitLease>,
     terminal: Option<ProductionSinkFailure>,
+}
+
+#[derive(Debug)]
+struct StreamShutdownDrain {
+    graceful: CancellationToken,
+    forced: CancellationToken,
+    deadline: Arc<OnceLock<Instant>>,
 }
 
 impl<'a> ProductionRawMarketSink<'a> {
@@ -256,6 +266,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             decoder,
             publication,
             publication_permit: None,
+            stream_shutdown: None,
             metadata,
             generation: GenerationIdentity::from_session(session),
             subscription,
@@ -275,6 +286,59 @@ impl<'a> ProductionRawMarketSink<'a> {
             active_request_budget: None,
             terminal: None,
         })
+    }
+
+    pub(super) fn install_stream_shutdown(
+        &mut self,
+        graceful: CancellationToken,
+        forced: CancellationToken,
+        deadline: Arc<OnceLock<Instant>>,
+    ) {
+        self.stream_shutdown = Some(StreamShutdownDrain {
+            graceful,
+            forced,
+            deadline,
+        });
+    }
+
+    async fn drain_stream_cancellation(&mut self) -> Result<(), ProductionSinkFailure> {
+        // Release a slot reserved for a socket read that cancellation prevented. Route senders
+        // and the adapter's active request budget remain alive through this entire hook.
+        self.publication_permit.take();
+        let Some(shutdown) = &self.stream_shutdown else {
+            return Ok(());
+        };
+        if !shutdown.graceful.is_cancelled() || shutdown.forced.is_cancelled() {
+            return Ok(());
+        }
+        if let Some(failure) = self.terminal {
+            return Err(failure);
+        }
+        // Buffered pre-ACK work has not entered the frame admission budget. Do not acknowledge
+        // it as drained; normal capture cleanup still retains its original journal custody.
+        if !self.pending_data.entries.is_empty() || self.pending_raw_capture.is_some() {
+            return Err(ProductionSinkFailure::PublicationDrain(
+                PublicationDrainError::UnsubmittedFrames,
+            ));
+        }
+        let deadline = *shutdown
+            .deadline
+            .get()
+            .ok_or(ProductionSinkFailure::PublicationDrain(
+                PublicationDrainError::MissingDeadline,
+            ))?;
+        let result = match &self.publication {
+            ProductionCapturedPublicationIngress::Coinbase(ingress) => {
+                ingress.drain_admitted(deadline, &shutdown.forced).await
+            }
+            ProductionCapturedPublicationIngress::Kraken(ingress) => {
+                ingress.drain_admitted(deadline, &shutdown.forced).await
+            }
+            ProductionCapturedPublicationIngress::None
+            | ProductionCapturedPublicationIngress::Alpaca(_) => Ok(()),
+        };
+        result.map_err(ProductionSinkFailure::PublicationDrain)?;
+        self.output.poll_failures()
     }
 
     pub(super) const fn terminal_failure(&self) -> Option<ProductionSinkFailure> {
@@ -1490,6 +1554,16 @@ impl ProductionRawMarketSink<'_> {
 }
 
 impl RawMarketSink for ProductionRawMarketSink<'_> {
+    fn finish_stream_cancellation(
+        &mut self,
+    ) -> futures_util::future::BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async move {
+            self.drain_stream_cancellation()
+                .await
+                .map_err(|failure| self.fail(failure))
+        })
+    }
+
     fn wait_for_capacity(&mut self) -> futures_util::future::BoxFuture<'_, Result<(), SinkError>> {
         Box::pin(async move {
             if let Some(failure) = self.terminal {
@@ -1707,6 +1781,8 @@ pub enum ProductionSinkFailure {
     PublicationTopologyMismatch,
     #[error("bounded durable-publication ingress is unavailable")]
     PublicationBackpressure,
+    #[error("admitted public publication drain failed: {0}")]
+    PublicationDrain(PublicationDrainError),
 }
 
 impl ProductionSinkFailure {
@@ -1758,7 +1834,8 @@ impl ProductionSinkFailure {
             | Self::AlpacaPublicationWorkerClosed
             | Self::KrakenPublicationMaterial
             | Self::PublicationTopologyMismatch
-            | Self::PublicationBackpressure => false,
+            | Self::PublicationBackpressure
+            | Self::PublicationDrain(_) => false,
             Self::DisplayIngress | Self::DisplayTerminal => true,
         }
     }
@@ -1811,7 +1888,8 @@ impl ProductionSinkFailure {
             | Self::AlpacaPublicationWorkerClosed
             | Self::KrakenPublicationMaterial
             | Self::PublicationTopologyMismatch
-            | Self::PublicationBackpressure => SinkError::CaptureIncomplete,
+            | Self::PublicationBackpressure
+            | Self::PublicationDrain(_) => SinkError::CaptureIncomplete,
         }
     }
 }

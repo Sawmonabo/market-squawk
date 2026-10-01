@@ -631,12 +631,15 @@ struct KrakenPublicSupervisorTask {
     channel: KrakenPublicChannel,
     task: JoinHandle<Result<(), ProductionSupervisorError>>,
     cancellation: CancellationToken,
+    reaped: bool,
 }
 
 impl Drop for KrakenPublicSupervisorTask {
     fn drop(&mut self) {
-        self.cancellation.cancel();
-        self.task.abort();
+        if !self.reaped {
+            self.cancellation.cancel();
+            self.task.abort();
+        }
     }
 }
 
@@ -656,6 +659,7 @@ impl KrakenPublicSupervisorSet {
         book: ProductionSourceSupervisor,
         trades: ProductionSourceSupervisor,
         parent_cancellation: CancellationToken,
+        graceful_shutdown: CancellationToken,
         cleanup_timeout: Duration,
         currentness: KrakenPublicCurrentnessObserver,
     ) -> Result<Self, KrakenPublicSupervisorSetError> {
@@ -682,14 +686,18 @@ impl KrakenPublicSupervisorSet {
             let (ready, receiver) = oneshot::channel();
             let run_cancellation = cancellation.clone();
             let terminal_cancellation = cancellation.clone();
+            let graceful_shutdown = graceful_shutdown.clone();
             tasks.push(KrakenPublicSupervisorTask {
                 channel,
                 cancellation: cancellation.clone(),
+                reaped: false,
                 task: tokio::spawn(async move {
                     let outcome = supervisor.run(run_cancellation, ready).await;
-                    // Either channel leaving its run loop makes the pair non-current. Cancel the
-                    // sibling immediately; the owner reaps and reports both bounded outcomes.
-                    terminal_cancellation.cancel();
+                    // Unexpected exit or failure stops the sibling immediately. Orderly shutdown
+                    // lets both channels finish their already accepted publications.
+                    if outcome.is_err() || !graceful_shutdown.is_cancelled() {
+                        terminal_cancellation.cancel();
+                    }
                     outcome
                 }),
             });
@@ -805,8 +813,11 @@ impl KrakenPublicSupervisorSet {
     pub(super) async fn shutdown(
         mut self,
         deadline: Instant,
+        graceful: bool,
     ) -> Result<(), KrakenPublicSupervisorSetError> {
-        self.cancellation.cancel();
+        if !graceful {
+            self.cancellation.cancel();
+        }
         match reap_tasks(&mut self.tasks, deadline).await {
             Some(error) => Err(error),
             None => Ok(()),
@@ -842,11 +853,18 @@ async fn reap_tasks(
                 source,
             }),
             None => {
+                owned.cancellation.cancel();
                 owned.task.abort();
                 let _aborted = (&mut owned.task).await;
                 Some(KrakenPublicSupervisorSetError::ShutdownDeadline)
             }
         };
+        if error.is_some() {
+            owned.cancellation.cancel();
+        }
+        // Joining one orderly channel must not force its sibling out of publication drain.
+        // An interrupted reap still drops an armed owner and cancels/aborts the original task.
+        owned.reaped = true;
         if let Some(error) = error
             && first_error.as_ref().is_none_or(|first| {
                 matches!(
@@ -867,8 +885,10 @@ async fn reap_tasks(
 
 async fn abort_tasks(tasks: &mut Vec<KrakenPublicSupervisorTask>) {
     while let Some(mut owned) = tasks.pop() {
+        owned.cancellation.cancel();
         owned.task.abort();
         let _aborted = (&mut owned.task).await;
+        owned.reaped = true;
     }
 }
 
@@ -986,6 +1006,7 @@ mod cleanup_tests {
             KrakenPublicSupervisorTask {
                 channel: KrakenPublicChannel::Trades,
                 cancellation: cancellation.clone(),
+                reaped: false,
                 task: tokio::spawn(async move {
                     assert!(
                         stale_observed.await.is_ok(),
@@ -1001,6 +1022,7 @@ mod cleanup_tests {
             KrakenPublicSupervisorTask {
                 channel: KrakenPublicChannel::Book,
                 cancellation,
+                reaped: false,
                 task: tokio::spawn(async move {
                     assert!(
                         stale_finished.send(()).is_ok(),

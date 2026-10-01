@@ -169,6 +169,34 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
 
 #[tokio::test]
 async fn cancellation_preempts_read_and_source_refuses_same_generation_restart() -> TestResult {
+    struct DrainSink {
+        budget: market_squawk_sources::SharedProviderBudget,
+        drained: bool,
+    }
+    impl RawMarketSink for DrainSink {
+        fn try_publish(&mut self, _frame: RawMarketFrame) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn finish_stream_cancellation(
+            &mut self,
+        ) -> futures_util::future::BoxFuture<'_, Result<(), SinkError>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                assert!(
+                    matches!(
+                        self.budget.try_reserve_request(),
+                        market_squawk_sources::BudgetReservationDecision::Unavailable(
+                            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+                        )
+                    ),
+                    "transport authority was released before publication drained"
+                );
+                self.drained = true;
+                Ok(())
+            })
+        }
+    }
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
     let fixture = selected_fixture()?;
     let config = fixture.config.clone();
@@ -177,24 +205,34 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
     let mut source = CoinbaseExchangeSource::try_new(config, generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let cancellation = CancellationToken::new();
+    let stop = cancellation.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
         for _ in 0..3 {
-            let _subscription = socket.next().await;
+            socket.next().await.ok_or("subscription was not sent")??;
         }
+        stop.cancel();
         std::future::pending::<Result<(), Box<dyn Error + Send + Sync>>>().await
     });
     let stream = TcpStream::connect(address).await?;
     let (socket, _) = client_async(format!("ws://{address}"), stream).await?;
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
+    let mut sink = DrainSink {
+        budget: source.budget.clone(),
+        drained: false,
+    };
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
-        source.run_with_socket_for_test(socket, &mut RecordingSink::default(), cancellation),
+        source.run_with_socket_for_test(socket, &mut sink, cancellation),
     )
     .await?;
     assert_eq!(outcome, Err(SourceError::Cancelled));
+    assert!(sink.drained);
+    assert!(matches!(
+        source.budget.try_reserve_request(),
+        market_squawk_sources::BudgetReservationDecision::Ready(_)
+    ));
     assert_eq!(
         source.begin_generation_for_test(),
         Err(SourceError::InvalidProtocolState)

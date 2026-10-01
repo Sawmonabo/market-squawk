@@ -646,6 +646,13 @@ monotonic clocks. It cannot admit another live observation or renew price/execut
 The ordinary live validator retains its original freshness checks. Verification status belongs in
 the delivery ledger.
 
+Orderly public-stream shutdown first stops network admission, then drains accepted publication
+work under the original shutdown deadline before releasing transport budgets, route actors,
+sessions or capture owners. The existing end-to-end frame permits provide the drain barrier; no
+second queue or lifetime history bound is introduced. Paired channels finish independently before
+their shared owner is released. Explicit forced cancellation, revoked authority and actual worker
+failures remain failures; an empty queue alone does not replace joining the worker's real result.
+
 Market-event point reads select an immutable logical publication and its exact source evidence.
 Physical placement is resolved within that read's WAL snapshot: canonical active rows or the
 publication's exact interval in a catalog-admitted archive. Archival preserves publication/row

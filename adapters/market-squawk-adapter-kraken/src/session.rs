@@ -599,6 +599,9 @@ impl KrakenSource {
         let result = self
             .run_established_inner(socket, sink, &cancellation, deadlines)
             .await;
+        if result == Err(SourceError::Cancelled) {
+            sink.finish_stream_cancellation().await?;
+        }
         if result.is_err() && !matches!(result, Err(SourceError::Sink(_))) {
             self.decode_control.mark_quarantined_unless_retired()?;
         }
@@ -687,7 +690,9 @@ impl KrakenSource {
                     )
                     .await
                     {
-                        self.decode_control.mark_quarantined()?;
+                        if error != SourceError::Cancelled {
+                            self.decode_control.mark_quarantined()?;
+                        }
                         return Err(error);
                     }
                 }

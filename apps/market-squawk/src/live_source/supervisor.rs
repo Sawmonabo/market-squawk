@@ -2,7 +2,7 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -91,6 +91,7 @@ pub(super) struct ProductionSourceSupervisor {
     config: AppConfig,
     profile: ProductionSourceProfile,
     publication: ProductionCapturedPublicationIngress,
+    graceful_shutdown: CancellationToken,
     registry: Option<AuthoritativeSourceRegistry>,
     catalog: Option<ProductionCatalogSelection>,
     startup_catalog_admission: Option<(Instant, CancellationToken)>,
@@ -310,6 +311,7 @@ impl ProductionSourceSupervisor {
             config: config.clone(),
             profile,
             publication: ProductionCapturedPublicationIngress::none(),
+            graceful_shutdown: CancellationToken::new(),
             registry: Some(registry),
             catalog: catalog.map(|(selection, _, _)| selection.clone()),
             startup_catalog_admission: catalog
@@ -322,6 +324,11 @@ impl ProductionSourceSupervisor {
             cleanup_failure: None,
             completion: None,
         })
+    }
+
+    pub(super) fn with_graceful_shutdown(mut self, graceful: CancellationToken) -> Self {
+        self.graceful_shutdown = graceful;
+        self
     }
 
     pub(super) fn with_completion(
@@ -411,6 +418,9 @@ impl ProductionSourceSupervisor {
         let generation = session.generation();
         let startup_required = startup.is_some();
         let route_cancellation = cancellation.child_token();
+        // An aborted supervisor must still stop every route actor. Graceful network shutdown
+        // only cancels its separate child below, leaving accepted route work alive until drained.
+        let _route_drop_cancellation = route_cancellation.clone().drop_guard();
         let mut capture_control = None;
         let mut writer_handle = None;
 
@@ -577,8 +587,30 @@ impl ProductionSourceSupervisor {
                     sink
                 }
             };
+            let network_cancellation = cancellation.child_token();
+            let drain_deadline = Arc::new(OnceLock::new());
+            sink.install_stream_shutdown(
+                self.graceful_shutdown.clone(),
+                cancellation.clone(),
+                Arc::clone(&drain_deadline),
+            );
             let result = if display_monitors.is_empty() {
-                source.run(&mut sink, cancellation.clone()).await
+                let source_run = source.run(&mut sink, network_cancellation.clone());
+                tokio::pin!(source_run);
+                tokio::select! {
+                    biased;
+                    result = &mut source_run => result,
+                    () = self.graceful_shutdown.cancelled() => {
+                        let deadline = Instant::now().checked_add(self.config.source_shutdown())
+                            .ok_or(ProductionSupervisorError::InvalidStaticPolicy)?;
+                        drain_deadline.set(deadline)
+                            .map_err(|_| ProductionSupervisorError::InvalidStaticPolicy)?;
+                        network_cancellation.cancel();
+                        // The adapter's cancellation hook drains while its active budget and
+                        // decoder owner still exist. Never drop this original future to stop it.
+                        source_run.await
+                    }
+                }
             } else {
                 run_display_source(
                     &mut source,
@@ -743,7 +775,7 @@ impl ProductionSourceSupervisor {
         startup: &mut Option<oneshot::Sender<()>>,
     ) -> Result<(), ProductionSupervisorError> {
         loop {
-            if cancellation.is_cancelled() {
+            if cancellation.is_cancelled() || self.graceful_shutdown.is_cancelled() {
                 return Ok(());
             }
             let outcome = self
@@ -751,7 +783,11 @@ impl ProductionSourceSupervisor {
                 .await?;
             if outcome.failed_before_startup_readiness() {
                 return match outcome.source_error() {
-                    Some(SourceError::Cancelled) if cancellation.is_cancelled() => Ok(()),
+                    Some(SourceError::Cancelled)
+                        if cancellation.is_cancelled() || self.graceful_shutdown.is_cancelled() =>
+                    {
+                        Ok(())
+                    }
                     Some(source) => Err(ProductionSupervisorError::SourceFailedBeforeReadiness(
                         source,
                     )),
@@ -763,7 +799,11 @@ impl ProductionSourceSupervisor {
                 continue;
             };
             match error {
-                SourceError::Cancelled if cancellation.is_cancelled() => return Ok(()),
+                SourceError::Cancelled
+                    if cancellation.is_cancelled() || self.graceful_shutdown.is_cancelled() =>
+                {
+                    return Ok(());
+                }
                 SourceError::BudgetWaitUntil { deadline } => {
                     self.wait_until(cancellation, deadline).await?;
                 }

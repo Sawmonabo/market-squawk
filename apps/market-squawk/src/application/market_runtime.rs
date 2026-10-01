@@ -2775,7 +2775,7 @@ impl MarketRuntimeRegistry {
             std::mem::take(&mut *entries)
         };
         for entry in &entries {
-            entry.begin_shutdown();
+            entry.begin_graceful_shutdown();
         }
         for entry in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3209,6 +3209,18 @@ impl MarketRuntimeEntry {
         self.cancellation.cancel();
     }
 
+    fn begin_graceful_shutdown(&self) {
+        match &self.runtime {
+            MarketRuntime::Public(runtime) => {
+                if let Some(exports) = self.exports.as_ref() {
+                    exports.begin_shutdown();
+                }
+                runtime.begin_graceful_shutdown();
+            }
+            MarketRuntime::CoinbaseDirect(_) | MarketRuntime::Account(_) => self.begin_shutdown(),
+        }
+    }
+
     fn scalar_snapshots(&self) -> Result<LiveSnapshotReader, ServiceError> {
         self.runtime.scalar_snapshots()
     }
@@ -3267,7 +3279,7 @@ impl MarketRuntimeEntry {
             .checked_add(shutdown_budget)
             .ok_or(ServiceError::Unavailable)?;
         let cleanup = CancellationToken::new();
-        self.begin_shutdown();
+        self.begin_graceful_shutdown();
         let runtime_result = self.runtime.shutdown_before(deadline, &cleanup).await;
         let export_result = match self.exports.take() {
             Some(exports) => exports
