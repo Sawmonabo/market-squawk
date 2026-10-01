@@ -7,6 +7,7 @@ use super::super::admission::{
 };
 use super::super::system_timestamp;
 use super::{ActorError, RouteOwner, ShardActor};
+use crate::committed_research_export::PreparedCommittedResearchMarketBatch;
 use crate::features::{CommittedFeatureInput, FeatureInvalidationReason, FeatureUpdateDisposition};
 use crate::processor::{AppliedLiveObservation, LiveApplyError};
 use crate::{
@@ -220,9 +221,47 @@ impl ShardActor {
 
     pub(super) fn process(&mut self, command: ShardCommand) -> Result<(), ActorError> {
         let admission = command.admission.clone();
-        match self.process_inner(command) {
+        let route = crate::ShardKey::new(
+            command.batch.key().venue().clone(),
+            command.batch.key().instrument(),
+        );
+        let mut research_export = self
+            .routes
+            .get(&route)
+            .and_then(|owner| owner.committed_research_export.as_ref())
+            .map(|export| {
+                // The admission charge covers the complete routed batch, not one row.
+                export.prepare(&command.batch, command.retained_bytes)
+            })
+            .transpose()
+            .map_err(|failure| {
+                // Export disposition is a closed unit enum, with no provider material.
+                tracing::warn!(?failure, "live route terminal export admission failed");
+                ActorError::CommittedResearchMarketExportUnavailable
+            })?;
+        let outcome = self.process_inner(command, &mut research_export);
+        if let Some(export) = research_export {
+            export.finish(outcome.is_ok());
+        }
+        match outcome {
             Ok(()) => Ok(()),
             Err(error) => {
+                let category = match &error {
+                    ActorError::GenerationNotCurrent => "generation_not_current",
+                    ActorError::Apply(LiveApplyError::Source(_)) => "source_currentness",
+                    ActorError::Apply(LiveApplyError::CapabilityExpired) => "capability_expired",
+                    ActorError::Apply(LiveApplyError::Sequence(_)) => "sequence",
+                    ActorError::Apply(LiveApplyError::SnapshotRequired) => "snapshot_required",
+                    ActorError::Apply(LiveApplyError::Quarantined) => "quarantined",
+                    ActorError::Apply(LiveApplyError::Qualification(_)) => "qualification",
+                    ActorError::CommittedResearchMarketExportUnavailable => "research_export",
+                    ActorError::Apply(_) => "observation_rejected",
+                    _ => "actor_processing",
+                };
+                tracing::warn!(
+                    category,
+                    "live route batch rejected before complete research export"
+                );
                 admission.invalidate_on_admission_failure();
                 self.health_revision = self.health_revision.saturating_add(1);
                 self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
@@ -237,7 +276,11 @@ impl ShardActor {
         }
     }
 
-    fn process_inner(&mut self, command: ShardCommand) -> Result<(), ActorError> {
+    fn process_inner(
+        &mut self,
+        command: ShardCommand,
+        research_export: &mut Option<PreparedCommittedResearchMarketBatch>,
+    ) -> Result<(), ActorError> {
         self._guard.validate()?;
         let now = system_timestamp().map_err(|_| ActorError::ClockRange)?;
         command
@@ -281,8 +324,13 @@ impl ShardActor {
                         return Err(error.into());
                     }
                 };
-                let disposition =
-                    process_applied_observation(&key, owner, applied, _retained_bytes)?;
+                let disposition = process_applied_observation(
+                    &key,
+                    owner,
+                    applied,
+                    _retained_bytes,
+                    research_export.as_mut(),
+                )?;
                 feature_unavailable |= disposition.feature_unavailable;
                 action_failed |= disposition.action_failed;
                 qualified_market_export_dropped |= disposition.qualified_market_export_dropped;
@@ -319,6 +367,7 @@ fn process_applied_observation(
     owner: &mut RouteOwner,
     applied: AppliedLiveObservation,
     conservative_retained_bytes: u32,
+    research_export: Option<&mut PreparedCommittedResearchMarketBatch>,
 ) -> Result<AppliedObservationDisposition, ActorError> {
     if let Some(authority) = applied.authority.as_ref() {
         owner.processor.validate_applied_current(authority)?;
@@ -466,7 +515,7 @@ fn process_applied_observation(
             (dropped, false)
         }
         market_squawk_domain::DataQuality::DirectUnverified => {
-            let dropped = if let Some(exporter) = owner.committed_research_export.as_ref() {
+            let dropped = if let Some(exporter) = research_export {
                 let observation = crate::CommittedResearchMarketObservation::from_committed(
                     applied.event,
                     applied.assessment,
@@ -480,11 +529,7 @@ fn process_applied_observation(
                     applied.row_count,
                     applied.stable_trade_id,
                 );
-                observation.is_none_or(|observation| {
-                    exporter
-                        .try_export(observation, conservative_retained_bytes)
-                        .is_err()
-                })
+                observation.is_none_or(|observation| exporter.push(observation).is_err())
             } else {
                 false
             };

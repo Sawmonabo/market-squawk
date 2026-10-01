@@ -18,7 +18,12 @@ use crc32fast::Hasher;
 use fs2::FileExt as _;
 use thiserror::Error;
 
-use crate::{RawCaptureRecord, RawCaptureRecordError, raw_record::MAX_SERIALIZED_RECORD_BYTES};
+use crate::{
+    RawCaptureRecord, RawCaptureRecordError,
+    raw_record::{
+        MAX_SERIALIZED_RECORD_BYTES, RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES, write_json_buffered,
+    },
+};
 
 #[path = "journal/sealed.rs"]
 mod sealed;
@@ -303,9 +308,9 @@ fn write_current_frame_inner<W: Write>(
     let first_result = match checkpoint.as_deref_mut() {
         Some(checkpoint) => {
             let mut controlled = ControlledSerializationWriter::new(&mut first_pass, checkpoint, 0);
-            serde_json::to_writer(&mut controlled, record)
+            write_json_buffered(&mut controlled, record)
         }
-        None => serde_json::to_writer(&mut first_pass, record),
+        None => write_json_buffered(&mut first_pass, record),
     };
     if let Err(error) = first_result {
         if first_pass.attempted_bytes > MAX_RECORD_BYTES {
@@ -341,9 +346,9 @@ fn write_current_frame_inner<W: Write>(
         Some(checkpoint) => {
             let mut controlled =
                 ControlledSerializationWriter::new(&mut second_pass, checkpoint, payload_bytes_u64);
-            serde_json::to_writer(&mut controlled, record)
+            write_json_buffered(&mut controlled, record)
         }
-        None => serde_json::to_writer(&mut second_pass, record),
+        None => write_json_buffered(&mut second_pass, record),
     };
     if let Err(error) = second_result {
         if error.is_io() {
@@ -498,6 +503,10 @@ impl ParentDirectorySync {
 }
 
 impl JournalWriter {
+    /// Fixed temporary serialization workspace included in this sink's byte admission.
+    /// The two checksum passes reuse this bound sequentially; it is not per payload byte.
+    pub const SERIALIZATION_WORKSPACE_BYTES: usize = RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES;
+
     pub(crate) fn validate_limits_for_path(
         path: &PathBuf,
         limits: JournalSinkLimits,
@@ -505,6 +514,7 @@ impl JournalWriter {
         let required = std::mem::size_of::<Self>()
             .checked_add(path.capacity())
             .and_then(|bytes| bytes.checked_add(limits.buffer_capacity()))
+            .and_then(|bytes| bytes.checked_add(RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES))
             .ok_or(JournalSinkConstructionError::ArithmeticOverflow)?;
         if required > limits.retained_byte_ceiling() {
             return Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
@@ -558,6 +568,7 @@ impl JournalWriter {
         let fixed_retained_bytes = std::mem::size_of::<Self>()
             .checked_add(path.capacity())
             .and_then(|bytes| bytes.checked_add(writer.capacity()))
+            .and_then(|bytes| bytes.checked_add(RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES))
             .ok_or(JournalSinkConstructionError::ArithmeticOverflow)?;
         if fixed_retained_bytes > limits.retained_byte_ceiling() {
             return Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
@@ -595,7 +606,7 @@ impl JournalWriter {
         &self.path
     }
 
-    /// Returns the exact observed fixed Rust graph owned by this sink.
+    /// Returns the fixed sink graph plus its bounded temporary serialization workspace.
     pub const fn fixed_retained_bytes(&self) -> usize {
         self.fixed_retained_bytes
     }

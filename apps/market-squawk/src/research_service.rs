@@ -41,6 +41,8 @@ use crate::{ProviderOnboardingError, ProviderOnboardingService};
 // Failure-only phase evidence for the existing owned seal lane. No captured data is logged.
 struct CaptureSealDiagnostic {
     phase: Arc<std::sync::atomic::AtomicU8>,
+    physical_started: Arc<std::sync::OnceLock<Instant>>,
+    started: Instant,
     completed: bool,
 }
 
@@ -48,6 +50,8 @@ impl CaptureSealDiagnostic {
     fn new() -> Self {
         Self {
             phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            physical_started: Arc::new(std::sync::OnceLock::new()),
+            started: Instant::now(),
             completed: false,
         }
     }
@@ -61,7 +65,15 @@ impl Drop for CaptureSealDiagnostic {
                 1 => "physical_seal",
                 _ => "completed",
             };
-            tracing::warn!(stage, "provider capture seal interrupted");
+            tracing::warn!(
+                stage,
+                elapsed_ms = self.started.elapsed().as_millis(),
+                physical_elapsed_ms = self
+                    .physical_started
+                    .get()
+                    .map(|at| at.elapsed().as_millis()),
+                "provider capture seal interrupted"
+            );
         }
     }
 }
@@ -627,6 +639,7 @@ impl ResearchService {
         let store = Arc::clone(&self.provider_captures);
         let mut diagnostic = CaptureSealDiagnostic::new();
         let phase = Arc::clone(&diagnostic.phase);
+        let physical_started = Arc::clone(&diagnostic.physical_started);
         let result = self
             .provider_capture_worker
             .run_with_job_context(
@@ -640,6 +653,7 @@ impl ResearchService {
                     if Instant::now() >= deadline {
                         return Err(IngestError::DeadlineExceeded.into());
                     }
+                    let _ = physical_started.set(Instant::now());
                     phase.store(1, std::sync::atomic::Ordering::Relaxed);
                     let result = request
                         .seal(store.as_ref())

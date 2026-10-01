@@ -20,6 +20,34 @@ use uuid::Uuid;
 pub(crate) const MAX_SERIALIZED_RECORD_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMPATIBILITY_PAYLOAD_BYTES: usize = MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES;
 const CONTROLLED_COMPATIBILITY_CHUNK_BYTES: usize = 64 * 1024;
+
+// One temporary buffer per serialization pass; passes never retain it simultaneously.
+const SERIALIZATION_BUFFER_CAPACITY: usize = 8 * 1024;
+/// Maximum buffer allocation plus its inline owner, charged separately from the raw record.
+pub(crate) const RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES: usize =
+    SERIALIZATION_BUFFER_CAPACITY + std::mem::size_of::<io::BufWriter<&mut dyn io::Write>>();
+
+/// Coalesces serde's byte-array fragments before downstream bounds, checksums and controls.
+/// `into_inner` drains this buffer without flushing the caller's file/pipe buffer. Disarming
+/// Drop on either error prevents an implicit retry from writing after a failed/cancelled pass.
+pub(crate) fn write_json_buffered<W: io::Write, T: Serialize + ?Sized>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), serde_json::Error> {
+    let mut buffered = io::BufWriter::with_capacity(SERIALIZATION_BUFFER_CAPACITY, writer);
+    if let Err(error) = serde_json::to_writer(&mut buffered, value) {
+        let (_writer, _unwritten) = buffered.into_parts();
+        return Err(error);
+    }
+    match buffered.into_inner() {
+        Ok(_writer) => Ok(()),
+        Err(error) => {
+            let (source, buffered) = error.into_parts();
+            let (_writer, _unwritten) = buffered.into_parts();
+            Err(serde_json::Error::io(source))
+        }
+    }
+}
 const MAX_LIVE_WORST_CASE_SERIALIZED_BYTES: usize =
     MAX_LIVE_CAPTURE_PAYLOAD_BYTES * 4 + RawCaptureRecord::MAX_LIVE_SOURCE_BYTES * 6 + 4_096;
 const _: () = assert!(MAX_LIVE_WORST_CASE_SERIALIZED_BYTES < MAX_SERIALIZED_RECORD_BYTES);
@@ -953,11 +981,34 @@ mod tests {
             Utc.timestamp_opt(0, 0)
                 .single()
                 .ok_or("invalid fixture time")?,
-            vec![0, 9, 10, 99, 100, 255],
+            [0, 9, 10, 99, 100, 255].repeat(super::SERIALIZATION_BUFFER_CAPACITY / 6 + 1),
         )?;
         let after_construction = COMPATIBILITY_VALIDATION_PASSES.with(std::cell::Cell::get);
         let encoded = serde_json::to_vec(&record)?;
-        assert!(!encoded.is_empty());
+        assert!(encoded.len() > super::SERIALIZATION_BUFFER_CAPACITY);
+        let mut buffered = Vec::new();
+        super::write_json_buffered(&mut buffered, &record)?;
+        assert_eq!(buffered, encoded);
+
+        // Exercise both a full-buffer drain during serialization and the final short drain.
+        // A failed write must return immediately, with no implicit BufWriter Drop retry.
+        struct RejectWrites(usize);
+        impl std::io::Write for RejectWrites {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(std::io::Error::other("fixture rejects buffered output"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut full = RejectWrites(0);
+        assert!(super::write_json_buffered(&mut full, &record).is_err());
+        assert_eq!(full.0, 1);
+        let mut tail = RejectWrites(0);
+        assert!(super::write_json_buffered(&mut tail, &0_u8).is_err());
+        assert_eq!(tail.0, 1);
         assert_eq!(
             COMPATIBILITY_VALIDATION_PASSES.with(std::cell::Cell::get),
             after_construction

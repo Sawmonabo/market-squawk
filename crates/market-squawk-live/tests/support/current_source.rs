@@ -206,7 +206,12 @@ fn freshness() -> Result<FreshnessPolicy, market_squawk_sources::SourceMetadataE
     )
 }
 
-fn metadata(source: &str, revision: &str, instrument_id: &str) -> TestResult<SourceMetadata> {
+fn metadata(
+    source: &str,
+    revision: &str,
+    instrument_id: &str,
+    quality: DataQuality,
+) -> TestResult<SourceMetadata> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let non_book = SnapshotApplicability::NotApplicable {
         metadata_rule: rule("non-book-no-snapshot-v1")?,
@@ -262,7 +267,7 @@ fn metadata(source: &str, revision: &str, instrument_id: &str) -> TestResult<Sou
             effective,
         ),
         coverage,
-        DataQuality::DirectVerified,
+        quality,
         NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
             "wss://advanced-trade-ws.coinbase.com",
         ])?),
@@ -320,11 +325,25 @@ pub(super) struct SourceHarness {
 
 impl SourceHarness {
     pub(super) fn try_new(source: &str, generation: u64, instrument_id: &str) -> TestResult<Self> {
+        Self::try_new_with_quality(
+            source,
+            generation,
+            instrument_id,
+            DataQuality::DirectVerified,
+        )
+    }
+
+    pub(super) fn try_new_with_quality(
+        source: &str,
+        generation: u64,
+        instrument_id: &str,
+        quality: DataQuality,
+    ) -> TestResult<Self> {
         let instance = SOURCE_INSTANCE.fetch_add(1, Ordering::Relaxed);
         let revision = format!("{source}-revision-{instance}");
         let at = now()?;
         let (registry, registered) = source_fixture::register_fixture_source(
-            metadata(source, &revision, instrument_id)?,
+            metadata(source, &revision, instrument_id, quality)?,
             &[(instrument(instrument_id)?, native_symbol(instrument_id)?)],
             Timestamp::from_unix_nanos(0),
         )?;
@@ -472,12 +491,12 @@ impl SourceHarness {
                 instrument(&self.instrument_id)?,
                 market_squawk_sources::ProviderNativeInstrumentIdentity::new(
                     market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
-                    market_squawk_domain::ProviderInstrumentId::try_from(
-                        native_symbol(&self.instrument_id)?,
-                    )?,
-                    market_squawk_domain::VenueSymbol::try_from(
-                        native_symbol(&self.instrument_id)?,
-                    )?,
+                    market_squawk_domain::ProviderInstrumentId::try_from(native_symbol(
+                        &self.instrument_id,
+                    )?)?,
+                    market_squawk_domain::VenueSymbol::try_from(native_symbol(
+                        &self.instrument_id,
+                    )?)?,
                 ),
                 ProviderTimestampEvidence::Provided {
                     value: frame_at,
@@ -585,12 +604,10 @@ impl SourceHarness {
             instrument(&self.instrument_id)?,
             market_squawk_sources::ProviderNativeInstrumentIdentity::new(
                 market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
-                market_squawk_domain::ProviderInstrumentId::try_from(
-                    native_symbol(&self.instrument_id)?,
-                )?,
-                market_squawk_domain::VenueSymbol::try_from(
-                    native_symbol(&self.instrument_id)?,
-                )?,
+                market_squawk_domain::ProviderInstrumentId::try_from(native_symbol(
+                    &self.instrument_id,
+                )?)?,
+                market_squawk_domain::VenueSymbol::try_from(native_symbol(&self.instrument_id)?)?,
             ),
             ProviderTimestampEvidence::Provided {
                 value: frame_at,
@@ -678,12 +695,10 @@ impl SourceHarness {
             instrument(&self.instrument_id)?,
             market_squawk_sources::ProviderNativeInstrumentIdentity::new(
                 market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
-                market_squawk_domain::ProviderInstrumentId::try_from(
-                    native_symbol(&self.instrument_id)?,
-                )?,
-                market_squawk_domain::VenueSymbol::try_from(
-                    native_symbol(&self.instrument_id)?,
-                )?,
+                market_squawk_domain::ProviderInstrumentId::try_from(native_symbol(
+                    &self.instrument_id,
+                )?)?,
+                market_squawk_domain::VenueSymbol::try_from(native_symbol(&self.instrument_id)?)?,
             ),
             ProviderTimestampEvidence::Provided {
                 value: frame_at,

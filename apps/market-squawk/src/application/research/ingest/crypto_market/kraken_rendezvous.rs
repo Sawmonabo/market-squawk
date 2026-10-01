@@ -17,7 +17,10 @@ use market_squawk_adapter_kraken::{
     KrakenPublicationUnavailable, KrakenSealedMarketPublicationMaterial,
 };
 use market_squawk_domain::{ConnectionGeneration, EvidenceDigest, SourceId};
-use market_squawk_live::CommittedResearchMarketObservationLease;
+use market_squawk_live::{
+    CommittedResearchMarketBatchCoordinates, CommittedResearchMarketBatchLease,
+    CommittedResearchMarketBatchOutcome, CommittedResearchMarketObservationLease,
+};
 use market_squawk_sources::MAX_DECODED_EVENTS;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -134,6 +137,23 @@ impl SourceObjectKey {
         ))
     }
 
+    fn from_batch(coordinates: &CommittedResearchMarketBatchCoordinates) -> Self {
+        let evidence = coordinates.evidence();
+        Self {
+            source_id: evidence.binding().source_id().clone(),
+            generation: evidence.binding().connection_generation(),
+            coordinate: match evidence {
+                market_squawk_sources::CurrentObservationEvidence::TransportFrame(frame) => {
+                    SourceObjectCoordinate::TransportFrame(frame.frame_id().get())
+                }
+                market_squawk_sources::CurrentObservationEvidence::HttpResponse(response) => {
+                    SourceObjectCoordinate::HttpResponse(response.receipt().coordinate_digest())
+                }
+            },
+            raw_payload_digest: evidence.payload_digest(),
+        }
+    }
+
     fn from_lease(
         lease: &CommittedResearchMarketObservationLease,
     ) -> Result<Self, CryptoMarketPublicationError> {
@@ -155,8 +175,63 @@ impl SourceObjectKey {
     }
 }
 
+enum PendingRow {
+    Committed(CommittedResearchMarketObservationLease),
+    Rejected,
+}
+
+enum CompleteRows {
+    Committed(Vec<CommittedResearchMarketObservationLease>),
+    Rejected,
+}
+
+impl CompleteRows {
+    fn committed(self) -> Option<Vec<CommittedResearchMarketObservationLease>> {
+        match self {
+            Self::Committed(rows) => Some(rows),
+            Self::Rejected => None,
+        }
+    }
+}
+
+// Counts are the last observation under the existing state lock, not provider identifiers.
+// Drop reports interrupted waits even when the supervisor cancels and drops the entire future.
+struct PublicationWaitDiagnostic {
+    stage: &'static str,
+    expected: usize,
+    observed_present: usize,
+    observed_rejected: usize,
+    completed: bool,
+}
+
+impl PublicationWaitDiagnostic {
+    fn new(stage: &'static str, expected: usize) -> Self {
+        Self {
+            stage,
+            expected,
+            observed_present: 0,
+            observed_rejected: 0,
+            completed: false,
+        }
+    }
+}
+
+impl Drop for PublicationWaitDiagnostic {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::warn!(
+                stage = self.stage,
+                expected = self.expected,
+                observed_present = self.observed_present,
+                observed_rejected = self.observed_rejected,
+                "crypto publication rendezvous interrupted"
+            );
+        }
+    }
+}
+
 struct PendingRows {
-    rows: Vec<Option<CommittedResearchMarketObservationLease>>,
+    rows: Vec<Option<PendingRow>>,
     retained_bytes: usize,
 }
 
@@ -307,6 +382,12 @@ impl CryptoPendingFrameIngress {
                 KrakenPublicationUnavailable::ApplicationBackpressure,
             ));
         };
+        let CompleteRows::Committed(rows) = rows else {
+            return Ok(unavailable(
+                material,
+                KrakenPublicationUnavailable::QualifiedCanonicalOutputUnavailable,
+            ));
+        };
         let rows = rows
             .into_iter()
             .map(CommittedResearchMarketObservationLease::into_observation)
@@ -347,11 +428,20 @@ impl CryptoPendingFrameIngress {
                     .into_sealed_raw(CoinbaseMarketNonPublicationReason::ApplicationBackpressure)?,
             ));
         };
+        let CompleteRows::Committed(rows) = rows else {
+            return Ok(CoinbaseMarketApplicationOutcome::SealedRaw(
+                material.into_sealed_raw(
+                    CoinbaseMarketNonPublicationReason::CanonicalQualificationUnavailable,
+                )?,
+            ));
+        };
         let rows = rows
             .into_iter()
             .map(CommittedResearchMarketObservationLease::into_observation)
             .collect();
-        publication
+        let mut diagnostic = PublicationWaitDiagnostic::new("canonical_publication", expected);
+        diagnostic.observed_present = expected;
+        let result = publication
             .publish_coinbase_public_joined(
                 material,
                 rows,
@@ -361,7 +451,9 @@ impl CryptoPendingFrameIngress {
                 precommit_authority,
                 self.core.cancellation.clone(),
             )
-            .await
+            .await;
+        diagnostic.completed = result.is_ok();
+        result
     }
 
     #[allow(
@@ -387,6 +479,10 @@ impl CryptoPendingFrameIngress {
             None => None,
         };
         let terminal = self.wait_for_rows(terminal_key, 1, retained_bytes).await;
+        let rejected = matches!(&snapshot, Some(CompleteRows::Rejected))
+            || matches!(&terminal, Some(CompleteRows::Rejected));
+        let snapshot = snapshot.and_then(CompleteRows::committed);
+        let terminal = terminal.and_then(CompleteRows::committed);
         let (qualification, native_selections, precommit_authority) = match (snapshot, terminal) {
             (snapshot, Some(mut terminal)) if !initial || snapshot.is_some() => {
                 let replay = terminal
@@ -460,9 +556,11 @@ impl CryptoPendingFrameIngress {
                 )
             }
             _ => (
-                CoinbaseMarketQualificationOutcome::Unavailable(
-                    CoinbaseMarketNonPublicationReason::ApplicationBackpressure,
-                ),
+                CoinbaseMarketQualificationOutcome::Unavailable(if rejected {
+                    CoinbaseMarketNonPublicationReason::CanonicalQualificationUnavailable
+                } else {
+                    CoinbaseMarketNonPublicationReason::ApplicationBackpressure
+                }),
                 None,
                 precommit_authority,
             ),
@@ -491,22 +589,34 @@ impl CryptoPendingFrameIngress {
         key: SourceObjectKey,
         expected: usize,
         retained_bytes: usize,
-    ) -> Option<Vec<CommittedResearchMarketObservationLease>> {
+    ) -> Option<CompleteRows> {
+        let mut diagnostic = PublicationWaitDiagnostic::new("frame_admission", expected);
         let deadline = self.frame_deadline(&key).await?;
+        diagnostic.stage = "material_admission";
         if expected == 0 || !self.admit_material(&key, retained_bytes).await {
             self.discard(&key).await;
             return None;
         }
+        diagnostic.stage = "terminal_rows";
         loop {
             // Register before inspecting rows; submit may notify while that state lock is awaited.
             let wake = self.core.changed.notified();
             tokio::pin!(wake);
             wake.as_mut().enable();
             if self.core.cancellation.is_cancelled() || Instant::now() >= deadline {
+                diagnostic.stage = if self.core.cancellation.is_cancelled() {
+                    "terminal_rows_cancelled"
+                } else {
+                    "terminal_rows_deadline"
+                };
                 self.discard(&key).await;
                 return None;
             }
-            if let Some(rows) = self.take_complete_rows(&key, expected).await {
+            if let Some(rows) = self
+                .take_complete_rows(&key, expected, &mut diagnostic)
+                .await
+            {
+                diagnostic.completed = true;
                 return Some(rows);
             }
             tokio::select! {
@@ -540,9 +650,18 @@ impl CryptoPendingFrameIngress {
         &self,
         key: &SourceObjectKey,
         expected: usize,
-    ) -> Option<Vec<CommittedResearchMarketObservationLease>> {
+        diagnostic: &mut PublicationWaitDiagnostic,
+    ) -> Option<CompleteRows> {
         let mut state = self.core.state.lock().await;
+        diagnostic.observed_present = 0;
+        diagnostic.observed_rejected = 0;
         let pending = state.rows.get(key)?;
+        diagnostic.observed_present = pending.rows.iter().filter(|row| row.is_some()).count();
+        diagnostic.observed_rejected = pending
+            .rows
+            .iter()
+            .filter(|row| matches!(row, Some(PendingRow::Rejected)))
+            .count();
         if pending.rows.len() != expected || pending.rows.iter().any(Option::is_none) {
             return None;
         }
@@ -553,7 +672,22 @@ impl CryptoPendingFrameIngress {
             .retained_bytes
             .saturating_sub(pending.retained_bytes)
             .saturating_sub(sealed_bytes);
-        pending.rows.into_iter().collect()
+        if pending
+            .rows
+            .iter()
+            .any(|row| matches!(row, Some(PendingRow::Rejected)))
+        {
+            return Some(CompleteRows::Rejected);
+        }
+        let rows: Option<Vec<_>> = pending
+            .rows
+            .into_iter()
+            .map(|row| match row {
+                Some(PendingRow::Committed(row)) => Some(row),
+                _ => None,
+            })
+            .collect();
+        rows.map(CompleteRows::Committed)
     }
 
     async fn admit_material(&self, key: &SourceObjectKey, retained_bytes: usize) -> bool {
@@ -589,68 +723,91 @@ impl CryptoPendingFrameIngress {
 impl CryptoCommittedRowIngress {
     pub(crate) async fn submit(
         &self,
-        wire_ordinal: usize,
-        expected_row_count: NonZeroUsize,
-        lease: CommittedResearchMarketObservationLease,
+        batch: CommittedResearchMarketBatchLease,
     ) -> Result<(), CryptoMarketPublicationError> {
-        let row_count = expected_row_count.get();
-        let observation = lease.observation();
+        let coordinates = batch.coordinates();
+        let row_count = coordinates.row_count();
+        let ordinals = coordinates.wire_ordinals();
         if self.core.cancellation.is_cancelled()
+            || row_count == 0
             || row_count > MAX_DECODED_EVENTS
-            || wire_ordinal >= row_count
-            || observation.wire_ordinal() != wire_ordinal
-            || observation.row_count() != row_count
+            || ordinals.is_empty()
+            || ordinals.iter().any(|ordinal| *ordinal >= row_count)
+            || ordinals.windows(2).any(|pair| pair[0] >= pair[1])
         {
-            tracing::warn!(
-                cancelled = self.core.cancellation.is_cancelled(),
-                row_count,
-                wire_ordinal,
-                "committed publication row rejected at admission"
-            );
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
-        let key = SourceObjectKey::from_lease(&lease)?;
-        let retained_bytes = lease.retained_bytes();
-        let row_slot_bytes = std::mem::size_of::<Option<CommittedResearchMarketObservationLease>>()
+        let key = SourceObjectKey::from_batch(coordinates);
+        let retained_bytes = batch.retained_bytes();
+        let (coordinates, outcome) = batch.into_parts();
+        let ordinals = coordinates.wire_ordinals();
+        let retained_bytes = match &outcome {
+            CommittedResearchMarketBatchOutcome::Committed(rows) => {
+                if rows.len() != ordinals.len() {
+                    return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+                }
+                for (row, ordinal) in rows.iter().zip(ordinals) {
+                    if row.observation().wire_ordinal() != *ordinal
+                        || row.observation().row_count() != row_count
+                        || SourceObjectKey::from_lease(row)? != key
+                    {
+                        return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+                    }
+                }
+                retained_bytes
+            }
+            // Rejection stores only finite row coverage; exact coordinate evidence is consumed
+            // here, and the source-key/slot allocation is covered by the same pending-frame bound.
+            CommittedResearchMarketBatchOutcome::Rejected => 0,
+        };
+        let row_slot_bytes = std::mem::size_of::<Option<PendingRow>>()
             .checked_mul(row_count)
             .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
         let now = Instant::now();
         let mut state = self.core.state.lock().await;
+        let new_frame = !state.deadlines.contains_key(&key);
+        if new_frame && state.deadlines.len() >= self.core.limits.maximum_pending_frames.get() {
+            tracing::warn!(
+                pending_frames = state.deadlines.len(),
+                "terminal publication batch exceeds admitted frame capacity"
+            );
+            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+        }
         let deadline = match state.deadlines.get(&key).copied() {
             Some(deadline) => deadline,
-            None => {
-                if state.deadlines.len() >= self.core.limits.maximum_pending_frames.get() {
-                    tracing::warn!(
-                        pending_frames = state.deadlines.len(),
-                        maximum_pending_frames = self.core.limits.maximum_pending_frames.get(),
-                        "committed publication exceeds admitted frame capacity"
-                    );
-                    return Err(CryptoMarketPublicationError::RendezvousUnavailable);
-                }
-                let deadline = now
-                    .checked_add(self.core.limits.frame_timeout)
-                    .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
-                state.deadlines.insert(key.clone(), deadline);
-                deadline
-            }
+            None => now
+                .checked_add(self.core.limits.frame_timeout)
+                .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?,
         };
         if now >= deadline {
-            tracing::warn!("committed publication arrived after its frame deadline");
+            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+        }
+        let additional_slots = if let Some(pending) = state.rows.get(&key) {
+            if pending.rows.len() != row_count
+                || ordinals
+                    .iter()
+                    .any(|ordinal| pending.rows[*ordinal].is_some())
+            {
+                return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+            }
+            0
+        } else {
+            row_slot_bytes
+        };
+        let total = state
+            .retained_bytes
+            .checked_add(additional_slots)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
+            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
+        if total > self.core.limits.maximum_retained_bytes.get() {
+            tracing::warn!(
+                required_bytes = total,
+                maximum_bytes = self.core.limits.maximum_retained_bytes.get(),
+                "terminal publication batch exceeds retained byte budget"
+            );
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
         if !state.rows.contains_key(&key) {
-            let total = state
-                .retained_bytes
-                .checked_add(row_slot_bytes)
-                .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
-            if total > self.core.limits.maximum_retained_bytes.get() {
-                tracing::warn!(
-                    required_bytes = total,
-                    maximum_bytes = self.core.limits.maximum_retained_bytes.get(),
-                    "committed publication row slots exceed retained byte budget"
-                );
-                return Err(CryptoMarketPublicationError::RendezvousUnavailable);
-            }
             let mut rows = Vec::new();
             rows.try_reserve_exact(row_count)
                 .map_err(|_| CryptoMarketPublicationError::RendezvousUnavailable)?;
@@ -662,34 +819,24 @@ impl CryptoCommittedRowIngress {
                     retained_bytes: row_slot_bytes,
                 },
             );
-            state.retained_bytes = total;
         }
-        let total = state
-            .retained_bytes
-            .checked_add(retained_bytes)
-            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
-        if total > self.core.limits.maximum_retained_bytes.get() {
-            tracing::warn!(
-                required_bytes = total,
-                maximum_bytes = self.core.limits.maximum_retained_bytes.get(),
-                "committed publication rows exceed retained byte budget"
-            );
-            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
-        }
+        state.deadlines.insert(key.clone(), deadline);
         let pending = state
             .rows
             .get_mut(&key)
             .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
-        if pending.rows.len() != row_count || pending.rows[wire_ordinal].is_some() {
-            tracing::warn!(
-                retained_row_count = pending.rows.len(),
-                row_count,
-                wire_ordinal,
-                "committed publication row count conflicts or ordinal is duplicated"
-            );
-            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+        match outcome {
+            CommittedResearchMarketBatchOutcome::Committed(rows) => {
+                for (ordinal, row) in ordinals.iter().zip(rows) {
+                    pending.rows[*ordinal] = Some(PendingRow::Committed(row));
+                }
+            }
+            CommittedResearchMarketBatchOutcome::Rejected => {
+                for ordinal in ordinals {
+                    pending.rows[*ordinal] = Some(PendingRow::Rejected);
+                }
+            }
         }
-        pending.rows[wire_ordinal] = Some(lease);
         pending.retained_bytes = pending
             .retained_bytes
             .checked_add(retained_bytes)

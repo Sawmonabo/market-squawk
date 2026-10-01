@@ -332,10 +332,7 @@ async fn run_committed_worker(
                 None => break,
             },
         };
-        let wire_ordinal = lease.observation().wire_ordinal();
-        let row_count = NonZeroUsize::new(lease.observation().row_count())
-            .ok_or(KrakenPublicationSupervisorError::CommittedCoordinates)?;
-        ingress.submit(wire_ordinal, row_count, lease).await?;
+        ingress.submit(lease).await?;
     }
     while let Ok(_discarded) = receiver.try_recv() {}
     Ok(())
@@ -378,8 +375,6 @@ pub(super) enum KrakenPublicationSupervisorError {
     Allocation,
     #[error("Kraken publication deadline cannot be represented")]
     DeadlineRange,
-    #[error("Kraken committed observation coordinates are invalid")]
-    CommittedCoordinates,
     #[error("Kraken publication worker exceeded its shutdown deadline")]
     ShutdownDeadline,
     #[error("Kraken publication worker task failed: {0}")]

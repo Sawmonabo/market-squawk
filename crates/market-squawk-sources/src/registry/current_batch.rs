@@ -779,6 +779,11 @@ impl CurrentDecodedProviderBatch {
         Ok(())
     }
 
+    /// Borrows the exact routed observations without transferring their processing authority.
+    pub fn observations(&self) -> &[CurrentProviderObservation] {
+        &self.observations
+    }
+
     /// Consumes the homogeneous routing batch in original provider wire order.
     pub fn into_observations(self) -> CurrentObservationIter {
         CurrentObservationIter(self.observations.into_vec().into_iter())

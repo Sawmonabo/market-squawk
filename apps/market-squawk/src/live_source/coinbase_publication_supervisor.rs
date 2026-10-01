@@ -257,6 +257,7 @@ async fn run_raw_worker(
                     }
                     Some(input) => inflight.push(publish_raw(
                         input,
+                        RawPublicationDiagnostic::queued(),
                         pending.clone(),
                         Arc::clone(&authority),
                         limits,
@@ -273,14 +274,65 @@ async fn run_raw_worker(
     Ok(())
 }
 
+// Created at dequeue so Drop also distinguishes an unpolled future from an interrupted stage.
+struct RawPublicationDiagnostic {
+    queued_at: Instant,
+    first_polled_at: Option<Instant>,
+    stage_started_at: Instant,
+    stage: &'static str,
+    completed: bool,
+}
+
+impl RawPublicationDiagnostic {
+    fn queued() -> Self {
+        let queued_at = Instant::now();
+        Self {
+            queued_at,
+            first_polled_at: None,
+            stage_started_at: queued_at,
+            stage: "queued",
+            completed: false,
+        }
+    }
+
+    fn enter_stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+        self.stage_started_at = Instant::now();
+    }
+}
+
+impl Drop for RawPublicationDiagnostic {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::warn!(
+                stage = self.stage,
+                polled = self.first_polled_at.is_some(),
+                before_first_poll_ms = ?self.first_polled_at.map(|at| {
+                    at.duration_since(self.queued_at).as_millis()
+                }),
+                total_elapsed_ms = %self.queued_at.elapsed().as_millis(),
+                stage_elapsed_ms = %self.stage_started_at.elapsed().as_millis(),
+                "Coinbase raw publication interrupted"
+            );
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dequeue diagnostic accompanies the existing exact publication inputs"
+)]
 async fn publish_raw(
     input: CoinbaseCapturedPublicationInput,
+    mut diagnostic: RawPublicationDiagnostic,
     pending: CryptoPendingFrameIngress,
     authority: Arc<CryptoMarketPublicationAuthority>,
     limits: CryptoPublicationRendezvousLimits,
     durable_writer: MarketEventDurableReadWriter,
     cancellation: CancellationToken,
 ) -> Result<(), CoinbasePublicationSupervisorError> {
+    diagnostic.first_polled_at = Some(Instant::now());
+    diagnostic.enter_stage("authority");
     authority.validate_precommit()?;
     let publication = authority.publication();
     let (outcome, _frame_admission) = match input {
@@ -294,6 +346,7 @@ async fn publish_raw(
             let deadline = Instant::now()
                 .checked_add(limits.frame_timeout())
                 .ok_or(CoinbasePublicationSupervisorError::DeadlineRange)?;
+            diagnostic.enter_stage("raw_seal");
             let material = publication
                 .seal_coinbase_public(
                     rejoin,
@@ -304,6 +357,7 @@ async fn publish_raw(
                     deadline,
                 )
                 .await?;
+            diagnostic.enter_stage("terminal_rows_or_canonical_publication");
             let outcome = match disposition {
                 CoinbaseCapturedPublicationDisposition::AwaitCommittedRows => {
                     let idempotency = coinbase_idempotency_key(&material)?;
@@ -334,8 +388,10 @@ async fn publish_raw(
     };
     // Retain end-to-end admission until the durable read owner has retained this commit too.
     if let CoinbaseMarketApplicationOutcome::Published(receipt) = outcome {
+        diagnostic.enter_stage("durable_receipt_retention");
         durable_writer.retain(receipt).await?;
     }
+    diagnostic.completed = true;
     Ok(())
 }
 
@@ -525,10 +581,7 @@ async fn run_committed_worker(
                 None => break,
             },
         };
-        let wire_ordinal = lease.observation().wire_ordinal();
-        let row_count = NonZeroUsize::new(lease.observation().row_count())
-            .ok_or(CoinbasePublicationSupervisorError::CommittedCoordinates)?;
-        ingress.submit(wire_ordinal, row_count, lease).await?;
+        ingress.submit(lease).await?;
     }
     while let Ok(_discarded) = receiver.try_recv() {}
     Ok(())

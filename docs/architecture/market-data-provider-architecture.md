@@ -547,10 +547,9 @@ identity in the registry.
 
 The [2026-10-01 storage research](../research/2026-10-01-market-data-storage/final-report.md)
 defines the approved boundary: transactional SQLite microbatches for active events and indexed
-current/as-of reads, with bounded Parquet archives queried through DataFusion. The active-event
-slice has focused restart/integrity evidence. Archive handoff, reclamation and exact backup
-are being integrated and remain subject to the critical checks in the delivery ledger. Whole-history event compaction is removed. No throughput or whole-app
-memory claim follows from this change. The delivery ledger owns integration and acceptance status.
+current/as-of reads, with bounded Parquet archives queried through DataFusion. The active-event, archive handoff, raw recovery and exact backup paths are integrated; the
+delivery ledger records their critical checks and remaining live workflow failures. Whole-history
+event compaction is removed. No throughput or whole-app memory claim follows from this change.
 
 The durable layout extends the existing [research data plane](research-data-plane.md); it does not
 replace it with a second database or a new data application.
@@ -573,6 +572,11 @@ exclusion. Startup creates the cursor without scanning all history. Exact select
 explicit backups still verify their complete selected bytes; background completion is not an
 authorization receipt. Accounting detects integer overflow rather than imposing a cumulative
 physical-object or stored-byte quota.
+
+Raw journal and capture-pipe serialization share an 8 KiB temporary buffer ahead of checksum/count
+writers. This coalesces JSON fragments without materializing an entire encoded record or changing
+its bytes. Each pass explicitly drains before checking its length/digest; failure discards pending
+buffered output without retrying a cancelled write. The existing two-pass integrity checks remain.
 
 Analytical backup streams canonical catalog evidence in a consistent transaction and retains a
 compact digest/count/byte summary. Physical verification and copying traverse the retained immutable
@@ -638,8 +642,9 @@ not the total accepted history.
 
 Exact backup includes logical event relations, active payloads and archive membership plus every
 referenced physical archive. Archive and backup verification are tracked in the delivery ledger.
-Continuous-ingestion acceptance also requires replacing the separate raw-custody lifetime admission
-and whole-store startup scan; bounded canonical archives alone do not establish that acceptance.
+Raw custody uses indexed membership and incremental recovery as described above. Together these
+changes remove the identified cumulative event-publication and raw-object admission limits;
+continuous-ingestion acceptance still requires the actual live workflow, not only storage checks.
 
 Alpaca stock history binds the current catalog-selected native asset UUID and listing to an
 explicit New York symbol-resolution date (`asof`). Capture and publication retain that selection's

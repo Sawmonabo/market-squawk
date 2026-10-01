@@ -231,6 +231,8 @@ pub(super) fn spawn_route_activation(
                     break Ok(());
                 }
                 Err(failure) => {
+                    // These closed errors contain only unit variants or retained-byte counts.
+                    tracing::warn!(?failure, "live route activation or ingress failed");
                     status_sender.send_replace(Some(failure));
                     break Err(failure);
                 }

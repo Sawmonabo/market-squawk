@@ -1,7 +1,6 @@
 //! Deterministic instrument-owned live state and current execution authority.
 
 mod action;
-pub mod virtual_paper;
 mod authority;
 mod book;
 mod committed_research_export;
@@ -17,6 +16,7 @@ mod runtime;
 mod sharding;
 mod snapshot;
 mod state;
+pub mod virtual_paper;
 
 pub(crate) use action::ActionHookActivationLease;
 pub use action::{
@@ -33,8 +33,10 @@ pub use authority::{
 };
 pub use book::{BookError, BookSide, DepthLimit, LevelUpdate, MAX_BOOK_MESSAGE_ITEMS, ScaledBook};
 pub use committed_research_export::{
-    CommittedResearchMarketExportError, CommittedResearchMarketObservationLease,
-    CommittedResearchMarketObservationReceiver, RouteCommittedResearchMarketExport,
+    CommittedResearchMarketBatchCoordinates, CommittedResearchMarketBatchLease,
+    CommittedResearchMarketBatchOutcome, CommittedResearchMarketExportError,
+    CommittedResearchMarketObservationLease, CommittedResearchMarketObservationReceiver,
+    RouteCommittedResearchMarketExport,
 };
 pub use cross_venue::{
     CrossVenueFeatureError, CrossVenueFeatureHub, CrossVenueFeatureSnapshot, CrossVenueUpdate,

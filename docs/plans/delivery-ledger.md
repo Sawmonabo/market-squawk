@@ -38,21 +38,52 @@ release checks pass as detailed below. These are focused working-tree checks, no
 approval. The independently pending terminal-batch changes remain uncommitted; real Coinbase
 publication still fails and is not represented as completed live behavior.
 
+**Streamed recovery/backup checkpoint `ee77ff55` pushed** (PR #43 comment5930175512).
+Its focused evidence is recorded below. Independent terminal-batch WIP remains preserved.
+
 ### Current dependency and ownership wave
 
-Lead integrates the bounded storage wave below; all implementation owners are frozen. Existing
-platform raw-journal recovery passes1/1,0.10s and logical-object cancel/resume/pin recovery passes
-1/1,0.18s (`streamed-raw-{recovery,logical}-critical.log`). Data critical checks now pass as recorded below. The sole single-job compiler is preparing
-application integration (`streamed-storage-app-build.log`). No checks from this wave establish live
-or installed acceptance.
+The storage wave is pushed through `ee77ff55`; its focused platform, data and shared-service
+checks pass. The live feed still fails before publication. Terminal-batch changes and the bounded
+serialization correction below are frozen with the lead for integrated verification; no other
+implementation owner is active. The single-job application build passed in 6m55s; live verification failed in 132.26s as recorded below. No current evidence
+establishes completed live ingestion or installed Desktop workflows.
 
-Astra research_options_failure completed the bounded read-only worker/raw-seal trace: no concrete
-self-dependency was found, so no scheduling change is justified yet. Files remain frozen with lead;
-the next dependency is actual live phase evidence.
-`research_service/worker.rs` now records only closed
-wait stages and compile-time operation names on interruption. Seal phase diagnostics distinguish
-queued from physical work without changing scheduling or deadlines. The next real live run follows
-integrated storage compilation and focused correctness checks.
+### Raw capture serialization correction — base `ee77ff55`
+
+The 74–77s sample caught `write_current_frame_inner -> serde_json -> CountingCrcWriter` and the
+parallel capture pipe's per-fragment SHA writer. Payload bytes are JSON integers; downstream
+file/pipe buffering does not coalesce checksum updates. This is CPU serialization evidence, not
+an fsync or mutex stall. The elapsed live check records about 5.2s before source admission fails.
+
+| Owner | Exact ownership / dependency | Completion evidence |
+| --- | --- | --- |
+| Astra research_options_failure | Platform `journal.rs`, `raw_record.rs` if a cohesive shared serializer belongs there, and `capture/process_journal/{sink.rs,protocol.rs}`; relevant existing platform critical cases only | Coalesce serialization fragments before CRC/SHA using maintained buffering, preserve exact bytes/length/two-pass checks, cancellation and honest fixed memory accounting. No all-record materialization, new format/version, cap/deadline increases, independent builds or Git. Return any accounting/API caller changes to lead before expanding ownership. |
+| Lead | Shared exports/accounting callers if needed; application integration, build/test scheduling, Git/ledger/PR | Inspect actual changes, run existing journal/capture integrity and cancellation checks once, then unchanged live ingestion/restart proof. |
+
+This bounded wave follows the concrete occupied stack; it does not create another review quarter
+or performance acceptance claim. Earlier diagnostic-only owners are frozen.
+
+Implementation is frozen: one shared 8 KiB serializer buffer precedes CRC/SHA/count/control writers.
+Successful completion drains without forcing an underlying file/pipe flush; failure disarms buffer
+Drop so cancelled/failed writes are not retried. Journal accounting includes temporary workspace.
+Existing critical checks pass 5/5: exact bytes/no failed-write retry, sealed restart/recovery, frame
+length/CRC, exact storage accounting, and helper kill/reap/release. Platform compilation passes in 12.64s.
+Evidence: `buffered-capture-{build,critical}.log`. The application build passes in 6m55s
+(`buffered-capture-app-build.log`); the unchanged public-feed restart check fails in 132.26s
+(`buffered-capture-live.log`). No timeout,
+data limit or wire-format change was made.
+
+
+### Live publication follow-up — current buffering candidate
+
+The updated live run fails in 132.26s. It reaches canonical publication after raw sealing and complete terminal-row
+pairing at about 2.98s publication age, then reports `publication_authority_invalid`.
+The final check reports no array-shaped unified feed after source teardown. Kraken is not reached. This is progress beyond the prior occupied
+serialization stack, not completed live acceptance. Astra research_options_failure owns a read-only
+trace of that exact error through Coinbase publication authority, canonical ingestion and revocation;
+no edits, builds, timeout changes or Git. Lead retains all source ownership and live execution. The
+outcome is an exact failing condition and smallest correction proposal before further changes.
 
 ### Bounded storage implementation wave — base `d9f91902`
 
@@ -86,8 +117,21 @@ Application control-plane compilation passes6m57s (`streamed-storage-app-build.l
 Existing shared service/startup/restart/optional-access check passes1/1,100.25s
 (`streamed-storage-shared-service-critical.log`). Actual public-feed verification fails79.22s (`streamed-storage-live.log`): one capture is at
 `current_join`/`physical_seal`, three wait at `gate_admission`/`queued`. Coinbase readiness times
-out before selected publication. The physical sealing stall is the next concrete dependency;
-Astra research_options_failure is examining the captured stack read-only. This does not establish
+out before selected publication. Those phases describe teardown only. The repeated run fails78.87s, but its58.8s stack
+sample has idle runtime/blocking workers and no active seal. Neither a long seal stall nor runtime
+starvation is proved. Astra finished this read-only trace; lead will sample the final admission
+interval before choosing a behavioral fix. The68–71s sample also has no active seal.
+Astra research_options_failure now owns only failure-age diagnostics in
+`live_source/coinbase_publication_supervisor.rs`; lead owns matching seal-phase elapsed evidence in
+`research_service.rs`. No scheduling/timeout/cap changes; compile only after both freeze, then the
+same live check. These diagnostics close the gap between teardown phase and actual wait duration. Both owners are
+frozen; the single-job application rebuild passes4m30s
+(`storage-publication-elapsed-build.log`). Lead is running the unchanged live check with elapsed
+failure fields (`storage-publication-elapsed-live.log`). The68–71s sampled run ultimately fails132.33s
+(`streamed-storage-live-admission-sample.log`). No behavior change is claimed from diagnostics. The elapsed run fails79.09s: every raw future
+was polled immediately; one physical seal runs5243ms and three requests queue behind it. Thus
+the earlier68–71s sample preceded physical sealing. Lead is sampling the actual74–77s interval
+(`storage-physical-seal-sample.txt`, `storage-physical-seal-sample-live.log`); Astra retains read-only stack diagnosis. This does not establish
 live ingestion or Desktop completion. The separately preserved terminal-batch WIP remains open.
 No whole-app RAM or release claim.
 

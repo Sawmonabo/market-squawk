@@ -25,6 +25,7 @@ use crate::capture::CapturedRawRecord;
 use crate::capture::writer::{
     CaptureDestination, CaptureIoContext, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
 };
+use crate::raw_record::write_json_buffered;
 
 const STARTUP_REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -203,14 +204,14 @@ impl ProcessJournalSink {
     fn append_record(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         let sequence = self.next_sequence;
         let mut measurement = CountingDigestWriter::new();
-        serde_json::to_writer(&mut measurement, record.record())
+        write_json_buffered(&mut measurement, record.record())
             .map_err(|_error| storage_error(CaptureStorageErrorClass::Corruption))?;
         let (payload_bytes, digest) = measurement.finish();
         Header::try_new(MessageKind::Append, sequence, payload_bytes, digest)
             .and_then(|header| header.write_to(&mut self.input))
             .map_err(protocol_storage_error)?;
         let mut forwarding = VerifyingForwardWriter::new(&mut self.input, payload_bytes);
-        serde_json::to_writer(&mut forwarding, record.record())
+        write_json_buffered(&mut forwarding, record.record())
             .map_err(|_error| storage_error(CaptureStorageErrorClass::Corruption))?;
         let (observed_bytes, observed_digest) = forwarding.finish();
         if observed_bytes != payload_bytes || observed_digest != digest {
