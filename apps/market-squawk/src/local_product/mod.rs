@@ -621,28 +621,37 @@ impl LocalProduct {
         let application_preparation = Application::prepare_composition(config.source_shutdown())?;
         let cancellation = CancellationToken::new();
         let _startup_cancellation = cancellation.clone().drop_guard();
-        let recovery_deadline = Instant::now()
-            .checked_add(LOCAL_RECOVERY_TIMEOUT)
-            .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
-        let recovery_context = ArtifactReadContext::new(cancellation.clone(), recovery_deadline);
-        recovery_context.ensure_live()?;
+        // Each finite recovery operation owns its deadline. Catalog integrity and executable
+        // identity work must not consume a later operation's lifetime before it starts.
+        let recovery_deadline = || {
+            Instant::now()
+                .checked_add(LOCAL_RECOVERY_TIMEOUT)
+                .ok_or(LocalProductError::InvalidCodeOwnedLimit)
+        };
         let (research, onboarding_catalog, feature_dataset_production_publisher) =
             open_research(&paths)?;
         let research = Arc::new(research);
         // No provider reopening or retained valuation source read precedes raw-capture recovery.
         let provider_capture_report = {
+            let capture_context =
+                ArtifactReadContext::new(cancellation.clone(), recovery_deadline()?);
+            capture_context.ensure_live()?;
             let recovery = research.recover_provider_capture_store(&cancellation);
             tokio::pin!(recovery);
-            match tokio::time::timeout_at(recovery_deadline.into(), &mut recovery).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    cancellation.cancel();
-                    let _reaped = recovery.await;
-                    return Err(LocalProductError::Artifact(ArtifactError::DeadlineExceeded));
-                }
-            }
+            let report =
+                match tokio::time::timeout_at(capture_context.deadline().into(), &mut recovery)
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        cancellation.cancel();
+                        let _reaped = recovery.await;
+                        return Err(LocalProductError::Artifact(ArtifactError::DeadlineExceeded));
+                    }
+                };
+            capture_context.ensure_live()?;
+            report
         };
-        recovery_context.ensure_live()?;
         tracing::info!(
             quarantined_staging = provider_capture_report.quarantined_staging().len(),
             quarantined_objects = provider_capture_report.quarantined_objects().len(),
@@ -755,7 +764,7 @@ impl LocalProduct {
         let provider_secret_root = paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY);
         let secret_control = SecretOperationControl::try_new(
             "provider-credentials-open",
-            recovery_deadline,
+            recovery_deadline()?,
             1,
             SecretInteractionPolicy::Forbid,
             SecretCancellation::new(),
@@ -988,7 +997,7 @@ impl LocalProduct {
         market_runtime
             .bind_account_reconnect(
                 Arc::downgrade(&reconnect_owner),
-                recovery_deadline,
+                recovery_deadline()?,
                 &cancellation,
             )
             .await?;
@@ -1175,6 +1184,7 @@ impl LocalProduct {
         let fair_value_inputs =
             ProductionFairValueInputAuthority::try_new(FairValueInputAuthorityLimits::standard())?;
         let fair_value_limits = fair_value_limits()?;
+        let recovery_context = ArtifactReadContext::new(cancellation.clone(), recovery_deadline()?);
         recovery_context.ensure_live()?;
         let forecast_sources =
             ForecastValuationSourceFactory::new(Arc::clone(&model), Arc::clone(&research));
