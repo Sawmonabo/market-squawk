@@ -108,7 +108,6 @@ export function ProductProvider({
   const [recoveryError, setRecoveryError] = React.useState<string | null>(null)
   const [eventConnection, setEventConnection] =
     React.useState<EventConnectionState>({ status: "inactive" })
-  const [eventAdmissionPending, setEventAdmissionPending] = React.useState(true)
   const [eventAdmittedProductSession, setEventAdmittedProductSession] =
     React.useState<DesktopBootstrap["productSessionToken"] | null>(null)
   const [explicitRefreshGeneration, setExplicitRefreshGeneration] =
@@ -147,7 +146,6 @@ export function ProductProvider({
     const startup = bootstrap.data
     if (!startup || "status" in startup) {
       setEventConnection({ status: "inactive" })
-      setEventAdmissionPending(true)
       setEventAdmittedProductSession(null)
       return
     }
@@ -169,19 +167,18 @@ export function ProductProvider({
       subscription = null
       return current ? current.unsubscribe() : Promise.resolve()
     }
-    const unavailable = () => {
+    const unavailable = (retainAdmittedSession = false) => {
       if (!active) return
       failed = true
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
       reconnectTimer = null
-      setEventAdmissionPending(false)
-      setEventAdmittedProductSession(null)
+      if (!retainAdmittedSession) setEventAdmittedProductSession(null)
       setEventConnection({ status: "unavailable" })
       void release().catch(() => undefined)
     }
     const connecting = () => {
-      setEventAdmissionPending(true)
-      setEventAdmittedProductSession(null)
+      // Transport recovery does not invalidate the workspace that was already admitted.
+      // A replacement scope or rejected event/receipt still requires fresh admission.
       setEventConnection({ status: "connecting" })
     }
     const scheduleReconnect = () => {
@@ -197,11 +194,12 @@ export function ProductProvider({
         await release()
         scheduleReconnect()
       } catch {
-        unavailable()
+        unavailable(true)
       }
     }
     const connect = async () => {
       const requestedSequence = previousSequence
+      const recovering = serviceReconnectRequired || explicitRefreshGeneration > 0
       let disconnected = false
       try {
         if (serviceReconnectRequired) {
@@ -228,6 +226,8 @@ export function ProductProvider({
               disconnected = true
               serviceReconnectRequired = true
               connecting()
+              // Preserve last successful query results when in-flight reads lose transport.
+              void queryClient.cancelQueries({ queryKey: productKeys.root(scope) })
               if (subscription) void reconnect()
               return
             }
@@ -249,7 +249,7 @@ export function ProductProvider({
               ),
             )
           },
-          unavailable,
+          () => unavailable(),
         )
         if (!active || failed) {
           void connected.unsubscribe().catch(() => undefined)
@@ -271,13 +271,15 @@ export function ProductProvider({
           return
         }
         setEventAdmittedProductSession(receipt.productSessionToken)
-        setEventAdmissionPending(false)
         setEventConnection({
           status: "connected",
           resumed: receipt.resumed,
         })
+        if (recovering) {
+          void queryClient.invalidateQueries({ queryKey: productKeys.root(scope) })
+        }
       } catch {
-        unavailable()
+        unavailable(true)
       }
     }
 
@@ -340,7 +342,6 @@ export function ProductProvider({
   )
 
   const refresh = React.useCallback(() => {
-    setEventAdmissionPending(true)
     const startup = bootstrap.data
     if (
       startup &&
@@ -348,7 +349,6 @@ export function ProductProvider({
       (eventConnection.status === "unavailable" ||
         eventConnection.status === "connecting")
     ) {
-      setEventAdmittedProductSession(null)
       setEventConnection({ status: "connecting" })
       void reconnectService(startup.productSessionToken)
         .then((restored) => {
@@ -364,8 +364,6 @@ export function ProductProvider({
           setExplicitRefreshGeneration((generation) => generation + 1)
         })
         .catch(() => {
-          setEventAdmissionPending(false)
-          setEventAdmittedProductSession(null)
           setEventConnection({ status: "unavailable" })
         })
       return
@@ -378,8 +376,7 @@ export function ProductProvider({
     bootstrap.data && !("status" in bootstrap.data) ? bootstrap.data : null
   const generationHandoffPending =
     readySystemBootstrap !== null &&
-    (eventAdmissionPending ||
-      eventAdmittedProductSession === null ||
+    (eventAdmittedProductSession === null ||
       !sameProductSession(
         readySystemBootstrap.productSessionToken,
         eventAdmittedProductSession,

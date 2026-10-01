@@ -20,10 +20,14 @@ export function StatusRail() {
             : product.status === "loading"
               ? "Starting"
               : product.status === "ready"
-                ? "Ready"
+                ? system.eventConnection.status === "connected"
+                  ? "Ready"
+                  : system.eventConnection.status === "connecting"
+                    ? "Reconnecting"
+                    : "Disconnected"
                 : "Unavailable"
         }
-        ready={product.status === "ready"}
+        ready={product.status === "ready" && system.eventConnection.status === "connected"}
       />
       <div className="ml-auto flex items-center gap-2">
         {product.status === "ready" ? (

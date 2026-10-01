@@ -1645,7 +1645,9 @@ describe("Market Squawk desktop boundary", () => {
           body: { type: "stream_disconnected" },
         })
       })
-      expect(summary.getByText("Starting")).toBeTruthy()
+      expect(summary.getByText("Reconnecting")).toBeTruthy()
+      expect(screen.getByRole("heading", { name: "What needs your attention now?" })).toBeTruthy()
+      expect(screen.queryByText("Loading workspace…")).toBeNull()
       expect(subscriptions[0]!.unsubscribe).toHaveBeenCalledOnce()
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
       expect(reconnectService).toHaveBeenNthCalledWith(1, blockedBootstrap.productSessionToken)
@@ -1654,7 +1656,9 @@ describe("Market Squawk desktop boundary", () => {
         productSessionToken: blockedBootstrap.productSessionToken,
         afterSequence: "1",
       })
-      expect(summary.getByText("Starting")).toBeTruthy()
+      expect(summary.getByText("Reconnecting")).toBeTruthy()
+      expect(screen.getByRole("heading", { name: "What needs your attention now?" })).toBeTruthy()
+      expect(screen.queryByText("Loading workspace…")).toBeNull()
       await act(async () => {
         resolveResume!({
           receipt: {
@@ -1674,7 +1678,8 @@ describe("Market Squawk desktop boundary", () => {
           body: { type: "stream_disconnected" },
         })
       })
-      expect(screen.getByText("Loading workspace…")).toBeTruthy()
+      expect(screen.queryByText("Loading workspace…")).toBeNull()
+      expect(screen.getByText(/Live updates are disconnected/)).toBeTruthy()
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
       expect(reconnectService).toHaveBeenNthCalledWith(2, blockedBootstrap.productSessionToken)
       // Deliver the replacement bootstrap through React Query's notification scheduler.

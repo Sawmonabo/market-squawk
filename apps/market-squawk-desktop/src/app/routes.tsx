@@ -74,6 +74,22 @@ export function AppRoutes() {
 
   return (
     <RouteErrorBoundary key={location.pathname}>
+      {product.status === "ready" && system.eventConnection.status !== "connected" ? (
+        <div role="status" className="mx-5 mt-4 flex items-center justify-between gap-4 rounded-lg border border-border bg-card p-4 text-sm">
+          <p>
+            Live updates are disconnected. Displayed information may be out of date.
+            {system.eventConnection.status === "connecting" ? " Reconnecting…" : " Retry to reconnect."}
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={product.refresh}
+            disabled={system.eventConnection.status === "connecting"}
+          >
+            Reconnect
+          </Button>
+        </div>
+      ) : null}
       <Suspense fallback={<RouteLoading />}>
         {system.status === "recovery_required" ? (
           <SettingsPage section="onboarding" />

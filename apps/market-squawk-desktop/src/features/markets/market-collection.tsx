@@ -4,6 +4,7 @@ import { Link } from "react-router-dom"
 import { z } from "zod"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
+import { useSystem } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -83,6 +84,7 @@ export function MarketCollection({
   layout?: "list" | "grid"
 }) {
   const { collection, marketInformation, choice } = state
+  const { eventConnection } = useSystem()
   const savedCollection = collection.data
   const marketCollection = marketInformation.data ?? null
   const marketInformationMatches = savedCollection !== undefined && marketCollection !== null
@@ -98,9 +100,10 @@ export function MarketCollection({
   })) ?? []
   const kept = entries.filter((entry) => entry.kept)
   const removed = entries.filter((entry) => !entry.kept)
-  const busy = choice.isPending || collection.isFetching || collection.isError
+  const disconnected = eventConnection.status !== "connected"
+  const busy = disconnected || choice.isPending || collection.isFetching || collection.isError
   const marketInformationUnverified = collection.isError || collection.isFetching
-    || marketInformation.isError || marketInformation.isFetching
+    || marketInformation.isError || marketInformation.isFetching || disconnected
 
   return <section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Your market collection">
     <div className="flex items-start justify-between gap-3">

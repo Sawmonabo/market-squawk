@@ -5533,3 +5533,27 @@ remove/restore, successful price read, both refresh failures, preserved timestam
 TypeScript check passed. This is critical fixture evidence, not native/live startup completion.
 Only its two Desktop files plus ledger are checkpointed; backend WIP remains explicitly pending.
 Git inventory: one primary worktree, local and origin main/release/feature only. No cleanup needed.
+
+Screen checkpoint pushed cbcd09e5; PR43 comment5938561586. Remaining backend changes inspected
+and frozen for one service build (saved-price-restoration-build.log). Calendar uses owned optional-job
+ingest worker and removes redundant try-lock reobservation; caller deadline/cancellation remain
+bounded, while non-preemptible catalog wait retains original worker custody until it completes.
+No 1ms polling, extra worker runtime, stack-size increase or authority bypass added. Stack fix
+isolates both measured large public/scalar future variants. Next: real service startup + price reads,
+then existing complete-history/reobservation critical check.
+
+Lead-only Desktop reconnect slice during serialized backend build: product-context.tsx, routes.tsx,
+status-rail.tsx, app-sidebar.tsx and existing app.test.tsx reconnect case. Confirmed global failure:
+stream_disconnected clears already-admitted same-session state and unmounts every product route.
+Keep that known session/rendered cached views during transport recovery; first admission, replacement
+scope and rejected event/receipt still require verified admission. Show explicit reconnect/stale
+notice and correct shell status. Existing reconnect test must prove retained view plus old-session
+rejection and replacement admission; no new harness.
+
+Desktop reconnect slice critically verified: existing startup/session replacement and market journey
+cases PASS 2/2 (4.73s); TypeScript check passes. Already-admitted same-session routes remain mounted
+with a disconnect notice and saved-price qualification, cancelled reads retain successful data,
+and successful reconnect refreshes active queries. New sessions and invalid receipts/events still
+require admission. Native combined-workflow verification remains pending. Backend compilation caught
+a shared helper removed despite child-module callers; lead restored that still-used helper unchanged.
+Reobservation retains its new owned-worker path; one service build is running.
