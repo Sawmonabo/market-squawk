@@ -1,4 +1,4 @@
-//! Retained custody of the existing single synchronous research I/O lane.
+//! Retained custody of one synchronous research I/O lane.
 
 use std::{
     future::Future,
@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ResearchServiceError;
 
-/// The one-permit limit is the existing capture-seal lane, shared with retained reads.
+/// Each lane owns at most one blocking operation; capture and retained reads use separate owners.
 #[derive(Debug)]
 pub(super) struct ResearchIoWorker {
     gate: Arc<Semaphore>,
@@ -267,5 +267,100 @@ impl Drop for ResearchIoWorker {
                 Poll::Pending => thread::park(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ResearchService;
+    use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
+    use market_squawk_platform::LocalPaths;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+
+    // The data-layer history fixture does not exercise application worker admission or custody.
+    #[tokio::test]
+    async fn retained_read_progresses_during_capture_and_both_workers_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("research"))?;
+        let catalog = CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(64)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?;
+        let service = Arc::new(ResearchService::initialize(
+            &paths,
+            catalog,
+            8,
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 128, Duration::from_secs(60))?,
+        )?);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let capture_cancel = CancellationToken::new();
+        let (capture_entered, entered) = oneshot::channel();
+        let (release_capture, capture_release) = std::sync::mpsc::channel();
+        let capture_finished = Arc::new(AtomicBool::new(false));
+        let capture = {
+            let service = Arc::clone(&service);
+            let token = capture_cancel.clone();
+            let finished = Arc::clone(&capture_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_io(deadline, &token, move |_| {
+                        let _ = capture_entered.send(());
+                        let _ = capture_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        let read = service
+            .run_owned_research_read(deadline, &CancellationToken::new(), |_| 42)
+            .await?;
+        assert_eq!(read, 42);
+        assert!(!capture_finished.load(Ordering::Acquire));
+
+        let read_cancel = CancellationToken::new();
+        let (read_entered, entered) = oneshot::channel();
+        let (release_read, read_release) = std::sync::mpsc::channel();
+        let read_finished = Arc::new(AtomicBool::new(false));
+        let read = {
+            let service = Arc::clone(&service);
+            let token = read_cancel.clone();
+            let finished = Arc::clone(&read_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_read(deadline, &token, move |_| {
+                        let _ = read_entered.send(());
+                        let _ = read_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        capture_cancel.cancel();
+        read_cancel.cancel();
+        assert!(matches!(
+            capture.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
+            read.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!read_finished.load(Ordering::Acquire));
+        release_capture.send(())?;
+        release_read.send(())?;
+        service.finish_owned_io_shutdown(deadline).await?;
+        assert!(capture_finished.load(Ordering::Acquire));
+        assert!(read_finished.load(Ordering::Acquire));
+        Ok(())
     }
 }

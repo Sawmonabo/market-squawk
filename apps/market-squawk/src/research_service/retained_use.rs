@@ -72,7 +72,7 @@ pub(crate) fn research_source_operations(
 }
 
 impl ResearchService {
-    /// Admits exact lineage on the original retained synchronous I/O lane.
+    /// Admits exact lineage on the retained-read worker with the existing writer lease.
     /// The worker owns only the existing analytical service, never this worker's owner.
     pub(crate) async fn authorize_research_use(
         &self,
@@ -107,7 +107,7 @@ impl ResearchService {
         };
         let policies = Arc::clone(&self.retained_use_policies);
         let result = self
-            .run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
+            .run_owned_research_read(deadline, cancellation, move |worker_cancellation| {
                 admission.authorize_research_use_with_retained_policy(
                     request,
                     &policies,
@@ -125,7 +125,7 @@ impl ResearchService {
         Ok(result)
     }
 
-    /// Admits exact logical market observations on the same retained I/O lane.
+    /// Admits exact logical observations on the retained-read worker with the existing writer lease.
     /// The worker owns only the existing analytical service, never this worker's owner.
     pub(crate) async fn authorize_market_event_use(
         &self,
@@ -160,7 +160,7 @@ impl ResearchService {
         };
         let policies = Arc::clone(&self.retained_use_policies);
         let result = self
-            .run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
+            .run_owned_research_read(deadline, cancellation, move |worker_cancellation| {
                 admission.authorize_market_event_use_with_retained_policy(
                     request,
                     &policies,

@@ -618,6 +618,19 @@ when that operation exits; it is not a cached connection or a second runtime. Th
 [snapshot isolation](https://www.sqlite.org/isolation.html) (reviewed 2026-09-30). Actual SQLite
 lock conflicts remain possible; WAL does not justify treating every source as available.
 
+Market collection population and completed-close reads use a separate supervised blocking owner
+from capture sealing and ingestion.
+Each owner retains one original worker through caller cancellation, and shutdown closes and joins
+both. Population selection, completed-close selection, original calendar replay and retained-use
+checks therefore do not wait for the capture worker. Retained-use authorization still acquires its
+existing analytical lease and catalog writer for genuine policy changes; scheduling isolation does
+not grant new authority. Complete/exact history selectors and origin metadata use the same
+endpoint-bound WAL snapshot facility with configured catalog limits and original cutoffs.
+This follows Tokio's [blocking task lifetime guidance](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+(reviewed 2026-10-01): started blocking tasks cannot be aborted, so cancellation must retain and join
+the original work. Full selected-history validation remains; no repeated-read cache or throughput
+claim is implied. Live screen acceptance remains in the delivery ledger.
+
 Market-data instrument definition, population, search, enumeration and retained native-reference
 reads also use endpoint-bound snapshots. Latest execution-instrument definitions use the same
 snapshot owner; execution-definition pinning and search retain their existing authority path. Service composition captures the endpoint before sharing

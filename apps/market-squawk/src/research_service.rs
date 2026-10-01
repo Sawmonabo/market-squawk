@@ -398,6 +398,7 @@ pub struct ResearchService {
     analytical: Arc<AnalyticalDataService>,
     provider_captures: Arc<SealedResearchJournalStore>,
     provider_capture_worker: ResearchIoWorker,
+    retained_read_worker: ResearchIoWorker,
     retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
 }
 
@@ -593,6 +594,7 @@ impl ResearchService {
             analytical,
             provider_captures: Arc::new(paths.sealed_research_journal_store()?),
             provider_capture_worker: ResearchIoWorker::new(),
+            retained_read_worker: ResearchIoWorker::new(),
             retained_use_policies: retained_use::current_policies()?.into(),
         })
     }
@@ -680,7 +682,7 @@ impl ResearchService {
     ) -> Result<market_squawk_data::ProviderMacroMetadataCapture, ResearchServiceError> {
         let analytical = Arc::clone(&self.analytical);
         let store = Arc::clone(&self.provider_captures);
-        self.provider_capture_worker
+        self.retained_read_worker
             .run(deadline, cancellation, move |worker_cancellation| {
                 analytical
                     .verify_provider_macro_metadata_capture(
@@ -716,6 +718,25 @@ impl ResearchService {
             .await
     }
 
+    /// Runs retained-evidence work independently of capture sealing and ingestion. The
+    /// original blocking handle remains owned through cancellation and shutdown. This
+    /// scheduling boundary grants no catalog authority; policy writes still require the
+    /// analytical operation lease and catalog writer held by their existing callers.
+    pub(crate) async fn run_owned_research_read<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.retained_read_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
     /// Runs one synchronous operation and drains its admitted handle before returning on
     /// cancellation or deadline, keeping the caller's authority lease alive through completion.
     pub(crate) async fn run_owned_research_io_joined<T, F>(
@@ -736,14 +757,20 @@ impl ResearchService {
     /// Closes admission and cancels original reads without discarding their blocking handles.
     pub(crate) fn begin_owned_io_shutdown(&self) {
         self.provider_capture_worker.begin_shutdown();
+        self.retained_read_worker.begin_shutdown();
     }
 
-    /// Joins the original capture/read worker; a timed-out caller can retry the same owner.
+    /// Joins both original workers even if one fails; interrupted joins retain their owners.
     pub(crate) async fn finish_owned_io_shutdown(
         &self,
         deadline: Instant,
     ) -> Result<(), ResearchServiceError> {
-        self.provider_capture_worker.finish_shutdown(deadline).await
+        self.begin_owned_io_shutdown();
+        let (capture, reads) = tokio::join!(
+            self.provider_capture_worker.finish_shutdown(deadline),
+            self.retained_read_worker.finish_shutdown(deadline),
+        );
+        capture.and(reads)
     }
 
     /// Rejoins the fixed analytical selection to bounded original native/physical custody in the
@@ -757,7 +784,7 @@ impl ResearchService {
     ) -> Result<market_squawk_data::SelectedProviderCaptureEvidence, ResearchServiceError> {
         let analytical = Arc::clone(&self.analytical);
         let store = Arc::clone(&self.provider_captures);
-        self.provider_capture_worker
+        self.retained_read_worker
             .run_with_job_context(None, deadline, cancellation, move |worker_cancellation| {
                 analytical
                     .selected_provider_capture_evidence_bounded(
@@ -772,8 +799,8 @@ impl ResearchService {
             .await?
     }
 
-    /// Reopens one original generation and performs a bounded typed read in the existing raw
-    /// worker lane. The callback cannot mint publication authority or use another object store.
+    /// Reopens one original generation and performs a bounded typed read in the retained
+    /// read lane. The callback cannot mint publication authority or use another object store.
     pub(crate) async fn read_provider_capture_generation<T, F>(
         &self,
         manifest: market_squawk_data::DatasetManifestRef,
@@ -827,7 +854,7 @@ impl ResearchService {
         use market_squawk_platform::{ResearchObjectControl as _, ResearchObjectControlPoint};
         let analytical = Arc::clone(&self.analytical);
         let store = Arc::clone(&self.provider_captures);
-        self.provider_capture_worker
+        self.retained_read_worker
             .run_with_job_context(
                 job.map(|job| job.cancellation()),
                 deadline,

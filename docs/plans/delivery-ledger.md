@@ -2,17 +2,23 @@
 
 ## Current execution — 2026-10-01
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. Latest pushed
-checkpoint `ff788610` fixes verified service-owner joining at Desktop startup (PR #43 comment5940019410).
+Working branch `feature/v1-installed-product-experience`, primary worktree only. This checkpoint
+isolates retained reads and adds failed-request stage attribution; native initial collection loading
+remains unresolved. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
+`ff788610` fixes verified service-owner joining at Desktop startup (PR #43 comment5940019410).
 `9eac1d57` fixes actor-time current presentation; `4239a7d6` preserves Alpaca publication custody;
 `96abecae` preserves retained evidence access and analytical/I/O admission order.
 One worktree, three local and three origin branches; protected backup refs remain untouched.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — starter-history checkpoint and screen-read integration | Owns Git/builds/checks/docs and shared contracts. Per-instrument history operation is implemented; nine completed closes verified in the real workspace. | Finish native refresh evidence and push history checkpoint. Collection read deadline remains a separate open defect. |
-| Astra collection_read — identify failing collection read | Read-only: trace Market.GetCollection through market/product and previous-close reads; inspect starter-history-operation-live.log. No edits, builds, runtime commands or Git. | Exact deadline/coordination cause and smallest shared-path correction preserving selected evidence; lead integrates after history checkpoint. |
-| Public crypto reference diagnosis — completed | Existing references are present. Catalog capability pin still takes writer authority; contention is collapsed into unavailable. No edits. | Reuse existing independent read snapshots while preserving full pinned histories; latest run also reports publication HealthNotQualified, so reference contention alone is not the full crypto failure. |
+| Lead — isolate retained-screen reads | Owns research_service.rs/retained_use.rs, worker lifecycle, market_selection/product.rs and previous_close.rs caller routing; analytical_read.rs/history_cursor.rs and ingest.rs configured-limit plumbing; Git/builds/checks/docs. Reuse ResearchIoWorker with separate retained-read ownership; preserve actual catalog write authority for authorization. | Existing nine-price warm CLI read passes in12.69s. Prove capture work cannot monopolize read admission, original workers drain, and native startup collection loads. |
+| GPT-6.1 Sol history_snapshot — frozen independent history selectors | Owns only crates/market-squawk-data/src/manifest/catalog.rs and its existing private catalog regression case. The complete-history recovery fixture remains unchanged. Start from existing endpoint-bound snapshot reader; no new connection framework, cap/deadline changes or authority bypass. | Implementation frozen; direct held-writer and unchanged full-history integrity/restart cases PASS1/1 each. Application worker custody/progress case PASS1/1; service build and native initial-load proof follow. |
+| Lead — request-stage attribution verified | Diagnostic build PASS5m35s. Initial collection completes nine current reads, then fails third previous-close fallback at native-session-rejoin. elapsed17069ms, remaining1935ms at stage entry, stage4007ms, fallback_completed2. | Exact live evidence retained-read-stage-live.log; correct repeated history reconstruction, not the request timeout. |
+| Astra collection_read — completed-close projection design | Read-only current previous_close.rs/native_sessions.rs, history publication/selection and catalog schema; no edits/builds/Git. | Find smallest reusable persisted/indexed completed-close projection with exact history/calendar/rights lineage; no whole-history reconstruction per card, no authority bypass or new arbitrary limits. Return bounded file/API plan. |
+| Astra collection_read — crypto diagnosis complete | No active edits. Report `.agents/tmp/v1-first-stock/crypto-publication-followup.md` traces local capacity charged as socket idle and accepted-publication custody dropped on recoverable transport exit. | Correct admission/receive accounting and drain-before-teardown together after the current read checkpoint. HealthNotQualified predicate remains unattributed; preserve existing expiry/revocation checks. |
+| Public crypto reference diagnosis — completed | Existing references are present. Catalog capability pin still takes writer authority; contention is collapsed into unavailable. No edits. | Reuse independent read snapshots while preserving pinned histories; latest run additionally reports HealthNotQualified. |
+
 
 Latest-display build PASS7m22s. Real CLI IWM changes279.34→279.32; native Home shows QQQ742.43,
 IWM279.31 and five previous closes. Evidence: `latest-display-{service-build,live}.log`,
@@ -57,7 +63,32 @@ Evidence: `starter-history-operation-{build,live,native}.log`,
 `starter-history-capture-critical.log` under ignored `.agents/tmp/v1-first-stock/`.
 Latest live run also reports crypto HealthNotQualified and raw-publication interruption; the
 previous reference diagnosis does not establish that these separate failures are resolved.
+The warm CLI collection also returned all nine completed closes in12.69s. Owned background
+service5335/native5346 and their WebDriver session were stopped after this evidence.
 No CI, release gate or whole-app RAM measurement ran.
+
+Retained-read isolation: separate supervised read and capture/ingest owners, original
+cancel/join custody, and configured-limit history snapshots are implemented and critically verified.
+The existing direct catalog writer-contention case PASS1/1 (0.53s); unchanged complete Alpaca
+history/clock/restart case PASS1/1 (2.93s). The new application worker custody/progress case PASS1/1 (0.50s; compile5m35s).
+Service build PASS5m59s. Real service67642/native67650 reaches Ready, but the first
+Market.GetCollection(includeMarket=true) still times out before any previous-close diagnostic.
+No manual refresh was used. The later CLI read also failed to complete. Initial-load acceptance
+remains open; Astra adds only missing stage attribution before another live run. Owned service67642
+and native67650 are stopped; service shutdown reported an incomplete structured-log drain.
+This run does not establish clean installed shutdown. Evidence: `retained-read-{catalog,history,worker}-critical.log`,
+`retained-read-native-home-settled.json`, `retained-read-live.log` and `retained-read-cli-warm.stderr`
+under the same ignored evidence directory.
+
+Diagnostic service build PASS5m35s. Real service76139/native76140 reaches Ready without password,
+but initial collection again fails: nine current-market reads completed, then the third previous-close
+fallback exhausts the request during native-calendar rejoin (17069ms total;1935ms remaining at
+stage entry;4007ms in that stage). Evidence: `retained-read-stage-live.log` and
+`retained-read-stage-native-initial-home.json`. No Refresh was clicked. This establishes the next
+concrete correction: reuse an indexed completed-close projection with original history/calendar
+lineage instead of reconstructing selected history for each card. The source log does not yet
+apportion the earlier elapsed time among successful stages. The owned WebDriver session and
+service/native processes were stopped after evidence. No CI, RAM measurement or final gate ran.
 
 Next dependency order: correct initial collection-read failure; integrate existing rich quote projection and
 committed-domain screen invalidation; continue missing family detail and

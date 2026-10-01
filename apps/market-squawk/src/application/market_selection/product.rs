@@ -49,7 +49,7 @@ impl MarketProductSelectionReadCapability {
             .map_err(|_| ServiceError::ResourceExhausted)?;
         let market_definitions = self.market_definitions.clone();
         self.research
-            .run_owned_research_io(deadline, cancellation, move |operation_cancellation| {
+            .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
                 Self::resolve_owned(
                     &market_definitions,
                     &token,
@@ -71,7 +71,7 @@ impl MarketProductSelectionReadCapability {
     ) -> Result<Vec<MarketDataInstrumentRecord>, ServiceError> {
         let reader = self.market_definitions.clone();
         self.research
-            .run_owned_research_io(deadline, cancellation, move |operation_cancellation| {
+            .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
                 if as_of.unix_nanos() <= 0 {
                     return Err(ServiceError::InvalidRequest);
                 }

@@ -2897,7 +2897,11 @@ impl AnalyticalDataService {
 
     /// Returns a cloneable immutable manifest and fixed-template observation read capability.
     pub fn analytical_reader(&self) -> crate::AnalyticalReadCapability {
-        crate::AnalyticalReadCapability::new(Arc::clone(&self.manifests), Arc::clone(&self.objects))
+        crate::AnalyticalReadCapability::new(
+            Arc::clone(&self.manifests),
+            Arc::clone(&self.objects),
+            self.catalog_read_limits,
+        )
     }
 
     /// Acquires the existing operation gate before dispatch to an owned synchronous worker.

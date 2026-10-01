@@ -8,6 +8,75 @@ use crate::application::research::{map_catalog_error, map_durable_market_ingest_
 use market_squawk_services::ServiceLimits;
 use serde_json::json;
 
+/// Drop also records a read whose caller cancels or discards its future before an error returns.
+struct ProductReadProgress<'a> {
+    operation: &'a str,
+    context: &'a RequestContext,
+    started: Instant,
+    stage_started: Instant,
+    stage: &'static str,
+    remaining_at_stage_entry_ms: u128,
+    instrument_id: Option<InstrumentId>,
+    current_completed: usize,
+    fallback_completed: usize,
+    completed: bool,
+}
+
+impl<'a> ProductReadProgress<'a> {
+    fn new(operation: &'a str, context: &'a RequestContext) -> Self {
+        let now = Instant::now();
+        Self {
+            operation,
+            context,
+            started: now,
+            stage_started: now,
+            stage: "collection_snapshot",
+            remaining_at_stage_entry_ms: context.deadline().saturating_duration_since(now).as_millis(),
+            instrument_id: None,
+            current_completed: 0,
+            fallback_completed: 0,
+            completed: false,
+        }
+    }
+
+    fn enter(&mut self, stage: &'static str, instrument_id: Option<InstrumentId>) {
+        self.stage = stage;
+        self.instrument_id = instrument_id;
+        self.stage_started = Instant::now();
+        self.remaining_at_stage_entry_ms = self
+            .context
+            .deadline()
+            .saturating_duration_since(self.stage_started)
+            .as_millis();
+    }
+
+    fn finish<T>(&mut self, result: Result<T, ServiceError>) -> Result<T, ServiceError> {
+        self.completed = result.is_ok();
+        result
+    }
+}
+
+impl Drop for ProductReadProgress<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let now = Instant::now();
+            tracing::warn!(
+                operation = self.operation,
+                stage = self.stage,
+                elapsed_ms = %now.duration_since(self.started).as_millis(),
+                stage_elapsed_ms = %now.duration_since(self.stage_started).as_millis(),
+                remaining_at_stage_entry_ms = %self.remaining_at_stage_entry_ms,
+                instrument_id = ?self.instrument_id,
+                current_completed = self.current_completed,
+                fallback_completed = self.fallback_completed,
+                cancelled = self.context.cancellation().is_cancelled(),
+                deadline_elapsed = now >= self.context.deadline(),
+                "product market read failed or interrupted"
+            );
+        }
+    }
+}
+
 impl MarketDomainService {
     pub(super) async fn call_product(
         &self,
@@ -16,6 +85,7 @@ impl MarketDomainService {
         limits: ServiceLimits,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        let mut progress = ProductReadProgress::new(request.name(), context);
         let collection = if matches!(request.name(), MARKET_GET_OVERVIEW | "Market.GetCollection") {
             Some(
                 self.market_collection
@@ -41,21 +111,23 @@ impl MarketDomainService {
                 })
                 .collect();
             ensure_live(context)?;
-            return TypedToolResult::try_new(
+            return progress.finish(TypedToolResult::try_new(
                 json!({"revision": collection.revision.to_string(), "entries": entries}),
                 entries.len(),
                 ToolResultMetadata::complete_not_applicable(),
                 limits,
             )
-            .map_err(|_| ServiceError::ResourceExhausted);
+            .map_err(|_| ServiceError::ResourceExhausted));
         }
         let selections = MarketProductSelectionReadCapability::new(
             Arc::clone(&self.product_research),
             self.market_data_instruments.clone(),
         );
+        progress.enter("population", None);
         let records = selections
             .population(reference_at, context.deadline(), context.cancellation())
             .await?;
+        progress.enter("identity_selection", None);
         let argument = |name: &str| request.arguments().get(name).and_then(Value::as_str);
         let mut identities =
             product::product_market_identities(&records, reference_at, argument("query"))?;
@@ -80,6 +152,7 @@ impl MarketDomainService {
             .maximum_result_items()
             .min(product::MAXIMUM_PRODUCT_MARKET_ROWS);
         if request.name() == MARKET_SEARCH_UNIVERSE {
+            progress.enter("search_projection", None);
             let (content, available, has_more) = product::product_search_page(
                 &identities,
                 argument("query").ok_or(ServiceError::InvalidRequest)?,
@@ -87,12 +160,13 @@ impl MarketDomainService {
                 argument("pageToken"),
             )?;
             ensure_live(context)?;
-            return product::product_result(content, available, has_more, limits);
+            return progress.finish(product::product_result(content, available, has_more, limits));
         }
         if request.name() == MARKET_GET_HISTORY {
             let token = argument("historyToken").ok_or(ServiceError::InvalidRequest)?;
             let instrument_id = product::resolve_history_token(&identities, token)?;
-            return history::build_product_market_history_result(
+            progress.enter("history_read", Some(instrument_id));
+            let result = history::build_product_market_history_result(
                 &self.market_history,
                 &self.product_research,
                 instrument_id,
@@ -102,7 +176,9 @@ impl MarketDomainService {
                 context,
             )
             .await;
+            return progress.finish(result);
         }
+        progress.enter("page_selection", None);
         let page = if request.name() == MARKET_GET_INSTRUMENT {
             let instrument_id = product::resolve_selection_token(
                 &identities,
@@ -129,6 +205,7 @@ impl MarketDomainService {
             .try_reserve_exact(page.instrument_ids().len())
             .map_err(|_| ServiceError::ResourceExhausted)?;
         for instrument_id in page.instrument_ids() {
+            progress.enter("current_market_read", Some(*instrument_id));
             ensure_live(context)?;
             let record = records
                 .binary_search_by_key(instrument_id, |record| record.definition().instrument_id())
@@ -149,6 +226,7 @@ impl MarketDomainService {
                 Err(ServiceError::Unavailable | ServiceError::Unauthorized) => None,
                 Err(error) => return Err(error),
             };
+            progress.enter("durable_row_projection", Some(*instrument_id));
             let row = receipt
                 .as_ref()
                 .map(|receipt| self.durable_product_row(receipt, record, reference_at, context))
@@ -159,10 +237,12 @@ impl MarketDomainService {
             } else {
                 missing.push(*instrument_id);
             }
+            progress.current_completed += 1;
         }
         // SnapshotDisplay never issues an analytical receipt or sizing authority.
         if !missing.is_empty() {
             missing.sort_unstable();
+            progress.enter("display_fallback", None);
             let display = match self
                 .product_display_rows(&records, &missing, reference_at, limits, context)
                 .await
@@ -172,6 +252,7 @@ impl MarketDomainService {
                 Err(error) => return Err(error),
             };
             for instrument_id in missing {
+                progress.enter("fallback_selection", Some(instrument_id));
                 let selected = display.iter().find(|row| {
                     row.get("instrumentId")
                         .and_then(Value::as_str)
@@ -196,6 +277,7 @@ impl MarketDomainService {
                         .ok()
                         .and_then(|index| records.get(index))
                         .ok_or(ServiceError::InvalidResult)?;
+                    progress.enter("previous_close", Some(instrument_id));
                     match self
                         .previous_close_product_row(record, reference_at, context)
                         .await
@@ -208,13 +290,16 @@ impl MarketDomainService {
                 rows.push(row.unwrap_or_else(|| json!({
                     "instrumentId": instrument_id.to_string(), "currentPrice": Value::Null, "availability": "unavailable",
                 })));
+                progress.fallback_completed += 1;
             }
         }
+        progress.enter("page_projection", None);
         let available = page.available();
         let has_more = page.has_more();
         let content = product::project_product_page(&identities, page, &rows)?;
         ensure_live(context)?;
         if request.name() == "Market.GetCollection" {
+            progress.enter("collection_projection", None);
             let collection = collection.ok_or(ServiceError::InvalidResult)?;
             let projected = content
                 .get("data")
@@ -240,15 +325,15 @@ impl MarketDomainService {
                     json!({"symbol": choice.symbol, "kept": choice.kept, "market": market})
                 })
                 .collect();
-            return TypedToolResult::try_new(
+            return progress.finish(TypedToolResult::try_new(
                 json!({"revision": collection.revision.to_string(), "entries": entries}),
                 entries.len(),
                 ToolResultMetadata::complete_not_applicable(),
                 limits,
             )
-            .map_err(|_| ServiceError::ResourceExhausted);
+            .map_err(|_| ServiceError::ResourceExhausted));
         }
-        product::product_result(content, available, has_more, limits)
+        progress.finish(product::product_result(content, available, has_more, limits))
     }
 
     fn durable_product_row(
@@ -351,21 +436,28 @@ impl MarketDomainService {
         limits: ServiceLimits,
         context: &RequestContext,
     ) -> Result<Vec<Value>, ServiceError> {
+        let mut progress = ProductReadProgress::new("market_display_rows", context);
+        progress.enter("display_filters", None);
         let filters = MarketFilters {
             instruments: instrument_ids.to_vec(),
             sources: Vec::new(),
             time_range: None,
         };
+        progress.enter("registry_snapshots", None);
         let snapshots = self
             .registry
             .snapshots(context.deadline(), context.cancellation())
             .await?;
+        progress.enter("stream_collection", None);
         let mut streams = collect_streams(&snapshots, &filters, context)?;
+        progress.enter("durable_market_evidence", None);
         let mut durable =
             load_durable_market_evidence(self.registry.as_ref(), &filters, reference_at, context)
                 .await?;
+        progress.enter("display_instrument_ids", None);
         let display_ids =
             load_display_instrument_ids(self.registry.as_ref(), &filters, context).await?;
+        progress.enter("kraken_price_projections", None);
         let mut kraken = load_kraken_price_projections(
             self.registry.as_ref(),
             instrument_ids,
@@ -373,6 +465,7 @@ impl MarketDomainService {
             context,
         )
         .await?;
+        progress.enter("instrument_definitions", None);
         let definitions = self
             .instrument_definitions
             .latest(
@@ -382,6 +475,7 @@ impl MarketDomainService {
                 context.cancellation(),
             )
             .map_err(map_catalog_error)?;
+        progress.enter("display_route_filtering", None);
         let executable = |id| {
             definitions
                 .iter()
@@ -408,10 +502,12 @@ impl MarketDomainService {
                 })
         });
         let kraken_refs = kraken_projection_refs(&kraken)?;
+        progress.enter("order_level_snapshots", None);
         let order_level =
             load_order_level_snapshots(self.registry.as_ref(), &streams, &kraken, context).await?;
         // Current presentation is selected when the actor handles the read, after slower
         // catalog preparation. Historical queries above retain the original request cutoff.
+        progress.enter("display_snapshots", None);
         let display_batches = load_display_snapshots(
             self.registry.as_ref(),
             &display_ids,
@@ -419,6 +515,7 @@ impl MarketDomainService {
             context,
         )
         .await?;
+        progress.enter("display_projection", None);
         let display = display_snapshot_refs(&display_batches, &filters)?;
         let display_selected_at = system_timestamp()?;
         let policies = build_surface_policies(
@@ -453,10 +550,11 @@ impl MarketDomainService {
             limits,
             context,
         )?;
-        result
+        let rows = result
             .structured_content()
             .as_array()
             .cloned()
-            .ok_or(ServiceError::InvalidResult)
+            .ok_or(ServiceError::InvalidResult);
+        progress.finish(rows)
     }
 }

@@ -212,9 +212,12 @@ impl AnalyticalReadCapability {
         cancellation: CancellationToken,
     ) -> Result<Option<CompleteMarketBarHistoryCursor>, AnalyticalReadError> {
         let cutoff = request.knowledge_cutoff();
-        let Some(selection) =
-            self.manifests
-                .select_complete_market_bar_history(&request, deadline, &cancellation)?
+        let Some(selection) = self.manifests.select_complete_market_bar_history(
+            &request,
+            self.catalog_read_limits,
+            deadline,
+            &cancellation,
+        )?
         else {
             return Ok(None);
         };
@@ -232,6 +235,7 @@ impl AnalyticalReadCapability {
         let cutoff = request.knowledge_cutoff();
         let Some(selection) = self.manifests.select_canonical_market_bar_history(
             &request,
+            self.catalog_read_limits,
             deadline,
             &cancellation,
         )?
@@ -252,9 +256,12 @@ impl AnalyticalReadCapability {
         history_read_checkpoint(deadline, &cancellation).await?;
         let invalid = || AnalyticalReadError::InvalidMarketBarResult;
         let receipt = selection.receipt();
-        let (origin, origin_source, _) =
-            self.manifests
-                .read_exact(receipt.origin_manifest(), deadline, &cancellation)?;
+        let (origin, origin_source, _) = self.manifests.read_exact_snapshot(
+            receipt.origin_manifest(),
+            self.catalog_read_limits,
+            deadline,
+            &cancellation,
+        )?;
         let ordinal = usize::from(receipt.origin_object_ordinal());
         let object = origin
             .objects()

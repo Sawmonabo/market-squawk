@@ -66,7 +66,7 @@ impl MarketHistoryReadCapability {
         let reader = self.reader.clone();
         let deadline = context.deadline();
         let selection = research
-            .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+            .run_owned_research_read(deadline, context.cancellation(), move |cancellation| {
                 reader.select_latest_canonical_market_bar_history_window(
                     request,
                     deadline,

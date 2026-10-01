@@ -2056,6 +2056,7 @@ impl AnalyticalObservationOutput {
 /// Cloneable immutable analytical read authority with no catalog-writer or raw-SQL surface.
 #[derive(Clone)]
 pub struct AnalyticalReadCapability {
+    catalog_read_limits: crate::CatalogResultLimits,
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
 }
@@ -2074,8 +2075,13 @@ impl AnalyticalReadCapability {
     pub(crate) fn new(
         manifests: Arc<AnalyticalManifestCatalog>,
         objects: Arc<ParquetObjectStore>,
+        catalog_read_limits: crate::CatalogResultLimits,
     ) -> Self {
-        Self { manifests, objects }
+        Self {
+            manifests,
+            objects,
+            catalog_read_limits,
+        }
     }
 
     /// Lists one stable dataset-id page, returning each dataset's latest immutable generation.
@@ -2632,6 +2638,7 @@ impl AnalyticalReadCapability {
                 selected_content_hash,
                 policy,
                 cutoff,
+                self.catalog_read_limits,
                 deadline,
                 cancellation,
             )
@@ -2650,7 +2657,12 @@ impl AnalyticalReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, AnalyticalReadError> {
         self.manifests
-            .select_latest_canonical_market_bar_history_window(&request, deadline, cancellation)
+            .select_latest_canonical_market_bar_history_window(
+                &request,
+                self.catalog_read_limits,
+                deadline,
+                cancellation,
+            )
             .map_err(Into::into)
     }
 
@@ -2668,6 +2680,7 @@ impl AnalyticalReadCapability {
         let knowledge_cutoff = request.knowledge_cutoff();
         let Some(selection) = self.manifests.select_canonical_market_bar_history(
             &request,
+            self.catalog_read_limits,
             deadline,
             &cancellation,
         )?
@@ -2696,9 +2709,12 @@ impl AnalyticalReadCapability {
         cancellation: CancellationToken,
     ) -> Result<Option<CompleteMarketBarHistoryOutput>, AnalyticalReadError> {
         let knowledge_cutoff = request.knowledge_cutoff();
-        let Some(selection) =
-            self.manifests
-                .select_complete_market_bar_history(&request, deadline, &cancellation)?
+        let Some(selection) = self.manifests.select_complete_market_bar_history(
+            &request,
+            self.catalog_read_limits,
+            deadline,
+            &cancellation,
+        )?
         else {
             return Ok(None);
         };

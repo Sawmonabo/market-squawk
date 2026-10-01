@@ -2040,27 +2040,24 @@ impl AnalyticalManifestCatalog {
     pub fn select_complete_market_bar_history(
         &self,
         request: &CompleteMarketBarHistoryRequest,
+        result_limits: CatalogResultLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<CompleteMarketBarHistorySelection>, ManifestCatalogError> {
-        self.read_bounded(deadline, cancellation, |connection| {
-            let transaction =
-                Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
-            match select_complete_market_bar_history(
-                &transaction,
-                self.max_objects_per_generation,
-                request,
-                deadline,
-                cancellation,
-            ) {
-                Ok(selection) => {
-                    transaction.commit()?;
-                    Ok(selection)
-                }
-                Err(error) => Err(error),
-            }
-        })
-        .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+        self.read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .and_then(|snapshot| {
+                snapshot.read(|snapshot| {
+                    select_complete_market_bar_history(
+                        snapshot.connection(),
+                        self.max_objects_per_generation,
+                        request,
+                        deadline,
+                        cancellation,
+                    )
+                })
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     /// Resolves a saved content hash without selecting a newer generation.
@@ -2074,26 +2071,27 @@ impl AnalyticalManifestCatalog {
         selected_content_hash: Sha256Digest,
         policy: super::market_history::MarketHistorySelectionPolicy,
         cutoff: Timestamp,
+        result_limits: CatalogResultLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<CanonicalMarketBarHistoryRequest>, ManifestCatalogError> {
-        self.read_bounded(deadline, cancellation, |connection| {
-            let transaction =
-                Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
-            let result = super::market_history::exact_canonical_market_bar_history_window(
-                &transaction,
-                self.max_objects_per_generation,
-                instrument_id,
-                selected_content_hash,
-                policy,
-                cutoff,
-                deadline,
-                cancellation,
-            )?;
-            transaction.commit()?;
-            Ok(result)
-        })
-        .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+        self.read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .and_then(|snapshot| {
+                snapshot.read(|snapshot| {
+                    super::market_history::exact_canonical_market_bar_history_window(
+                        snapshot.connection(),
+                        self.max_objects_per_generation,
+                        instrument_id,
+                        selected_content_hash,
+                        policy,
+                        cutoff,
+                        deadline,
+                        cancellation,
+                    )
+                })
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     /// Selects the latest complete provider-neutral history window known at one cutoff.
@@ -2102,54 +2100,48 @@ impl AnalyticalManifestCatalog {
     pub fn select_latest_canonical_market_bar_history_window(
         &self,
         request: &LatestCanonicalMarketBarHistoryWindowRequest,
+        result_limits: CatalogResultLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ManifestCatalogError> {
-        self.read_bounded(deadline, cancellation, |connection| {
-            let transaction =
-                Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
-            match select_latest_canonical_market_bar_history_window(
-                &transaction,
-                self.max_objects_per_generation,
-                request,
-                deadline,
-                cancellation,
-            ) {
-                Ok(selection) => {
-                    transaction.commit()?;
-                    Ok(selection)
-                }
-                Err(error) => Err(error),
-            }
-        })
-        .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+        self.read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .and_then(|snapshot| {
+                snapshot.read(|snapshot| {
+                    select_latest_canonical_market_bar_history_window(
+                        snapshot.connection(),
+                        self.max_objects_per_generation,
+                        request,
+                        deadline,
+                        cancellation,
+                    )
+                })
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     /// Resolves exactly one clock-safe durable series from canonical, provider-neutral inputs.
     pub fn select_canonical_market_bar_history(
         &self,
         request: &CanonicalMarketBarHistoryRequest,
+        result_limits: CatalogResultLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<CompleteMarketBarHistorySelection>, ManifestCatalogError> {
-        self.read_bounded(deadline, cancellation, |connection| {
-            let transaction =
-                Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
-            match select_canonical_market_bar_history(
-                &transaction,
-                self.max_objects_per_generation,
-                request,
-                deadline,
-                cancellation,
-            ) {
-                Ok(selection) => {
-                    transaction.commit()?;
-                    Ok(selection)
-                }
-                Err(error) => Err(error),
-            }
-        })
-        .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+        self.read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .and_then(|snapshot| {
+                snapshot.read(|snapshot| {
+                    select_canonical_market_bar_history(
+                        snapshot.connection(),
+                        self.max_objects_per_generation,
+                        request,
+                        deadline,
+                        cancellation,
+                    )
+                })
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     /// Selects one provider-neutral Fund NAV family and immutable generation at the cutoff.
@@ -2257,11 +2249,30 @@ impl AnalyticalManifestCatalog {
     ) -> Result<(PinnedDataset, SourceId, Option<Sha256Digest>), ManifestCatalogError> {
         check_read_operation(deadline, cancellation)?;
         let connection = self.lock()?;
-        let pinned = load_pinned(&connection, manifest, self.max_objects_per_generation)?;
-        let source_id = generation_source(&connection, manifest)?;
-        let python_export_sha256 = generation_python_export(&connection, manifest)?;
+        let result = load_exact(&connection, manifest, self.max_objects_per_generation)?;
         check_read_operation(deadline, cancellation)?;
-        Ok((pinned, source_id, python_export_sha256))
+        Ok(result)
+    }
+
+    pub(crate) fn read_exact_snapshot(
+        &self,
+        manifest: &DatasetManifestRef,
+        result_limits: CatalogResultLimits,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(PinnedDataset, SourceId, Option<Sha256Digest>), ManifestCatalogError> {
+        self.read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .and_then(|snapshot| {
+                snapshot.read(|snapshot| {
+                    load_exact(
+                        snapshot.connection(),
+                        manifest,
+                        self.max_objects_per_generation,
+                    )
+                })
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     pub(crate) fn read_latest(
@@ -2593,6 +2604,17 @@ impl AnalyticalManifestCatalog {
             .lock()
             .map_err(|_| ManifestCatalogError::LockPoisoned)
     }
+}
+
+fn load_exact(
+    connection: &Connection,
+    manifest: &DatasetManifestRef,
+    max_objects_per_generation: usize,
+) -> Result<(PinnedDataset, SourceId, Option<Sha256Digest>), ManifestCatalogError> {
+    let pinned = load_pinned(connection, manifest, max_objects_per_generation)?;
+    let source_id = generation_source(connection, manifest)?;
+    let python_export_sha256 = generation_python_export(connection, manifest)?;
+    Ok((pinned, source_id, python_export_sha256))
 }
 
 fn load_for_run(
@@ -3172,7 +3194,14 @@ fn classify_sqlite_interrupt(
     cancellation: &CancellationToken,
 ) -> ManifestCatalogError {
     match error {
+        ManifestCatalogError::CatalogAuthority(CatalogError::MarketRecoveryReadCancelled) => {
+            ManifestCatalogError::Cancelled
+        }
+        ManifestCatalogError::CatalogAuthority(
+            CatalogError::MarketRecoveryReadDeadlineExceeded,
+        ) => ManifestCatalogError::DeadlineExceeded,
         ManifestCatalogError::Sqlite(sqlite)
+        | ManifestCatalogError::CatalogAuthority(CatalogError::Sqlite(sqlite))
             if sqlite.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) =>
         {
             if cancellation.is_cancelled() {
@@ -5513,7 +5542,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use market_squawk_domain::{
-        DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
+        BarTimestampBasis, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarAdjustment,
+        MarketBarSessionKind, ProviderInstrumentId, SourceId, SourceIdentifier, Timestamp, VenueId,
     };
     use market_squawk_platform::LocalPaths;
     use rusqlite::{Connection, params};
@@ -5526,10 +5556,12 @@ mod tests {
     use crate::manifest::{DatasetBuildSpecDigest, DerivedGenerationParents};
     use crate::rights::SourceRightsDecision;
     use crate::{
-        ArtifactRecord, CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
-        DatasetId, DatasetManifestRecord, DatasetManifestRef, DatasetSchemaRef,
-        DatasetSchemaRegistry, GenerationKind, ManifestObject, ManifestPlan, RightsBasis,
-        RightsDecisionInput, Sha256Digest, SourceOperation,
+        ArtifactRecord, CanonicalMarketBarHistoryRequest, CatalogAuthority, CatalogConfig,
+        CatalogLimit, CatalogResultLimits, CompleteMarketBarHistoryRequest, DatasetId,
+        DatasetManifestRecord, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry,
+        GenerationKind, LatestCanonicalMarketBarHistoryWindowRequest, ManifestObject, ManifestPlan,
+        MarketHistorySelectionPolicy, RightsBasis, RightsDecisionInput, Sha256Digest,
+        SourceOperation,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -5759,6 +5791,110 @@ mod tests {
             ),
             Err(ManifestCatalogError::AnchorMismatch)
         ));
+
+        let result_limits = CatalogAuthority::open(test_catalog_config(location.clone())?)?
+            .catalog()
+            .read_result_limits();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cancellation = CancellationToken::new();
+        let original = catalog.read_exact(&manifest, deadline, &cancellation)?;
+        let instrument: InstrumentId = "0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1".parse()?;
+        let cutoff = Timestamp::from_unix_nanos(100);
+        let policy = MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1;
+        let canonical = CanonicalMarketBarHistoryRequest::try_latest(
+            instrument,
+            Timestamp::from_unix_nanos(1),
+            Timestamp::from_unix_nanos(2),
+            policy,
+            cutoff,
+        )?;
+        let latest =
+            LatestCanonicalMarketBarHistoryWindowRequest::try_new(instrument, policy, cutoff)?;
+        let complete = CompleteMarketBarHistoryRequest::try_latest(
+            instrument,
+            Timestamp::from_unix_nanos(1),
+            Timestamp::from_unix_nanos(2),
+            ProviderInstrumentId::try_from("AAPL")?,
+            VenueId::try_from("iex")?,
+            SourceIdentifier::try_from("iex")?,
+            SourceIdentifier::try_from("1Day")?,
+            MarketBarAdjustment::All,
+            BarTimestampBasis::PeriodStart,
+            MarketBarSessionKind::ProviderDefined,
+            SourceIdentifier::try_from("alpaca-v3-iex-utc-range-returned-dates-v2")?,
+            cutoff,
+        )?;
+        // Hold both the exact manifest writer connection and a real SQLite write transaction.
+        // This fixture has no history; contention must not turn that absence into AuthorityBusy.
+        let writer = catalog.lock()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &writer,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        assert_eq!(
+            catalog.read_exact_snapshot(&manifest, result_limits, deadline, &cancellation)?,
+            original
+        );
+        assert!(
+            catalog
+                .select_complete_market_bar_history(
+                    &complete,
+                    result_limits,
+                    deadline,
+                    &cancellation,
+                )?
+                .is_none()
+        );
+        assert!(
+            catalog
+                .select_canonical_market_bar_history(
+                    &canonical,
+                    result_limits,
+                    deadline,
+                    &cancellation,
+                )?
+                .is_none()
+        );
+        assert!(
+            catalog
+                .select_latest_canonical_market_bar_history_window(
+                    &latest,
+                    result_limits,
+                    deadline,
+                    &cancellation,
+                )?
+                .is_none()
+        );
+        assert!(
+            catalog
+                .exact_canonical_market_bar_history_window(
+                    instrument,
+                    manifest.content_hash(),
+                    policy,
+                    cutoff,
+                    result_limits,
+                    deadline,
+                    &cancellation,
+                )?
+                .is_none()
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            catalog.select_latest_canonical_market_bar_history_window(
+                &latest,
+                result_limits,
+                deadline,
+                &cancelled,
+            ),
+            Err(ManifestCatalogError::Cancelled)
+        ));
+        assert!(matches!(
+            catalog.read_exact_snapshot(&manifest, result_limits, Instant::now(), &cancellation,),
+            Err(ManifestCatalogError::DeadlineExceeded)
+        ));
+        transaction.rollback()?;
+        drop(writer);
         drop(catalog);
 
         let reopened = CatalogAuthority::open(test_catalog_config(location)?);
