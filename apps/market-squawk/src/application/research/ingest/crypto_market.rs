@@ -283,7 +283,7 @@ impl CryptoMarketPublicationClosure {
         self.validate_source_binding(material.source_id(), material.metadata_revision())?;
         precommit_authority.validate_precommit()?;
         let (native_selections, precommit_authority) =
-            committed_publication_authority(&rows, observed_at, precommit_authority)?;
+            committed_publication_authority(&rows, precommit_authority)?;
         let binding = material.try_publish_committed(rows)?;
         let binding = bind_committed_native_selections(binding, native_selections)?;
         let prepared = self
@@ -398,7 +398,7 @@ impl CryptoMarketPublicationClosure {
         )?;
         precommit_authority.validate_precommit()?;
         let (native_selections, precommit_authority) =
-            committed_publication_authority(&rows, observed_at, precommit_authority)?;
+            committed_publication_authority(&rows, precommit_authority)?;
         let binding =
             material.try_publish_qualified(KrakenQualifiedMarketPublication::try_new(rows)?)?;
         let binding = bind_committed_native_selections(binding, native_selections)?;
@@ -1501,19 +1501,27 @@ pub(crate) enum CryptoMarketPublicationError {
 #[derive(Debug)]
 struct CommittedNativePublicationAuthority {
     inner: Arc<dyn IngestPrecommitAuthority>,
-    observed_at: Timestamp,
     rows: Vec<(
         market_squawk_sources::CurrentProviderIdentity,
         market_squawk_sources::CurrentSourceAuthorityLease,
+        Timestamp,
     )>,
 }
 
 impl CommittedNativePublicationAuthority {
     fn validate_rows(&self) -> Result<(), IngestError> {
-        for (identity, source) in &self.rows {
+        for (identity, source, ingested_at) in &self.rows {
             source
-                .validate_provider_identity_at(identity, self.observed_at)
-                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+                .validate_provider_identity_at(identity, *ingested_at)
+                .map_err(|error| {
+                    tracing::warn!(
+                        ?error,
+                        before_valid_from = *ingested_at < source.valid_from(),
+                        after_valid_until = *ingested_at > source.valid_until(),
+                        "committed crypto row authority failed precommit revalidation"
+                    );
+                    IngestError::PublicationAuthorityRevoked
+                })?;
         }
         Ok(())
     }
@@ -1536,7 +1544,6 @@ impl IngestPrecommitAuthority for CommittedNativePublicationAuthority {
 
 fn committed_publication_authority(
     rows: &[market_squawk_live::CommittedResearchMarketObservation],
-    observed_at: Timestamp,
     inner: Arc<dyn IngestPrecommitAuthority>,
 ) -> Result<
     (
@@ -1558,19 +1565,29 @@ fn committed_publication_authority(
         .try_reserve_exact(rows.len())
         .map_err(|_| CryptoMarketPublicationError::AuthorityInvalid)?;
     for row in rows {
-        row.validate_at(observed_at)
-            .map_err(|_| CryptoMarketPublicationError::AuthorityInvalid)?;
+        // Reuse the actor's genuine commit clock. Pre-ACK raw availability can precede the
+        // accepted health epoch, while current sealed-clock/revocation checks still run here.
+        let ingested_at = row.ingested_at();
+        row.validate_at(ingested_at).map_err(|error| {
+            tracing::warn!(
+                ?error,
+                before_valid_from = ingested_at < row.source_authority().valid_from(),
+                after_valid_until = ingested_at > row.source_authority().valid_until(),
+                "committed crypto row authority rejected publication"
+            );
+            CryptoMarketPublicationError::AuthorityInvalid
+        })?;
         selections.push(row.native_identity_selection().clone());
         authorities.push((
             row.provider_identity().clone(),
             row.source_authority().clone(),
+            ingested_at,
         ));
     }
     Ok((
         selections,
         Arc::new(CommittedNativePublicationAuthority {
             inner,
-            observed_at,
             rows: authorities,
         }),
     ))

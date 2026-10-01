@@ -502,11 +502,8 @@ impl CryptoPendingFrameIngress {
                     );
                 }
                 committed.push(replay);
-                let (selections, authority) = super::committed_publication_authority(
-                    &committed,
-                    observed_at,
-                    precommit_authority,
-                )?;
+                let (selections, authority) =
+                    super::committed_publication_authority(&committed, precommit_authority)?;
                 let mut events = committed.into_iter().map(|row| row.into_parts().event);
                 let initial_snapshot = if initial {
                     Some(

@@ -85,6 +85,36 @@ trace of that exact error through Coinbase publication authority, canonical inge
 no edits, builds, timeout changes or Git. Lead retains all source ownership and live execution. The
 outcome is an exact failing condition and smallest correction proposal before further changes.
 
+### Committed-row clock correction — base `8404085c`
+
+The prior batch/buffer checkpoint is pushed as `8404085c` (PR #43 comment5930638154).
+Astra found a concrete mismatch: buffered pre-acknowledgement frames keep their raw receipt time,
+but live qualification uses the later acknowledgement/processing time. Publication rechecks the
+committed row at the earlier raw time, before its health lease begins. Current live diagnostics
+identify the authority stage but do not yet prove which predicate rejected that particular row.
+
+| Owner | Exact files / outcome | Critical evidence |
+| --- | --- | --- |
+| Astra research_options_failure | `crates/market-squawk-live/src/qualification.rs`, `apps/market-squawk/src/application/research/ingest/crypto_market.rs`; expose existing committed provenance ingestion time and retain it per row for source/native-identity checks. Preserve all raw/publication clocks and sealed currentness checks. | Locate/extend only existing critical authority coverage for different receipt/commit times; return selectors before build. No new clock, limit, deadline, authority bypass, build or Git. |
+| Lead | Shared integration, docs, existing live check, serialized builds and Git | Inspect provenance/currentness path; compile once frozen, run critical existing check and unchanged real publication/restart journey. |
+
+Both clock-fix files are frozen and lead-inspected. Canonical event availability/ingestion already
+use actual qualification time, and SQLite commit availability uses its trusted commit clock;
+original raw times remain unchanged. Existing source lease time-bound/expiry/revocation coverage
+passes1/1 (0.01s; build19.59s), log `committed-clock-authority-critical.log`. This unchanged source
+check does not independently prove the app's new per-row clock wiring; the existing real public
+publication/restart journey exercises that integration. No new carrier fixture/harness was added.
+The first application compile found one third helper caller in the composite-book path
+(`crypto_market/kraken_rendezvous.rs`); lead aligned it and stopped that known-failed build
+(exit130), so it is not acceptance evidence. Repository-wide caller search confirms the three
+canonical consumers now use the same helper. The single-job retry passes in4m28s
+(`committed-clock-app-build-retry.log`). The unchanged live journey fails in132.50s
+(`committed-clock-live.log`). It passes committed-row authority and now returns a Coinbase
+publication error during canonical evidence binding; the source stops and no selected feed becomes
+available. Kraken is not reached. The clock correction is implemented/compiled, with unchanged
+source authority critical coverage passing, but complete live ingestion remains unverified.
+Next: identify the closed adapter validation failure rather than relaxing evidence checks.
+
 ### Bounded storage implementation wave — base `d9f91902`
 
 The diagnostic build passed5m01s; the existing live check failed79.22s

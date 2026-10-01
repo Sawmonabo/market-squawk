@@ -242,6 +242,12 @@ impl CommittedResearchMarketObservation {
         })
     }
 
+    /// Returns the canonical ingestion time already validated by the committing actor.
+    /// This can follow raw availability when data waited for subscription acknowledgement.
+    pub fn ingested_at(&self) -> Timestamp {
+        event_provenance(&self.event).ingested_at()
+    }
+
     /// Returns the committed canonical event without granting execution authority.
     pub const fn event(&self) -> &MarketEvent {
         &self.event
