@@ -3,13 +3,14 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Latest pushed
-checkpoint `05a30951` fixes measured restoration stack frames. One worktree and three local/origin
+checkpoint `96abecae` preserves retained-data access and correct analytical/I/O admission order;
+`05a30951` fixes measured restoration stack frames. One worktree and three local/origin
 branches verified; protected bundle-backup refs and original recovery evidence are retained.
 The dated records below are history, not additional active assignments.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — retained history and independent I/O admission | Frozen backend WIP listed below; all Git/shared contracts/build scheduling. Three selected data checks pass: history/reobservation/restart1.88s, PIT authorization4.36s, market-event restart13.25s. | Application build PASS6m20s; genuine gate/worker regression PASS1/1,0.42s; identity and publication-custody cases PASS1/1 each. Commit/push coherent retained-data and feed-backpressure checkpoints. |
+| Lead — retained history and independent I/O admission | Retained-data checkpoint96abecae pushed. Lead owns Git/shared contracts/build scheduling. Three selected data checks pass: history/reobservation/restart1.88s, PIT authorization4.36s, market-event restart13.25s. | Application build PASS6m20s; genuine gate/worker regression PASS1/1,0.42s; identity and publication-custody cases PASS1/1 each. Retained-data pushed; complete feed-backpressure checkpoint, then latest-display native proof. |
 | Astra live_stack_failure — current display selection | Read-only proposal complete; actor clock patch frozen in display_market.rs but not accepted as complete latest-display fix. | Explicit latest-display selection at actor read time; financial/paper callers retain original cutoff. Lead reserves shared caller changes. |
 | GPT-6.1 Sol screen_contract_coverage — full screen/data mapping | Completed read-only audit of17 screens and required family subflows; lead checked principal projection/event gaps. No implementation ownership. | Lead integrates missing edges below in producer-to-consumer checkpoints. |
 
@@ -5687,3 +5688,18 @@ Current metadata identity and publication-custody checks also PASS1/1 each. Logs
 `admitted-{application-critical,application-scheduling-critical,identity-critical,custody-critical}.log`.
 The clock patch and durable failure diagnostics remain pending the complete latest-display read
 semantics and native check. No full current-price/streaming/screen-completion claim.
+
+Retained-data/admission checkpoint `96abecae` pushed. Independent Alpaca backpressure/custody
+slice uses the existing queue and waits for capacity before further reads; cancellation preserves
+its one producer-held raw input, and stale source timestamps withhold currentness without killing
+the connection. Existing custody and startup-health clock cases PASS1/1 each on the new app binary.
+These are focused integrity checks; sustained fresh quote display remains unverified. The current
+feed slice excludes pending display-read clocks and durable-route diagnostics.
+
+Next ownership barrier (after the completed unit build): Astra live_stack_failure owns
+`live_source/display_market.rs` and `application/market_runtime.rs` for canonical
+DisplayMarketReadTime::{At(Timestamp),LatestDisplay} passed through the existing read APIs.
+Latest resolves its cutoff inside actor processing and cannot yield virtual-paper admission;
+explicit financial callers retain At. Lead owns paper/market.rs, paper/market/durable_product.rs,
+paper/equity.rs and paper_bot/virtual_routes.rs caller alignment. Reuse one selection/validation
+path, no compatibility wrappers. Freeze all callers before the one scheduled service build.

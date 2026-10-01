@@ -33,17 +33,29 @@ impl AlpacaPublicationRuntime {
             loop {
                 let next = if stop.is_cancelled() {
                     owned.begin_shutdown();
-                    receiver.close();
+                    receiver.close_admission();
+                    // The source still owns one reserved slot and may transfer its pending
+                    // producer allocation for raw-only sealing before dropping its sender.
                     receiver.recv().await
                 } else {
                     tokio::select! { biased;
-                        ()=stop.cancelled()=> { owned.begin_shutdown();receiver.close();receiver.recv().await }
-                        item=receiver.recv()=>item,
+                        () = stop.cancelled() => {
+                            owned.begin_shutdown();
+                            receiver.close_admission();
+                            receiver.recv().await
+                        }
+                        item = receiver.recv() => item,
                     }
                 };
                 let Some(item) = next else {
                     break;
                 };
+                if item._bytes.is_cancelled_producer() {
+                    owned.begin_shutdown();
+                    stop.cancel();
+                    receiver.close_admission();
+                }
+                debug_assert!(item._bytes.retained_bytes() > 0);
                 let deadline = Instant::now()
                     .checked_add(timeout)
                     .ok_or(AlpacaPublicationRuntimeError::Bounds);
@@ -56,11 +68,12 @@ impl AlpacaPublicationRuntime {
                 };
                 // item._bytes remains owned until publication completes, including error paths.
                 drop(item._bytes);
+                drop(item._frame);
                 if let Err(error) = result {
                     outcome.record_failure(error);
                     owned.begin_shutdown();
                     stop.cancel();
-                    receiver.close();
+                    receiver.close_admission();
                 }
             }
             owned.begin_shutdown();

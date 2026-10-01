@@ -112,6 +112,7 @@ impl ProductionCapturedPublicationIngress {
 enum CapturedPublicationPermit {
     Coinbase(PublicationReservation<CoinbaseCapturedPublicationInput>),
     Kraken(PublicationReservation<KrakenCapturedPublicationInput>),
+    Alpaca(PublicationReservation<alpaca_publication::AlpacaCapturedPublicationInput>),
 }
 
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
@@ -124,6 +125,10 @@ pub(super) struct ProductionRawMarketSink<'a> {
     decoder: Option<ProductionMarketDecoder>,
     publication: ProductionCapturedPublicationIngress,
     publication_permit: Option<CapturedPublicationPermit>,
+    // One decoded producer working allocation, bounded independently by the same single-input
+    // ceiling as the queue. It replaces the transient pre-submit allocation, not a second queue.
+    // Its charge remains owned on cancelled waits and through raw-only shutdown sealing.
+    pending_alpaca_publication: Option<alpaca_publication::PendingAlpacaPublication>,
     stream_shutdown: Option<StreamShutdownDrain>,
     metadata: SourceMetadata,
     generation: GenerationIdentity,
@@ -266,6 +271,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             decoder,
             publication,
             publication_permit: None,
+            pending_alpaca_publication: None,
             stream_shutdown: None,
             metadata,
             generation: GenerationIdentity::from_session(session),
@@ -302,6 +308,10 @@ impl<'a> ProductionRawMarketSink<'a> {
     }
 
     async fn drain_stream_cancellation(&mut self) -> Result<(), ProductionSinkFailure> {
+        // Forced account shutdown cannot wait for fresh byte admission. Transfer the one
+        // existing producer allocation through its already reserved slot; the worker seals it
+        // raw-only before its original bounded shutdown owner can acknowledge cleanup.
+        self.transfer_cancelled_alpaca_publication()?;
         // Release a slot reserved for a socket read that cancellation prevented. Route senders
         // and the adapter's active request budget remain alive through this entire hook.
         self.publication_permit.take();
@@ -456,19 +466,19 @@ impl<'a> ProductionRawMarketSink<'a> {
                     };
                     let observed_at = system_timestamp()
                         .map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
-                    publication
-                        .try_submit(rejoin, seal_request, observed_at)
-                        .map_err(|error| match error {
-                            alpaca_publication::AlpacaPublicationQueueError::Closed => {
-                                ProductionSinkFailure::AlpacaPublicationWorkerClosed
-                            }
-                            alpaca_publication::AlpacaPublicationQueueError::Full => {
-                                ProductionSinkFailure::PublicationBackpressure
-                            }
-                            alpaca_publication::AlpacaPublicationQueueError::Bounds => {
-                                ProductionSinkFailure::AlpacaPublicationMaterial
-                            }
-                        })?;
+                    if self.pending_alpaca_publication.is_some()
+                        || !matches!(
+                            self.publication_permit,
+                            Some(CapturedPublicationPermit::Alpaca(_))
+                        )
+                    {
+                        return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+                    }
+                    self.pending_alpaca_publication = Some(
+                        publication
+                            .prepare(rejoin, seal_request, observed_at)
+                            .map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?,
+                    );
                 }
                 self.process_captured_outcome(outcome, receipt)
             }
@@ -785,6 +795,19 @@ impl<'a> ProductionRawMarketSink<'a> {
         }
         match self.process_active_data(data, latest_source_at, received_at, received_at)? {
             ActiveDataDisposition::Published => self.publish_startup_readiness(),
+            ActiveDataDisposition::FreshnessUnqualified
+                if matches!(
+                    &self.publication,
+                    ProductionCapturedPublicationIngress::Alpaca(_)
+                ) =>
+            {
+                // Alpaca custody/publication is independent of live actor admission. Keep its
+                // pending handoff for the next capacity wait without presenting stale rows as
+                // current or ready. The next data batch must qualify again on its genuine clocks.
+                self.health_rebind_at = None;
+                self.health_valid_until = None;
+                Ok(())
+            }
             ActiveDataDisposition::FreshnessUnqualified => Err(ProductionSinkFailure::Registry(
                 RegistryError::HealthNotQualified,
             )),
@@ -1509,6 +1532,47 @@ struct PreparedQualifiedRoute {
 }
 
 impl ProductionRawMarketSink<'_> {
+    fn transfer_cancelled_alpaca_publication(&mut self) -> Result<(), ProductionSinkFailure> {
+        let Some(pending) = self.pending_alpaca_publication.take() else {
+            return Ok(());
+        };
+        let (
+            ProductionCapturedPublicationIngress::Alpaca(publication),
+            Some(CapturedPublicationPermit::Alpaca(reservation)),
+        ) = (&self.publication, self.publication_permit.take())
+        else {
+            return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+        };
+        publication
+            .submit_cancelled(reservation, pending)
+            .map_err(|_| ProductionSinkFailure::AlpacaPublicationWorkerClosed)
+    }
+
+    async fn flush_alpaca_publication(&mut self) -> Result<(), SinkError> {
+        let Some(pending) = self.pending_alpaca_publication.as_ref() else {
+            return Ok(());
+        };
+        let ProductionCapturedPublicationIngress::Alpaca(publication) = &self.publication else {
+            return Err(self.fail(ProductionSinkFailure::PublicationTopologyMismatch));
+        };
+        // Await only while borrowing the pending input. Cancellation leaves both the original
+        // input and reserved queue slot in the sink for its custody-preserving shutdown hook.
+        let bytes = match publication.reserve_bytes(pending).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(self.fail(ProductionSinkFailure::AlpacaPublicationWorkerClosed)),
+        };
+        let Some(CapturedPublicationPermit::Alpaca(reservation)) = self.publication_permit.take()
+        else {
+            return Err(self.fail(ProductionSinkFailure::PublicationTopologyMismatch));
+        };
+        let Some(pending) = self.pending_alpaca_publication.take() else {
+            return Err(self.fail(ProductionSinkFailure::PublicationTopologyMismatch));
+        };
+        publication
+            .submit_reserved(reservation, pending, bytes)
+            .map_err(|_| self.fail(ProductionSinkFailure::AlpacaPublicationWorkerClosed))
+    }
+
     async fn reserve_publication_capacity(&mut self) -> Result<(), SinkError> {
         if let Some(failure) = self.terminal {
             return Err(failure.as_sink_error());
@@ -1550,8 +1614,22 @@ impl ProductionRawMarketSink<'_> {
                     }
                 }
             }
-            ProductionCapturedPublicationIngress::None
-            | ProductionCapturedPublicationIngress::Alpaca(_) => return Ok(()),
+            ProductionCapturedPublicationIngress::Alpaca(publication) => {
+                match &self.publication_permit {
+                    Some(CapturedPublicationPermit::Alpaca(_)) => return Ok(()),
+                    Some(_) => {
+                        return Err(self.fail(ProductionSinkFailure::PublicationTopologyMismatch));
+                    }
+                    None => {}
+                }
+                match publication.reserve().await {
+                    Ok(permit) => CapturedPublicationPermit::Alpaca(permit),
+                    Err(_) => {
+                        return Err(self.fail(ProductionSinkFailure::AlpacaPublicationWorkerClosed));
+                    }
+                }
+            }
+            ProductionCapturedPublicationIngress::None => return Ok(()),
         };
         // Control frames retain this slot. Cancellation before admission owns no permit;
         // cancellation afterward releases it when the generation drops its sink.
@@ -1590,6 +1668,7 @@ impl RawMarketSink for ProductionRawMarketSink<'_> {
                 // raw and decoded material without occupying the active publication budget.
                 return Ok(());
             }
+            self.flush_alpaca_publication().await?;
             self.flush_pending_publications().await?;
             self.reserve_publication_capacity().await
         })

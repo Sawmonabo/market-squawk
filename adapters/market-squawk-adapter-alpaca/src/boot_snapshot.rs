@@ -245,6 +245,14 @@ impl AlpacaIexBootSnapshotTransport {
         let deadline = sink_deadline.map_or(transport_deadline, |deadline| {
             deadline.min(transport_deadline)
         });
+        tokio::select! { biased;
+            () = cancellation.cancelled() => return Err(SourceError::Cancelled),
+            () = tokio::time::sleep_until(deadline.into()) => {
+                ensure_before_deadline(sink, sink_deadline, deadline)?;
+                return Err(SourceError::Network);
+            }
+            admitted = sink.wait_for_capacity() => admitted?,
+        }
         let reservation = crate::budget::reserve_request(budget, deadline, cancellation)
             .await
             .map_err(crate::budget::AdmissionError::into_source_error)?;

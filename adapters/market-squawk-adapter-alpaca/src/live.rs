@@ -132,7 +132,15 @@ impl LiveMarketSource for AlpacaIexLiveSource {
         sink: &'a mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), SourceError>> {
-        self.run_production(sink, cancellation).boxed()
+        async move {
+            let result = self.run_production(sink, cancellation).await;
+            // Every terminal exit transfers any already captured producer handoff for raw-only
+            // custody, including a future clean EOF. The existing supervisor remains the bounded
+            // owner of physical sealing and worker drain; this hook does not await new capacity.
+            sink.finish_stream_cancellation().await?;
+            result
+        }
+        .boxed()
     }
 }
 
@@ -206,7 +214,15 @@ impl LiveMarketSource for AlpacaOptionsLiveSource {
         sink: &'a mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), SourceError>> {
-        self.run_production(sink, cancellation).boxed()
+        async move {
+            let result = self.run_production(sink, cancellation).await;
+            // Every terminal exit transfers any already captured producer handoff for raw-only
+            // custody, including a future clean EOF. The existing supervisor remains the bounded
+            // owner of physical sealing and worker drain; this hook does not await new capacity.
+            sink.finish_stream_cancellation().await?;
+            result
+        }
+        .boxed()
     }
 }
 
@@ -462,7 +478,10 @@ where
             }
             return Err(SourceError::Network);
         }
-        result = socket.next() => result,
+        result = async {
+            sink.wait_for_capacity().await?;
+            Ok::<_, market_squawk_sources::SinkError>(socket.next().await)
+        } => result?,
     };
     match next {
         Some(Ok(message)) => Ok(message),
