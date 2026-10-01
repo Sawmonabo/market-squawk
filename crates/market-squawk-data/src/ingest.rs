@@ -262,7 +262,7 @@ impl ProviderPublicationInput {
         })
     }
 
-    /// Retains the current request's rights for a fresh capture of unchanged macro facts.
+    /// Retains the current request's rights for a fresh capture of unchanged provider facts.
     ///
     /// Reobservation still requires native/canonical equality and live precommit authority.
     pub fn with_reobservation_rights(mut self, rights: RightsDecisionInput) -> Self {
@@ -1037,21 +1037,33 @@ impl StagedProviderMacroPlanRestartEvidence {
     }
 }
 
-// Native time, values, units, quality and the canonical macro family must be unchanged.
-// Local acquisition clocks and an adapter's attempt-specific source identifier may differ;
-// EIA's identifier includes its received_at clock. Exact native bytes are checked by the caller,
-// and each identifier remains in its original binding rather than being rewritten or promoted.
-// The original durable revision remains owned by its generation.
-fn same_macro_facts_on_reobservation(
+// Native facts and original canonical publication remain unchanged. Macro adapters may have
+// attempt-specific source identifiers (EIA includes its received clock); calendar identifiers,
+// scope and every normalized calendar field must remain exact. Only monotonic acquisition
+// clocks may differ, and the original generation keeps its revision and first-observed facts.
+fn same_provider_facts_on_reobservation(
     original: &ResearchObservation,
     fresh: &ResearchObservation,
 ) -> bool {
-    let (ResearchObservation::Macro(old), ResearchObservation::Macro(new)) = (original, fresh)
-    else {
-        return false;
+    let (old_context, new_context) = match (original, fresh) {
+        (ResearchObservation::Macro(old), ResearchObservation::Macro(new))
+            if old.series() == new.series()
+                && old.value() == new.value()
+                && old.unit() == new.unit() =>
+        {
+            (old.context(), new.context())
+        }
+        (ResearchObservation::MarketCalendar(old), ResearchObservation::MarketCalendar(new))
+            if old.scope() == new.scope()
+                && old.payload() == new.payload()
+                && old.observed_at() <= new.observed_at()
+                && old.context().provenance().source_identifier()
+                    == new.context().provenance().source_identifier() =>
+        {
+            (old.context(), new.context())
+        }
+        _ => return false,
     };
-    let old_context = old.context();
-    let new_context = new.context();
     let old_provenance = old_context.provenance();
     let new_provenance = new_context.provenance();
     let availability_matches = match (old_provenance.availability(), new_provenance.availability())
@@ -1062,10 +1074,7 @@ fn same_macro_facts_on_reobservation(
         ) => new >= old,
         (old, new) => old == new,
     };
-    old.series() == new.series()
-        && old.value() == new.value()
-        && old.unit() == new.unit()
-        && old_context.time().effective() == new_context.time().effective()
+    old_context.time().effective() == new_context.time().effective()
         && old_context.time().published() == new_context.time().published()
         && old_context.time().superseded() == new_context.time().superseded()
         && old_provenance.schema_version() == new_provenance.schema_version()
@@ -4875,7 +4884,7 @@ impl AnalyticalDataService {
                     return Err(IngestError::ReplayConflict);
                 }
                 return self
-                    .reconcile_macro_reobservation(
+                    .reconcile_provider_reobservation(
                         &reservation,
                         &analytical_dataset,
                         &prepared,
@@ -6431,7 +6440,7 @@ impl AnalyticalDataService {
         clippy::too_many_arguments,
         reason = "reobservation binds original rows, fresh physical capture, rights, and live authority"
     )]
-    async fn reconcile_macro_reobservation(
+    async fn reconcile_provider_reobservation(
         &self,
         reservation: &IngestReservation,
         dataset: &DatasetId,
@@ -6486,7 +6495,10 @@ impl AnalyticalDataService {
         if fresh_rows.len() != retained.record_count()
             || fresh_rows
                 .iter()
-                .any(|row| !matches!(row, ResearchObservation::Macro(_)))
+                .any(|row| match new_schema.implementation() {
+                    "alpaca_calendar_v1" => !matches!(row, ResearchObservation::MarketCalendar(_)),
+                    _ => !matches!(row, ResearchObservation::Macro(_)),
+                })
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -6556,7 +6568,8 @@ impl AnalyticalDataService {
                 check_market_event_read(deadline, cancellation)?;
                 let ordinal = usize::try_from(ordinal).map_err(|_| IngestError::ReplayConflict)?;
                 let fresh = fresh_rows.get(ordinal).ok_or(IngestError::ReplayConflict)?;
-                if !seen.insert(ordinal) || !same_macro_facts_on_reobservation(&original, fresh) {
+                if !seen.insert(ordinal) || !same_provider_facts_on_reobservation(&original, fresh)
+                {
                     return Err(IngestError::ReplayConflict);
                 }
             }
@@ -6587,7 +6600,7 @@ impl AnalyticalDataService {
         let grant = authority.admit_source_rights(rights)?;
         authority
             .catalog()
-            .retain_macro_reobservation(
+            .retain_provider_reobservation(
                 reservation,
                 retained,
                 input,

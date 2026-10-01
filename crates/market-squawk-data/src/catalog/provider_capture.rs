@@ -1065,7 +1065,7 @@ pub(super) fn load_selected_provider_capture_rows(
 }
 
 impl Catalog {
-    /// Retains a separately verified macro reobservation without changing the original run.
+    /// Retains a separately verified provider reobservation without changing the original run.
     ///
     /// The ingest owner has compared the original canonical/native rows. This transaction
     /// preserves exact physical evidence, current request rights, original custody consumption,
@@ -1074,7 +1074,7 @@ impl Catalog {
         clippy::too_many_arguments,
         reason = "exact replay retention keeps each authority explicit"
     )]
-    pub(crate) fn retain_macro_reobservation(
+    pub(crate) fn retain_provider_reobservation(
         &self,
         reservation: &crate::IngestReservation,
         original: &PersistedProviderCaptureBindingEvidence,

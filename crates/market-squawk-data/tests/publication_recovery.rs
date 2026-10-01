@@ -4548,7 +4548,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             11,
             MarketBarAdjustment::Raw,
             symbol_asof,
-            Some((&native_request, native_calendar_body)),
+            Some((&native_request, native_calendar_body.clone())),
         )?,
         "alpaca:paper-iex:complete-daily-history:aapl:native-rejoin:v1",
     )
@@ -4661,6 +4661,77 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     drop(newer_wide);
     drop(short);
     drop(older_wide);
+    let calendar_first_at = Timestamp::from_unix_nanos(native_end + COMPLETE_HISTORY_DAY_NS);
+    let (first_calendar, _) = sealed_calendar_reobservation_fixture(
+        &capture_store,
+        &calendar_source,
+        &native_request,
+        native_calendar_body.clone(),
+        calendar_first_at,
+        false,
+    )?;
+    let original_calendar_binding = first_calendar.evidence_digest().evidence();
+    let first_calendar = publish_calendar_reobservation_fixture(
+        &service,
+        &calendar_source,
+        first_calendar,
+        calendar_first_at,
+    )
+    .await?;
+    let calendar_manifest = first_calendar.manifest().clone();
+    let calendar_later_at = calendar_first_at.checked_add_nanos(1_000_000_000)?;
+    let (later_calendar, later_calendar_receipt) = sealed_calendar_reobservation_fixture(
+        &capture_store,
+        &calendar_source,
+        &native_request,
+        native_calendar_body.clone(),
+        calendar_later_at,
+        false,
+    )?;
+    let later_calendar_binding = later_calendar.evidence_digest().evidence();
+    assert_ne!(original_calendar_binding, later_calendar_binding);
+    let later_calendar = publish_calendar_reobservation_fixture(
+        &service,
+        &calendar_source,
+        later_calendar,
+        calendar_later_at,
+    )
+    .await?;
+    assert_eq!(later_calendar.manifest(), &calendar_manifest);
+    assert_eq!(
+        later_calendar.original_binding_for_reobservation(later_calendar_binding),
+        Some(original_calendar_binding)
+    );
+    assert_eq!(
+        service.provider_capture_binding_digests(&calendar_manifest)?,
+        vec![original_calendar_binding]
+    );
+    let (changed_calendar, _) = sealed_calendar_reobservation_fixture(
+        &capture_store,
+        &calendar_source,
+        &native_request,
+        native_calendar_body.clone(),
+        calendar_later_at,
+        true,
+    )?;
+    let changed_calendar = publish_calendar_reobservation_fixture(
+        &service,
+        &calendar_source,
+        changed_calendar,
+        calendar_later_at,
+    )
+    .await;
+    assert!(
+        changed_calendar
+            .as_ref()
+            .err()
+            .is_some_and(|error| matches!(
+                error.downcast_ref::<IngestError>(),
+                Some(IngestError::ReplayConflict)
+            ))
+    );
+    drop(later_calendar);
+    drop(first_calendar);
     drop(service);
 
     let restarted = AnalyticalDataService::open(
@@ -4686,6 +4757,69 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         native_output,
         &native_request,
     )?;
+    // Recovery must retain the later independent raw seal even though the canonical generation
+    // still owns its original rows, revision and first-observed clock.
+    let retention = rusqlite::Connection::open_with_flags(
+        location.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let retained: bool = retention.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_capture_bindings WHERE binding_digest=?1)",
+        [later_calendar_binding.bytes()],
+        |row| row.get(0),
+    )?;
+    assert!(retained);
+    drop(retention);
+    struct CalendarReplayControl;
+    impl ResearchObjectControl for CalendarReplayControl {
+        fn checkpoint(
+            &self,
+            _: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            Ok(())
+        }
+    }
+    let later_segment = capture_store.open_verified_claim_with_control(
+        later_calendar_receipt.segment().claim(),
+        &CalendarReplayControl,
+    )?;
+    market_squawk_adapter_alpaca::AlpacaRetainedCalendarSessions::try_replay(
+        &native_request,
+        &later_calendar_receipt,
+        &later_segment,
+        &CalendarReplayControl,
+    )?;
+    let original_calendar = restarted.provider_capture_binding_evidence(
+        &calendar_manifest,
+        original_calendar_binding,
+        &capture_store,
+    )?;
+    assert_eq!(
+        original_calendar.capture().pages()[0].received_at(),
+        calendar_first_at
+    );
+    let (restarted_calendar, _) = sealed_calendar_reobservation_fixture(
+        &capture_store,
+        &calendar_source,
+        &native_request,
+        native_calendar_body,
+        calendar_later_at.checked_add_nanos(1_000_000_000)?,
+        false,
+    )?;
+    let restarted_binding = restarted_calendar.evidence_digest().evidence();
+    let restarted_calendar = publish_calendar_reobservation_fixture(
+        &restarted,
+        &calendar_source,
+        restarted_calendar,
+        calendar_later_at.checked_add_nanos(1_000_000_000)?,
+    )
+    .await?;
+    assert_eq!(restarted_calendar.manifest(), &calendar_manifest);
+    assert_eq!(
+        restarted_calendar.original_binding_for_reobservation(restarted_binding),
+        Some(original_calendar_binding)
+    );
+    drop(restarted_calendar);
     let restart_cutoff = Timestamp::from_unix_nanos(i64::MAX);
     let replayed = read_complete_history_fixture(
         &restarted.analytical_reader(),
@@ -5893,6 +6027,305 @@ fn sec_filing_observation(
         SourceIdentifier::try_from(form)?,
         SourceIdentifier::try_from(accession)?,
     )?))
+}
+
+// A standalone calendar publication uses the same real body/seal and native lineage as the
+// history replay below. Only acquisition clocks vary between successful observations.
+fn sealed_calendar_reobservation_fixture(
+    store: &SealedResearchJournalStore,
+    source: &SourceMetadata,
+    request: &market_squawk_adapter_alpaca::AlpacaAuthenticatedCalendarRequest,
+    body: Bytes,
+    received_at: Timestamp,
+    changed_native: bool,
+) -> Result<
+    (
+        SealedProviderCaptureBinding,
+        market_squawk_sources::SealedProviderCaptureSetReceipt,
+    ),
+    Box<dyn Error>,
+> {
+    use market_squawk_domain::{
+        MARKET_CALENDAR_DATE_MEMBERSHIP_DOMAIN, MarketCalendarBoundary, MarketCalendarCompleteness,
+        MarketCalendarDateScope, MarketCalendarDay, MarketCalendarDayInput,
+        MarketCalendarDayStatus, MarketCalendarField, MarketCalendarInterval,
+        MarketCalendarMetadata, MarketCalendarObservation, MarketCalendarObservationInput,
+        MarketCalendarPayload, MarketCalendarScope, MarketCalendarSessionPresence,
+        MarketCalendarSessionRole, MarketSourceText, PayloadHash,
+    };
+    let wire: serde_json::Value = serde_json::from_slice(&body)?;
+    let days = wire["calendar"].as_array().ok_or("calendar days")?;
+    let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
+    let capture = ProviderCaptureSetReceipt::try_new(
+        source.source_id().clone(),
+        source.revision().clone(),
+        SourceIdentifier::try_from("alpaca-calendar-reobservation")?,
+        request.capture_request_identity()?,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![ProviderCapturePageReceipt::try_new(
+            0,
+            request.capture_request_identity()?,
+            None,
+            None,
+            200,
+            u64::try_from(body.len())?,
+            body_digest,
+            received_at,
+        )?],
+    )?;
+    let discovery = DiscoveryRequest::try_new(
+        capture.dataset().clone(),
+        None,
+        NonZeroU16::MIN,
+        Timestamp::from_unix_nanos(i64::MAX),
+    )?;
+    let object = SourceObject::try_new_with_capture_identity(
+        source.source_id().clone(),
+        source.revision().clone(),
+        &discovery,
+        SourceIdentifier::try_from("calendar-identical-content")?,
+        SourceIdentifier::try_from("application/vnd.market-squawk.alpaca-calendar+json")?,
+        ExactPayloadEvidence::from_content_digest(capture.content_digest()),
+        SourceObjectCaptureIdentity::try_from_capture(&capture)?,
+        EffectiveInterval::new(received_at, None)?,
+        None,
+        SourceAvailabilityEvidence::LocalFirstObserved {
+            observed_at: received_at,
+        },
+        Some(capture.total_body_bytes()),
+    )?;
+    let extraction = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(3).ok_or("three rows")?,
+        NonZeroU64::new(1024 * 1024).ok_or("calendar byte limit")?,
+        Timestamp::from_unix_nanos(i64::MAX),
+    )?;
+    let scope = MarketCalendarScope {
+        provider_product: ProviderProduct::new(SourceIdentifier::try_from(
+            "alpaca-market-calendar",
+        )?),
+        provider_channel: ProviderChannel::new(SourceIdentifier::try_from("v3-calendar")?),
+        source_contract_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "alpaca-v3-market-utc-calendar-v1",
+        )?),
+        native_market_type: MarketCalendarField::Missing,
+        native_product: MarketSourceText::try_new("IEX")?,
+        requested_timezone: MarketCalendarField::Reported(MarketSourceText::try_new("UTC")?),
+        date_scope: MarketCalendarDateScope::RequestedRange {
+            start_date: request.start_date(),
+            end_date: request.end_date(),
+        },
+        request_evidence: ExactPayloadEvidence::from_content_digest(
+            request.capture_request_identity()?,
+        ),
+    };
+    let mut membership = Sha256::new();
+    membership.update(MARKET_CALENDAR_DATE_MEMBERSHIP_DOMAIN);
+    membership.update(u32::try_from(days.len())?.to_be_bytes());
+    let mut payloads = Vec::new();
+    for day in days {
+        let date_text = day["date"].as_str().ok_or("calendar date")?;
+        let date = Timestamp::from_unix_nanos(
+            DateTime::parse_from_rfc3339(&format!("{date_text}T00:00:00Z"))?
+                .timestamp_nanos_opt()
+                .ok_or("calendar date nanos")?,
+        )
+        .utc_calendar_date()?;
+        membership.update(date.year().to_be_bytes());
+        membership.update([date.month(), date.day()]);
+        let boundary = |key: &str| -> Result<MarketCalendarBoundary, Box<dyn Error>> {
+            Ok(MarketCalendarBoundary::try_new(
+                Timestamp::from_unix_nanos(
+                    DateTime::parse_from_rfc3339(day[key].as_str().ok_or("calendar boundary")?)?
+                        .timestamp_nanos_opt()
+                        .ok_or("calendar boundary nanos")?,
+                ),
+                0,
+            )?)
+        };
+        payloads.push(MarketCalendarPayload::SessionDay {
+            day: MarketCalendarDay::try_new(MarketCalendarDayInput {
+                date,
+                status: MarketCalendarDayStatus::ScheduledSessions,
+                category: MarketCalendarField::Missing,
+                settlement_date: MarketCalendarField::Missing,
+                session_presence: MarketCalendarSessionPresence::Reported,
+                intervals: vec![MarketCalendarInterval {
+                    native_kind: MarketSourceText::try_new("core")?,
+                    native_ordinal: 0,
+                    role: MarketCalendarSessionRole::Core,
+                    start: boundary("core_start")?,
+                    end: boundary("core_end")?,
+                }],
+            })?,
+        });
+    }
+    payloads.insert(
+        0,
+        MarketCalendarPayload::Coverage {
+            market: MarketCalendarMetadata {
+                acronym: MarketCalendarField::Reported(MarketSourceText::try_new("IEX")?),
+                name: MarketCalendarField::Reported(MarketSourceText::try_new("IEX")?),
+                timezone: MarketCalendarField::Reported(MarketSourceText::try_new(
+                    "America/New_York",
+                )?),
+                bic: MarketCalendarField::Missing,
+                mic: MarketCalendarField::Missing,
+            },
+            completeness: MarketCalendarCompleteness::CompleteSessionEnumeration,
+            reported_day_count: u32::try_from(days.len())?,
+            reported_days_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                membership.finalize().into(),
+            ),
+        },
+    );
+    let mut records = Vec::new();
+    for payload in payloads {
+        let (date, suffix) = match &payload {
+            MarketCalendarPayload::Coverage { .. } => (request.start_date(), "coverage"),
+            MarketCalendarPayload::SessionDay { day } => (day.date(), "day"),
+        };
+        let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: source.source_id().clone(),
+            instrument_id: None,
+            venue_id: Some(VenueId::try_from("iex")?),
+            source_identifier: SourceIdentifier::try_from(
+                format!(
+                    "alpaca-calendar/{}/{}/{suffix}/{date}",
+                    request.start_date(),
+                    request.end_date()
+                )
+                .as_str(),
+            )?,
+            source_timestamp: None,
+            received_at,
+            ingested_at: received_at,
+            quality: DataQuality::Aggregated,
+            payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                DigestAlgorithm::Sha256,
+                body_digest.bytes(),
+            )),
+            availability: DomainAvailabilityEvidence::local_first_observed(received_at),
+        })?;
+        let effective = ResearchTemporalCoordinate::calendar_date(date);
+        let observation = ResearchObservation::MarketCalendar(MarketCalendarObservation::try_new(
+            MarketCalendarObservationInput {
+                context: ResearchContext::new(
+                    provenance,
+                    ResearchTime::try_new_with_coordinates(
+                        effective.clone(),
+                        None,
+                        RevisionNumber::new(1)?,
+                        None,
+                    )?,
+                )?,
+                scope: scope.clone(),
+                observed_at: received_at,
+                payload,
+            },
+        )?);
+        let payload = serde_json::to_vec(&observation)?;
+        records.push(ExtractionRecord::try_new_with_time(
+            &extraction,
+            SourceIdentifier::try_from(market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA)?,
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(&payload).into(),
+            )),
+            effective,
+            None,
+            SourceAvailabilityEvidence::LocalFirstObserved {
+                observed_at: received_at,
+            },
+            SourceIdentifier::try_from("calendar-local-revision")?,
+            None,
+            payload.into(),
+        )?);
+    }
+    let batch = ExtractionBatch::try_new(&extraction, records)?;
+    let mut native = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::AlpacaCalendarV1,
+        &batch,
+    )?;
+    native.try_push(&wire["market"])?;
+    for day in days {
+        let mut day = day.clone();
+        if changed_native {
+            day["core_end"] = serde_json::json!("2024-11-25T20:00:00Z");
+        }
+        native.try_push(&day)?;
+    }
+    let native = native.finish()?;
+    let material = ProviderCaptureMaterial::try_new(
+        capture,
+        vec![RawCaptureRecord::try_new_live(
+            Uuid::new_v4(),
+            Arc::from(source.source_id().as_str()),
+            Uuid::new_v4(),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            body,
+        )?],
+    )?;
+    let (expectation, seal) = material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal.seal(store)?)?
+        .try_into_whole()?;
+    let receipt = token.persisted_receipt().clone();
+    Ok((
+        SealedProviderCaptureBinding::try_whole(token, batch, native, vec![0; 3])?,
+        receipt,
+    ))
+}
+
+async fn publish_calendar_reobservation_fixture(
+    service: &AnalyticalDataService,
+    source: &SourceMetadata,
+    binding: SealedProviderCaptureBinding,
+    received_at: Timestamp,
+) -> Result<CommittedDataset, Box<dyn Error>> {
+    let payload_digest = extraction_provider_payload_digest(binding.batch());
+    let rights = RightsDecisionInput {
+        source_id: source.source_id().clone(),
+        payload_digest,
+        retrieved_at: received_at,
+        basis: RightsBasis::reviewed_terms(
+            "https://example.test/alpaca-calendar-terms/v1",
+            digest(41),
+        )?,
+        authorization_evidence: digest(43),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    };
+    let reservation = service
+        .reserve_source_ingest(
+            source,
+            Timestamp::from_unix_nanos(10),
+            rights.clone(),
+            &IngestIdentity::try_new(
+                source.source_id().clone(),
+                payload_digest,
+                SourceOperation::Persist,
+                "alpaca:calendar:identical-content:v1",
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    Ok(service
+        .ingest_provider_publication(
+            reservation,
+            DatasetId::try_from("alpaca-calendar-reobservation")?,
+            ProviderPublicationInput::try_new(
+                binding,
+                ExtractionRevisionPlan::locally_observed_with_native_lineage(3)?,
+            )?
+            .with_reobservation_rights(rights)
+            .with_precommit_authority(Arc::new(AllowProviderEventPublication)),
+            CancellationToken::new(),
+        )
+        .await?)
 }
 
 fn assert_complete_history_native_rejoin(

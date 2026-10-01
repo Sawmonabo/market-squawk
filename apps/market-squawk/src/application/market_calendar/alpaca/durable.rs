@@ -158,6 +158,11 @@ pub(crate) async fn publish_alpaca_market_calendar_with_job_context(
     };
     drop(guard);
     let committed = committed.map_err(map_research_error)?;
+    // Reobservation retains the fresh raw receipt separately; the canonical generation still
+    // owns its original binding and first-observed calendar facts.
+    let binding_digest = committed
+        .original_binding_for_reobservation(binding_digest)
+        .unwrap_or(binding_digest);
     runtime
         .require_current(deadline, cancellation)
         .await
