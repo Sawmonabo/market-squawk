@@ -267,10 +267,7 @@ impl ExtractionAuthority {
     pub fn try_reserve_response_observation(
         &self,
     ) -> Result<
-        impl FnOnce() -> Result<Timestamp, crate::ExtractionAuthorityError>
-        + Send
-        + 'static
-        + use<>,
+        impl FnOnce() -> Result<Timestamp, crate::ExtractionAuthorityError> + Send + 'static + use<>,
         crate::ExtractionAuthorityError,
     > {
         self.validate_current()?;
@@ -1135,7 +1132,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
     ///
     /// # Errors
     ///
-    /// Rejects a stale session, an authority outside the bounded healthy-refresh overlap,
+    /// Rejects a stale session, an authority outside its uninterrupted healthy authority run,
     /// unhealthy capture generation, degradation, or an expired current-health deadline.
     pub fn try_current_lease(&self) -> Result<CurrentSourceAuthorityLease, RegistryError> {
         let mint_at = self.clock.observe()?;
@@ -1151,7 +1148,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                 .validated
                 .session
                 .lease
-                .validate_health_epoch(self.health.epoch, mint_at.wall())
+                .validate_health_epoch(self.health.epoch)
             || !self.health.budget.is_available()
             || !self.validated.session.capture.is_healthy()
         {
@@ -1255,7 +1252,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .validated
             .session
             .lease
-            .validate_health_epoch(self.health.epoch, scope_validated_at.wall())
+            .validate_health_epoch(self.health.epoch)
             || !self.health.budget.is_available()
         {
             return Err(RegistryError::HealthNotQualified);

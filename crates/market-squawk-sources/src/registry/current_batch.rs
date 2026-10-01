@@ -297,25 +297,44 @@ impl CurrentSourceAuthorityLease {
     ///
     /// # Errors
     ///
-    /// Fails after rollover, revision or capture changes, degradation, departure from the bounded
-    /// healthy-refresh overlap, or deadline expiry.
+    /// Fails after rollover, revision or capture changes, degradation, a change or narrowing of
+    /// healthy authority, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
         if trusted.monotonic() < self.trusted_valid_from_monotonic {
             return Err(RegistryError::TrustedClockRegression);
         }
-        if trusted.wall() >= self.trusted_valid_from
-            && trusted.wall() <= self.valid_until
-            && trusted.monotonic() <= self.valid_until_monotonic
-            && at >= self.valid_from
-            && at <= self.valid_until
-            && self.lease.validate_health_epoch(self.health_epoch, at)
-            && self.capture.is_healthy()
-            && self.budget.is_available()
+        let trusted_wall_before_acceptance = trusted.wall() < self.trusted_valid_from;
+        let trusted_wall_expired = trusted.wall() > self.valid_until;
+        let trusted_monotonic_expired = trusted.monotonic() > self.valid_until_monotonic;
+        let event_before_valid_from = at < self.valid_from;
+        let event_after_valid_until = at > self.valid_until;
+        let epoch_or_session_invalid = !self.lease.validate_health_epoch(self.health_epoch);
+        let capture_unhealthy = !self.capture.is_healthy();
+        let budget_unavailable = !self.budget.is_available();
+        if trusted_wall_before_acceptance
+            || trusted_wall_expired
+            || trusted_monotonic_expired
+            || event_before_valid_from
+            || event_after_valid_until
+            || epoch_or_session_invalid
+            || capture_unhealthy
+            || budget_unavailable
         {
-            Ok(())
-        } else {
+            tracing::warn!(
+                trusted_wall_before_acceptance,
+                trusted_wall_expired,
+                trusted_monotonic_expired,
+                event_before_valid_from,
+                event_after_valid_until,
+                epoch_or_session_invalid,
+                capture_unhealthy,
+                budget_unavailable,
+                "queued source authority validation failed"
+            );
             Err(RegistryError::HealthNotQualified)
+        } else {
+            Ok(())
         }
     }
 

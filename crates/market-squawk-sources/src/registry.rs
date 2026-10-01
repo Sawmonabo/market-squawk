@@ -68,7 +68,7 @@ struct HealthEpochInterval {
 struct SessionHealthQualification {
     epoch: u64,
     current: Option<HealthEpochInterval>,
-    previous: Option<HealthEpochInterval>,
+    first_valid_epoch: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -131,6 +131,7 @@ impl SessionLeaseState {
         &self,
         epoch: u64,
         qualified: bool,
+        benign_renewal: bool,
         valid_from: Option<Timestamp>,
         valid_until: Option<Timestamp>,
     ) {
@@ -142,29 +143,34 @@ impl SessionLeaseState {
             }),
             _ => None,
         };
-        // Publish one coherent snapshot. Queued work retains the immediately preceding epoch's
-        // original interval; a renewal neither rebases its timestamp nor briefly dequalifies it.
-        // An unhealthy update removes both intervals, so later recovery cannot revive either.
-        let previous = current.and_then(|_| self.health.load().current);
+        // Keep a constant-size uninterrupted healthy run, not a count-limited queue window.
+        // Every retained lease still checks its own original wall/monotonic interval. A scope
+        // change, narrowing, gap or unhealthy update starts a new run and cannot revive old work.
+        let prior = self.health.load();
+        let first_valid_epoch = current.map(|next| {
+            if benign_renewal
+                && prior.current.is_some_and(|old| {
+                    old.valid_from <= next.valid_from && next.valid_from <= old.valid_until
+                })
+            {
+                prior.first_valid_epoch.unwrap_or(epoch)
+            } else {
+                epoch
+            }
+        });
         self.health.store(Arc::new(SessionHealthQualification {
             epoch,
             current,
-            previous,
+            first_valid_epoch,
         }));
     }
 
-    fn validate_health_epoch(&self, epoch: u64, at: Timestamp) -> bool {
+    // This checks continuity only. All callers separately check their captured original interval.
+    fn validate_health_epoch(&self, epoch: u64) -> bool {
         let health = self.health.load();
         self.is_current()
-            && health
-                .current
-                .iter()
-                .chain(health.previous.iter())
-                .any(|interval| {
-                    epoch == interval.epoch
-                        && at >= interval.valid_from
-                        && at <= interval.valid_until
-                })
+            && health.first_valid_epoch.is_some_and(|first| first <= epoch)
+            && health.current.is_some_and(|current| epoch <= current.epoch)
     }
 
     fn shared_allocation_charge() -> Option<usize> {

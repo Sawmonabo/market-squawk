@@ -4280,7 +4280,11 @@ async fn invoke_exact_public_crypto(
     if response.result()["ok"] != true {
         anyhow::bail!("{operation} failed: {}", response.result());
     }
-    Ok(response.result()["value"]["data"].clone())
+    let value = &response.result()["value"];
+    if operation == "Market.GetUnifiedFeed" && value["data"].is_null() {
+        anyhow::bail!("crypto unified feed has no rows; metadata: {}", value["metadata"]);
+    }
+    Ok(value["data"].clone())
 }
 
 #[cfg(debug_assertions)]

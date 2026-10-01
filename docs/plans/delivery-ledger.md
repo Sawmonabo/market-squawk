@@ -43,13 +43,12 @@ Its focused evidence is recorded below. Independent terminal-batch WIP remains p
 
 ### Current dependency and ownership wave
 
-The database/archive/recovery work is pushed through `ee77ff55`, capture batching/buffering
-through `8404085c`, committed-row clock correction through `5a763d8d`, and feed/native-product
-identity correction through `042fd569`. Live publication now reaches SQLite, where stale 64-row
-schema constraints reject validated 100-row batches. The current in-place integration aligns the
-schema with admitted parent counts, preserves uniqueness-only retries, and moves Markets latest
-instrument-definition reads to an independent WAL snapshot. Astra's implementation is frozen;
-the lead owns remaining critical checks, the combined live run, integration and push.
+Storage and backup integration is pushed through `0852aad6` (PR #43 comment5931971854), including
+valid100-row batches and independent latest execution-definition reads. Current source-authority
+renewal correction has passed its three critical checks and combined build, but live ingestion
+still fails132.52s (`healthy-renewal-live.log`) before Kraken/restart. Diagnostics isolate trusted
+wall/monotonic lease expiry; epoch/session, capture and budget remain valid. Astra owns read-only
+lease provenance/refresh tracing; the lead owns accepted checkpoint integration and scheduling.
 No current evidence establishes completed live ingestion or installed Desktop workflows.
 
 ### Raw capture serialization correction — base `ee77ff55`
@@ -4807,3 +4806,66 @@ is unqualified. Kraken/restart are not reached. Storage critical checks pass; li
 acceptance remains open. Astra research_options_failure owns read-only analysis of the current
 unified-feed result envelope and health-invalidating path; lead owns any next integration, builds
 and Git. No source edits during this handoff.
+
+Checkpoint0852aad6 pushed; PR #43 comment5931971854. Source audit confirms the live helper's
+envelope is current: a successful zero-row (or zero-fitting-row) response contains data:null.
+Lead owns existing production_mcp_composition.rs helper diagnostic: include typed result metadata
+for a null unified feed, preserving all success assertions and retry deadlines. Astra continues
+read-only tracing of zero-row selection/source health; no production edits yet.
+
+Next read-only diagnostic assignment to Astra: trace public runtime preparation's
+wait_for_public_snapshots/aggregate against actual source-product and stream-product semantics,
+and how those selected snapshots reach the runtime registry. Lead's metadata-only live run is
+active; no source changes, builds or additional worktrees by the agent.
+
+Diagnostic live run fails132.49s (`crypto-empty-feed-live.log`), with zero available/observed sources
+and no result truncation. Health rejection precedes final test cancellation by54s. Astra owns
+read-only assessment of registry.rs SessionHealthQualification's current/previous-epoch overlap
+and actual public heartbeat update frequency: determine whether healthy renewals invalidate still-
+in-deadline queued rows and propose a revocation-aware bounded design plus an existing critical
+selector. No behavior changes until the concrete contract is established; lead retains integration.
+
+Approved bounded authority correction: queued leases keep their original time interval across
+benign health renewals, without retaining a count-limited epoch history. A constant-size healthy-run
+floor is reset on unqualified state, session invalidation, changed authorization/coverage evidence
+or narrowed authority. Original wall/monotonic/event deadlines and capture/budget/identity guards
+remain. Astra owns sources registry.rs, registry/{health_authority.rs,authority.rs,current_batch.rs,
+authority/live_scope.rs}, and existing registry_authority/pre_feed_cases.rs. Add closed predicate
+diagnostics on failed queued authority to distinguish the actual live failure; lead owns the
+existing workspace tracing dependency in sources Cargo.toml/lockfile, compilation and integration.
+The110ms live failure is not yet proved to be two-epoch eviction; do not claim that cause.
+
+Lead also owns the sole catalog.rs attestation caller: its existing explicit unqualification
+passes benign_renewal=false. The registry metadata/attestation invalidation remains immediate.
+
+Lead closed the authority-evidence critical gap in the same pre-feed case: a changed subscription
+receipt revokes an otherwise time-extended lease. Correct compiled harness is decode_contracts
+(module registry_authority), not a standalone registry_authority target; no new harness added.
+
+Renewal/degradation/narrowing/evidence-change case passes1/1; terminal epoch exhaustion passes1/1.
+Existing budget invalidation case fails before its assertions with LiveScopeNotCovered: unlike
+the updated pre-feed case it omits required native identity fixture setup. Lead owns that one
+function in tests/registry_authority.rs and reuses existing register_fixture_source with its exact
+covered instrument. No production guard relaxation or new fixture/harness.
+
+Final source critical checks: pre-feed authority continuity/revocation1/1 (22.47s build), budget
+revocation1/1 in0.01s after existing-fixture repair (2.99s build), terminal epoch exhaustion1/1
+(11.80s build). Logs healthy-renewal-{critical,budget-fixture-critical,exhaustion-critical}.log.
+Lead inspected all source changes and aligned architecture prose; no expiry/freshness increase.
+Single-job combined application build is running on frozen source.
+
+Combined authority candidate compiles6m32s (`healthy-renewal-app-build.log`); exact new executable
+is control_plane-7656717189705b23. Live Coinbase/Kraken restart scenario is running from that
+executable with unchanged reviewed public configs and the existing120s readiness bound.
+
+Live predicate diagnostic at13:21:25.845 proves the remaining rejection is trusted wall AND
+monotonic expiry; event timestamp remains in bounds, epoch/session continuity remains valid,
+capture is healthy and budget available. This is not count eviction or teardown. Astra
+research_options_failure owns read-only tracing of which captured lease is attached to committed
+rows (including actor reuse) and whether persistence incorrectly reuses live freshness admission.
+Identify the exact age/owner and minimal correct authority boundary; no deadline increases, edits
+or builds. Current test is still joining/finalizing and has not reached restart.
+
+Healthy-renewal live run finishes failed132.52s; no prior count-eviction, SQLite or definition-writer
+rejection is reported. Exact trusted lease expiry remains open; no live/restart acceptance claimed.
+Critical renewal, revocation, evidence-change, budget and terminal-epoch checks pass as above.

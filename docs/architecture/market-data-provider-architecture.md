@@ -605,8 +605,9 @@ when that operation exits; it is not a cached connection or a second runtime. Th
 [snapshot isolation](https://www.sqlite.org/isolation.html) (reviewed 2026-09-30). Actual SQLite
 lock conflicts remain possible; WAL does not justify treating every source as available.
 
-Immutable instrument definition, population, search, enumeration and retained native-reference
-reads also use endpoint-bound snapshots. Service composition captures the endpoint before sharing
+Market-data instrument definition, population, search, enumeration and retained native-reference
+reads also use endpoint-bound snapshots. Latest execution-instrument definitions use the same
+snapshot owner; execution-definition pinning and search retain their existing authority path. Service composition captures the endpoint before sharing
 the writer, so obtaining a reader does not acquire writer admission. The existing SQL, selection
 clocks, receipt validation and cancellation/deadline controls apply within one read transaction.
 Current-identity clock/watch mutation and already-borrowed publication validation retain their
@@ -623,6 +624,13 @@ watch, then resolves and verifies identity through the same independent snapshot
 validates that watch after reading, so a concurrent identity publication cannot authorize an old
 snapshot. Contention at the short mutation boundary observes the original cancellation/deadline;
 an occupied writer mutex alone is not an invalid identity.
+
+Queued source authority retains each lease's original wall-clock, monotonic and event-time bounds.
+Benign healthy renewals preserve that authority through a constant-size epoch floor, independent of
+refresh count. Degradation, session invalidation, changed authorization/subscription evidence,
+narrower authority or a gap in qualified time starts a new run; later recovery cannot revive old
+leases. Capture, budget and native-identity revocation checks remain separate. This is queued-work
+continuity, not an extension of price freshness or permission to use expired observations.
 
 Market-event point reads select an immutable logical publication and its exact source evidence.
 Physical placement is resolved within that read's WAL snapshot: canonical active rows or the

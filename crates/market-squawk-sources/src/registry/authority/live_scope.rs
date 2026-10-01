@@ -71,7 +71,7 @@ impl ValidatedLiveScope {
             && trusted.monotonic() <= self.valid_until_monotonic
             && at >= self.valid_from
             && at <= self.valid_until
-            && self.lease.validate_health_epoch(self.health_epoch, at)
+            && self.lease.validate_health_epoch(self.health_epoch)
             && self.capture.is_healthy()
             && self.budget.is_available()
         {

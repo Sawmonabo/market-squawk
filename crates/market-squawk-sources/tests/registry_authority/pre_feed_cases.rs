@@ -6,9 +6,11 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         reporter: &mut market_squawk_sources::CurrentHealthReporter,
         observed_at: i64,
         integrity: StreamIntegrityState,
+        authority_until: Option<Timestamp>,
+        coverage_evidence: u8,
     ) -> TestResult {
         let observed = Timestamp::from_unix_nanos(observed_at);
-        let valid_until = observed.checked_add_nanos(10_000_000_000)?;
+        let valid_until = authority_until.unwrap_or(observed.checked_add_nanos(10_000_000_000)?);
         let health = SourceHealthSnapshot::try_new(
             session,
             observed,
@@ -32,7 +34,7 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
                 valid_until,
             },
             CoverageHealth::Sufficient {
-                evidence: exact_evidence(22),
+                evidence: exact_evidence(coverage_evidence),
                 provider_product: ProviderProduct::new(source_identifier("direct-product")?),
                 provider_channel: ProviderChannel::new(source_identifier("trades")?),
                 valid_until,
@@ -93,6 +95,8 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut first_reporter,
         first_at.unix_nanos(),
         StreamIntegrityState::Healthy,
+        None,
+        22,
     )?;
     let lease = {
         let current = first.validate_current_authority(&first_session)?;
@@ -110,6 +114,8 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut first_reporter,
         refreshed_at.unix_nanos(),
         StreamIntegrityState::Healthy,
+        None,
+        22,
     )?;
     // An admitted FIFO batch keeps its original validation timestamp across renewal.
     assert!(lease.validate_at(first_at).is_ok());
@@ -131,9 +137,29 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut first_reporter,
         second_refresh_at.unix_nanos(),
         StreamIntegrityState::Healthy,
+        None,
+        22,
     )?;
-    assert!(lease.validate_at(second_refresh_at).is_err());
-    assert!(lease.validate_at(first_at).is_err());
+    assert!(lease.validate_at(second_refresh_at).is_ok());
+    assert!(lease.validate_at(first_at).is_ok());
+    let third_refresh_at = next_timestamp_after(second_refresh_at)?;
+    record_health(
+        &mut first,
+        &first_session,
+        &mut first_reporter,
+        third_refresh_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
+        None,
+        22,
+    )?;
+    assert!(lease.validate_at(first_at).is_ok());
+    assert!(lease.validate_at(third_refresh_at).is_ok());
+    // Renewals never extend the first lease's captured interval.
+    assert!(
+        lease
+            .validate_at(lease.valid_until().checked_add_nanos(1)?)
+            .is_err()
+    );
     assert!(refreshed.validate_at(refreshed_at).is_ok());
     assert!(refreshed.validate_at(second_refresh_at).is_ok());
 
@@ -152,6 +178,8 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut second_reporter,
         second_at.unix_nanos(),
         StreamIntegrityState::Healthy,
+        None,
+        22,
     )?;
     let second_lease = second
         .validate_current_authority(&second_session)?
@@ -170,6 +198,8 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut second_reporter,
         degraded_at.unix_nanos(),
         StreamIntegrityState::GapDetected,
+        None,
+        22,
     )?;
     assert!(second_lease.validate_at(second_at).is_err());
     let recovered_at = next_timestamp_after(degraded_at)?;
@@ -179,6 +209,8 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut second_reporter,
         recovered_at.unix_nanos(),
         StreamIntegrityState::Healthy,
+        None,
+        22,
     )?;
     second
         .validate_current_authority(&second_session)?
@@ -186,6 +218,59 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         .validate_at(recovered_at)?;
     assert!(second_lease.validate_at(second_at).is_err());
     assert!(second_lease.validate_at(recovered_at).is_err());
+
+    // A still-qualified but shorter authorization is a new run, not a benign refresh.
+    let recovered = second
+        .validate_current_authority(&second_session)?
+        .try_current_lease()?;
+    let narrowed_at = next_timestamp_after(recovered_at)?;
+    let narrowed_until = narrowed_at.checked_add_nanos(500_000_000)?;
+    assert!(narrowed_until < recovered.valid_until());
+    record_health(
+        &mut second,
+        &second_session,
+        &mut second_reporter,
+        narrowed_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
+        Some(narrowed_until),
+        22,
+    )?;
+    assert!(recovered.validate_at(recovered_at).is_err());
+    second
+        .validate_current_authority(&second_session)?
+        .try_current_lease()?
+        .validate_at(narrowed_at)?;
+    let extended_at = next_timestamp_after(narrowed_at)?;
+    record_health(
+        &mut second,
+        &second_session,
+        &mut second_reporter,
+        extended_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
+        None,
+        22,
+    )?;
+    assert!(recovered.validate_at(recovered_at).is_err());
+
+    // A replacement subscription receipt must revoke the old run even if time extends.
+    let extended = second
+        .validate_current_authority(&second_session)?
+        .try_current_lease()?;
+    let changed_at = next_timestamp_after(extended_at)?;
+    record_health(
+        &mut second,
+        &second_session,
+        &mut second_reporter,
+        changed_at.unix_nanos(),
+        StreamIntegrityState::Healthy,
+        None,
+        23,
+    )?;
+    assert!(extended.validate_at(extended_at).is_err());
+    second
+        .validate_current_authority(&second_session)?
+        .try_current_lease()?
+        .validate_at(changed_at)?;
 
     let (
         mut exiting,
@@ -202,6 +287,8 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut exiting_reporter,
         exiting_at.unix_nanos(),
         StreamIntegrityState::Healthy,
+        None,
+        22,
     )?;
     let exiting_lease = exiting
         .validate_current_authority(&exiting_session)?

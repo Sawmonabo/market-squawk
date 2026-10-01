@@ -1016,14 +1016,19 @@ fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
 
 #[test]
 fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(
-        direct_metadata_for_provider(
-            "budget-source",
-            "budget-revision",
-            "budget-authority-test-provider",
-            "wss://budget-authority.example.test/feed",
-        )?,
+    let metadata = direct_metadata_for_provider(
+        "budget-source",
+        "budget-revision",
+        "budget-authority-test-provider",
+        "wss://budget-authority.example.test/feed",
+    )?;
+    let [instrument] = metadata.coverage().instruments().instruments() else {
+        return Err("budget fixture requires one covered instrument".into());
+    };
+    let native_routes = [(*instrument, "BTC-USD")];
+    let (mut registry, registered) = crate::common::register_fixture_source(
+        metadata,
+        &native_routes,
         Timestamp::from_unix_nanos(1),
     )?;
     let session = registry.begin_session(

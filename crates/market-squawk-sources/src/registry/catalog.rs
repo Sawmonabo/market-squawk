@@ -548,7 +548,7 @@ impl AuthoritativeSourceRegistry {
         if let (Some(active), Some(epoch)) = (&entry.active, next_health_epoch) {
             active
                 .lease
-                .commit_live_qualification(epoch, false, None, None);
+                .commit_live_qualification(epoch, false, false, None, None);
         }
         Ok(())
     }

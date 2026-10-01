@@ -77,8 +77,14 @@ impl AuthoritativeSourceRegistry {
             return Err(RegistryError::StaleHealthObservation);
         }
         let live_declaration = match health.coverage() {
-            crate::CoverageHealth::Sufficient { provider_product, provider_channel, .. } =>
-                entry.metadata.coverage().live_for(provider_product, provider_channel),
+            crate::CoverageHealth::Sufficient {
+                provider_product,
+                provider_channel,
+                ..
+            } => entry
+                .metadata
+                .coverage()
+                .live_for(provider_product, provider_channel),
             _ => None,
         };
         let quality_ceiling = entry.metadata.quality_ceiling();
@@ -225,9 +231,15 @@ impl AuthoritativeSourceRegistry {
         } else {
             None
         };
+        let benign_renewal = entry
+            .health_authority
+            .as_ref()
+            .zip(next_authority.as_ref())
+            .is_some_and(|(previous, next)| previous.is_benign_renewal(next));
         session.lease.commit_live_qualification(
             epoch,
             qualified,
+            benign_renewal,
             qualified.then_some(health.observed_at()),
             valid_until,
         );
@@ -269,9 +281,7 @@ impl AuthoritativeSourceRegistry {
             || validation_at.wall() < health.observed_at
             || validation_at.wall() > health.valid_until
             || validation_at.monotonic() > health.valid_until_monotonic
-            || !session
-                .lease
-                .validate_health_epoch(health.epoch, validation_at.wall())
+            || !session.lease.validate_health_epoch(health.epoch)
         {
             return Err(RegistryError::HealthNotQualified);
         }
@@ -353,5 +363,51 @@ impl AuthoritativeSourceRegistry {
             return Err(RegistryError::SessionNotCurrent);
         }
         Ok(entry)
+    }
+}
+
+impl CurrentHealthAuthority {
+    /// Renewal may extend time, but cannot replace or narrow the evidence authorizing old work.
+    fn is_benign_renewal(&self, next: &Self) -> bool {
+        let authorization_continues = match (&self.authorization, &next.authorization) {
+            (
+                crate::AuthorizationHealth::Valid {
+                    evidence: before,
+                    valid_until: before_until,
+                },
+                crate::AuthorizationHealth::Valid {
+                    evidence: after,
+                    valid_until: after_until,
+                },
+            ) => before == after && after_until >= before_until,
+            _ => false,
+        };
+        let coverage_continues = match (&self.coverage, &next.coverage) {
+            (
+                crate::CoverageHealth::Sufficient {
+                    evidence: before,
+                    provider_product: before_product,
+                    provider_channel: before_channel,
+                    valid_until: before_until,
+                },
+                crate::CoverageHealth::Sufficient {
+                    evidence: after,
+                    provider_product: after_product,
+                    provider_channel: after_channel,
+                    valid_until: after_until,
+                },
+            ) => {
+                before == after
+                    && before_product == after_product
+                    && before_channel == after_channel
+                    && after_until >= before_until
+            }
+            _ => false,
+        };
+        authorization_continues
+            && coverage_continues
+            && next.valid_until >= self.valid_until
+            && next.valid_until_monotonic >= self.valid_until_monotonic
+            && self.budget.is_available()
     }
 }
