@@ -922,130 +922,140 @@ impl MarketDataInstrumentReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<CurrentMarketDataProviderIdentity, MarketDataInstrumentCatalogError> {
         check_operation(deadline, cancellation)?;
-        let catalog = self.authority.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => {
-                MarketDataInstrumentCatalogError::SourceAuthority(
-                    super::CatalogError::AuthorityBusy,
-                )
-            }
-            std::sync::TryLockError::Poisoned(_) => {
-                MarketDataInstrumentCatalogError::SourceAuthority(
-                    super::CatalogError::AuthorityLockPoisoned,
-                )
-            }
-        })?;
-        let connection = &catalog.catalog().connection;
-        let busy_millis: u32 =
-            connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-        connection.busy_timeout(std::time::Duration::ZERO)?;
-        let result = (|| {
-            install_progress_handler(connection, deadline, cancellation)?;
-            let transaction = connection.unchecked_transaction()?;
-            let now = trusted_catalog_now(&transaction)?;
-            if request.knowledge_at > now {
-                return Err(MarketDataInstrumentCatalogError::InvalidInput);
-            }
-            let query = MarketDataProviderIdentityQuery::try_new(
-                request.namespace.clone(),
-                request.provider_instrument_id.clone(),
-                request.knowledge_at,
-                request.effective_at,
-            )?;
-            let selection = MarketDataProviderIdentitySelection::from_resolution(
-                catalog.resolve_market_data_provider_identity_in_catalog(
-                    query,
-                    deadline,
-                    cancellation,
-                )?,
-            )
-            .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
-            let record = catalog.selected_provider_record_in_catalog(&selection)?;
-            let evidence = native_identity_evidence(&selection, &record, request)?;
-            catalog.require_current_provider_identity_in_catalog(
-                &evidence,
+        // The clock and generation watch are mutable authority. Capture them together only
+        // after any preceding definition publication has committed or rolled back.
+        let (now, generation, location, binding, limits) = {
+            let catalog = lock_native_identity_authority(&self.authority, deadline, cancellation)?;
+            let connection = &catalog.catalog().connection;
+            let busy_millis: u32 =
+                connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+            connection.busy_timeout(std::time::Duration::ZERO)?;
+            let admitted = (|| {
+                install_progress_handler(connection, deadline, cancellation)?;
+                let transaction = connection.unchecked_transaction()?;
+                let now = trusted_catalog_now(&transaction)?;
+                if request.knowledge_at > now {
+                    return Err(MarketDataInstrumentCatalogError::InvalidInput);
+                }
+                let generation = catalog.provider_identity_generation.select(request)?;
+                check_operation(deadline, cancellation)?;
+                transaction.commit()?;
+                Ok((now, generation))
+            })();
+            let progress_cleanup = clear_progress_handler(connection);
+            let busy_cleanup =
+                connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
+            progress_cleanup?;
+            busy_cleanup?;
+            let (now, generation) = classify_operation(admitted, deadline, cancellation)?;
+            (
                 now,
+                generation,
+                catalog.catalog().location.clone(),
+                catalog.catalog().artifact_root_binding,
+                catalog.catalog().result_bytes,
+            )
+        };
+        // No writer mutex is held through resolution or immutable evidence replay. A later
+        // relevant writer revokes the watch before its first SQL change, even on rollback.
+        let result = (|| {
+            let snapshot = super::CatalogReadSnapshot::open(
+                &location,
+                binding,
+                limits,
                 deadline,
                 cancellation,
             )?;
-            let generation = catalog.provider_identity_generation.select(request)?;
-            // Charge all retained fields and watched counter allocations conservatively.
-            let exact = selection.exact_receipt()?;
-            let mut retained_bytes = size_of::<CurrentMarketDataProviderIdentity>()
-                .checked_add(generation.retained_allocation_bytes())
-                .and_then(|size| size.checked_add(evidence.dynamic_retained_bytes()?))
-                .and_then(|size| size.checked_add(selection.query().source_id().retained_bytes()))
-                .and_then(|size| {
-                    size.checked_add(selection.query().provider_instrument_id().retained_bytes())
-                })
-                .and_then(|size| {
-                    size.checked_add(
-                        exact
-                            .definition_reference_revision()
-                            .as_source_identifier()
-                            .retained_bytes(),
-                    )
-                })
-                .and_then(|size| {
-                    size.checked_add(
-                        exact
-                            .provider_identity_revision()
-                            .as_source_identifier()
-                            .retained_bytes(),
-                    )
-                })
-                .and_then(|size| {
-                    size.checked_add(
-                        exact
-                            .matching_venues()
-                            .len()
-                            .checked_mul(size_of::<VenueId>())?,
-                    )
-                })
-                .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
-            for venue in exact.matching_venues() {
-                retained_bytes = retained_bytes
-                    .checked_add(venue.retained_bytes())
+            let identity = snapshot.read(|snapshot| {
+                let connection = snapshot.connection();
+                let query = MarketDataProviderIdentityQuery::try_new(
+                    request.namespace.clone(),
+                    request.provider_instrument_id.clone(),
+                    request.knowledge_at,
+                    request.effective_at,
+                )?;
+                let selection = MarketDataProviderIdentitySelection::from_resolution(
+                    resolve_provider_identity_in_connection(connection, limits, query, || {
+                        check_operation(deadline, cancellation)
+                    })?,
+                )
+                .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
+                let record =
+                    selected_provider_record_in_connection(connection, limits, &selection)?;
+                let evidence = native_identity_evidence(&selection, &record, request)?;
+                require_current_provider_identity_in_connection(
+                    connection,
+                    limits,
+                    &evidence,
+                    now,
+                    deadline,
+                    cancellation,
+                )?;
+                // Charge all retained fields and watched counter allocations conservatively.
+                let exact = selection.exact_receipt()?;
+                let mut retained_bytes = size_of::<CurrentMarketDataProviderIdentity>()
+                    .checked_add(generation.retained_allocation_bytes())
+                    .and_then(|size| size.checked_add(evidence.dynamic_retained_bytes()?))
+                    .and_then(|size| {
+                        size.checked_add(selection.query().source_id().retained_bytes())
+                    })
+                    .and_then(|size| {
+                        size.checked_add(
+                            selection.query().provider_instrument_id().retained_bytes(),
+                        )
+                    })
+                    .and_then(|size| {
+                        size.checked_add(
+                            exact
+                                .definition_reference_revision()
+                                .as_source_identifier()
+                                .retained_bytes(),
+                        )
+                    })
+                    .and_then(|size| {
+                        size.checked_add(
+                            exact
+                                .provider_identity_revision()
+                                .as_source_identifier()
+                                .retained_bytes(),
+                        )
+                    })
+                    .and_then(|size| {
+                        size.checked_add(
+                            exact
+                                .matching_venues()
+                                .len()
+                                .checked_mul(size_of::<VenueId>())?,
+                        )
+                    })
                     .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
-            }
+                for venue in exact.matching_venues() {
+                    retained_bytes = retained_bytes
+                        .checked_add(venue.retained_bytes())
+                        .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                }
+                check_operation(deadline, cancellation)?;
+                Ok::<_, MarketDataInstrumentCatalogError>(CurrentMarketDataProviderIdentity {
+                    selection,
+                    evidence,
+                    generation,
+                    selected_at: now,
+                    retained_bytes,
+                })
+            })?;
+            // A token observed before SQL commit must never bless an older WAL snapshot.
+            identity
+                .generation
+                .validate()
+                .map_err(|_| MarketDataInstrumentCatalogError::ReferencePositionConflict)?;
             check_operation(deadline, cancellation)?;
-            transaction.commit()?;
-            Ok(CurrentMarketDataProviderIdentity {
-                selection,
-                evidence,
-                generation,
-                selected_at: now,
-                retained_bytes,
-            })
+            Ok(identity)
         })();
-        let progress_cleanup = clear_progress_handler(connection);
-        let busy_cleanup =
-            connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
-        progress_cleanup?;
-        busy_cleanup?;
         classify_operation(result, deadline, cancellation)
     }
 }
 
 impl CatalogAuthority {
-    fn selected_provider_record_in_catalog(
-        &self,
-        selection: &MarketDataProviderIdentitySelection,
-    ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
-        let exact = selection.exact_receipt()?;
-        let row = self.catalog().connection.query_row(
-            &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_revisions AS revisions WHERE revisions.revision_digest=?1"),
-            [exact.definition_revision_digest().bytes()], decode_stored_row)?;
-        charge_row(&row, &mut ResultBudget::new(self.catalog().result_bytes))?;
-        let record = rebuild_record(row)?;
-        if record.definition().instrument_id() != exact.instrument_id()
-            || record.revision_sequence() != exact.definition_revision_sequence()
-            || record.published_at() != exact.definition_published_at()
-        {
-            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
-        }
-        Ok(record)
-    }
-
     /// Transaction-local replay of persisted evidence. No mutex reentry or progress-handler
     /// replacement; the caller owns the catalog lock and the bounded transaction.
     pub(crate) fn verify_provider_identity_evidence_in_catalog(
@@ -1054,22 +1064,13 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketDataProviderIdentitySelection, MarketDataInstrumentCatalogError> {
-        let request = &evidence.native;
-        let query = MarketDataProviderIdentityQuery::try_new(
-            request.namespace.clone(),
-            request.provider_instrument_id.clone(),
-            request.knowledge_at,
-            request.effective_at,
-        )?;
-        let selection = MarketDataProviderIdentitySelection::from_resolution(
-            self.resolve_market_data_provider_identity_in_catalog(query, deadline, cancellation)?,
-        )
-        .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
-        let record = self.selected_provider_record_in_catalog(&selection)?;
-        if native_identity_evidence(&selection, &record, request)? != *evidence {
-            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
-        }
-        Ok(selection)
+        let result = verify_provider_identity_evidence_in_connection(
+            &self.catalog().connection,
+            self.catalog().result_bytes,
+            evidence,
+            || check_operation(deadline, cancellation),
+        );
+        classify_operation(result, deadline, cancellation).map(|(selection, _)| selection)
     }
 
     /// Existing publication transactions call this with their trusted commit time while holding
@@ -1081,33 +1082,131 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), MarketDataInstrumentCatalogError> {
-        if evidence.native.knowledge_at > at
-            || !interval_contains(evidence.definition_validity, at)
-            || !interval_contains(evidence.provider_validity, at)
-        {
-            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
-        }
-        let selected =
-            self.verify_provider_identity_evidence_in_catalog(evidence, deadline, cancellation)?;
-        let record = self.selected_provider_record_in_catalog(&selected)?;
-        require_current_market_data_instrument(self, &record, deadline, cancellation)?;
-        let fresh = self.resolve_market_data_provider_identity_in_catalog(
-            MarketDataProviderIdentityQuery::try_new(
-                evidence.native.namespace.clone(),
-                evidence.native.provider_instrument_id.clone(),
-                at,
-                at,
-            )?,
+        require_current_provider_identity_in_connection(
+            &self.catalog().connection,
+            self.catalog().result_bytes,
+            evidence,
+            at,
             deadline,
             cancellation,
-        )?;
-        match fresh.outcome() {
-            MarketDataProviderIdentityResolutionOutcome::Exact(exact)
-                if exact == selected.exact_receipt()? =>
-            {
-                Ok(())
+        )
+    }
+}
+
+fn selected_provider_record_in_connection(
+    connection: &rusqlite::Connection,
+    limits: super::CatalogResultLimits,
+    selection: &MarketDataProviderIdentitySelection,
+) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+    let exact = selection.exact_receipt()?;
+    let row = connection.query_row(
+            &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_revisions AS revisions WHERE revisions.revision_digest=?1"),
+            [exact.definition_revision_digest().bytes()], decode_stored_row)?;
+    charge_row(&row, &mut ResultBudget::new(limits))?;
+    let record = rebuild_record(row)?;
+    if record.definition().instrument_id() != exact.instrument_id()
+        || record.revision_sequence() != exact.definition_revision_sequence()
+        || record.published_at() != exact.definition_published_at()
+    {
+        return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+    }
+    Ok(record)
+}
+
+fn require_current_provider_identity_in_connection(
+    connection: &rusqlite::Connection,
+    limits: super::CatalogResultLimits,
+    evidence: &ProviderIdentitySelectionEvidence,
+    at: Timestamp,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), MarketDataInstrumentCatalogError> {
+    if evidence.native.knowledge_at > at
+        || !interval_contains(evidence.definition_validity, at)
+        || !interval_contains(evidence.provider_validity, at)
+    {
+        return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+    }
+    let (selected, record) =
+        verify_provider_identity_evidence_in_connection(connection, limits, evidence, || {
+            check_operation(deadline, cancellation)
+        })?;
+    require_current_market_data_instrument_in_connection(
+        connection,
+        limits,
+        &record,
+        deadline,
+        cancellation,
+    )?;
+    let fresh = resolve_provider_identity_in_connection(
+        connection,
+        limits,
+        MarketDataProviderIdentityQuery::try_new(
+            evidence.native.namespace.clone(),
+            evidence.native.provider_instrument_id.clone(),
+            at,
+            at,
+        )?,
+        || check_operation(deadline, cancellation),
+    )?;
+    match fresh.outcome() {
+        MarketDataProviderIdentityResolutionOutcome::Exact(exact)
+            if exact == selected.exact_receipt()? =>
+        {
+            Ok(())
+        }
+        _ => Err(MarketDataInstrumentCatalogError::ReferencePositionConflict),
+    }
+}
+
+fn require_current_market_data_instrument_in_connection(
+    connection: &rusqlite::Connection,
+    limits: super::CatalogResultLimits,
+    expected: &MarketDataInstrumentRecord,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), MarketDataInstrumentCatalogError> {
+    check_operation(deadline, cancellation)?;
+
+    let row = connection.query_row(
+                &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_current AS current_
+                    JOIN market_data_instrument_revisions AS revisions ON revisions.revision_digest=current_.revision_digest
+                    WHERE current_.instrument_id=?1 LIMIT 1"),
+                [expected.definition().instrument_id().to_string()], decode_stored_row,
+            ).optional()?;
+    let Some(row) = row else {
+        return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+    };
+    charge_row(&row, &mut ResultBudget::new(limits))?;
+    if rebuild_record(row)? != *expected {
+        return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+    }
+    Ok(())
+}
+
+/// Called only in the existing supervised blocking I/O owner. Waiting is bounded by the
+/// original request and applies only to clock/watch mutation, never snapshot resolution.
+fn lock_native_identity_authority<'a>(
+    authority: &'a Mutex<CatalogAuthority>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<std::sync::MutexGuard<'a, CatalogAuthority>, MarketDataInstrumentCatalogError> {
+    loop {
+        check_operation(deadline, cancellation)?;
+        match authority.try_lock() {
+            Ok(guard) => {
+                check_operation(deadline, cancellation)?;
+                return Ok(guard);
             }
-            _ => Err(MarketDataInstrumentCatalogError::ReferencePositionConflict),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MarketDataInstrumentCatalogError::SourceAuthority(
+                    super::CatalogError::AuthorityLockPoisoned,
+                ));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+            }
         }
     }
 }
@@ -1133,6 +1232,25 @@ pub(crate) fn verify_provider_identity_evidence_with_limits(
     evidence: &ProviderIdentitySelectionEvidence,
     limits: super::CatalogResultLimits,
 ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+    verify_provider_identity_evidence_in_connection(connection, limits, evidence, || Ok(()))
+        .map(|(_, record)| record)
+}
+
+/// One replay proof for writer transactions and independent snapshots. The caller retains
+/// its SQLite progress handler; explicit checks use that operation's original control bounds.
+fn verify_provider_identity_evidence_in_connection(
+    connection: &rusqlite::Connection,
+    limits: super::CatalogResultLimits,
+    evidence: &ProviderIdentitySelectionEvidence,
+    check: impl Fn() -> Result<(), MarketDataInstrumentCatalogError>,
+) -> Result<
+    (
+        MarketDataProviderIdentitySelection,
+        MarketDataInstrumentRecord,
+    ),
+    MarketDataInstrumentCatalogError,
+> {
+    check()?;
     let request = &evidence.native;
     let query = MarketDataProviderIdentityQuery::try_new(
         request.namespace.clone(),
@@ -1141,24 +1259,16 @@ pub(crate) fn verify_provider_identity_evidence_with_limits(
         request.effective_at,
     )?;
     let selection = MarketDataProviderIdentitySelection::from_resolution(
-        resolve_provider_identity_in_connection(connection, limits, query, || Ok(()))?,
+        resolve_provider_identity_in_connection(connection, limits, query, &check)?,
     )
     .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
-    let exact = selection.exact_receipt()?;
-    let row = connection.query_row(
-        &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_revisions AS revisions WHERE revisions.revision_digest=?1"),
-        [exact.definition_revision_digest().bytes()], decode_stored_row,
-    )?;
-    charge_row(&row, &mut ResultBudget::new(limits))?;
-    let record = rebuild_record(row)?;
-    if record.definition().instrument_id() != exact.instrument_id()
-        || record.revision_sequence() != exact.definition_revision_sequence()
-        || record.published_at() != exact.definition_published_at()
-        || native_identity_evidence(&selection, &record, request)? != *evidence
-    {
+    check()?;
+    let record = selected_provider_record_in_connection(connection, limits, &selection)?;
+    if native_identity_evidence(&selection, &record, request)? != *evidence {
         return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
     }
-    Ok(record)
+    check()?;
+    Ok((selection, record))
 }
 
 fn resolve_provider_identity_in_connection(
@@ -1836,22 +1946,13 @@ fn require_current_market_data_instrument(
     let connection = &catalog.catalog().connection;
     let busy_millis: u32 = connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     connection.busy_timeout(std::time::Duration::ZERO)?;
-    let result = (|| {
-        let row = connection.query_row(
-                &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_current AS current_
-                    JOIN market_data_instrument_revisions AS revisions ON revisions.revision_digest=current_.revision_digest
-                    WHERE current_.instrument_id=?1 LIMIT 1"),
-                [expected.definition().instrument_id().to_string()], decode_stored_row,
-            ).optional()?;
-        let Some(row) = row else {
-            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
-        };
-        charge_row(&row, &mut ResultBudget::new(catalog.catalog().result_bytes))?;
-        if rebuild_record(row)? != *expected {
-            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
-        }
-        Ok(())
-    })();
+    let result = require_current_market_data_instrument_in_connection(
+        connection,
+        catalog.catalog().result_bytes,
+        expected,
+        deadline,
+        cancellation,
+    );
     let cleanup = connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
     check_operation(deadline, cancellation)?;
     cleanup?;

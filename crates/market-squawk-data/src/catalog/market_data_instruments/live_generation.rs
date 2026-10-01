@@ -17,7 +17,7 @@ use super::MarketDataInstrumentCatalogError;
 
 const COUNTER_ALLOCATION_BYTES: usize = size_of::<AtomicU64>() + 2 * size_of::<usize>();
 
-/// Private catalog-lifetime authority. Mutation and selection run under the catalog mutex.
+/// Private catalog-lifetime authority. Mutation and watch capture run under the catalog mutex.
 /// Retains only keys observed by live selections, never catalog definitions or a catalog copy.
 /// Watch allocation uses the existing catalog result-memory admission limit.
 #[derive(Debug)]
@@ -59,8 +59,9 @@ impl LiveProviderIdentityGenerations {
         }
     }
 
-    /// Call only after the exact current catalog resolution has been proved, while retaining
-    /// its catalog mutex. No caller can mint or refresh a watch independently of that proof.
+    /// Capture under the catalog mutex, before opening the independent resolution snapshot.
+    /// This watch is private provisional state: the caller must prove exact current identity
+    /// and validate the watch after snapshot completion before returning any live authority.
     pub(super) fn select(
         &self,
         request: &ProviderNativeIdentityRequest,

@@ -750,6 +750,7 @@ impl AuditEvent {
 /// The sole process-local writer for one catalog path.
 pub struct Catalog {
     pub(super) connection: Connection,
+    pub(super) location: CatalogLocation,
     pub(super) _catalog_file: CatalogFileGuard,
     pub(super) _cross_process_writer: CatalogWriterGuard,
     pub(super) _writer_permit: WriterPermit,

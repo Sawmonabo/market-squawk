@@ -2735,19 +2735,73 @@ async fn native_reference_custody_preserves_prior_identity_and_recovers_original
         effective_at: cutoff,
         ..request
     };
+    // A concurrent publisher owns the real writer mutex. Selection must wait for the short
+    // clock/watch fence, then resolve the sealed identity rather than fail on transient Busy.
+    std::thread::scope(|scope| -> TestResult {
+        let guard = authority.lock().map_err(|_| "catalog lock poisoned")?;
+        let (started, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = &reader;
+        let request = &request;
+        let cancellation = &cancellation;
+        let selection = scope.spawn(move || {
+            let _ = started.send(());
+            let result = reader.select_current(request, deadline(), cancellation);
+            let _ = finished.send(());
+            result
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let held = finished_rx.recv_timeout(Duration::from_millis(20));
+        drop(guard);
+        assert!(matches!(
+            held,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        selection
+            .join()
+            .map_err(|_| "identity selection worker panicked")??
+            .validate_at(now()?)?;
+        Ok(())
+    })?;
+    // Cancellation during writer admission does not need that writer to release its guard.
+    std::thread::scope(|scope| -> TestResult {
+        let guard = authority.lock().map_err(|_| "catalog lock poisoned")?;
+        let cancelled = CancellationToken::new();
+        let work_cancelled = cancelled.clone();
+        let (started, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = &reader;
+        let request = &request;
+        let selection = scope.spawn(move || {
+            let _ = started.send(());
+            let result = reader.select_current(request, deadline(), &work_cancelled);
+            let _ = finished.send(());
+            result
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let held = finished_rx.recv_timeout(Duration::from_millis(20));
+        cancelled.cancel();
+        let result = selection
+            .join()
+            .map_err(|_| "identity selection worker panicked")?;
+        drop(guard);
+        assert!(matches!(
+            held,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            result,
+            Err(RegistryError::ProviderIdentitySelectionCancelled)
+        ));
+        Ok(())
+    })?;
     let guard = authority.lock().map_err(|_| "catalog lock poisoned")?;
     assert!(matches!(
-        reader.select_current(&request, deadline(), &cancellation),
-        Err(RegistryError::ProviderIdentityAuthorityBusy)
-    ));
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    assert!(matches!(
-        reader.select_current(&request, deadline(), &cancelled),
-        Err(RegistryError::ProviderIdentitySelectionCancelled)
-    ));
-    assert!(matches!(
-        reader.select_current(&request, Instant::now(), &cancellation),
+        reader.select_current(
+            &request,
+            Instant::now() + Duration::from_millis(20),
+            &cancellation,
+        ),
         Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded)
     ));
     drop(guard);
