@@ -366,10 +366,6 @@ impl MarketDomainService {
                 .await?;
         let display_ids =
             load_display_instrument_ids(self.registry.as_ref(), &filters, context).await?;
-        let display_batches =
-            load_display_snapshots(self.registry.as_ref(), &display_ids, reference_at, context)
-                .await?;
-        let display = display_snapshot_refs(&display_batches, &filters)?;
         let mut kraken = load_kraken_price_projections(
             self.registry.as_ref(),
             instrument_ids,
@@ -414,12 +410,23 @@ impl MarketDomainService {
         let kraken_refs = kraken_projection_refs(&kraken)?;
         let order_level =
             load_order_level_snapshots(self.registry.as_ref(), &streams, &kraken, context).await?;
+        // Current presentation is selected when the actor handles the read, after slower
+        // catalog preparation. Historical queries above retain the original request cutoff.
+        let display_batches = load_display_snapshots(
+            self.registry.as_ref(),
+            &display_ids,
+            DisplayMarketReadTime::LatestDisplay,
+            context,
+        )
+        .await?;
+        let display = display_snapshot_refs(&display_batches, &filters)?;
+        let display_selected_at = system_timestamp()?;
         let policies = build_surface_policies(
             &snapshots,
             &display,
             &kraken_refs,
             &durable,
-            reference_at,
+            display_selected_at,
             presentation_surface_operations()?,
         )?;
         let page_records = records
@@ -441,7 +448,7 @@ impl MarketDomainService {
             &policies,
             &order_level,
             &durable,
-            reference_at,
+            display_selected_at,
             snapshots.failures().is_empty() && durable.complete_for(&streams),
             limits,
             context,

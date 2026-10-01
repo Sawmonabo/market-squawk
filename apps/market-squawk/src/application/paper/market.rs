@@ -43,6 +43,7 @@ use crate::application::market_selection::{MarketOperation, MarketOperationSet};
 use crate::application::research::MarketEventPointInTimeReceipt;
 use crate::application::research::MarketHistoryReadCapability;
 use crate::application::{ApplicationDomainService, effective_service_limits};
+use crate::live_source::display_market::DisplayMarketReadTime;
 pub(super) use candidate::ProductionPortfolioCandidateResolutionFactory;
 use results::{
     build_book_result, build_comparison_result, build_quality_result, build_quote_result,
@@ -160,6 +161,16 @@ impl DurableMarketRouteEvidence {
         venue_id: VenueId,
         mut selections: Vec<MarketEventPointInTimeReceipt>,
     ) -> Result<Option<Self>, ServiceError> {
+        let invalid = |stage: &'static str| {
+            tracing::warn!(
+                %source_id,
+                %instrument_id,
+                %venue_id,
+                stage,
+                "durable market evidence rejected"
+            );
+            ServiceError::InvalidResult
+        };
         let mut seen_event_kinds = Vec::new();
         seen_event_kinds
             .try_reserve_exact(selections.len())
@@ -174,7 +185,7 @@ impl DurableMarketRouteEvidence {
                 || selection.completeness() != ProviderMarketEventSelectionCompleteness::Complete
                 || seen_event_kinds.contains(&request.event_kind())
             {
-                return Err(ServiceError::InvalidResult);
+                return Err(invalid("selection_identity_or_completeness"));
             }
             seen_event_kinds.push(request.event_kind());
             // A complete empty selection proves this event family has no eligible evidence.
@@ -185,11 +196,11 @@ impl DurableMarketRouteEvidence {
             let source = selection
                 .sources()
                 .first()
-                .ok_or(ServiceError::InvalidResult)?;
+                .ok_or_else(|| invalid("selected_source_missing"))?;
             let candidate = source
                 .tied_candidates()
                 .first()
-                .ok_or(ServiceError::InvalidResult)?;
+                .ok_or_else(|| invalid("selected_candidate_missing"))?;
             if selection.sources().len() != 1
                 || source.source_surface() != &source_id
                 || source.tied_candidates().iter().skip(1).any(|tied| {
@@ -198,14 +209,14 @@ impl DurableMarketRouteEvidence {
                         || tied.event() != candidate.event()
                 })
             {
-                return Err(ServiceError::InvalidResult);
+                return Err(invalid("ambiguous_source_or_event"));
             }
             if candidate.coordinate().instrument_id() != Some(instrument_id)
                 || candidate.coordinate().venue_id() != &venue_id
                 || candidate.coordinate().event_kind() != request.event_kind()
                 || market_event_class(candidate.event()) != request.event_kind()
             {
-                return Err(ServiceError::InvalidResult);
+                return Err(invalid("candidate_identity_or_kind"));
             }
         }
         selections.retain(|receipt| !receipt.selection().sources().is_empty());
@@ -228,7 +239,7 @@ impl DurableMarketRouteEvidence {
                 Some((selected_key, selected_binding))
                     if key == *selected_key && !same_durable_cohort(binding, selected_binding) =>
                 {
-                    return Err(ServiceError::InvalidResult);
+                    return Err(invalid("ambiguous_cohort"));
                 }
                 Some(_) => {}
             }
@@ -239,15 +250,30 @@ impl DurableMarketRouteEvidence {
         let live = metadata
             .coverage()
             .live()
-            .ok_or(ServiceError::InvalidResult)?;
-        if cohort_binding.source_id() != &source_id
-            || cohort_binding.instrument_id() != Some(instrument_id)
-            || cohort_binding.venue_id() != &venue_id
-            || cohort_binding.metadata_revision() != metadata.revision()
-            || cohort_binding.provider_product() != live.provider_product()
-            || cohort_binding.provider_channel() != live.provider_channel()
-        {
-            return Err(ServiceError::InvalidResult);
+            .ok_or_else(|| invalid("live_coverage_missing"))?;
+        for (stage, matches) in [
+            ("cohort_source", cohort_binding.source_id() == &source_id),
+            (
+                "cohort_instrument",
+                cohort_binding.instrument_id() == Some(instrument_id),
+            ),
+            ("cohort_venue", cohort_binding.venue_id() == &venue_id),
+            (
+                "cohort_metadata_revision",
+                cohort_binding.metadata_revision() == metadata.revision(),
+            ),
+            (
+                "cohort_product",
+                cohort_binding.provider_product() == live.provider_product(),
+            ),
+            (
+                "cohort_channel",
+                cohort_binding.provider_channel() == live.provider_channel(),
+            ),
+        ] {
+            if !matches {
+                return Err(invalid(stage));
+            }
         }
         selections.retain(|receipt| {
             same_durable_cohort(
@@ -684,14 +710,6 @@ impl ApplicationDomainService for MarketDomainService {
                     load_display_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
                 let market_instrument_ids =
                     load_market_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
-                let display_batches = load_display_snapshots(
-                    self.registry.as_ref(),
-                    &display_instrument_ids,
-                    reference_at,
-                    &context,
-                )
-                .await?;
-                let display_snapshots = display_snapshot_refs(&display_batches, &filters)?;
                 let kraken_price_projections = load_kraken_price_projections(
                     self.registry.as_ref(),
                     &market_instrument_ids,
@@ -707,6 +725,22 @@ impl ApplicationDomainService for MarketDomainService {
                     &durable_market,
                     &context,
                 )?;
+                let order_level = load_order_level_snapshots(
+                    self.registry.as_ref(),
+                    &streams,
+                    &kraken_price_projections,
+                    &context,
+                )
+                .await?;
+                let display_batches = load_display_snapshots(
+                    self.registry.as_ref(),
+                    &display_instrument_ids,
+                    DisplayMarketReadTime::LatestDisplay,
+                    &context,
+                )
+                .await?;
+                let display_snapshots = display_snapshot_refs(&display_batches, &filters)?;
+                let reference_at = system_timestamp()?;
                 let market_data_records = load_market_data_instrument_records(
                     &self.market_data_instruments,
                     &definitions,
@@ -715,13 +749,6 @@ impl ApplicationDomainService for MarketDomainService {
                     reference_at,
                     &context,
                 )?;
-                let order_level = load_order_level_snapshots(
-                    self.registry.as_ref(),
-                    &streams,
-                    &kraken_price_projections,
-                    &context,
-                )
-                .await?;
                 let surface_policies = build_surface_policies(
                     &snapshots,
                     &display_snapshots,
@@ -901,7 +928,7 @@ async fn load_display_instrument_ids(
 async fn load_display_snapshots(
     registry: &MarketRuntimeRegistry,
     instrument_ids: &[InstrumentId],
-    reference_at: Timestamp,
+    read_time: DisplayMarketReadTime,
     context: &RequestContext,
 ) -> Result<Vec<MarketDisplaySnapshotBatch>, ServiceError> {
     let maximum_sources = NonZeroUsize::new(MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT)
@@ -916,7 +943,7 @@ async fn load_display_snapshots(
             .display_snapshots_for_instrument(
                 *instrument_id,
                 maximum_sources,
-                reference_at,
+                read_time,
                 context.deadline(),
                 context.cancellation(),
             )

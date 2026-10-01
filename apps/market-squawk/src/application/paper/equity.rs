@@ -6,6 +6,7 @@ use crate::application::market_calendar::{
 use crate::application::research::{
     SourceActionPreparationCapability, SourceAppliedCorporateActionReadCapability,
 };
+use crate::live_source::display_market::DisplayMarketReadTime;
 use crate::paper_bot::{ProductionPaperBotComposition, VirtualEquityRoute};
 use chrono::{Datelike as _, Utc};
 
@@ -270,7 +271,7 @@ impl PaperController {
                 .display_snapshots_for_instrument(
                     record.definition().instrument_id(),
                     std::num::NonZeroUsize::new(32).ok_or(ServiceError::Internal)?,
-                    at,
+                    DisplayMarketReadTime::At(at),
                     deadline,
                     cancellation,
                 )

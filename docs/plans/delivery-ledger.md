@@ -3,20 +3,30 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Latest pushed
-checkpoint `96abecae` preserves retained-data access and correct analytical/I/O admission order;
+checkpoint `4239a7d6` preserves Alpaca publication custody under backpressure;
+`96abecae` preserves retained-data access and correct analytical/I/O admission order;
 `05a30951` fixes measured restoration stack frames. One worktree and three local/origin
 branches verified; protected bundle-backup refs and original recovery evidence are retained.
 The dated records below are history, not additional active assignments.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — retained history and independent I/O admission | Retained-data checkpoint96abecae pushed. Lead owns Git/shared contracts/build scheduling. Three selected data checks pass: history/reobservation/restart1.88s, PIT authorization4.36s, market-event restart13.25s. | Application build PASS6m20s; genuine gate/worker regression PASS1/1,0.42s; identity and publication-custody cases PASS1/1 each. Retained-data pushed; complete feed-backpressure checkpoint, then latest-display native proof. |
-| Astra live_stack_failure — current display selection | Read-only proposal complete; actor clock patch frozen in display_market.rs but not accepted as complete latest-display fix. | Explicit latest-display selection at actor read time; financial/paper callers retain original cutoff. Lead reserves shared caller changes. |
-| GPT-6.1 Sol screen_contract_coverage — full screen/data mapping | Completed read-only audit of17 screens and required family subflows; lead checked principal projection/event gaps. No implementation ownership. | Lead integrates missing edges below in producer-to-consumer checkpoints. |
+| Lead — retained history and independent I/O admission | Retained-data checkpoint96abecae pushed. Lead owns Git/shared contracts/build scheduling. Three selected data checks pass: history/reobservation/restart1.88s, PIT authorization4.36s, market-event restart13.25s. | Application build PASS6m20s; genuine gate/worker regression PASS1/1,0.42s; identity and publication-custody cases PASS1/1 each. Retained-data and feed-backpressure checkpoints pushed; PR #43 comment5939484067. Latest-display build PASS7m22s. CLI current IWM changes279.34→279.32; native Home later shows QQQ742.43/IWM279.31 and five previous closes. Full quote/auto-update proof remains open. |
+| Lead — current display selection | Astra handoff frozen and inspected: live_source/display_market.rs and display_market/equity_paper.rs; lead integrated application/market_runtime.rs, paper/market.rs, paper/market/durable_product.rs, paper/equity.rs and paper_bot/virtual_routes.rs. | Build and real CLI/native Home reads pass; actor LatestDisplay and financial At cutoff remain separate. No durable-route rejection appeared in this run. Startup race and missing quote/update edges remain explicit below. |
+| Astra live_stack_failure — startup contention | Quote projection proposal complete; no new receipt needed. Read-only diagnosis of simultaneous direct-service/native startup: Desktop reports child exited while original service later becomes ready. | Identify existing launch/admission ownership and smallest correction; no edits/builds. Lead runs latest-display live checks. |
+| GPT-6.1 Sol screen_contract_coverage — background update dependency | Full17-screen audit complete. Read-only follow-up traces the smallest committed-domain event path through service composition, async publication and Desktop invalidation. No source ownership or builds. | Return concrete producer hooks, lifecycle ownership and consumer keys for lead integration after current-display verification. |
 
 Native17-route navigation and four saved previous closes are verified on the preceding binary;
 streaming current quote display and complete screen contracts are **not verified**. No whole-app
 RAM measurement, CI or final gate has run. Empty screens are not completed product workflows.
+
+Latest-display native evidence: `latest-display-{service-build,live}.log`,
+`latest-display-collection{,-second}.json`, `latest-display-native-prices.json` under the current
+ignored evidence directory. SPY/MSFT remain unavailable; starter history still reports an extraction
+deadline, and public crypto startup lacks current accepted catalog terms in this workspace.
+Simultaneous direct-service/native start reproduces a Desktop competing-child exit error; launching
+Desktop after readiness opens Home. Retry stayed loading in the first process and remains unproven.
+These are unresolved workflow defects, not acceptance of all startup or streaming behavior.
 
 ### Required data-to-screen closure
 
@@ -35,6 +45,10 @@ require every family on every screen or streaming fundamentally scheduled data. 
    discard independent quote/trade fields, basis and component freshness; changePercent is always
    null. Complete exact quote sides/sizes, last-trade versus midpoint meaning and available change
    evidence together. Native source-reported size units may be unresolved; never invent shares/lots.
+   Follow-up confirms rich ProductQuote already exists: durable_product.rs bypasses it when scalar
+   mark succeeds and discards one-sided quote rows with no midpoint. Reuse that projection and
+   exact source view. product.rs must use observation/session-close time for asOf, not expiry.
+   Native Money events need typed durable projection without requiring legacy execution scales.
 3. **Rich instrument details:** Desktop ProductQuery/Markets lacks option terms/chains/Greeks,
    fund NAV/holdings/overlap, company filings/statements/ratios, crypto trades/books/comparisons and
    supported bond terms/yield detail. Reuse existing typed company/fund/options/market projections,

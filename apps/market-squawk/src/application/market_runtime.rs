@@ -100,7 +100,7 @@ use crate::{
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
     live_source::display_market::{
         DisplayMarketDirectory, DisplayMarketDirectoryError, DisplayMarketReadError,
-        MAX_DISPLAY_MARKET_ROUTES,
+        DisplayMarketReadTime, MAX_DISPLAY_MARKET_ROUTES,
     },
     live_source::order_level::{
         MAX_ORDER_LEVEL_DIRECTORY_BOOKS, OrderLevelBookKey, OrderLevelDirectory,
@@ -2311,7 +2311,7 @@ impl MarketRuntimeRegistry {
         &self,
         instrument_id: InstrumentId,
         maximum_sources: NonZeroUsize,
-        at: Timestamp,
+        read_time: DisplayMarketReadTime,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketDisplaySnapshotBatch, ServiceError> {
@@ -2343,7 +2343,13 @@ impl MarketRuntimeRegistry {
         };
         let leases = self
             .display
-            .snapshots_for_instrument(instrument_id, maximum_sources, at, cancellation, deadline)
+            .snapshots_for_instrument(
+                instrument_id,
+                maximum_sources,
+                read_time,
+                cancellation,
+                deadline,
+            )
             .await
             .map_err(map_display_read_error)?;
         if leases.len() != descriptors.len() {

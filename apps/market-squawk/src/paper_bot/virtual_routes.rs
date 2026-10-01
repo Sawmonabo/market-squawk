@@ -2,6 +2,7 @@
 use super::*;
 use crate::application::market_calendar::CompletedMarketSessionRead;
 use crate::application::{EquityPaperRouteEvidence, EquityPaperSourceRoute, MarketRuntimeRegistry};
+use crate::live_source::display_market::DisplayMarketReadTime;
 use market_squawk_data::MarketDataInstrumentRecord;
 use market_squawk_execution::virtual_paper::ExecutionVirtualPaperHook;
 use market_squawk_services::{RequestContext, ServiceError};
@@ -264,7 +265,7 @@ impl ProductionPaperBotRuntime {
                     .display_snapshots_for_instrument(
                         original.definition().instrument_id(),
                         NonZeroUsize::new(32).ok_or(ServiceError::Internal)?,
-                        at,
+                        DisplayMarketReadTime::At(at),
                         context.deadline(),
                         context.cancellation(),
                     )

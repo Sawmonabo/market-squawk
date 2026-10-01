@@ -18,7 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use market_squawk_domain::{
@@ -818,7 +818,16 @@ pub(crate) enum DisplayMarketAvailability {
     },
 }
 
-/// Owned observation plus freshness calculated at the caller's explicit read time.
+/// Observation selection time; current authority is always checked when the actor reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DisplayMarketReadTime {
+    /// Preserve an explicit financial cutoff without substituting newer actor state.
+    At(Timestamp),
+    /// Select current presentation data at actor read time, without virtual-paper authority.
+    LatestDisplay,
+}
+
+/// Owned cutoff-eligible observation plus freshness checked when the actor handles the read.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DisplayMarketReadObservation {
     observation: DisplayMarketObservation,
@@ -968,7 +977,7 @@ struct ReadBudgetTicket {
 #[derive(Debug)]
 struct ReadCommand {
     include_virtual_paper: bool,
-    at: Timestamp,
+    read_time: DisplayMarketReadTime,
     response: oneshot::Sender<Result<DisplayMarketSnapshotLease, DisplayMarketReadError>>,
     ticket: ReadBudgetTicket,
 }
@@ -986,7 +995,7 @@ struct ReadClient {
 impl ReadClient {
     async fn snapshot(
         &self,
-        at: Timestamp,
+        read_time: DisplayMarketReadTime,
         cancellation: &CancellationToken,
         deadline: Instant,
         include_virtual_paper: bool,
@@ -1021,7 +1030,7 @@ impl ReadClient {
         let (response, receiver) = oneshot::channel();
         let command = ReadCommand {
             include_virtual_paper,
-            at,
+            read_time,
             response,
             ticket,
         };
@@ -1265,7 +1274,7 @@ impl DisplayMarketDirectory {
         &self,
         instrument_id: InstrumentId,
         maximum_sources: NonZeroUsize,
-        at: Timestamp,
+        read_time: DisplayMarketReadTime,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<Vec<DisplayMarketSnapshotLease>, DisplayMarketReadError> {
@@ -1311,7 +1320,11 @@ impl DisplayMarketDirectory {
             .try_reserve_exact(match_count)
             .map_err(|_error| DisplayMarketReadError::Allocation)?;
         for client in clients {
-            snapshots.push(client.snapshot(at, cancellation, deadline, false).await?);
+            snapshots.push(
+                client
+                    .snapshot(read_time, cancellation, deadline, false)
+                    .await?,
+            );
         }
         Ok(snapshots)
     }
@@ -2020,11 +2033,33 @@ fn process_read(
 ) -> Option<DisplayMarketTerminalFailure> {
     let ReadCommand {
         include_virtual_paper,
-        at,
+        read_time,
         response,
         ticket,
     } = command;
-    let result = snapshot_from_state(Arc::clone(key), state, at, ticket, include_virtual_paper);
+    let read_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(DisplayMarketReadError::Unavailable);
+    let result = read_at.and_then(|read_at| {
+        let at = match read_time {
+            DisplayMarketReadTime::At(at) => at,
+            DisplayMarketReadTime::LatestDisplay if !include_virtual_paper => read_at,
+            DisplayMarketReadTime::LatestDisplay => {
+                return Err(DisplayMarketReadError::Unavailable);
+            }
+        };
+        snapshot_from_state(
+            Arc::clone(key),
+            state,
+            at,
+            read_at,
+            ticket,
+            include_virtual_paper,
+        )
+    });
     let failure = result.as_ref().err().and_then(|error| match error {
         DisplayMarketReadError::AccountingOverflow => {
             Some(DisplayMarketTerminalFailure::AccountingOverflow)
@@ -2045,25 +2080,33 @@ fn snapshot_from_state(
     key: Arc<DisplayMarketKey>,
     state: &DisplayMarketState,
     at: Timestamp,
+    read_at: Timestamp,
     ticket: ReadBudgetTicket,
     include_virtual_paper: bool,
 ) -> Result<DisplayMarketSnapshotLease, DisplayMarketReadError> {
     let trade = state
         .trade
         .as_ref()
-        .map(|value| try_read_observation(value, at, state.terminal_failure))
-        .transpose()?;
+        .map(|value| try_read_observation(value, at, read_at, state.terminal_failure))
+        .transpose()?
+        .flatten();
     let quote = state
         .quote
         .as_ref()
-        .map(|value| try_read_observation(value, at, state.terminal_failure))
-        .transpose()?;
+        .map(|value| try_read_observation(value, at, read_at, state.terminal_failure))
+        .transpose()?
+        .flatten();
     let status = state
         .status
         .as_ref()
-        .map(|value| try_read_observation(value, at, state.terminal_failure))
-        .transpose()?;
-    let virtual_paper = if include_virtual_paper && state.terminal_failure.is_none() {
+        .map(|value| try_read_observation(value, at, read_at, state.terminal_failure))
+        .transpose()?
+        .flatten();
+    let virtual_paper = if include_virtual_paper
+        && state.terminal_failure.is_none()
+        && quote.is_some()
+        && (state.status.is_none() || status.is_some())
+    {
         state.virtual_paper.read().ok()
     } else {
         None
@@ -2099,9 +2142,20 @@ fn snapshot_from_state(
 
 fn try_read_observation(
     retained: &RetainedObservation,
-    at: Timestamp,
+    cutoff: Timestamp,
+    read_at: Timestamp,
     terminal: Option<DisplayMarketTerminalFailure>,
-) -> Result<DisplayMarketReadObservation, DisplayMarketReadError> {
+) -> Result<Option<DisplayMarketReadObservation>, DisplayMarketReadError> {
+    let provenance = retained.observation.provenance();
+    let Some(at) = observation_read_time(
+        cutoff,
+        read_at,
+        provenance.effective_at(),
+        provenance.received_at(),
+        provenance.available_at(),
+    ) else {
+        return Ok(None);
+    };
     let availability = if let Some(failure) = terminal {
         DisplayMarketAvailability::Quarantined { failure }
     } else if at > retained.expires_after
@@ -2124,11 +2178,24 @@ fn try_read_observation(
             expires_after: retained.expires_after,
         }
     };
-    Ok(DisplayMarketReadObservation {
+    Ok(Some(DisplayMarketReadObservation {
         observation: try_clone_observation(&retained.observation)
             .map_err(|_error| DisplayMarketReadError::Allocation)?,
         availability,
-    })
+    }))
+}
+
+// Latest actor state is not historical storage. Keep the caller's financial cutoff,
+// but never use that earlier cutoff as the time of current authority validation.
+fn observation_read_time(
+    cutoff: Timestamp,
+    read_at: Timestamp,
+    effective_at: Timestamp,
+    received_at: Timestamp,
+    available_at: Timestamp,
+) -> Option<Timestamp> {
+    (cutoff <= read_at && effective_at <= cutoff && received_at <= cutoff && available_at <= cutoff)
+        .then_some(read_at)
 }
 
 fn try_clone_observation(

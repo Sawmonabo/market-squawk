@@ -25,7 +25,9 @@ impl DisplayMarketDirectory {
         }
         let client = entry.read_client.clone();
         drop(entries);
-        let snapshot = client.snapshot(at, cancellation, deadline, true).await?;
+        let snapshot = client
+            .snapshot(DisplayMarketReadTime::At(at), cancellation, deadline, true)
+            .await?;
         require_read_time(cancellation, deadline)?;
         Ok(snapshot)
     }
