@@ -109,6 +109,7 @@ function transport(
   })
   const bridge: ProductTransport & SystemTransport = {
     bootstrap: async () => bootstrap,
+    reconnect: async () => bootstrap,
     bootstrapService: async () => {
       throw new Error("Service bootstrap is not configured for this test.")
     },
@@ -296,6 +297,7 @@ function transport(
   }
   const system: SystemTransport = {
     bootstrap: bridge.bootstrap,
+    reconnect: bridge.reconnect,
     bootstrapService: bridge.bootstrapService,
     installation: bridge.installation,
     systemQuery: bridge.systemQuery,
@@ -1461,7 +1463,7 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(screen.queryByLabelText("Position comparison results")).toBeNull())
   })
 
-  it("admits secure startup and resumes a disconnected stream without accepting an old session", async () => {
+  it("admits secure startup and reconnects the workspace without accepting an old session", async () => {
     const user = userEvent.setup()
     let ready = false
     let submittedUnlock: string | null = null
@@ -1471,6 +1473,15 @@ describe("Market Squawk desktop boundary", () => {
       unsubscribe: DesktopEventSubscription["unsubscribe"]
     }[] = []
     let resolveResume: ((subscription: DesktopEventSubscription) => void) | undefined
+    let resolveReplacement: ((subscription: DesktopEventSubscription) => void) | undefined
+    const replacementBootstrap = {
+      ...blockedBootstrap,
+      productSessionToken: "8cfa9e1a-652b-4475-ab21-15a28186c449",
+    }
+    const reconnectService = vi.fn<SystemTransport["reconnect"]>()
+      .mockResolvedValueOnce(blockedBootstrap)
+      .mockResolvedValueOnce(replacementBootstrap)
+      .mockRejectedValueOnce(new Error("The local service could not restart."))
     const baseTransport = transport()
     const bootstrapTransport = {
       product: baseTransport.product,
@@ -1490,12 +1501,18 @@ describe("Market Squawk desktop boundary", () => {
           submittedUnlock = request.unlock
           ready = true
         },
+        reconnect: reconnectService,
         subscribe: async (request, onEvent) => {
           const unsubscribe = vi.fn(async () => undefined)
           subscriptions.push({ request, onEvent, unsubscribe })
           if (subscriptions.length === 2) {
             return new Promise<DesktopEventSubscription>((resolve) => {
               resolveResume = resolve
+            })
+          }
+          if (subscriptions.length === 3) {
+            return new Promise<DesktopEventSubscription>((resolve) => {
+              resolveReplacement = resolve
             })
           }
           return {
@@ -1549,6 +1566,7 @@ describe("Market Squawk desktop boundary", () => {
       expect(summary.getByText("Starting")).toBeTruthy()
       expect(subscriptions[0]!.unsubscribe).toHaveBeenCalledOnce()
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      expect(reconnectService).toHaveBeenNthCalledWith(1, blockedBootstrap.productSessionToken)
       expect(subscriptions).toHaveLength(2)
       expect(subscriptions[1]!.request).toEqual({
         productSessionToken: blockedBootstrap.productSessionToken,
@@ -1569,15 +1587,58 @@ describe("Market Squawk desktop boundary", () => {
       expect(summary.getByText("Ready")).toBeTruthy()
       await act(async () => {
         subscriptions[1]!.onEvent({
-          productSessionToken: "8cfa9e1a-652b-4475-ab21-15a28186c449",
+          productSessionToken: blockedBootstrap.productSessionToken,
           sequence: "1",
+          body: { type: "stream_disconnected" },
+        })
+      })
+      expect(screen.getByText("Loading workspace…")).toBeTruthy()
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(reconnectService).toHaveBeenNthCalledWith(2, blockedBootstrap.productSessionToken)
+      // Deliver the replacement bootstrap through React Query's notification scheduler.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+      expect(subscriptions).toHaveLength(3)
+      expect(subscriptions[2]!.request).toEqual({
+        productSessionToken: replacementBootstrap.productSessionToken,
+        afterSequence: "0",
+      })
+      expect(screen.getByText("Loading workspace…")).toBeTruthy()
+      await act(async () => {
+        resolveReplacement!({
+          receipt: {
+            subscriptionId: "36aed8b2-3b6f-4541-8a43-ec80a2fdf89d",
+            productSessionToken: replacementBootstrap.productSessionToken,
+            sequence: "0",
+            resumed: false,
+          },
+          unsubscribe: subscriptions[2]!.unsubscribe,
+        })
+      })
+      expect(screen.queryByText("Loading workspace…")).toBeNull()
+      expect(screen.getByRole("heading", { name: "What needs your attention now?" })).toBeTruthy()
+      expect(summary.getByText("Ready")).toBeTruthy()
+      await act(async () => {
+        subscriptions[2]!.onEvent({
+          productSessionToken: blockedBootstrap.productSessionToken,
+          sequence: "0",
           body: { type: "stream_disconnected" },
         })
         await vi.advanceTimersByTimeAsync(30_000)
       })
       expect(summary.getByText("Unavailable")).toBeTruthy()
-      expect(subscriptions).toHaveLength(2)
+      expect(reconnectService).toHaveBeenCalledTimes(2)
+      expect(subscriptions).toHaveLength(3)
       expect(subscriptions[1]!.unsubscribe).toHaveBeenCalledOnce()
+      expect(subscriptions[2]!.unsubscribe).toHaveBeenCalledOnce()
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Try again" }))
+      })
+      expect(reconnectService).toHaveBeenNthCalledWith(3, replacementBootstrap.productSessionToken)
+      expect(screen.getByText("Investment workspace unavailable")).toBeTruthy()
+      expect(summary.getByText("Unavailable")).toBeTruthy()
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(reconnectService).toHaveBeenCalledTimes(3)
+      expect(subscriptions).toHaveLength(3)
     } finally {
       view.unmount()
       vi.useRealTimers()

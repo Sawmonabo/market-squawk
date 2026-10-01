@@ -1523,6 +1523,25 @@ async fn commit_reconnected_generation(
     connection: DesktopServiceConnection,
 ) -> Result<DesktopBootstrap, DesktopCommandError> {
     let old = state.current_generation()?;
+    if !Arc::ptr_eq(&state.service, &connection.authority)
+        || old.runtime() != expected_runtime
+        || state.shutting_down.load(Ordering::Acquire)
+    {
+        return Err(service_generation_changed());
+    }
+    let connected = ServiceBootstrapSnapshot::try_from(connection.bootstrap.clone())?;
+    let connected_root = resolve_workspace_data_root(
+        &connected,
+        &state.context.configured_data_root,
+        &state.context.service_data_root,
+    )?;
+    if connected.runtime == expected_runtime && connected_root == old.data_root {
+        // Authenticated reconnect proved the same service and workspace. Keep its opaque
+        // product tokens and event cursor; only a newer runtime needs the retirement fence.
+        let bootstrap = old.bootstrap(state).await?;
+        state.admit_current(&old)?;
+        return Ok(bootstrap);
+    }
     let retirement_fence = old.mcp_clients().retirement_fence().await;
     state.admit_current(&old)?;
     let prepared = state

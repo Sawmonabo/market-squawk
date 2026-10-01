@@ -438,6 +438,9 @@ export type ForecastPreparationRequest =
 
 export interface SystemTransport {
   bootstrap(): Promise<DesktopSystemStartup>
+  reconnect(
+    expectedProductSessionToken: DesktopBootstrap["productSessionToken"],
+  ): Promise<DesktopSystemStartup>
   bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
   installation(
     request: InstallationControlRequest,

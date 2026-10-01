@@ -15,6 +15,10 @@ supersedes forced password storage in development and any conflicting import-onl
 
 ### Current outcomes and verification
 
+Native backend replacement is live verified: after the owned service was stopped, Desktop launched a new service and moved to a new product-session token; both contexts became Ready, the event stream connected, and Home had no query errors or password prompt. Evidence: `native-backend-reconnect-{before,after,completed}.json` and `native-reconnect-read-probe.json`. The first 55-second observation expired while connecting; completion was observed later, so no fast-recovery timing claim. A thread sample showed no sustained synchronous native deadlock. Reconnect latency remains unexplained.
+
+Updated native build passes (7m16s), and the preserved workspace loads all 17 routes with Ready Product/System states and no active-query errors. Home settles in 3.06s and Markets in 4.12s; all nine starter identities are visible, prices still unavailable. No password submitted. Evidence: `startup-integrated-{native-build.log,routes.json}`. Live history retry now returns without a stack crash, but fails with provider `BudgetUnavailable`/`ConcurrencyExhausted`, followed by runtime unavailability; this is not a completed live-data workflow.
+
 Durable route discovery is corrected without schema/cache changes: compact dataset/source/venue keys and EXISTS preserve the exact original eligibility joins. Existing provider-event restart/cutoff/corruption case passes (0.99s). Read-only preserved-catalog comparisons match all 36 result sets across nine instruments and four clock/event cases; current Quote/Trade routes drop from 9.41s to 16ms total. Evidence: `route-query-{critical.log,results.json,measure.py,original.sql}`. The integrated native build is running; no Desktop timeout-closure claim yet.
 
 Exact publication reads are critically verified in the existing restart case (1.01s), including inherited selection and unrelated/selected file corruption. Complete history/restart passes (1.19s); adapter contract case passes. Native three-binary build passes (5m52s). The native sweep still reports Home/Markets failures, so no screen-completion claim: the subsequent live retry exposed an extraction stack overflow and additional currentness contention. This data-read checkpoint is independently useful and does not claim to close those remaining defects.
@@ -40,6 +44,12 @@ Evidence under `.agents/tmp/v1-first-stock/`:
 `calendar-currentness-diagnostic-retry.json`, `credential-access-diagnostic-service.log`.
 
 ### Dependency and ownership
+
+Authorized request-admission fix: Astra `credential_runtime_lifecycle` owns adapter Alpaca `live.rs`, `boot_snapshot.rs`, `historical.rs` and a cohesive shared `budget.rs` helper if needed; lead owns `lib.rs` declaration. Reuse existing admission semantics, wait only on ConcurrencyExhausted with original deadline/cancellation, retain exact budget identity and terminal errors. No budget increase/new background worker. Critical gap is live bootstrap/history overlap incorrectly stopping the source; extend only an existing adapter admission case if needed, after returning its exact ownership.
+
+Native reconnect diagnosis: Astra `calendar_currentness_failure` owns read-only tracing of native event subscription cancellation/drain and reconnect commit. Actual restarted service becomes Ready but the existing WebView remains Starting for over 60s. No edits/builds/runtime mutations until a precise cause/file scope is proposed; lead owns the running native probe and bridge integration.
+
+Next bounded diagnosis: Astra `credential_runtime_lifecycle` traces the real provider-budget exhaustion during starter history preparation (structured log sequences233–244, service remains alive). Read-only ownership of runtime budget, display-source supervisor and historical extraction callers; propose exact smallest fix before edits. No builds/Git/service mutation. Lead owns native reconnect live proof and integration.
 
 Measured market query correction: Astra `research_options_failure` exclusively owns `crates/market-squawk-data/src/catalog/market_recovery.rs`, only durable-route SQL. Existing route query costs 1.34–1.51s for one instrument in the preserved catalog; nine sequential reads consume most of the native deadline. Compact dataset/route keys plus an exact EXISTS eligibility join measured 46.95ms for all nine. Preserve all source-input/schema/clock predicates, ordering, limits and cancellation. No other query changes, schema/index/cache or new test harness. Lead runs the existing publication/restart critical case and native proof.
 

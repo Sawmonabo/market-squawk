@@ -6,6 +6,7 @@ import {
   type DesktopBootstrap,
   type DesktopServiceBootstrap,
   type DesktopSystemBootstrap,
+  type DesktopSystemStartup,
 } from "@/lib/schemas"
 import type {
   DesktopEventSubscription,
@@ -99,6 +100,10 @@ export function ProductProvider({
 }) {
   const queryClient = useQueryClient()
   const recoveryInFlight = React.useRef<Promise<void> | null>(null)
+  const serviceReconnectInFlight = React.useRef<{
+    scope: DesktopBootstrap["productSessionToken"]
+    attempt: Promise<DesktopSystemStartup>
+  } | null>(null)
   const [recoveryPending, setRecoveryPending] = React.useState(false)
   const [recoveryError, setRecoveryError] = React.useState<string | null>(null)
   const [eventConnection, setEventConnection] =
@@ -121,6 +126,22 @@ export function ProductProvider({
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
   })
+  const reconnectService = React.useCallback(
+    (scope: DesktopBootstrap["productSessionToken"]) => {
+      const current = serviceReconnectInFlight.current
+      if (current && sameProductSession(scope, current.scope)) {
+        return current.attempt
+      }
+      const attempt: Promise<DesktopSystemStartup> = transport.system.reconnect(scope).finally(() => {
+        if (serviceReconnectInFlight.current?.attempt === attempt) {
+          serviceReconnectInFlight.current = null
+        }
+      })
+      serviceReconnectInFlight.current = { scope, attempt }
+      return attempt
+    },
+    [transport.system],
+  )
 
   React.useEffect(() => {
     const startup = bootstrap.data
@@ -137,6 +158,7 @@ export function ProductProvider({
     let subscription: DesktopEventSubscription | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectDelay = 1_000
+    let serviceReconnectRequired = false
     let previousSequence =
       eventCursor.current &&
       sameProductSession(scope, eventCursor.current.productSessionToken)
@@ -182,6 +204,18 @@ export function ProductProvider({
       const requestedSequence = previousSequence
       let disconnected = false
       try {
+        if (serviceReconnectRequired) {
+          const restored = await reconnectService(scope)
+          if (!active || failed) return
+          serviceReconnectRequired = false
+          if (
+            "status" in restored ||
+            !sameProductSession(scope, restored.productSessionToken)
+          ) {
+            queryClient.setQueryData(productKeys.bootstrap, restored)
+            return
+          }
+        }
         const connected = await transport.system.subscribe(
           { productSessionToken: scope, afterSequence: requestedSequence },
           (event) => {
@@ -192,6 +226,7 @@ export function ProductProvider({
               event.sequence === previousSequence
             ) {
               disconnected = true
+              serviceReconnectRequired = true
               connecting()
               if (subscription) void reconnect()
               return
@@ -258,6 +293,7 @@ export function ProductProvider({
     bootstrap.data,
     explicitRefreshGeneration,
     queryClient,
+    reconnectService,
     transport.system,
   ])
 
@@ -305,9 +341,38 @@ export function ProductProvider({
 
   const refresh = React.useCallback(() => {
     setEventAdmissionPending(true)
+    const startup = bootstrap.data
+    if (
+      startup &&
+      !("status" in startup) &&
+      (eventConnection.status === "unavailable" ||
+        eventConnection.status === "connecting")
+    ) {
+      setEventAdmittedProductSession(null)
+      setEventConnection({ status: "connecting" })
+      void reconnectService(startup.productSessionToken)
+        .then((restored) => {
+          const current = queryClient.getQueryData<DesktopSystemStartup>(
+            productKeys.bootstrap,
+          )
+          if (
+            !current ||
+            "status" in current ||
+            !sameProductSession(startup.productSessionToken, current.productSessionToken)
+          ) return
+          queryClient.setQueryData(productKeys.bootstrap, restored)
+          setExplicitRefreshGeneration((generation) => generation + 1)
+        })
+        .catch(() => {
+          setEventAdmissionPending(false)
+          setEventAdmittedProductSession(null)
+          setEventConnection({ status: "unavailable" })
+        })
+      return
+    }
     setExplicitRefreshGeneration((generation) => generation + 1)
     void bootstrap.refetch()
-  }, [bootstrap])
+  }, [bootstrap, eventConnection.status, queryClient, reconnectService])
 
   const readySystemBootstrap =
     bootstrap.data && !("status" in bootstrap.data) ? bootstrap.data : null

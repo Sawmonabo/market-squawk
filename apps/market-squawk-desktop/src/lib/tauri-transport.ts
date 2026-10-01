@@ -72,6 +72,7 @@ function productPort(transport: ProductTransport): ProductTransport {
 function systemPort(transport: SystemTransport): SystemTransport {
   return Object.freeze({
     bootstrap: transport.bootstrap.bind(transport),
+    reconnect: transport.reconnect.bind(transport),
     bootstrapService: transport.bootstrapService.bind(transport),
     installation: transport.installation.bind(transport),
     systemQuery: transport.systemQuery.bind(transport),
@@ -110,6 +111,17 @@ class TauriTransport implements ProductTransport, SystemTransport {
 
   async bootstrapService(request: Parameters<SystemTransport["bootstrapService"]>[0]) {
     await invoke("desktop_service_bootstrap", { request })
+  }
+
+  async reconnect(expectedProductSessionToken: Parameters<SystemTransport["reconnect"]>[0]) {
+    const value = await invoke("desktop_service_reconnect", {
+      request: { expectedProductSessionToken },
+    })
+    const startup = desktopSystemStartupSchema.parse(value)
+    this.productSessionToken = "productSessionToken" in startup
+      ? startup.productSessionToken
+      : undefined
+    return startup
   }
 
   async installation(request: InstallationControlRequest, confirmed = false) {
@@ -455,6 +467,10 @@ class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
   }
 
   bootstrapService(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  reconnect(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
