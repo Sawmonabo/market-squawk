@@ -386,10 +386,12 @@ fn publish_startup(
     startup: Option<&ServiceStartupEvidenceWriter>,
     state: ServiceStartupState,
 ) -> Result<()> {
-    startup
-        .map(|startup| startup.publish(state))
-        .transpose()
-        .context("failed to publish installed-service startup evidence")?;
+    if let Some(startup) = startup {
+        let process = market_squawk::service::SystemProcessIdentityVerifier.current()?;
+        startup
+            .publish(state, process)
+            .context("failed to publish installed-service startup evidence")?;
+    }
     Ok(())
 }
 

@@ -14,15 +14,17 @@ use market_squawk::{
     SchwabOAuthInstallationTrustState,
     service::{
         BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceBootstrapStatus,
-        InstalledServiceConnector, InstalledServiceError, launch_foreground_keyring_broker,
+        InstalledServiceConnector, InstalledServiceError, SystemProcessIdentityVerifier,
+        launch_foreground_keyring_broker,
     },
     verified_installed_service_program,
 };
 use market_squawk_installer::default_installation_data_root;
 use market_squawk_platform::{AppConfig, SecretValue};
 use market_squawk_runtime::{
-    ApplicationClientError, LoopbackApplicationClient, NamedClient, ServiceStartupEvidenceError,
-    ServiceStartupPhase, ServiceStartupState, read_service_startup_evidence,
+    ApplicationClientError, LoopbackApplicationClient, NamedClient, ProcessIdentity,
+    ProcessIdentityVerifier, ServiceStartupEvidenceError, ServiceStartupPhase, ServiceStartupState,
+    read_service_startup_evidence,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -154,7 +156,55 @@ pub(crate) async fn reconnect_or_start(
     authority: &Arc<DesktopServiceAuthority>,
     cancellation: CancellationToken,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
-    match connect(authority).await {
+    let deadline = Instant::now()
+        .checked_add(STARTUP_TIMEOUT)
+        .ok_or(DesktopServiceError::StartupDeadline)?;
+    let mut child = None;
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(DesktopServiceError::StartupCancelled),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            Err(DesktopServiceError::StartupDeadline)
+        }
+        result = reconnect_or_start_until(authority, &mut child, deadline, &cancellation) => result,
+    };
+    let result = if cancellation.is_cancelled() {
+        Err(DesktopServiceError::StartupCancelled)
+    } else if Instant::now() >= deadline {
+        Err(DesktopServiceError::StartupDeadline)
+    } else {
+        result
+    };
+    if result.is_err()
+        && let Some(child) = child.as_mut()
+    {
+        // Only the child created by this attempt is ours to stop; a joined owner is not.
+        stop_failed_start(child);
+    }
+    result
+}
+
+async fn reconnect_or_start_until(
+    authority: &Arc<DesktopServiceAuthority>,
+    child: &mut Option<Child>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<DesktopServiceStartup, DesktopServiceError> {
+    let previous = read_service_startup_evidence(&authority.launch.installation_data_root)?;
+    if let Some(evidence) = previous
+        && process_is_current(evidence.process_identity())?
+    {
+        return wait_for_started_service(
+            authority,
+            None,
+            Some(evidence.process_identity()),
+            previous.map(|evidence| evidence.process_identity()),
+            deadline,
+            cancellation,
+        )
+        .await;
+    }
+    match connect(authority, deadline, cancellation).await {
         Ok(connection) => return Ok(DesktopServiceStartup::Ready(Box::new(connection))),
         Err(ConnectionAttempt::NotRunning) => {}
         Err(ConnectionAttempt::InvalidBootstrap) => {
@@ -190,15 +240,19 @@ pub(crate) async fn reconnect_or_start(
     if cancellation.is_cancelled() {
         return Err(DesktopServiceError::StartupCancelled);
     }
-    let mut child = command.spawn().map_err(DesktopServiceError::Launch)?;
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            stop_failed_start(&mut child);
-            Err(DesktopServiceError::StartupCancelled)
-        }
-        result = wait_for_started_service(authority, &mut child) => result,
+    if Instant::now() >= deadline {
+        return Err(DesktopServiceError::StartupDeadline);
     }
+    *child = Some(command.spawn().map_err(DesktopServiceError::Launch)?);
+    wait_for_started_service(
+        authority,
+        child.as_mut(),
+        None,
+        previous.map(|evidence| evidence.process_identity()),
+        deadline,
+        cancellation,
+    )
+    .await
 }
 
 fn selected_service_program() -> Result<PathBuf, DesktopServiceError> {
@@ -210,71 +264,91 @@ fn selected_service_program() -> Result<PathBuf, DesktopServiceError> {
     verified_installed_service_program().map_err(|_error| DesktopServiceError::Discovery)
 }
 
+fn process_is_current(process: ProcessIdentity) -> Result<bool, DesktopServiceError> {
+    SystemProcessIdentityVerifier
+        .is_current(process)
+        .map_err(|_| DesktopServiceError::Discovery)
+}
+
 async fn wait_for_started_service(
     authority: &Arc<DesktopServiceAuthority>,
-    child: &mut Child,
+    mut child: Option<&mut Child>,
+    mut owner: Option<ProcessIdentity>,
+    previous: Option<ProcessIdentity>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
-    let deadline = Instant::now()
-        .checked_add(STARTUP_TIMEOUT)
-        .ok_or(DesktopServiceError::StartupDeadline)?;
-    let mut observed_fresh_start = false;
     loop {
-        if child
-            .try_wait()
-            .map_err(DesktopServiceError::ProcessState)?
-            .is_some()
-        {
-            return connect_after_competing_start(authority).await;
+        if Instant::now() >= deadline {
+            return Err(DesktopServiceError::StartupDeadline);
         }
-        let startup = read_service_startup_evidence(&authority.launch.installation_data_root)
-            .map(|evidence| evidence.map(|evidence| evidence.state()));
-        match startup {
-            Ok(Some(ServiceStartupState::Starting { .. })) => {
-                observed_fresh_start = true;
+        let child_exited = child
+            .as_mut()
+            .map(|child| child.try_wait())
+            .transpose()
+            .map_err(DesktopServiceError::ProcessState)?
+            .flatten()
+            .is_some();
+        let evidence = read_service_startup_evidence(&authority.launch.installation_data_root)?;
+        let mut live_state = None;
+        if let Some(evidence) = evidence {
+            let process = evidence.process_identity();
+            if process_is_current(process)? {
+                owner = Some(process);
+                live_state = Some(evidence.state());
+            } else if owner == Some(process)
+                || (child_exited
+                    && previous != Some(process)
+                    && child
+                        .as_ref()
+                        .is_some_and(|child| child.id() == process.process_id()))
+            {
+                return Err(match evidence.state() {
+                    ServiceStartupState::Failed { phase } => {
+                        DesktopServiceError::StartupFailed { phase }
+                    }
+                    _ => DesktopServiceError::StartupExited,
+                });
+            }
+        }
+        if live_state.is_none()
+            && let Some(process) = owner
+            && !process_is_current(process)?
+        {
+            return Err(DesktopServiceError::StartupExited);
+        }
+        match live_state {
+            Some(ServiceStartupState::Failed { phase }) => {
+                return Err(DesktopServiceError::StartupFailed { phase });
+            }
+            Some(ServiceStartupState::Stopped) => return Err(DesktopServiceError::StartupExited),
+            Some(ServiceStartupState::Starting { .. }) => {
                 if let Some(bootstrap) = bootstrap_required(authority).await? {
                     return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
                 }
             }
-            Ok(Some(ServiceStartupState::Ready)) => match connect(authority).await {
-                Ok(connection) => {
-                    return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
+            Some(ServiceStartupState::Ready) | None => {
+                match connect(authority, deadline, cancellation).await {
+                    Ok(connection) => {
+                        return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
+                    }
+                    Err(ConnectionAttempt::InvalidBootstrap) => {
+                        return Err(DesktopServiceError::InvalidBootstrap);
+                    }
+                    Err(ConnectionAttempt::NotRunning) => {}
                 }
-                Err(ConnectionAttempt::NotRunning) => {}
-                Err(ConnectionAttempt::InvalidBootstrap) if !observed_fresh_start => {}
-                Err(ConnectionAttempt::InvalidBootstrap) => {
-                    stop_failed_start(child);
-                    return Err(DesktopServiceError::InvalidBootstrap);
+                if let Some(bootstrap) = bootstrap_required(authority).await? {
+                    return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
                 }
-            },
-            Ok(Some(ServiceStartupState::Failed { phase })) if observed_fresh_start => {
-                stop_failed_start(child);
-                return Err(DesktopServiceError::StartupFailed { phase });
             }
-            Ok(Some(ServiceStartupState::Stopped)) if observed_fresh_start => {
-                stop_failed_start(child);
-                return Err(DesktopServiceError::StartupExited);
-            }
-            Ok(Some(ServiceStartupState::Failed { .. } | ServiceStartupState::Stopped) | None)
-            | Err(_) => {}
         }
         if Instant::now() >= deadline {
-            stop_failed_start(child);
             return Err(DesktopServiceError::StartupDeadline);
         }
+        // A contender can exit before the owner publishes its first evidence. Wait only for
+        // authenticated readiness or verified process evidence within this original deadline.
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-async fn connect_after_competing_start(
-    authority: &Arc<DesktopServiceAuthority>,
-) -> Result<DesktopServiceStartup, DesktopServiceError> {
-    if let Ok(connection) = connect(authority).await {
-        return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
-    }
-    if let Some(bootstrap) = bootstrap_required(authority).await? {
-        return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
-    }
-    Err(DesktopServiceError::StartupExited)
 }
 
 pub(crate) async fn complete_bootstrap(
@@ -377,13 +451,15 @@ async fn connect_until_ready(
             Some(ServiceStartupState::Stopped) => {
                 return Err(DesktopServiceError::StartupExited);
             }
-            Some(ServiceStartupState::Ready) | None => match connect(authority).await {
-                Ok(connection) => return Ok(connection),
-                Err(ConnectionAttempt::InvalidBootstrap) => {
-                    return Err(DesktopServiceError::InvalidBootstrap);
+            Some(ServiceStartupState::Ready) | None => {
+                match connect(authority, deadline, &CancellationToken::new()).await {
+                    Ok(connection) => return Ok(connection),
+                    Err(ConnectionAttempt::InvalidBootstrap) => {
+                        return Err(DesktopServiceError::InvalidBootstrap);
+                    }
+                    Err(ConnectionAttempt::NotRunning) => {}
                 }
-                Err(ConnectionAttempt::NotRunning) => {}
-            },
+            }
         }
         if Instant::now() >= deadline {
             return Err(DesktopServiceError::StartupDeadline);
@@ -394,17 +470,25 @@ async fn connect_until_ready(
 
 async fn connect(
     authority: &Arc<DesktopServiceAuthority>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<DesktopServiceConnection, ConnectionAttempt> {
+    let timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(CONNECT_TIMEOUT);
+    if timeout.is_zero() || cancellation.is_cancelled() {
+        return Err(ConnectionAttempt::NotRunning);
+    }
     let application = authority
         .connector
         .connect_with_timeout(
             NamedClient::Desktop,
             Some(DESKTOP_ORIGIN.to_owned()),
-            CONNECT_TIMEOUT,
+            timeout,
         )
         .map_err(map_connect_error)?;
     let bootstrap = application
-        .bootstrap(CancellationToken::new())
+        .bootstrap(cancellation.clone())
         .await
         .map_err(map_client_error)?;
     Ok(DesktopServiceConnection {

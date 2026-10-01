@@ -10,6 +10,8 @@ use market_squawk_platform::{LocalPaths, PathError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::ProcessIdentity;
+
 const EVIDENCE_DIRECTORY: &str = "installed-service-startup";
 const EVIDENCE_FILE: &str = "state.json";
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -52,10 +54,17 @@ pub enum ServiceStartupState {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServiceStartupEvidence {
     schema_version: u32,
+    process: ProcessIdentity,
     state: ServiceStartupState,
 }
 
 impl ServiceStartupEvidence {
+    /// Exact process that published this state; callers must check that it is still alive.
+    #[must_use]
+    pub const fn process_identity(self) -> ProcessIdentity {
+        self.process
+    }
+
     /// Returns the closed startup state.
     #[must_use]
     pub const fn state(self) -> ServiceStartupState {
@@ -112,10 +121,15 @@ impl ServiceStartupEvidenceWriter {
     /// # Errors
     ///
     /// Fails when the fixed evidence file is unsafe or cannot be written and synchronized.
-    pub fn publish(&self, state: ServiceStartupState) -> Result<(), ServiceStartupEvidenceError> {
+    pub fn publish(
+        &self,
+        state: ServiceStartupState,
+        process: ProcessIdentity,
+    ) -> Result<(), ServiceStartupEvidenceError> {
         validate_existing_file(&self.file)?;
         let bytes = serde_json::to_vec(&ServiceStartupEvidence {
             schema_version: EVIDENCE_SCHEMA_VERSION,
+            process,
             state,
         })
         .map_err(|_| ServiceStartupEvidenceError::InvalidEvidence)?;

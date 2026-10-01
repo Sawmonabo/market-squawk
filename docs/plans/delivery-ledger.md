@@ -3,30 +3,51 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Latest pushed
-checkpoint `4239a7d6` preserves Alpaca publication custody under backpressure;
-`96abecae` preserves retained-data access and correct analytical/I/O admission order;
-`05a30951` fixes measured restoration stack frames. One worktree and three local/origin
-branches verified; protected bundle-backup refs and original recovery evidence are retained.
-The dated records below are history, not additional active assignments.
+checkpoint `9eac1d57` separates actor-time current presentation from financial cutoffs;
+`4239a7d6` preserves Alpaca publication custody under backpressure; `96abecae` preserves retained
+evidence access and analytical/I/O admission order. PR #43 comments5939484067 and5939704383.
+One worktree, three local and three origin branches verified; protected backup refs are retained.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — retained history and independent I/O admission | Retained-data checkpoint96abecae pushed. Lead owns Git/shared contracts/build scheduling. Three selected data checks pass: history/reobservation/restart1.88s, PIT authorization4.36s, market-event restart13.25s. | Application build PASS6m20s; genuine gate/worker regression PASS1/1,0.42s; identity and publication-custody cases PASS1/1 each. Retained-data and feed-backpressure checkpoints pushed; PR #43 comment5939484067. Latest-display build PASS7m22s. CLI current IWM changes279.34→279.32; native Home later shows QQQ742.43/IWM279.31 and five previous closes. Full quote/auto-update proof remains open. |
-| Lead — current display selection | Astra handoff frozen and inspected: live_source/display_market.rs and display_market/equity_paper.rs; lead integrated application/market_runtime.rs, paper/market.rs, paper/market/durable_product.rs, paper/equity.rs and paper_bot/virtual_routes.rs. | Build and real CLI/native Home reads pass; actor LatestDisplay and financial At cutoff remain separate. No durable-route rejection appeared in this run. Startup race and missing quote/update edges remain explicit below. |
-| Astra live_stack_failure — startup contention | Quote projection proposal complete; no new receipt needed. Read-only diagnosis of simultaneous direct-service/native startup: Desktop reports child exited while original service later becomes ready. | Identify existing launch/admission ownership and smallest correction; no edits/builds. Lead runs latest-display live checks. |
-| GPT-6.1 Sol screen_contract_coverage — background update dependency | Full17-screen audit complete. Read-only follow-up traces the smallest committed-domain event path through service composition, async publication and Desktop invalidation. No source ownership or builds. | Return concrete producer hooks, lifecycle ownership and consumer keys for lead integration after current-display verification. |
+| Lead — native competing-start integration | Shared process-bound startup evidence and Desktop owner joining implemented in place. Critical identity check, service/Desktop builds and reproduced native startup pass. | Commit/push frozen checkpoint, then rich quote/update delivery and starter-history operation lifetime. |
+| Astra live_stack_failure — startup frozen; history diagnosis | Native service.rs handed to lead and frozen for build. History diagnosis complete: one30s deadline covers all nine starters, and expiry abandons later instruments. No further active edits. | Return exact bottleneck, smallest existing-path correction and critical check. Lead owns native competing-start verification in parallel. |
+| GPT-6.1 Sol screen_contract_coverage — released | Source audit and committed-domain update proposal complete; no active edits. | Reuse accepted actor/durable commit hooks and existing EventHub in next price-to-screen checkpoint. |
 
-Native17-route navigation and four saved previous closes are verified on the preceding binary;
-streaming current quote display and complete screen contracts are **not verified**. No whole-app
-RAM measurement, CI or final gate has run. Empty screens are not completed product workflows.
-
-Latest-display native evidence: `latest-display-{service-build,live}.log`,
-`latest-display-collection{,-second}.json`, `latest-display-native-prices.json` under the current
-ignored evidence directory. SPY/MSFT remain unavailable; starter history still reports an extraction
+Latest-display build PASS7m22s. Real CLI IWM changes279.34→279.32; native Home shows QQQ742.43,
+IWM279.31 and five previous closes. Evidence: `latest-display-{service-build,live}.log`,
+`latest-display-collection{,-second}.json`, `latest-display-native-prices.json` in ignored
+`.agents/tmp/v1-first-stock/`. SPY/MSFT remain unavailable; starter history reports an extraction
 deadline, and public crypto startup lacks current accepted catalog terms in this workspace.
-Simultaneous direct-service/native start reproduces a Desktop competing-child exit error; launching
-Desktop after readiness opens Home. Retry stayed loading in the first process and remains unproven.
-These are unresolved workflow defects, not acceptance of all startup or streaming behavior.
+No durable-route diagnostic rejection occurred in this run. Simultaneous direct-service/native
+start reproduces a Desktop competing-child exit error; Desktop launched after readiness opens Home.
+Retry stayed loading in the first process and remains unproven. The lead stopped both owned test
+processes after collecting evidence. No whole-app RAM measurement, CI or final gate ran.
+
+Startup identity critical check PASS1/1: existing runtime
+`rendezvous_is_secret_free_authenticated_and_bound_to_process_start` verifies the reused
+PID/start identity and authenticated readiness contract. Service build PASS7m31s; explicit
+Desktop automation build PASS42.35s. The first combined Cargo command selected only the service
+binary; its old-Desktop run is excluded from acceptance.
+
+Corrected native proof: direct service21073 followed one second later by Desktop21090 showed
+Starting, then Home Ready without retry. The same service remained owner; Home loaded QQQ742.635,
+IWM279.44 and five retained previous closes. SPY/MSFT remained unavailable. Closing only Desktop
+left the owner alive; fresh Desktop22485 rejoined and rendered Home Ready without password.
+Evidence: `competing-start-verified-{live,native,native-restart}.log` and matching
+`{initial,settled,home-data,restart}.json` in ignored `.agents/tmp/v1-first-stock/`. This proves
+the reproduced race and ready-owner rejoin, not all startup failures or full data contracts.
+Owned processes are stopped after evidence collection; no foreground automation or RAM gate.
+
+Starter-history diagnosis: source_lifecycle/display_history.rs applies one30s recovery deadline
+to all nine instruments; corporate_actions/preflight/display_history.rs aborts the remainder on
+expiry. Next correction keeps the finite generation-owned worker and canonical pipeline, with
+per-instrument operation deadlines, stage attribution and cancellation/drain. Five stored closes
+are not proof of publication during this run; extraction cost still needs direct evidence.
+
+Next dependency order: close reproduced native startup race; integrate existing rich quote
+projection and committed-domain screen invalidation; continue missing starter/family detail and
+first saved Investment Brief. Screen route presence is not complete workflow acceptance.
 
 ### Required data-to-screen closure
 
@@ -62,9 +83,10 @@ require every family on every screen or streaming fundamentally scheduled data. 
    unconditional-placeholder findings are superseded. Available-data, all model/provider families,
    paper accounting and shared-client/installed restart still need actual end-to-end evidence.
 
-Next integration order: finish frozen retained-data/admission checkpoint; complete current market
-selection plus rich quote projection and background update delivery; then remaining family detail
-checkpoints alongside the first saved Investment Brief. Full scope in the owner-test goal remains.
+Retained-data/admission and actor-time current selection checkpoints are pushed. Next integration
+order: native competing-start closure, rich quote projection with background update delivery, then
+remaining family detail checkpoints alongside the first saved Investment Brief. Full scope in the
+owner-test goal remains.
 
 ## Historical integration records
 
