@@ -931,10 +931,17 @@ impl<'a> ProductionRawMarketSink<'a> {
         if requires_rebind {
             match self.record_health(health_observed_at)? {
                 CurrentHealthRecording::Qualified => {}
-                CurrentHealthRecording::Unqualified(cause) if cause.is_freshness_only() => {
-                    return Ok(ActiveDataDisposition::FreshnessUnqualified);
-                }
-                CurrentHealthRecording::Unqualified(_cause) => {
+                CurrentHealthRecording::Unqualified(cause) => {
+                    let freshness_only = cause.is_freshness_only();
+                    tracing::warn!(
+                        stage = "health_recording",
+                        ?cause,
+                        freshness_only,
+                        "sink current health did not qualify data"
+                    );
+                    if freshness_only {
+                        return Ok(ActiveDataDisposition::FreshnessUnqualified);
+                    }
                     return Err(ProductionSinkFailure::Registry(
                         RegistryError::HealthNotQualified,
                     ));

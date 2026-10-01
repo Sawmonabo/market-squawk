@@ -5148,3 +5148,80 @@ complete genuine typed publication, clean stop/restart, new publication, exact p
 readback and explicit-stop persistence. No warnings/errors in the passing log. This is focused
 working-tree live evidence, not clean-head full-gate, native WebView, throughput or RAM acceptance.
 No additional test matrix or gate is needed for this coherent commit; remaining V1 work stays open.
+
+### Native stock workflow continuation — base `0ac80011`
+
+Prior goal turn made progress: both public crypto installed-service lifecycle journeys passed,
+checkpoint pushed (PR #43 comment5935482496), and 6.8GB obsolete control-plane build artifacts
+removed with current executable/evidence retained. This wave returns to required native screens
+and real stock analysis. The prior stable-endpoints workspace predates current in-place schemas;
+keep it and all original recovery/session state untouched. Use a fresh explicit
+`.market-squawk/v1-owner-test-indexed-storage/{data,installation}` verification workspace, reusing
+authorized config import and practice-account choices through current product operations.
+
+| Owner | Disjoint scope / dependency | Completion evidence |
+| --- | --- | --- |
+| Lead | Runtime roots, credential import/native automation, shared contracts, ledger/Git and sole build scheduling | Current service + hidden Desktop; all ordinary routes settle; real starter data and stock workflow preparation receipts; fix only reproduced failures. |
+| GPT-6.1 Sol native_stock_preparation | Read-only current setup/stock operation recipe; no credentials or runtime actions | Exact current operations for import, stock/benchmark/fiscal preparation, approved practice allocation and start/resume; reusable existing script locations. |
+| Astra calendar_currentness_failure | Read-only interpretation of actual stock preparation/result receipts once lead captures them | First real missing evidence producer or proof of complete saved stock analysis; no fixture-only rewrite. |
+
+DAG: current native build/service → config/setup and native route reads → stock/benchmark/fiscal
+inputs + approved simulated account → real analysis → saved result/restart. No release build,
+whole-app RAM check, new branch/worktree, foreground automation or competing compilation.
+
+Fresh current service starts Ready without password. During authorized bundle import, some
+credentials persist but CLI import returns generic Unavailable; same-bundle idempotent retry is
+running. Root retains value-free receipts. Fresh combined public defaults also expose Kraken
+HealthNotQualified followed by Coinbase publication backpressure, unlike separate-provider
+lifecycle proof. Astra research_options_failure owns read-only first-failure/clock/teardown trace
+in fresh service logs and live source/qualification/import activation paths; no edits/builds/runtime
+control. Lead continues native build/setup; Sol recipe lane checks current import timeout routing.
+
+Native continuation evidence: current Desktop build passed; hidden WebDriver inspected all17 routes
+against fresh indexed-storage service. Home/Markets fail `Market.GetCollection`/`Market.GetOverview`;
+other15 routes have no query errors in this read. This is not full workflow acceptance. Source
+inspection plus read-only catalog query identifies two valid crypto definition revisions without
+optional display_name; product_market_identities requires it and rejects the whole population.
+Lead owns `application/market_selection/product.rs` plus existing product-market critical check
+for this presentation defect. Astra owns only `live_source/sink.rs` closed-cause diagnostics for
+separate combined-public health failure; no behavior relaxation until actual cause is captured.
+Native route evidence: `.agents/tmp/v1-first-stock/indexed-storage-native-routes.json`.
+Practice account $100,000USD/0.25% costs and approved allocation committed using genuine receipts;
+no paper session/order started. Credential retry completed17 provider dispositions without secret
+output. Initial Nasdaq kind=source request was invalid (SurfaceMismatch); recipe correction pending,
+not evidence that Nasdaq itself failed. No new branches/worktrees, gates or memory measurement.
+
+Financial dependency follow-up: Astra calendar_currentness_failure owns read-only confirmation
+of the reported missing fiscal plan/build/forecast dispatch handlers and SEC canonical identity
+consumer. Produce a bounded producer-to-consumer implementation recommendation against current
+HEAD; no edits, builds, runtime actions or Git. Lead current implementation remains optional-name
+market projection and its existing critical test, plus the closed live-health diagnostic only.
+
+Alpaca verify/start succeeded and admitted9starter equities/funds. It subsequently failed with
+TrustedReceiptHighWaterUnavailable. Astra traced the actual16-spin paired-clock seqlock; ordinary
+writer preemption can exhaust it and terminate the stream. BudgetUnavailable follows transport
+permit release, not an independent budget contention defect. Assign Astra only
+`crates/market-squawk-sources/src/authority_time.rs` (including existing paired-sample critical case)
+to replace the homemade seqlock with the existing arc-swap immutable paired snapshot. Preserve
+continuity/revocation/range checks and account for snapshot allocation. Lead reserves dependencies,
+Git/builds. Source-source critical check precedes rebuilt app/native verification. No timeout or
+freshness increase. First optional-name test compile found a test-only closure error conversion;
+lead corrected setup value construction before retry, no production behavioral change.
+
+Read-only financial lane confirmed missing first-stock edges (not new calculators): fiscal
+GetFiscalPreparationPlan/StartFiscalDatasetBuild/StartFiscalForecast have contracts/driver calls
+but no installed handlers; existing dataset/forecast preparation authorities are disconnected.
+SEC issuer normalization uses CIK-derived identity, while stock financial admission needs an
+explicit authorized company/security relationship and exact canonical identity. The relationship
+authority has no production caller; wiring it alone is insufficient because row admission still
+requires ID equality. Next financial checkpoint must wire those existing owners coherently and
+retain original issuer evidence, using current company-identity/restart tests. These remain
+functional acceptance blockers; current-share projection itself was already traced as wired.
+
+Paired-clock critical checks PASS3/3 in0.02s (`paired-clock-critical.log`): concurrent initialized
+reads always return a coherent nonregressing pair; uninitialized and terminal states still reject;
+poisoned-clock permanent invalidation and forged receipt range/continuity checks pass. Existing
+arc-swap1.9.2 dependency reused, no manifest change. Closed health cause diagnostic is behavior-neutral.
+This independently coherent source-authority correction is ready for commit/push; live proof waits
+for rebuilt service. Optional-name product fix remains separate WIP with corrected critical compile
+running. No completed V1/combined-live or exact-head full-gate claim.
