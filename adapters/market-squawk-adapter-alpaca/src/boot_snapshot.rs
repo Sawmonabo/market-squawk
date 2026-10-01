@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, ApiEndpointRule, BudgetDispatchDecision, BudgetReservationDecision,
-    HttpRequestBounds, PathScope, QueryParameterRule, QuerySensitivity, RawMarketFrame,
-    RawMarketSink, SharedProviderBudget, SourceError, TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, ApiEndpointRule, HttpRequestBounds, PathScope, QueryParameterRule,
+    QuerySensitivity, RawMarketFrame, RawMarketSink, SharedProviderBudget, SourceError,
+    TransportFrameKind, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -236,15 +236,6 @@ impl AlpacaIexBootSnapshotTransport {
             .authorize(self.contract.target())
             .map_err(|_| SourceError::InvalidProtocolState)?;
         authority.validate_current()?;
-        let reservation = match budget.try_reserve_request() {
-            BudgetReservationDecision::Ready(reservation) => reservation,
-            BudgetReservationDecision::WaitUntil(deadline) => {
-                return Err(SourceError::BudgetWaitUntil { deadline });
-            }
-            BudgetReservationDecision::Unavailable(reason) => {
-                return Err(SourceError::BudgetUnavailable { reason });
-            }
-        };
         let transport_deadline = Instant::now()
             .checked_add(Duration::from_nanos(
                 self.contract.request_bounds().total_timeout_nanos(),
@@ -254,15 +245,13 @@ impl AlpacaIexBootSnapshotTransport {
         let deadline = sink_deadline.map_or(transport_deadline, |deadline| {
             deadline.min(transport_deadline)
         });
-        let permit = match reservation.commit_dispatch() {
-            BudgetDispatchDecision::Ready(permit) => permit,
-            BudgetDispatchDecision::WaitUntil(deadline) => {
-                return Err(SourceError::BudgetWaitUntil { deadline });
-            }
-            BudgetDispatchDecision::Unavailable(reason) => {
-                return Err(SourceError::BudgetUnavailable { reason });
-            }
-        };
+        let reservation = crate::budget::reserve_request(budget, deadline, cancellation)
+            .await
+            .map_err(crate::budget::AdmissionError::into_source_error)?;
+        let permit = crate::budget::commit_request(reservation, budget, deadline, cancellation)
+            .await
+            .map_err(crate::budget::AdmissionError::into_source_error)?;
+        authority.validate_current()?;
         let complete_frame = authority.frames_mut()?.try_reserve_capture_frame()?;
         let (frame, status, headers) = authenticated_bounded_get_with_completion(
             &self.client,

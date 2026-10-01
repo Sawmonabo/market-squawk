@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _, future::BoxFuture};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetReservation,
-    BudgetReservationDecision, LiveMarketSource, LiveSourceGeneration, RawMarketSink,
+    ActiveLiveSourceGeneration, LiveMarketSource, LiveSourceGeneration, RawMarketSink,
     SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
     apply_http_retry_after,
 };
@@ -236,7 +235,15 @@ async fn run_transport(
         return Err(SourceError::Cancelled);
     }
     authority.validate_current()?;
-    let reservation = reserve_budget(budget)?;
+    let deadline = Instant::now()
+        .checked_add(limits.connect_timeout())
+        .ok_or(SourceError::InvalidProtocolState)?;
+    let deadline = sink
+        .next_deadline()
+        .map_or(deadline, |next| next.min(deadline));
+    let reservation = crate::budget::reserve_request(budget, deadline, &cancellation)
+        .await
+        .map_err(crate::budget::AdmissionError::into_source_error)?;
     let request = authenticated_request(endpoint, credentials, messagepack)?;
     let websocket_config = WebSocketConfig::default()
         .read_buffer_size(limits.max_frame_bytes().clamp(4 * 1024, 128 * 1024))
@@ -244,13 +251,18 @@ async fn run_transport(
         .max_write_buffer_size(64 * 1024)
         .max_message_size(Some(limits.max_frame_bytes()))
         .max_frame_size(Some(limits.max_frame_bytes()));
-    let mut permit = commit_budget(reservation)?;
+    let mut permit = crate::budget::commit_request(reservation, budget, deadline, &cancellation)
+        .await
+        .map_err(crate::budget::AdmissionError::into_source_error)?;
+    authority.validate_current()?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(SourceError::Network)?;
     let connect = connect_async_with_config(request, Some(websocket_config), true);
-    let (mut socket, response) =
-        await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
-            map_connect_error(error, budget)
-        })
-        .await?;
+    let (mut socket, response) = await_websocket(&cancellation, remaining, connect, |error| {
+        map_connect_error(error, budget)
+    })
+    .await?;
     drop(response);
     permit
         .complete_transport_handshake()
@@ -357,32 +369,6 @@ fn validate_generation(
         return Err(SourceError::GenerationAuthorityMismatch);
     }
     Ok(())
-}
-
-fn reserve_budget(budget: &SharedProviderBudget) -> Result<BudgetReservation, SourceError> {
-    match budget.try_reserve_request() {
-        BudgetReservationDecision::Ready(reservation) => Ok(reservation),
-        BudgetReservationDecision::WaitUntil(deadline) => {
-            Err(SourceError::BudgetWaitUntil { deadline })
-        }
-        BudgetReservationDecision::Unavailable(reason) => {
-            Err(SourceError::BudgetUnavailable { reason })
-        }
-    }
-}
-
-fn commit_budget(
-    reservation: BudgetReservation,
-) -> Result<market_squawk_sources::BudgetPermit, SourceError> {
-    match reservation.commit_dispatch() {
-        BudgetDispatchDecision::Ready(permit) => Ok(permit),
-        BudgetDispatchDecision::WaitUntil(deadline) => {
-            Err(SourceError::BudgetWaitUntil { deadline })
-        }
-        BudgetDispatchDecision::Unavailable(reason) => {
-            Err(SourceError::BudgetUnavailable { reason })
-        }
-    }
 }
 
 fn publish(

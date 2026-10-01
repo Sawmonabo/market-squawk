@@ -7,6 +7,7 @@
 
 mod asset_reference;
 mod boot_snapshot;
+mod budget;
 pub use asset_reference::{
     ALPACA_ASSET_REFERENCE_ENDPOINT, AlpacaAssetReferenceClient, AlpacaAssetReferenceRejoin,
     AlpacaOriginalAssetReference, AlpacaPendingAssetReference,

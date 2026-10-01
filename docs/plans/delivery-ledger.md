@@ -2,7 +2,7 @@
 
 ## Active startup, optional-lock and previous-close integration — 2026-09-30
 
-Current pushed currentness checkpoint: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
+Current pushed Desktop reconnect checkpoint: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
 History integration audit base: `a0e8b77b`; both preserved on `feature/v1-installed-product-experience`.
 One primary worktree, three local branches and three origin branches; no linked worktrees.
 Original session and recovery backups remain protected. No CI or release gate has run for this wave.
@@ -14,6 +14,8 @@ Lock/Forget, and a user-selected reauthentication interval. Saved pages remain u
 supersedes forced password storage in development and any conflicting import-only guidance.
 
 ### Current outcomes and verification
+
+Request-slot waiting passes the focused overlap/cancellation/uncharged-expiry case (0.03s). One serialized native build is running (`request-admission-native-build.log`); live price availability remains unproven. Lead owns build/native actions and integration. Astra `calendar_currentness_failure` has a read-only integration trace of the retained history identity/publication/previous-close changes; no file edits, builds or additional review round. This trace identifies concrete consumer gaps before the coherent history checkpoint.
 
 Native backend replacement is live verified: after the owned service was stopped, Desktop launched a new service and moved to a new product-session token; both contexts became Ready, the event stream connected, and Home had no query errors or password prompt. Evidence: `native-backend-reconnect-{before,after,completed}.json` and `native-reconnect-read-probe.json`. The first 55-second observation expired while connecting; completion was observed later, so no fast-recovery timing claim. A thread sample showed no sustained synchronous native deadlock. Reconnect latency remains unexplained.
 
@@ -45,15 +47,13 @@ Evidence under `.agents/tmp/v1-first-stock/`:
 
 ### Dependency and ownership
 
+Native-session read correction: Astra `calendar_currentness_failure` exclusively owns `crates/market-squawk-data/src/analytical_read/history_sessions.rs` to align final period-end inclusion with the existing inclusive request-end contract (period_end - 1ns). Publication and replay currently disagree for completed daily requests ending at midnight minus 1ns. Astra also owns a narrowly scoped extension inside the existing `publication_recovery.rs` complete-history case and its calendar capture builder: one real sealed calendar replay across publication/restart at the inclusive final daily boundary. Existing synthetic cases stay intact; no new harness or test matrix. Lead owns compilation and real read/restart verification. No other agent edits these files.
+
+Native reconnect diagnosis is closed without speculative lock changes: replacement and same-runtime reconnect both pass in the real WebView. Same-runtime evidence preserves the token (`native-same-runtime-reconnect.json`); replacement latency remains unmeasured beyond the initial observation window. Provider admission is the only active implementation slice below; other returned slices remain lead integration work.
+
 Authorized request-admission fix: Astra `credential_runtime_lifecycle` owns adapter Alpaca `live.rs`, `boot_snapshot.rs`, `historical.rs` and a cohesive shared `budget.rs` helper if needed; lead owns `lib.rs` declaration. Reuse existing admission semantics, wait only on ConcurrencyExhausted with original deadline/cancellation, retain exact budget identity and terminal errors. No budget increase/new background worker. Critical gap is live bootstrap/history overlap incorrectly stopping the source; extend only an existing adapter admission case if needed, after returning its exact ownership.
 
-Native reconnect diagnosis: Astra `calendar_currentness_failure` owns read-only tracing of native event subscription cancellation/drain and reconnect commit. Actual restarted service becomes Ready but the existing WebView remains Starting for over 60s. No edits/builds/runtime mutations until a precise cause/file scope is proposed; lead owns the running native probe and bridge integration.
-
-Next bounded diagnosis: Astra `credential_runtime_lifecycle` traces the real provider-budget exhaustion during starter history preparation (structured log sequences233–244, service remains alive). Read-only ownership of runtime budget, display-source supervisor and historical extraction callers; propose exact smallest fix before edits. No builds/Git/service mutation. Lead owns native reconnect live proof and integration.
-
 Measured market query correction: Astra `research_options_failure` exclusively owns `crates/market-squawk-data/src/catalog/market_recovery.rs`, only durable-route SQL. Existing route query costs 1.34–1.51s for one instrument in the preserved catalog; nine sequential reads consume most of the native deadline. Compact dataset/route keys plus an exact EXISTS eligibility join measured 46.95ms for all nine. Preserve all source-input/schema/clock predicates, ordering, limits and cancellation. No other query changes, schema/index/cache or new test harness. Lead runs the existing publication/restart critical case and native proof.
-
-Parallel read-only diagnosis: Astra `research_options_failure` traces Home/Markets timeout after the selected-object fix, through `application/paper/market/durable_product.rs`, market-history previous-close selection and shared I/O admission. No edits, builds, Git or runtime actions. Return only demonstrated repeated/blocking work and the smallest fix proposal; lead owns any resulting implementation.
 
 Authorized extraction-stack correction: Astra `credential_runtime_lifecycle` exclusively owns app `application/research/ingest.rs`, `ingest/alpaca_historical.rs`, and sources `extraction/capture.rs`. Heap-own managed extraction/handoff payloads and optional semantic capture payload so large results are not copied through every nested async frame. Bounded crash disassembly confirms cumulative frame pressure (ingest_inner approximately459KiB), not a large RawTask frame alone. Preserve capture serialization/digests and AbortOnDrop/cancellation; no increased stack limit, extra runtime or data cap.
 

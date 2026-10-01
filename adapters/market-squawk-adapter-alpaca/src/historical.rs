@@ -16,9 +16,9 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
-    AvailabilityEvidence, BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
-    BudgetReservationDecision, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
-    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
+    AvailabilityEvidence, BudgetDecision, BudgetPermit, BudgetReservation,
+    CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
+    ExtractionBatch, ExtractionRecord, ExtractionRequest,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HttpRequestBounds,
     ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
     ProviderCaptureTerminalDisposition, SharedProviderBudget, SourceError, SourceMetadata,
@@ -1430,17 +1430,12 @@ async fn acquire_preflight_budget(
     cancellation: &CancellationToken,
 ) -> Result<BudgetReservation, AlpacaError> {
     loop {
-        if cancellation.is_cancelled() {
-            return Err(AlpacaError::Cancelled);
-        }
-        match budget.try_reserve_request() {
-            BudgetReservationDecision::Ready(reservation) => return Ok(reservation),
-            BudgetReservationDecision::WaitUntil(wait_until) => {
+        match crate::budget::reserve_request(budget, deadline, cancellation).await {
+            Ok(reservation) => return Ok(reservation),
+            Err(crate::budget::AdmissionError::WaitUntil(wait_until)) => {
                 wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await?;
             }
-            BudgetReservationDecision::Unavailable(_reason) => {
-                return Err(AlpacaError::Network);
-            }
+            Err(error) => return Err(preflight_admission_error(error)),
         }
     }
 }
@@ -1452,20 +1447,23 @@ async fn commit_preflight_budget(
     cancellation: &CancellationToken,
 ) -> Result<BudgetPermit, AlpacaError> {
     loop {
-        if cancellation.is_cancelled() {
-            return Err(AlpacaError::Cancelled);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(AlpacaError::DeadlineExceeded);
-        }
-        match reservation.commit_dispatch() {
-            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
-            BudgetDispatchDecision::WaitUntil(wait_until) => {
+        match crate::budget::commit_request(reservation, budget, deadline, cancellation).await {
+            Ok(permit) => return Ok(permit),
+            Err(crate::budget::AdmissionError::WaitUntil(wait_until)) => {
                 wait_for_budget_deadline(budget, wait_until, deadline, cancellation).await?;
                 reservation = acquire_preflight_budget(budget, deadline, cancellation).await?;
             }
-            BudgetDispatchDecision::Unavailable(_reason) => return Err(AlpacaError::Network),
+            Err(error) => return Err(preflight_admission_error(error)),
         }
+    }
+}
+
+fn preflight_admission_error(error: crate::budget::AdmissionError) -> AlpacaError {
+    match error {
+        crate::budget::AdmissionError::Cancelled => AlpacaError::Cancelled,
+        crate::budget::AdmissionError::DeadlineExceeded => AlpacaError::DeadlineExceeded,
+        crate::budget::AdmissionError::WaitUntil(_)
+        | crate::budget::AdmissionError::Unavailable(_) => AlpacaError::Network,
     }
 }
 
@@ -2018,8 +2016,9 @@ mod capture_tests {
     use crate::{AlpacaAuthenticatedCalendarRequest, AlpacaTradingApiEnvironment};
     use market_squawk_domain::{AssetClass, MetadataRevision};
     use market_squawk_sources::{
-        AuthorizationMode, BackoffPolicy, BudgetScope, PreparedProviderRateRegistrationBatch,
-        ProviderBudgetPolicy, ProviderRateAuthority, ProviderRateDeclaration,
+        AuthorizationMode, BackoffPolicy, BudgetReservationDecision, BudgetScope,
+        PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderRateAuthority,
+        ProviderRateDeclaration,
         ProviderRateDispatchDecision, ProviderRateGroupId, ProviderRatePermitId,
         ProviderRateRegistration, ProviderRateReservationDecision, ProviderRateReservationId,
         ProviderRateRunId, ProviderRateStore, ProviderRateStoreError, RetryAfter,
@@ -2171,12 +2170,19 @@ mod capture_tests {
     fn one_request_budget(
         store: Arc<ReadyRateStore>,
     ) -> Result<SharedProviderBudget, Box<dyn Error>> {
+        request_budget(store, NonZeroU32::MIN)
+    }
+
+    fn request_budget(
+        store: Arc<ReadyRateStore>,
+        requests: NonZeroU32,
+    ) -> Result<SharedProviderBudget, Box<dyn Error>> {
         const WINDOW_NANOS: u64 = 60_000_000_000;
         let provider = SourceIdentifier::try_from("alpaca-ready-budget-test")?;
         let subject = SourceIdentifier::try_from("alpaca-ready-budget-subject")?;
         let policy = ProviderBudgetPolicy::try_new(
             BudgetScope::with_authorization_account(provider, subject.clone()),
-            NonZeroU32::MIN,
+            requests,
             NonZeroU64::new(WINDOW_NANOS).ok_or("budget window must be nonzero")?,
             NonZeroU16::MIN,
             BackoffPolicy::try_new(
@@ -2222,6 +2228,65 @@ mod capture_tests {
             next_reservation,
             BudgetReservationDecision::Ready(_)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_request_budget_waits_for_release_and_cancellation_is_uncharged()
+    -> Result<(), Box<dyn Error>> {
+        let store = Arc::new(ReadyRateStore::default());
+        let budget = request_budget(store.clone(), NonZeroU32::new(2).ok_or("request count")?)?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        let first = commit_preflight_budget(first, &budget, deadline, &cancellation).await?;
+
+        let next = acquire_preflight_budget(&budget, deadline, &cancellation);
+        tokio::pin!(next);
+        assert!(futures_util::poll!(&mut next).is_pending());
+        assert_eq!(store.dispatches(), 1);
+        first.release();
+        let next = next.await?;
+        let next = commit_preflight_budget(next, &budget, deadline, &cancellation).await?;
+        assert_eq!(store.dispatches(), 2);
+        next.release();
+
+        let store = Arc::new(ReadyRateStore::default());
+        let budget = request_budget(store.clone(), NonZeroU32::new(2).ok_or("request count")?)?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let held = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        let held = commit_preflight_budget(held, &budget, deadline, &cancellation).await?;
+        let transport_dispatches = AtomicUsize::new(0);
+        let blocked = async {
+            let reservation = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+            let permit =
+                commit_preflight_budget(reservation, &budget, deadline, &cancellation).await?;
+            transport_dispatches.fetch_add(1, AtomicOrdering::SeqCst);
+            permit.release();
+            Ok::<_, AlpacaError>(())
+        };
+        tokio::pin!(blocked);
+        assert!(futures_util::poll!(&mut blocked).is_pending());
+        cancellation.cancel();
+        assert!(matches!(blocked.await, Err(AlpacaError::Cancelled)));
+        assert_eq!(store.dispatches(), 1);
+        assert_eq!(transport_dispatches.load(AtomicOrdering::SeqCst), 0);
+        held.release();
+
+        // A ready reservation that expires before dispatch returns its concurrency slot and
+        // leaves the one remaining request available to the next transport.
+        let cancellation = CancellationToken::new();
+        let reservation = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        assert!(matches!(
+            commit_preflight_budget(reservation, &budget, Instant::now(), &cancellation).await,
+            Err(AlpacaError::DeadlineExceeded)
+        ));
+        assert_eq!(store.dispatches(), 1);
+        let reservation = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        let permit = commit_preflight_budget(reservation, &budget, deadline, &cancellation).await?;
+        assert_eq!(store.dispatches(), 2);
+        permit.release();
         Ok(())
     }
 
