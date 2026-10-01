@@ -369,19 +369,25 @@ impl Catalog {
             .ok()
             .filter(|value| *value > 0)
             .ok_or(CatalogError::InvalidRecord)?;
+        let membership = crate::manifest::generation_contains_origin_sql(
+            "?1",
+            "generation_input.generation_sequence",
+        );
         let run_id = self
             .connection
             .query_row(
-                "SELECT generation_input.run_id
+                &format!(
+                    "SELECT generation_input.run_id
                  FROM analytical_generation_provider_publication_bindings AS generation_input
                  JOIN ingest_run_provider_publication_bindings AS run_input
                    ON run_input.run_id=generation_input.run_id
                   AND run_input.publication_digest=generation_input.publication_digest
-                 WHERE generation_input.generation_sequence=?1
+                 WHERE {membership}
                    AND generation_input.publication_digest=?2
                    AND generation_input.publication_kind=?3
                    AND run_input.publication_kind=?3
-                   AND run_input.logical_binding_digest=?2",
+                   AND run_input.logical_binding_digest=?2"
+                ),
                 params![generation, digest_bytes(binding_digest), PUBLICATION_KIND],
                 |row| row.get::<_, String>(0),
             )

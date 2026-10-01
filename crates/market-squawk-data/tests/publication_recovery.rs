@@ -1724,7 +1724,7 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
             cancellation,
         )
         .await?;
-    let binding_digests = service.provider_capture_binding_digests(committed.manifest())?;
+    let binding_digests = service.provider_capture_binding_digests(committed.manifest(), None, 2)?;
     assert_eq!(binding_digests.len(), 1);
     let retained_binding = service.provider_capture_binding_evidence(
         committed.manifest(),
@@ -3231,7 +3231,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         )
         .await?;
     let manifest = committed.manifest().clone();
-    let selectors = service.provider_market_event_publications(&manifest)?;
+    let selectors = service.provider_market_event_publications(&manifest, None, 2)?;
     assert_eq!(selectors.len(), 1);
     assert_eq!(selectors[0].publication_digest(), publication_digest);
     assert_eq!(
@@ -3249,7 +3249,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?);
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
-    let restarted_selectors = restarted.provider_market_event_publications(&manifest)?;
+    let restarted_selectors = restarted.provider_market_event_publications(&manifest, None, 2)?;
     assert_eq!(restarted_selectors, selectors);
     let reopened = restarted
         .read_provider_market_event_publication(
@@ -4281,7 +4281,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(short_after_compaction.bars().len(), 1);
     drop(short_after_compaction);
 
-    let short_first_lineage = service.provider_capture_binding_digests(short.manifest())?;
+    let short_first_lineage = service.provider_capture_binding_digests(short.manifest(), None, 3)?;
     assert_eq!(short_first_lineage.len(), 1);
     let short_append = publish_complete_history_fixture(
         &service,
@@ -4301,7 +4301,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     )
     .await?;
     let short_cumulative_lineage =
-        service.provider_capture_binding_digests(short_append.manifest())?;
+        service.provider_capture_binding_digests(short_append.manifest(), None, 3)?;
     assert_eq!(short_cumulative_lineage.len(), 2);
     assert!(
         short_first_lineage
@@ -4790,7 +4790,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         Some(original_calendar_binding)
     );
     assert_eq!(
-        service.provider_capture_binding_digests(&calendar_manifest)?,
+        service.provider_capture_binding_digests(&calendar_manifest, None, 2)?,
         vec![original_calendar_binding]
     );
     let (changed_calendar, _) = sealed_calendar_reobservation_fixture(

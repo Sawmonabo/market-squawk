@@ -881,10 +881,10 @@ impl SecResearchReadCapability {
                 .await;
         }
 
-        let retained_bindings = self
+        if !self
             .manifests
-            .provider_capture_binding_digests(request.manifest())?;
-        if !retained_bindings.contains(&request.provider_binding_digest()) {
+            .has_provider_capture_binding(request.manifest(), request.provider_binding_digest())?
+        {
             return Err(SecResearchReadError::ProviderBindingMismatch);
         }
         let binding = self

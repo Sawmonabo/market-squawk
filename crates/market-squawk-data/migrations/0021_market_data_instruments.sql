@@ -2197,6 +2197,15 @@ CREATE TABLE analytical_generation_provider_publication_bindings (
         REFERENCES ingest_run_provider_publication_bindings(run_id, publication_digest)
 ) STRICT, WITHOUT ROWID;
 
+CREATE INDEX analytical_generation_provider_publication_by_digest
+ON analytical_generation_provider_publication_bindings(publication_digest, publication_kind, generation_sequence);
+CREATE INDEX analytical_generation_provider_capture_by_digest
+ON analytical_generation_provider_capture_bindings(binding_digest, generation_sequence);
+CREATE INDEX ingest_run_provider_publication_by_digest
+ON ingest_run_provider_publication_bindings(publication_digest, publication_kind, run_id, source_id);
+CREATE INDEX ingest_run_provider_capture_by_digest
+ON ingest_run_provider_capture_bindings(binding_digest, run_id, source_id);
+
 CREATE TRIGGER analytical_generation_provider_publication_bindings_guarded_insert
 BEFORE INSERT ON analytical_generation_provider_publication_bindings
 WHEN NOT EXISTS (
@@ -2212,22 +2221,6 @@ WHEN NOT EXISTS (
       AND publication.publication_kind=NEW.publication_kind
       AND publication.run_id=NEW.run_id
       AND publication.source_id=NEW.source_id
-)
-AND NOT EXISTS (
-    SELECT 1
-    FROM analytical_generations AS child
-    JOIN analytical_generation_parents AS edge
-      ON edge.child_dataset_id=child.dataset_id
-     AND edge.child_manifest_version=child.manifest_version
-    JOIN analytical_generations AS parent
-      ON parent.generation_sequence=edge.parent_generation_sequence
-    JOIN analytical_generation_provider_publication_bindings AS parent_input
-      ON parent_input.generation_sequence=parent.generation_sequence
-    WHERE child.generation_sequence=NEW.generation_sequence
-      AND parent_input.publication_digest=NEW.publication_digest
-      AND parent_input.publication_kind=NEW.publication_kind
-      AND parent_input.run_id=NEW.run_id
-      AND parent_input.source_id=NEW.source_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation provider event publication is invalid');
@@ -2247,21 +2240,6 @@ WHEN NOT EXISTS (
       AND capture_input.binding_digest = NEW.binding_digest
       AND capture_input.run_id = NEW.run_id
       AND capture_input.source_id = NEW.source_id
-)
-AND NOT EXISTS (
-    SELECT 1
-    FROM analytical_generations AS child
-    JOIN analytical_generation_parents AS edge
-      ON edge.child_dataset_id = child.dataset_id
-     AND edge.child_manifest_version = child.manifest_version
-    JOIN analytical_generations AS parent
-      ON parent.generation_sequence = edge.parent_generation_sequence
-    JOIN analytical_generation_provider_capture_bindings AS parent_input
-      ON parent_input.generation_sequence = parent.generation_sequence
-    WHERE child.generation_sequence = NEW.generation_sequence
-      AND parent_input.binding_digest = NEW.binding_digest
-      AND parent_input.run_id = NEW.run_id
-      AND parent_input.source_id = NEW.source_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation provider capture binding is invalid');
@@ -2873,34 +2851,6 @@ WHEN NOT EXISTS (
     FROM market_bar_history_publications AS publication
     WHERE publication.publication_receipt_digest = NEW.publication_receipt_digest
       AND publication.origin_generation_sequence = NEW.generation_sequence
-      AND (
-        (publication.requested_start_ns IS NOT NULL AND EXISTS (
-          SELECT 1 FROM analytical_generation_provider_capture_bindings AS input
-          WHERE input.generation_sequence = NEW.generation_sequence
-            AND input.binding_digest = publication.binding_digest
-            AND input.source_id = publication.source_id
-        )) OR (publication.requested_start_date IS NOT NULL AND EXISTS (
-          SELECT 1 FROM analytical_generation_provider_publication_bindings AS input
-          WHERE input.generation_sequence = NEW.generation_sequence
-            AND input.publication_digest = publication.binding_digest
-            AND input.publication_kind = 'provider_logical'
-            AND input.source_id = publication.source_id
-        ))
-      )
-)
-AND NOT EXISTS (
-    SELECT 1
-    FROM analytical_generations AS child
-    JOIN analytical_generation_parents AS edge
-      ON edge.child_dataset_id = child.dataset_id
-     AND edge.child_manifest_version = child.manifest_version
-    JOIN analytical_generation_market_bar_history_inputs AS parent_input
-      ON parent_input.generation_sequence = edge.parent_generation_sequence
-    JOIN market_bar_history_publications AS publication
-      ON publication.publication_receipt_digest = parent_input.publication_receipt_digest
-    WHERE child.generation_sequence = NEW.generation_sequence
-      AND child.generation_kind IN ('ingest', 'compaction', 'derived')
-      AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest
       AND (
         (publication.requested_start_ns IS NOT NULL AND EXISTS (
           SELECT 1 FROM analytical_generation_provider_capture_bindings AS input
@@ -4217,6 +4167,9 @@ ON fund_nav_publications(
     publication_receipt_digest
 );
 
+CREATE INDEX fund_nav_publications_origin
+ON fund_nav_publications(origin_generation_sequence, publication_receipt_digest);
+
 CREATE INDEX analytical_generation_fund_nav_receipt
 ON analytical_generation_fund_nav_inputs(
     publication_receipt_digest,
@@ -4283,23 +4236,6 @@ WHEN NOT EXISTS (
      AND capture_input.binding_digest = publication.binding_digest
     WHERE publication.publication_receipt_digest = NEW.publication_receipt_digest
       AND publication.origin_generation_sequence = NEW.generation_sequence
-)
-AND NOT EXISTS (
-    SELECT 1
-    FROM analytical_generations AS child
-    JOIN analytical_generation_parents AS edge
-      ON edge.child_dataset_id = child.dataset_id
-     AND edge.child_manifest_version = child.manifest_version
-    JOIN analytical_generation_fund_nav_inputs AS parent_input
-      ON parent_input.generation_sequence = edge.parent_generation_sequence
-    JOIN fund_nav_publications AS publication
-      ON publication.publication_receipt_digest = parent_input.publication_receipt_digest
-    JOIN analytical_generation_provider_capture_bindings AS capture_input
-      ON capture_input.generation_sequence = NEW.generation_sequence
-     AND capture_input.binding_digest = publication.binding_digest
-    WHERE child.generation_sequence = NEW.generation_sequence
-      AND child.generation_kind IN ('ingest', 'compaction', 'derived')
-      AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation Fund NAV input is invalid');

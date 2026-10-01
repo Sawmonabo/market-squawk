@@ -1,12 +1,10 @@
-//! Bounded successful-source closure and publication availability, shared by every writer.
+//! Direct-source and exact-parent publication availability, shared by every writer.
 
 use market_squawk_domain::Timestamp;
-use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
+use rusqlite::{OptionalExtension as _, Transaction, params};
 
 use super::{DatasetManifestRef, ManifestCatalogError};
 use crate::catalog::trusted_catalog_now;
-
-const MAX_GENERATION_SOURCE_RUNS: usize = 4_096;
 
 pub(crate) fn finalize_generation_availability(
     transaction: &Transaction<'_>,
@@ -35,16 +33,33 @@ pub(crate) fn finalize_generation_availability(
     {
         return Ok(Timestamp::from_unix_nanos(available));
     }
-    insert_generation_transitive_source_runs(transaction, sequence)?;
-    let (count, succeeded, completed): (i64, bool, Option<i64>) = transaction.query_row(
-        "SELECT COUNT(*), COALESCE(MIN(run.state='succeeded' AND run.completed_at_ns IS NOT NULL), 0),
+    let (count, succeeded, direct_completed): (i64, bool, Option<i64>) = transaction.query_row(
+        "SELECT COUNT(*), COALESCE(MIN(run.state='succeeded' AND run.completed_at_ns IS NOT NULL), 1),
                 MAX(run.completed_at_ns)
-         FROM analytical_generation_transitive_source_runs AS input
+         FROM analytical_generation_source_inputs AS input
          JOIN ingest_runs AS run USING (run_id) WHERE input.generation_sequence=?1",
         [sequence], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    let completed = completed
-        .filter(|_| succeeded)
+    let (expected_parents, actual_parents, parent_completed): (i64, i64, Option<i64>) = transaction
+        .query_row(
+            "SELECT generation.parent_count, COUNT(proof.generation_sequence),
+                MAX(proof.source_runs_completed_at_ns)
+         FROM analytical_generations AS generation
+         LEFT JOIN analytical_generation_parents AS edge
+           ON edge.child_dataset_id=generation.dataset_id
+          AND edge.child_manifest_version=generation.manifest_version
+         LEFT JOIN analytical_generation_source_availability_proofs AS proof
+           ON proof.generation_sequence=edge.parent_generation_sequence
+         WHERE generation.generation_sequence=?1
+         GROUP BY generation.generation_sequence",
+            [sequence],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let completed = direct_completed
+        .into_iter()
+        .chain(parent_completed)
+        .max()
+        .filter(|_| succeeded && count <= 1 && actual_parents == expected_parents)
         .ok_or(ManifestCatalogError::SourceRunsIncomplete)?;
     // All objects, parent edges, bindings and run-success transitions precede this sample.
     let now = trusted_catalog_now(transaction)?;
@@ -53,114 +68,10 @@ pub(crate) fn finalize_generation_availability(
     }
     transaction.execute(
         "INSERT INTO analytical_generation_source_availability_proofs
-         (generation_sequence, transaction_available_at_ns, source_run_count,
+         (generation_sequence, transaction_available_at_ns, direct_source_run_count,
           source_runs_completed_at_ns, effective_available_at_ns)
          VALUES (?1, ?2, ?3, ?4, ?2)",
         params![sequence, now.unix_nanos(), count, completed],
     )?;
     Ok(now)
-}
-
-fn insert_generation_transitive_source_runs(
-    transaction: &Transaction<'_>,
-    generation_sequence: i64,
-) -> Result<(), ManifestCatalogError> {
-    if generation_sequence <= 0 {
-        return Err(ManifestCatalogError::CorruptCatalog);
-    }
-    let (candidate_count, distinct_runs): (i64, i64) = transaction.query_row(
-        "WITH candidates AS (
-             SELECT direct.run_id, direct.source_id, direct.rights_id
-             FROM analytical_generation_source_inputs AS direct
-             WHERE direct.generation_sequence=?1
-             UNION
-             SELECT parent_input.run_id, parent_input.source_id, parent_input.rights_id
-             FROM analytical_generations AS child
-             JOIN analytical_generation_parents AS edge
-               ON edge.child_dataset_id=child.dataset_id
-              AND edge.child_manifest_version=child.manifest_version
-             JOIN analytical_generation_transitive_source_runs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-         )
-         SELECT COUNT(*), COUNT(DISTINCT run_id) FROM candidates",
-        [generation_sequence],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let candidate_count =
-        usize::try_from(candidate_count).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-    if candidate_count == 0
-        || candidate_count > MAX_GENERATION_SOURCE_RUNS
-        || i64::try_from(candidate_count).ok() != Some(distinct_runs)
-    {
-        return Err(ManifestCatalogError::SourceRunInputLimitExceeded {
-            max: MAX_GENERATION_SOURCE_RUNS,
-        });
-    }
-    let inserted = transaction.execute(
-        "INSERT INTO analytical_generation_transitive_source_runs
-         (generation_sequence, input_ordinal, run_id, source_id, rights_id)
-         WITH candidates AS (
-             SELECT direct.run_id, direct.source_id, direct.rights_id
-             FROM analytical_generation_source_inputs AS direct
-             WHERE direct.generation_sequence=?1
-             UNION
-             SELECT parent_input.run_id, parent_input.source_id, parent_input.rights_id
-             FROM analytical_generations AS child
-             JOIN analytical_generation_parents AS edge
-               ON edge.child_dataset_id=child.dataset_id
-              AND edge.child_manifest_version=child.manifest_version
-             JOIN analytical_generation_transitive_source_runs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-         )
-         SELECT ?1, ROW_NUMBER() OVER (ORDER BY run_id, source_id, rights_id) - 1,
-                run_id, source_id, rights_id
-         FROM candidates
-         ORDER BY run_id, source_id, rights_id",
-        [generation_sequence],
-    )?;
-    if inserted != candidate_count
-        || !generation_transitive_source_runs_match(transaction, generation_sequence)?
-    {
-        return Err(ManifestCatalogError::CorruptCatalog);
-    }
-    Ok(())
-}
-
-fn generation_transitive_source_runs_match(
-    connection: &Connection,
-    generation_sequence: i64,
-) -> Result<bool, ManifestCatalogError> {
-    connection
-        .query_row(
-            "WITH candidates AS (
-                 SELECT direct.run_id, direct.source_id, direct.rights_id
-                 FROM analytical_generation_source_inputs AS direct
-                 WHERE direct.generation_sequence=?1
-                 UNION
-                 SELECT parent_input.run_id, parent_input.source_id, parent_input.rights_id
-                 FROM analytical_generations AS child
-                 JOIN analytical_generation_parents AS edge
-                   ON edge.child_dataset_id=child.dataset_id
-                  AND edge.child_manifest_version=child.manifest_version
-                 JOIN analytical_generation_transitive_source_runs AS parent_input
-                   ON parent_input.generation_sequence=edge.parent_generation_sequence
-                 WHERE child.generation_sequence=?1
-             ), expected AS (
-                 SELECT ROW_NUMBER() OVER (ORDER BY run_id, source_id, rights_id) - 1
-                            AS input_ordinal,
-                        run_id, source_id, rights_id
-                 FROM candidates
-             ), actual AS (
-                 SELECT input_ordinal, run_id, source_id, rights_id
-                 FROM analytical_generation_transitive_source_runs
-                 WHERE generation_sequence=?1
-             )
-             SELECT NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM actual)
-                AND NOT EXISTS(SELECT * FROM actual EXCEPT SELECT * FROM expected)",
-            [generation_sequence],
-            |row| row.get(0),
-        )
-        .map_err(ManifestCatalogError::from)
 }

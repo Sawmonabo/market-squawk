@@ -1025,62 +1025,14 @@ WHERE EXISTS (
 
 DROP TABLE research_use_authority_migration_guard;
 
-CREATE TABLE analytical_generation_transitive_source_runs (
-    generation_sequence INTEGER NOT NULL
-        REFERENCES analytical_generations(generation_sequence),
-    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
-    run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
-    source_id TEXT NOT NULL REFERENCES sources(source_id),
-    rights_id BLOB NOT NULL REFERENCES source_rights(rights_id),
-    PRIMARY KEY (generation_sequence, input_ordinal),
-    UNIQUE (generation_sequence, run_id)
-) STRICT, WITHOUT ROWID;
-
-CREATE TRIGGER analytical_generation_transitive_source_runs_guarded_insert
-BEFORE INSERT ON analytical_generation_transitive_source_runs
-WHEN EXISTS (
-    SELECT 1 FROM analytical_generation_source_availability_proofs
-    WHERE generation_sequence=NEW.generation_sequence
-) OR (NOT EXISTS (
-    SELECT 1
-    FROM analytical_generation_source_inputs AS direct
-    WHERE direct.generation_sequence = NEW.generation_sequence
-      AND direct.run_id = NEW.run_id
-      AND direct.source_id = NEW.source_id
-      AND direct.rights_id = NEW.rights_id
-)
-AND NOT EXISTS (
-    SELECT 1
-    FROM analytical_generations AS child
-    JOIN analytical_generation_parents AS edge
-      ON edge.child_dataset_id = child.dataset_id
-     AND edge.child_manifest_version = child.manifest_version
-    JOIN analytical_generation_transitive_source_runs AS parent_input
-      ON parent_input.generation_sequence = edge.parent_generation_sequence
-    WHERE child.generation_sequence = NEW.generation_sequence
-      AND parent_input.run_id = NEW.run_id
-      AND parent_input.source_id = NEW.source_id
-      AND parent_input.rights_id = NEW.rights_id
-))
-BEGIN
-    SELECT RAISE(ABORT, 'analytical generation transitive source run is invalid');
-END;
-
-CREATE TRIGGER analytical_generation_transitive_source_runs_immutable_update
-BEFORE UPDATE ON analytical_generation_transitive_source_runs BEGIN
-    SELECT RAISE(ABORT, 'analytical generation transitive source runs are immutable');
-END;
-
-CREATE TRIGGER analytical_generation_transitive_source_runs_immutable_delete
-BEFORE DELETE ON analytical_generation_transitive_source_runs BEGIN
-    SELECT RAISE(ABORT, 'analytical generation transitive source runs are immutable');
-END;
+CREATE INDEX analytical_generation_source_inputs_by_run
+ON analytical_generation_source_inputs(run_id, source_id, generation_sequence);
 
 -- Availability is issued only after complete lineage and successful source/output runs.
 CREATE TABLE analytical_generation_source_availability_proofs (
     generation_sequence INTEGER PRIMARY KEY REFERENCES analytical_generations(generation_sequence),
     transaction_available_at_ns INTEGER NOT NULL,
-    source_run_count INTEGER NOT NULL CHECK (source_run_count BETWEEN 1 AND 4096),
+    direct_source_run_count INTEGER NOT NULL CHECK (direct_source_run_count BETWEEN 0 AND 1),
     source_runs_completed_at_ns INTEGER NOT NULL,
     effective_available_at_ns INTEGER NOT NULL,
     CHECK (effective_available_at_ns = MAX(transaction_available_at_ns, source_runs_completed_at_ns))
@@ -1120,30 +1072,32 @@ WHEN NOT EXISTS (
                  OR output.created_at_ns>NEW.transaction_available_at_ns)
       )
 )
-OR NOT EXISTS (
-    SELECT 1 FROM analytical_generation_transitive_source_runs AS input
-    JOIN ingest_runs AS run ON run.run_id=input.run_id
-    WHERE input.generation_sequence=NEW.generation_sequence
-    GROUP BY input.generation_sequence
-    HAVING COUNT(*)=NEW.source_run_count
-       AND MIN(run.state='succeeded' AND run.completed_at_ns IS NOT NULL)=1
-       AND MAX(run.completed_at_ns)=NEW.source_runs_completed_at_ns
+OR NEW.direct_source_run_count <> (
+    SELECT COUNT(*) FROM analytical_generation_source_inputs
+    WHERE generation_sequence=NEW.generation_sequence
 )
 OR EXISTS (
-    SELECT run_id, source_id, rights_id FROM analytical_generation_source_inputs
-    WHERE generation_sequence=NEW.generation_sequence
-    UNION
-    SELECT input.run_id, input.source_id, input.rights_id
-    FROM analytical_generations AS child
-    JOIN analytical_generation_parents AS edge
-      ON edge.child_dataset_id=child.dataset_id
-     AND edge.child_manifest_version=child.manifest_version
-    JOIN analytical_generation_transitive_source_runs AS input
-      ON input.generation_sequence=edge.parent_generation_sequence
-    WHERE child.generation_sequence=NEW.generation_sequence
-    EXCEPT
-    SELECT run_id, source_id, rights_id FROM analytical_generation_transitive_source_runs
-    WHERE generation_sequence=NEW.generation_sequence
+    SELECT 1 FROM analytical_generation_source_inputs AS input
+    JOIN ingest_runs AS run USING (run_id)
+    WHERE input.generation_sequence=NEW.generation_sequence
+      AND (run.state<>'succeeded' OR run.completed_at_ns IS NULL)
+)
+OR NEW.source_runs_completed_at_ns IS NOT (
+    SELECT MAX(completed_at_ns) FROM (
+        SELECT run.completed_at_ns
+        FROM analytical_generation_source_inputs AS input
+        JOIN ingest_runs AS run USING (run_id)
+        WHERE input.generation_sequence=NEW.generation_sequence
+        UNION ALL
+        SELECT proof.source_runs_completed_at_ns
+        FROM analytical_generations AS child
+        JOIN analytical_generation_parents AS edge
+          ON edge.child_dataset_id=child.dataset_id
+         AND edge.child_manifest_version=child.manifest_version
+        JOIN analytical_generation_source_availability_proofs AS proof
+          ON proof.generation_sequence=edge.parent_generation_sequence
+        WHERE child.generation_sequence=NEW.generation_sequence
+    )
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation source availability proof is invalid');

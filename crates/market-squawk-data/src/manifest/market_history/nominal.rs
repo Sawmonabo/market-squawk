@@ -513,18 +513,20 @@ pub(super) fn select_nominal_history(
     }
     let exact = request.exact_manifest.as_ref();
     let mut statement=connection.prepare(
-        "SELECT selected_generation.dataset_id, selected_generation.manifest_version, selected_generation.content_hash,
+        &format!("SELECT selected_generation.dataset_id, selected_generation.manifest_version, selected_generation.content_hash,
                 publication.publication_receipt_digest, publication.published_at_ns, publication.origin_generation_sequence
          FROM analytical_available_generations AS selected_generation
          JOIN dataset_manifests AS selected_manifest ON selected_manifest.manifest_id=selected_generation.anchor_manifest_id
          JOIN artifacts AS selected_artifact ON selected_artifact.artifact_id=selected_manifest.artifact_id
          JOIN ingest_runs AS selected_run ON selected_run.run_id=selected_artifact.run_id
-         JOIN analytical_generation_market_bar_history_inputs AS history_input ON history_input.generation_sequence=selected_generation.generation_sequence
-         JOIN market_bar_history_publications AS publication USING(publication_receipt_digest)
+         JOIN market_bar_history_publications AS publication ON {contains_origin}
+         JOIN analytical_generation_market_bar_history_inputs AS history_input
+           ON history_input.generation_sequence=publication.origin_generation_sequence
+          AND history_input.publication_receipt_digest=publication.publication_receipt_digest
          JOIN ingest_runs AS origin_run ON origin_run.run_id=publication.origin_run_id
          JOIN provider_logical_publication_bindings AS binding ON binding.binding_digest=publication.binding_digest
          JOIN analytical_generation_provider_publication_bindings AS selected_capture
-           ON selected_capture.generation_sequence=selected_generation.generation_sequence
+           ON selected_capture.generation_sequence=publication.origin_generation_sequence
           AND selected_capture.publication_digest=publication.binding_digest
           AND selected_capture.publication_kind='provider_logical'
           AND selected_capture.source_id=publication.source_id
@@ -551,7 +553,7 @@ pub(super) fn select_nominal_history(
            AND (?14=0 OR json_extract(publication.receipt_json,'$.raw_bar_count')=publication.expected_bar_count)
          ORDER BY publication.published_at_ns DESC, publication.origin_generation_sequence DESC,
                   selected_generation.available_at_ns DESC, selected_generation.generation_sequence DESC
-         LIMIT 2")?;
+         LIMIT 2", contains_origin = generation_contains_origin_sql("selected_generation.generation_sequence", "publication.origin_generation_sequence")))?;
     let mut rows = statement.query(params![
         request.instrument_id.to_string(),
         date_key(start),
@@ -662,14 +664,16 @@ pub(super) fn resolve_nominal_request(
         .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?;
     let exact = request.exact_manifest.as_ref();
     let mut statement=connection.prepare(
-        "SELECT DISTINCT publication.provider_instrument_id,publication.venue_id
+        &format!("SELECT DISTINCT publication.provider_instrument_id,publication.venue_id
          FROM market_bar_history_publications AS publication
-         JOIN analytical_generation_market_bar_history_inputs AS input USING(publication_receipt_digest)
-         JOIN analytical_available_generations AS generation ON generation.generation_sequence=input.generation_sequence
+         JOIN analytical_generation_market_bar_history_inputs AS input
+           ON input.publication_receipt_digest=publication.publication_receipt_digest
+          AND input.generation_sequence=publication.origin_generation_sequence
+         JOIN analytical_available_generations AS generation ON {contains_origin}
          WHERE publication.instrument_id=?1 AND publication.source_id='tiingo-starter'
            AND publication.requested_start_date=?2 AND publication.requested_end_date=?3 AND publication.published_at_ns<=?4
            AND generation.available_at_ns<=?4 AND (?5 IS NULL OR (generation.dataset_id=?5 AND generation.manifest_version=?6 AND generation.content_hash=?7))
-         ORDER BY publication.provider_instrument_id,publication.venue_id LIMIT 2")?;
+         ORDER BY publication.provider_instrument_id,publication.venue_id LIMIT 2", contains_origin = generation_contains_origin_sql("generation.generation_sequence", "publication.origin_generation_sequence")))?;
     let mut rows = statement.query(params![
         request.instrument_id.to_string(),
         date_key(start),

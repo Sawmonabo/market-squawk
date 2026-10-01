@@ -56,14 +56,11 @@ impl SecResearchReadCapability {
             deadline,
             cancellation: &cancellation,
         };
-        if !self
-            .manifests
-            .provider_publication_bindings(request.manifest())?
-            .iter()
-            .any(|(digest, kind)| {
-                *digest == request.provider_binding_digest() && kind == "provider_logical"
-            })
-        {
+        if !self.manifests.has_provider_publication(
+            request.manifest(),
+            request.provider_binding_digest(),
+            "provider_logical",
+        )? {
             return Err(mismatch());
         }
         let binding = self

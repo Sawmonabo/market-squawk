@@ -22,9 +22,10 @@ use market_squawk_data::{
     IngestPrecommitAuthority, OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
     PersistedProviderCaptureBindingEvidence, PersistedProviderOptionMarketBindingEvidence,
     PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderMarketEventPublicationKind, ProviderOptionMarketArrowBatch, QueryLimits, RightsError,
-    SourceOperation, extraction_provider_payload_digest, provider_market_event_publication_digest,
-    provider_option_market_publication_digest,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderOptionMarketArrowBatch, ProviderOptionMarketPublicationSelector, QueryLimits,
+    RightsError, SourceOperation, extraction_provider_payload_digest,
+    provider_market_event_publication_digest, provider_option_market_publication_digest,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
@@ -891,16 +892,17 @@ impl YahooMarketEventRestartSelector {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<YahooMarketEventRestartReceipt, YahooEnrichmentPublicationError> {
-        let selector = research
-            .analytical()
-            .provider_market_event_publications(&self.manifest)?
-            .into_iter()
-            .find(|selector| {
-                selector.publication_digest() == self.publication_digest
-                    && selector.publication_kind()
-                        == ProviderMarketEventPublicationKind::ResponseMarketEvent
-            })
-            .ok_or(YahooEnrichmentPublicationError::RestartInvalid)?;
+        if !research.analytical().has_provider_publication(
+            &self.manifest,
+            self.publication_digest,
+            ProviderMarketEventPublicationKind::ResponseMarketEvent.as_str(),
+        )? {
+            return Err(YahooEnrichmentPublicationError::RestartInvalid);
+        }
+        let selector = ProviderMarketEventPublicationSelector::new(
+            self.publication_digest,
+            ProviderMarketEventPublicationKind::ResponseMarketEvent,
+        );
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()
@@ -975,15 +977,21 @@ impl YahooOptionRestartSelector {
         research: &ResearchService,
         cancellation: CancellationToken,
     ) -> Result<YahooOptionRestartReceipt, YahooEnrichmentPublicationError> {
-        let selector = research
-            .analytical()
-            .provider_option_market_publications(&self.manifest)?
-            .into_iter()
-            .find(|selector| {
-                selector.publication_digest() == self.publication_digest
-                    && selector.publication_kind() == self.publication_kind
-            })
-            .ok_or(YahooEnrichmentPublicationError::RestartInvalid)?;
+        let publication_kind = match self.publication_kind {
+            OptionMarketBatchKind::Snapshots => "option_snapshots",
+            OptionMarketBatchKind::Expirations => "option_expirations",
+        };
+        if !research.analytical().has_provider_publication(
+            &self.manifest,
+            self.publication_digest,
+            publication_kind,
+        )? {
+            return Err(YahooEnrichmentPublicationError::RestartInvalid);
+        }
+        let selector = ProviderOptionMarketPublicationSelector::new(
+            self.publication_digest,
+            self.publication_kind,
+        );
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()

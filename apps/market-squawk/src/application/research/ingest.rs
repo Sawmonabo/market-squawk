@@ -1518,7 +1518,7 @@ impl ProviderMacroRestartBinding {
     ) -> Result<Self, ProviderMacroPublicationError> {
         let binding_digests = research
             .analytical()
-            .provider_capture_binding_digests(&manifest)?;
+            .provider_capture_binding_digests(&manifest, None, 2)?;
         let [binding_digest] = binding_digests.as_slice() else {
             return Err(ProviderMacroPublicationError::RestartMismatch);
         };

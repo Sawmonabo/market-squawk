@@ -22,7 +22,7 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::catalog::load_pinned;
+use super::catalog::{lineage::generation_contains_origin_sql, load_pinned};
 use super::{
     DatasetId, DatasetManifestRef, ManifestCatalogError, ManifestPlan, PinnedDataset, Sha256Digest,
 };
@@ -1794,24 +1794,22 @@ pub(super) fn insert_generation_market_bar_history_inputs(
         [generation_sequence],
         |row| row.get(0),
     )?;
-    let inherited_count: i64 = transaction.query_row(
-        "SELECT COUNT(*)
-         FROM analytical_generation_parents AS edge
-         JOIN analytical_generations AS child
-           ON child.dataset_id=edge.child_dataset_id
-          AND child.manifest_version=edge.child_manifest_version
-         JOIN analytical_generation_market_bar_history_inputs AS parent_input
-           ON parent_input.generation_sequence=edge.parent_generation_sequence
-         WHERE child.generation_sequence=?1
-           AND child.generation_kind IN ('ingest', 'compaction', 'derived')",
+    let has_inherited: bool = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM market_bar_history_publications AS publication
+                 JOIN analytical_generation_market_bar_history_inputs AS input
+                   ON input.generation_sequence=publication.origin_generation_sequence
+                  AND input.publication_receipt_digest=publication.publication_receipt_digest
+                 WHERE publication.origin_generation_sequence<?1 AND {contains_origin}
+             )",
+            contains_origin =
+                generation_contains_origin_sql("?1", "publication.origin_generation_sequence",),
+        ),
         [generation_sequence],
         |row| row.get(0),
     )?;
-    if inherited_count < 0
-        || usize::try_from(inherited_count)
-            .ok()
-            .is_none_or(|count| count > MAX_GENERATION_MARKET_BAR_HISTORY_INPUTS)
-        || (kind == "ingest" && inherited_count > 0 && candidate.is_none())
+    if (kind == "ingest" && has_inherited && candidate.is_none())
         || (candidate.is_some() && (kind != "ingest" || source_input.is_none()))
     {
         return Err(ManifestCatalogError::MarketBarHistoryMismatch);
@@ -1887,16 +1885,6 @@ pub(crate) fn propagate_generation_market_bar_history_inputs(
         "INSERT INTO analytical_generation_market_bar_history_inputs
          (generation_sequence, input_ordinal, publication_receipt_digest)
          WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_market_bar_history_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
-             UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
              WHERE publication.origin_generation_sequence=?1
@@ -1915,16 +1903,6 @@ pub(crate) fn propagate_generation_market_bar_history_inputs(
     )?;
     let expected: i64 = transaction.query_row(
         "WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_market_bar_history_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
-             UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
              WHERE publication.origin_generation_sequence=?1
@@ -1950,18 +1928,14 @@ fn validate_inherited_series(
     candidate: &MarketBarHistoryPublicationCandidate,
     asset_class: AssetClass,
 ) -> Result<(), ManifestCatalogError> {
-    let mismatches: i64 = transaction.query_row(
-        "SELECT COUNT(*)
-         FROM analytical_generation_parents AS edge
-         JOIN analytical_generations AS child
-           ON child.dataset_id=edge.child_dataset_id
-          AND child.manifest_version=edge.child_manifest_version
-         JOIN analytical_generation_market_bar_history_inputs AS parent_input
-           ON parent_input.generation_sequence=edge.parent_generation_sequence
-         JOIN market_bar_history_publications AS publication
-           USING (publication_receipt_digest)
-         WHERE child.generation_sequence=?1
-           AND child.generation_kind IN ('ingest', 'compaction')
+    let mismatches: bool = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(
+             SELECT 1 FROM market_bar_history_publications AS publication
+             JOIN analytical_generation_market_bar_history_inputs AS input
+               ON input.generation_sequence=publication.origin_generation_sequence
+              AND input.publication_receipt_digest=publication.publication_receipt_digest
+             WHERE publication.origin_generation_sequence<?1 AND {contains_origin}
            AND (
                publication.source_id<>?2
                OR publication.instrument_id<>?3
@@ -1976,7 +1950,10 @@ fn validate_inherited_series(
                OR publication.session_ruleset<>?11
                OR publication.graph_purpose<>?12
                OR publication.currency<>?13
-           )",
+           ))",
+            contains_origin =
+                generation_contains_origin_sql("?1", "publication.origin_generation_sequence",),
+        ),
         params![
             generation_sequence,
             candidate.source_id.as_str(),
@@ -1995,7 +1972,7 @@ fn validate_inherited_series(
         ],
         |row| row.get(0),
     )?;
-    if mismatches == 0 {
+    if !mismatches {
         Ok(())
     } else {
         Err(ManifestCatalogError::MarketBarHistoryMismatch)
@@ -2299,16 +2276,6 @@ pub(super) fn generation_market_bar_history_inputs_match_manifest(
     )?;
     let expected: i64 = connection.query_row(
         "WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_market_bar_history_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
-             UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
              WHERE publication.origin_generation_sequence=?1
@@ -2346,16 +2313,6 @@ pub(super) fn generation_market_bar_history_inputs_match_manifest(
     )?;
     let exact: bool = connection.query_row(
         "WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_market_bar_history_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
-             UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
              WHERE publication.origin_generation_sequence=?1
@@ -2565,7 +2522,7 @@ fn resolve_canonical_market_bar_history_series(
         exact.map_or(0, |manifest| i64::from(manifest.schema_version().get()));
     let exact_fingerprint = exact.map_or(zero_digest, |manifest| manifest.schema().fingerprint());
     let exact_content = exact.map_or(zero_digest, |manifest| manifest.content_hash().bytes());
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT DISTINCT
                 publication.source_id,
                 publication.asset_class,
@@ -2586,10 +2543,10 @@ fn resolve_canonical_market_bar_history_series(
            ON selected_artifact.artifact_id=selected_manifest.artifact_id
          JOIN ingest_runs AS selected_run
            ON selected_run.run_id=selected_artifact.run_id
+         JOIN market_bar_history_publications AS publication ON {contains_origin}
          JOIN analytical_generation_market_bar_history_inputs AS history_input
-           ON history_input.generation_sequence=selected_generation.generation_sequence
-         JOIN market_bar_history_publications AS publication
-           USING (publication_receipt_digest)
+           ON history_input.generation_sequence=publication.origin_generation_sequence
+          AND history_input.publication_receipt_digest=publication.publication_receipt_digest
          JOIN ingest_runs AS origin_run
            ON origin_run.run_id=publication.origin_run_id
          JOIN provider_capture_bindings AS binding
@@ -2597,7 +2554,7 @@ fn resolve_canonical_market_bar_history_series(
          JOIN provider_raw_observations AS capture
            ON capture.capture_observation_digest=binding.capture_observation_digest
          JOIN analytical_generation_provider_capture_bindings AS selected_capture
-           ON selected_capture.generation_sequence=selected_generation.generation_sequence
+           ON selected_capture.generation_sequence=publication.origin_generation_sequence
           AND selected_capture.binding_digest=publication.binding_digest
          WHERE publication.instrument_id=?1
            AND publication.requested_start_ns IS ?13
@@ -2661,7 +2618,11 @@ fn resolve_canonical_market_bar_history_series(
                   publication.graph_purpose,
                   publication.currency
          LIMIT 2",
-    )?;
+        contains_origin = generation_contains_origin_sql(
+            "selected_generation.generation_sequence",
+            "publication.origin_generation_sequence"
+        )
+    ))?;
     let rows = statement.query_map(
         params![
             request.instrument_id().to_string(),
@@ -2876,18 +2837,23 @@ pub(super) fn exact_canonical_market_bar_history_window(
         return Err(ManifestCatalogError::MarketBarHistoryMismatch);
     }
     let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT DISTINCT generation.dataset_id, generation.manifest_version,
                 substr(publication.receipt_json,1,4194305)
          FROM analytical_generations AS generation
+         JOIN market_bar_history_publications AS publication ON {contains_origin}
          JOIN analytical_generation_market_bar_history_inputs AS input
-           ON input.generation_sequence=generation.generation_sequence
-         JOIN market_bar_history_publications AS publication USING(publication_receipt_digest)
+           ON input.generation_sequence=publication.origin_generation_sequence
+          AND input.publication_receipt_digest=publication.publication_receipt_digest
          WHERE generation.content_hash=?1 AND publication.instrument_id=?2
            AND generation.schema_name=?3 AND generation.schema_version=?4
            AND generation.schema_fingerprint=?5
          LIMIT 2",
-    )?;
+        contains_origin = generation_contains_origin_sql(
+            "generation.generation_sequence",
+            "publication.origin_generation_sequence"
+        )
+    ))?;
     let mut rows = statement.query(params![
         selected_content_hash.bytes(),
         instrument_id.to_string(),
@@ -2979,7 +2945,7 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
         return Ok(Some(selection));
     }
     let canonical_schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT DISTINCT
                 publication.requested_start_ns,
                 publication.requested_end_ns,
@@ -2994,10 +2960,10 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
            ON selected_artifact.artifact_id=selected_manifest.artifact_id
          JOIN ingest_runs AS selected_run
            ON selected_run.run_id=selected_artifact.run_id
+         JOIN market_bar_history_publications AS publication ON {contains_origin}
          JOIN analytical_generation_market_bar_history_inputs AS history_input
-           ON history_input.generation_sequence=selected_generation.generation_sequence
-         JOIN market_bar_history_publications AS publication
-           USING (publication_receipt_digest)
+           ON history_input.generation_sequence=publication.origin_generation_sequence
+          AND history_input.publication_receipt_digest=publication.publication_receipt_digest
          JOIN ingest_runs AS origin_run
            ON origin_run.run_id=publication.origin_run_id
          JOIN provider_capture_bindings AS binding
@@ -3005,7 +2971,7 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
          JOIN provider_raw_observations AS capture
            ON capture.capture_observation_digest=binding.capture_observation_digest
          JOIN analytical_generation_provider_capture_bindings AS selected_capture
-           ON selected_capture.generation_sequence=selected_generation.generation_sequence
+           ON selected_capture.generation_sequence=publication.origin_generation_sequence
           AND selected_capture.binding_digest=publication.binding_digest
          WHERE publication.instrument_id=?1
            AND selected_generation.schema_name=?3
@@ -3056,7 +3022,11 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
                   publication.coverage_first_ns ASC,
                   publication.coverage_last_ns DESC
          LIMIT 2",
-    )?;
+        contains_origin = generation_contains_origin_sql(
+            "selected_generation.generation_sequence",
+            "publication.origin_generation_sequence"
+        )
+    ))?;
     let rows = statement.query_map(
         params![
             request.instrument_id().to_string(),
@@ -3199,7 +3169,8 @@ fn ensure_unambiguous_history_series(
     let exact_fingerprint = exact.map_or(zero_digest, |manifest| manifest.schema().fingerprint());
     let exact_content = exact.map_or(zero_digest, |manifest| manifest.content_hash().bytes());
     let series_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM (
+        &format!(
+            "SELECT COUNT(*) FROM (
              SELECT publication.asset_class
              FROM analytical_generations AS selected_generation
              JOIN dataset_manifests AS selected_manifest
@@ -3208,10 +3179,10 @@ fn ensure_unambiguous_history_series(
                ON selected_artifact.artifact_id=selected_manifest.artifact_id
              JOIN ingest_runs AS selected_run
                ON selected_run.run_id=selected_artifact.run_id
-             JOIN analytical_generation_market_bar_history_inputs AS history_input
-               ON history_input.generation_sequence=selected_generation.generation_sequence
-             JOIN market_bar_history_publications AS publication
-               USING (publication_receipt_digest)
+             JOIN market_bar_history_publications AS publication ON {contains_origin}
+         JOIN analytical_generation_market_bar_history_inputs AS history_input
+           ON history_input.generation_sequence=publication.origin_generation_sequence
+          AND history_input.publication_receipt_digest=publication.publication_receipt_digest
              JOIN ingest_runs AS origin_run
                ON origin_run.run_id=publication.origin_run_id
              JOIN provider_capture_bindings AS binding
@@ -3219,7 +3190,7 @@ fn ensure_unambiguous_history_series(
              JOIN provider_raw_observations AS capture
                ON capture.capture_observation_digest=binding.capture_observation_digest
              JOIN analytical_generation_provider_capture_bindings AS selected_capture
-               ON selected_capture.generation_sequence=selected_generation.generation_sequence
+               ON selected_capture.generation_sequence=publication.origin_generation_sequence
               AND selected_capture.binding_digest=publication.binding_digest
              WHERE publication.instrument_id=?1
                AND publication.requested_start_ns IS ?13
@@ -3274,6 +3245,11 @@ fn ensure_unambiguous_history_series(
              GROUP BY publication.asset_class
              LIMIT 2
          )",
+            contains_origin = generation_contains_origin_sql(
+                "selected_generation.generation_sequence",
+                "publication.origin_generation_sequence"
+            )
+        ),
         params![
             request.instrument_id().to_string(),
             request.knowledge_cutoff().unix_nanos(),
@@ -3348,7 +3324,8 @@ pub(super) fn select_complete_market_bar_history(
         }
         let digest = connection
             .query_row(
-                "SELECT publication.publication_receipt_digest
+                &format!(
+                    "SELECT publication.publication_receipt_digest
                  FROM analytical_available_generations AS selected_generation
                  JOIN dataset_manifests AS selected_manifest
                    ON selected_manifest.manifest_id=selected_generation.anchor_manifest_id
@@ -3356,10 +3333,10 @@ pub(super) fn select_complete_market_bar_history(
                    ON selected_artifact.artifact_id=selected_manifest.artifact_id
                  JOIN ingest_runs AS selected_run
                    ON selected_run.run_id=selected_artifact.run_id
-                 JOIN analytical_generation_market_bar_history_inputs AS history_input
-                   ON history_input.generation_sequence=selected_generation.generation_sequence
-                 JOIN market_bar_history_publications AS publication
-                   USING (publication_receipt_digest)
+                 JOIN market_bar_history_publications AS publication ON {contains_origin}
+         JOIN analytical_generation_market_bar_history_inputs AS history_input
+           ON history_input.generation_sequence=publication.origin_generation_sequence
+          AND history_input.publication_receipt_digest=publication.publication_receipt_digest
                  JOIN ingest_runs AS origin_run
                    ON origin_run.run_id=publication.origin_run_id
                  JOIN provider_capture_bindings AS binding
@@ -3367,7 +3344,7 @@ pub(super) fn select_complete_market_bar_history(
                  JOIN provider_raw_observations AS capture
                    ON capture.capture_observation_digest=binding.capture_observation_digest
                  JOIN analytical_generation_provider_capture_bindings AS selected_capture
-                   ON selected_capture.generation_sequence=selected_generation.generation_sequence
+                   ON selected_capture.generation_sequence=publication.origin_generation_sequence
                   AND selected_capture.binding_digest=publication.binding_digest
                  WHERE selected_generation.dataset_id=?1
                    AND selected_generation.manifest_version=?2
@@ -3418,6 +3395,11 @@ pub(super) fn select_complete_market_bar_history(
                           publication.origin_generation_sequence DESC,
                           publication.publication_receipt_digest DESC
                  LIMIT 1",
+                    contains_origin = generation_contains_origin_sql(
+                        "selected_generation.generation_sequence",
+                        "publication.origin_generation_sequence"
+                    )
+                ),
                 params![
                     exact.dataset_id().as_str(),
                     i64::try_from(exact.manifest_version())
@@ -3464,7 +3446,8 @@ pub(super) fn select_complete_market_bar_history(
     } else {
         connection
             .query_row(
-                "SELECT selected_generation.dataset_id,
+                &format!(
+                    "SELECT selected_generation.dataset_id,
                         selected_generation.manifest_version,
                         selected_generation.schema_name,
                         selected_generation.schema_version,
@@ -3478,10 +3461,10 @@ pub(super) fn select_complete_market_bar_history(
                    ON selected_artifact.artifact_id=selected_manifest.artifact_id
                  JOIN ingest_runs AS selected_run
                    ON selected_run.run_id=selected_artifact.run_id
-                 JOIN analytical_generation_market_bar_history_inputs AS history_input
-                   ON history_input.generation_sequence=selected_generation.generation_sequence
-                 JOIN market_bar_history_publications AS publication
-                   USING (publication_receipt_digest)
+                 JOIN market_bar_history_publications AS publication ON {contains_origin}
+         JOIN analytical_generation_market_bar_history_inputs AS history_input
+           ON history_input.generation_sequence=publication.origin_generation_sequence
+          AND history_input.publication_receipt_digest=publication.publication_receipt_digest
                  JOIN ingest_runs AS origin_run
                    ON origin_run.run_id=publication.origin_run_id
                  JOIN provider_capture_bindings AS binding
@@ -3489,7 +3472,7 @@ pub(super) fn select_complete_market_bar_history(
                  JOIN provider_raw_observations AS capture
                    ON capture.capture_observation_digest=binding.capture_observation_digest
                  JOIN analytical_generation_provider_capture_bindings AS selected_capture
-                   ON selected_capture.generation_sequence=selected_generation.generation_sequence
+                   ON selected_capture.generation_sequence=publication.origin_generation_sequence
                   AND selected_capture.binding_digest=publication.binding_digest
                  WHERE publication.instrument_id=?1
                    AND selected_generation.schema_name=?3
@@ -3539,6 +3522,11 @@ pub(super) fn select_complete_market_bar_history(
                           selected_generation.available_at_ns DESC,
                           selected_generation.generation_sequence DESC
                  LIMIT 1",
+                    contains_origin = generation_contains_origin_sql(
+                        "selected_generation.generation_sequence",
+                        "publication.origin_generation_sequence"
+                    )
+                ),
                 params![
                     request.instrument_id().to_string(),
                     request.knowledge_cutoff().unix_nanos(),

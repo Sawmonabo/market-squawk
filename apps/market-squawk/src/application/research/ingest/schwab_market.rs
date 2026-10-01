@@ -33,7 +33,8 @@ use market_squawk_data::{
     CommittedDataset, DatasetId, IngestError, IngestIdentity, IngestPrecommitAuthority,
     PersistedProviderCaptureBindingEvidence, PersistedProviderOptionMarketBindingEvidence,
     PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderMarketEventPublicationKind, ProviderOptionMarketArrowBatch, RightsError,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderOptionMarketArrowBatch, ProviderOptionMarketPublicationSelector, RightsError,
     SourceOperation, extraction_provider_payload_digest, provider_market_event_publication_digest,
     provider_option_market_publication_digest,
 };
@@ -1202,15 +1203,17 @@ impl SchwabMarketEventRestartSelector {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<SchwabMarketEventRestartReceipt, SchwabMarketPublicationError> {
-        let selector = research
-            .analytical()
-            .provider_market_event_publications(&self.manifest)?
-            .into_iter()
-            .find(|selector| {
-                selector.publication_digest() == self.publication_digest
-                    && selector.publication_kind() == self.publication_kind
-            })
-            .ok_or(SchwabMarketPublicationError::RestartInvalid)?;
+        if !research.analytical().has_provider_publication(
+            &self.manifest,
+            self.publication_digest,
+            self.publication_kind.as_str(),
+        )? {
+            return Err(SchwabMarketPublicationError::RestartInvalid);
+        }
+        let selector = ProviderMarketEventPublicationSelector::new(
+            self.publication_digest,
+            self.publication_kind,
+        );
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()
@@ -1447,15 +1450,21 @@ impl SchwabOptionMarketRestartSelector {
         research: &ResearchService,
         cancellation: CancellationToken,
     ) -> Result<SchwabOptionMarketRestartReceipt, SchwabMarketPublicationError> {
-        let selector = research
-            .analytical()
-            .provider_option_market_publications(&self.manifest)?
-            .into_iter()
-            .find(|selector| {
-                selector.publication_digest() == self.publication_digest
-                    && selector.publication_kind() == self.publication_kind
-            })
-            .ok_or(SchwabMarketPublicationError::RestartInvalid)?;
+        let publication_kind = match self.publication_kind {
+            OptionMarketBatchKind::Snapshots => "option_snapshots",
+            OptionMarketBatchKind::Expirations => "option_expirations",
+        };
+        if !research.analytical().has_provider_publication(
+            &self.manifest,
+            self.publication_digest,
+            publication_kind,
+        )? {
+            return Err(SchwabMarketPublicationError::RestartInvalid);
+        }
+        let selector = ProviderOptionMarketPublicationSelector::new(
+            self.publication_digest,
+            self.publication_kind,
+        );
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()

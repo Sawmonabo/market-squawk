@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::catalog::load_pinned;
+use super::catalog::{lineage::generation_contains_origin_sql, load_pinned};
 use super::{
     DatasetId, DatasetManifestRef, ManifestCatalogError, ManifestPlan, PinnedDataset, Sha256Digest,
 };
@@ -637,15 +637,6 @@ pub(crate) fn propagate_generation_fund_nav_inputs(
         "INSERT INTO analytical_generation_fund_nav_inputs
          (generation_sequence, input_ordinal, publication_receipt_digest)
          WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_fund_nav_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-             UNION
              SELECT publication_receipt_digest FROM fund_nav_publications
              WHERE origin_generation_sequence=?1
          )
@@ -660,15 +651,6 @@ pub(crate) fn propagate_generation_fund_nav_inputs(
     )?;
     let expected: i64 = transaction.query_row(
         "WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_fund_nav_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-             UNION
              SELECT publication_receipt_digest FROM fund_nav_publications
              WHERE origin_generation_sequence=?1
          ) SELECT COUNT(*) FROM candidates",
@@ -963,15 +945,6 @@ pub(super) fn generation_fund_nav_inputs_match_manifest(
     )?;
     let expected: i64 = connection.query_row(
         "WITH candidates AS (
-             SELECT parent_input.publication_receipt_digest
-             FROM analytical_generation_parents AS edge
-             JOIN analytical_generations AS child
-               ON child.dataset_id=edge.child_dataset_id
-              AND child.manifest_version=edge.child_manifest_version
-             JOIN analytical_generation_fund_nav_inputs AS parent_input
-               ON parent_input.generation_sequence=edge.parent_generation_sequence
-             WHERE child.generation_sequence=?1
-             UNION
              SELECT publication_receipt_digest FROM fund_nav_publications
              WHERE origin_generation_sequence=?1
          ) SELECT COUNT(*) FROM candidates",
@@ -985,7 +958,9 @@ pub(super) fn generation_fund_nav_inputs_match_manifest(
            ON capture.generation_sequence=input.generation_sequence
           AND capture.binding_digest=publication.binding_digest
          WHERE input.generation_sequence=?1
-           AND (publication.publication_receipt_digest IS NULL OR capture.binding_digest IS NULL)",
+           AND (publication.publication_receipt_digest IS NULL
+                OR publication.origin_generation_sequence<>input.generation_sequence
+                OR capture.binding_digest IS NULL)",
         [generation_sequence],
         |row| row.get(0),
     )?;
@@ -1016,7 +991,8 @@ pub(super) fn select_canonical_fund_nav(
     let exact = request.exact_manifest();
     let selected = connection
         .query_row(
-            "SELECT selected_generation.dataset_id, selected_generation.manifest_version,
+            &format!(
+                "SELECT selected_generation.dataset_id, selected_generation.manifest_version,
                     selected_generation.schema_name, selected_generation.schema_version,
                     selected_generation.schema_fingerprint, selected_generation.content_hash,
                     publication.publication_receipt_digest
@@ -1026,16 +1002,17 @@ pub(super) fn select_canonical_fund_nav(
              JOIN artifacts AS selected_artifact
                ON selected_artifact.artifact_id=selected_manifest.artifact_id
              JOIN ingest_runs AS selected_run ON selected_run.run_id=selected_artifact.run_id
-             JOIN analytical_generation_fund_nav_inputs AS input
-               ON input.generation_sequence=selected_generation.generation_sequence
-             JOIN fund_nav_publications AS publication USING (publication_receipt_digest)
+             JOIN fund_nav_publications AS publication ON {contains_origin}
+         JOIN analytical_generation_fund_nav_inputs AS input
+           ON input.generation_sequence=publication.origin_generation_sequence
+          AND input.publication_receipt_digest=publication.publication_receipt_digest
              JOIN ingest_runs AS origin_run ON origin_run.run_id=publication.origin_run_id
              JOIN provider_capture_bindings AS binding
                ON binding.binding_digest=publication.binding_digest
              JOIN provider_raw_observations AS capture
                ON capture.capture_observation_digest=binding.capture_observation_digest
              JOIN analytical_generation_provider_capture_bindings AS selected_capture
-               ON selected_capture.generation_sequence=selected_generation.generation_sequence
+               ON selected_capture.generation_sequence=publication.origin_generation_sequence
               AND selected_capture.binding_digest=publication.binding_digest
              WHERE publication.instrument_id=?1
                AND selected_generation.schema_name=?2
@@ -1065,6 +1042,11 @@ pub(super) fn select_canonical_fund_nav(
                       selected_generation.available_at_ns DESC,
                       selected_generation.generation_sequence DESC
              LIMIT 1",
+                contains_origin = generation_contains_origin_sql(
+                    "selected_generation.generation_sequence",
+                    "publication.origin_generation_sequence"
+                )
+            ),
             params![
                 request.instrument_id().to_string(),
                 schema.name(),
@@ -1160,12 +1142,14 @@ fn ensure_unambiguous_family(
 ) -> Result<(), ManifestCatalogError> {
     let exact = request.exact_manifest();
     let count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM (
+        &format!(
+            "SELECT COUNT(*) FROM (
              SELECT DISTINCT publication.source_family_digest
              FROM analytical_available_generations AS generation
-             JOIN analytical_generation_fund_nav_inputs AS input
-               ON input.generation_sequence=generation.generation_sequence
-             JOIN fund_nav_publications AS publication USING (publication_receipt_digest)
+             JOIN fund_nav_publications AS publication ON {contains_origin}
+         JOIN analytical_generation_fund_nav_inputs AS input
+           ON input.generation_sequence=publication.origin_generation_sequence
+          AND input.publication_receipt_digest=publication.publication_receipt_digest
              WHERE publication.instrument_id=?1
                AND generation.schema_name=?2 AND generation.schema_version=?3
                AND generation.schema_fingerprint=?4
@@ -1181,6 +1165,11 @@ fn ensure_unambiguous_family(
                AND (?8 IS NULL OR generation.content_hash=?8)
              LIMIT 2
          )",
+            contains_origin = generation_contains_origin_sql(
+                "generation.generation_sequence",
+                "publication.origin_generation_sequence"
+            )
+        ),
         params![
             request.instrument_id().to_string(),
             schema.name(),

@@ -14,8 +14,9 @@ use market_squawk_data::{
     DatasetId, DatasetManifestRef, IngestError, IngestIdentity, IngestPrecommitAuthority,
     OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
     PersistedProviderOptionMarketBindingEvidence, ProviderMarketEventPublicationKind,
-    ProviderOptionMarketArrowBatch, RightsError, SourceOperation,
-    provider_market_event_publication_digest, provider_option_market_publication_digest,
+    ProviderOptionMarketArrowBatch, ProviderOptionMarketPublicationSelector, RightsError,
+    SourceOperation, provider_market_event_publication_digest,
+    provider_option_market_publication_digest,
 };
 use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, LiveProvenance,
@@ -564,15 +565,21 @@ impl AlpacaOptionMarketRestartSelector {
         research: &ResearchService,
         cancellation: CancellationToken,
     ) -> Result<AlpacaOptionMarketRestartReceipt, AlpacaMarketPublicationError> {
-        let selector = research
-            .analytical()
-            .provider_option_market_publications(&self.manifest)?
-            .into_iter()
-            .find(|selector| {
-                selector.publication_digest() == self.publication_digest
-                    && selector.publication_kind() == self.publication_kind
-            })
-            .ok_or(AlpacaMarketPublicationError::RestartInvalid)?;
+        let publication_kind = match self.publication_kind {
+            OptionMarketBatchKind::Snapshots => "option_snapshots",
+            OptionMarketBatchKind::Expirations => "option_expirations",
+        };
+        if !research.analytical().has_provider_publication(
+            &self.manifest,
+            self.publication_digest,
+            publication_kind,
+        )? {
+            return Err(AlpacaMarketPublicationError::RestartInvalid);
+        }
+        let selector = ProviderOptionMarketPublicationSelector::new(
+            self.publication_digest,
+            self.publication_kind,
+        );
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()

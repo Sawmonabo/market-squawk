@@ -15,6 +15,20 @@ supersedes forced password storage in development and any conflicting import-onl
 
 ### Current outcomes and verification
 
+Direct-lineage integration evidence, 2026-10-01: existing event restart/compaction case passes (1.44s), complete stock-history/PIT/native-evidence restart passes (1.52s), and Fund NAV exact vertical passes (0.69s). The first event run exposed stale embedded schema hashes; lead updated the two current schema fingerprints in place and the rerun passed. No new migration or compatibility path. The application control-plane harness compiles with all changed callers (6m37s); no live or lifetime-scale acceptance is claimed. All implementation agents are frozen; the lead is closing the source-readiness wait before resuming active-row edits. The active-row implementation contract is recorded at `.agents/tmp/v1-first-stock/active-row-contract.md` and awaits the coherent integration checkpoint, not further owner approval.
+
+Owner authorized the recommended database-primary implementation on 2026-10-01; the lead owns the design choice. No further design permission is pending.
+
+Resumed integration wave, 2026-10-01, audit base `0e1a2291`: previous turn made progress by pushing the independently checked storage decision. Acceptance items 1/2/5/7 remain blocked by incomplete durable ingestion and source startup. No completed Brief or live-price claim.
+
+| Owner | Outcome and exact ownership | Dependency and smallest critical evidence |
+| --- | --- | --- |
+| Astra research_options_failure | Finish already-started direct-lineage consumers in data `manifest/catalog.rs`, `manifest/catalog/lineage.rs`, `manifest/availability.rs`, `provider_event_selection.rs`, `catalog/{provider_capture,provider_logical,read_snapshot}.rs`, and option-selection owner as discovered; data ingest/SEC changes already frozen | No new storage partition design. Shared SQL remains lead-owned. Existing publication/history/NAV restart and PIT cases must retain inherited evidence; report exact changed files before editing any additional owner. |
+| Astra first_brief_readiness | Concrete active-row ingestion implementation contract only, in `.agents/tmp/v1-first-stock/active-row-contract.md`; inspect current event writer/selector/schema and existing DataFusion providers | New database-primary direction; specify smallest producer-to-consumer slice and exact schema/API/file ownership, durable ack, late revisions and hot/archive union; no application edits, tests or independent framework. |
+| Lead | Canonical SQL, all source-startup/composition WIP, fixture integration, compilation, Git and runtime | Apply reviewed existing-schema edits, inspect released source startup, serialize one-job critical checks. Push a coherent independently useful checkpoint before starting further implementation. |
+
+All other implementation files remain frozen. Order: finish inherited lineage consumers + lead SQL/source integration → focused checks/push → database-primary active event slice using the concrete contract → native workflow. The lineage correction remains necessary for bulk history and exact saved evidence; it does not substitute for the active-row storage change. No new branches/worktrees or broad gate.
+
 Storage research synthesis, 2026-10-01 (independent evidence audit PASS; report SHA-256 `e52d52338685734c90c8b54b7c682f3d4a18dc79d0e06f88da1e0f57c6591b7d`): [decision report](../research/2026-10-01-market-data-storage/final-report.md)
 recommends database-primary active microbatches and indexed reads using SQLite, with bounded
 cold Parquet queried through existing DataFusion. This deliberately revises the prior control-plane-only

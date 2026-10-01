@@ -767,16 +767,20 @@ pub(super) fn load_selected_provider_capture_rows(
         let binding = if let Some(header) = headers.get(&binding_key) {
             Arc::clone(header)
         } else {
-            // Predicate joins the exact selected generation, including its already-retained
-            // cumulative lineage, to the original binding. No ancestor walk is needed.
+            // Resolve only this selected binding's creating generation, then verify exact
+            // parent membership. Capture bytes and native rows remain independently checked.
+            let membership = crate::manifest::generation_contains_origin_sql(
+                "?1",
+                "selected.generation_sequence",
+            );
             let (capture_len, sidecar_len): (i64, i64) = connection
                         .query_row(
-                            "SELECT length(raw.capture_json), COALESCE(length(native.batch_sidecar_payload),0)
+                            &format!("SELECT length(raw.capture_json), COALESCE(length(native.batch_sidecar_payload),0)
                      FROM analytical_generation_provider_capture_bindings AS selected
                      JOIN provider_capture_bindings AS binding ON binding.binding_digest=selected.binding_digest
                      JOIN provider_raw_observations AS raw ON raw.capture_observation_digest=binding.capture_observation_digest
                      JOIN provider_capture_binding_native_lineage AS native ON native.binding_digest=binding.binding_digest
-                     WHERE selected.generation_sequence=?1 AND selected.binding_digest=?2 AND selected.source_id=?3",
+                     WHERE selected.binding_digest=?2 AND selected.source_id=?3 AND {membership}"),
                             params![
                                 generation,
                                 digest_bytes(coordinate.binding_digest),

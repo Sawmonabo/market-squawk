@@ -26,7 +26,8 @@ use market_squawk_data::{
     IngestPrecommitAuthority, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
-    ProviderMarketEventSelectionError, ProviderMarketEventTiePolicy, RightsError, SourceOperation,
+    ProviderMarketEventPublicationSelector, ProviderMarketEventSelectionError,
+    ProviderMarketEventTiePolicy, RightsError, SourceOperation,
     provider_market_event_publication_digest,
 };
 use market_squawk_domain::{
@@ -861,7 +862,10 @@ impl MarketEventPointInTimeSelector {
     }
 
     /// Reads one exact source-declared screener cohort through the ordinary immutable selector.
-    #[allow(clippy::too_many_arguments, reason = "closed cohort identity and PIT bounds stay explicit")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "closed cohort identity and PIT bounds stay explicit"
+    )]
     pub(crate) async fn select_cohort_latest(
         &self,
         cohort_key: SourceIdentifier,
@@ -888,13 +892,21 @@ impl MarketEventPointInTimeSelector {
             maximum_candidates,
         )?;
         let store = self.research.provider_capture_store();
-        let selection = self.research.analytical()
-            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation).await?;
-        selection.map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection)).transpose()
+        let selection = self
+            .research
+            .analytical()
+            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation)
+            .await?;
+        selection
+            .map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection))
+            .transpose()
     }
 
     /// Reads one exact source-declared screener cohort through the ordinary immutable selector.
-    #[allow(clippy::too_many_arguments, reason = "closed cohort identity and PIT bounds stay explicit")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "closed cohort identity and PIT bounds stay explicit"
+    )]
     pub(crate) async fn select_cohort_exact(
         &self,
         cohort_key: SourceIdentifier,
@@ -923,9 +935,14 @@ impl MarketEventPointInTimeSelector {
             exact_manifest,
         )?;
         let store = self.research.provider_capture_store();
-        let selection = self.research.analytical()
-            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation).await?;
-        selection.map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection)).transpose()
+        let selection = self
+            .research
+            .analytical()
+            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation)
+            .await?;
+        selection
+            .map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection))
+            .transpose()
     }
 
     /// Reopens the original selection's exact manifest and rejects any request, source, row,
@@ -1288,15 +1305,17 @@ impl MarketEventRestartSelector {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<MarketEventRestartReceipt, MarketEventReadError> {
-        let selector = research
-            .analytical()
-            .provider_market_event_publications(&self.manifest)?
-            .into_iter()
-            .find(|selector| {
-                selector.publication_digest() == self.publication_digest
-                    && selector.publication_kind() == self.publication_kind
-            })
-            .ok_or(MarketEventReadError::RestartInvalid)?;
+        if !research.analytical().has_provider_publication(
+            &self.manifest,
+            self.publication_digest,
+            self.publication_kind.as_str(),
+        )? {
+            return Err(MarketEventReadError::RestartInvalid);
+        }
+        let selector = ProviderMarketEventPublicationSelector::new(
+            self.publication_digest,
+            self.publication_kind,
+        );
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()

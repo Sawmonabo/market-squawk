@@ -198,6 +198,17 @@ pub struct ProviderMarketEventPublicationSelector {
 }
 
 impl ProviderMarketEventPublicationSelector {
+    /// Names an exact publication; readers independently verify generation membership and evidence.
+    pub const fn new(
+        publication_digest: EvidenceDigest,
+        publication_kind: ProviderMarketEventPublicationKind,
+    ) -> Self {
+        Self {
+            publication_digest,
+            publication_kind,
+        }
+    }
+
     /// Returns the exact kind-qualified publication digest.
     pub const fn publication_digest(self) -> EvidenceDigest {
         self.publication_digest
@@ -217,6 +228,17 @@ pub struct ProviderOptionMarketPublicationSelector {
 }
 
 impl ProviderOptionMarketPublicationSelector {
+    /// Names an exact publication; readers independently verify generation membership and evidence.
+    pub const fn new(
+        publication_digest: EvidenceDigest,
+        publication_kind: OptionMarketBatchKind,
+    ) -> Self {
+        Self {
+            publication_digest,
+            publication_kind,
+        }
+    }
+
     pub const fn publication_digest(self) -> EvidenceDigest {
         self.publication_digest
     }
@@ -3208,17 +3230,40 @@ impl AnalyticalDataService {
             .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)?
     }
 
-    /// Lists the exact generation's bounded cumulative provider lineage.
-    ///
-    /// The result includes inherited ancestor bindings in canonical digest order. It is suitable
-    /// for lineage traversal, not for reconstructing the publication owned by this generation.
+    /// Returns a digest-ordered page of inherited capture bindings. Pass the last digest as
+    /// `after`; a page shorter than `limit` proves exhaustion. The per-page limit is 1..=4096.
     pub fn provider_capture_binding_digests(
         &self,
         manifest: &DatasetManifestRef,
+        after: Option<EvidenceDigest>,
+        limit: usize,
     ) -> Result<Vec<EvidenceDigest>, IngestError> {
         self.manifests
-            .provider_capture_binding_digests(manifest)
+            .provider_capture_binding_digests(manifest, after, limit)
             .map_err(IngestError::Manifest)
+    }
+
+    /// Checks one exact capture binding through its creating generation and retained parents.
+    pub fn has_provider_capture_binding(
+        &self,
+        manifest: &DatasetManifestRef,
+        digest: EvidenceDigest,
+    ) -> Result<bool, IngestError> {
+        Ok(self
+            .manifests
+            .has_provider_capture_binding(manifest, digest)?)
+    }
+
+    /// Checks one exact publication. `kind` must be a registered canonical publication kind.
+    pub fn has_provider_publication(
+        &self,
+        manifest: &DatasetManifestRef,
+        digest: EvidenceDigest,
+        kind: &str,
+    ) -> Result<bool, IngestError> {
+        Ok(self
+            .manifests
+            .has_provider_publication(manifest, digest, kind)?)
     }
 
     /// Reopens and verifies one explicitly selected historical provider binding.
@@ -3228,8 +3273,10 @@ impl AnalyticalDataService {
         binding_digest: EvidenceDigest,
         store: &market_squawk_platform::SealedResearchJournalStore,
     ) -> Result<crate::PersistedProviderCaptureBindingEvidence, IngestError> {
-        let binding_digests = self.manifests.provider_capture_binding_digests(manifest)?;
-        if !binding_digests.contains(&binding_digest) {
+        if !self
+            .manifests
+            .has_provider_capture_binding(manifest, binding_digest)?
+        {
             return Err(IngestError::ProviderCaptureRequired);
         }
         let evidence = self
@@ -3564,28 +3611,19 @@ impl AnalyticalDataService {
         })
     }
 
-    /// Lists every bounded, kind-qualified market-event publication retained by one generation.
+    /// Returns a digest-ordered market-event publication page, filtering family before limiting.
+    /// Digest identifies one kind; conflicting kinds are corruption, never a cursor tie. Pass the
+    /// last returned digest as `after`; fewer than `limit` entries proves exhaustion (1..=4096).
     pub fn provider_market_event_publications(
         &self,
         manifest: &DatasetManifestRef,
+        after: Option<EvidenceDigest>,
+        limit: usize,
     ) -> Result<Vec<ProviderMarketEventPublicationSelector>, IngestError> {
-        self.provider_market_event_publications_inner(manifest, None)
-    }
-
-    fn provider_market_event_publications_inner(
-        &self,
-        manifest: &DatasetManifestRef,
-        control: Option<&MarketEventReadControl<'_>>,
-    ) -> Result<Vec<ProviderMarketEventPublicationSelector>, IngestError> {
-        let retained = match control {
-            Some(control) => self.manifests.provider_publication_bindings_bounded(
-                manifest,
-                control.deadline,
-                control.cancellation,
-            )?,
-            None => self.manifests.provider_publication_bindings(manifest)?,
-        };
-        Self::provider_market_event_publication_selectors(retained)
+        Self::provider_market_event_publication_selectors(
+            self.manifests
+                .provider_publication_bindings(manifest, after, limit, false)?,
+        )
     }
 
     fn provider_market_event_publication_selectors(
@@ -3620,12 +3658,17 @@ impl AnalyticalDataService {
         Ok(selectors)
     }
 
-    /// Lists every bounded option-market publication retained by one exact generation.
+    /// Returns a digest-ordered option publication page, filtering family before limiting.
+    /// Pass the last digest as `after`; fewer than `limit` entries proves exhaustion (1..=4096).
     pub fn provider_option_market_publications(
         &self,
         manifest: &DatasetManifestRef,
+        after: Option<EvidenceDigest>,
+        limit: usize,
     ) -> Result<Vec<ProviderOptionMarketPublicationSelector>, IngestError> {
-        let retained = self.manifests.provider_publication_bindings(manifest)?;
+        let retained = self
+            .manifests
+            .provider_publication_bindings(manifest, after, limit, true)?;
         let mut selectors = Vec::new();
         selectors
             .try_reserve_exact(retained.len())
@@ -3665,13 +3708,20 @@ impl AnalyticalDataService {
         control: Option<&MarketEventReadControl<'_>>,
     ) -> Result<crate::PersistedProviderPublicationEvidence, IngestError> {
         let read_catalog = |snapshot: Option<&crate::catalog::CatalogReadSnapshot>| {
-            let retained = match snapshot {
-                Some(snapshot) => self
-                    .manifests
-                    .provider_publication_bindings_in_snapshot(manifest, snapshot)?,
-                None => self.manifests.provider_publication_bindings(manifest)?,
+            let member = match snapshot {
+                Some(snapshot) => self.manifests.has_provider_publication_in_snapshot(
+                    manifest,
+                    selector.publication_digest,
+                    selector.publication_kind.as_str(),
+                    snapshot,
+                )?,
+                None => self.manifests.has_provider_publication(
+                    manifest,
+                    selector.publication_digest,
+                    selector.publication_kind.as_str(),
+                )?,
             };
-            if !Self::provider_market_event_publication_selectors(retained)?.contains(&selector) {
+            if !member {
                 return Err(IngestError::ProviderCaptureRequired);
             }
             let authority = if snapshot.is_none() {
@@ -4052,10 +4102,6 @@ impl AnalyticalDataService {
             .pinned_in_snapshot(&plan.manifest, snapshot)?;
         check_market_event_read(deadline, cancellation)?;
 
-        let retained = self
-            .manifests
-            .provider_publication_bindings_in_snapshot(&plan.manifest, snapshot)?;
-        let selectors = Self::provider_market_event_publication_selectors(retained)?;
         let mut reopened: Vec<(
             ProviderMarketEventPublicationSelector,
             Arc<crate::PersistedProviderPublicationEvidence>,
@@ -4075,9 +4121,6 @@ impl AnalyticalDataService {
                 .any(|(retained, _, _)| *retained == selector)
             {
                 continue;
-            }
-            if !selectors.contains(&selector) {
-                return Err(IngestError::ProviderCaptureRequired);
             }
             let evidence = snapshot
                 .publication_evidence(selector.publication_digest)?
@@ -4189,9 +4232,13 @@ impl AnalyticalDataService {
         selector: ProviderOptionMarketPublicationSelector,
         store: &market_squawk_platform::SealedResearchJournalStore,
     ) -> Result<crate::PersistedProviderOptionMarketBindingEvidence, IngestError> {
+        let kind = match selector.publication_kind {
+            OptionMarketBatchKind::Snapshots => "option_snapshots",
+            OptionMarketBatchKind::Expirations => "option_expirations",
+        };
         if !self
-            .provider_option_market_publications(manifest)?
-            .contains(&selector)
+            .manifests
+            .has_provider_publication(manifest, selector.publication_digest, kind)?
         {
             return Err(IngestError::ProviderCaptureRequired);
         }
@@ -4314,11 +4361,11 @@ impl AnalyticalDataService {
             .ok_or(IngestError::ProviderLogicalFundRequired)?;
         if manifest.dataset_id() != request.dataset()
             || manifest.schema().name() != market_squawk_domain::FUND_HOLDINGS_SCHEMA_NAME
-            || !self
-                .manifests
-                .provider_publication_bindings(manifest)?
-                .iter()
-                .any(|(digest, kind)| *digest == binding_digest && kind == "provider_logical")
+            || !self.manifests.has_provider_publication(
+                manifest,
+                binding_digest,
+                "provider_logical",
+            )?
         {
             return Err(IngestError::ProviderLogicalFundRequired);
         }
@@ -6013,12 +6060,11 @@ impl AnalyticalDataService {
             .provider_logical_publication_binding(payload_digest)?
             .ok_or(IngestError::ProviderLogicalFundRequired)?;
         validate_persisted_sec_fund_logical_publication(&persisted, &converted)?;
-        if !self
-            .manifests
-            .provider_publication_bindings(committed.manifest())?
-            .iter()
-            .any(|(digest, kind)| *digest == payload_digest && kind == "provider_logical")
-        {
+        if !self.manifests.has_provider_publication(
+            committed.manifest(),
+            payload_digest,
+            "provider_logical",
+        )? {
             return Err(IngestError::ProviderLogicalFundRequired);
         }
         Ok((committed, payload_digest))
@@ -6372,9 +6418,6 @@ impl AnalyticalDataService {
         let retained = authority
             .provider_publication_for_run(reservation.run_id())?
             .ok_or(IngestError::IncompleteSuccessfulRun)?;
-        let generation = self
-            .manifests
-            .provider_publication_bindings(existing.manifest())?;
         if existing.manifest().dataset_id() != dataset_id
             || !input.matches_persisted(&retained)
             || !authority
@@ -6386,9 +6429,11 @@ impl AnalyticalDataService {
                     input.source_id(),
                     ProviderArtifactInputCoordinate::try_new(0, 0)?,
                 )?
-            || !generation.iter().any(|(digest, kind)| {
-                *digest == retained.publication_digest() && kind == retained.publication_kind()
-            })
+            || !self.manifests.has_provider_publication(
+                existing.manifest(),
+                retained.publication_digest(),
+                retained.publication_kind(),
+            )?
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -6422,9 +6467,6 @@ impl AnalyticalDataService {
         let retained = authority
             .provider_option_market_for_run(reservation.run_id())?
             .ok_or(IngestError::IncompleteSuccessfulRun)?;
-        let generation = self
-            .manifests
-            .provider_publication_bindings(existing.manifest())?;
         if existing.manifest().dataset_id() != dataset_id
             || !input.matches_persisted(&retained)
             || !authority
@@ -6436,9 +6478,11 @@ impl AnalyticalDataService {
                     input.source_id().as_str(),
                     ProviderArtifactInputCoordinate::try_new(0, 0)?,
                 )?
-            || !generation.iter().any(|(digest, kind)| {
-                *digest == retained.binding_digest() && kind == retained.publication_kind_name()
-            })
+            || !self.manifests.has_provider_publication(
+                existing.manifest(),
+                retained.binding_digest(),
+                retained.publication_kind_name(),
+            )?
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -6459,9 +6503,6 @@ impl AnalyticalDataService {
         let retained = authority
             .provider_logical_publication_binding(binding_digest)?
             .ok_or(IngestError::IncompleteSuccessfulRun)?;
-        let generation = self
-            .manifests
-            .provider_publication_bindings(existing.manifest())?;
         if existing.manifest().dataset_id() != dataset_id
             || retained.binding_digest() != binding_digest
             || !authority
@@ -6473,9 +6514,11 @@ impl AnalyticalDataService {
                     retained.terminal().source_id().as_str(),
                     ProviderArtifactInputCoordinate::try_new(0, 0)?,
                 )?
-            || !generation
-                .iter()
-                .any(|(digest, kind)| *digest == binding_digest && kind == "provider_logical")
+            || !self.manifests.has_provider_publication(
+                existing.manifest(),
+                binding_digest,
+                "provider_logical",
+            )?
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -6726,9 +6769,6 @@ impl AnalyticalDataService {
         let owned = self
             .manifests
             .generation_owned_provider_captures(existing.manifest())?;
-        let generation_bindings = self
-            .manifests
-            .provider_capture_binding_digests(existing.manifest())?;
         if input != &retained
             || owned.suffix_start + owned.inputs.len() != owned.pinned.objects().len()
             || owned.inputs.len() != 1
@@ -6737,7 +6777,9 @@ impl AnalyticalDataService {
             || owned.inputs[0].object_input_ordinal != 0
             || owned.inputs[0].binding_digest != retained.binding_digest()
             || owned.inputs[0].record_count != retained.record_count()
-            || !generation_bindings.contains(&retained.binding_digest())
+            || !self
+                .manifests
+                .has_provider_capture_binding(existing.manifest(), retained.binding_digest())?
         {
             return Err(IngestError::ReplayConflict);
         }

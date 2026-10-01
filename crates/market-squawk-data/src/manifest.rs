@@ -19,6 +19,7 @@ pub(crate) use self::availability::finalize_generation_availability;
 pub use self::catalog::benchmark_support::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
+pub(crate) use self::catalog::lineage::generation_contains_origin_sql;
 pub use self::catalog::{
     AnalyticalManifestCatalog, GenerationKind, MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
     MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES, ManifestCatalogError, PinnedDataset,
