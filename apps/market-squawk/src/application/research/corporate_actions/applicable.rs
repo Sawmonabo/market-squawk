@@ -180,7 +180,8 @@ pub(crate) struct SourceAppliedCorporateActionPlan {
     payment_policy: CorporateActionPaymentPolicy,
     ordinary: Option<OrdinaryActionCoverage>,
     current_ordinary: Option<current_ordinary::CurrentOrdinaryCoverage>,
-    anchor: Option<anchor::AlpacaOriginAdjustmentAnchor>,
+    // The two retained cursors belong to an optional anchor, not every by-value plan/result.
+    anchor: Option<Box<anchor::AlpacaOriginAdjustmentAnchor>>,
 }
 
 impl SourceAppliedCorporateActionPlan {
@@ -508,7 +509,7 @@ impl SourceAppliedCorporateActionPlan {
             ordinary_coverage_digest: self.ordinary.as_ref().map(OrdinaryActionCoverage::digest),
             anchor: self
                 .anchor
-                .as_ref()
+                .as_deref()
                 .map(anchor::AlpacaOriginAdjustmentAnchor::reference)
                 .transpose()?,
         })

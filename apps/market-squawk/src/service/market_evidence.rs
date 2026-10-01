@@ -6,6 +6,7 @@ use preparation::{SourcePreparationStep, clock, reference_digest};
 
 use std::sync::Arc;
 
+use futures_util::future::BoxFuture;
 use market_squawk_domain::{AssetClass, Currency, InstrumentId, MarketEvent, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
@@ -352,7 +353,18 @@ impl InstalledMarketEvidence {
         Ok(response)
     }
 
-    async fn prepare_sources(
+    // Construct the acquisition future in a returning frame. Its state must not be embedded
+    // repeatedly in prepare, call and the installed dispatcher while they poll source evidence.
+    fn prepare_sources<'a>(
+        &'a self,
+        input: PrepareRequest,
+        context: &'a RequestContext,
+        models: Option<&'a ForecastPreparationCatalog>,
+    ) -> BoxFuture<'a, Result<TypedToolResult, ServiceError>> {
+        Box::pin(self.prepare_sources_impl(input, context, models))
+    }
+
+    async fn prepare_sources_impl(
         &self,
         input: PrepareRequest,
         context: &RequestContext,

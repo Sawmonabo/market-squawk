@@ -4,6 +4,7 @@ use super::*;
 use crate::application::research::{
     RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
 };
+use futures_util::{FutureExt as _, future::BoxFuture};
 use market_squawk_data::{CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryRequest};
 use market_squawk_domain::MarketBarAdjustment;
 use std::collections::BTreeMap;
@@ -98,7 +99,34 @@ impl SourceActionPreparationCapability {
         })
     }
 
-    pub(super) async fn prepare_selected_nominal_histories(
+    // Return the allocation before polling: complete-history preparation must not embed this
+    // producer's state or retain its construction frame while its source children run.
+    pub(super) fn prepare_selected_nominal_histories<'a>(
+        &'a self,
+        histories: Vec<CompleteMarketBarHistoryCursor>,
+        interval: (CalendarDate, CalendarDate),
+        valuation_cutoff: Timestamp,
+        context: &'a RequestContext,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            (
+                Vec<CompleteMarketBarHistoryCursor>,
+                SourceAppliedCorporateActionPlan,
+                Timestamp,
+            ),
+            ServiceError,
+        >,
+    > {
+        Box::pin(self.prepare_selected_nominal_histories_impl(
+            histories,
+            interval,
+            valuation_cutoff,
+            context,
+        ))
+    }
+
+    async fn prepare_selected_nominal_histories_impl(
         &self,
         histories: Vec<CompleteMarketBarHistoryCursor>,
         interval: (CalendarDate, CalendarDate),
@@ -182,6 +210,7 @@ impl SourceActionPreparationCapability {
                 &calendar,
                 context,
             )
+            .boxed()
             .await?;
         runtime
             .require_current(context.deadline(), context.cancellation())
@@ -259,7 +288,19 @@ impl SourceActionPreparationCapability {
         Ok((reopened, plan, cutoff))
     }
 
-    pub(super) async fn reopen_original_ordinary_history(
+    pub(super) fn reopen_original_ordinary_history<'a>(
+        &'a self,
+        original: &'a CompleteMarketBarHistoryCursor,
+        cutoff: Timestamp,
+        context: &'a RequestContext,
+    ) -> BoxFuture<
+        'a,
+        Result<(CompleteMarketBarHistoryCursor, CompletedMarketSessionRead), ServiceError>,
+    > {
+        Box::pin(self.reopen_original_ordinary_history_impl(original, cutoff, context))
+    }
+
+    async fn reopen_original_ordinary_history_impl(
         &self,
         original: &CompleteMarketBarHistoryCursor,
         cutoff: Timestamp,
@@ -294,6 +335,7 @@ impl SourceActionPreparationCapability {
                 context.deadline(),
                 context.cancellation().clone(),
             )
+            .boxed()
             .await
             .map_err(map_analytical_error)?
             .ok_or(ServiceError::Unavailable)?;
@@ -323,6 +365,7 @@ impl SourceActionPreparationCapability {
                 context.deadline(),
                 context.cancellation(),
             )
+            .boxed()
             .await
             .map_err(map_research_error)?;
         if reopened.read_receipt().knowledge_cutoff() != cutoff
@@ -403,7 +446,22 @@ impl PreparedSelectedHistorySources {
     }
 }
 impl SourceActionPreparationCapability {
-    pub(crate) async fn prepare_selected_complete_histories(
+    pub(crate) fn prepare_selected_complete_histories<'a>(
+        &'a self,
+        instruments: &'a [MarketDataInstrumentRecord],
+        population_start: Timestamp,
+        analysis_at: Timestamp,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<PreparedSelectedHistorySources, ServiceError>> {
+        Box::pin(self.prepare_selected_complete_histories_impl(
+            instruments,
+            population_start,
+            analysis_at,
+            context,
+        ))
+    }
+
+    async fn prepare_selected_complete_histories_impl(
         &self,
         instruments: &[MarketDataInstrumentRecord],
         population_start: Timestamp,
@@ -480,6 +538,7 @@ impl SourceActionPreparationCapability {
         for original in &published {
             let history = self
                 .reopen_published_history_ref(original, inspection_at, context)
+                .boxed()
                 .await?;
             let sessions = history
                 .native_sessions()
@@ -525,9 +584,10 @@ impl SourceActionPreparationCapability {
             }
             let publication = activation
                 .prepare_instrument_eod_history(instrument, venue, &self.calendars, dates, context)
+                .boxed()
                 .await?;
             let history = self.ingest.read_complete_tiingo_eod_publication(&publication, instrument, venue, dates,
-                &self.calendars, now()?, context.deadline(), context.cancellation()).await
+                &self.calendars, now()?, context.deadline(), context.cancellation()).boxed().await
                 .map_err(|error| match error {
                     crate::application::research::ingest::TiingoHistoryApplicationError::Read(error) => map_analytical_error(error),
                     crate::application::research::ingest::TiingoHistoryApplicationError::Calendar(error) => map_calendar_error(error),
@@ -545,6 +605,7 @@ impl SourceActionPreparationCapability {
         for original in &published {
             histories.push(
                 self.reopen_published_history_ref(original, cutoff, context)
+                    .boxed()
                     .await?,
             );
         }

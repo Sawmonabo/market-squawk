@@ -12,6 +12,7 @@ use crate::{
     },
     provider_activation::ProviderAdapterActivation,
 };
+use futures_util::FutureExt as _;
 use market_squawk_domain::EvidenceDigest;
 use market_squawk_sources::{
     OptionExpirationRange, OptionMarketBatchKind, OptionMarketRequestFilter,
@@ -86,7 +87,26 @@ impl InstalledInvestmentSourcePreparation {
     }
 
     /// Acquire the complete source interval before selecting the prices used by calculation.
-    pub(super) async fn acquire_current_investment_sources(
+    pub(super) fn acquire_current_investment_sources<'a>(
+        &'a self,
+        identity: &'a InstrumentContextRead,
+        origin: Option<Timestamp>,
+        original_knowledge_at: Option<Timestamp>,
+        markets: &'a MarketInvestmentReadCapability,
+        profile: &'a ValidatedAnalyticalProfile,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<CurrentInvestmentSources, ServiceError>> {
+        Box::pin(self.acquire_current_investment_sources_impl(
+            identity,
+            origin,
+            original_knowledge_at,
+            markets,
+            profile,
+            context,
+        ))
+    }
+
+    async fn acquire_current_investment_sources_impl(
         &self,
         identity: &InstrumentContextRead,
         origin: Option<Timestamp>,
@@ -118,6 +138,7 @@ impl InstalledInvestmentSourcePreparation {
                     knowledge_at,
                     context,
                 )
+                .boxed()
                 .await?;
                 // These marks choose only the native source dates. Final prices are read below.
                 let mut pending = Vec::with_capacity(requirements.requirements().len());
@@ -126,8 +147,10 @@ impl InstalledInvestmentSourcePreparation {
                         let quote = quote_clock(&markets, id, clock()?, context).await?;
                         self.actions
                             .acquire_financial_share_sources(&[(id, start, quote)], context)
+                            .boxed()
                             .await
                     }
+                    .boxed()
                     .await;
                     match acquired {
                         Ok(originals) => pending.push((id, originals)),
@@ -143,6 +166,7 @@ impl InstalledInvestmentSourcePreparation {
                 }
                 Ok::<_, ServiceError>((requirements, pending))
             }
+            .boxed()
             .await;
             match acquired {
                 Ok(value) => Some(value),
@@ -169,6 +193,7 @@ impl InstalledInvestmentSourcePreparation {
                     clock()?,
                     context,
                 )
+                .boxed()
                 .await
             {
                 Ok(value) => Some(value),
@@ -199,6 +224,7 @@ impl InstalledInvestmentSourcePreparation {
                 let plan = self
                     .actions
                     .finish_current_action_sources(pending, quote_at, context)
+                    .boxed()
                     .await?;
                 let reference = plan.reference().map_err(|_| ServiceError::InvalidResult)?;
                 if reference.knowledge_cutoff() < cutoff || reference.valuation_cutoff() != quote_at
@@ -207,6 +233,7 @@ impl InstalledInvestmentSourcePreparation {
                 }
                 Ok::<_, ServiceError>(reference)
             }
+            .boxed()
             .await;
             match outcome {
                 Ok(reference) => {
@@ -247,8 +274,10 @@ impl InstalledInvestmentSourcePreparation {
                                 &[(id, effective_at, cutoff)],
                                 context,
                             )
+                            .boxed()
                             .await
                     }
+                    .boxed()
                     .await;
                     match finished {
                         Ok(mut original) => references.append(&mut original),
@@ -262,6 +291,7 @@ impl InstalledInvestmentSourcePreparation {
                 }
                 finish_common_share_sources(requirements, references)
             }
+            .boxed()
             .await;
             match outcome {
                 Ok(reference) => {
@@ -422,7 +452,19 @@ impl InstalledInvestmentSourcePreparation {
 
     /// Source identities are selected before outcomes; their analytical cutoff is frozen later.
     /// No private cache or replacement source authority is created here.
-    pub(super) async fn acquire(
+    // These source families retain their own futures on the heap. The caller still polls and
+    // drops them directly, with its original cancellation, deadline and authority lifetimes.
+    pub(super) fn acquire<'a>(
+        &'a self,
+        identity: &'a InstrumentContextRead,
+        calendars: &'a CompletedMarketSessionReadCapability,
+        benchmark_instrument_id: Option<InstrumentId>,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<AcquiredInvestmentSources, ServiceError>> {
+        Box::pin(self.acquire_impl(identity, calendars, benchmark_instrument_id, context))
+    }
+
+    async fn acquire_impl(
         &self,
         identity: &InstrumentContextRead,
         calendars: &CompletedMarketSessionReadCapability,
@@ -439,6 +481,7 @@ impl InstalledInvestmentSourcePreparation {
         let h15 = self
             .ingest
             .prepare_default_h15_full_history(context)
+            .boxed()
             .await
             .map(|reference| reference.binding_digest())
             .map_err(map_board_error);
@@ -487,6 +530,7 @@ impl InstalledInvestmentSourcePreparation {
             let published = self
                 .activation
                 .prepare_default_equity_premium_history(&benchmark, calendars, context)
+                .boxed()
                 .await;
             let published = match published {
                 Ok(published) => {
@@ -515,6 +559,7 @@ impl InstalledInvestmentSourcePreparation {
                     .prepare_selected_investment_histories(
                         identity, &benchmark, &published, calendars, context,
                     )
+                    .boxed()
                     .await;
                 let histories = match histories {
                     Ok(histories) => {
@@ -548,6 +593,7 @@ impl InstalledInvestmentSourcePreparation {
                             selection_at,
                             context,
                         )
+                        .boxed()
                         .await;
                     let outcome = match prepared {
                         Ok(prepared) => {
@@ -776,7 +822,16 @@ impl InstalledInvestmentSourcePreparation {
 
     /// Runs the genuine source reader after acquisition at one final cutoff. A failed premium
     /// leaves independent valuation methods available and never becomes a caller-supplied rate.
-    pub(super) async fn assess_premium(
+    pub(super) fn assess_premium<'a>(
+        &'a self,
+        calendars: &'a CompletedMarketSessionReadCapability,
+        source_cutoff: Timestamp,
+        context: &'a RequestContext,
+    ) -> BoxFuture<'a, Result<SourcePreparationStep, ServiceError>> {
+        Box::pin(self.assess_premium_impl(calendars, source_cutoff, context))
+    }
+
+    async fn assess_premium_impl(
         &self,
         calendars: &CompletedMarketSessionReadCapability,
         source_cutoff: Timestamp,
@@ -793,6 +848,7 @@ impl InstalledInvestmentSourcePreparation {
                 context.deadline(),
                 context.cancellation().clone(),
             )
+            .boxed()
             .await;
         ensure_live(context)?;
         match premium {
@@ -875,7 +931,14 @@ impl SourcePreparationStep {
                     completed_at,
                 ))
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    source,
+                    failure = service_failure(error),
+                    "investment source preparation failed"
+                );
+                Err(error)
+            }
         }
     }
 

@@ -310,6 +310,22 @@ admission atomically and begins domain shutdown in reverse dependency order. Com
 absolute deadline; each domain receives its terminal barrier even when another domain reports a
 failure, and the resulting report retains per-domain evidence.
 
+Investment source preparation returns heap-owned pinned futures from its existing producer
+boundaries. Large acquisition phases are separately boxed so their state is not embedded through
+every caller. They remain on the original task: cancellation, deadlines, borrowed authorities and
+drop behavior stay with that task; boxing does not create a separate polling stack or runtime.
+The optional corporate-action adjustment anchor also heap-owns its two retained history cursors,
+so ordinary plan transfers do not copy those cursors. These allocations reduce stack pressure
+without increasing worker stacks or restricting market data. The [Rust async working-group case study](https://rust-lang.github.io/wg-async/vision/submitted_stories/status_quo/alan_runs_into_stack_trouble.html)
+provides allocation background (reviewed 2026-10-01); rebuilt frame measurements and the actual
+resumed investment workflow are the implementation proof, recorded in the delivery ledger.
+
+Startup deadlines belong to finite operations: capture recovery after catalog integrity checking,
+credential-store opening, reconnect binding, then combined retained valuation/decision recovery.
+Each operation keeps its original deadline and cancellation behavior throughout its work. Catalog
+integrity and executable identity verification remain mandatory; their time does not consume a
+later operation's deadline before that operation starts.
+
 For the installed service and its MCP route:
 
 1. platform termination listeners are installed before product composition so Unix

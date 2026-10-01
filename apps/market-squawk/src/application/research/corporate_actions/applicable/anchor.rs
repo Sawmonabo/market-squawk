@@ -70,7 +70,7 @@ impl AlpacaOriginAdjustmentAnchor {
         cutoff: Timestamp,
         raw_page_received_at: Box<[Timestamp]>,
         split_page_received_at: Box<[Timestamp]>,
-    ) -> Result<Self, ApplicableActionPlanError> {
+    ) -> Result<Box<Self>, ApplicableActionPlanError> {
         let a = raw.selection().receipt();
         let b = split.selection().receipt();
         let raw_native = raw
@@ -124,12 +124,12 @@ impl AlpacaOriginAdjustmentAnchor {
                 return Err(ApplicableActionPlanError::InvalidEvidence);
             }
         }
-        Ok(Self {
+        Ok(Box::new(Self {
             raw,
             split,
             raw_page_received_at,
             split_page_received_at,
-        })
+        }))
     }
     pub(super) fn reference(
         &self,

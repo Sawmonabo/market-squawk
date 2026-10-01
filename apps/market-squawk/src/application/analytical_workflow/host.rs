@@ -357,11 +357,17 @@ pub(super) async fn invoke_analytical_operation(
         () = request_cancel.cancelled() => return Err(ServiceError::Cancelled.into()),
         () = cancellation.cancelled() => return Err(ServiceError::Cancelled.into()),
         () = tokio::time::sleep_until(deadline.into()) => return Err(ServiceError::DeadlineExceeded.into()),
-        result = services.call(request, context) => result.map_err(WorkflowError::from)?,
+        result = services.call(request, context) => result.map_err(|error| {
+            tracing::warn!(operation, %error, stage = "analytical-operation", "investment analysis operation failed");
+            WorkflowError::from(error)
+        })?,
     };
     result
         .validate_for(descriptor)
-        .map_err(|_| WorkflowError::from(ServiceError::InvalidResult))?;
+        .map_err(|error| {
+            tracing::warn!(operation, %error, stage = "analytical-result-contract", "investment analysis result rejected");
+            WorkflowError::from(ServiceError::InvalidResult)
+        })?;
     Ok(result.into_envelope(ResultEnvelopeProjection::NativeEvidenceV1))
 }
 
