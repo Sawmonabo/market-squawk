@@ -258,7 +258,7 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         let operation = operation_id(digest).map_err(reconnect_error)?;
         // The existing transition observes the predecessor before durable CAS, joins it,
         // acknowledges its real receipt, and derives the successor from the current doctor lease.
-        self.execute_account_transition(&command, surface, record, digest, operation)
+        self.execute_account_transition(&command, surface, record, digest, operation, None)
             .await
             .map_err(reconnect_error)?;
         Ok(())
@@ -274,11 +274,11 @@ impl ProductionSourceLifecycleAuthority {
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError> {
         let surface = AccountMarketSurface::AlpacaBasic;
+        let _gate = self
+            .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
+            .await
+            .map_err(reconnect_error)?;
         let original = {
-            let _gate = self
-                .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
-                .await
-                .map_err(reconnect_error)?;
             self.credential_access
                 .ensure_resumed()
                 .map_err(reconnect_error)?;
@@ -308,28 +308,32 @@ impl ProductionSourceLifecycleAuthority {
                 .map_err(reconnect_error)?;
             record
         };
-        let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
-            provider: SourceIdentifier::try_from(surface.surface_id())
-                .map_err(|_| ServiceError::Internal)?,
-            action: SourceLifecycleAction::Retry,
-            expected_state_revision: original.revision(),
-            expected_generation: None,
-            expected_runtime_generation_digest: Some(generation.digest()),
-            onboarding_session_id: Some(request.onboarding_session_id()),
-            public_configuration_digest: Some(request.expected_public_configuration_digest()),
-            reason: Some(
-                SourceIdentifier::try_from("alpaca-doctor-proof-expired")
-                    .map_err(|_| ServiceError::Internal)?,
-            ),
-            cancellation,
+        let command = saved_source_retry_command(
+            SourceIdentifier::try_from(surface.surface_id()).map_err(|_| ServiceError::Internal)?,
+            original.revision(),
+            "alpaca-doctor-proof-expired",
             deadline,
-        })
+            cancellation,
+        )
         .map_err(reconnect_error)?;
-        // execute_owned reacquires admission and the lifecycle gate before its exact CAS. It
-        // persists the predecessor, drains and acknowledges it, then verifies the saved keys.
-        self.execute_owned(&command)
-            .await
+        ensure_live(&command).map_err(reconnect_error)?;
+        self.credential_access
+            .ensure_resumed()
             .map_err(reconnect_error)?;
+        let digest = command_digest(&command).map_err(reconnect_error)?;
+        let operation = operation_id(digest).map_err(reconnect_error)?;
+        // Keep the lifecycle gate through exact runtime comparison and durable intent. The
+        // ordinary transition then drains and acknowledges that predecessor before renewal.
+        self.execute_account_transition(
+            &command,
+            surface,
+            original,
+            digest,
+            operation,
+            Some((request, generation)),
+        )
+        .await
+        .map_err(reconnect_error)?;
         Ok(())
     }
 

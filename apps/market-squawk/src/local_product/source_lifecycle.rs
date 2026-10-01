@@ -274,10 +274,10 @@ impl ProductionSourceLifecycleAuthority {
                     Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
                 }
             } else if let Some(surface) = AccountMarketSurface::parse(provider.as_str()) {
-                let (action, session, configuration) = if surface == AccountMarketSurface::AlpacaBasic {
+                let command = if surface == AccountMarketSurface::AlpacaBasic {
                     // Retry owns fresh doctor verification when a saved proof expired while
                     // the application was stopped. Saved keys alone never authorize a runtime.
-                    let (Some(session), Some(configuration)) =
+                    let (Some(_session), Some(_configuration)) =
                         (record.session_id(), record.public_configuration_digest())
                     else {
                         failures.push(LiveSourceRestoreFailure {
@@ -286,34 +286,37 @@ impl ProductionSourceLifecycleAuthority {
                         });
                         continue;
                     };
-                    (SourceLifecycleAction::Retry, session, configuration)
+                    saved_source_retry_command(
+                        provider.clone(),
+                        record.revision(),
+                        "automatic-alpaca-source-recovery",
+                        deadline,
+                        cancellation.child_token(),
+                    )?
                 } else {
-                    let request = match self.restored_account_group_request(surface, &provider, &record)
-                    {
-                        Ok(request) => request,
-                        Err(error) => {
-                            failures.push(LiveSourceRestoreFailure { provider, error });
-                            continue;
-                        }
-                    };
-                    (
-                        SourceLifecycleAction::Start,
-                        request.onboarding_session_id(),
-                        request.expected_public_configuration_digest(),
-                    )
+                    let request =
+                        match self.restored_account_group_request(surface, &provider, &record) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                failures.push(LiveSourceRestoreFailure { provider, error });
+                                continue;
+                            }
+                        };
+                    SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                        provider: provider.clone(),
+                        action: SourceLifecycleAction::Start,
+                        expected_state_revision: record.revision(),
+                        expected_generation: None,
+                        expected_runtime_generation_digest: None,
+                        onboarding_session_id: Some(request.onboarding_session_id()),
+                        public_configuration_digest: Some(
+                            request.expected_public_configuration_digest(),
+                        ),
+                        reason: None,
+                        cancellation: cancellation.child_token(),
+                        deadline,
+                    })?
                 };
-                let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
-                    provider: provider.clone(),
-                    action,
-                    expected_state_revision: record.revision(),
-                    expected_generation: None,
-                    expected_runtime_generation_digest: None,
-                    onboarding_session_id: Some(session),
-                    public_configuration_digest: Some(configuration),
-                    reason: None,
-                    cancellation: cancellation.child_token(),
-                    deadline,
-                })?;
                 match self.execute_owned(&command).await {
                     Ok(_) => restored.push(provider),
                     Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
@@ -374,6 +377,7 @@ impl ProductionSourceLifecycleAuthority {
                         current,
                         command_digest,
                         operation_id,
+                        None,
                     )
                     .await;
             }
@@ -724,6 +728,10 @@ impl ProductionSourceLifecycleAuthority {
         current: DurableSourceLifecycleRecord,
         digest: EvidenceDigest,
         operation: SourceIdentifier,
+        expected_predecessor: Option<(
+            PreparedMarketProviderConfigurationRequest,
+            MarketRuntimeGroupGeneration,
+        )>,
     ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
         let provider = surface.surface_id();
         if current.operation_id() == Some(&operation)
@@ -826,6 +834,11 @@ impl ProductionSourceLifecycleAuthority {
                 .await
                 .map_err(map_live_error)?;
             let observed = prepared.predecessor();
+            // Automatic recovery retains its exact runtime CAS internally: the public Retry
+            // command addresses saved intent and deliberately accepts no runtime coordinates.
+            if expected_predecessor.is_some_and(|expected| observed != Some(expected)) {
+                return Err(SourceLifecycleError::Conflict);
+            }
             if let Some((actual, _)) = observed {
                 if current.runtime_verification_receipt_digest().is_some()
                     && actual != account_group_request_from_record(surface, &current)?
@@ -1285,7 +1298,8 @@ impl ProductionSourceLifecycleAuthority {
             )
             .map_err(map_durable_error)?;
         if surface == AccountMarketSurface::AlpacaBasic {
-            let admitted = match self.live
+            let admitted = match self
+                .live
                 .current_alpaca_calendar_runtime(deadline, cancellation)
                 .await
             {
@@ -2583,6 +2597,29 @@ impl ProductionSourceLifecycleAuthority {
     }
 }
 
+fn saved_source_retry_command(
+    provider: SourceIdentifier,
+    expected_state_revision: NonZeroU64,
+    reason: &str,
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> Result<SourceLifecycleCommand, SourceLifecycleError> {
+    SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+        provider,
+        action: SourceLifecycleAction::Retry,
+        expected_state_revision,
+        expected_generation: None,
+        expected_runtime_generation_digest: None,
+        onboarding_session_id: None,
+        public_configuration_digest: None,
+        reason: Some(
+            SourceIdentifier::try_from(reason).map_err(|_| SourceLifecycleError::Internal)?,
+        ),
+        cancellation,
+        deadline,
+    })
+}
+
 const fn doctor_attempt_had_no_onboarding_effect(error: SourceLifecycleError) -> bool {
     matches!(
         error,
@@ -3063,4 +3100,55 @@ fn lower_hex(bytes: &[u8; 32]) -> String {
         value.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_saved_source_retry_preserves_command_contract_and_control()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = SourceIdentifier::try_from(ProviderMarketAccount::AlpacaBasic.surface_id())?;
+        let revision = NonZeroU64::new(7).ok_or("nonzero test revision")?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        for reason in [
+            "automatic-alpaca-source-recovery",
+            "alpaca-doctor-proof-expired",
+        ] {
+            let cancellation = CancellationToken::new();
+            let command = saved_source_retry_command(
+                provider.clone(),
+                revision,
+                reason,
+                deadline,
+                cancellation.clone(),
+            )?;
+            assert_eq!(command.provider(), &provider);
+            assert_eq!(command.action(), SourceLifecycleAction::Retry);
+            assert_eq!(command.expected_state_revision(), revision);
+            assert_eq!(command.expected_generation(), None);
+            assert_eq!(command.expected_runtime_generation_digest(), None);
+            assert_eq!(command.onboarding_session_id(), None);
+            assert_eq!(command.public_configuration_digest(), None);
+            assert_eq!(command.reason().map(SourceIdentifier::as_str), Some(reason));
+            assert_eq!(command.deadline(), deadline);
+            assert!(!command.cancellation().is_cancelled());
+            cancellation.cancel();
+            assert!(command.cancellation().is_cancelled());
+            assert_eq!(ensure_live(&command), Err(SourceLifecycleError::Cancelled));
+        }
+        assert_eq!(
+            saved_source_retry_command(
+                provider,
+                revision,
+                "alpaca-doctor-proof-expired",
+                Instant::now(),
+                CancellationToken::new(),
+            )
+            .unwrap_err(),
+            SourceLifecycleError::DeadlineExceeded,
+        );
+        Ok(())
+    }
 }

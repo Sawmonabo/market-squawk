@@ -930,20 +930,37 @@ fn calendar_read_failure(stage: &'static str, error: &market_squawk_data::Analyt
     tracing::warn!(stage, failure, "completed market calendar read failed");
 }
 
-fn calendar_worker_failure(stage: &'static str, error: &ResearchServiceError) {
+pub(super) fn calendar_worker_failure(stage: &'static str, error: &ResearchServiceError) {
     use market_squawk_data::{CatalogError, IngestError};
+    use market_squawk_platform::SealedResearchJournalStoreError as StoreError;
     let failure = match error {
         ResearchServiceError::Ingest(IngestError::AuthorityBusy)
         | ResearchServiceError::Ingest(IngestError::Catalog(CatalogError::AuthorityBusy))
         | ResearchServiceError::Catalog(CatalogError::AuthorityBusy) => "catalog-busy",
+        ResearchServiceError::Ingest(IngestError::AuthorityLockPoisoned) => {
+            "catalog-lock-poisoned"
+        }
         ResearchServiceError::Ingest(IngestError::Cancelled) => "cancelled",
         ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => "deadline-exceeded",
+        ResearchServiceError::Ingest(IngestError::ProviderCaptureRequired) => {
+            "capture-evidence-mismatch"
+        }
+        ResearchServiceError::Ingest(IngestError::Manifest(_))
+        | ResearchServiceError::Manifest(_) => "manifest-error",
+        ResearchServiceError::Ingest(IngestError::Catalog(_))
+        | ResearchServiceError::Catalog(_) => "catalog-error",
+        ResearchServiceError::Ingest(IngestError::SealedProviderCapture(
+            StoreError::Io { .. },
+        ))
+        | ResearchServiceError::ProviderCaptureStore(StoreError::Io { .. }) => {
+            "capture-store-io"
+        }
+        ResearchServiceError::Ingest(IngestError::SealedProviderCapture(_))
+        | ResearchServiceError::ProviderCaptureStore(_) => "capture-store-error",
+        ResearchServiceError::Ingest(_) => "ingest-error",
         ResearchServiceError::IngestAuthorityMismatch => "ingest-authority-mismatch",
         ResearchServiceError::ProviderCaptureSealWorkerUnavailable => "worker-unavailable",
-        ResearchServiceError::Manifest(_) => "manifest-error",
-        ResearchServiceError::Catalog(_) => "catalog-error",
-        ResearchServiceError::ProviderCaptureStore(_) => "capture-store-error",
-        ResearchServiceError::Ingest(_) => "ingest-error",
+        ResearchServiceError::Path(_) => "path-unavailable",
         _ => "research-error",
     };
     tracing::warn!(stage, failure, "completed market calendar worker failed");

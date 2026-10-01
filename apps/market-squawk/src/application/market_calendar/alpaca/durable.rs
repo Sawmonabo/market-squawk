@@ -309,42 +309,9 @@ pub(crate) async fn read_alpaca_completed_calendar_with_job_context(
         )
         .await
         .inspect_err(|error| {
-            use market_squawk_data::{CatalogError, IngestError};
-            use market_squawk_platform::SealedResearchJournalStoreError as StoreError;
-            let failure = match error {
-                ResearchServiceError::Ingest(IngestError::AuthorityBusy)
-                | ResearchServiceError::Ingest(IngestError::Catalog(CatalogError::AuthorityBusy))
-                | ResearchServiceError::Catalog(CatalogError::AuthorityBusy) => "catalog-busy",
-                ResearchServiceError::Ingest(IngestError::AuthorityLockPoisoned) => {
-                    "catalog-lock-poisoned"
-                }
-                ResearchServiceError::Ingest(IngestError::Cancelled) => "cancelled",
-                ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => "deadline-exceeded",
-                ResearchServiceError::Ingest(IngestError::ProviderCaptureRequired) => {
-                    "capture-evidence-mismatch"
-                }
-                ResearchServiceError::Ingest(IngestError::Manifest(_))
-                | ResearchServiceError::Manifest(_) => "manifest-error",
-                ResearchServiceError::Ingest(IngestError::Catalog(_))
-                | ResearchServiceError::Catalog(_) => "catalog-error",
-                ResearchServiceError::Ingest(IngestError::SealedProviderCapture(
-                    StoreError::Io { .. },
-                ))
-                | ResearchServiceError::ProviderCaptureStore(StoreError::Io { .. }) => {
-                    "capture-store-io"
-                }
-                ResearchServiceError::Ingest(IngestError::SealedProviderCapture(_))
-                | ResearchServiceError::ProviderCaptureStore(_) => "capture-store-error",
-                ResearchServiceError::Ingest(_) => "ingest-error",
-                ResearchServiceError::IngestAuthorityMismatch => "ingest-authority-mismatch",
-                ResearchServiceError::ProviderCaptureSealWorkerUnavailable => "worker-unavailable",
-                ResearchServiceError::Path(_) => "path-unavailable",
-                _ => "research-error",
-            };
-            tracing::warn!(
-                stage = "calendar-native-read-worker",
-                failure,
-                "completed market calendar replay unavailable"
+            crate::application::market_calendar::read::calendar_worker_failure(
+                "calendar-native-read-worker",
+                error,
             );
         })
         .map_err(map_research_error)??;
