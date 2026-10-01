@@ -26,6 +26,7 @@ mod provider_macro_plan;
 mod provider_option;
 mod publication;
 mod query_artifacts;
+mod read_snapshot;
 mod records;
 mod restore_logical;
 mod runs;
@@ -54,6 +55,7 @@ pub use self::portfolio_planning::{
 };
 
 pub(crate) use self::authority::exact_catalog_file_binding;
+pub(crate) use self::read_snapshot::CatalogReadSnapshot;
 pub use self::backup::BackupReceipt;
 pub(crate) use self::backup::{
     InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,

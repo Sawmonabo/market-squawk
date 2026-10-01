@@ -137,6 +137,38 @@ struct RejectDatasetPublication {
 #[derive(Debug)]
 struct AllowProviderEventPublication;
 
+// Hold the real service writer mutex at the existing publication seam while a reader runs.
+#[derive(Debug)]
+struct HoldProviderEventPublication {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl market_squawk_data::IngestPrecommitAuthority for HoldProviderEventPublication {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        Ok(())
+    }
+
+    fn validate_catalog_precommit(&self, _catalog: &CatalogAuthority) -> Result<(), IngestError> {
+        let entered = self
+            .entered
+            .lock()
+            .map_err(|_| IngestError::PublicationAuthorityRevoked)?
+            .take();
+        if let Some(entered) = entered {
+            entered
+                .send(())
+                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+            self.release
+                .lock()
+                .map_err(|_| IngestError::PublicationAuthorityRevoked)?
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct CancelDuringRawVerification {
     verification_chunks: AtomicUsize,
@@ -3152,7 +3184,7 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_market_event_publication_is_restart_queryable() -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("provider-market-event"))?;
@@ -3210,12 +3242,12 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     drop(service);
     drop(capture_store);
 
-    let restarted = AnalyticalDataService::open(
+    let restarted = Arc::new(AnalyticalDataService::open(
         CatalogAuthority::open(catalog_config)?,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
-    )?;
+    )?);
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
     let restarted_selectors = restarted.provider_market_event_publications(&manifest)?;
     assert_eq!(restarted_selectors, selectors);
@@ -3414,15 +3446,52 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 &cancellation,
             )
             .await?;
-        let committed = restarted
-            .ingest_provider_market_events(
-                reservation,
-                manifest.dataset_id().clone(),
-                publication,
-                cancellation.clone(),
-                Arc::new(AllowProviderEventPublication),
-            )
-            .await?;
+        let committed = if batch_number == 2 {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let writer = Arc::clone(&restarted);
+            let dataset = manifest.dataset_id().clone();
+            let publication_cancellation = cancellation.clone();
+            let publication_task = tokio::spawn(async move {
+                writer
+                    .ingest_provider_market_events(
+                        reservation,
+                        dataset,
+                        publication,
+                        publication_cancellation,
+                        Arc::new(HoldProviderEventPublication {
+                            entered: std::sync::Mutex::new(Some(entered_tx)),
+                            release: std::sync::Mutex::new(release_rx),
+                        }),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered_rx).await??;
+            let during_write = restarted
+                .read_provider_market_event_point_in_time(
+                    &selection_request,
+                    Arc::clone(&capture_store),
+                    Instant::now() + Duration::from_secs(5),
+                    cancellation.clone(),
+                )
+                .await;
+            // Release before propagating a read failure, so the writer cannot outlive this check.
+            release_tx.send(())?;
+            let committed = publication_task.await??;
+            let during_write = during_write?.ok_or("writer hid existing market evidence")?;
+            assert_eq!(during_write, selected);
+            committed
+        } else {
+            restarted
+                .ingest_provider_market_events(
+                    reservation,
+                    manifest.dataset_id().clone(),
+                    publication,
+                    cancellation.clone(),
+                    Arc::new(AllowProviderEventPublication),
+                )
+                .await?
+        };
         let request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
             manifest.dataset_id().clone(),
             instrument,

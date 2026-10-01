@@ -9,7 +9,7 @@ use market_squawk_domain::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::catalog::Catalog;
+use crate::catalog::CatalogReadSnapshot;
 use crate::{
     CatalogError, DatasetId, DatasetManifestRef, ManifestCatalogError,
     PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
@@ -809,7 +809,8 @@ impl ProviderMarketEventPointInTimeSelection {
                     .ok_or(ProviderMarketEventSelectionError::EvidenceMismatch)?;
                 if effective_time(&candidate.coordinate, request.effective_time_basis)?
                     != effective_at
-                    || (request.tie_policy == ProviderMarketEventTiePolicy::LatestReceivedObservation
+                    || (request.tie_policy
+                        == ProviderMarketEventTiePolicy::LatestReceivedObservation
                         && candidate.coordinate.received_at != tied[0].coordinate.received_at)
                 {
                     return Err(ProviderMarketEventSelectionError::EvidenceMismatch);
@@ -895,7 +896,7 @@ impl ProviderMarketEventSelectedCandidate {
     pub(crate) fn try_from_reopened_publication(
         request: &ProviderMarketEventPointInTimeRequest,
         planned: &ProviderMarketEventCatalogCandidate,
-        authority: &Catalog,
+        snapshot: &CatalogReadSnapshot,
         batch: &ProviderMarketEventArrowBatch,
         evidence: Arc<PersistedProviderPublicationEvidence>,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
@@ -907,8 +908,7 @@ impl ProviderMarketEventSelectedCandidate {
             return Err(ProviderMarketEventSelectionError::EvidenceMismatch);
         }
         evidence.verify_integrity()?;
-        let publication_rows = authority
-            .provider_market_event_selection_for_publication(planned.publication.digest)?;
+        let publication_rows = snapshot.publication_coordinates(planned.publication.digest)?;
         let indexed = publication_rows
             .get(
                 usize::try_from(planned.publication_row_ordinal)
@@ -1084,7 +1084,12 @@ fn selection_digest(
             .to_be_bytes(),
     );
     hash.update(selection.exclusions.superseded_effective_time.to_be_bytes());
-    hash.update(selection.exclusions.superseded_received_observation.to_be_bytes());
+    hash.update(
+        selection
+            .exclusions
+            .superseded_received_observation
+            .to_be_bytes(),
+    );
     hash.update([1]);
     hash.update(
         u64::try_from(selection.sources.len())

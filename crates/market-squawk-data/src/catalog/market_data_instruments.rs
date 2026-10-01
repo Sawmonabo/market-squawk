@@ -1124,6 +1124,15 @@ pub(crate) fn verify_provider_identity_evidence(
             .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?
             .min(super::types::MAX_SQLITE_RECORD_BYTES);
     let limits = super::CatalogResultLimits::try_new(record_limit, record_limit.saturating_mul(4))?;
+    verify_provider_identity_evidence_with_limits(connection, evidence, limits)
+}
+
+/// Replays the same retained selection with the caller's exact decoded-result budget.
+pub(crate) fn verify_provider_identity_evidence_with_limits(
+    connection: &rusqlite::Connection,
+    evidence: &ProviderIdentitySelectionEvidence,
+    limits: super::CatalogResultLimits,
+) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
     let request = &evidence.native;
     let query = MarketDataProviderIdentityQuery::try_new(
         request.namespace.clone(),

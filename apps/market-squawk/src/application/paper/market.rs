@@ -167,6 +167,21 @@ impl DurableMarketRouteEvidence {
         for receipt in &selections {
             let selection = receipt.selection();
             let request = selection.request();
+            if receipt.source_surface() != &source_id
+                || metadata.source_id() != &source_id
+                || request.instrument_id() != Some(instrument_id)
+                || request.venue_id() != &venue_id
+                || selection.completeness() != ProviderMarketEventSelectionCompleteness::Complete
+                || seen_event_kinds.contains(&request.event_kind())
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            seen_event_kinds.push(request.event_kind());
+            // A complete empty selection proves this event family has no eligible evidence.
+            // Validate its route identity and uniqueness before omitting it from presentation.
+            if selection.sources().is_empty() {
+                continue;
+            }
             let source = selection
                 .sources()
                 .first()
@@ -175,19 +190,13 @@ impl DurableMarketRouteEvidence {
                 .tied_candidates()
                 .first()
                 .ok_or(ServiceError::InvalidResult)?;
-            if receipt.source_surface() != &source_id
-                || metadata.source_id() != &source_id
-                || request.instrument_id() != Some(instrument_id)
-                || request.venue_id() != &venue_id
-                || selection.completeness() != ProviderMarketEventSelectionCompleteness::Complete
-                || selection.sources().len() != 1
+            if selection.sources().len() != 1
                 || source.source_surface() != &source_id
                 || source.tied_candidates().iter().skip(1).any(|tied| {
                     tied.coordinate().canonical_event_digest()
                         != candidate.coordinate().canonical_event_digest()
                         || tied.event() != candidate.event()
                 })
-                || seen_event_kinds.contains(&request.event_kind())
             {
                 return Err(ServiceError::InvalidResult);
             }
@@ -198,8 +207,8 @@ impl DurableMarketRouteEvidence {
             {
                 return Err(ServiceError::InvalidResult);
             }
-            seen_event_kinds.push(request.event_kind());
         }
+        selections.retain(|receipt| !receipt.selection().sources().is_empty());
         let mut selected_cohort: Option<(
             (Timestamp, Timestamp, Timestamp, u64, Timestamp),
             market_squawk_domain::LiveEvidenceBinding,
@@ -224,7 +233,9 @@ impl DurableMarketRouteEvidence {
                 Some(_) => {}
             }
         }
-        let (_cohort_key, cohort_binding) = selected_cohort.ok_or(ServiceError::Unavailable)?;
+        let Some((_cohort_key, cohort_binding)) = selected_cohort else {
+            return Ok(None);
+        };
         let live = metadata
             .coverage()
             .live()

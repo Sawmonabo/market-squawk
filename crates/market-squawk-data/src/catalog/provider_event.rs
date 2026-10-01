@@ -1472,53 +1472,7 @@ impl Catalog {
         &self,
         publication_digest: EvidenceDigest,
     ) -> Result<Vec<ProviderMarketEventSelectionCandidate>, CatalogError> {
-        let Some(evidence) =
-            load_provider_publication_evidence(&self.connection, publication_digest)?
-        else {
-            return Ok(Vec::new());
-        };
-        let expected = persisted_provider_publication_row_count(&evidence)?;
-        if expected == 0 || expected > MAX_PROVIDER_MARKET_EVENT_PUBLICATION_ROWS {
-            return Err(CatalogError::CorruptCatalog);
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT publication_digest, publication_kind, publication_row_ordinal,
-                    component_kind, component_binding_digest, component_row_ordinal,
-                    canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
-                    source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
-                    connection_generation_be, source_sequence_be, provider_event_id,
-                    coordinate_digest, cohort_key, provider_product, provider_channel
-             FROM provider_market_event_selection_index
-             WHERE publication_digest=?1
-             ORDER BY publication_row_ordinal
-             LIMIT ?2",
-        )?;
-        let maximum = expected
-            .checked_add(1)
-            .ok_or(CatalogError::ResultRowLimitExceeded)?;
-        let mut sqlite_rows =
-            statement.query(params![digest_bytes(publication_digest), to_i64(maximum)?,])?;
-        let mut candidates = Vec::new();
-        candidates
-            .try_reserve_exact(expected)
-            .map_err(|_| CatalogError::Allocation)?;
-        while let Some(row) = sqlite_rows.next()? {
-            if candidates.len() == expected {
-                return Err(CatalogError::ResultRowLimitExceeded);
-            }
-            let candidate = load_provider_market_event_selection_candidate(row)?;
-            if candidate.publication_digest != publication_digest
-                || candidate.publication_row_ordinal
-                    != u32::try_from(candidates.len()).map_err(|_| CatalogError::CorruptCatalog)?
-            {
-                return Err(CatalogError::CorruptCatalog);
-            }
-            candidates.push(candidate);
-        }
-        if candidates.len() != expected {
-            return Err(CatalogError::CorruptCatalog);
-        }
-        Ok(candidates)
+        provider_market_event_selection_for_publication(&self.connection, publication_digest)
     }
 
     /// Returns a bounded factual candidate set ordered by source time and local availability.
@@ -2662,7 +2616,7 @@ pub(crate) fn load_provider_publication_for_run(
         .map(Option::flatten)
 }
 
-fn load_provider_publication_evidence(
+pub(super) fn load_provider_publication_evidence(
     connection: &Connection,
     publication_digest: EvidenceDigest,
 ) -> Result<Option<PersistedProviderPublicationEvidence>, CatalogError> {
@@ -3447,75 +3401,7 @@ impl Catalog {
         events: &[MarketEvent],
         evidence: &PersistedProviderPublicationEvidence,
     ) -> Result<(), CatalogError> {
-        evidence.verify_integrity()?;
-        let response_count = evidence
-            .response()
-            .map_or(0, |value| value.canonical_event_count());
-        let expected = response_count
-            .checked_add(
-                evidence
-                    .event()
-                    .map_or(0, |value| value.canonical_event_count()),
-            )
-            .ok_or(CatalogError::ProviderEventMismatch)?;
-        if events.len() != expected {
-            return Err(CatalogError::ProviderEventMismatch);
-        }
-        if let Some(response) = evidence.response() {
-            let capture = response.capture();
-            let (digest, json): (Vec<u8>, String) = self.connection.query_row(
-                "SELECT capture.source_revision_digest, revision.metadata_json
-                 FROM provider_raw_observations AS capture JOIN source_revisions AS revision
-                   ON revision.source_id=capture.source_id
-                  AND revision.revision_digest=capture.source_revision_digest
-                 WHERE capture.capture_observation_digest=?1",
-                [digest_bytes(capture.observation_digest())],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let metadata = checked_event_source_metadata(&digest, &json)?;
-            if metadata.source_id() != capture.source_id()
-                || metadata.revision() != capture.metadata_revision()
-            {
-                return Err(CatalogError::ProviderEventMismatch);
-            }
-            for event in &events[..response_count] {
-                let provenance = market_event_provenance(event);
-                market_squawk_sources::validate_provider_market_event_binding_metadata(
-                    provenance.binding(),
-                    provenance.received_at(),
-                    &metadata,
-                )
-                .map_err(|_| CatalogError::ProviderEventMismatch)?;
-            }
-        }
-        if let Some(event) = evidence.event() {
-            let capture = event.capture();
-            let (digest, json): (Vec<u8>, String) = self.connection.query_row(
-                "SELECT capture.source_revision_digest, revision.metadata_json
-                 FROM provider_event_microbatches AS capture JOIN source_revisions AS revision
-                   ON revision.source_id=capture.source_id
-                  AND revision.revision_digest=capture.source_revision_digest
-                 WHERE capture.event_observation_digest=?1",
-                [digest_bytes(capture.observation_digest())],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let metadata = checked_event_source_metadata(&digest, &json)?;
-            if metadata.source_id() != capture.source_id()
-                || metadata.revision() != capture.metadata_revision()
-            {
-                return Err(CatalogError::ProviderEventMismatch);
-            }
-            for event in &events[response_count..] {
-                let provenance = market_event_provenance(event);
-                market_squawk_sources::validate_provider_market_event_binding_metadata(
-                    provenance.binding(),
-                    provenance.received_at(),
-                    &metadata,
-                )
-                .map_err(|_| CatalogError::ProviderEventMismatch)?;
-            }
-        }
-        Ok(())
+        validate_provider_market_event_metadata(&self.connection, events, evidence)
     }
 }
 
@@ -3566,4 +3452,133 @@ fn copy_identity_selection(payload: Option<&[u8]>) -> Result<Option<Vec<u8>>, Ca
             Ok(bytes)
         })
         .transpose()
+}
+
+/// Loads exact publication coordinates on the caller's retained read transaction.
+pub(super) fn provider_market_event_selection_for_publication(
+    connection: &Connection,
+    publication_digest: EvidenceDigest,
+) -> Result<Vec<ProviderMarketEventSelectionCandidate>, CatalogError> {
+    let Some(evidence) = load_provider_publication_evidence(connection, publication_digest)? else {
+        return Ok(Vec::new());
+    };
+    let expected = persisted_provider_publication_row_count(&evidence)?;
+    if expected == 0 || expected > MAX_PROVIDER_MARKET_EVENT_PUBLICATION_ROWS {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let mut statement = connection.prepare(
+        "SELECT publication_digest, publication_kind, publication_row_ordinal,
+                component_kind, component_binding_digest, component_row_ordinal,
+                canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
+                source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
+                connection_generation_be, source_sequence_be, provider_event_id,
+                coordinate_digest, cohort_key, provider_product, provider_channel
+         FROM provider_market_event_selection_index
+         WHERE publication_digest=?1
+         ORDER BY publication_row_ordinal
+         LIMIT ?2",
+    )?;
+    let maximum = expected
+        .checked_add(1)
+        .ok_or(CatalogError::ResultRowLimitExceeded)?;
+    let mut sqlite_rows =
+        statement.query(params![digest_bytes(publication_digest), to_i64(maximum)?,])?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(expected)
+        .map_err(|_| CatalogError::Allocation)?;
+    while let Some(row) = sqlite_rows.next()? {
+        if candidates.len() == expected {
+            return Err(CatalogError::ResultRowLimitExceeded);
+        }
+        let candidate = load_provider_market_event_selection_candidate(row)?;
+        if candidate.publication_digest != publication_digest
+            || candidate.publication_row_ordinal
+                != u32::try_from(candidates.len()).map_err(|_| CatalogError::CorruptCatalog)?
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        candidates.push(candidate);
+    }
+    if candidates.len() != expected {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(candidates)
+}
+
+/// Replays immutable capture metadata on the caller's retained read transaction.
+pub(super) fn validate_provider_market_event_metadata(
+    connection: &Connection,
+    events: &[MarketEvent],
+    evidence: &PersistedProviderPublicationEvidence,
+) -> Result<(), CatalogError> {
+    evidence.verify_integrity()?;
+    let response_count = evidence
+        .response()
+        .map_or(0, |value| value.canonical_event_count());
+    let expected = response_count
+        .checked_add(
+            evidence
+                .event()
+                .map_or(0, |value| value.canonical_event_count()),
+        )
+        .ok_or(CatalogError::ProviderEventMismatch)?;
+    if events.len() != expected {
+        return Err(CatalogError::ProviderEventMismatch);
+    }
+    if let Some(response) = evidence.response() {
+        let capture = response.capture();
+        let (digest, json): (Vec<u8>, String) = connection.query_row(
+            "SELECT capture.source_revision_digest, revision.metadata_json
+             FROM provider_raw_observations AS capture JOIN source_revisions AS revision
+               ON revision.source_id=capture.source_id
+              AND revision.revision_digest=capture.source_revision_digest
+             WHERE capture.capture_observation_digest=?1",
+            [digest_bytes(capture.observation_digest())],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let metadata = checked_event_source_metadata(&digest, &json)?;
+        if metadata.source_id() != capture.source_id()
+            || metadata.revision() != capture.metadata_revision()
+        {
+            return Err(CatalogError::ProviderEventMismatch);
+        }
+        for event in &events[..response_count] {
+            let provenance = market_event_provenance(event);
+            market_squawk_sources::validate_provider_market_event_binding_metadata(
+                provenance.binding(),
+                provenance.received_at(),
+                &metadata,
+            )
+            .map_err(|_| CatalogError::ProviderEventMismatch)?;
+        }
+    }
+    if let Some(event) = evidence.event() {
+        let capture = event.capture();
+        let (digest, json): (Vec<u8>, String) = connection.query_row(
+            "SELECT capture.source_revision_digest, revision.metadata_json
+             FROM provider_event_microbatches AS capture JOIN source_revisions AS revision
+               ON revision.source_id=capture.source_id
+              AND revision.revision_digest=capture.source_revision_digest
+             WHERE capture.event_observation_digest=?1",
+            [digest_bytes(capture.observation_digest())],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let metadata = checked_event_source_metadata(&digest, &json)?;
+        if metadata.source_id() != capture.source_id()
+            || metadata.revision() != capture.metadata_revision()
+        {
+            return Err(CatalogError::ProviderEventMismatch);
+        }
+        for event in &events[response_count..] {
+            let provenance = market_event_provenance(event);
+            market_squawk_sources::validate_provider_market_event_binding_metadata(
+                provenance.binding(),
+                provenance.received_at(),
+                &metadata,
+            )
+            .map_err(|_| CatalogError::ProviderEventMismatch)?;
+        }
+    }
+    Ok(())
 }

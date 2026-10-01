@@ -45,7 +45,7 @@ use super::{
     ManifestPlanError, MarketBarHistoryPublicationCandidate, Sha256Digest, compare_manifest_refs,
 };
 use crate::OptionMarketPointInTimeRequest;
-use crate::catalog::exact_catalog_file_binding;
+use crate::catalog::{CatalogReadSnapshot, exact_catalog_file_binding};
 use crate::catalog::{
     PreparedProviderCaptureBinding, ProviderArtifactInputCoordinate,
     ProviderMacroPlanPublicationCommit, ProviderMacroPlanPublishedHead,
@@ -159,6 +159,7 @@ impl PinnedDataset {
 /// SQLite-backed immutable analytical generation registry.
 pub struct AnalyticalManifestCatalog {
     connection: Mutex<Connection>,
+    location: CatalogLocation,
     max_objects_per_generation: usize,
     catalog_binding: [u8; 32],
     catalog_file: CatalogFileGuard,
@@ -392,149 +393,145 @@ impl AnalyticalManifestCatalog {
     pub(crate) fn select_provider_market_event_candidates(
         &self,
         request: &ProviderMarketEventPointInTimeRequest,
-        deadline: Instant,
-        cancellation: &CancellationToken,
+        snapshot: &CatalogReadSnapshot,
     ) -> Result<Option<ProviderMarketEventCatalogPlan>, ProviderMarketEventSelectionError> {
-        self.read_bounded(deadline, cancellation, |connection| {
-            let Some(selected) = selected_provider_market_event_generation(&connection, request)?
-            else {
-                return Ok(None);
-            };
-            let clock = match request.effective_time_basis() {
-                ProviderMarketEventEffectiveTimeBasis::SourceTimestamp => 0_i64,
-                ProviderMarketEventEffectiveTimeBasis::ReceivedAt => 1_i64,
-            };
-            let retrieval_limit = request
-                .maximum_candidates()
-                .checked_add(1)
-                .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
-            let mut statement = connection.prepare(
-                "WITH publication_origin AS (
-                 SELECT publication.publication_digest,
-                        MIN(generation.available_at_ns) AS origin_published_at_ns
-                 FROM analytical_generation_provider_publication_bindings AS publication
-                 JOIN analytical_available_generations AS generation
-                   ON generation.generation_sequence=publication.generation_sequence
-                 JOIN analytical_generation_source_inputs AS source_input
-                   ON source_input.generation_sequence=generation.generation_sequence
-                  AND source_input.run_id=publication.run_id
-                 WHERE generation.dataset_id=?1
-                   AND generation.generation_kind='ingest'
-                 GROUP BY publication.publication_digest
-             ), keyed_rows AS (
-                 SELECT publication.publication_digest, publication.publication_kind,
-                        indexed.publication_row_ordinal, indexed.coordinate_digest,
-                        indexed.source_id, indexed.received_at_ns,
-                        CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
-                             ELSE indexed.received_at_ns END AS effective_at_ns,
-                        origin.origin_published_at_ns
-                 FROM analytical_generation_provider_publication_bindings AS publication
-                 JOIN provider_market_event_selection_index AS indexed
-                   ON indexed.publication_digest=publication.publication_digest
-                  AND indexed.publication_kind=publication.publication_kind
-                  AND indexed.source_id=publication.source_id
-                 JOIN publication_origin AS origin
-                   ON origin.publication_digest=publication.publication_digest
-                 WHERE publication.generation_sequence=?2
-                   AND ((?3 IS NOT NULL AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL)
-                        OR (?3 IS NULL AND indexed.instrument_id IS NULL AND indexed.cohort_key=?11
-                            AND indexed.provider_product=?12 AND indexed.provider_channel=?13))
-                   AND indexed.venue_id=?4
-                   AND indexed.event_kind=?5
-                   AND (?9 IS NULL OR indexed.source_id=?9)
-                   AND ((?6=0 AND indexed.source_timestamp_ns IS NOT NULL
-                                   AND indexed.source_timestamp_ns<=?7)
-                        OR (?6=1 AND indexed.received_at_ns<=?7))
-                   AND indexed.available_at_ns<=?8
-                   AND indexed.ingested_at_ns<=?8
-                   AND origin.origin_published_at_ns<=?8
-             ), newest_by_source AS (
-                 SELECT *, MAX(effective_at_ns) OVER (
-                     PARTITION BY source_id
-                 ) AS newest_effective_at_ns,
-                 MAX(received_at_ns) OVER (
-                     PARTITION BY source_id, effective_at_ns
-                 ) AS newest_received_at_ns
-                 FROM keyed_rows
-             )
-             SELECT publication_digest, publication_kind, publication_row_ordinal,
-                    coordinate_digest, source_id, effective_at_ns, origin_published_at_ns
-             FROM newest_by_source
-             WHERE effective_at_ns=newest_effective_at_ns
-               AND (?14=0 OR received_at_ns=newest_received_at_ns)
-             ORDER BY source_id, publication_digest, publication_row_ordinal
-             LIMIT ?10",
-            )?;
-            let instrument = request.instrument_id().map(|id| id.as_uuid());
-            let mut rows = statement.query(params![
-                request.dataset().as_str(),
-                selected.generation_sequence,
-                instrument.as_ref().map(|id| id.as_bytes().as_slice()),
-                request.venue_id().as_str(),
-                crate::provider_event_selection::event_kind_name(request.event_kind()),
-                clock,
-                request.as_of_cutoff().unix_nanos(),
-                request.knowledge_cutoff().unix_nanos(),
-                request.exact_source_surface().map(SourceId::as_str),
-                i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?,
-                request.cohort_key().map(|key| key.as_str()),
-                request
-                    .exact_product()
-                    .map(|value| value.as_source_identifier().as_str()),
-                request
-                    .exact_channel()
-                    .map(|value| value.as_source_identifier().as_str()),
-                request.tie_policy()
-                    == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
-            ])?;
-            let mut candidates = Vec::new();
-            candidates
-                .try_reserve_exact(request.maximum_candidates())
-                .map_err(|_| ProviderMarketEventSelectionError::Allocation)?;
-            while let Some(row) = rows.next()? {
-                if candidates.len() == request.maximum_candidates() {
-                    return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
-                }
-                let publication_digest = EvidenceDigest::new(
-                    DigestAlgorithm::Sha256,
-                    parse_digest(&row.get::<_, Vec<u8>>(0)?)?.bytes(),
-                );
-                let publication_kind =
-                    parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
-                let publication_row_ordinal = u32::try_from(row.get::<_, i64>(2)?)
-                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-                let coordinate_digest = EvidenceDigest::new(
-                    DigestAlgorithm::Sha256,
-                    parse_digest(&row.get::<_, Vec<u8>>(3)?)?.bytes(),
-                );
-                let source_surface = SourceId::try_from(row.get::<_, String>(4)?)
-                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-                candidates.push(ProviderMarketEventCatalogCandidate {
-                    publication: ProviderMarketEventExactPublication::from_catalog(
-                        publication_digest,
-                        publication_kind,
-                    ),
-                    publication_row_ordinal,
-                    coordinate_digest,
-                    source_surface,
-                    effective_at: Timestamp::from_unix_nanos(row.get(5)?),
-                    origin_generation_published_at: Timestamp::from_unix_nanos(row.get(6)?),
-                });
+        let connection = snapshot.connection();
+        let Some(selected) = selected_provider_market_event_generation(connection, request)? else {
+            return Ok(None);
+        };
+        let clock = match request.effective_time_basis() {
+            ProviderMarketEventEffectiveTimeBasis::SourceTimestamp => 0_i64,
+            ProviderMarketEventEffectiveTimeBasis::ReceivedAt => 1_i64,
+        };
+        let retrieval_limit = request
+            .maximum_candidates()
+            .checked_add(1)
+            .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
+        let mut statement = connection.prepare(
+            "WITH publication_origin AS (
+             SELECT publication.publication_digest,
+                    MIN(generation.available_at_ns) AS origin_published_at_ns
+             FROM analytical_generation_provider_publication_bindings AS publication
+             JOIN analytical_available_generations AS generation
+               ON generation.generation_sequence=publication.generation_sequence
+             JOIN analytical_generation_source_inputs AS source_input
+               ON source_input.generation_sequence=generation.generation_sequence
+              AND source_input.run_id=publication.run_id
+             WHERE generation.dataset_id=?1
+               AND generation.generation_kind='ingest'
+             GROUP BY publication.publication_digest
+         ), keyed_rows AS (
+             SELECT publication.publication_digest, publication.publication_kind,
+                    indexed.publication_row_ordinal, indexed.coordinate_digest,
+                    indexed.source_id, indexed.received_at_ns,
+                    CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
+                         ELSE indexed.received_at_ns END AS effective_at_ns,
+                    origin.origin_published_at_ns
+             FROM analytical_generation_provider_publication_bindings AS publication
+             JOIN provider_market_event_selection_index AS indexed
+               ON indexed.publication_digest=publication.publication_digest
+              AND indexed.publication_kind=publication.publication_kind
+              AND indexed.source_id=publication.source_id
+             JOIN publication_origin AS origin
+               ON origin.publication_digest=publication.publication_digest
+             WHERE publication.generation_sequence=?2
+               AND ((?3 IS NOT NULL AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL)
+                    OR (?3 IS NULL AND indexed.instrument_id IS NULL AND indexed.cohort_key=?11
+                        AND indexed.provider_product=?12 AND indexed.provider_channel=?13))
+               AND indexed.venue_id=?4
+               AND indexed.event_kind=?5
+               AND (?9 IS NULL OR indexed.source_id=?9)
+               AND ((?6=0 AND indexed.source_timestamp_ns IS NOT NULL
+                               AND indexed.source_timestamp_ns<=?7)
+                    OR (?6=1 AND indexed.received_at_ns<=?7))
+               AND indexed.available_at_ns<=?8
+               AND indexed.ingested_at_ns<=?8
+               AND origin.origin_published_at_ns<=?8
+         ), newest_by_source AS (
+             SELECT *, MAX(effective_at_ns) OVER (
+                 PARTITION BY source_id
+             ) AS newest_effective_at_ns,
+             MAX(received_at_ns) OVER (
+                 PARTITION BY source_id, effective_at_ns
+             ) AS newest_received_at_ns
+             FROM keyed_rows
+         )
+         SELECT publication_digest, publication_kind, publication_row_ordinal,
+                coordinate_digest, source_id, effective_at_ns, origin_published_at_ns
+         FROM newest_by_source
+         WHERE effective_at_ns=newest_effective_at_ns
+           AND (?14=0 OR received_at_ns=newest_received_at_ns)
+         ORDER BY source_id, publication_digest, publication_row_ordinal
+         LIMIT ?10",
+        )?;
+        let instrument = request.instrument_id().map(|id| id.as_uuid());
+        let mut rows = statement.query(params![
+            request.dataset().as_str(),
+            selected.generation_sequence,
+            instrument.as_ref().map(|id| id.as_bytes().as_slice()),
+            request.venue_id().as_str(),
+            crate::provider_event_selection::event_kind_name(request.event_kind()),
+            clock,
+            request.as_of_cutoff().unix_nanos(),
+            request.knowledge_cutoff().unix_nanos(),
+            request.exact_source_surface().map(SourceId::as_str),
+            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?,
+            request.cohort_key().map(|key| key.as_str()),
+            request
+                .exact_product()
+                .map(|value| value.as_source_identifier().as_str()),
+            request
+                .exact_channel()
+                .map(|value| value.as_source_identifier().as_str()),
+            request.tie_policy() == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
+        ])?;
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(request.maximum_candidates())
+            .map_err(|_| ProviderMarketEventSelectionError::Allocation)?;
+        while let Some(row) = rows.next()? {
+            if candidates.len() == request.maximum_candidates() {
+                return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
             }
-            let exclusions = provider_market_event_exclusion_counts(
-                &connection,
-                request,
-                selected.generation_sequence,
-                clock,
-            )?;
-            ProviderMarketEventCatalogPlan::try_new(
-                selected.manifest,
-                selected.published_at,
-                candidates,
-                exclusions,
-            )
-            .map(Some)
-        })
+            let publication_digest = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                parse_digest(&row.get::<_, Vec<u8>>(0)?)?.bytes(),
+            );
+            let publication_kind =
+                parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
+            let publication_row_ordinal = u32::try_from(row.get::<_, i64>(2)?)
+                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let coordinate_digest = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                parse_digest(&row.get::<_, Vec<u8>>(3)?)?.bytes(),
+            );
+            let source_surface = SourceId::try_from(row.get::<_, String>(4)?)
+                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            candidates.push(ProviderMarketEventCatalogCandidate {
+                publication: ProviderMarketEventExactPublication::from_catalog(
+                    publication_digest,
+                    publication_kind,
+                ),
+                publication_row_ordinal,
+                coordinate_digest,
+                source_surface,
+                effective_at: Timestamp::from_unix_nanos(row.get(5)?),
+                origin_generation_published_at: Timestamp::from_unix_nanos(row.get(6)?),
+            });
+        }
+        let exclusions = provider_market_event_exclusion_counts(
+            connection,
+            request,
+            selected.generation_sequence,
+            clock,
+        )?;
+        ProviderMarketEventCatalogPlan::try_new(
+            selected.manifest,
+            selected.published_at,
+            candidates,
+            exclusions,
+        )
+        .map(Some)
     }
 
     pub(crate) fn provider_publication_bindings(
@@ -563,106 +560,102 @@ impl AnalyticalManifestCatalog {
         &self,
         pinned: &PinnedDataset,
         publication: &ProviderMarketEventExactPublication,
-        deadline: Instant,
-        cancellation: &CancellationToken,
+        snapshot: &CatalogReadSnapshot,
     ) -> Result<Vec<(Uuid, usize)>, ManifestCatalogError> {
-        self.read_bounded(deadline, cancellation, |connection| {
-            let manifest = pinned.manifest();
-            let run_id: String = connection
-                .query_row(
-                    "SELECT publication.run_id
-                 FROM analytical_available_generations AS generation
-                 JOIN analytical_generation_provider_publication_bindings AS publication
-                   ON publication.generation_sequence=generation.generation_sequence
-                 JOIN ingest_run_provider_publication_bindings AS original
-                   ON original.run_id=publication.run_id
-                  AND original.publication_digest=publication.publication_digest
-                  AND original.publication_kind=publication.publication_kind
-                  AND original.source_id=publication.source_id
-                 WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
-                   AND generation.schema_name=?3 AND generation.schema_version=?4
-                   AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
-                   AND publication.publication_digest=?7 AND publication.publication_kind=?8",
-                    params![
-                        manifest.dataset_id().as_str(),
-                        to_i64(manifest.manifest_version())?,
-                        manifest.schema().name(),
-                        i64::from(manifest.schema().version().get()),
-                        manifest.schema().fingerprint().as_slice(),
-                        manifest.content_hash().bytes(),
-                        publication.digest().bytes(),
-                        publication.kind().as_str()
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or(ManifestCatalogError::GenerationConflict)?;
-            let run_id =
-                Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let mut statement = connection.prepare(
-                "SELECT output.publication_ordinal, output.artifact_id,
-                        output.content_algorithm, output.content_digest, output.size_bytes,
-                        output.relative_reference, object.ordinal,
-                        object.content_hash, object.row_count, object.size_bytes
-                 FROM artifacts AS output
-                 LEFT JOIN analytical_generation_objects AS object
-                   ON object.dataset_id=?1 AND object.manifest_version=?2
-                  AND object.artifact_id=output.artifact_id
-                 WHERE output.run_id=?3
-                 ORDER BY output.publication_ordinal LIMIT 1025",
-            )?;
-            let mut rows = statement.query(params![
-                manifest.dataset_id().as_str(),
-                to_i64(manifest.manifest_version())?,
-                run_id.to_string()
-            ])?;
-            let mut outputs = Vec::new();
-            let mut count = 0usize;
-            while let Some(row) = rows.next()? {
-                let output_ordinal: i64 = row.get(0)?;
-                let artifact_id = Uuid::parse_str(&row.get::<_, String>(1)?)
-                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-                let algorithm: i64 = row.get(2)?;
-                let digest = parse_digest(&row.get::<_, Vec<u8>>(3)?)?;
-                let bytes = u64::try_from(row.get::<_, i64>(4)?)
-                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-                let reference: String = row.get(5)?;
-                if count >= 1024
-                    || usize::try_from(output_ordinal).ok() != Some(count)
-                    || algorithm != 1
-                    || bytes == 0
-                {
-                    return Err(ManifestCatalogError::CorruptCatalog);
-                }
-                count += 1;
-                let ordinal = row
-                    .get::<_, Option<i64>>(6)?
-                    .ok_or(ManifestCatalogError::CorruptCatalog)?;
-                let ordinal =
-                    usize::try_from(ordinal).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-                let object = pinned
-                    .objects()
-                    .get(ordinal)
-                    .ok_or(ManifestCatalogError::CorruptCatalog)?;
-                if object.artifact_id() != artifact_id
-                    || object.relative_reference() != reference
-                    || object.object().content_hash() != digest
-                    || object.object().size_bytes() != bytes
-                    || parse_digest(&row.get::<_, Vec<u8>>(7)?)? != digest
-                    || u64::try_from(row.get::<_, i64>(8)?).ok()
-                        != Some(object.object().row_count())
-                    || u64::try_from(row.get::<_, i64>(9)?).ok() != Some(bytes)
-                    || outputs.iter().any(|(_, prior)| *prior == ordinal)
-                {
-                    return Err(ManifestCatalogError::CorruptCatalog);
-                }
-                outputs.push((artifact_id, ordinal));
-            }
-            if count == 0 || outputs.len() != count {
+        let connection = snapshot.connection();
+        let manifest = pinned.manifest();
+        let run_id: String = connection
+            .query_row(
+                "SELECT publication.run_id
+             FROM analytical_available_generations AS generation
+             JOIN analytical_generation_provider_publication_bindings AS publication
+               ON publication.generation_sequence=generation.generation_sequence
+             JOIN ingest_run_provider_publication_bindings AS original
+               ON original.run_id=publication.run_id
+              AND original.publication_digest=publication.publication_digest
+              AND original.publication_kind=publication.publication_kind
+              AND original.source_id=publication.source_id
+             WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+               AND generation.schema_name=?3 AND generation.schema_version=?4
+               AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
+               AND publication.publication_digest=?7 AND publication.publication_kind=?8",
+                params![
+                    manifest.dataset_id().as_str(),
+                    to_i64(manifest.manifest_version())?,
+                    manifest.schema().name(),
+                    i64::from(manifest.schema().version().get()),
+                    manifest.schema().fingerprint().as_slice(),
+                    manifest.content_hash().bytes(),
+                    publication.digest().bytes(),
+                    publication.kind().as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ManifestCatalogError::GenerationConflict)?;
+        let run_id = Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+        let mut statement = connection.prepare(
+            "SELECT output.publication_ordinal, output.artifact_id,
+                    output.content_algorithm, output.content_digest, output.size_bytes,
+                    output.relative_reference, object.ordinal,
+                    object.content_hash, object.row_count, object.size_bytes
+             FROM artifacts AS output
+             LEFT JOIN analytical_generation_objects AS object
+               ON object.dataset_id=?1 AND object.manifest_version=?2
+              AND object.artifact_id=output.artifact_id
+             WHERE output.run_id=?3
+             ORDER BY output.publication_ordinal LIMIT 1025",
+        )?;
+        let mut rows = statement.query(params![
+            manifest.dataset_id().as_str(),
+            to_i64(manifest.manifest_version())?,
+            run_id.to_string()
+        ])?;
+        let mut outputs = Vec::new();
+        let mut count = 0usize;
+        while let Some(row) = rows.next()? {
+            let output_ordinal: i64 = row.get(0)?;
+            let artifact_id = Uuid::parse_str(&row.get::<_, String>(1)?)
+                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let algorithm: i64 = row.get(2)?;
+            let digest = parse_digest(&row.get::<_, Vec<u8>>(3)?)?;
+            let bytes = u64::try_from(row.get::<_, i64>(4)?)
+                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let reference: String = row.get(5)?;
+            if count >= 1024
+                || usize::try_from(output_ordinal).ok() != Some(count)
+                || algorithm != 1
+                || bytes == 0
+            {
                 return Err(ManifestCatalogError::CorruptCatalog);
             }
-            Ok(outputs)
-        })
+            count += 1;
+            let ordinal = row
+                .get::<_, Option<i64>>(6)?
+                .ok_or(ManifestCatalogError::CorruptCatalog)?;
+            let ordinal =
+                usize::try_from(ordinal).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let object = pinned
+                .objects()
+                .get(ordinal)
+                .ok_or(ManifestCatalogError::CorruptCatalog)?;
+            if object.artifact_id() != artifact_id
+                || object.relative_reference() != reference
+                || object.object().content_hash() != digest
+                || object.object().size_bytes() != bytes
+                || parse_digest(&row.get::<_, Vec<u8>>(7)?)? != digest
+                || u64::try_from(row.get::<_, i64>(8)?).ok() != Some(object.object().row_count())
+                || u64::try_from(row.get::<_, i64>(9)?).ok() != Some(bytes)
+                || outputs.iter().any(|(_, prior)| *prior == ordinal)
+            {
+                return Err(ManifestCatalogError::CorruptCatalog);
+            }
+            outputs.push((artifact_id, ordinal));
+        }
+        if count == 0 || outputs.len() != count {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        Ok(outputs)
     }
 
     /// Lists the generation's complete cumulative provider lineage in canonical digest order.
@@ -965,10 +958,50 @@ impl AnalyticalManifestCatalog {
         catalog_file.validate_identity()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            location: location.clone(),
             max_objects_per_generation,
             catalog_binding,
             catalog_file,
         })
+    }
+
+    /// Opens an independent live-WAL reader bound to this exact manifest catalog.
+    pub(crate) fn read_snapshot(
+        &self,
+        limits: CatalogResultLimits,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogReadSnapshot, CatalogError> {
+        CatalogReadSnapshot::open(
+            &self.location,
+            self.catalog_binding,
+            limits,
+            deadline,
+            cancellation,
+        )
+    }
+
+    pub(crate) fn pinned_in_snapshot(
+        &self,
+        manifest: &DatasetManifestRef,
+        snapshot: &CatalogReadSnapshot,
+    ) -> Result<PinnedDataset, ManifestCatalogError> {
+        DatasetSchemaRegistry::local()
+            .resolve(manifest.schema())
+            .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
+        load_pinned(
+            snapshot.connection(),
+            manifest,
+            self.max_objects_per_generation,
+        )
+    }
+
+    pub(crate) fn provider_publication_bindings_in_snapshot(
+        &self,
+        manifest: &DatasetManifestRef,
+        snapshot: &CatalogReadSnapshot,
+    ) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
+        load_provider_publication_bindings(snapshot.connection(), manifest)
     }
 
     pub(crate) const fn catalog_binding(&self) -> [u8; 32] {

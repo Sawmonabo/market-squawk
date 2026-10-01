@@ -2,7 +2,7 @@
 
 ## Active startup, optional-lock and previous-close integration — 2026-09-30
 
-Current pushed request-admission checkpoint: `e092a17b` (PR #43 comment 5923423225); Desktop reconnect: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
+History checkpoint: `0206d13a` (PR #43 comment 5923592639). Request-admission checkpoint: `e092a17b` (PR #43 comment 5923423225); Desktop reconnect: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
 History integration audit base: `a0e8b77b`; both preserved on `feature/v1-installed-product-experience`.
 One primary worktree, three local branches and three origin branches; no linked worktrees.
 Original session and recovery backups remain protected. No CI or release gate has run for this wave.
@@ -14,6 +14,12 @@ Lock/Forget, and a user-selected reauthentication interval. Saved pages remain u
 supersedes forced password storage in development and any conflicting import-only guidance.
 
 ### Current outcomes and verification
+
+Current integrated slice: independent read-only WAL snapshots remove the writer/manifest mutexes from market PIT reads without changing their clocks, limits or evidence. The existing provider-event restart case now holds the real writer mutex at precommit while an exact read must return its unchanged selection; this and existing cancellation/deadline/corruption assertions pass (1.26s; `independent-market-read-critical.log`). The app also omits validated empty event-family selections instead of failing its complete route. These changes are critically verified; the snapshot binary has not yet been live exercised.
+
+Latest actual native sweep: all 17 routes Ready/connected with no active query errors and no password (`history-rejoin-native-routes.json`). Starter prices remain unavailable. Calendar selection now succeeds, but history canonical-publication fails before any ingest record. Its cause remains under diagnosis. Separately, Retry successfully refreshes the provider doctor but the publication registry rejects same-credential renewal for Alpaca; a shared lease-bound renewal correction is in progress. Preserve exact expiry/currentness and drained predecessors, not longer time limits. No compiler is currently running. Prior observations below are historical evidence, not additional active queues.
+
+### Prior integrated observations
 
 Coherent retained-history checkpoint: adapter request identity/asof, shared capture contract, catalog publication/reopen validation and all application producers/consumers are integrated together. The complete-history critical case now also verifies actual native calendar rejoin at the inclusive daily boundary before/after restart (1.37s). Heap-owned extraction payloads preserve serialization and avoid the observed stack crash. Existing V1 schema/checksum updated in place, no migration path; original local catalog recovery backup retained. This checkpoint is critically verified, not live price completion: native source retry succeeds but separate calendar preparation currently rejects before history publication. Display warming/previous-close UI remains in pending working-tree integration.
 
@@ -50,6 +56,16 @@ Evidence under `.agents/tmp/v1-first-stock/`:
 `calendar-currentness-diagnostic-retry.json`, `credential-access-diagnostic-service.log`.
 
 ### Dependency and ownership
+
+Confirmed source renewal defect: current-generation replacement recognizes fresh unchanged-credential doctor evidence only for named Schwab profiles, rejecting the renewed Alpaca asset-reference slot after expiry. Astra `credential_runtime_lifecycle` owns `application/research/ingest/provider_runtime.rs` and its existing exact-generation critical case: replace named exceptions with lease-bound renewal evidence, preserving later interval, exact slot/credentials/capability and drained predecessor. Lead owns composition in `provider_activation/mod.rs` and callers `schwab_reference.rs`, `schwab_quote_metadata.rs`, `schwab_market_hours.rs`. No expiry increase or bypass.
+
+Calendar lane next bounded diagnostic ownership: Astra `calendar_currentness_failure` owns app `research/corporate_actions/preflight/history.rs` and app `research/ingest.rs` only to expose existing closed ProviderOperationDiagnostic phase/failure and remaining canonical-publication stage. First three failures precede activation expiry and no history ingest run exists. No speculative behavior fix. Lead owns new critical writer-held/read assertion in existing data publication_recovery case; it uses the existing precommit seam, not a production testing API.
+
+Independent bounded diagnosis: Astra `credential_runtime_lifecycle` traces automatic source restoration and settled Retry returning Unavailable after activation-expired, including whether initial display warming blocks ordinary readiness. Read-only source/log trace; no edits/runtime/builds. Lead retains lifecycle/composition ownership. Calendar lane owns canonical-publication failure diagnosis; snapshot lane owns data reads.
+
+Current integration: `0206d13a` is pushed. The actual native-calendar inclusive-end/restart regression passes (1.37s), and the serialized native build passes. Live starter prices remain unverified; preparation still fails before history publication in the prior runtime.
+
+Next ownership wave: independent PIT read snapshot → critical concurrent-read integrity check → native market retry. Astra `research_options_failure` owns only data `catalog/read_snapshot.rs`, `catalog/provider_event.rs`, `manifest/catalog.rs`, `provider_event_selection.rs`, and `ingest.rs`, plus the small shared identity replay helper in `catalog/market_data_instruments.rs`, for one read-only WAL snapshot inside the existing supervised worker. Lead reserves `catalog.rs`, shared exports/composition, existing critical tests, Git and build scheduling. Preserve exact original clocks, publication/identity checks, cancellation/deadline and bounded object reads; no global operation gate, extra worker/runtime, immutable live database, compatibility path or new dependency. Calendar diagnosis remains an independent lane in app files; lead owns runtime actions.
 
 Confirmed presentation defect: an absent event kind yields a valid complete empty selection, but durable route assembly treats it as InvalidResult. Astra `research_options_failure` exclusively owns `application/paper/market.rs` and its existing inline critical case (if needed) to preserve receipt identity/completeness validation and omit only genuinely empty selections. Separately, investigate independent existing catalog read ownership for PIT reads; do not serialize all reads behind the global ingest gate without establishing necessity. No data-layer edits yet.
 
