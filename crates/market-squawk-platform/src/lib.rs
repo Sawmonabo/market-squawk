@@ -66,8 +66,9 @@ pub use journal::{
     ResearchObjectReceipt, SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
     SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
     SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
-    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
-    SealedResearchRecoverySession, VerifiedResearchObject,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRawObjectKind,
+    SealedResearchRecoveryAdmission, SealedResearchRecoverySession, SealedResearchRecoveryTurn,
+    VerifiedResearchObject,
 };
 pub use paths::{
     ArtifactPathError, ArtifactRoot, CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard,

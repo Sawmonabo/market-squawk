@@ -2715,15 +2715,27 @@ async fn native_reference_custody_preserves_prior_identity_and_recovers_original
     drop(reader);
     drop(publisher);
     drop(service);
+    drop(capture);
     drop(raw_store);
 
     let service = initialize()?;
     let raw_store = Arc::new(paths.sealed_research_journal_store()?);
-    let recovery = service
-        .recover_provider_capture_store(Arc::clone(&raw_store), &cancellation)
-        .await?;
-    assert_eq!(recovery.retained_journal_segments(), 1);
-    assert!(recovery.quarantined_objects().is_empty());
+    let recovery = Arc::new(Mutex::new(
+        service.create_provider_capture_recovery(Arc::clone(&raw_store))?,
+    ));
+    let mut retained_segments = 0;
+    loop {
+        let turn = service
+            .recover_provider_capture_store_turn(Arc::clone(&recovery), deadline(), &cancellation)
+            .await?;
+        retained_segments += turn.report().retained_journal_segments();
+        assert!(turn.report().quarantined_objects().is_empty());
+        if turn.complete() {
+            break;
+        }
+    }
+    assert_eq!(retained_segments, 1);
+    drop(recovery);
     let reader = service.market_data_instruments();
     let selection = reader
         .select_provider_identity_as_of(query, deadline(), &cancellation)?

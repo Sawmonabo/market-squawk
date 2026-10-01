@@ -75,7 +75,7 @@ impl ProductStartupTasks {
     pub(super) fn start(
         research: Arc<ResearchApplicationServices>,
         cancellation: CancellationToken,
-        futures: [Option<StartupFuture>; 5],
+        futures: [Option<StartupFuture>; 6],
     ) -> Arc<Self> {
         let owner = Arc::new(Self {
             research,
@@ -446,6 +446,51 @@ pub(super) async fn run_market_event_archive(
                 // Archive failure leaves active rows authoritative and does not stop a source.
                 tracing::warn!("market event archive turn could not complete");
                 cursor = None;
+            }
+        }
+    }
+}
+
+/// Reconciles historical raw files incrementally without delaying source or screen readiness.
+pub(super) async fn run_provider_capture_recovery(
+    analytical: Arc<market_squawk_data::AnalyticalDataService>,
+    recovery: market_squawk_data::ProviderCaptureRecovery,
+    cancellation: CancellationToken,
+) {
+    let recovery = Arc::new(std::sync::Mutex::new(recovery));
+    let mut cadence = tokio::time::interval(Duration::from_secs(5));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { biased;
+            () = cancellation.cancelled() => return,
+            _ = cadence.tick() => {},
+        }
+        let result = analytical
+            .recover_provider_capture_store_turn(
+                Arc::clone(&recovery),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )
+            .await;
+        if cancellation.is_cancelled() {
+            return;
+        }
+        match result {
+            Ok(turn) if turn.complete() => return,
+            Ok(_) => {}
+            Err(
+                market_squawk_data::IngestError::DeadlineExceeded
+                | market_squawk_data::IngestError::ProviderCaptureRecoveryWorkerUnavailable
+                | market_squawk_data::IngestError::SealedProviderCapture(
+                    market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(
+                        market_squawk_platform::ResearchObjectControlError::Unavailable,
+                    ),
+                ),
+            ) => {}
+            Err(_) => {
+                // Exact reads remain authoritative; an incomplete sweep never grants admission.
+                tracing::warn!("raw capture reconciliation turn could not complete");
+                return;
             }
         }
     }

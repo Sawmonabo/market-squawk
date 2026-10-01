@@ -489,10 +489,10 @@ CREATE TABLE provider_raw_observation_pages (
 CREATE TABLE provider_capture_recovery_capacity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     physical_claims INTEGER NOT NULL CHECK (
-        physical_claims BETWEEN 0 AND 25000
+        physical_claims >= 0
     ),
     physical_bytes INTEGER NOT NULL CHECK (
-        physical_bytes BETWEEN 0 AND 549755813888
+        physical_bytes >= 0
     )
 ) STRICT, WITHOUT ROWID;
 
@@ -541,6 +541,11 @@ CREATE TABLE sealed_raw_objects (
     )
 ) STRICT, WITHOUT ROWID;
 
+-- Indexed exact membership for incremental raw-object reconciliation. These totals describe
+-- retained storage; only integer overflow, not a lifetime row/byte quota, rejects accounting.
+CREATE INDEX sealed_raw_objects_physical_identity
+ON sealed_raw_objects(raw_claim_kind,content_digest,physical_receipt_digest);
+
 CREATE TRIGGER sealed_raw_objects_recovery_capacity_insert
 BEFORE INSERT ON sealed_raw_objects
 WHEN NOT EXISTS (
@@ -550,12 +555,12 @@ WHEN NOT EXISTS (
     FROM provider_capture_recovery_capacity
     WHERE singleton = 1
       AND (
-          physical_claims >= 25000
-          OR physical_bytes > 549755813888 - NEW.size_bytes
+          physical_claims = 9223372036854775807
+          OR physical_bytes > 9223372036854775807 - NEW.size_bytes
       )
 )
 BEGIN
-    SELECT RAISE(ABORT, 'sealed provider raw-object recovery capacity exceeded');
+    SELECT RAISE(ABORT, 'sealed provider raw-object accounting overflow');
 END;
 
 CREATE TRIGGER sealed_raw_objects_recovery_capacity_account
@@ -4693,3 +4698,9 @@ AND NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'successful ingest run lacks a closed publication');
 END;
+
+-- Exact streaming backup lookups must not rescan all generations or query results per object.
+CREATE INDEX analytical_generation_objects_artifact_rows
+ON analytical_generation_objects(artifact_id, row_count);
+CREATE INDEX query_artifact_results_relative_reference
+ON query_artifact_results(relative_reference, reservation_id);

@@ -390,32 +390,6 @@ fn verify_backup_contents(
     Ok(())
 }
 
-// Recovery already holds the store operation mutex. Reuse the same bounded verifier without
-// acquiring that mutex recursively or constructing a replacement authority receipt.
-pub(super) fn verify_recovery_journal_claim(
-    store: &SealedResearchJournalStore,
-    claim: &SealedResearchJournalSegmentClaim,
-    control: &dyn ResearchObjectControl,
-) -> Result<()> {
-    validate_claim_shape(claim)?;
-    let terms = BackupTerms {
-        kind: RawObjectKind::JournalSegment,
-        bytes: claim.size_bytes(),
-        digest: claim.content_digest(),
-    };
-    let hex = try_digest_hex(terms.digest)?;
-    let shard = store
-        .objects
-        .open_dir_nofollow(&hex[..2])
-        .map_err(|source| {
-            SealedResearchJournalStoreError::io("failed to open recovered raw shard", source)
-        })?;
-    let filename = format!("{hex}.msj");
-    let (mut file, identity) = open_backup_object(&shard, &filename, terms)?;
-    verify_backup_journal_contents(&mut file, claim, terms, control)?;
-    validate_backup_identity(&shard, &filename, &file, identity, terms, true)
-}
-
 fn verify_backup_journal_contents(
     file: &mut File,
     claim: &SealedResearchJournalSegmentClaim,

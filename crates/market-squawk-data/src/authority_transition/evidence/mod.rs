@@ -4,7 +4,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-mod canonical;
+pub(crate) mod canonical;
 mod catalog;
 pub(crate) mod fs;
 
@@ -78,6 +78,12 @@ pub(crate) enum EvidenceError {
 }
 pub(crate) use catalog::{
     ArtifactEvidenceRow, CatalogEvidenceSnapshot, EvidenceLimits, EvidenceSnapshotRequest,
-    GenerationEvidenceRow, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
-    ManifestEvidenceRow, MarketEventArchiveEvidenceRow, QueryArtifactEvidenceRow,
+    GenerationEvidenceHeader, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
+    ManifestEvidenceRow, MarketEventArchiveEvidenceRow, ProviderCatalogRelation,
+    ProviderCatalogRelationEvidenceRow, QueryArtifactEvidenceRow,
 };
+
+mod physical;
+pub(crate) use physical::PhysicalArtifactEvidence;
+mod generation;
+pub(crate) use generation::GenerationPlanEvidence;

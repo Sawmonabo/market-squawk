@@ -59,8 +59,6 @@ use crate::{
     },
 };
 
-const MAXIMUM_BACKUP_ARTIFACTS: usize = 100_000;
-const MAXIMUM_BACKUP_REFERENCES: usize = 400_000;
 const MAXIMUM_BACKUP_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAXIMUM_BACKUP_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAXIMUM_PARQUET_METADATA_BYTES: u64 = 64 * 1024 * 1024;
@@ -293,8 +291,6 @@ impl PreparedInstalledOperations {
             setup,
         });
         let backup_limits = AnalyticalBackupLimits::try_new(
-            MAXIMUM_BACKUP_ARTIFACTS,
-            MAXIMUM_BACKUP_REFERENCES,
             MAXIMUM_BACKUP_BYTES,
             MAXIMUM_BACKUP_OBJECT_BYTES,
             MAXIMUM_PARQUET_METADATA_BYTES,

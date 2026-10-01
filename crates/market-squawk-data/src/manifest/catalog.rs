@@ -5749,9 +5749,10 @@ mod tests {
         let reopened = CatalogAuthority::open(test_catalog_config(location)?);
         assert!(reopened.is_ok(), "catalog reopen failed: {reopened:?}");
         let catalog_authority = reopened?;
-        let limits = EvidenceLimits::try_new(16, 64, 1 << 20, 1 << 20, 64 << 10)?;
+        let limits = EvidenceLimits::try_new(1 << 20, 1 << 20, 64 << 10)?;
         let captured = catalog_authority.analytical_evidence_snapshot(
             EvidenceSnapshotRequest::new(Timestamp::from_unix_nanos(100), limits),
+            &CancellationToken::new(),
         );
         assert!(captured.is_ok(), "evidence capture failed: {captured:?}");
         let (_, evidence) = captured?;

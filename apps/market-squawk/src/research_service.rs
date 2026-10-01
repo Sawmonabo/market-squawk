@@ -38,6 +38,34 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ProviderOnboardingError, ProviderOnboardingService};
 
+// Failure-only phase evidence for the existing owned seal lane. No captured data is logged.
+struct CaptureSealDiagnostic {
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    completed: bool,
+}
+
+impl CaptureSealDiagnostic {
+    fn new() -> Self {
+        Self {
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            completed: false,
+        }
+    }
+}
+
+impl Drop for CaptureSealDiagnostic {
+    fn drop(&mut self) {
+        if !self.completed {
+            let stage = match self.phase.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => "queued",
+                1 => "physical_seal",
+                _ => "completed",
+            };
+            tracing::warn!(stage, "provider capture seal interrupted");
+        }
+    }
+}
+
 /// One rights-reserved normalized extraction, with provider revision evidence when required.
 #[derive(Debug)]
 pub struct ResearchIngestRequest {
@@ -553,19 +581,12 @@ impl ResearchService {
         })
     }
 
-    /// Verifies every catalog-retained provider capture before a provider runtime is published.
-    ///
-    /// Incomplete stages and unreferenced final objects are quarantined by the sole sealed-store
-    /// owner. A retained claim is never trusted from SQLite alone: its exact MSJ1 bytes are opened,
-    /// hashed, and replay-validated during this recovery boundary.
-    pub async fn recover_provider_capture_store(
+    /// Creates a retained recovery cursor without scanning history or delaying startup.
+    pub(crate) fn create_provider_capture_recovery(
         &self,
-        cancellation: &CancellationToken,
-    ) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, ResearchServiceError>
-    {
+    ) -> Result<market_squawk_data::ProviderCaptureRecovery, ResearchServiceError> {
         self.analytical
-            .recover_provider_capture_store(Arc::clone(&self.provider_captures), cancellation)
-            .await
+            .create_provider_capture_recovery(Arc::clone(&self.provider_captures))
             .map_err(Into::into)
     }
 
@@ -573,7 +594,7 @@ impl ResearchService {
     ///
     /// The synchronous filesystem work runs on one application-owned blocking lane. Cancellation
     /// and the monotonic deadline race both lane admission and completion; a late unreferenced
-    /// segment remains recoverable by the startup quarantine pass.
+    /// segment remains recoverable by incremental reconciliation.
     pub(crate) async fn seal_provider_capture(
         &self,
         request: ProviderCaptureSealRequest,
@@ -604,7 +625,10 @@ impl ResearchService {
         deadline: Instant,
     ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
         let store = Arc::clone(&self.provider_captures);
-        self.provider_capture_worker
+        let mut diagnostic = CaptureSealDiagnostic::new();
+        let phase = Arc::clone(&diagnostic.phase);
+        let result = self
+            .provider_capture_worker
             .run_with_job_context(
                 job.map(|job| job.cancellation()),
                 deadline,
@@ -616,12 +640,17 @@ impl ResearchService {
                     if Instant::now() >= deadline {
                         return Err(IngestError::DeadlineExceeded.into());
                     }
-                    request
+                    phase.store(1, std::sync::atomic::Ordering::Relaxed);
+                    let result = request
                         .seal(store.as_ref())
-                        .map_err(map_provider_capture_seal_error)
+                        .map_err(map_provider_capture_seal_error);
+                    phase.store(2, std::sync::atomic::Ordering::Relaxed);
+                    result
                 },
             )
-            .await?
+            .await?;
+        diagnostic.completed = result.is_ok();
+        result
     }
 
     /// Physically verifies an original metadata seal on the existing supervised I/O owner.

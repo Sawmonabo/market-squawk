@@ -1,9 +1,8 @@
 //! Exact full-catalog sealed raw closure for the existing workspace SourceData component.
 //!
-//! The analytical component restores the entire catalog. Its original startup recovery verifies
-//! every authoritative raw claim; a paper-only subset is therefore insufficient. No append journal
-//! or orphan file is selected. Claims come from the same bounded authoritative catalog paging used
-//! by startup, and each body is transferred by the existing sealed raw owner.
+//! The analytical component restores the complete catalog. Raw claims are enumerated in one
+//! independent WAL read snapshot; explicit backup streams every required body without holding
+//! the ingest writer or retaining the full inventory in memory.
 use super::*;
 use sha2::{Digest as _, Sha256};
 use std::io::{Read, Write};
@@ -36,8 +35,13 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<SealedSourceBackupInventory, IngestError> {
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        scan(&authority, deadline, cancellation, |_| Ok(()))
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| scan(snapshot, deadline, cancellation, |_| Ok(())))
+            .map_err(map_source_backup_error)
     }
     /// Synchronous bounded owner operation; the caller retains its supervised backup worker.
     pub fn write_source_backup(
@@ -48,34 +52,41 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), IngestError> {
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        if scan(&authority, deadline, cancellation, |_| Ok(()))? != expected {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        let control = MarketEventReadControl {
-            deadline,
-            cancellation,
-        };
-        for bytes in [
-            MAGIC.as_slice(),
-            &expected.claims.to_be_bytes(),
-            &expected.bytes.to_be_bytes(),
-            &expected.digest,
-        ] {
-            check_market_event_read(deadline, cancellation)?;
-            writer
-                .write_all(bytes)
-                .map_err(|_| IngestError::ProviderCaptureRequired)?;
-        }
-        let actual = scan(&authority, deadline, cancellation, |claim| {
-            store
-                .write_backup_claim(claim, writer, &control)
-                .map_err(map_provider_recovery_store_error)
-        })?;
-        if actual != expected {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        check_market_event_read(deadline, cancellation)
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| {
+                if scan(snapshot, deadline, cancellation, |_| Ok(()))? != expected {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                let control = MarketEventReadControl {
+                    deadline,
+                    cancellation,
+                };
+                for bytes in [
+                    MAGIC.as_slice(),
+                    &expected.claims.to_be_bytes(),
+                    &expected.bytes.to_be_bytes(),
+                    &expected.digest,
+                ] {
+                    check_market_event_read(deadline, cancellation)?;
+                    writer
+                        .write_all(bytes)
+                        .map_err(|_| IngestError::ProviderCaptureRequired)?;
+                }
+                let actual = scan(snapshot, deadline, cancellation, |claim| {
+                    store
+                        .write_backup_claim(claim, writer, &control)
+                        .map_err(map_provider_recovery_store_error)
+                })?;
+                if actual != expected {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                check_market_event_read(deadline, cancellation)
+            })
+            .map_err(map_source_backup_error)
     }
     /// Restores only claims physically present in this already-restored exact analytical catalog.
     /// The stream contains no path claims; canonical catalog order defines every body and length.
@@ -87,65 +98,67 @@ impl AnalyticalDataService {
         cancellation: &CancellationToken,
     ) -> Result<SealedSourceBackupInventory, IngestError> {
         check_market_event_read(deadline, cancellation)?;
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        let expected = scan(&authority, deadline, cancellation, |_| Ok(()))?;
-        let mut magic = [0; 16];
-        let mut claims = [0; 8];
-        let mut bytes = [0; 8];
-        let mut digest = [0; 32];
-        for buffer in [
-            magic.as_mut_slice(),
-            claims.as_mut_slice(),
-            bytes.as_mut_slice(),
-            digest.as_mut_slice(),
-        ] {
-            check_market_event_read(deadline, cancellation)?;
-            reader
-                .read_exact(buffer)
-                .map_err(|_| IngestError::ProviderCaptureRequired)?;
-        }
-        if &magic != MAGIC
-            || u64::from_be_bytes(claims) != expected.claims
-            || u64::from_be_bytes(bytes) != expected.bytes
-            || digest != expected.digest
-        {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        let control = MarketEventReadControl {
-            deadline,
-            cancellation,
-        };
-        let actual = scan(&authority, deadline, cancellation, |claim| {
-            store
-                .restore_backup_claim(claim, reader, &control)
-                .map_err(map_provider_recovery_store_error)
-        })?;
-        if actual != expected {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        check_market_event_read(deadline, cancellation)?;
-        Ok(actual)
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| {
+                let expected = scan(snapshot, deadline, cancellation, |_| Ok(()))?;
+                let mut magic = [0; 16];
+                let mut claims = [0; 8];
+                let mut bytes = [0; 8];
+                let mut digest = [0; 32];
+                for buffer in [
+                    magic.as_mut_slice(),
+                    claims.as_mut_slice(),
+                    bytes.as_mut_slice(),
+                    digest.as_mut_slice(),
+                ] {
+                    check_market_event_read(deadline, cancellation)?;
+                    reader
+                        .read_exact(buffer)
+                        .map_err(|_| IngestError::ProviderCaptureRequired)?;
+                }
+                if &magic != MAGIC
+                    || u64::from_be_bytes(claims) != expected.claims
+                    || u64::from_be_bytes(bytes) != expected.bytes
+                    || digest != expected.digest
+                {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                let control = MarketEventReadControl {
+                    deadline,
+                    cancellation,
+                };
+                let actual = scan(snapshot, deadline, cancellation, |claim| {
+                    store
+                        .restore_backup_claim(claim, reader, &control)
+                        .map_err(map_provider_recovery_store_error)
+                })?;
+                if actual != expected {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                check_market_event_read(deadline, cancellation)?;
+                Ok(actual)
+            })
+            .map_err(map_source_backup_error)
     }
 }
 fn scan(
-    authority: &CatalogAuthority,
+    snapshot: &crate::catalog::CatalogReadSnapshot,
     deadline: Instant,
     cancellation: &CancellationToken,
     mut visit: impl FnMut(&SealedResearchRawClaim) -> Result<(), IngestError>,
 ) -> Result<SealedSourceBackupInventory, IngestError> {
     let mut after = None;
-    let mut claims = 0usize;
+    let mut claims = 0u64;
     let mut bytes = 0u64;
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/source-backup-catalog-closure/v1\0");
     loop {
         check_market_event_read(deadline, cancellation)?;
-        let catalog = authority.catalog();
-        let page = catalog
-            .market_recovery_read(deadline, cancellation, || {
-                catalog.authoritative_provider_raw_claim_page(after)
-            })
-            .map_err(map_market_recovery_catalog_error)?;
+        let page = snapshot.authoritative_provider_raw_claim_page(after)?;
         if page.is_empty() {
             break;
         }
@@ -158,7 +171,6 @@ fn scan(
             }
             claims = claims
                 .checked_add(1)
-                .filter(|n| *n <= MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS)
                 .ok_or(IngestError::ProviderCaptureRequired)?;
             let (kind, size, content, physical) = match &claim {
                 SealedResearchRawClaim::JournalSegment(c) => (
@@ -176,7 +188,6 @@ fn scan(
             };
             bytes = bytes
                 .checked_add(size)
-                .filter(|n| *n <= MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES)
                 .ok_or(IngestError::ProviderCaptureRequired)?;
             digest.update(key.bytes());
             digest.update([kind]);
@@ -187,7 +198,6 @@ fn scan(
             after = Some(key);
         }
     }
-    let claims = u64::try_from(claims).map_err(|_| IngestError::ProviderCaptureRequired)?;
     digest.update(claims.to_be_bytes());
     digest.update(bytes.to_be_bytes());
     Ok(SealedSourceBackupInventory {
@@ -195,4 +205,11 @@ fn scan(
         bytes,
         digest: digest.finalize().into(),
     })
+}
+
+fn map_source_backup_error(error: IngestError) -> IngestError {
+    match error {
+        IngestError::Catalog(error) => map_market_recovery_catalog_error(error),
+        other => other,
+    }
 }

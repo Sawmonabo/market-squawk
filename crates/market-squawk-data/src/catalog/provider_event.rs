@@ -21,7 +21,6 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::provider_capture::{
-    MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
     native_implementation_name, parse_native_implementation, parse_source_sequence,
     raw_claim_digest, source_sequence_blob,
 };
@@ -2318,35 +2317,11 @@ pub(super) fn require_raw_claim_capacity(
     raw_claim_digest: EvidenceDigest,
     physical_claim: &SealedResearchJournalSegmentClaim,
 ) -> Result<(), CatalogError> {
-    let exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sealed_raw_objects WHERE raw_claim_digest=?1)",
-        [digest_bytes(raw_claim_digest)],
-        |row| row.get(0),
-    )?;
-    if exists {
-        return Ok(());
-    }
-    let (retained, retained_bytes): (i64, i64) = connection.query_row(
-        "SELECT physical_claims, physical_bytes
-         FROM provider_capture_recovery_capacity WHERE singleton=1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let retained = usize::try_from(retained).map_err(|_| CatalogError::CorruptCatalog)?;
-    let retained_bytes = u64::try_from(retained_bytes).map_err(|_| CatalogError::CorruptCatalog)?;
-    if retained
-        .checked_add(1)
-        .is_none_or(|total| total > MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS)
-        || retained_bytes
-            .checked_add(physical_claim.size_bytes())
-            .is_none_or(|total| total > MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES)
-    {
-        return Err(CatalogError::ProviderCaptureCapacityExceeded {
-            max_claims: MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
-            max_bytes: MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES,
-        });
-    }
-    Ok(())
+    super::provider_capture::require_raw_claim_accounting(
+        connection,
+        raw_claim_digest,
+        physical_claim.size_bytes(),
+    )
 }
 
 pub(super) fn insert_journal_claim(

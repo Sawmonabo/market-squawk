@@ -17,7 +17,7 @@ use crate::ParquetObjectStore;
 use crate::analytical_backup::AnalyticalBackupBundleReceipt;
 use crate::catalog::RestoreCatalogBaseline;
 use crate::catalog::VerifiedBackupCatalog;
-use crate::{BackupReceipt, CatalogAuthority, CatalogError};
+use crate::{BackupReceipt, Catalog, CatalogAuthority, CatalogError};
 
 /// Exact receipt-bound facts derived from retained source catalog and artifact capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +53,33 @@ impl ReceiptValidatedRestoreEvidence {
     pub(crate) const fn request(&self) -> super::evidence::EvidenceSnapshotRequest {
         self._catalog_evidence.request()
     }
+
+    pub(crate) fn revalidate(
+        &self,
+        catalog: &VerifiedBackupCatalog,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RestoreValidationError> {
+        let (authority, evidence, physical) = Catalog::verified_backup_evidence(
+            catalog,
+            self.request(),
+            cancellation,
+            |connection, evidence| {
+                Ok((|| -> Result<(), EvidenceError> {
+                    if evidence.evidence_digest()? != self._catalog_evidence.evidence_digest()? {
+                        return Err(EvidenceError::InvalidCatalogEvidence);
+                    }
+                    self.artifact_inventory.revalidate(connection, cancellation)
+                })())
+            },
+        )?;
+        physical?;
+        if authority != self.authority
+            || evidence.evidence_digest()? != self.receipt.catalog_content_evidence()
+        {
+            return Err(RestoreValidationError::ReceiptMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ReceiptValidatedRestoreEvidence {
@@ -87,8 +114,7 @@ pub(crate) fn validate_restore_evidence(
         .bound()
         .ok_or(RestoreValidationError::AuthorityNotBound)?;
     let prepared = bound.prepared();
-    let artifact_count = u64::try_from(artifact_inventory.artifacts().len())
-        .map_err(|_| RestoreValidationError::ResourceLimitExceeded)?;
+    let artifact_count = artifact_inventory.artifact_count();
     let catalog_content_evidence = catalog_evidence.evidence_digest()?;
     let summary = RestoreEvidenceSummary {
         catalog_identity: prepared.target_catalog_identity(),
@@ -178,7 +204,9 @@ impl VerifiedRestoreCatalogAuthority {
         if self.authority.authority_snapshot_without_endpoint()? != self.snapshot {
             return Err(CatalogError::BackupRestoreConflict);
         }
-        let (snapshot, evidence) = self.authority.analytical_evidence_snapshot(self.request)?;
+        let (snapshot, evidence) = self
+            .authority
+            .analytical_evidence_snapshot(self.request, &self.cancellation)?;
         if snapshot != self.snapshot
             || evidence
                 .evidence_digest()
@@ -307,44 +335,68 @@ pub(crate) fn materialize_verified_restore(
     }
     source_catalog.revalidate()?;
     target_catalog.revalidate()?;
-    let materialized_root = match mode {
-        RestoreArtifactMode::Fresh => source_evidence
-            .artifact_inventory
-            .materialize_no_replace(destination, cancellation)?,
-        RestoreArtifactMode::ResumeExactSubset => {
-            let (prepared, catalog_bound) = match target_catalog.snapshot().state() {
-                AuthorityState::Prepared { transition, .. }
-                    if transition.kind() == super::AuthorityTransitionKind::BackupRestore =>
-                {
-                    (transition, false)
-                }
-                AuthorityState::Bound { transition, .. }
-                    if transition.prepared().kind()
-                        == super::AuthorityTransitionKind::BackupRestore =>
-                {
-                    (transition.prepared(), true)
-                }
-                AuthorityState::InitializationRequired
-                | AuthorityState::LegacyRequired { .. }
-                | AuthorityState::Prepared { .. }
-                | AuthorityState::Bound { .. } => {
-                    return Err(RestoreValidationError::CatalogReceiptMismatch);
-                }
-            };
-            let directory = destination
-                .try_clone_directory()
-                .map_err(|_| EvidenceError::DestinationConflict)?;
-            let controls = ParquetObjectStore::validate_restore_control_subset(
-                &directory,
-                prepared,
-                catalog_bound,
+    let (_, _, materialized_root) = Catalog::verified_backup_evidence(
+        &source_catalog,
+        source_evidence.request(),
+        cancellation,
+        |connection, snapshot| {
+            Ok(
+                (|| -> Result<MaterializedArtifactRoot, RestoreValidationError> {
+                    if snapshot.evidence_digest()?
+                        != source_evidence.receipt.catalog_content_evidence()
+                    {
+                        return Err(RestoreValidationError::ReceiptMismatch);
+                    }
+                    Ok(match mode {
+                        RestoreArtifactMode::Fresh => source_evidence
+                            .artifact_inventory
+                            .materialize_no_replace(connection, destination, cancellation)?,
+                        RestoreArtifactMode::ResumeExactSubset => {
+                            let (prepared, catalog_bound) = match target_catalog.snapshot().state()
+                            {
+                                AuthorityState::Prepared { transition, .. }
+                                    if transition.kind()
+                                        == super::AuthorityTransitionKind::BackupRestore =>
+                                {
+                                    (transition, false)
+                                }
+                                AuthorityState::Bound { transition, .. }
+                                    if transition.prepared().kind()
+                                        == super::AuthorityTransitionKind::BackupRestore =>
+                                {
+                                    (transition.prepared(), true)
+                                }
+                                AuthorityState::InitializationRequired
+                                | AuthorityState::LegacyRequired { .. }
+                                | AuthorityState::Prepared { .. }
+                                | AuthorityState::Bound { .. } => {
+                                    return Err(RestoreValidationError::CatalogReceiptMismatch);
+                                }
+                            };
+                            let directory = destination
+                                .try_clone_directory()
+                                .map_err(|_| EvidenceError::DestinationConflict)?;
+                            let controls = ParquetObjectStore::validate_restore_control_subset(
+                                &directory,
+                                prepared,
+                                catalog_bound,
+                            )
+                            .map_err(|_| EvidenceError::DestinationConflict)?;
+                            source_evidence
+                                .artifact_inventory
+                                .resume_exact_subset_no_replace(
+                                    connection,
+                                    destination,
+                                    cancellation,
+                                    &controls,
+                                )?
+                        }
+                    })
+                })(),
             )
-            .map_err(|_| EvidenceError::DestinationConflict)?;
-            source_evidence
-                .artifact_inventory
-                .resume_exact_subset_no_replace(destination, cancellation, &controls)?
-        }
-    };
+        },
+    )?;
+    let materialized_root = materialized_root?;
     source_catalog.revalidate()?;
     target_catalog.revalidate()?;
     Ok(VerifiedRestoreHandoff {
@@ -395,9 +447,6 @@ pub(crate) enum RestoreValidationError {
     /// Receipt fields differ from exact catalog or artifact evidence.
     #[error("analytical restore evidence does not match the bundle receipt")]
     ReceiptMismatch,
-    /// An attacker-controlled evidence count could not be represented.
-    #[error("analytical restore evidence exceeds a fixed resource ceiling")]
-    ResourceLimitExceeded,
     /// The caller cancelled source verification before destination mutation.
     #[error("analytical restore source verification was cancelled")]
     Cancelled,

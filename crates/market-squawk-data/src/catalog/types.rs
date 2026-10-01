@@ -984,16 +984,6 @@ pub enum CatalogError {
     /// A repeated streamed logical publication differs from retained immutable evidence.
     #[error("provider logical publication conflicts with retained immutable evidence")]
     ProviderLogicalConflict,
-    /// Retained physical provider evidence exhausted the fixed recovery-safe catalog ceiling.
-    #[error(
-        "provider capture exceeds the recovery-safe maximum of {max_claims} physical objects or {max_bytes} retained bytes"
-    )]
-    ProviderCaptureCapacityExceeded {
-        /// Maximum physical raw objects retained by one installed catalog.
-        max_claims: usize,
-        /// Maximum aggregate physical raw-object bytes retained by one installed catalog.
-        max_bytes: u64,
-    },
     /// Backups are never overwritten.
     #[error("catalog backup destination already exists")]
     BackupAlreadyExists,

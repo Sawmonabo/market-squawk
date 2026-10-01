@@ -1,6 +1,7 @@
 //! Consistent bounded relational snapshots for analytical backup authority.
 
-use std::collections::BTreeMap;
+use crate::authority_transition::evidence::canonical::EvidenceDigest;
+use tokio_util::sync::CancellationToken;
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_platform::SealedResearchRawClaim;
@@ -17,11 +18,14 @@ use super::types::MAX_SQLITE_RECORD_BYTES;
 use super::{Catalog, CatalogError};
 use crate::authority_transition::AuthoritySnapshot;
 
+mod generations;
 mod market_events;
+mod physical;
 use crate::authority_transition::evidence::{
     ArtifactEvidenceRow, CatalogEvidenceSnapshot, EvidenceError, EvidenceSnapshotRequest,
-    GenerationEvidenceRow, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
-    ManifestEvidenceRow, MarketEventArchiveEvidenceRow, QueryArtifactEvidenceRow,
+    GenerationEvidenceHeader, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
+    ManifestEvidenceRow, MarketEventArchiveEvidenceRow, PhysicalArtifactEvidence,
+    ProviderCatalogRelation, ProviderCatalogRelationEvidenceRow, QueryArtifactEvidenceRow,
 };
 use crate::manifest::{DatasetBuildSpecDigest, GenerationParentRelation};
 use crate::{
@@ -30,26 +34,27 @@ use crate::{
 };
 
 impl Catalog {
-    /// Captures authority and analytical relationships from one consistent live read transaction.
+    /// Computes a compact exact summary under one consistent live read transaction.
     pub(crate) fn analytical_evidence_snapshot(
         &self,
         request: EvidenceSnapshotRequest,
+        cancellation: &CancellationToken,
     ) -> Result<(AuthoritySnapshot, CatalogEvidenceSnapshot), CatalogError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let snapshot = evidence_snapshot(&transaction, request)?;
-        transaction.commit()?;
-        Ok(snapshot)
+        with_cancellation(&self.connection, cancellation, || {
+            let transaction = self.connection.unchecked_transaction()?;
+            let snapshot = evidence_snapshot(&transaction, request, cancellation)?;
+            transaction.commit()?;
+            Ok(snapshot)
+        })
     }
 
-    /// Captures exact read-only evidence from a retained immutable backup lease.
-    ///
-    /// This path does not create a writer sidecar, run migrations, or mutate the backup. The
-    /// exact receipt, retained file identity, compiled migrations, and SQLite integrity are
-    /// revalidated before and after the single read transaction.
-    pub(crate) fn verified_backup_evidence(
+    /// The consumer runs inside the exact retained immutable catalog's read transaction.
+    pub(crate) fn verified_backup_evidence<T>(
         backup: &VerifiedBackupCatalog,
         request: EvidenceSnapshotRequest,
-    ) -> Result<(AuthoritySnapshot, CatalogEvidenceSnapshot), CatalogError> {
+        cancellation: &CancellationToken,
+        consume: impl FnOnce(&Connection, &CatalogEvidenceSnapshot) -> Result<T, CatalogError>,
+    ) -> Result<(AuthoritySnapshot, CatalogEvidenceSnapshot, T), CatalogError> {
         backup.revalidate()?;
         let connection = open_immutable_backup(backup.location().path())?;
         let sqlite_length_limit = i32::try_from(MAX_SQLITE_RECORD_BYTES)
@@ -57,83 +62,198 @@ impl Catalog {
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, sqlite_length_limit)?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         connection.pragma_update(None, "query_only", "ON")?;
-        verify_migration_identities(&connection)?;
-        verify_integrity(&connection)?;
-        backup.revalidate()?;
-
-        let transaction = connection.unchecked_transaction()?;
-        let snapshot = evidence_snapshot(&transaction, request)?;
-        transaction.commit()?;
-        verify_migration_identities(&connection)?;
-        verify_integrity(&connection)?;
+        // SQLite's existing bounded page cache and file-backed temporary sorter keep the
+        // working set independent of the retained history, including ORDER BY spill.
+        let result = with_cancellation(&connection, cancellation, || {
+            verify_migration_identities(&connection)?;
+            verify_integrity(&connection)?;
+            backup.revalidate()?;
+            let transaction = connection.unchecked_transaction()?;
+            let (authority, evidence) = evidence_snapshot(&transaction, request, cancellation)?;
+            let result = consume(&transaction, &evidence)?;
+            transaction.commit()?;
+            verify_migration_identities(&connection)?;
+            verify_integrity(&connection)?;
+            backup.revalidate()?;
+            Ok((authority, evidence, result))
+        });
         connection.close().map_err(|(_, error)| error)?;
         backup.revalidate()?;
-        Ok(snapshot)
+        result
     }
 }
 
+fn with_cancellation<T>(
+    connection: &Connection,
+    cancellation: &CancellationToken,
+    consume: impl FnOnce() -> Result<T, CatalogError>,
+) -> Result<T, CatalogError> {
+    check_cancellation(cancellation)?;
+    let previous_temp_store: i64 =
+        connection.pragma_query_value(None, "temp_store", |row| row.get(0))?;
+    connection.pragma_update(None, "temp_store", "FILE")?;
+    let token = cancellation.clone();
+    connection.progress_handler(1_000, Some(move || token.is_cancelled()))?;
+    let result = consume();
+    let cleanup = connection.progress_handler::<fn() -> bool>(0, None);
+    let restore_temp_store = connection.pragma_update(None, "temp_store", previous_temp_store);
+    check_cancellation(cancellation)?;
+    cleanup?;
+    restore_temp_store?;
+    result
+}
+fn check_cancellation(cancellation: &CancellationToken) -> Result<(), CatalogError> {
+    if cancellation.is_cancelled() {
+        Err(CatalogError::AnalyticalEvidenceCancelled)
+    } else {
+        Ok(())
+    }
+}
+fn count(connection: &Connection, table: &str) -> Result<u64, CatalogError> {
+    // table is always one of the closed code-owned relation names.
+    let value: i64 = connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    parse_nonnegative_u64(value)
+}
+fn add(total: &mut u64, value: u64) -> Result<(), CatalogError> {
+    *total = total
+        .checked_add(value)
+        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
+    Ok(())
+}
+fn check_count(expected: u64, observed: u64) -> Result<(), CatalogError> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(CatalogError::CorruptCatalog)
+    }
+}
 fn evidence_snapshot(
     transaction: &Transaction<'_>,
     request: EvidenceSnapshotRequest,
+    cancellation: &CancellationToken,
 ) -> Result<(AuthoritySnapshot, CatalogEvidenceSnapshot), CatalogError> {
+    check_cancellation(cancellation)?;
     let authority = read_authority_snapshot_without_endpoint(transaction)?;
-    let limits = request.limits();
-    let artifacts = read_artifacts(transaction, limits.max_artifacts())?;
-    let mut remaining_references = limits
-        .max_references()
-        .checked_sub(artifacts.len())
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    let manifests = read_manifests(transaction, remaining_references)?;
-    remaining_references = remaining_references
-        .checked_sub(manifests.len())
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    let (generations, generation_references) = read_generations(transaction, remaining_references)?;
-    remaining_references = remaining_references
-        .checked_sub(generation_references)
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    let query_artifacts =
-        read_query_artifacts(transaction, request.cutoff(), remaining_references)?;
-    remaining_references = remaining_references
-        .checked_sub(query_artifacts.len())
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    let market_event_archives = market_events::read_archives(transaction, remaining_references)?;
-    remaining_references = remaining_references
-        .checked_sub(market_event_archives.len())
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
+    generations::validate_relations(transaction, request)?;
     validate_provider_relation_integrity(transaction)?;
     market_events::validate_integrity(transaction)?;
-    let provider_relation_rows = read_provider_relation_rows(transaction, remaining_references)?;
-    let evidence = CatalogEvidenceSnapshot::try_new_with_provider_relation_rows(
+    let mut digest = EvidenceDigest::new(request.cutoff());
+    let mut references = 0;
+    let mut physical_count = 0;
+    let mut total_bytes = 0;
+    let mut physical_bytes = 0;
+    let mut account = |bytes: u64| -> Result<(), CatalogError> {
+        if bytes > request.limits().max_object_bytes() {
+            return Err(CatalogError::AnalyticalEvidenceInvalid);
+        }
+        add(&mut physical_count, 1)?;
+        add(&mut physical_bytes, bytes)?;
+        if physical_bytes > request.limits().max_total_bytes() {
+            return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
+        }
+        Ok(())
+    };
+    let expected = count(transaction, "artifacts")?;
+    digest
+        .section("artifacts", expected)
+        .map_err(map_evidence_error)?;
+    let mut observed = 0;
+    read_artifacts(transaction, &mut |row| {
+        check_cancellation(cancellation)?;
+        digest.artifact(&row).map_err(map_evidence_error)?;
+        account(row.size_bytes())?;
+        add(&mut observed, 1)
+    })?;
+    check_count(expected, observed)?;
+    add(&mut references, observed)?;
+    let expected = count(transaction, "dataset_manifests")?;
+    digest
+        .section("manifests", expected)
+        .map_err(map_evidence_error)?;
+    observed = 0;
+    read_manifests(transaction, &mut |row| {
+        check_cancellation(cancellation)?;
+        digest.manifest(&row).map_err(map_evidence_error)?;
+        add(&mut observed, 1)
+    })?;
+    check_count(expected, observed)?;
+    add(&mut references, observed)?;
+    generations::stream(transaction, &mut digest, &mut references, cancellation)?;
+    let expected=parse_nonnegative_u64(transaction.query_row("SELECT COUNT(*) FROM query_artifact_reservations AS reservations JOIN query_artifact_results AS results USING(reservation_id) WHERE reservations.state='published' AND reservations.expires_at_ns>?1",[request.cutoff().unix_nanos()],|row|row.get::<_, i64>(0))?)?;
+    digest
+        .section("live-query-artifacts", expected)
+        .map_err(map_evidence_error)?;
+    observed = 0;
+    read_query_artifacts(transaction, request.cutoff(), &mut |row| {
+        check_cancellation(cancellation)?;
+        digest.query_artifact(&row).map_err(map_evidence_error)?;
+        account(row.size_bytes())?;
+        add(&mut observed, 1)
+    })?;
+    check_count(expected, observed)?;
+    add(&mut references, observed)?;
+    let expected = count(transaction, "market_event_archive_objects")?;
+    digest
+        .section("market-event-archives", expected)
+        .map_err(map_evidence_error)?;
+    observed = 0;
+    market_events::read_archives(transaction, &mut |row| {
+        check_cancellation(cancellation)?;
+        digest.archive(&row).map_err(map_evidence_error)?;
+        account(row.size_bytes())?;
+        add(&mut observed, 1)
+    })?;
+    check_count(expected, observed)?;
+    add(&mut references, observed)?;
+    add(&mut total_bytes, physical_bytes)?;
+    let expected = ProviderCatalogRelation::ALL
+        .iter()
+        .try_fold(0_u64, |sum, relation| {
+            sum.checked_add(count(transaction, relation.database_name())?)
+                .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)
+        })?;
+    digest
+        .section("provider-catalog-relations", expected)
+        .map_err(map_evidence_error)?;
+    let mut sink = ProviderEvidenceSink {
+        digest: &mut digest,
+        cancellation,
         request,
-        artifacts,
-        manifests,
-        generations,
-        query_artifacts,
-        market_event_archives,
-        provider_relation_rows,
-    )
-    .map_err(map_evidence_error)?;
+        previous: None,
+        count: 0,
+        total_bytes: &mut total_bytes,
+    };
+    read_provider_relation_rows(transaction, &mut sink)?;
+    check_count(expected, sink.count)?;
+    add(&mut references, sink.count)?;
+    let evidence = CatalogEvidenceSnapshot::new(
+        request,
+        physical_count,
+        physical_bytes,
+        references,
+        total_bytes,
+        digest.finish().map_err(map_evidence_error)?,
+    );
     Ok((authority, evidence))
 }
 
 fn read_artifacts(
     connection: &Connection,
-    maximum: usize,
-) -> Result<Vec<ArtifactEvidenceRow>, CatalogError> {
-    let limit = limit_with_sentinel(maximum)?;
+    consume: &mut impl FnMut(ArtifactEvidenceRow) -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
     let mut statement = connection.prepare(
         "SELECT artifact_id, run_id, publication_ordinal, relative_reference,
                 content_algorithm, content_digest, size_bytes
-         FROM artifacts ORDER BY artifact_id LIMIT ?1",
+         FROM artifacts ORDER BY lower(artifact_id)",
     )?;
-    let mut rows = statement.query([limit])?;
-    let mut result = Vec::new();
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(&result, maximum)?;
         let ordinal =
             u16::try_from(row.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
         let algorithm: i64 = row.get(4)?;
-        result.push(
+        consume(
             ArtifactEvidenceRow::try_new(
                 parse_uuid(row.get::<_, String>(0)?)?,
                 parse_uuid(row.get::<_, String>(1)?)?,
@@ -143,27 +263,24 @@ fn read_artifacts(
                 parse_positive_u64(row.get(6)?)?,
             )
             .map_err(map_evidence_error)?,
-        );
+        )?;
     }
-    Ok(result)
+    Ok(())
 }
 
 fn read_manifests(
     connection: &Connection,
-    maximum: usize,
-) -> Result<Vec<ManifestEvidenceRow>, CatalogError> {
-    let limit = limit_with_sentinel(maximum)?;
+    consume: &mut impl FnMut(ManifestEvidenceRow) -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
     let mut statement = connection.prepare(
         "SELECT manifest_id, dataset_name, schema_version, artifact_id, content_algorithm, \
-                content_digest FROM dataset_manifests ORDER BY manifest_id LIMIT ?1",
+                content_digest FROM dataset_manifests ORDER BY lower(manifest_id)",
     )?;
-    let mut rows = statement.query([limit])?;
-    let mut result = Vec::new();
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(&result, maximum)?;
         let dataset = row.get::<_, String>(1)?;
         let algorithm: i64 = row.get(4)?;
-        result.push(
+        consume(
             ManifestEvidenceRow::try_new(
                 parse_uuid(row.get::<_, String>(0)?)?,
                 DatasetId::try_from(dataset.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
@@ -172,258 +289,16 @@ fn read_manifests(
                 parse_sha256(algorithm, row.get::<_, Vec<u8>>(5)?)?,
             )
             .map_err(map_evidence_error)?,
-        );
+        )?;
     }
-    Ok(result)
-}
-
-#[derive(Debug)]
-struct GenerationHeader {
-    generation_sequence: u64,
-    dataset_id: DatasetId,
-    dataset_key: String,
-    manifest_version: u64,
-    content_hash: Sha256Digest,
-    lineage_hash: Sha256Digest,
-    row_count: u64,
-    total_bytes: u64,
-    schema: DatasetSchemaRef,
-    anchor_manifest_id: Uuid,
-    kind: GenerationKind,
-    build_spec_digest: Option<DatasetBuildSpecDigest>,
-}
-
-fn read_generations(
-    connection: &Connection,
-    maximum_references: usize,
-) -> Result<(Vec<GenerationEvidenceRow>, usize), CatalogError> {
-    let headers = read_generation_headers(connection, maximum_references)?;
-    let mut objects = read_generation_objects(connection, maximum_references)?;
-    let mut parents = read_generation_parents(connection, maximum_references)?;
-    let object_count = objects.values().try_fold(0_usize, |total, members| {
-        total
-            .checked_add(members.len())
-            .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)
-    })?;
-    let parent_count = parents.values().try_fold(0_usize, |total, members| {
-        total
-            .checked_add(members.len())
-            .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)
-    })?;
-    let reference_count = object_count
-        .checked_add(parent_count)
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    if reference_count > maximum_references {
-        return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
-    }
-    let mut result = Vec::with_capacity(headers.len());
-    for header in headers {
-        let key = (header.dataset_key.clone(), header.manifest_version);
-        let generation_objects = objects.remove(&key).ok_or(CatalogError::CorruptCatalog)?;
-        let generation_parents = parents.remove(&key).unwrap_or_default();
-        result.push(
-            GenerationEvidenceRow::try_new(
-                header.generation_sequence,
-                header.dataset_id,
-                header.manifest_version,
-                header.content_hash,
-                header.lineage_hash,
-                header.row_count,
-                header.total_bytes,
-                header.schema,
-                header.anchor_manifest_id,
-                header.kind,
-                header.build_spec_digest,
-                generation_parents,
-                generation_objects,
-            )
-            .map_err(map_evidence_error)?,
-        );
-    }
-    if !objects.is_empty() || !parents.is_empty() {
-        return Err(CatalogError::CorruptCatalog);
-    }
-    Ok((result, reference_count))
-}
-
-fn read_generation_headers(
-    connection: &Connection,
-    maximum: usize,
-) -> Result<Vec<GenerationHeader>, CatalogError> {
-    let limit = limit_with_sentinel(maximum)?;
-    let mut statement = connection.prepare(
-        "SELECT generation_sequence, dataset_id, manifest_version, content_hash, lineage_hash, \
-                row_count, total_bytes, \
-                schema_name, schema_version, schema_fingerprint, anchor_manifest_id, \
-                generation_kind, build_spec_digest \
-         FROM analytical_generations ORDER BY dataset_id, manifest_version LIMIT ?1",
-    )?;
-    let mut rows = statement.query([limit])?;
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        require_capacity(&result, maximum)?;
-        let dataset_key: String = row.get(1)?;
-        let kind: String = row.get(11)?;
-        let schema_name: String = row.get(7)?;
-        let schema_version =
-            u16::try_from(row.get::<_, i64>(8)?).map_err(|_| CatalogError::CorruptCatalog)?;
-        let schema_fingerprint: [u8; 32] = row
-            .get::<_, Vec<u8>>(9)?
-            .try_into()
-            .map_err(|_| CatalogError::CorruptCatalog)?;
-        let schema = DatasetSchemaRef::try_new(
-            &schema_name,
-            market_squawk_domain::SchemaVersion::new(schema_version)
-                .map_err(|_| CatalogError::CorruptCatalog)?,
-            schema_fingerprint,
-        )
-        .map_err(|_| CatalogError::CorruptCatalog)?;
-        DatasetSchemaRegistry::local()
-            .resolve(&schema)
-            .map_err(|_| CatalogError::CorruptCatalog)?;
-        result.push(GenerationHeader {
-            generation_sequence: parse_positive_u64(row.get(0)?)?,
-            dataset_id: DatasetId::try_from(dataset_key.as_str())
-                .map_err(|_| CatalogError::CorruptCatalog)?,
-            dataset_key,
-            manifest_version: parse_positive_u64(row.get(2)?)?,
-            content_hash: parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?,
-            lineage_hash: parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?,
-            row_count: parse_positive_u64(row.get(5)?)?,
-            total_bytes: parse_positive_u64(row.get(6)?)?,
-            schema,
-            anchor_manifest_id: parse_uuid(row.get::<_, String>(10)?)?,
-            kind: GenerationKind::from_database_name(&kind).ok_or(CatalogError::CorruptCatalog)?,
-            build_spec_digest: row
-                .get::<_, Option<Vec<u8>>>(12)?
-                .map(parse_build_spec_digest)
-                .transpose()?,
-        });
-    }
-    Ok(result)
-}
-
-fn read_generation_parents(
-    connection: &Connection,
-    maximum: usize,
-) -> Result<BTreeMap<(String, u64), Vec<GenerationParentEvidenceRow>>, CatalogError> {
-    let limit = limit_with_sentinel(maximum)?;
-    let mut statement = connection.prepare(
-        "SELECT child_dataset_id, child_manifest_version, ordinal, relation, \
-                parent_generation_sequence, parent_dataset_id, parent_manifest_version, \
-                parent_schema_name, parent_schema_version, parent_schema_fingerprint, \
-                parent_content_hash \
-         FROM analytical_generation_parents \
-         ORDER BY child_dataset_id, child_manifest_version, ordinal LIMIT ?1",
-    )?;
-    let mut rows = statement.query([limit])?;
-    let mut result: BTreeMap<(String, u64), Vec<GenerationParentEvidenceRow>> = BTreeMap::new();
-    let mut observed = 0_usize;
-    while let Some(row) = rows.next()? {
-        if observed >= maximum {
-            return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
-        }
-        observed = observed
-            .checked_add(1)
-            .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-        let child_dataset: String = row.get(0)?;
-        DatasetId::try_from(child_dataset.as_str()).map_err(|_| CatalogError::CorruptCatalog)?;
-        let child_version = parse_positive_u64(row.get(1)?)?;
-        let ordinal =
-            usize::try_from(row.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
-        let members = result.entry((child_dataset, child_version)).or_default();
-        if ordinal != members.len() {
-            return Err(CatalogError::CorruptCatalog);
-        }
-
-        let relation = GenerationParentRelation::from_database_name(&row.get::<_, String>(3)?)
-            .ok_or(CatalogError::CorruptCatalog)?;
-        let parent_sequence = parse_positive_u64(row.get(4)?)?;
-        let parent_dataset_key: String = row.get(5)?;
-        let parent_dataset = DatasetId::try_from(parent_dataset_key.as_str())
-            .map_err(|_| CatalogError::CorruptCatalog)?;
-        let parent_version = parse_positive_u64(row.get(6)?)?;
-        let parent_schema_name: String = row.get(7)?;
-        let parent_schema_version =
-            u16::try_from(row.get::<_, i64>(8)?).map_err(|_| CatalogError::CorruptCatalog)?;
-        let parent_schema_fingerprint: [u8; 32] = row
-            .get::<_, Vec<u8>>(9)?
-            .try_into()
-            .map_err(|_| CatalogError::CorruptCatalog)?;
-        let parent_schema = DatasetSchemaRef::try_new(
-            &parent_schema_name,
-            market_squawk_domain::SchemaVersion::new(parent_schema_version)
-                .map_err(|_| CatalogError::CorruptCatalog)?,
-            parent_schema_fingerprint,
-        )
-        .map_err(|_| CatalogError::CorruptCatalog)?;
-        DatasetSchemaRegistry::local()
-            .resolve(&parent_schema)
-            .map_err(|_| CatalogError::CorruptCatalog)?;
-        let parent = DatasetManifestRef::try_new_with_schema(
-            parent_dataset,
-            parent_version,
-            parent_schema,
-            parse_sha256(1, row.get::<_, Vec<u8>>(10)?)?,
-        )
-        .map_err(|_| CatalogError::CorruptCatalog)?;
-        members.push(
-            GenerationParentEvidenceRow::try_new(parent_sequence, relation, parent)
-                .map_err(map_evidence_error)?,
-        );
-    }
-    Ok(result)
-}
-
-fn read_generation_objects(
-    connection: &Connection,
-    maximum: usize,
-) -> Result<BTreeMap<(String, u64), Vec<GenerationObjectEvidenceRow>>, CatalogError> {
-    let limit = limit_with_sentinel(maximum)?;
-    let mut statement = connection.prepare(
-        "SELECT dataset_id, manifest_version, ordinal, artifact_id, content_hash, row_count, \
-                size_bytes, lineage_hash FROM analytical_generation_objects \
-         ORDER BY dataset_id, manifest_version, ordinal LIMIT ?1",
-    )?;
-    let mut rows = statement.query([limit])?;
-    let mut result: BTreeMap<(String, u64), Vec<GenerationObjectEvidenceRow>> = BTreeMap::new();
-    let mut observed = 0_usize;
-    while let Some(row) = rows.next()? {
-        if observed >= maximum {
-            return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
-        }
-        observed = observed
-            .checked_add(1)
-            .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-        let dataset: String = row.get(0)?;
-        DatasetId::try_from(dataset.as_str()).map_err(|_| CatalogError::CorruptCatalog)?;
-        let version = parse_positive_u64(row.get(1)?)?;
-        let ordinal =
-            usize::try_from(row.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
-        let members = result.entry((dataset, version)).or_default();
-        if ordinal != members.len() {
-            return Err(CatalogError::CorruptCatalog);
-        }
-        members.push(
-            GenerationObjectEvidenceRow::try_new(
-                parse_uuid(row.get::<_, String>(3)?)?,
-                parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?,
-                parse_positive_u64(row.get(5)?)?,
-                parse_positive_u64(row.get(6)?)?,
-                parse_sha256(1, row.get::<_, Vec<u8>>(7)?)?,
-            )
-            .map_err(map_evidence_error)?,
-        );
-    }
-    Ok(result)
+    Ok(())
 }
 
 fn read_query_artifacts(
     connection: &Connection,
     cutoff: Timestamp,
-    maximum: usize,
-) -> Result<Vec<QueryArtifactEvidenceRow>, CatalogError> {
-    let limit = limit_with_sentinel(maximum)?;
+    consume: &mut impl FnMut(QueryArtifactEvidenceRow) -> Result<(), CatalogError>,
+) -> Result<(), CatalogError> {
     let mut statement = connection.prepare(
         "SELECT reservations.reservation_id, reservations.owner, reservations.request_algorithm, \
                 reservations.request_digest, results.artifact_id, results.relative_reference, \
@@ -432,15 +307,13 @@ fn read_query_artifacts(
          FROM query_artifact_reservations AS reservations \
          JOIN query_artifact_results AS results USING (reservation_id) \
          WHERE reservations.state='published' AND reservations.expires_at_ns>?1 \
-         ORDER BY reservations.reservation_id LIMIT ?2",
+         ORDER BY lower(reservations.reservation_id)",
     )?;
-    let mut rows = statement.query((cutoff.unix_nanos(), limit))?;
-    let mut result = Vec::new();
+    let mut rows = statement.query([cutoff.unix_nanos()])?;
     while let Some(row) = rows.next()? {
-        require_capacity(&result, maximum)?;
         let request_algorithm: i64 = row.get(2)?;
         let content_algorithm: i64 = row.get(6)?;
-        result.push(
+        consume(
             QueryArtifactEvidenceRow::try_new(
                 parse_uuid(row.get::<_, String>(0)?)?,
                 SourceIdentifier::try_from(row.get::<_, String>(1)?)
@@ -453,35 +326,81 @@ fn read_query_artifacts(
                 Timestamp::from_unix_nanos(row.get(9)?),
             )
             .map_err(map_evidence_error)?,
-        );
+        )?;
     }
-    Ok(result)
+    Ok(())
 }
 
 type ProviderRelationEvidenceRow = (Box<str>, Box<[u8]>, Sha256Digest, u64);
 
+struct ProviderEvidenceSink<'a> {
+    digest: &'a mut EvidenceDigest,
+    cancellation: &'a CancellationToken,
+    request: EvidenceSnapshotRequest,
+    previous: Option<(ProviderCatalogRelation, Box<[u8]>)>,
+    count: u64,
+    total_bytes: &'a mut u64,
+}
+impl ProviderEvidenceSink<'_> {
+    fn push(&mut self, row: ProviderRelationEvidenceRow) -> Result<(), CatalogError> {
+        check_cancellation(self.cancellation)?;
+        let (name, key, content, bytes) = row;
+        let relation = ProviderCatalogRelation::from_database_name(&name)
+            .ok_or(CatalogError::AnalyticalEvidenceInvalid)?;
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|(previous, previous_key)| {
+                (*previous, previous_key.as_ref()) >= (relation, key.as_ref())
+            })
+        {
+            return Err(CatalogError::AnalyticalEvidenceInvalid);
+        }
+        let row =
+            ProviderCatalogRelationEvidenceRow::try_new(relation, key.clone(), content, bytes)
+                .map_err(map_evidence_error)?;
+        if bytes > self.request.limits().max_object_bytes() {
+            return Err(CatalogError::AnalyticalEvidenceInvalid);
+        }
+        add(self.total_bytes, bytes)?;
+        if *self.total_bytes > self.request.limits().max_total_bytes() {
+            return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
+        }
+        self.digest
+            .provider_relation(&row)
+            .map_err(map_evidence_error)?;
+        add(&mut self.count, 1)?;
+        self.previous = Some((relation, key));
+        Ok(())
+    }
+}
 fn read_provider_relation_rows(
     connection: &Connection,
-    maximum: usize,
-) -> Result<Vec<ProviderRelationEvidenceRow>, CatalogError> {
-    let mut result = Vec::new();
-    read_sealed_raw_object_evidence(connection, maximum, &mut result)?;
-    read_native_reference_evidence(connection, maximum, &mut result)?;
-    read_provider_logical_evidence(connection, maximum, &mut result)?;
-    read_provider_logical_original_evidence(connection, maximum, &mut result)?;
-    read_provider_capture_original_evidence(connection, maximum, &mut result)?;
-    read_provider_option_evidence(connection, maximum, &mut result)?;
-    read_direct_provider_input_evidence(connection, maximum, &mut result)?;
-    market_events::read_relations(connection, maximum, &mut result)?;
-    read_indexed_resource_evidence(connection, maximum, &mut result)?;
-    Ok(result)
+    result: &mut ProviderEvidenceSink<'_>,
+) -> Result<(), CatalogError> {
+    read_sealed_raw_object_evidence(connection, result)?;
+    read_provider_logical_bindings(connection, result)?;
+    read_provider_logical_families(connection, result)?;
+    read_provider_logical_objects(connection, result)?;
+    read_provider_logical_partitions(connection, result)?;
+    read_provider_logical_expectations(connection, result)?;
+    read_provider_option_bindings(connection, result)?;
+    read_provider_option_native_lineage(connection, result)?;
+    read_provider_option_rows(connection, result)?;
+    market_events::read_relations(connection, result, true)?;
+    read_direct_provider_input_evidence(connection, result)?;
+    read_provider_logical_original_evidence(connection, result)?;
+    read_provider_capture_original_evidence(connection, result)?;
+    read_provider_logical_partition_artifacts(connection, result)?;
+    market_events::read_relations(connection, result, false)?;
+    read_native_reference_evidence(connection, result)?;
+    read_indexed_resource_evidence(connection, result)
 }
 
 // Hash one stored record at a time. Model bytes and filing chunks are never accumulated here.
 fn read_indexed_resource_evidence(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     use rusqlite::types::ValueRef;
 
@@ -515,7 +434,7 @@ fn read_indexed_resource_evidence(
         let columns = statement.column_count();
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            require_capacity(result, maximum)?;
+            check_cancellation(result.cancellation)?;
             let key: String = row.get(0)?;
             let mut digest = ProviderRowDigest::new(relation)?;
             for index in 1..columns {
@@ -534,7 +453,7 @@ fn read_indexed_resource_evidence(
                 key.into_bytes().into_boxed_slice(),
                 digest.finish(),
                 0,
-            ));
+            ))?;
         }
     }
     Ok(())
@@ -542,19 +461,18 @@ fn read_indexed_resource_evidence(
 
 fn read_direct_provider_input_evidence(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const CAPTURE_RELATION: &str = "ingest_run_provider_capture_bindings";
     let mut capture_statement = connection.prepare(
         "SELECT run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
                 binding_digest, source_id, metadata_dependency_digest
          FROM ingest_run_provider_capture_bindings
-         ORDER BY run_id, input_ordinal LIMIT ?1",
+         ORDER BY lower(run_id), input_ordinal",
     )?;
-    let mut rows = capture_statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = capture_statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let run = parse_uuid(row.get::<_, String>(0)?)?;
         let input_ordinal: i64 = row.get(1)?;
         let output_ordinal: i64 = row.get(2)?;
@@ -581,7 +499,7 @@ fn read_direct_provider_input_evidence(
             run_ordinal_primary_key(run, input_ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
 
     const PUBLICATION_RELATION: &str = "ingest_run_provider_publication_bindings";
@@ -591,11 +509,11 @@ fn read_direct_provider_input_evidence(
                 response_binding_digest, event_binding_digest, composite_binding_digest,
                 option_binding_digest, logical_binding_digest, active_dataset_id, active_commit_sequence
          FROM ingest_run_provider_publication_bindings
-         ORDER BY run_id, input_ordinal LIMIT ?1",
+         ORDER BY lower(run_id), input_ordinal",
     )?;
-    let mut rows = publication_statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = publication_statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let run = parse_uuid(row.get::<_, String>(0)?)?;
         let input_ordinal: i64 = row.get(1)?;
         let output_ordinal: Option<i64> = row.get(2)?;
@@ -662,7 +580,7 @@ fn read_direct_provider_input_evidence(
             run_ordinal_primary_key(run, input_ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
@@ -840,19 +758,18 @@ fn validate_provider_relation_integrity(connection: &Connection) -> Result<(), C
 
 fn read_sealed_raw_object_evidence(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "sealed_raw_objects";
     let mut statement = connection.prepare(
         "SELECT raw_claim_digest, raw_claim_kind, physical_receipt_digest,
                 relative_reference, content_digest, size_bytes, integrity_chunk_bytes,
                 unit_count, raw_claim_json, recorded_at_ns
-         FROM sealed_raw_objects ORDER BY raw_claim_digest LIMIT ?1",
+         FROM sealed_raw_objects ORDER BY raw_claim_digest",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let claim_digest = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let claim_kind: String = row.get(1)?;
         let physical_receipt = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
@@ -923,28 +840,14 @@ fn read_sealed_raw_object_evidence(
             digest_primary_key(claim_digest),
             digest.finish(),
             size_bytes,
-        ));
+        ))?;
     }
     Ok(())
 }
 
-fn read_provider_logical_evidence(
-    connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
-) -> Result<(), CatalogError> {
-    read_provider_logical_bindings(connection, maximum, result)?;
-    read_provider_logical_families(connection, maximum, result)?;
-    read_provider_logical_objects(connection, maximum, result)?;
-    read_provider_logical_partitions(connection, maximum, result)?;
-    read_provider_logical_expectations(connection, maximum, result)?;
-    read_provider_logical_partition_artifacts(connection, maximum, result)
-}
-
 fn read_provider_logical_original_evidence(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_originals";
     let mut statement = connection.prepare(
@@ -953,11 +856,11 @@ fn read_provider_logical_original_evidence(
                 checkpoint_bytes, object_count, object_set_digest, rights_id, custody_digest,
                 retained_at_ns, publication_digest, published_at_ns,
                 registered_source_revision_digest, source_revision_kind
-         FROM provider_logical_originals ORDER BY coordinate_digest LIMIT ?1",
+         FROM provider_logical_originals ORDER BY coordinate_digest",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let coordinate = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let dataset: String = row.get(1)?;
         let source: String = row.get(2)?;
@@ -1018,26 +921,25 @@ fn read_provider_logical_original_evidence(
             digest_primary_key(coordinate),
             digest.finish(),
             0,
-        ));
+        ))?;
     }
-    read_provider_logical_original_objects(connection, maximum, result)
+    read_provider_logical_original_objects(connection, result)
 }
 
 fn read_provider_logical_bindings(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_publication_bindings";
     let mut statement = connection.prepare(
         "SELECT binding_digest, binding_format_version, source_id, terminal_receipt_digest,
                 terminal_json, required_family_count, object_count, partition_count,
                 canonical_partition_count, recorded_at_ns
-         FROM provider_logical_publication_bindings ORDER BY binding_digest LIMIT ?1",
+         FROM provider_logical_publication_bindings ORDER BY binding_digest",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         super::provider_logical::load_provider_logical_publication_binding(
             connection,
@@ -1083,25 +985,24 @@ fn read_provider_logical_bindings(
             digest_primary_key(binding),
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_logical_families(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_publication_required_families";
     let mut statement = connection.prepare(
         "SELECT binding_digest, family_ordinal, family
          FROM provider_logical_publication_required_families
-         ORDER BY binding_digest, family_ordinal LIMIT ?1",
+         ORDER BY binding_digest, family_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let ordinal: i64 = row.get(1)?;
         let family: String = row.get(2)?;
@@ -1117,26 +1018,25 @@ fn read_provider_logical_families(
             digest_ordinal_primary_key(binding, ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_logical_objects(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_publication_objects";
     let mut statement = connection.prepare(
         "SELECT binding_digest, object_ordinal, object_role, semantic_identity,
                 raw_claim_digest, physical_receipt_digest
          FROM provider_logical_publication_objects
-         ORDER BY binding_digest, object_ordinal LIMIT ?1",
+         ORDER BY binding_digest, object_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let ordinal: i64 = row.get(1)?;
         let role: String = row.get(2)?;
@@ -1163,26 +1063,25 @@ fn read_provider_logical_objects(
             digest_ordinal_primary_key(binding, ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_logical_original_objects(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_original_objects";
     let mut statement = connection.prepare(
         "SELECT coordinate_digest, object_ordinal, object_role, semantic_identity,
                 raw_claim_digest, physical_receipt_digest
          FROM provider_logical_original_objects
-         ORDER BY coordinate_digest, object_ordinal LIMIT ?1",
+         ORDER BY coordinate_digest, object_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let ordinal: i64 = row.get(1)?;
         let role: String = row.get(2)?;
@@ -1209,15 +1108,14 @@ fn read_provider_logical_original_objects(
             digest_ordinal_primary_key(binding, ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_logical_partitions(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_publication_partitions";
     let mut statement = connection.prepare(
@@ -1225,11 +1123,11 @@ fn read_provider_logical_partitions(
                 partition_ordinal, first_item_ordinal, item_count, schema_identity,
                 semantic_digest, raw_claim_digest, physical_receipt_digest
          FROM provider_logical_publication_partitions
-         ORDER BY binding_digest, partition_family_ordinal, partition_ordinal LIMIT ?1",
+         ORDER BY binding_digest, partition_family_ordinal, partition_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let family_ordinal: i64 = row.get(1)?;
         let family: String = row.get(2)?;
@@ -1264,15 +1162,14 @@ fn read_provider_logical_partitions(
             digest_pair_ordinal_primary_key(binding, family_ordinal, partition_ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_logical_expectations(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_logical_publication_canonical_expectations";
     let mut statement = connection.prepare(
@@ -1280,11 +1177,11 @@ fn read_provider_logical_expectations(
                 schema_identity, semantic_digest, aligned_native_partition,
                 aligned_row_map_partition
          FROM provider_logical_publication_canonical_expectations
-         ORDER BY binding_digest, partition_ordinal LIMIT ?1",
+         ORDER BY binding_digest, partition_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let ordinal: i64 = row.get(1)?;
         let first: i64 = row.get(2)?;
@@ -1315,25 +1212,14 @@ fn read_provider_logical_expectations(
             digest_ordinal_primary_key(binding, ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
-fn read_provider_option_evidence(
-    connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
-) -> Result<(), CatalogError> {
-    read_provider_option_bindings(connection, maximum, result)?;
-    read_provider_option_native_lineage(connection, maximum, result)?;
-    read_provider_option_rows(connection, maximum, result)
-}
-
 fn read_provider_option_bindings(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_option_market_bindings";
     let mut statement = connection.prepare(
@@ -1343,11 +1229,11 @@ fn read_provider_option_bindings(
                 scope_json, scope_digest, completeness_json, completeness_digest,
                 filter_json, filter_digest, underlying_instrument_id, available_at_ns,
                 received_at_ns, ingested_at_ns, disposition, row_mapping_digest, recorded_at_ns
-         FROM provider_option_market_bindings ORDER BY option_binding_digest LIMIT ?1",
+         FROM provider_option_market_bindings ORDER BY option_binding_digest",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let format: i64 = row.get(1)?;
         let capture = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
@@ -1409,26 +1295,25 @@ fn read_provider_option_bindings(
             digest_primary_key(binding),
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_option_native_lineage(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_option_market_binding_native_lineage";
     let mut statement = connection.prepare(
         "SELECT option_binding_digest, schema_version, implementation, schema_fingerprint,
                 row_count, batch_digest, batch_sidecar_payload, batch_sidecar_digest
          FROM provider_option_market_binding_native_lineage
-         ORDER BY option_binding_digest LIMIT ?1",
+         ORDER BY option_binding_digest",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let schema_version: i64 = row.get(1)?;
         let implementation: String = row.get(2)?;
@@ -1461,15 +1346,14 @@ fn read_provider_option_native_lineage(
             digest_primary_key(binding),
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_option_rows(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_option_market_binding_rows";
     let mut statement = connection.prepare(
@@ -1478,11 +1362,11 @@ fn read_provider_option_rows(
                 capture_page_ordinal, physical_frame_ordinal, payload_digest,
                 received_at_ns, source_sequence
          FROM provider_option_market_binding_rows
-         ORDER BY option_binding_digest, canonical_row_ordinal LIMIT ?1",
+         ORDER BY option_binding_digest, canonical_row_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let capture = parse_sha256(1, row.get::<_, Vec<u8>>(1)?)?;
         let ordinal: i64 = row.get(2)?;
@@ -1521,7 +1405,7 @@ fn read_provider_option_rows(
             digest_ordinal_primary_key(binding, ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
@@ -1690,21 +1574,6 @@ fn logical_family(value: &str) -> bool {
     )
 }
 
-fn require_capacity<T>(items: &[T], maximum: usize) -> Result<(), CatalogError> {
-    if items.len() >= maximum {
-        Err(CatalogError::AnalyticalEvidenceLimitExceeded)
-    } else {
-        Ok(())
-    }
-}
-
-fn limit_with_sentinel(maximum: usize) -> Result<i64, CatalogError> {
-    let limit = maximum
-        .checked_add(1)
-        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    i64::try_from(limit).map_err(|_| CatalogError::AnalyticalEvidenceLimitExceeded)
-}
-
 fn parse_uuid(value: String) -> Result<Uuid, CatalogError> {
     let value = Uuid::parse_str(&value).map_err(|_| CatalogError::CorruptCatalog)?;
     if value.is_nil() {
@@ -1727,6 +1596,14 @@ fn parse_sha256(algorithm: i64, value: Vec<u8>) -> Result<Sha256Digest, CatalogE
 fn parse_build_spec_digest(value: Vec<u8>) -> Result<DatasetBuildSpecDigest, CatalogError> {
     DatasetBuildSpecDigest::try_new(value.try_into().map_err(|_| CatalogError::CorruptCatalog)?)
         .map_err(|_| CatalogError::CorruptCatalog)
+}
+
+fn parse_nonnegative_u64(value: i64) -> Result<u64, CatalogError> {
+    u64::try_from(value).map_err(|_| CatalogError::CorruptCatalog)
+}
+
+fn sqlite_integer(value: u64) -> Result<i64, CatalogError> {
+    i64::try_from(value).map_err(|_| CatalogError::CorruptCatalog)
 }
 
 fn parse_positive_u64(value: i64) -> Result<u64, CatalogError> {
@@ -1753,14 +1630,13 @@ fn map_evidence_error(error: EvidenceError) -> CatalogError {
 
 fn read_provider_capture_original_evidence(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "provider_capture_originals";
-    let mut statement=connection.prepare("SELECT session_digest,ordinal,rights_id,retained_at_ns FROM provider_capture_originals ORDER BY session_digest,ordinal LIMIT ?1")?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut statement=connection.prepare("SELECT session_digest,ordinal,rights_id,retained_at_ns FROM provider_capture_originals ORDER BY original_digest")?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let session = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let ordinal = row.get::<_, u16>(1)?;
         let original = super::provider_capture::original::load(
@@ -1795,25 +1671,24 @@ fn read_provider_capture_original_evidence(
             digest_primary_key(Sha256Digest::new(original.digest().bytes())),
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_native_reference_evidence(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "market_data_native_reference_captures";
     let mut statement = connection.prepare(
         "SELECT identity_digest, origin_revision_digest, coordinate_json, raw_claim_digest,
                 physical_receipt_digest, custody_digest, retained_at_ns
-         FROM market_data_native_reference_captures ORDER BY identity_digest LIMIT ?1",
+         FROM market_data_native_reference_captures ORDER BY identity_digest",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let identity = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
         let origin = parse_sha256(1, row.get::<_, Vec<u8>>(1)?)?;
         let coordinate: String = row.get(2)?;
@@ -1837,25 +1712,24 @@ fn read_native_reference_evidence(
             digest_primary_key(identity),
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }
 
 fn read_provider_logical_partition_artifacts(
     connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
+    result: &mut ProviderEvidenceSink<'_>,
 ) -> Result<(), CatalogError> {
     const RELATION: &str = "ingest_run_provider_logical_partition_artifacts";
     let mut statement = connection.prepare(
         "SELECT run_id, partition_ordinal, logical_binding_digest, output_artifact_ordinal, object_input_ordinal
          FROM ingest_run_provider_logical_partition_artifacts
-         ORDER BY run_id, partition_ordinal LIMIT ?1",
+         ORDER BY lower(run_id), partition_ordinal",
     )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
+        check_cancellation(result.cancellation)?;
         let run = parse_uuid(row.get::<_, String>(0)?)?;
         let ordinal: i64 = row.get(1)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
@@ -1878,7 +1752,7 @@ fn read_provider_logical_partition_artifacts(
             run_ordinal_primary_key(run, ordinal)?,
             digest.finish(),
             0,
-        ));
+        ))?;
     }
     Ok(())
 }

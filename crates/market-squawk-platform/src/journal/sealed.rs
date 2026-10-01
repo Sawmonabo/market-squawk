@@ -7,11 +7,12 @@
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     fmt,
     fs::File,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak},
 };
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -39,8 +40,8 @@ pub use sealed_object::{
     PendingResearchObject, ResearchObjectAdmission, ResearchObjectCheckpointClaim,
     ResearchObjectChunkReceipt, ResearchObjectClaim, ResearchObjectControl,
     ResearchObjectControlError, ResearchObjectControlPoint, ResearchObjectReceipt,
-    SealedResearchRawClaim, SealedResearchRecoveryAdmission, SealedResearchRecoverySession,
-    VerifiedResearchObject,
+    SealedResearchRawClaim, SealedResearchRawObjectKind, SealedResearchRecoveryAdmission,
+    SealedResearchRecoverySession, SealedResearchRecoveryTurn, VerifiedResearchObject,
 };
 
 const STORE_DIRECTORY: &str = "research-segments";
@@ -51,7 +52,6 @@ const QUARANTINE_DIRECTORY: &str = "quarantine";
 const OWNER_LOCK_FILE: &str = ".owner.lock";
 const MAX_SEALED_FRAMES: usize = 4_096;
 const MAX_SEALED_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_RECOVERY_ENTRIES: usize = 100_000;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_CLAIM_REFERENCE_BYTES: usize = 128;
 
@@ -274,6 +274,8 @@ where
 #[serde(deny_unknown_fields)]
 pub struct SealedResearchJournalSegmentReceipt {
     claim: SealedResearchJournalSegmentClaim,
+    #[serde(skip)]
+    _pin: LiveRawPin,
 }
 
 impl SealedResearchJournalSegmentReceipt {
@@ -332,7 +334,7 @@ impl SealedResearchJournalSegment {
     }
 }
 
-/// Conservative startup-recovery result. Quarantine entries are retained, never deleted here.
+/// Bounded recovery-turn observations. Quarantine entries are retained, never deleted here.
 #[derive(Debug, Eq, PartialEq)]
 pub struct SealedResearchJournalRecoveryReport {
     quarantined_staging: Vec<String>,
@@ -479,19 +481,81 @@ impl SealedResearchJournalStoreError {
     }
 }
 
+// Only live capabilities retain entries. The single owner lock outlives the store while any
+// receipt or stage writer remains alive; a same-root reopen therefore cannot lose its pins.
+#[derive(Debug)]
+struct RawStoreOwner {
+    lock: File,
+    pins: Mutex<BTreeMap<String, Weak<LiveRawPinInner>>>,
+}
+#[derive(Debug)]
+struct LiveRawPinInner {
+    owner: Arc<RawStoreOwner>,
+    reference: String,
+}
+#[derive(Clone, Debug)]
+struct LiveRawPin(Arc<LiveRawPinInner>);
+impl PartialEq for LiveRawPin {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.reference == other.0.reference
+    }
+}
+impl Eq for LiveRawPin {}
+impl Drop for LiveRawPinInner {
+    fn drop(&mut self) {
+        if let Ok(mut pins) = self.owner.pins.lock() {
+            if pins
+                .get(&self.reference)
+                .is_some_and(|pin| pin.strong_count() == 0)
+            {
+                pins.remove(&self.reference);
+            }
+        }
+    }
+}
+impl RawStoreOwner {
+    fn pin(
+        self: &Arc<Self>,
+        reference: &str,
+    ) -> Result<LiveRawPin, SealedResearchJournalStoreError> {
+        let mut pins = self
+            .pins
+            .lock()
+            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        if let Some(pin) = pins.get(reference).and_then(Weak::upgrade) {
+            return Ok(LiveRawPin(pin));
+        }
+        let pin = Arc::new(LiveRawPinInner {
+            owner: Arc::clone(self),
+            reference: reference.to_owned(),
+        });
+        pins.insert(reference.to_owned(), Arc::downgrade(&pin));
+        Ok(LiveRawPin(pin))
+    }
+    fn pinned(&self, reference: &str) -> Result<bool, SealedResearchJournalStoreError> {
+        let pins = self
+            .pins
+            .lock()
+            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        Ok(pins
+            .get(reference)
+            .is_some_and(|pin| pin.strong_count() != 0))
+    }
+}
+
 /// Single-owner sealed `MSJ1` research-segment authority.
 ///
 /// The retained filesystem lock prevents two store instances from racing publication or startup
 /// recovery. The mutation mutex serializes seals and recovery; immutable reads share a separate
-/// guard that excludes recovery without blocking seals or other reads. Recovery must be called
-/// only after the caller has supplied the complete authoritative catalog receipt set.
+/// guard that excludes each bounded recovery turn without blocking seals or other reads.
+/// Recovery checks live pins and fresh exact catalog membership before quarantining an object.
 #[derive(Debug)]
 pub struct SealedResearchJournalStore {
     root: Arc<Dir>,
     staging: Dir,
     objects: Dir,
     quarantine: Dir,
-    _owner_lock: File,
+    owner: Arc<RawStoreOwner>,
     owner_identity: FileIdentity,
     operation: Mutex<()>,
     recovery_exclusion: RwLock<()>,
@@ -541,7 +605,10 @@ impl SealedResearchJournalStore {
             staging,
             objects,
             quarantine,
-            _owner_lock: owner_lock,
+            owner: Arc::new(RawStoreOwner {
+                lock: owner_lock,
+                pins: Mutex::new(BTreeMap::new()),
+            }),
             owner_identity,
             operation: Mutex::new(()),
             recovery_exclusion: RwLock::new(()),
@@ -649,7 +716,7 @@ impl SealedResearchJournalStore {
                     source,
                 )
             })?;
-        let opened = opened_file_metadata(&self._owner_lock)?;
+        let opened = opened_file_metadata(&self.owner.lock)?;
         validate_private_regular_file(&named, None)?;
         validate_private_regular_file(&opened, None)?;
         if FileIdentity::from_metadata(&named) != self.owner_identity
@@ -813,6 +880,7 @@ impl SealedResearchJournalStore {
         };
         let receipt = SealedResearchJournalSegmentReceipt {
             claim: claim.clone(),
+            _pin: self.owner.pin(claim.relative_reference())?,
         };
 
         let shard = ensure_directory(&self.objects, shard_name)?;
@@ -1025,6 +1093,7 @@ impl SealedResearchJournalStore {
         }
         Ok(SealedResearchJournalSegmentReceipt {
             claim: claim.clone(),
+            _pin: self.owner.pin(claim.relative_reference())?,
         })
     }
 }
@@ -1132,30 +1201,6 @@ fn validate_exact_records(
         },
     )?;
     if count != expected.len() {
-        return Err(SealedResearchJournalStoreError::ReceiptMismatch);
-    }
-    Ok(())
-}
-
-fn validate_unclaimed_msj_with_control(
-    file: &File,
-    size_bytes: u64,
-    control: Option<&dyn ResearchObjectControl>,
-) -> Result<(), SealedResearchJournalStoreError> {
-    if size_bytes > MAX_SEALED_BYTES {
-        return Err(SealedResearchJournalStoreError::ReceiptMismatch);
-    }
-    let clone = file.try_clone().map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to clone recovered MSJ1 object", source)
-    })?;
-    let count = visit_msj_records_bounded(
-        clone,
-        MAX_SEALED_FRAMES,
-        size_bytes.saturating_sub(CURRENT_MAGIC.len() as u64),
-        control,
-        |_, _, _, _| Ok(()),
-    )?;
-    if count == 0 {
         return Err(SealedResearchJournalStoreError::ReceiptMismatch);
     }
     Ok(())
@@ -1492,11 +1537,6 @@ fn sync_directory(directory: &Dir) -> Result<(), SealedResearchJournalStoreError
     }
 }
 
-struct BoundedNamedEntry {
-    name: String,
-    entry: cap_std::fs::DirEntry,
-}
-
 #[derive(Clone, Copy)]
 struct RecoveryControl<'control> {
     control: &'control dyn ResearchObjectControl,
@@ -1511,53 +1551,6 @@ impl RecoveryControl<'_> {
             })?;
         Ok(())
     }
-}
-
-fn bounded_entries(
-    directory: &Dir,
-    inspected_entries: &mut usize,
-    maximum_entries: usize,
-    control: &dyn ResearchObjectControl,
-) -> Result<Vec<BoundedNamedEntry>, SealedResearchJournalStoreError> {
-    if maximum_entries > MAX_RECOVERY_ENTRIES || *inspected_entries > maximum_entries {
-        return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-    }
-    let mut entries = Vec::new();
-    let mut iterator = directory.entries().map_err(|source| {
-        SealedResearchJournalStoreError::io("failed to enumerate research-segment state", source)
-    })?;
-    let remaining = maximum_entries - *inspected_entries;
-    entries
-        .try_reserve_exact(iterator.size_hint().0.min(remaining))
-        .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
-    loop {
-        control.checkpoint(ResearchObjectControlPoint::BeforeRecoveryEntry {
-            inspected_entries: *inspected_entries,
-        })?;
-        let Some(entry) = iterator.next() else {
-            break;
-        };
-        if *inspected_entries >= maximum_entries {
-            return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-        }
-        let entry = entry.map_err(|source| {
-            SealedResearchJournalStoreError::io(
-                "failed to read research-segment directory entry",
-                source,
-            )
-        })?;
-        entries
-            .try_reserve(1)
-            .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
-        let file_name = entry.file_name();
-        let name = try_portable_name(&file_name)?;
-        entries.push(BoundedNamedEntry { name, entry });
-        *inspected_entries = inspected_entries
-            .checked_add(1)
-            .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-    }
-    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    Ok(entries)
 }
 
 fn try_portable_name(name: &std::ffi::OsStr) -> Result<String, SealedResearchJournalStoreError> {
@@ -1799,6 +1792,12 @@ fn quarantine_no_replace_with_admission(
                 .map_err(|_error| SealedResearchJournalStoreError::RawPublicationIndeterminate);
         }
         Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Recovery uses fresh orphan names. An unexpected collision must not turn a
+            // bounded maintenance action into an unbounded whole-file comparison.
+            if recovery.is_some() {
+                return Err(SealedResearchJournalStoreError::StateConflict);
+            }
+
             let Some(exact_match) = exact_files_match(
                 source_directory,
                 source_name,
@@ -2135,32 +2134,66 @@ mod tests {
         )?;
         let orphan = store.seal(std::slice::from_ref(&second))?;
         let authoritative = SealedResearchRawClaim::JournalSegment(receipt.claim().clone());
-        let mut recovery =
-            store.begin_recovery(SealedResearchRecoveryAdmission::try_new(4, 32)?, &Allow)?;
-        assert!(matches!(
-            store.open_verified_claim_with_control(receipt.claim(), &Allow),
-            Err(super::SealedResearchJournalStoreError::ObjectControl(
-                ResearchObjectControlError::Unavailable
-            ))
-        ));
-        assert!(matches!(
-            store.verify_claim_with_control(receipt.claim(), &Allow),
-            Err(super::SealedResearchJournalStoreError::ObjectControl(
-                ResearchObjectControlError::Unavailable
-            ))
-        ));
-        recovery.observe_claim(&authoritative)?;
-        let recovery = recovery.finish()?;
-        assert!(recovery.quarantined_staging().is_empty());
+        let orphan_claim = orphan.claim().clone();
+        // Even an unpublished receipt remains live through clone ownership. Maintenance may
+        // release its locks between turns without losing this pre-catalog publication pin.
+        let orphan_clone = orphan.clone();
+        drop(orphan);
+        let mut recovery = store.begin_recovery()?;
+        loop {
+            let turn = recovery.advance(
+                &store,
+                SealedResearchRecoveryAdmission::try_new(1, 8)?,
+                &Allow,
+                |_, _| Ok(None),
+            )?;
+            assert!(turn.report().quarantined_objects().is_empty());
+            assert_eq!(
+                store.open_verified(&receipt)?.records()[0].payload(),
+                first.payload()
+            );
+            if turn.complete() {
+                break;
+            }
+        }
+        drop(recovery);
+        drop(orphan_clone);
+        let retained_claim = receipt.claim().clone();
+        drop(reopened);
+        drop(receipt);
+        let mut recovery = store.begin_recovery()?;
+        let mut quarantined = Vec::new();
+        let mut retained = 0;
+        loop {
+            let turn = recovery.advance(
+                &store,
+                SealedResearchRecoveryAdmission::try_new(1, 8)?,
+                &Allow,
+                |_, digest| {
+                    Ok((digest == retained_claim.content_digest()).then(|| authoritative.clone()))
+                },
+            )?;
+            quarantined.extend_from_slice(turn.report().quarantined_objects());
+            retained += turn.report().retained_journal_segments();
+            if turn.complete() {
+                break;
+            }
+        }
         assert_eq!(
-            recovery.quarantined_objects(),
-            &[String::from(orphan.relative_reference())]
+            quarantined,
+            vec![orphan_claim.relative_reference().to_owned()]
         );
+        assert_eq!(retained, 1);
+        let receipt = store.verify_claim_with_control(&retained_claim, &Allow)?;
         assert_eq!(
             store.open_verified(&receipt)?.records()[0].payload(),
             first.payload()
         );
-        assert!(store.open_verified(&orphan).is_err());
+        assert!(
+            store
+                .open_verified_claim_with_control(&orphan_claim, &Allow)
+                .is_err()
+        );
         // Late corruption cannot issue a verify-only receipt after successful earlier reads.
         use std::io::{Seek as _, Write as _};
         let path = temporary

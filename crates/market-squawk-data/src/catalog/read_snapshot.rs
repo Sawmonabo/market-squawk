@@ -157,6 +157,35 @@ impl CatalogReadSnapshot {
         &self.connection
     }
 
+    pub(crate) fn authoritative_provider_raw_claim_page(
+        &self,
+        after: Option<EvidenceDigest>,
+    ) -> Result<
+        Vec<(
+            EvidenceDigest,
+            market_squawk_platform::SealedResearchRawClaim,
+        )>,
+        CatalogError,
+    > {
+        super::provider_capture::authoritative_provider_raw_claim_page(
+            &self.connection,
+            after,
+            self.result_limits,
+        )
+    }
+
+    pub(crate) fn authoritative_provider_raw_claim(
+        &self,
+        kind: market_squawk_platform::SealedResearchRawObjectKind,
+        content_digest: EvidenceDigest,
+    ) -> Result<Option<market_squawk_platform::SealedResearchRawClaim>, CatalogError> {
+        super::provider_capture::authoritative_provider_raw_claim(
+            &self.connection,
+            kind,
+            content_digest,
+        )
+    }
+
     pub(crate) fn publication_evidence(
         &self,
         digest: EvidenceDigest,

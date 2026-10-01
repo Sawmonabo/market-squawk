@@ -566,6 +566,23 @@ replace it with a second database or a new data application.
 | Derived datasets | Separate immutable Parquet generations for local bars, features, statements/ratios, model inputs/outputs, backtests, and decision evidence. Each binds all source generations and implementation identities. |
 | Product reads | Fixed, bounded typed application operations over exact pins/PIT selectors. Desktop receives closed results; operator DataFusion/Python access cannot become an unbounded frontend query path. |
 
+Raw-store reconciliation retains a directory cursor and one incremental hash state across bounded
+background turns. Live stage and receipt capabilities pin their objects until publication or
+release; orphan decisions use fresh indexed catalog membership under the store's mutation
+exclusion. Startup creates the cursor without scanning all history. Exact selected reads and
+explicit backups still verify their complete selected bytes; background completion is not an
+authorization receipt. Accounting detects integer overflow rather than imposing a cumulative
+physical-object or stored-byte quota.
+
+Analytical backup streams canonical catalog evidence in a consistent transaction and retains a
+compact digest/count/byte summary. Physical verification and copying traverse the retained immutable
+backup catalog in exact reference order, opening one file at a time. Restore verifies the complete
+source before target mutation and verifies each object again while copying. Indexed exact-reference
+lookups support interrupted-copy retry without retaining every path or file descriptor. Caller
+backup byte budgets and per-object integrity checks remain explicit; arbitrary lifetime artifact and
+reference counts do not govern admission. Current implementation and critical/live verification
+status remain in the delivery ledger.
+
 Logical partition keys are data family, effective/session date, provider/feed where material, and a
 bounded instrument bucket. They improve locality but never define identity; identity remains in the
 canonical row and logical evidence. The event writer micro-batches by bounded bytes/records/time

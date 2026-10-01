@@ -39,10 +39,10 @@ pub(crate) async fn reopen_current_price_input(
             Catalog::InvalidLimit
             | Catalog::ResultByteLimitExceeded
             | Catalog::ResultRowLimitExceeded
-            | Catalog::ProviderCaptureCapacityExceeded { .. }
             | Catalog::AnalyticalEvidenceLimitExceeded
             | Catalog::Allocation => ServiceError::ResourceExhausted,
-            Catalog::RightsDenied(_) | Catalog::RightsNotAdmitted
+            Catalog::RightsDenied(_)
+            | Catalog::RightsNotAdmitted
             | Catalog::InvalidRightsCapability => ServiceError::Unauthorized,
             _ => ServiceError::Internal,
         }
@@ -53,7 +53,9 @@ pub(crate) async fn reopen_current_price_input(
             ResearchUse::Cancelled => ServiceError::Cancelled,
             ResearchUse::DeadlineExceeded => ServiceError::DeadlineExceeded,
             ResearchUse::LimitExceeded => ServiceError::ResourceExhausted,
-            ResearchUse::Denied { .. } | ResearchUse::Expired | ResearchUse::Revoked
+            ResearchUse::Denied { .. }
+            | ResearchUse::Expired
+            | ResearchUse::Revoked
             | ResearchUse::InvalidPermitSession => ServiceError::Unauthorized,
             ResearchUse::Catalog(error) => catalog(error),
             _ => ServiceError::Internal,
@@ -66,10 +68,13 @@ pub(crate) async fn reopen_current_price_input(
             Parquet::ReadDeadlineExceeded | Parquet::RecoveryDeadlineExceeded => {
                 ServiceError::DeadlineExceeded
             }
-            Parquet::StagingLimitExceeded | Parquet::ReadLimitExceeded
-            | Parquet::SizeOverflow | Parquet::BlockingTaskLimitExceeded
+            Parquet::StagingLimitExceeded
+            | Parquet::ReadLimitExceeded
+            | Parquet::SizeOverflow
+            | Parquet::BlockingTaskLimitExceeded
             | Parquet::RecoveryScanLimit => ServiceError::ResourceExhausted,
-            Parquet::ContentAddressConflict | Parquet::ObjectMetadataMismatch
+            Parquet::ContentAddressConflict
+            | Parquet::ObjectMetadataMismatch
             | Parquet::RootCatalogMismatch => ServiceError::InvalidResult,
             _ => ServiceError::Internal,
         }
@@ -81,12 +86,15 @@ pub(crate) async fn reopen_current_price_input(
             Read::ForecastDatasetUnavailable => ServiceError::Unavailable,
             Read::NativeSessionControl(Control::Cancelled) => ServiceError::Cancelled,
             Read::NativeSessionControl(Control::DeadlineExceeded) => ServiceError::DeadlineExceeded,
-            Read::InvalidLimit | Read::InputEpochResultRequiresInline => ServiceError::ResourceExhausted,
+            Read::InvalidLimit | Read::InputEpochResultRequiresInline => {
+                ServiceError::ResourceExhausted
+            }
             Read::InvalidInputEpoch => ServiceError::InvalidResult,
             Read::Manifest(error) => match error {
                 Manifest::Cancelled => ServiceError::Cancelled,
                 Manifest::DeadlineExceeded => ServiceError::DeadlineExceeded,
-                Manifest::ObjectLimitExceeded { .. } | Manifest::CaptureInputLimitExceeded { .. }
+                Manifest::ObjectLimitExceeded { .. }
+                | Manifest::CaptureInputLimitExceeded { .. }
                 | Manifest::MarketBarHistoryInputLimitExceeded { .. }
                 | Manifest::FundNavInputLimitExceeded { .. }
                 | Manifest::ReferenceWorkLimitExceeded { .. }
@@ -94,11 +102,13 @@ pub(crate) async fn reopen_current_price_input(
                 | Manifest::CountOverflow => ServiceError::ResourceExhausted,
                 Manifest::PopulationResearchUse(error) => research_use(*error),
                 Manifest::CatalogAuthority(error) => catalog(error),
-                Manifest::AnchorMismatch | Manifest::SchemaMismatch | Manifest::SchemaIdentity(_)
-                | Manifest::CorruptCatalog | Manifest::MarketBarHistoryMismatch
-                | Manifest::FundNavPublicationMismatch | Manifest::ProviderMacroPlanMismatch => {
-                    ServiceError::InvalidResult
-                }
+                Manifest::AnchorMismatch
+                | Manifest::SchemaMismatch
+                | Manifest::SchemaIdentity(_)
+                | Manifest::CorruptCatalog
+                | Manifest::MarketBarHistoryMismatch
+                | Manifest::FundNavPublicationMismatch
+                | Manifest::ProviderMacroPlanMismatch => ServiceError::InvalidResult,
                 _ => ServiceError::Internal,
             },
             Read::PythonDataset(error) => match error {
@@ -108,7 +118,8 @@ pub(crate) async fn reopen_current_price_input(
                 Python::PopulationResearchUse(error) => research_use(*error),
                 Python::Catalog(error) => catalog(error),
                 Python::ResearchAuthorizationExpired => ServiceError::Unauthorized,
-                Python::CorruptAdmission | Python::InvalidProductionEvidence
+                Python::CorruptAdmission
+                | Python::InvalidProductionEvidence
                 | Python::ConflictingProductionAdmission => ServiceError::InvalidResult,
                 _ => ServiceError::Internal,
             },
@@ -116,10 +127,15 @@ pub(crate) async fn reopen_current_price_input(
             Read::Query(error) => match error {
                 Query::Cancelled => ServiceError::Cancelled,
                 Query::DeadlineExceeded => ServiceError::DeadlineExceeded,
-                Query::InvalidLimits | Query::AstLimitExceeded | Query::PlanLimitExceeded
-                | Query::PartitionLimitExceeded | Query::RowLimitExceeded { .. }
-                | Query::ByteLimitExceeded { .. } | Query::MemoryLimitExceeded { .. }
-                | Query::SizeOverflow | Query::BlockingTaskLimitExceeded
+                Query::InvalidLimits
+                | Query::AstLimitExceeded
+                | Query::PlanLimitExceeded
+                | Query::PartitionLimitExceeded
+                | Query::RowLimitExceeded { .. }
+                | Query::ByteLimitExceeded { .. }
+                | Query::MemoryLimitExceeded { .. }
+                | Query::SizeOverflow
+                | Query::BlockingTaskLimitExceeded
                 | Query::ReaderMemoryBoundExceeded => ServiceError::ResourceExhausted,
                 Query::Artifact(error) => parquet(error),
                 Query::Catalog(error) => catalog(error),
@@ -250,8 +266,11 @@ pub(crate) async fn current_price_session_origin(
         return Ok(None);
     };
     let calendar = calendar.ok_or(ServiceError::Unavailable)?;
-    let cohort = calendar.read_cohort(reference, deadline, cancellation.clone()).await
-        .map_err(map_calendar_error)?.ok_or(ServiceError::Unavailable)?;
+    let cohort = calendar
+        .read_cohort(reference, deadline, cancellation.clone())
+        .await
+        .map_err(map_calendar_error)?
+        .ok_or(ServiceError::Unavailable)?;
     cohort
         .bind_input_epoch(coordinate)
         .map_err(|_| ServiceError::InvalidResult)?

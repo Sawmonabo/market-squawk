@@ -1131,7 +1131,7 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         backup_paths.artifacts()?.clone(),
     )?;
     let backup_limits =
-        AnalyticalBackupLimits::try_new(64, 256, 64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
+        AnalyticalBackupLimits::try_new(64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
     let backup_cutoff = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?)
@@ -2654,7 +2654,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         backup_paths.artifacts()?.clone(),
     )?;
     let backup_limits =
-        AnalyticalBackupLimits::try_new(64, 256, 64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
+        AnalyticalBackupLimits::try_new(64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
     let backup_cutoff = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?)
@@ -3926,7 +3926,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         backup_paths.artifacts()?.clone(),
     )?;
     let backup_limits =
-        AnalyticalBackupLimits::try_new(64, 256, 64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
+        AnalyticalBackupLimits::try_new(64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
     let backup_cutoff = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?);
@@ -5220,9 +5220,22 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 64, Duration::from_secs(60))?,
     )?;
-    restarted
-        .recover_provider_capture_store(Arc::clone(&capture_store), &CancellationToken::new())
-        .await?;
+    let recovery = Arc::new(std::sync::Mutex::new(
+        restarted.create_provider_capture_recovery(Arc::clone(&capture_store))?,
+    ));
+    loop {
+        let turn = restarted
+            .recover_provider_capture_store_turn(
+                Arc::clone(&recovery),
+                Instant::now() + Duration::from_secs(30),
+                &CancellationToken::new(),
+            )
+            .await?;
+        if turn.complete() {
+            break;
+        }
+    }
+    drop(recovery);
     let native_output = read_complete_history_fixture(
         &restarted.analytical_reader(),
         native_exact,

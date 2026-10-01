@@ -6,12 +6,17 @@
 
 #[path = "sealed_backup.rs"]
 mod sealed_backup;
+#[path = "sealed_recovery.rs"]
+mod sealed_recovery;
+pub use sealed_recovery::{
+    SealedResearchRecoveryAdmission, SealedResearchRecoverySession, SealedResearchRecoveryTurn,
+};
 
 use std::{
     fmt,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    sync::{MutexGuard, RwLockWriteGuard},
+    sync::Arc,
 };
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -26,13 +31,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    FileIdentity, MAX_RECOVERY_ENTRIES, MAX_SEALED_BYTES, RecoveryControl,
+    FileIdentity, LiveRawPin, MAX_SEALED_BYTES, RawStoreOwner, RecoveryControl,
     SealedResearchJournalRecoveryReport, SealedResearchJournalSegmentClaim,
-    SealedResearchJournalStore, SealedResearchJournalStoreError, bounded_entries, digest_hex,
-    ensure_directory, hash_digest, hash_field, hash_file_bounded_with_control, is_lower_hex,
-    lock_pending_stage, opened_file_metadata, quarantine_no_replace, quarantine_stage_no_replace,
-    sync_directory, try_string_from_parts, validate_private_regular_file,
-    validate_private_regular_file_links, validate_unclaimed_msj_with_control,
+    SealedResearchJournalStore, SealedResearchJournalStoreError, digest_hex, ensure_directory,
+    hash_digest, hash_field, is_lower_hex, lock_pending_stage, opened_file_metadata,
+    quarantine_no_replace, quarantine_stage_no_replace, sync_directory, try_string_from_parts,
+    validate_private_regular_file, validate_private_regular_file_links,
 };
 
 const FORMAT_INTEGRITY_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
@@ -45,9 +49,12 @@ const LOGICAL_STAGE_SUFFIX: &str = ".mro.stage";
 const JOURNAL_OBJECT_SUFFIX: &str = ".msj";
 const JOURNAL_STAGE_SUFFIX: &str = ".msj.stage";
 
+/// Exact physical format of one content-addressed raw object.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RawObjectKind {
+pub enum SealedResearchRawObjectKind {
+    /// A bounded raw-record journal segment.
     JournalSegment,
+    /// A streamed logical raw object.
     LogicalObject,
 }
 
@@ -77,13 +84,13 @@ struct PreparedReadOnlyLink {
 }
 
 #[derive(Clone, Copy)]
-struct LinkedStageEvidence<'control> {
+struct LinkedStageEvidence {
     kind: RawObjectKind,
     size_bytes: u64,
     identity: FileIdentity,
-    content_digest: EvidenceDigest,
-    control: &'control dyn ResearchObjectControl,
 }
+
+type RawObjectKind = SealedResearchRawObjectKind;
 
 impl RawObjectKind {
     const fn object_suffix(self) -> &'static str {
@@ -99,14 +106,6 @@ impl RawObjectKind {
             Self::LogicalObject => FORMAT_MAX_BYTES,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RetainedRawObject {
-    kind: RawObjectKind,
-    content_digest: EvidenceDigest,
-    physical_receipt_digest: EvidenceDigest,
-    retained_units: usize,
 }
 
 /// Provider-owned limits for one logical raw object, below immutable format ceilings.
@@ -404,6 +403,8 @@ pub enum SealedResearchRawClaim {
 #[serde(deny_unknown_fields)]
 pub struct ResearchObjectReceipt {
     claim: ResearchObjectClaim,
+    #[serde(skip)]
+    _pin: LiveRawPin,
 }
 
 impl ResearchObjectReceipt {
@@ -485,78 +486,9 @@ pub trait ResearchObjectControl {
     ) -> Result<(), ResearchObjectControlError>;
 }
 
-/// Caller-owned hard bounds for one streaming raw-catalog recovery session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SealedResearchRecoveryAdmission {
-    maximum_claims: usize,
-    maximum_entries: usize,
-}
-
-impl SealedResearchRecoveryAdmission {
-    /// Constructs nonzero claim and filesystem budgets within the fixed recovery ceiling.
-    pub fn try_new(
-        maximum_claims: usize,
-        maximum_entries: usize,
-    ) -> Result<Self, SealedResearchJournalStoreError> {
-        if maximum_claims == 0
-            || maximum_entries == 0
-            || maximum_claims > MAX_RECOVERY_ENTRIES
-            || maximum_entries > MAX_RECOVERY_ENTRIES
-            || maximum_claims
-                .checked_add(maximum_entries)
-                .is_none_or(|total| total > MAX_RECOVERY_ENTRIES)
-        {
-            return Err(SealedResearchJournalStoreError::InvalidRecoveryAdmission);
-        }
-        Ok(Self {
-            maximum_claims,
-            maximum_entries,
-        })
-    }
-
-    /// Returns the complete catalog-claim budget.
-    pub const fn maximum_claims(self) -> usize {
-        self.maximum_claims
-    }
-
-    /// Returns the complete filesystem-entry budget.
-    pub const fn maximum_entries(self) -> usize {
-        self.maximum_entries
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoverySessionState {
-    Observing,
-    Aborted,
-}
-
-/// Noncloneable single-owner recovery authority for one complete catalog scan.
-pub struct SealedResearchRecoverySession<'store, 'control> {
-    store: &'store SealedResearchJournalStore,
-    _operation: MutexGuard<'store, ()>,
-    _recovery: RwLockWriteGuard<'store, ()>,
-    control: &'control dyn ResearchObjectControl,
-    admission: SealedResearchRecoveryAdmission,
-    retained: Vec<RetainedRawObject>,
-    observed_claims: usize,
-    state: RecoverySessionState,
-}
-
-impl fmt::Debug for SealedResearchRecoverySession<'_, '_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SealedResearchRecoverySession")
-            .field("maximum_claims", &self.admission.maximum_claims)
-            .field("maximum_entries", &self.admission.maximum_entries)
-            .field("observed_claims", &self.observed_claims)
-            .field("state", &self.state)
-            .finish()
-    }
-}
-
 /// Noncloneable writable owner of one capability-confined logical-object stage.
 pub struct PendingResearchObject {
+    _pin: LiveRawPin,
     admission: ResearchObjectAdmission,
     staging: Dir,
     stage_name: Box<str>,
@@ -872,6 +804,7 @@ impl SealedResearchJournalStore {
         }
         sync_directory(&self.staging)?;
         Ok(PendingResearchObject {
+            _pin: self.owner.pin(&format!("staging/{}", stage_name))?,
             admission,
             staging: self.staging.try_clone().map_err(|source| {
                 SealedResearchJournalStoreError::io(
@@ -1133,6 +1066,7 @@ impl SealedResearchJournalStore {
             validate_object_claim(&claim)?;
             let receipt = ResearchObjectReceipt {
                 claim: clone_object_claim(&claim)?,
+                _pin: self.owner.pin(claim.relative_reference())?,
             };
 
             pending.validate_identity()?;
@@ -1144,7 +1078,8 @@ impl SealedResearchJournalStore {
             let published_new = match self.staging.hard_link(&*stage_name, &shard, &filename) {
                 Ok(()) => true,
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = open_verified_object_from_shard(&shard, &filename, &claim)?;
+                    let existing =
+                        open_verified_object_from_shard(&shard, &filename, &claim, &self.owner)?;
                     if existing.receipt != receipt {
                         return Err(SealedResearchJournalStoreError::StateConflict);
                     }
@@ -1205,7 +1140,8 @@ impl SealedResearchJournalStore {
                     )
                 })?;
                 sync_directory(&self.staging)?;
-                let verified = open_verified_object_from_shard(&shard, &filename, &claim)?;
+                let verified =
+                    open_verified_object_from_shard(&shard, &filename, &claim, &self.owner)?;
                 if verified.receipt != receipt {
                     return Err(SealedResearchJournalStoreError::StateConflict);
                 }
@@ -1223,7 +1159,7 @@ impl SealedResearchJournalStore {
             )
         })?;
         sync_directory(&self.staging)?;
-        let verified = open_verified_object_from_shard(&shard, &filename, &claim)?;
+        let verified = open_verified_object_from_shard(&shard, &filename, &claim, &self.owner)?;
         if verified.receipt != receipt {
             return Err(SealedResearchJournalStoreError::StateConflict);
         }
@@ -1252,252 +1188,15 @@ impl SealedResearchJournalStore {
         Ok(verified)
     }
 
-    /// Begins one bounded, streaming recovery scan while retaining exclusive store authority.
-    ///
-    /// The caller must observe every authoritative catalog claim and consume [`finish`](
-    /// SealedResearchRecoverySession::finish) to attest that the catalog scan reached its end.
-    /// Dropping the session never starts orphan reconciliation.
-    pub fn begin_recovery<'store, 'control>(
-        &'store self,
-        admission: SealedResearchRecoveryAdmission,
-        control: &'control dyn ResearchObjectControl,
-    ) -> Result<SealedResearchRecoverySession<'store, 'control>, SealedResearchJournalStoreError>
-    {
-        let operation = self
-            .operation
-            .lock()
-            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
-        // Mutations take only operation; immutable verification takes only the shared guard.
-        // Recovery takes both in this order and retains them until reconciliation completes.
-        let recovery = self
-            .recovery_exclusion
-            .write()
-            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
-        self.validate_owner()?;
-        let mut retained = Vec::new();
-        retained
-            .try_reserve_exact(admission.maximum_claims)
-            .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
-        Ok(SealedResearchRecoverySession {
-            store: self,
-            _operation: operation,
-            _recovery: recovery,
-            control,
-            admission,
-            retained,
-            observed_claims: 0,
-            state: RecoverySessionState::Observing,
-        })
-    }
-
-    fn finish_recovery(
-        &self,
-        retained: &[RetainedRawObject],
-        admission: SealedResearchRecoveryAdmission,
-        control: &dyn ResearchObjectControl,
-    ) -> Result<SealedResearchJournalRecoveryReport, SealedResearchJournalStoreError> {
-        self.validate_owner()?;
-        let mut inspected_entries = 0_usize;
-        let staging_entries = bounded_entries(
-            &self.staging,
-            &mut inspected_entries,
-            admission.maximum_entries,
-            control,
-        )?;
-        let mut quarantined_staging = Vec::new();
-        quarantined_staging
-            .try_reserve_exact(staging_entries.len())
-            .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
-        for entry in staging_entries {
-            control.checkpoint(ResearchObjectControlPoint::BeforeRecoveryEntry {
-                inspected_entries,
-            })?;
-            let name = entry.name;
-            let entry = entry.entry;
-            let kind = raw_stage_kind(&name)?;
-            if !entry
-                .file_type()
-                .map_err(|source| {
-                    SealedResearchJournalStoreError::io(
-                        "failed to inspect raw-object staging entry type",
-                        source,
-                    )
-                })?
-                .is_file()
-            {
-                return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-            }
-            let metadata = self.staging.symlink_metadata(&name).map_err(|source| {
-                SealedResearchJournalStoreError::io(
-                    "failed to inspect raw-object staging link state",
-                    source,
-                )
-            })?;
-            match cap_fs_ext::MetadataExt::nlink(&metadata) {
-                1 => {
-                    let quarantine_name = try_string_from_parts(&["staging-", &name])?;
-                    quarantine_stage_no_replace(
-                        &self.staging,
-                        &name,
-                        &self.quarantine,
-                        &quarantine_name,
-                        kind.maximum_bytes(),
-                        1,
-                        Some(RecoveryControl {
-                            control,
-                            inspected_entries,
-                        }),
-                    )?;
-                    quarantined_staging.push(name);
-                }
-                2 => {
-                    if self.reconcile_linked_stage(
-                        kind,
-                        &name,
-                        RecoveryControl {
-                            control,
-                            inspected_entries,
-                        },
-                    )? == LinkedStageDisposition::Quarantined
-                    {
-                        quarantined_staging.push(name);
-                    }
-                }
-                _ => {
-                    return Err(SealedResearchJournalStoreError::RawPublicationIndeterminate);
-                }
-            }
-        }
-
-        let mut quarantined_objects = Vec::new();
-        let shard_entries = bounded_entries(
-            &self.objects,
-            &mut inspected_entries,
-            admission.maximum_entries,
-            control,
-        )?;
-        for shard_entry in shard_entries {
-            control.checkpoint(ResearchObjectControlPoint::BeforeRecoveryEntry {
-                inspected_entries,
-            })?;
-            let shard = shard_entry.name;
-            let shard_entry = shard_entry.entry;
-            if !is_lower_hex(&shard, 2)
-                || !shard_entry
-                    .file_type()
-                    .map_err(|source| {
-                        SealedResearchJournalStoreError::io(
-                            "failed to inspect raw-object shard type",
-                            source,
-                        )
-                    })?
-                    .is_dir()
-            {
-                return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-            }
-            let shard_directory = self.objects.open_dir_nofollow(&shard).map_err(|source| {
-                SealedResearchJournalStoreError::io("failed to open raw-object shard", source)
-            })?;
-            let file_entries = bounded_entries(
-                &shard_directory,
-                &mut inspected_entries,
-                admission.maximum_entries,
-                control,
-            )?;
-            quarantined_objects
-                .try_reserve(file_entries.len())
-                .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
-            for file_entry in file_entries {
-                control.checkpoint(ResearchObjectControlPoint::BeforeRecoveryEntry {
-                    inspected_entries,
-                })?;
-                let filename = file_entry.name;
-                let file_entry = file_entry.entry;
-                let (kind, hex) = raw_object_kind_and_hex(&filename)?;
-                if !is_lower_hex(hex, 64)
-                    || !hex.starts_with(&shard)
-                    || !file_entry
-                        .file_type()
-                        .map_err(|source| {
-                            SealedResearchJournalStoreError::io(
-                                "failed to inspect sealed raw-object type",
-                                source,
-                            )
-                        })?
-                        .is_file()
-                {
-                    return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-                }
-                let digest_bytes = decode_sha256_hex(hex)?;
-                if retained_raw_object_exists(retained, kind, &digest_bytes) {
-                    continue;
-                }
-                let reference =
-                    try_string_from_parts(&["objects/sha256/", &shard, "/", &filename])?;
-                let quarantine_name = try_string_from_parts(&["object-", &filename])?;
-                quarantine_no_replace(
-                    &shard_directory,
-                    &filename,
-                    &self.quarantine,
-                    &quarantine_name,
-                    kind.maximum_bytes(),
-                    Some(RecoveryControl {
-                        control,
-                        inspected_entries,
-                    }),
-                )?;
-                quarantined_objects.push(reference);
-            }
-        }
-        let quarantine_entries = bounded_entries(
-            &self.quarantine,
-            &mut inspected_entries,
-            admission.maximum_entries,
-            control,
-        )?;
-        let mut retained_journal_segments = 0_usize;
-        let mut retained_raw_records = 0_usize;
-        let mut retained_logical_objects = 0_usize;
-        let mut retained_logical_object_chunks = 0_usize;
-        for retained_object in retained {
-            match retained_object.kind {
-                RawObjectKind::JournalSegment => {
-                    retained_journal_segments = retained_journal_segments
-                        .checked_add(1)
-                        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-                    retained_raw_records = retained_raw_records
-                        .checked_add(retained_object.retained_units)
-                        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-                }
-                RawObjectKind::LogicalObject => {
-                    retained_logical_objects = retained_logical_objects
-                        .checked_add(1)
-                        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-                    retained_logical_object_chunks = retained_logical_object_chunks
-                        .checked_add(retained_object.retained_units)
-                        .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-                }
-            }
-        }
-        Ok(SealedResearchJournalRecoveryReport {
-            quarantined_staging,
-            quarantined_objects,
-            retained_quarantine_entries: quarantine_entries.len(),
-            retained_journal_segments,
-            retained_raw_records,
-            retained_logical_objects,
-            retained_logical_object_chunks,
-        })
-    }
-
     fn reconcile_linked_stage(
         &self,
         kind: RawObjectKind,
         stage_name: &str,
+        stage: &File,
+        verified_identity: FileIdentity,
+        verified_digest: EvidenceDigest,
         recovery: RecoveryControl<'_>,
     ) -> Result<LinkedStageDisposition, SealedResearchJournalStoreError> {
-        let mut stage = open_locked_linked_stage(&self.staging, stage_name, kind)
-            .map_err(|_error| SealedResearchJournalStoreError::RawPublicationIndeterminate)?;
         let prepared = (|| {
             let stage_named = self
                 .staging
@@ -1519,21 +1218,14 @@ impl SealedResearchJournalStore {
             if FileIdentity::from_metadata(&stage_named) != identity {
                 return Err(SealedResearchJournalStoreError::StateConflict);
             }
-            let content_digest = hash_file_bounded_with_control(
-                &mut stage,
-                size_bytes,
-                kind.maximum_bytes(),
-                Some(recovery.control),
-            )?;
-            if kind == RawObjectKind::JournalSegment {
-                validate_unclaimed_msj_with_control(&stage, size_bytes, Some(recovery.control))?;
+            if identity != verified_identity {
+                return Err(SealedResearchJournalStoreError::StateConflict);
             }
+            let content_digest = verified_digest;
             let evidence = LinkedStageEvidence {
                 kind,
                 size_bytes,
                 identity,
-                content_digest,
-                control: recovery.control,
             };
             let quarantine_name = try_string_from_parts(&["staging-", stage_name])?;
             let quarantine_matches =
@@ -1611,7 +1303,6 @@ impl SealedResearchJournalStore {
                 transition.complete(shard, filename)?;
                 sync_directory(shard)?;
             }
-            drop(stage);
             self.staging.remove_file(stage_name).map_err(|source| {
                 SealedResearchJournalStoreError::io(
                     "failed to retire reconciled raw-object stage",
@@ -1650,14 +1341,12 @@ impl SealedResearchJournalStore {
         &self,
         directory: &Dir,
         name: &str,
-        evidence: LinkedStageEvidence<'_>,
+        evidence: LinkedStageEvidence,
     ) -> Result<bool, SealedResearchJournalStoreError> {
         let LinkedStageEvidence {
             kind,
             size_bytes,
             identity,
-            content_digest,
-            control,
         } = evidence;
         let named = match directory.symlink_metadata(name) {
             Ok(named) => named,
@@ -1675,7 +1364,7 @@ impl SealedResearchJournalStore {
         validate_linked_file_state(kind, &named, Some(size_bytes))?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
-        let mut file = directory
+        let file = directory
             .open_with(name, &options)
             .map(cap_std::fs::File::into_std)
             .map_err(|source| {
@@ -1686,18 +1375,10 @@ impl SealedResearchJournalStore {
             })?;
         let opened = opened_file_metadata(&file)?;
         validate_linked_file_state(kind, &opened, Some(size_bytes))?;
-        if FileIdentity::from_metadata(&opened) != identity
-            || hash_file_bounded_with_control(
-                &mut file,
-                size_bytes,
-                kind.maximum_bytes(),
-                Some(control),
-            )? != content_digest
-        {
+        // This is the same inode as the fully hashed stage retained by recovery. Reopening
+        // verifies the link identity; hashing a second link would repeat the same bytes.
+        if FileIdentity::from_metadata(&opened) != identity {
             return Err(SealedResearchJournalStoreError::StateConflict);
-        }
-        if kind == RawObjectKind::JournalSegment {
-            validate_unclaimed_msj_with_control(&file, size_bytes, Some(control))?;
         }
         let named_after = directory.symlink_metadata(name).map_err(|source| {
             SealedResearchJournalStoreError::io(
@@ -1733,7 +1414,7 @@ impl SealedResearchJournalStore {
                 )
             })?;
         let filename = format!("{hex}{LOGICAL_OBJECT_SUFFIX}");
-        open_verified_object_from_shard_with_control(&shard, &filename, claim, control)
+        open_verified_object_from_shard_with_control(&shard, &filename, claim, &self.owner, control)
     }
 
     fn validate_pending_owner(
@@ -1821,6 +1502,9 @@ impl SealedResearchJournalStore {
             )
         })?;
         Ok(PendingResearchObject {
+            _pin: self
+                .owner
+                .pin(&format!("staging/{}", claim.staging_reference))?,
             admission,
             staging: self.staging.try_clone().map_err(|source| {
                 SealedResearchJournalStoreError::io(
@@ -1838,91 +1522,6 @@ impl SealedResearchJournalStore {
             partial_hasher: rehashed.partial_hasher,
             partial_chunk_bytes: rehashed.partial_chunk_bytes,
         })
-    }
-}
-
-impl SealedResearchRecoverySession<'_, '_> {
-    /// Verifies one authoritative claim and retains only its fixed-size digest evidence.
-    ///
-    /// A failed claim or control check permanently aborts this session. No staging or object
-    /// namespace is reconciled until [`finish`](Self::finish) consumes the complete scan.
-    pub fn observe_claim(
-        &mut self,
-        claim: &SealedResearchRawClaim,
-    ) -> Result<(), SealedResearchJournalStoreError> {
-        if self.state != RecoverySessionState::Observing {
-            return Err(SealedResearchJournalStoreError::RecoverySessionAborted);
-        }
-        let result = self.observe_claim_inner(claim);
-        if result.is_err() {
-            self.state = RecoverySessionState::Aborted;
-        }
-        result
-    }
-
-    /// Attests end-of-catalog, deduplicates verified evidence, and reconciles orphan state.
-    pub fn finish(
-        mut self,
-    ) -> Result<SealedResearchJournalRecoveryReport, SealedResearchJournalStoreError> {
-        if self.state != RecoverySessionState::Observing {
-            return Err(SealedResearchJournalStoreError::RecoverySessionAborted);
-        }
-        let prepared = (|| {
-            self.control
-                .checkpoint(ResearchObjectControlPoint::BeforeRecoveryFinish {
-                    observed_claims: self.observed_claims,
-                })?;
-            compact_retained_raw_objects(&mut self.retained)
-        })();
-        if let Err(error) = prepared {
-            self.state = RecoverySessionState::Aborted;
-            return Err(error);
-        }
-        self.store
-            .finish_recovery(&self.retained, self.admission, self.control)
-    }
-
-    fn observe_claim_inner(
-        &mut self,
-        claim: &SealedResearchRawClaim,
-    ) -> Result<(), SealedResearchJournalStoreError> {
-        if self.observed_claims >= self.admission.maximum_claims
-            || self.retained.len() >= self.retained.capacity()
-        {
-            return Err(SealedResearchJournalStoreError::RecoveryStateInvalid);
-        }
-        self.control
-            .checkpoint(ResearchObjectControlPoint::BeforeRecoveryClaim {
-                observed_claims: self.observed_claims,
-            })?;
-        let retained_object = match claim {
-            SealedResearchRawClaim::JournalSegment(claim) => {
-                sealed_backup::verify_recovery_journal_claim(self.store, claim, self.control)?;
-                RetainedRawObject {
-                    kind: RawObjectKind::JournalSegment,
-                    content_digest: claim.content_digest(),
-                    physical_receipt_digest: claim.physical_receipt_digest(),
-                    retained_units: claim.frames().len(),
-                }
-            }
-            SealedResearchRawClaim::LogicalObject(claim) => {
-                let verified = self
-                    .store
-                    .open_verified_logical_claim_inner_with_control(claim, Some(self.control))?;
-                RetainedRawObject {
-                    kind: RawObjectKind::LogicalObject,
-                    content_digest: verified.receipt.content_digest(),
-                    physical_receipt_digest: verified.receipt.claim().physical_receipt_digest(),
-                    retained_units: verified.receipt.chunks().len(),
-                }
-            }
-        };
-        self.retained.push(retained_object);
-        self.observed_claims = self
-            .observed_claims
-            .checked_add(1)
-            .ok_or(SealedResearchJournalStoreError::RecoveryStateInvalid)?;
-        Ok(())
     }
 }
 
@@ -2058,54 +1657,6 @@ fn try_digest_hex(digest: EvidenceDigest) -> Result<String, SealedResearchJourna
         encoded.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
     }
     Ok(encoded)
-}
-
-fn compact_retained_raw_objects(
-    retained: &mut Vec<RetainedRawObject>,
-) -> Result<(), SealedResearchJournalStoreError> {
-    retained.sort_unstable_by(|left, right| {
-        left.kind.cmp(&right.kind).then_with(|| {
-            left.content_digest
-                .bytes()
-                .cmp(&right.content_digest.bytes())
-        })
-    });
-    let mut unique = 0_usize;
-    for read in 0..retained.len() {
-        let candidate = retained[read];
-        if unique > 0 {
-            let existing = retained[unique - 1];
-            if existing.kind == candidate.kind
-                && existing.content_digest == candidate.content_digest
-            {
-                if existing.physical_receipt_digest != candidate.physical_receipt_digest
-                    || existing.retained_units != candidate.retained_units
-                {
-                    return Err(SealedResearchJournalStoreError::StateConflict);
-                }
-                continue;
-            }
-        }
-        retained[unique] = candidate;
-        unique += 1;
-    }
-    retained.truncate(unique);
-    Ok(())
-}
-
-fn retained_raw_object_exists(
-    retained: &[RetainedRawObject],
-    kind: RawObjectKind,
-    digest_bytes: &[u8; 32],
-) -> bool {
-    retained
-        .binary_search_by(|candidate| {
-            candidate
-                .kind
-                .cmp(&kind)
-                .then_with(|| candidate.content_digest.bytes().cmp(digest_bytes))
-        })
-        .is_ok()
 }
 
 fn raw_stage_kind(name: &str) -> Result<RawObjectKind, SealedResearchJournalStoreError> {
@@ -2346,14 +1897,16 @@ fn open_verified_object_from_shard(
     shard: &Dir,
     filename: &str,
     claim: &ResearchObjectClaim,
+    owner: &Arc<RawStoreOwner>,
 ) -> Result<VerifiedResearchObject, SealedResearchJournalStoreError> {
-    open_verified_object_from_shard_with_control(shard, filename, claim, None)
+    open_verified_object_from_shard_with_control(shard, filename, claim, owner, None)
 }
 
 fn open_verified_object_from_shard_with_control(
     shard: &Dir,
     filename: &str,
     claim: &ResearchObjectClaim,
+    owner: &Arc<RawStoreOwner>,
     control: Option<&dyn ResearchObjectControl>,
 ) -> Result<VerifiedResearchObject, SealedResearchJournalStoreError> {
     let named = shard.symlink_metadata(filename).map_err(|source| {
@@ -2385,6 +1938,7 @@ fn open_verified_object_from_shard_with_control(
     Ok(VerifiedResearchObject {
         receipt: ResearchObjectReceipt {
             claim: clone_object_claim(claim)?,
+            _pin: owner.pin(claim.relative_reference())?,
         },
         object_directory: shard.try_clone().map_err(|source| {
             SealedResearchJournalStoreError::io(
@@ -3051,8 +2605,12 @@ mod tests {
             std::fs::read_dir(temporary.path().join("research-segments/quarantine"))?.count(),
             0
         );
-        drop(pending);
         drop(store);
+        assert!(matches!(
+            SealedResearchJournalStore::try_from_journal_directory(Arc::clone(&journal)),
+            Err(SealedResearchJournalStoreError::AlreadyOwned)
+        ));
+        drop(pending);
         let checkpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint)?)?;
 
         let store = SealedResearchJournalStore::try_from_journal_directory(Arc::clone(&journal))?;
@@ -3184,38 +2742,64 @@ mod tests {
         )?;
         drop(interrupted);
         drop(quarantined);
+        let generic = SealedResearchRawClaim::LogicalObject(receipt.claim().clone());
+        let content_digest = receipt.content_digest();
+        let receipt_clone = receipt.clone();
         drop(store);
+        drop(receipt);
+        assert!(matches!(
+            SealedResearchJournalStore::try_from_journal_directory(Arc::clone(&journal)),
+            Err(SealedResearchJournalStoreError::AlreadyOwned)
+        ));
+        drop(receipt_clone);
 
         let store = SealedResearchJournalStore::try_from_journal_directory(Arc::clone(&journal))?;
-        let generic = SealedResearchRawClaim::LogicalObject(receipt.claim().clone());
-        let cancel_at_terminal_probe = CancelVerificationAt(receipt.size_bytes());
-        let mut cancelled = store.begin_recovery(
-            SealedResearchRecoveryAdmission::try_new(4, 32)?,
-            &cancel_at_terminal_probe,
-        )?;
+        let mut live = store.begin_logical_object(admission)?;
+        live.write_all(b"live")?;
+        let mut recovery = store.begin_recovery()?;
         assert!(matches!(
-            cancelled.observe_claim(&generic),
+            recovery.advance(
+                &store,
+                SealedResearchRecoveryAdmission::try_new(32, 3)?,
+                &CancelVerificationAt(0),
+                |_, digest| Ok((digest == content_digest).then(|| generic.clone()))
+            ),
             Err(SealedResearchJournalStoreError::ObjectControl(
                 ResearchObjectControlError::Cancelled
             ))
         ));
-        assert!(matches!(
-            cancelled.finish(),
-            Err(SealedResearchJournalStoreError::RecoverySessionAborted)
-        ));
-        let mut recovery =
-            store.begin_recovery(SealedResearchRecoveryAdmission::try_new(4, 32)?, &Allow)?;
-        recovery.observe_claim(&generic)?;
-        let recovery = recovery.finish()?;
-        assert_eq!(recovery.retained_journal_segments(), 0);
-        assert_eq!(recovery.retained_raw_records(), 0);
-        assert_eq!(recovery.retained_logical_objects(), 1);
-        assert_eq!(recovery.retained_logical_object_chunks(), 4);
+        // Cancellation and byte-budget yields retain the cursor and partial hash. The live
+        // writer remains usable while maintenance releases its per-turn store exclusions.
+        let mut logical = 0;
+        let mut chunks = 0;
+        let mut quarantined_stages = Vec::new();
+        let mut quarantined_objects = Vec::new();
+        loop {
+            let turn = recovery.advance(
+                &store,
+                SealedResearchRecoveryAdmission::try_new(2, 3)?,
+                &Allow,
+                |_, digest| Ok((digest == content_digest).then(|| generic.clone())),
+            )?;
+            assert_eq!(turn.report().retained_journal_segments(), 0);
+            assert_eq!(turn.report().retained_raw_records(), 0);
+            logical += turn.report().retained_logical_objects();
+            chunks += turn.report().retained_logical_object_chunks();
+            quarantined_stages.extend_from_slice(turn.report().quarantined_staging());
+            quarantined_objects.extend_from_slice(turn.report().quarantined_objects());
+            if turn.complete() {
+                break;
+            }
+        }
+        live.write_all(b"-still-owned")?;
+        store.abort_logical_object(live)?;
+        assert_eq!(logical, 1);
+        assert_eq!(chunks, 4);
         assert_eq!(
-            recovery.quarantined_staging(),
-            &[String::from(quarantined_checkpoint.staging_reference())]
+            quarantined_stages,
+            vec![quarantined_checkpoint.staging_reference().to_owned()]
         );
-        assert_eq!(recovery.quarantined_objects().len(), 1);
+        assert_eq!(quarantined_objects.len(), 1);
 
         let mut corrupt = store.begin_logical_object(admission)?;
         corrupt.write_all(b"abcdefghijkl")?;

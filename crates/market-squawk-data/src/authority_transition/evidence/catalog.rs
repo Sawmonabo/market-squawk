@@ -1,23 +1,16 @@
 //! Bounded catalog evidence snapshot DTOs and semantic validation.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{CatalogContentEvidenceDigest, EvidenceError, MAX_PARQUET_METADATA_BYTES};
-use crate::manifest::{
-    DatasetBuildSpecDigest, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, compare_manifest_refs,
-};
+use crate::manifest::{DatasetBuildSpecDigest, GenerationParent, GenerationParentRelation};
 use crate::{
     DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry, GenerationKind,
-    ManifestObject, ManifestPlan, Sha256Digest,
+    Sha256Digest,
 };
 
-const MAX_EVIDENCE_ARTIFACTS: usize = 100_000;
-const MAX_EVIDENCE_REFERENCES: usize = 400_000;
 const MAX_EVIDENCE_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_PROVIDER_RELATION_KEY_BYTES: usize = 128;
@@ -57,7 +50,38 @@ pub(crate) enum ProviderCatalogRelation {
 }
 
 impl ProviderCatalogRelation {
-    pub(super) const fn canonical_tag(self) -> u8 {
+    pub(crate) const ALL: [Self; 29] = [
+        Self::SealedRawObject,
+        Self::LogicalPublicationBinding,
+        Self::LogicalPublicationRequiredFamily,
+        Self::LogicalPublicationObject,
+        Self::LogicalPublicationPartition,
+        Self::LogicalPublicationCanonicalExpectation,
+        Self::OptionMarketBinding,
+        Self::OptionMarketNativeLineage,
+        Self::OptionMarketBindingRow,
+        Self::MarketEventSelectionIndex,
+        Self::DirectProviderCaptureBinding,
+        Self::DirectProviderPublicationBinding,
+        Self::LogicalOriginal,
+        Self::LogicalOriginalObject,
+        Self::CaptureOriginal,
+        Self::LogicalPartitionArtifact,
+        Self::MarketEventStorageHead,
+        Self::MarketEventCommit,
+        Self::MarketEventActiveRow,
+        Self::MarketEventArchiveObject,
+        Self::MarketEventArchiveMembership,
+        Self::MarketEventArchiveProgress,
+        Self::NativeReferenceCapture,
+        Self::ForecastInventoryVintage,
+        Self::ForecastInventoryOutcome,
+        Self::ModelInventorySeries,
+        Self::ChartProjectionHeader,
+        Self::ChartProjectionRow,
+        Self::ModelInventoryRecord,
+    ];
+    pub(crate) const fn canonical_tag(self) -> u8 {
         match self {
             Self::SealedRawObject => 1,
             Self::LogicalPublicationBinding => 2,
@@ -129,7 +153,7 @@ impl ProviderCatalogRelation {
         }
     }
 
-    fn from_database_name(value: &str) -> Option<Self> {
+    pub(crate) fn from_database_name(value: &str) -> Option<Self> {
         Some(match value {
             "sealed_raw_objects" => Self::SealedRawObject,
             "provider_logical_publication_bindings" => Self::LogicalPublicationBinding,
@@ -179,7 +203,6 @@ pub(crate) struct ProviderCatalogRelationEvidenceRow {
     relation: ProviderCatalogRelation,
     primary_key: Box<[u8]>,
     row_content_digest: Sha256Digest,
-    accounted_object_bytes: u64,
 }
 
 impl ProviderCatalogRelationEvidenceRow {
@@ -210,28 +233,25 @@ impl ProviderCatalogRelationEvidenceRow {
             relation,
             primary_key,
             row_content_digest,
-            accounted_object_bytes,
         })
     }
 
-    pub(super) const fn relation(&self) -> ProviderCatalogRelation {
+    pub(crate) const fn relation(&self) -> ProviderCatalogRelation {
         self.relation
     }
 
-    pub(super) fn primary_key(&self) -> &[u8] {
+    pub(crate) fn primary_key(&self) -> &[u8] {
         &self.primary_key
     }
 
-    pub(super) const fn row_content_digest(&self) -> Sha256Digest {
+    pub(crate) const fn row_content_digest(&self) -> Sha256Digest {
         self.row_content_digest
     }
 }
 
-/// Caller-selected resource bounds, capped by fixed process ceilings.
+/// Explicit byte and per-object Parquet metadata budgets; row cursors retain one row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EvidenceLimits {
-    max_artifacts: usize,
-    max_references: usize,
     max_total_bytes: u64,
     max_object_bytes: u64,
     max_parquet_metadata_bytes: u64,
@@ -239,18 +259,11 @@ pub(crate) struct EvidenceLimits {
 
 impl EvidenceLimits {
     pub(crate) fn try_new(
-        max_artifacts: usize,
-        max_references: usize,
         max_total_bytes: u64,
         max_object_bytes: u64,
         max_parquet_metadata_bytes: u64,
     ) -> Result<Self, EvidenceError> {
-        if max_artifacts == 0
-            || max_artifacts > MAX_EVIDENCE_ARTIFACTS
-            || max_references == 0
-            || max_references > MAX_EVIDENCE_REFERENCES
-            || max_references < max_artifacts
-            || max_total_bytes == 0
+        if max_total_bytes == 0
             || max_total_bytes > MAX_EVIDENCE_TOTAL_BYTES
             || max_object_bytes == 0
             || max_object_bytes > MAX_EVIDENCE_OBJECT_BYTES
@@ -260,20 +273,18 @@ impl EvidenceLimits {
             return Err(EvidenceError::InvalidLimits);
         }
         Ok(Self {
-            max_artifacts,
-            max_references,
             max_total_bytes,
             max_object_bytes,
             max_parquet_metadata_bytes,
         })
     }
 
-    pub(crate) const fn max_artifacts(self) -> usize {
-        self.max_artifacts
+    pub(crate) const fn max_total_bytes(self) -> u64 {
+        self.max_total_bytes
     }
 
-    pub(crate) const fn max_references(self) -> usize {
-        self.max_references
+    pub(crate) const fn max_object_bytes(self) -> u64 {
+        self.max_object_bytes
     }
 
     pub(crate) const fn max_parquet_metadata_bytes(self) -> u64 {
@@ -346,11 +357,11 @@ impl ArtifactEvidenceRow {
         self.artifact_id
     }
 
-    pub(super) const fn run_id(&self) -> Uuid {
+    pub(crate) const fn run_id(&self) -> Uuid {
         self.run_id
     }
 
-    pub(super) const fn publication_ordinal(&self) -> u16 {
+    pub(crate) const fn publication_ordinal(&self) -> u16 {
         self.publication_ordinal
     }
 
@@ -397,23 +408,23 @@ impl ManifestEvidenceRow {
         })
     }
 
-    pub(super) const fn manifest_id(&self) -> Uuid {
+    pub(crate) const fn manifest_id(&self) -> Uuid {
         self.manifest_id
     }
 
-    pub(super) const fn dataset_id(&self) -> &DatasetId {
+    pub(crate) const fn dataset_id(&self) -> &DatasetId {
         &self.dataset_id
     }
 
-    pub(super) const fn schema_version(&self) -> u32 {
+    pub(crate) const fn schema_version(&self) -> u32 {
         self.schema_version
     }
 
-    pub(super) const fn artifact_id(&self) -> Uuid {
+    pub(crate) const fn artifact_id(&self) -> Uuid {
         self.artifact_id
     }
 
-    pub(super) const fn content_hash(&self) -> Sha256Digest {
+    pub(crate) const fn content_hash(&self) -> Sha256Digest {
         self.content_hash
     }
 }
@@ -452,53 +463,25 @@ impl GenerationObjectEvidenceRow {
         })
     }
 
-    fn manifest_object(&self) -> Result<ManifestObject, EvidenceError> {
-        ManifestObject::try_new(
-            self.content_hash,
-            self.row_count,
-            self.size_bytes,
-            self.lineage_hash,
-        )
-        .map_err(|_| EvidenceError::GenerationSemanticMismatch)
-    }
-
-    pub(super) const fn artifact_id(&self) -> Uuid {
+    pub(crate) const fn artifact_id(&self) -> Uuid {
         self.artifact_id
     }
 
-    pub(super) const fn content_hash(&self) -> Sha256Digest {
+    pub(crate) const fn content_hash(&self) -> Sha256Digest {
         self.content_hash
     }
 
-    pub(super) const fn row_count(&self) -> u64 {
+    pub(crate) const fn row_count(&self) -> u64 {
         self.row_count
     }
 
-    pub(super) const fn size_bytes(&self) -> u64 {
+    pub(crate) const fn size_bytes(&self) -> u64 {
         self.size_bytes
     }
 
-    pub(super) const fn lineage_hash(&self) -> Sha256Digest {
+    pub(crate) const fn lineage_hash(&self) -> Sha256Digest {
         self.lineage_hash
     }
-}
-
-/// Complete immutable historical generation in catalog order.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GenerationEvidenceRow {
-    generation_sequence: u64,
-    dataset_id: DatasetId,
-    manifest_version: u64,
-    content_hash: Sha256Digest,
-    lineage_hash: Sha256Digest,
-    row_count: u64,
-    total_bytes: u64,
-    schema: DatasetSchemaRef,
-    anchor_manifest_id: Uuid,
-    kind: GenerationKind,
-    build_spec_digest: Option<DatasetBuildSpecDigest>,
-    parents: Vec<GenerationParentEvidenceRow>,
-    objects: Vec<GenerationObjectEvidenceRow>,
 }
 
 /// One exact, ordered, relationship-bearing generation parent in backup evidence.
@@ -526,116 +509,12 @@ impl GenerationParentEvidenceRow {
         })
     }
 
-    pub(super) const fn generation_sequence(&self) -> u64 {
+    pub(crate) const fn generation_sequence(&self) -> u64 {
         self.generation_sequence
     }
 
-    pub(super) const fn parent(&self) -> &GenerationParent {
+    pub(crate) const fn parent(&self) -> &GenerationParent {
         &self.parent
-    }
-}
-
-impl GenerationEvidenceRow {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the row mirrors independently durable analytical generation columns"
-    )]
-    pub(crate) fn try_new(
-        generation_sequence: u64,
-        dataset_id: DatasetId,
-        manifest_version: u64,
-        content_hash: Sha256Digest,
-        lineage_hash: Sha256Digest,
-        row_count: u64,
-        total_bytes: u64,
-        schema: DatasetSchemaRef,
-        anchor_manifest_id: Uuid,
-        kind: GenerationKind,
-        build_spec_digest: Option<DatasetBuildSpecDigest>,
-        parents: Vec<GenerationParentEvidenceRow>,
-        objects: Vec<GenerationObjectEvidenceRow>,
-    ) -> Result<Self, EvidenceError> {
-        if generation_sequence == 0
-            || manifest_version == 0
-            || row_count == 0
-            || total_bytes == 0
-            || anchor_manifest_id.is_nil()
-            || objects.is_empty()
-            || parents.len() > MAX_DERIVED_GENERATION_PARENTS
-            || (kind == GenerationKind::Derived) != build_spec_digest.is_some()
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-        DatasetSchemaRegistry::local()
-            .resolve(&schema)
-            .map_err(|_| EvidenceError::InvalidCatalogEvidence)?;
-        Ok(Self {
-            generation_sequence,
-            dataset_id,
-            manifest_version,
-            content_hash,
-            lineage_hash,
-            row_count,
-            total_bytes,
-            schema,
-            anchor_manifest_id,
-            kind,
-            build_spec_digest,
-            parents,
-            objects,
-        })
-    }
-
-    pub(super) const fn generation_sequence(&self) -> u64 {
-        self.generation_sequence
-    }
-
-    pub(super) const fn dataset_id(&self) -> &DatasetId {
-        &self.dataset_id
-    }
-
-    pub(super) const fn manifest_version(&self) -> u64 {
-        self.manifest_version
-    }
-
-    pub(super) const fn content_hash(&self) -> Sha256Digest {
-        self.content_hash
-    }
-
-    pub(super) const fn lineage_hash(&self) -> Sha256Digest {
-        self.lineage_hash
-    }
-
-    pub(super) const fn row_count(&self) -> u64 {
-        self.row_count
-    }
-
-    pub(super) const fn total_bytes(&self) -> u64 {
-        self.total_bytes
-    }
-
-    pub(super) const fn schema(&self) -> &DatasetSchemaRef {
-        &self.schema
-    }
-
-    pub(super) const fn anchor_manifest_id(&self) -> Uuid {
-        self.anchor_manifest_id
-    }
-
-    pub(super) const fn kind(&self) -> GenerationKind {
-        self.kind
-    }
-
-    pub(super) const fn build_spec_digest(&self) -> Option<DatasetBuildSpecDigest> {
-        self.build_spec_digest
-    }
-
-    pub(super) fn parents(&self) -> &[GenerationParentEvidenceRow] {
-        &self.parents
-    }
-
-    pub(super) fn objects(&self) -> &[GenerationObjectEvidenceRow] {
-        &self.objects
     }
 }
 
@@ -688,35 +567,35 @@ impl QueryArtifactEvidenceRow {
         })
     }
 
-    pub(super) const fn reservation_id(&self) -> Uuid {
+    pub(crate) const fn reservation_id(&self) -> Uuid {
         self.reservation_id
     }
 
-    pub(super) const fn owner(&self) -> &SourceIdentifier {
+    pub(crate) const fn owner(&self) -> &SourceIdentifier {
         &self.owner
     }
 
-    pub(super) const fn request_hash(&self) -> Sha256Digest {
+    pub(crate) const fn request_hash(&self) -> Sha256Digest {
         self.request_hash
     }
 
-    pub(super) const fn artifact_id(&self) -> Uuid {
+    pub(crate) const fn artifact_id(&self) -> Uuid {
         self.artifact_id
     }
 
-    pub(super) fn relative_reference(&self) -> &str {
+    pub(crate) fn relative_reference(&self) -> &str {
         &self.relative_reference
     }
 
-    pub(super) const fn content_hash(&self) -> Sha256Digest {
+    pub(crate) const fn content_hash(&self) -> Sha256Digest {
         self.content_hash
     }
 
-    pub(super) const fn size_bytes(&self) -> u64 {
+    pub(crate) const fn size_bytes(&self) -> u64 {
         self.size_bytes
     }
 
-    pub(super) const fn expires_at(&self) -> Timestamp {
+    pub(crate) const fn expires_at(&self) -> Timestamp {
         self.expires_at
     }
 }
@@ -785,174 +664,60 @@ impl MarketEventArchiveEvidenceRow {
     pub(crate) const fn row_count(&self) -> u64 {
         self.row_count
     }
-    pub(super) const fn created_at(&self) -> Timestamp {
+    pub(crate) const fn created_at(&self) -> Timestamp {
         self.created_at
     }
-    pub(super) const fn published_at(&self) -> Timestamp {
+    pub(crate) const fn published_at(&self) -> Timestamp {
         self.published_at
     }
 }
 
-/// Validated, bounded relational evidence captured from one SQLite read snapshot.
-#[derive(Debug)]
+/// Exact compact summary of one fully validated SQLite read transaction.
+#[derive(Clone, Debug)]
 pub(crate) struct CatalogEvidenceSnapshot {
     request: EvidenceSnapshotRequest,
-    artifacts: Vec<ArtifactEvidenceRow>,
-    manifests: Vec<ManifestEvidenceRow>,
-    generations: Vec<GenerationEvidenceRow>,
-    query_artifacts: Vec<QueryArtifactEvidenceRow>,
-    market_event_archives: Vec<MarketEventArchiveEvidenceRow>,
-    provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
+    physical_artifact_count: u64,
+    physical_artifact_bytes: u64,
+    reference_count: u64,
+    total_bytes: u64,
+    digest: CatalogContentEvidenceDigest,
 }
-
 impl CatalogEvidenceSnapshot {
-    #[cfg(test)]
-    pub(crate) fn try_new(
+    pub(crate) fn new(
         request: EvidenceSnapshotRequest,
-        artifacts: Vec<ArtifactEvidenceRow>,
-        manifests: Vec<ManifestEvidenceRow>,
-        generations: Vec<GenerationEvidenceRow>,
-        query_artifacts: Vec<QueryArtifactEvidenceRow>,
-    ) -> Result<Self, EvidenceError> {
-        Self::try_new_with_provider_relations(
+        physical_artifact_count: u64,
+        physical_artifact_bytes: u64,
+        reference_count: u64,
+        total_bytes: u64,
+        digest: CatalogContentEvidenceDigest,
+    ) -> Self {
+        Self {
             request,
-            artifacts,
-            manifests,
-            generations,
-            query_artifacts,
-            Vec::new(),
-            Vec::new(),
-        )
-    }
-
-    pub(crate) fn try_new_with_provider_relation_rows(
-        request: EvidenceSnapshotRequest,
-        artifacts: Vec<ArtifactEvidenceRow>,
-        manifests: Vec<ManifestEvidenceRow>,
-        generations: Vec<GenerationEvidenceRow>,
-        query_artifacts: Vec<QueryArtifactEvidenceRow>,
-        market_event_archives: Vec<MarketEventArchiveEvidenceRow>,
-        provider_relation_rows: Vec<(Box<str>, Box<[u8]>, Sha256Digest, u64)>,
-    ) -> Result<Self, EvidenceError> {
-        let provider_relations = provider_relation_rows
-            .into_iter()
-            .map(
-                |(relation, primary_key, row_content_digest, accounted_object_bytes)| {
-                    ProviderCatalogRelationEvidenceRow::try_new(
-                        ProviderCatalogRelation::from_database_name(&relation)
-                            .ok_or(EvidenceError::InvalidCatalogEvidence)?,
-                        primary_key,
-                        row_content_digest,
-                        accounted_object_bytes,
-                    )
-                },
-            )
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::try_new_with_provider_relations(
-            request,
-            artifacts,
-            manifests,
-            generations,
-            query_artifacts,
-            market_event_archives,
-            provider_relations,
-        )
-    }
-
-    fn try_new_with_provider_relations(
-        request: EvidenceSnapshotRequest,
-        artifacts: Vec<ArtifactEvidenceRow>,
-        manifests: Vec<ManifestEvidenceRow>,
-        generations: Vec<GenerationEvidenceRow>,
-        query_artifacts: Vec<QueryArtifactEvidenceRow>,
-        market_event_archives: Vec<MarketEventArchiveEvidenceRow>,
-        provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
-    ) -> Result<Self, EvidenceError> {
-        let limits = request.limits;
-        let generation_objects = generations.iter().try_fold(0_usize, |count, generation| {
-            count
-                .checked_add(generation.objects.len())
-                .ok_or(EvidenceError::ResourceLimitExceeded)
-        })?;
-        let generation_parents = generations.iter().try_fold(0_usize, |count, generation| {
-            count
-                .checked_add(generation.parents.len())
-                .ok_or(EvidenceError::ResourceLimitExceeded)
-        })?;
-        let references = artifacts
-            .len()
-            .checked_add(manifests.len())
-            .and_then(|count| count.checked_add(generation_objects))
-            .and_then(|count| count.checked_add(generation_parents))
-            .and_then(|count| count.checked_add(query_artifacts.len()))
-            .and_then(|count| count.checked_add(market_event_archives.len()))
-            .and_then(|count| count.checked_add(provider_relations.len()))
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-        let sealed_raw_objects = provider_relations
-            .iter()
-            .filter(|row| row.relation == ProviderCatalogRelation::SealedRawObject)
-            .count();
-        let physical_artifacts = artifacts
-            .len()
-            .checked_add(query_artifacts.len())
-            .and_then(|count| count.checked_add(market_event_archives.len()))
-            .and_then(|count| count.checked_add(sealed_raw_objects))
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-        if physical_artifacts > limits.max_artifacts || references > limits.max_references {
-            return Err(EvidenceError::ResourceLimitExceeded);
+            physical_artifact_count,
+            physical_artifact_bytes,
+            reference_count,
+            total_bytes,
+            digest,
         }
-        validate_relational_evidence(
-            request,
-            &artifacts,
-            &manifests,
-            &generations,
-            &query_artifacts,
-            &market_event_archives,
-            &provider_relations,
-        )?;
-        Ok(Self {
-            request,
-            artifacts,
-            manifests,
-            generations,
-            query_artifacts,
-            market_event_archives,
-            provider_relations,
-        })
     }
-
     pub(crate) const fn request(&self) -> EvidenceSnapshotRequest {
         self.request
     }
-
-    pub(crate) fn artifacts(&self) -> &[ArtifactEvidenceRow] {
-        &self.artifacts
+    pub(crate) const fn physical_artifact_count(&self) -> u64 {
+        self.physical_artifact_count
     }
-
-    pub(crate) fn manifests(&self) -> &[ManifestEvidenceRow] {
-        &self.manifests
+    pub(crate) const fn physical_artifact_bytes(&self) -> u64 {
+        self.physical_artifact_bytes
     }
-
-    pub(crate) fn generations(&self) -> &[GenerationEvidenceRow] {
-        &self.generations
+    pub(crate) const fn reference_count(&self) -> u64 {
+        self.reference_count
     }
-
-    pub(crate) fn query_artifacts(&self) -> &[QueryArtifactEvidenceRow] {
-        &self.query_artifacts
+    pub(crate) const fn total_bytes(&self) -> u64 {
+        self.total_bytes
     }
-
-    pub(crate) fn market_event_archives(&self) -> &[MarketEventArchiveEvidenceRow] {
-        &self.market_event_archives
+    pub(crate) fn evidence_digest(&self) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
+        Ok(self.digest)
     }
-
-    pub(crate) fn provider_relations(&self) -> &[ProviderCatalogRelationEvidenceRow] {
-        &self.provider_relations
-    }
-
-    pub(crate) fn physical_artifact_count(&self) -> usize {
-        self.artifacts.len() + self.query_artifacts.len() + self.market_event_archives.len()
-    }
-
     pub(crate) fn check_cancellation(
         &self,
         cancellation: &CancellationToken,
@@ -963,324 +728,6 @@ impl CatalogEvidenceSnapshot {
             Ok(())
         }
     }
-
-    pub(crate) fn evidence_digest(&self) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
-        super::canonical::evidence_digest(self)
-    }
-}
-
-fn validate_relational_evidence(
-    request: EvidenceSnapshotRequest,
-    artifacts: &[ArtifactEvidenceRow],
-    manifests: &[ManifestEvidenceRow],
-    generations: &[GenerationEvidenceRow],
-    query_artifacts: &[QueryArtifactEvidenceRow],
-    market_event_archives: &[MarketEventArchiveEvidenceRow],
-    provider_relations: &[ProviderCatalogRelationEvidenceRow],
-) -> Result<(), EvidenceError> {
-    let limits = request.limits;
-    let mut artifacts_by_id = BTreeMap::new();
-    let mut artifacts_by_run: BTreeMap<Uuid, BTreeMap<u16, &ArtifactEvidenceRow>> = BTreeMap::new();
-    let mut physical_artifact_ids = BTreeSet::new();
-    let mut references = BTreeSet::new();
-    let mut total_bytes = 0_u64;
-    for artifact in artifacts {
-        if artifact.size_bytes > limits.max_object_bytes
-            || artifacts_by_id
-                .insert(artifact.artifact_id, artifact)
-                .is_some()
-            || !physical_artifact_ids.insert(artifact.artifact_id)
-            || artifacts_by_run
-                .entry(artifact.run_id)
-                .or_default()
-                .insert(artifact.publication_ordinal, artifact)
-                .is_some()
-            || !references.insert(artifact.relative_reference.as_ref())
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-        total_bytes = total_bytes
-            .checked_add(artifact.size_bytes)
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-        if total_bytes > limits.max_total_bytes {
-            return Err(EvidenceError::ResourceLimitExceeded);
-        }
-    }
-    if artifacts_by_run.values().any(|group| {
-        group.is_empty()
-            || group.len() > 1024
-            || group
-                .keys()
-                .copied()
-                .enumerate()
-                .any(|(expected, retained)| usize::from(retained) != expected)
-    }) {
-        return Err(EvidenceError::InvalidCatalogEvidence);
-    }
-
-    let mut manifests_by_id = BTreeMap::new();
-    let mut manifest_runs = BTreeSet::new();
-    for manifest in manifests {
-        let Some(anchor) = artifacts_by_id.get(&manifest.artifact_id) else {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        };
-        let group = artifacts_by_run
-            .get(&anchor.run_id)
-            .ok_or(EvidenceError::InvalidCatalogEvidence)?;
-        if usize::from(anchor.publication_ordinal) != group.len() - 1
-            || !manifest_runs.insert(anchor.run_id)
-            || manifests_by_id
-                .insert(manifest.manifest_id, manifest)
-                .is_some()
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-    }
-
-    let mut generations_by_dataset: BTreeMap<&str, BTreeMap<u64, &GenerationEvidenceRow>> =
-        BTreeMap::new();
-    let mut generation_sequences = BTreeSet::new();
-    for generation in generations {
-        let anchor = manifests_by_id
-            .get(&generation.anchor_manifest_id)
-            .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-        if anchor.dataset_id != generation.dataset_id
-            || anchor.schema_version != u32::from(generation.schema.version().get())
-            || anchor.content_hash != generation.content_hash
-        {
-            return Err(EvidenceError::GenerationSemanticMismatch);
-        }
-        for object in &generation.objects {
-            let artifact = artifacts_by_id
-                .get(&object.artifact_id)
-                .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-            if artifact.content_hash != object.content_hash
-                || artifact.size_bytes != object.size_bytes
-            {
-                return Err(EvidenceError::GenerationSemanticMismatch);
-            }
-        }
-        if !generation_sequences.insert(generation.generation_sequence)
-            || generations_by_dataset
-                .entry(generation.dataset_id.as_str())
-                .or_default()
-                .insert(generation.manifest_version, generation)
-                .is_some()
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-    }
-    for generation in generations {
-        validate_generation_parents(generation, &generations_by_dataset)?;
-    }
-    for versions in generations_by_dataset.values() {
-        validate_dataset_history(
-            versions,
-            &manifests_by_id,
-            &artifacts_by_id,
-            &artifacts_by_run,
-        )?;
-    }
-
-    let mut query_reservations = BTreeSet::new();
-    for query in query_artifacts {
-        if query.size_bytes > limits.max_object_bytes
-            || !query_reservations.insert(query.reservation_id)
-            || !physical_artifact_ids.insert(query.artifact_id)
-            || !references.insert(query.relative_reference.as_ref())
-            || query.expires_at <= request.cutoff
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-        total_bytes = total_bytes
-            .checked_add(query.size_bytes)
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-        if total_bytes > limits.max_total_bytes {
-            return Err(EvidenceError::ResourceLimitExceeded);
-        }
-    }
-    let mut archive_digests = BTreeSet::new();
-    for archive in market_event_archives {
-        if archive.size_bytes > limits.max_object_bytes
-            || !archive_digests.insert(archive.content_hash)
-            || !references.insert(archive.relative_reference.as_ref())
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-        total_bytes = total_bytes
-            .checked_add(archive.size_bytes)
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-        if total_bytes > limits.max_total_bytes {
-            return Err(EvidenceError::ResourceLimitExceeded);
-        }
-    }
-    let mut provider_keys = BTreeSet::new();
-    for row in provider_relations {
-        if !provider_keys.insert((row.relation, row.primary_key.as_ref()))
-            || row.accounted_object_bytes > limits.max_object_bytes
-        {
-            return Err(EvidenceError::InvalidCatalogEvidence);
-        }
-        total_bytes = total_bytes
-            .checked_add(row.accounted_object_bytes)
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-        if total_bytes > limits.max_total_bytes {
-            return Err(EvidenceError::ResourceLimitExceeded);
-        }
-    }
-    Ok(())
-}
-
-fn validate_generation_parents(
-    child: &GenerationEvidenceRow,
-    generations: &BTreeMap<&str, BTreeMap<u64, &GenerationEvidenceRow>>,
-) -> Result<(), EvidenceError> {
-    for (ordinal, edge) in child.parents.iter().enumerate() {
-        let retained = generations
-            .get(edge.parent.manifest().dataset_id().as_str())
-            .and_then(|versions| versions.get(&edge.parent.manifest().manifest_version()))
-            .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-        if retained.generation_sequence != edge.generation_sequence
-            || retained.generation_sequence >= child.generation_sequence
-            || retained.schema != *edge.parent.manifest().schema()
-            || retained.content_hash != edge.parent.manifest().content_hash()
-            || (ordinal > 0
-                && compare_manifest_refs(
-                    child.parents[ordinal - 1].parent.manifest(),
-                    edge.parent.manifest(),
-                )
-                .is_ge())
-        {
-            return Err(EvidenceError::GenerationSemanticMismatch);
-        }
-    }
-    let predecessor = |relation| match child.parents.as_slice() {
-        [edge] => {
-            edge.parent.relation() == relation
-                && edge.parent.manifest().dataset_id() == &child.dataset_id
-                && edge.parent.manifest().manifest_version().checked_add(1)
-                    == Some(child.manifest_version)
-                && edge.parent.manifest().schema() == &child.schema
-        }
-        _ => false,
-    };
-    let valid = match child.kind {
-        GenerationKind::Ingest if child.manifest_version == 1 => child.parents.is_empty(),
-        GenerationKind::Ingest => predecessor(GenerationParentRelation::AppendPredecessor),
-        GenerationKind::Compaction => predecessor(GenerationParentRelation::CompactionPredecessor),
-        GenerationKind::Derived => {
-            !child.parents.is_empty()
-                && child
-                    .parents
-                    .iter()
-                    .all(|edge| edge.parent.relation() == GenerationParentRelation::DerivedInput)
-        }
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(EvidenceError::GenerationSemanticMismatch)
-    }
-}
-
-fn validate_dataset_history(
-    versions: &BTreeMap<u64, &GenerationEvidenceRow>,
-    manifests: &BTreeMap<Uuid, &ManifestEvidenceRow>,
-    artifacts: &BTreeMap<Uuid, &ArtifactEvidenceRow>,
-    artifacts_by_run: &BTreeMap<Uuid, BTreeMap<u16, &ArtifactEvidenceRow>>,
-) -> Result<(), EvidenceError> {
-    let mut previous_plan: Option<ManifestPlan> = None;
-    let mut retained_schema: Option<&DatasetSchemaRef> = None;
-    let mut expected_version = 1_u64;
-    for generation in versions.values() {
-        if generation.manifest_version != expected_version
-            || retained_schema.is_some_and(|schema| schema != &generation.schema)
-        {
-            return Err(EvidenceError::GenerationSemanticMismatch);
-        }
-        let plan = match generation.kind {
-            GenerationKind::Ingest => {
-                let anchor = manifests
-                    .get(&generation.anchor_manifest_id)
-                    .and_then(|manifest| artifacts.get(&manifest.artifact_id))
-                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-                let group = artifacts_by_run
-                    .get(&anchor.run_id)
-                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-                let suffix = generation
-                    .objects
-                    .get(
-                        generation
-                            .objects
-                            .len()
-                            .checked_sub(group.len())
-                            .ok_or(EvidenceError::GenerationSemanticMismatch)?..,
-                    )
-                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-                if suffix
-                    .iter()
-                    .zip(group.values())
-                    .any(|(object, artifact)| object.artifact_id != artifact.artifact_id)
-                {
-                    return Err(EvidenceError::GenerationSemanticMismatch);
-                }
-                ManifestPlan::append(
-                    generation.dataset_id.clone(),
-                    previous_plan.as_ref(),
-                    suffix
-                        .iter()
-                        .map(GenerationObjectEvidenceRow::manifest_object)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    generation.objects.len(),
-                )
-                .map_err(|_| EvidenceError::GenerationSemanticMismatch)?
-            }
-            GenerationKind::Compaction => {
-                let previous = previous_plan
-                    .as_ref()
-                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
-                if generation.objects.len() != 1 {
-                    return Err(EvidenceError::GenerationSemanticMismatch);
-                }
-                ManifestPlan::compact(previous, generation.objects[0].manifest_object()?)
-                    .map_err(|_| EvidenceError::GenerationSemanticMismatch)?
-            }
-            GenerationKind::Derived => ManifestPlan::derive(
-                generation.dataset_id.clone(),
-                generation
-                    .objects
-                    .iter()
-                    .map(GenerationObjectEvidenceRow::manifest_object)
-                    .collect::<Result<Vec<_>, _>>()?,
-                generation.objects.len(),
-            )
-            .map_err(|_| EvidenceError::GenerationSemanticMismatch)?,
-        };
-        if plan.objects().len() != generation.objects.len()
-            || plan.content_hash() != generation.content_hash
-            || plan.lineage_digest() != generation.lineage_hash
-            || plan.row_count() != generation.row_count
-            || plan.total_bytes() != generation.total_bytes
-            || plan
-                .objects()
-                .iter()
-                .zip(&generation.objects)
-                .any(|(planned, stored)| {
-                    planned.content_hash() != stored.content_hash
-                        || planned.row_count() != stored.row_count
-                        || planned.size_bytes() != stored.size_bytes
-                        || planned.lineage_digest() != stored.lineage_hash
-                })
-        {
-            return Err(EvidenceError::GenerationSemanticMismatch);
-        }
-        previous_plan = Some(plan);
-        retained_schema = Some(&generation.schema);
-        expected_version = expected_version
-            .checked_add(1)
-            .ok_or(EvidenceError::ResourceLimitExceeded)?;
-    }
-    Ok(())
 }
 
 fn canonical_object_reference(reference: &str, digest: Sha256Digest) -> bool {
@@ -1325,3 +772,63 @@ const fn hex_digit(nibble: u8) -> u8 {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Debug)]
+pub(crate) struct GenerationEvidenceHeader {
+    pub(crate) generation_sequence: u64,
+    pub(crate) dataset_id: DatasetId,
+    pub(crate) manifest_version: u64,
+    pub(crate) content_hash: Sha256Digest,
+    pub(crate) lineage_hash: Sha256Digest,
+    pub(crate) row_count: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) schema: DatasetSchemaRef,
+    pub(crate) anchor_manifest_id: Uuid,
+    pub(crate) kind: GenerationKind,
+    pub(crate) build_spec_digest: Option<DatasetBuildSpecDigest>,
+}
+impl GenerationEvidenceHeader {
+    pub(crate) const fn generation_sequence(&self) -> u64 {
+        self.generation_sequence
+    }
+
+    pub(crate) const fn dataset_id(&self) -> &DatasetId {
+        &self.dataset_id
+    }
+
+    pub(crate) const fn manifest_version(&self) -> u64 {
+        self.manifest_version
+    }
+
+    pub(crate) const fn content_hash(&self) -> Sha256Digest {
+        self.content_hash
+    }
+
+    pub(crate) const fn lineage_hash(&self) -> Sha256Digest {
+        self.lineage_hash
+    }
+
+    pub(crate) const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    pub(crate) const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub(crate) const fn schema(&self) -> &DatasetSchemaRef {
+        &self.schema
+    }
+
+    pub(crate) const fn anchor_manifest_id(&self) -> Uuid {
+        self.anchor_manifest_id
+    }
+
+    pub(crate) const fn kind(&self) -> GenerationKind {
+        self.kind
+    }
+
+    pub(crate) const fn build_spec_digest(&self) -> Option<DatasetBuildSpecDigest> {
+        self.build_spec_digest
+    }
+}

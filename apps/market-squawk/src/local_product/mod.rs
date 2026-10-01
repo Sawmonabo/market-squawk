@@ -631,33 +631,9 @@ impl LocalProduct {
         let (research, onboarding_catalog, feature_dataset_production_publisher) =
             open_research(&paths)?;
         let research = Arc::new(research);
-        // No provider reopening or retained valuation source read precedes raw-capture recovery.
-        let provider_capture_report = {
-            let capture_context =
-                ArtifactReadContext::new(cancellation.clone(), recovery_deadline()?);
-            capture_context.ensure_live()?;
-            let recovery = research.recover_provider_capture_store(&cancellation);
-            tokio::pin!(recovery);
-            let report =
-                match tokio::time::timeout_at(capture_context.deadline().into(), &mut recovery)
-                    .await
-                {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        cancellation.cancel();
-                        let _reaped = recovery.await;
-                        return Err(LocalProductError::Artifact(ArtifactError::DeadlineExceeded));
-                    }
-                };
-            capture_context.ensure_live()?;
-            report
-        };
-        tracing::info!(
-            quarantined_staging = provider_capture_report.quarantined_staging().len(),
-            quarantined_objects = provider_capture_report.quarantined_objects().len(),
-            retained_quarantine_entries = provider_capture_report.retained_quarantine_entries(),
-            "verified retained provider captures before provider runtime restoration"
-        );
+        // Recovery owns a bounded cursor; selected reads still verify their exact objects.
+        // Historical storage size must not hold ordinary application startup behind a full scan.
+        let provider_capture_recovery = research.create_provider_capture_recovery()?;
         let feature_dataset_production_publisher = Arc::new(feature_dataset_production_publisher);
         let company_security_resolution = Arc::new(CompanySecurityResolutionAuthority::new(
             research.company_identities(),
@@ -1347,6 +1323,11 @@ impl LocalProduct {
             research.analytical_service(),
             startup_cancellation.child_token(),
         )) as startup::StartupFuture);
+        let provider_capture_recovery = Some(Box::pin(startup::run_provider_capture_recovery(
+            research.analytical_service(),
+            provider_capture_recovery,
+            startup_cancellation.child_token(),
+        )) as startup::StartupFuture);
         let startup_tasks = startup::ProductStartupTasks::start(
             Arc::clone(&research_domains),
             startup_cancellation,
@@ -1356,6 +1337,7 @@ impl LocalProduct {
                 daily_startup,
                 display_history_startup,
                 market_event_archive,
+                provider_capture_recovery,
             ],
         );
         source_lifecycle.bind_public_startup_tasks(Arc::downgrade(&startup_tasks))?;

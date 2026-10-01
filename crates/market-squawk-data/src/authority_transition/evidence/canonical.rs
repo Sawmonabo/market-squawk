@@ -1,172 +1,167 @@
-//! Canonical relationship-bearing catalog evidence identity.
-
-use sha2::{Digest as _, Sha256};
-
-use super::{CatalogContentEvidenceDigest, CatalogEvidenceSnapshot, EvidenceError};
+//! Streaming encoder of the unchanged relationship-bearing domain-v4 catalog identity.
+use super::catalog::*;
+use super::{CatalogContentEvidenceDigest, EvidenceError};
 use crate::GenerationKind;
 use crate::manifest::GenerationParentRelation;
+use market_squawk_domain::Timestamp;
+use sha2::{Digest as _, Sha256};
 
-pub(super) fn evidence_digest(
-    snapshot: &CatalogEvidenceSnapshot,
-) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
-    let mut digest = Sha256::new();
-    digest.update(b"market-squawk/analytical-catalog-evidence/v4");
-    digest.update(snapshot.request().cutoff().unix_nanos().to_be_bytes());
-
-    let mut artifacts: Vec<_> = snapshot.artifacts().iter().collect();
-    artifacts.sort_unstable_by_key(|artifact| artifact.artifact_id());
-    section_count(&mut digest, b"artifacts", artifacts.len())?;
-    for artifact in artifacts {
-        digest.update(artifact.artifact_id().as_bytes());
-        digest.update(artifact.run_id().as_bytes());
-        digest.update(artifact.publication_ordinal().to_be_bytes());
-        text(&mut digest, artifact.relative_reference())?;
-        digest.update(artifact.content_hash().bytes());
-        digest.update(artifact.size_bytes().to_be_bytes());
+pub(crate) struct EvidenceDigest {
+    digest: Sha256,
+}
+impl EvidenceDigest {
+    pub(crate) fn new(cutoff: Timestamp) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/analytical-catalog-evidence/v4");
+        digest.update(cutoff.unix_nanos().to_be_bytes());
+        Self { digest }
+    }
+    pub(crate) fn section(&mut self, domain: &str, count: u64) -> Result<(), EvidenceError> {
+        text(&mut self.digest, domain)?;
+        self.digest.update(count.to_be_bytes());
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
+        CatalogContentEvidenceDigest::try_new(self.digest.finalize().into())
+            .ok_or(EvidenceError::InvalidCatalogEvidence)
+    }
+    pub(crate) fn artifact(&mut self, artifact: &ArtifactEvidenceRow) -> Result<(), EvidenceError> {
+        self.digest.update(artifact.artifact_id().as_bytes());
+        self.digest.update(artifact.run_id().as_bytes());
+        self.digest
+            .update(artifact.publication_ordinal().to_be_bytes());
+        text(&mut self.digest, artifact.relative_reference())?;
+        self.digest.update(artifact.content_hash().bytes());
+        self.digest.update(artifact.size_bytes().to_be_bytes());
+        Ok(())
     }
 
-    let mut manifests: Vec<_> = snapshot.manifests().iter().collect();
-    manifests.sort_unstable_by_key(|manifest| manifest.manifest_id());
-    section_count(&mut digest, b"manifests", manifests.len())?;
-    for manifest in manifests {
-        digest.update(manifest.manifest_id().as_bytes());
-        text(&mut digest, manifest.dataset_id().as_str())?;
-        digest.update(manifest.schema_version().to_be_bytes());
-        digest.update(manifest.artifact_id().as_bytes());
-        digest.update(manifest.content_hash().bytes());
+    pub(crate) fn manifest(&mut self, manifest: &ManifestEvidenceRow) -> Result<(), EvidenceError> {
+        self.digest.update(manifest.manifest_id().as_bytes());
+        text(&mut self.digest, manifest.dataset_id().as_str())?;
+        self.digest.update(manifest.schema_version().to_be_bytes());
+        self.digest.update(manifest.artifact_id().as_bytes());
+        self.digest.update(manifest.content_hash().bytes());
+        Ok(())
     }
 
-    let mut generations: Vec<_> = snapshot.generations().iter().collect();
-    generations.sort_unstable_by(|left, right| {
-        left.dataset_id()
-            .as_str()
-            .cmp(right.dataset_id().as_str())
-            .then_with(|| left.manifest_version().cmp(&right.manifest_version()))
-    });
-    section_count(&mut digest, b"generations", generations.len())?;
-    for generation in generations {
-        digest.update(generation.generation_sequence().to_be_bytes());
-        text(&mut digest, generation.dataset_id().as_str())?;
-        digest.update(generation.manifest_version().to_be_bytes());
-        digest.update(generation.content_hash().bytes());
-        digest.update(generation.lineage_hash().bytes());
-        digest.update(generation.row_count().to_be_bytes());
-        digest.update(generation.total_bytes().to_be_bytes());
-        text(&mut digest, generation.schema().name())?;
-        digest.update(generation.schema().version().get().to_be_bytes());
-        digest.update(generation.schema().fingerprint());
-        digest.update(generation.anchor_manifest_id().as_bytes());
+    pub(crate) fn query_artifact(
+        &mut self,
+        query: &QueryArtifactEvidenceRow,
+    ) -> Result<(), EvidenceError> {
+        self.digest.update(query.reservation_id().as_bytes());
+        text(&mut self.digest, query.owner().as_str())?;
+        self.digest.update(query.request_hash().bytes());
+        self.digest.update(query.artifact_id().as_bytes());
+        text(&mut self.digest, query.relative_reference())?;
+        self.digest.update(query.content_hash().bytes());
+        self.digest.update(query.size_bytes().to_be_bytes());
+        self.digest
+            .update(query.expires_at().unix_nanos().to_be_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn archive(
+        &mut self,
+        archive: &MarketEventArchiveEvidenceRow,
+    ) -> Result<(), EvidenceError> {
+        self.digest.update(archive.content_hash().bytes());
+        text(&mut self.digest, archive.relative_reference())?;
+        text(&mut self.digest, archive.schema().name())?;
+        self.digest
+            .update(archive.schema().version().get().to_be_bytes());
+        self.digest.update(archive.schema().fingerprint());
+        self.digest.update(archive.size_bytes().to_be_bytes());
+        self.digest.update(archive.row_count().to_be_bytes());
+        self.digest
+            .update(archive.created_at().unix_nanos().to_be_bytes());
+        self.digest
+            .update(archive.published_at().unix_nanos().to_be_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn provider_relation(
+        &mut self,
+        row: &ProviderCatalogRelationEvidenceRow,
+    ) -> Result<(), EvidenceError> {
+        self.digest.update([row.relation().canonical_tag()]);
+        text(&mut self.digest, row.relation().database_name())?;
+        bytes(&mut self.digest, row.primary_key())?;
+        self.digest.update(row.row_content_digest().bytes());
+        Ok(())
+    }
+
+    pub(crate) fn generation_header(
+        &mut self,
+        generation: &GenerationEvidenceHeader,
+    ) -> Result<(), EvidenceError> {
+        self.digest
+            .update(generation.generation_sequence().to_be_bytes());
+        text(&mut self.digest, generation.dataset_id().as_str())?;
+        self.digest
+            .update(generation.manifest_version().to_be_bytes());
+        self.digest.update(generation.content_hash().bytes());
+        self.digest.update(generation.lineage_hash().bytes());
+        self.digest.update(generation.row_count().to_be_bytes());
+        self.digest.update(generation.total_bytes().to_be_bytes());
+        text(&mut self.digest, generation.schema().name())?;
+        self.digest
+            .update(generation.schema().version().get().to_be_bytes());
+        self.digest.update(generation.schema().fingerprint());
+        self.digest
+            .update(generation.anchor_manifest_id().as_bytes());
         match generation.build_spec_digest() {
             Some(build_spec) => {
-                digest.update([1]);
-                digest.update(build_spec.digest().bytes());
+                self.digest.update([1]);
+                self.digest.update(build_spec.digest().bytes());
             }
-            None => digest.update([0]),
+            None => self.digest.update([0]),
         }
-        digest.update([match generation.kind() {
+        self.digest.update([match generation.kind() {
             GenerationKind::Ingest => 1,
             GenerationKind::Compaction => 2,
             GenerationKind::Derived => 3,
         }]);
-        section_count(&mut digest, b"parents", generation.parents().len())?;
-        for (ordinal, edge) in generation.parents().iter().enumerate() {
-            digest.update(
-                u64::try_from(ordinal)
-                    .map_err(|_| EvidenceError::ResourceLimitExceeded)?
-                    .to_be_bytes(),
-            );
-            digest.update(edge.generation_sequence().to_be_bytes());
-            digest.update([match edge.parent().relation() {
-                GenerationParentRelation::AppendPredecessor => 1,
-                GenerationParentRelation::CompactionPredecessor => 2,
-                GenerationParentRelation::DerivedInput => 3,
-            }]);
-            let parent = edge.parent().manifest();
-            text(&mut digest, parent.dataset_id().as_str())?;
-            digest.update(parent.manifest_version().to_be_bytes());
-            text(&mut digest, parent.schema().name())?;
-            digest.update(parent.schema().version().get().to_be_bytes());
-            digest.update(parent.schema().fingerprint());
-            digest.update(parent.content_hash().bytes());
-        }
-        section_count(&mut digest, b"objects", generation.objects().len())?;
-        for (ordinal, object) in generation.objects().iter().enumerate() {
-            digest.update(
-                u64::try_from(ordinal)
-                    .map_err(|_| EvidenceError::ResourceLimitExceeded)?
-                    .to_be_bytes(),
-            );
-            digest.update(object.artifact_id().as_bytes());
-            digest.update(object.content_hash().bytes());
-            digest.update(object.row_count().to_be_bytes());
-            digest.update(object.size_bytes().to_be_bytes());
-            digest.update(object.lineage_hash().bytes());
-        }
+        Ok(())
     }
 
-    let mut query_artifacts: Vec<_> = snapshot.query_artifacts().iter().collect();
-    query_artifacts.sort_unstable_by_key(|query| query.reservation_id());
-    section_count(&mut digest, b"live-query-artifacts", query_artifacts.len())?;
-    for query in query_artifacts {
-        digest.update(query.reservation_id().as_bytes());
-        text(&mut digest, query.owner().as_str())?;
-        digest.update(query.request_hash().bytes());
-        digest.update(query.artifact_id().as_bytes());
-        text(&mut digest, query.relative_reference())?;
-        digest.update(query.content_hash().bytes());
-        digest.update(query.size_bytes().to_be_bytes());
-        digest.update(query.expires_at().unix_nanos().to_be_bytes());
+    pub(crate) fn parent(
+        &mut self,
+        ordinal: u64,
+        edge: &GenerationParentEvidenceRow,
+    ) -> Result<(), EvidenceError> {
+        self.digest.update(ordinal.to_be_bytes());
+        self.digest.update(edge.generation_sequence().to_be_bytes());
+        self.digest.update([match edge.parent().relation() {
+            GenerationParentRelation::AppendPredecessor => 1,
+            GenerationParentRelation::CompactionPredecessor => 2,
+            GenerationParentRelation::DerivedInput => 3,
+        }]);
+        let parent = edge.parent().manifest();
+        text(&mut self.digest, parent.dataset_id().as_str())?;
+        self.digest.update(parent.manifest_version().to_be_bytes());
+        text(&mut self.digest, parent.schema().name())?;
+        self.digest
+            .update(parent.schema().version().get().to_be_bytes());
+        self.digest.update(parent.schema().fingerprint());
+        self.digest.update(parent.content_hash().bytes());
+        Ok(())
     }
 
-    let mut archives: Vec<_> = snapshot.market_event_archives().iter().collect();
-    archives.sort_unstable_by_key(|archive| archive.content_hash());
-    section_count(&mut digest, b"market-event-archives", archives.len())?;
-    for archive in archives {
-        digest.update(archive.content_hash().bytes());
-        text(&mut digest, archive.relative_reference())?;
-        text(&mut digest, archive.schema().name())?;
-        digest.update(archive.schema().version().get().to_be_bytes());
-        digest.update(archive.schema().fingerprint());
-        digest.update(archive.size_bytes().to_be_bytes());
-        digest.update(archive.row_count().to_be_bytes());
-        digest.update(archive.created_at().unix_nanos().to_be_bytes());
-        digest.update(archive.published_at().unix_nanos().to_be_bytes());
+    pub(crate) fn object(
+        &mut self,
+        ordinal: u64,
+        object: &GenerationObjectEvidenceRow,
+    ) -> Result<(), EvidenceError> {
+        self.digest.update(ordinal.to_be_bytes());
+        self.digest.update(object.artifact_id().as_bytes());
+        self.digest.update(object.content_hash().bytes());
+        self.digest.update(object.row_count().to_be_bytes());
+        self.digest.update(object.size_bytes().to_be_bytes());
+        self.digest.update(object.lineage_hash().bytes());
+        Ok(())
     }
-
-    let mut provider_relations: Vec<_> = snapshot.provider_relations().iter().collect();
-    provider_relations.sort_unstable_by(|left, right| {
-        left.relation()
-            .cmp(&right.relation())
-            .then_with(|| left.primary_key().cmp(right.primary_key()))
-    });
-    section_count(
-        &mut digest,
-        b"provider-catalog-relations",
-        provider_relations.len(),
-    )?;
-    for row in provider_relations {
-        digest.update([row.relation().canonical_tag()]);
-        text(&mut digest, row.relation().database_name())?;
-        bytes(&mut digest, row.primary_key())?;
-        digest.update(row.row_content_digest().bytes());
-    }
-    CatalogContentEvidenceDigest::try_new(digest.finalize().into())
-        .ok_or(EvidenceError::InvalidCatalogEvidence)
 }
-
-fn section_count(digest: &mut Sha256, domain: &[u8], count: usize) -> Result<(), EvidenceError> {
-    text(
-        digest,
-        std::str::from_utf8(domain).map_err(|_| EvidenceError::InvalidCatalogEvidence)?,
-    )?;
-    digest.update(
-        u64::try_from(count)
-            .map_err(|_| EvidenceError::ResourceLimitExceeded)?
-            .to_be_bytes(),
-    );
-    Ok(())
-}
-
 fn text(digest: &mut Sha256, value: &str) -> Result<(), EvidenceError> {
     bytes(digest, value.as_bytes())
 }

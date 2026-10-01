@@ -30,8 +30,9 @@ pub use sealed::{
     SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
     SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
     SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
-    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
-    SealedResearchRecoverySession, VerifiedResearchObject,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRawObjectKind,
+    SealedResearchRecoveryAdmission, SealedResearchRecoverySession, SealedResearchRecoveryTurn,
+    VerifiedResearchObject,
 };
 
 const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";

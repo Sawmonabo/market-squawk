@@ -14,6 +14,8 @@ pub use board_full_history::{
     BoardFullHistoryReservedPublication, BoardFullHistoryStagingLease,
 };
 pub use market_event_store::{MarketEventArchiveLimits, MarketEventArchiveTurn};
+mod provider_capture_recovery;
+pub use provider_capture_recovery::ProviderCaptureRecovery;
 mod provider_capture_metadata;
 pub use provider_capture_metadata::ProviderMacroMetadataCapture;
 mod provider_capture_original;
@@ -37,7 +39,7 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
-    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRecoveryAdmission,
+    SealedResearchJournalStoreError, SealedResearchRawClaim,
 };
 use market_squawk_sources::{
     CanonicalPartitionExpectation, ExtractionBatch, ExtractionContentIdentity, ExtractionError,
@@ -68,10 +70,6 @@ use crate::catalog::{
     ProviderMacroPlanSemanticsEvidence, ProviderMacroPlanSessionKey,
     ProviderMacroPlanSessionRecovery, ProviderMacroPlanStagedPageInput,
     ProviderMacroPlanTerminalInput, PublicationSourceEvidence,
-};
-use crate::catalog::{
-    MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
-    PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
 };
 use crate::manifest::{FundNavPublicationCandidate, MarketBarHistoryPublicationCandidate};
 use crate::parquet_store::ArtifactRootIdentity;
@@ -3242,38 +3240,6 @@ impl AnalyticalDataService {
         authority
             .reserve_ingest(identity, &grant)
             .map_err(Into::into)
-    }
-
-    /// Reconciles the sealed raw-object store against the complete immutable catalog receipt set.
-    ///
-    /// This is the startup boundary for quarantining incomplete stages and unreferenced final
-    /// objects. Every catalog claim is decoded and cross-checked against its publication and
-    /// physical-unit rows, then the sealed store verifies every retained object before moving
-    /// anything.
-    pub async fn recover_provider_capture_store(
-        &self,
-        store: Arc<market_squawk_platform::SealedResearchJournalStore>,
-        cancellation: &CancellationToken,
-    ) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, IngestError> {
-        let _operation = self
-            .operation_gate
-            .acquire(cancellation)
-            .await
-            .ok_or(IngestError::Cancelled)?;
-        if cancellation.is_cancelled() {
-            return Err(IngestError::Cancelled);
-        }
-        let supervisor = BlockingIoSupervisor::new(cancellation.clone());
-        let authority = Arc::clone(&self.authority);
-        let worker_cancellation = cancellation.clone();
-        let worker = supervisor
-            .spawn_blocking(move || {
-                recover_provider_capture_store_blocking(authority, store, &worker_cancellation)
-            })
-            .map_err(map_provider_recovery_admission_error)?;
-        worker
-            .await
-            .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)?
     }
 
     /// Returns a digest-ordered page of inherited capture bindings. Pass the last digest as
@@ -6599,91 +6565,6 @@ pub enum IngestError {
     /// The bounded blocking worker required for provider recovery was unavailable.
     #[error("provider-capture recovery worker is unavailable")]
     ProviderCaptureRecoveryWorkerUnavailable,
-}
-
-fn recover_provider_capture_store_blocking(
-    authority: Arc<Mutex<CatalogAuthority>>,
-    store: Arc<market_squawk_platform::SealedResearchJournalStore>,
-    cancellation: &CancellationToken,
-) -> Result<market_squawk_platform::SealedResearchJournalRecoveryReport, IngestError> {
-    let control = ProviderCaptureRecoveryControl { cancellation };
-    let admission = SealedResearchRecoveryAdmission::try_new(
-        MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
-        PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
-    )
-    .map_err(map_provider_recovery_store_error)?;
-    let mut recovery = store
-        .begin_recovery(admission, &control)
-        .map_err(map_provider_recovery_store_error)?;
-    let authority = lock_provider_recovery_authority(&authority, &control)?;
-    let mut after = None;
-    let mut observed = 0usize;
-    let mut observed_bytes = 0u64;
-    loop {
-        control
-            .checkpoint(ResearchObjectControlPoint::BeforeRecoveryClaim {
-                observed_claims: observed,
-            })
-            .map_err(|error| {
-                map_provider_recovery_store_error(SealedResearchJournalStoreError::ObjectControl(
-                    error,
-                ))
-            })?;
-        let page = authority.authoritative_provider_raw_claim_page(after)?;
-        if page.is_empty() {
-            break;
-        }
-        for (digest, claim) in page {
-            if digest.algorithm() != DigestAlgorithm::Sha256
-                || after.is_some_and(|prior| digest.bytes() <= prior.bytes())
-            {
-                return Err(IngestError::Catalog(CatalogError::CorruptCatalog));
-            }
-            observed = observed
-                .checked_add(1)
-                .ok_or(IngestError::ProviderCaptureRequired)?;
-            if observed > MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS {
-                return Err(IngestError::ProviderCaptureRequired);
-            }
-            observed_bytes = observed_bytes
-                .checked_add(match &claim {
-                    SealedResearchRawClaim::JournalSegment(claim) => claim.size_bytes(),
-                    SealedResearchRawClaim::LogicalObject(claim) => claim.size_bytes(),
-                })
-                .ok_or(IngestError::ProviderCaptureRequired)?;
-            if observed_bytes > MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES {
-                return Err(IngestError::Catalog(CatalogError::CorruptCatalog));
-            }
-            recovery
-                .observe_claim(&claim)
-                .map_err(map_provider_recovery_store_error)?;
-            after = Some(digest);
-        }
-    }
-    drop(authority);
-    recovery.finish().map_err(map_provider_recovery_store_error)
-}
-
-fn lock_provider_recovery_authority<'a>(
-    authority: &'a Mutex<CatalogAuthority>,
-    control: &ProviderCaptureRecoveryControl<'_>,
-) -> Result<MutexGuard<'a, CatalogAuthority>, IngestError> {
-    let mut blocked_attempts = 0usize;
-    loop {
-        if control.cancellation.is_cancelled() {
-            return Err(IngestError::Cancelled);
-        }
-        match authority.try_lock() {
-            Ok(authority) => return Ok(authority),
-            Err(TryLockError::Poisoned(_)) => return Err(IngestError::AuthorityLockPoisoned),
-            Err(TryLockError::WouldBlock) => {
-                blocked_attempts = blocked_attempts
-                    .checked_add(1)
-                    .ok_or(IngestError::ProviderCaptureRecoveryWorkerUnavailable)?;
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
 }
 
 fn map_provider_recovery_admission_error(error: BlockingIoAdmissionError) -> IngestError {

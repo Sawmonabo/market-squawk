@@ -32,6 +32,26 @@ struct State {
     first_join_error: Option<JoinError>,
 }
 
+// The operation label is its compile-time closure type, never captured provider/request data.
+// Drop covers a caller destroying its future while the owned worker remains in State.
+struct WaitDiagnostic {
+    operation: &'static str,
+    stage: &'static str,
+    completed: bool,
+}
+
+impl Drop for WaitDiagnostic {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::warn!(
+                operation = self.operation,
+                stage = self.stage,
+                "owned research I/O wait interrupted"
+            );
+        }
+    }
+}
+
 impl ResearchIoWorker {
     pub(super) fn new() -> Self {
         Self {
@@ -69,6 +89,11 @@ impl ResearchIoWorker {
         T: Send + 'static,
         F: FnOnce(CancellationToken) -> T + Send + 'static,
     {
+        let mut diagnostic = WaitDiagnostic {
+            operation: std::any::type_name::<F>(),
+            stage: "gate_admission",
+            completed: false,
+        };
         let operation_cancellation = self.shutdown.child_token();
         let _cancel_on_drop = operation_cancellation.clone().drop_guard();
         let deadline = tokio::time::Instant::from_std(deadline);
@@ -81,6 +106,7 @@ impl ResearchIoWorker {
         )
         .await?
         .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?;
+        diagnostic.stage = "state_lock";
         let mut state = wait(
             deadline,
             cancellation,
@@ -89,6 +115,7 @@ impl ResearchIoWorker {
             self.state.lock(),
         )
         .await?;
+        diagnostic.stage = "prior_join";
         // An abandoned request can leave a finished handle in this slot. Join that exact worker
         // before starting the next operation; never overwrite its result or failure.
         wait(
@@ -108,6 +135,7 @@ impl ResearchIoWorker {
             // durable and unreferenced for the existing startup quarantine pass.
             let _unclaimed_output = sender.send(output);
         }));
+        diagnostic.stage = "current_join";
         match wait(
             deadline,
             cancellation,
@@ -140,9 +168,11 @@ impl ResearchIoWorker {
         }
         // Receiving a result alone cannot attest that the original thread joined. This read is
         // synchronous and occurs only after the actual JoinHandle returned successfully.
-        result
+        let output = result
             .try_recv()
-            .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)
+            .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable);
+        diagnostic.completed = output.is_ok();
+        output
     }
 
     pub(super) fn begin_shutdown(&self) {

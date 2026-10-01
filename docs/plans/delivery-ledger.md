@@ -30,7 +30,7 @@ and supplies no evidence. Current logs: `sqlite-bootstrap-raw-only-build.log`,
 `.agents/tmp/v1-first-stock/`. The unrelated existing decision fixture still lacks genuine current-
 share evidence and remains failed/open.
 
-Archive integration checkpoint (this commit, based on `be6e661b`): bounded cold placement,
+Archive integration checkpoint **`d9f91902` pushed** (based on `be6e661b`): bounded cold placement,
 exact hot/cold reads, mixed backup/restore and joined maintenance shutdown are implemented.
 Existing shared Desktop/CLI/MCP service authority/restart check passes **1/1,100.08s**
 (`sqlite-archive-shared-service-critical.log`). Event archive/backup, general backup and worker
@@ -40,12 +40,60 @@ publication still fails and is not represented as completed live behavior.
 
 ### Current dependency and ownership wave
 
-| Owner | Finite outcome / files | Dependency and critical evidence |
+Lead integrates the bounded storage wave below; all implementation owners are frozen. Existing
+platform raw-journal recovery passes1/1,0.10s and logical-object cancel/resume/pin recovery passes
+1/1,0.18s (`streamed-raw-{recovery,logical}-critical.log`). Data critical checks now pass as recorded below. The sole single-job compiler is preparing
+application integration (`streamed-storage-app-build.log`). No checks from this wave establish live
+or installed acceptance.
+
+Astra research_options_failure completed the bounded read-only worker/raw-seal trace: no concrete
+self-dependency was found, so no scheduling change is justified yet. Files remain frozen with lead;
+the next dependency is actual live phase evidence.
+`research_service/worker.rs` now records only closed
+wait stages and compile-time operation names on interruption. Seal phase diagnostics distinguish
+queued from physical work without changing scheduling or deadlines. The next real live run follows
+integrated storage compilation and focused correctness checks.
+
+### Bounded storage implementation wave — base `d9f91902`
+
+The diagnostic build passed5m01s; the existing live check failed79.22s
+(`sqlite-terminal-stage-diagnostic-live.log`). All four interrupted Coinbase publications were at
+raw sealing, before terminal-row pairing or SQLite event publication. Source edits below are not
+covered by that executable. No new compilation until all owners freeze.
+
+| Owner | Exact ownership / outcome | Start barrier / evidence |
 | --- | --- | --- |
-| Astra research_options_failure | Read-only live admission failure trace: live-source admission/sink/publication supervision and crypto rendezvous | Terminal-batch and shutdown code frozen; unit checks pass. Real Coinbase still times out. Identify remaining dependency before editing; no build/Git. |
-| Astra first_brief_readiness | Raw-custody indexed/incremental recovery design completed; no active edits | Receipt-held object pins must precede background quarantine. Implement after current archive checkpoint; no discarded evidence or raised lifetime caps. |
-| Sol desktop_disconnect_recovery | Read-only streaming analytical-backup design: `catalog/evidence*`, `authority_transition/evidence*` and consumers | Archive/backup and SEC fixture changes frozen and critical checks pass. Replace whole-evidence collection ceiling without dropping exact evidence. |
-| Lead | Shared SQL, manifests, exports, composition, Git/build/test scheduling, ledger/PR evidence and archive integration | Archive critical checks pass; app build passes. Run independent shared-service restart check, then push the coherent storage checkpoint. Keep unresolved live-feed failure explicit. |
+| Astra first_brief_readiness | Platform `journal/{sealed.rs,sealed_object.rs,sealed_backup.rs}` and cohesive recovery child; data `catalog/provider_capture.rs`, `ingest/source_backup.rs`, new `ingest/provider_capture_recovery.rs` | Implement owner-scoped stage/receipt pins and bounded retained recovery; remove lifetime capture admission in Rust. First return shared API/SQL needs; lead owns exports/schema/parent declarations and caller alignment. Preserve existing selected verification and extend only existing critical platform recovery cases. |
+| Astra streamed_backup | Data `catalog/evidence.rs`, `catalog/evidence/market_events.rs`, `authority_transition/evidence/{catalog.rs,canonical.rs,mod.rs}` | Canonical streamed evidence and compact exact summaries. Lead-approved summary/cursor contract; no total-history count ceiling, excluded evidence, new format version or parallel old API. Propose existing test amendments; lead owns tests. |
+| Astra streamed_backup_files | Data `authority_transition/evidence/{fs.rs,fs/materialize.rs}`, `analytical_backup.rs`, `authority_transition/restore.rs` | Consume frozen compact snapshot and physical-evidence visitor API; one-object verification/copy against retained immutable catalog, full restore preflight. No all-history DTO/FD inventory or receipt-count ceiling. Existing critical backup/restore checks owned by lead. |
+| Lead | SQL0021/digest; platform/data exports; `catalog/read_snapshot.rs`; parent `ingest.rs`; research_service and local_product startup/composition; existing data tests; Git/build/ledger | Settle interfaces before dependent edits, serialize shared files. Critical existing raw recovery, mixed event archive/backup, general backup and exact-subset retry; then shared application integration. |
+
+Shared integration now replaces the startup-wide raw scan with a retained bounded background
+cursor; selected reads preserve full verification. Snapshot membership is fresh per object after
+checking live pins. SQL0021 adds physical-identity and backup lookup indexes and replaces lifetime
+raw-object quotas with signed-integer overflow protection. Analytical backup's obsolete artifact/
+reference-count constructor settings are removed in place, including service and test callers.
+These edits pass the platform and data critical checks below; application integration is pending.
+Existing recovery and backup/restart tests cover the changed paths; no new harness or full gate is added.
+
+Focused storage verification passes after checked SQLite integer conversion and snapshot import
+corrections. Data critical executable build passes1m12s (`streamed-storage-data-build-retry.log`).
+Existing checks: mixed event archive/restart/backup1/1,4.83s; general backup1/1,5.59s; native-reference
+recovery1/1,0.95s; complete history/recovery1/1,1.63s; prepared exact-subset restore retry1/1,5.85s;
+streamed lineage replay1/1; receipt count/byte validation1/1. Logs use
+`streamed-storage-{event,general-backup,native-recovery,history-recovery,exact-retry,lineage,count}-critical.log`.
+Application control-plane compilation passes6m57s (`streamed-storage-app-build.log`).
+Existing shared service/startup/restart/optional-access check passes1/1,100.25s
+(`streamed-storage-shared-service-critical.log`). Actual public-feed verification fails79.22s (`streamed-storage-live.log`): one capture is at
+`current_join`/`physical_seal`, three wait at `gate_admission`/`queued`. Coinbase readiness times
+out before selected publication. The physical sealing stall is the next concrete dependency;
+Astra research_options_failure is examining the captured stack read-only. This does not establish
+live ingestion or Desktop completion. The separately preserved terminal-batch WIP remains open.
+No whole-app RAM or release claim.
+
+No additional branch/worktree, competing build, new broad harness or full CI. Raw and backup work
+are independent implementations; they converge at the lead's caller/schema and critical-check
+barrier. Original sessions, saved evidence and recovery backups stay protected.
 
 Terminal-batch implementation and its corrected linear allocation accounting are frozen and
 lead-inspected. Existing `action_runtime` rejection checks pass **3/3** (0.02s; final single-job
