@@ -93,7 +93,11 @@ pub(super) fn identity_catalog(
     )?;
     Ok((
         directory,
-        MarketDataInstrumentReadCapability::new(authority),
+        MarketDataInstrumentReadCapability::new(
+            authority,
+            Instant::now() + Duration::from_secs(5),
+            cancellation,
+        )?,
     ))
 }
 

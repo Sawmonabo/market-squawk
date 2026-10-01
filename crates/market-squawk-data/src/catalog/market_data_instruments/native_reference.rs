@@ -465,45 +465,39 @@ impl MarketDataInstrumentReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<Option<RetainedNativeReferenceCapture>, MarketDataInstrumentCatalogError> {
         check_operation(deadline, cancellation)?;
-        let authority = self
-            .authority
-            .try_lock()
-            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?;
-        let record =
-            authority.read_selected_provider_definition(selection, deadline, cancellation)?;
-        let exact = selection.exact_receipt()?;
-        let identity = record
-            .definition()
-            .provider_identities()
-            .iter()
-            .find(|identity| {
-                identity.source_id() == selection.query().source_id()
-                    && identity.provider_instrument_id()
-                        == selection.query().provider_instrument_id()
-                    && identity.metadata_revision() == exact.provider_identity_revision()
-                    && identity.evidence().content_digest()
-                        == exact.provider_identity_payload_digest()
-                    && identity.validity() == exact.provider_identity_validity()
+        self.read_snapshot(deadline, cancellation, |connection, limits| {
+            let record = read_selected_provider_definition_in_connection(
+                connection,
+                limits,
+                selection,
+                deadline,
+                cancellation,
+            )?;
+            let exact = selection.exact_receipt()?;
+            let identity = record
+                .definition()
+                .provider_identities()
+                .iter()
+                .find(|identity| {
+                    identity.source_id() == selection.query().source_id()
+                        && identity.provider_instrument_id()
+                            == selection.query().provider_instrument_id()
+                        && identity.metadata_revision() == exact.provider_identity_revision()
+                        && identity.evidence().content_digest()
+                            == exact.provider_identity_payload_digest()
+                        && identity.validity() == exact.provider_identity_validity()
+                })
+                .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
+            load_reference(connection, identity, limits.max_record_bytes()).and_then(|value| {
+                if value
+                    .as_ref()
+                    .is_some_and(|value| value.retained_at > selection.query().knowledge_at())
+                {
+                    return Ok(None);
+                }
+                Ok(value)
             })
-            .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
-        let connection = &authority.catalog().connection;
-        install_progress_handler(connection, deadline, cancellation)?;
-        let result = load_reference(
-            connection,
-            identity,
-            authority.catalog().result_bytes.max_record_bytes(),
-        )
-        .and_then(|value| {
-            if value
-                .as_ref()
-                .is_some_and(|value| value.retained_at > selection.query().knowledge_at())
-            {
-                return Ok(None);
-            }
-            Ok(value)
-        });
-        clear_progress_handler(connection)?;
-        classify_operation(result, deadline, cancellation)
+        })
     }
 }
 

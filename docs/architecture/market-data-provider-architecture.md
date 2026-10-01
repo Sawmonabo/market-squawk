@@ -575,6 +575,13 @@ when that operation exits; it is not a cached connection or a second runtime. Th
 [snapshot isolation](https://www.sqlite.org/isolation.html) (reviewed 2026-09-30). Actual SQLite
 lock conflicts remain possible; WAL does not justify treating every source as available.
 
+Immutable instrument definition, population, search, enumeration and retained native-reference
+reads also use endpoint-bound snapshots. Service composition captures the endpoint before sharing
+the writer, so obtaining a reader does not acquire writer admission. The existing SQL, selection
+clocks, receipt validation and cancellation/deadline controls apply within one read transaction.
+Current-identity clock/watch mutation and already-borrowed publication validation retain their
+existing authority boundaries.
+
 Bounded retained-capture and calendar reads use that same snapshot owner for generation membership,
 capture bindings and original metadata. Durable market-route and retained-source metadata reads also
 use independent snapshots. Physical capture verification runs after the catalog transaction closes;

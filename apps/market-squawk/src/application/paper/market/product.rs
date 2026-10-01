@@ -443,7 +443,7 @@ mod tests {
             deadline,
             &cancellation,
         )?;
-        let reader = MarketDataInstrumentReadCapability::new(authority);
+        let reader = MarketDataInstrumentReadCapability::new(authority, deadline, &cancellation)?;
         let mut records = Vec::new();
         for id in [
             "00000000-0000-0000-0000-000000000101",

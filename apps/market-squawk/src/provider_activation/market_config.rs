@@ -2690,9 +2690,9 @@ mod tests {
             CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
         )?)?));
         let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
-        let reader = MarketDataInstrumentReadCapability::new(authority);
         let cancellation = CancellationToken::new();
         let deadline = || Instant::now() + Duration::from_secs(2);
+        let reader = MarketDataInstrumentReadCapability::new(authority, deadline(), &cancellation)?;
         let instrument: InstrumentId = "00000000-0000-0000-0000-000000000101".parse()?;
         let original = reference_definition(instrument, 10, false, "USD")?;
         publisher.synchronize(

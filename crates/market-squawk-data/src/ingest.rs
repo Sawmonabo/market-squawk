@@ -1724,6 +1724,7 @@ pub struct AnalyticalDataService {
     authority: Arc<Mutex<CatalogAuthority>>,
     catalog_id: uuid::Uuid,
     catalog_read_limits: crate::CatalogResultLimits,
+    market_data_instrument_reader: crate::MarketDataInstrumentReadCapability,
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
     operation_gate: AnalyticalOperationGate,
@@ -2713,10 +2714,13 @@ impl AnalyticalDataService {
     ) -> Self {
         let catalog_id = authority.session_id();
         let catalog_read_limits = authority.catalog().read_result_limits();
+        let (authority, market_data_instrument_reader) =
+            crate::MarketDataInstrumentReadCapability::from_active_catalog(authority);
         Self {
-            authority: Arc::new(Mutex::new(authority)),
+            authority,
             catalog_id,
             catalog_read_limits,
+            market_data_instrument_reader,
             manifests: Arc::new(manifests),
             objects: Arc::new(objects),
             operation_gate: AnalyticalOperationGate::default(),
@@ -3065,7 +3069,7 @@ impl AnalyticalDataService {
 
     /// Returns bounded current reads over repository-owned, non-execution market-data definitions.
     pub fn market_data_instruments(&self) -> crate::MarketDataInstrumentReadCapability {
-        crate::MarketDataInstrumentReadCapability::new(Arc::clone(&self.authority))
+        self.market_data_instrument_reader.clone()
     }
 
     /// Returns the sole atomic publication authority for receipt-bound market-data definitions.
@@ -3850,6 +3854,7 @@ impl AnalyticalDataService {
             authority: Arc::clone(&self.authority),
             catalog_id: self.catalog_id,
             catalog_read_limits: self.catalog_read_limits,
+            market_data_instrument_reader: self.market_data_instrument_reader.clone(),
             manifests: Arc::clone(&self.manifests),
             objects: Arc::clone(&self.objects),
             operation_gate: self.operation_gate.clone(),

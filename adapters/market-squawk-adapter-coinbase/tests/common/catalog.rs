@@ -44,7 +44,11 @@ impl CatalogFixture {
         )?;
         let authority = Arc::new(Mutex::new(CatalogAuthority::open(catalog)?));
         let writer = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
-        let reader = MarketDataInstrumentReadCapability::new(authority);
+        let reader = MarketDataInstrumentReadCapability::new(
+            authority,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )?;
         let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?;
         let observed_at = system_timestamp()?;
         let namespace = SourceId::try_from("coinbase-advanced-trade")?;

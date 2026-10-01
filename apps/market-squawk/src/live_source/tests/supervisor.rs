@@ -331,7 +331,11 @@ fn identity_catalog(
     )?;
     let at = system_timestamp()?;
     Ok((
-        MarketDataInstrumentReadCapability::new(authority),
+        MarketDataInstrumentReadCapability::new(
+            authority,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )?,
         ProviderNativeIdentityRequest {
             namespace,
             provider_instrument_id: native_id,

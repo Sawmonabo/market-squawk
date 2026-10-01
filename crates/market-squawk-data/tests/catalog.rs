@@ -1193,7 +1193,11 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
 
     let authority = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
     let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
-    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(
+        Arc::clone(&authority),
+        Instant::now() + Duration::from_secs(2),
+        &CancellationToken::new(),
+    )?;
     let relationship_publisher =
         CompanySecurityLinkPublicationCapability::new(Arc::clone(&authority));
     let relationship_reader = CompanySecurityIdentityReadCapability::new(Arc::clone(&authority));
@@ -1821,7 +1825,11 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     drop(authority);
 
     let authority = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
-    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(
+        Arc::clone(&authority),
+        Instant::now() + Duration::from_secs(2),
+        &CancellationToken::new(),
+    )?;
     let relationship_reader = CompanySecurityIdentityReadCapability::new(authority);
     let reopened = reader
         .latest(instrument_id, deadline(), &cancellation)?
@@ -2166,7 +2174,11 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         })
     };
     let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
-    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(
+        Arc::clone(&authority),
+        Instant::now() + Duration::from_secs(2),
+        &CancellationToken::new(),
+    )?;
     let created = publisher.publish_alpaca_asset_reference(
         admission(original, &listing)?,
         &allowed,
@@ -2349,7 +2361,11 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     drop(authority);
     let reopened = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
     let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&reopened));
-    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&reopened));
+    let reader = MarketDataInstrumentReadCapability::new(
+        Arc::clone(&reopened),
+        Instant::now() + Duration::from_secs(2),
+        &CancellationToken::new(),
+    )?;
     // Replay the original received timestamp, which necessarily preceded catalog publication.
     let retained = ProviderCaptureMaterial::try_new(original_receipt, original_records)?;
     let replay = publisher.publish_alpaca_asset_reference(
@@ -2728,13 +2744,70 @@ async fn native_reference_custody_preserves_prior_identity_and_recovers_original
 
     // The same real reopened custody distinguishes transient contention from terminal authority.
     let authority = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
-    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(
+        Arc::clone(&authority),
+        Instant::now() + Duration::from_secs(2),
+        &CancellationToken::new(),
+    )?;
     let cutoff = now()?;
     let request = ProviderNativeIdentityRequest {
         knowledge_at: cutoff,
         effective_at: cutoff,
         ..request
     };
+    // Immutable definition/custody reads use the same retained catalog while a publisher
+    // owns its writer. Compare exact clocks, digests and exclusions with the pre-write view.
+    let immutable_reads = || -> TestResult<_> {
+        let selection = reader
+            .select_provider_identity_as_of(
+                MarketDataProviderIdentityQuery::try_new(
+                    request.namespace.clone(),
+                    request.provider_instrument_id.clone(),
+                    cutoff,
+                    cutoff,
+                )?,
+                deadline(),
+                &cancellation,
+            )?
+            .ok_or("missing immutable provider identity")?;
+        Ok((
+            reader.latest(instrument, deadline(), &cancellation)?,
+            reader.pin_population_as_of(
+                MarketDataInstrumentPopulationQuery::try_new(vec![instrument], cutoff, cutoff)?,
+                deadline(),
+                &cancellation,
+            )?,
+            reader.enumerate_as_of(cutoff, cutoff, None, 256, deadline(), &cancellation)?,
+            reader.search("Apple", 10, deadline(), &cancellation)?,
+            reader.search_as_of("Apple", cutoff, cutoff, 10, deadline(), &cancellation)?,
+            reader.resolve_exact_as_of("AAPL.NATIVE", cutoff, cutoff, deadline(), &cancellation)?,
+            reader.read_selected_provider_definition(&selection, deadline(), &cancellation)?,
+            reader.native_reference(&selection, deadline(), &cancellation)?,
+        ))
+    };
+    let before_write = immutable_reads()?;
+    assert_eq!(before_write.0.as_ref(), Some(&before_write.6));
+    assert_eq!(before_write.7.as_ref(), Some(&retained));
+    let guard = authority.lock().map_err(|_| "catalog lock poisoned")?;
+    let during_write = immutable_reads();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let cancelled_read = reader.latest(instrument, deadline(), &cancelled);
+    let expired_read = reader.pin_population_as_of(
+        MarketDataInstrumentPopulationQuery::try_new(vec![instrument], cutoff, cutoff)?,
+        Instant::now(),
+        &cancellation,
+    );
+    drop(guard);
+    assert_eq!(during_write?, before_write);
+    assert!(matches!(
+        cancelled_read,
+        Err(MarketDataInstrumentCatalogError::Cancelled)
+    ));
+    assert!(matches!(
+        expired_read,
+        Err(MarketDataInstrumentCatalogError::DeadlineExceeded)
+    ));
     // A concurrent publisher owns the real writer mutex. Selection must wait for the short
     // clock/watch fence, then resolve the sealed identity rather than fail on transient Busy.
     std::thread::scope(|scope| -> TestResult {
