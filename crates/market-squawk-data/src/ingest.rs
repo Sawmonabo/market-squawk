@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::compute::concat_batches;
@@ -1750,6 +1750,46 @@ pub trait ResearchIngestService {
     ) -> Result<CommittedDataset, IngestError>;
 }
 
+/// A newly committed, reader-visible data publication. No provider payload is retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataPublication {
+    /// Canonical research data, including optional market-history selection evidence.
+    ResearchGeneration {
+        /// The generation publishes canonical market-bar history.
+        market_history: bool,
+    },
+    /// A complete provider macro plan became available.
+    MacroGeneration,
+    /// A new logical market-event horizon became available.
+    MarketEvents,
+    /// Reference identity or reference-selection evidence changed.
+    Reference,
+    /// A previously absent immutable chart projection became available.
+    ChartProjection,
+    /// A new analytical generation derived from exact parents became available.
+    DerivedGeneration,
+}
+
+/// Composition-owned notification of successful data commits.
+///
+/// Called synchronously while publication ownership is retained. Implementations must only
+/// record the notification: never block, reenter storage, or perform fallible publication work.
+pub trait DataPublicationObserver: fmt::Debug + Send + Sync {
+    /// Records a publication after its transaction committed, even if its caller later cancels.
+    fn published(&self, publication: DataPublication);
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DataPublicationObserverSlot(Arc<OnceLock<Arc<dyn DataPublicationObserver>>>);
+
+impl DataPublicationObserverSlot {
+    pub(crate) fn record(&self, publication: DataPublication) {
+        if let Some(observer) = self.0.get() {
+            observer.published(publication);
+        }
+    }
+}
+
 /// Local composition of Task 3 authority, immutable generations, and controlled Parquet objects.
 #[derive(Debug)]
 pub struct AnalyticalDataService {
@@ -2868,10 +2908,11 @@ impl AnalyticalDataService {
 
     pub(crate) fn from_active_parts(
         authority: CatalogAuthority,
-        manifests: AnalyticalManifestCatalog,
+        mut manifests: AnalyticalManifestCatalog,
         objects: ParquetObjectStore,
     ) -> Self {
         let catalog_id = authority.session_id();
+        manifests.publication_observer = authority.catalog().publication_observer.clone();
         let catalog_read_limits = authority.catalog().read_result_limits();
         let (authority, market_data_instrument_reader) =
             crate::MarketDataInstrumentReadCapability::from_active_catalog(authority);
@@ -2888,6 +2929,18 @@ impl AnalyticalDataService {
 
     pub(crate) const fn catalog_session_id(&self) -> uuid::Uuid {
         self.catalog_id
+    }
+
+    /// Installs the single publication observer before producers start. A second binding fails.
+    pub fn install_publication_observer(
+        &self,
+        observer: Arc<dyn DataPublicationObserver>,
+    ) -> Result<(), IngestError> {
+        self.manifests
+            .publication_observer
+            .0
+            .set(observer)
+            .map_err(|_| CatalogError::InvalidConfiguration.into())
     }
 
     /// Returns the controlled object capability for manifest-pinned query construction.

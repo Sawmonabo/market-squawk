@@ -1255,6 +1255,7 @@ async fn compose_transport(
             runtime.runtime().service_generation(),
             EventHubLimits::try_new(RETAINED_EVENTS, MAXIMUM_EVENT_BYTES)
                 .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+            product.research().application_changes(),
         )
         .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     );

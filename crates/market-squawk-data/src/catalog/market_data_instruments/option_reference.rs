@@ -317,6 +317,11 @@ impl CatalogAuthority {
                 .validate_catalog_precommit(self)
                 .map_err(reference_precommit_error)?;
             transaction.commit()?;
+            if inserted != 0 {
+                self.catalog()
+                    .publication_observer
+                    .record(crate::DataPublication::Reference);
+            }
             Ok(MarketDataInstrumentSynchronizationReceipt {
                 batch_digest,
                 submitted: count,

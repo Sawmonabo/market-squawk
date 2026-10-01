@@ -338,6 +338,7 @@ impl Catalog {
         verify_integrity(&connection)?;
         Ok(Self {
             connection,
+            publication_observer: crate::ingest::DataPublicationObserverSlot::default(),
             location: config.location.clone(),
             _catalog_file: catalog_file,
             _cross_process_writer: cross_process_writer,

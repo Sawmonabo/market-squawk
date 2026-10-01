@@ -385,6 +385,7 @@ impl MarketRuntimeRegistry {
         prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
         prepared_schwab: Arc<dyn PreparedSchwabMarketRuntimeResolver>,
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
+        application_changes: market_squawk_runtime::ApplicationChanges,
     ) -> Result<Arc<Self>, ServiceError> {
         let mut entries = Vec::new();
         entries
@@ -408,6 +409,7 @@ impl MarketRuntimeRegistry {
         let display = DisplayMarketDirectory::try_new(
             NonZeroUsize::new(MAX_DISPLAY_MARKET_ROUTES).ok_or(ServiceError::ResourceExhausted)?,
             lifecycle.child_token(),
+            application_changes,
         )
         .map_err(|error| {
             tracing::error!(%error, "display-market directory construction failed");

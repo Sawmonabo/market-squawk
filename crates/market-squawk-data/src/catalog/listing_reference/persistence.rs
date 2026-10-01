@@ -125,6 +125,9 @@ impl CatalogAuthority {
         )
         .map_err(|_| ListingReferenceError::CorruptCatalog)?;
         transaction.commit()?;
+        self.catalog()
+            .publication_observer
+            .record(crate::DataPublication::Reference);
         let generation = ListingReferenceGenerationReceipt {
             dataset: dataset.clone(),
             generation_digest: canonical::digest(generation_digest),

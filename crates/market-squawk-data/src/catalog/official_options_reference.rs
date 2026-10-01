@@ -3396,6 +3396,11 @@ impl CatalogAuthority {
                 )?;
             }
             transaction.commit()?;
+            if !replay {
+                self.catalog()
+                    .publication_observer
+                    .record(crate::DataPublication::Reference);
+            }
             Ok(OfficialOptionsReferencePublicationReceipt {
                 disposition: if replay {
                     OfficialOptionsReferencePublicationDisposition::Replay

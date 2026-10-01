@@ -1574,6 +1574,9 @@ impl CatalogAuthority {
             )
             .map_err(|_| CompanySecurityIdentityCatalogError::CorruptCatalog)?;
             transaction.commit()?;
+            self.catalog()
+                .publication_observer
+                .record(crate::DataPublication::Reference);
             Ok(CompanySecurityLinkPublicationReceipt {
                 record: CompanySecurityIdentityRecord {
                     link,

@@ -2352,6 +2352,7 @@ impl CatalogAuthority {
             }
             super::storage::persist_rights(&transaction, &rights, commit_at)?;
             retain_provider_macro_plan_completion_capture(&transaction, &capture, commit_at)?;
+            let changed = matches!(&plan, PublicationPlan::Insert { .. });
             let (sequence, original_published_at) = match plan {
                 PublicationPlan::Replay => {
                     let current =
@@ -2407,6 +2408,11 @@ impl CatalogAuthority {
                 .validate_catalog_precommit(self)
                 .map_err(reference_precommit_error)?;
             transaction.commit()?;
+            if changed {
+                self.catalog()
+                    .publication_observer
+                    .record(crate::DataPublication::Reference);
+            }
             Ok(MarketDataInstrumentRecord {
                 definition: prepared.definition,
                 revision_digest: digest(prepared.digest),
@@ -2525,6 +2531,11 @@ impl CatalogAuthority {
             )
             .map_err(|_| MarketDataInstrumentCatalogError::CorruptCatalog)?;
             transaction.commit()?;
+            if inserted != 0 {
+                self.catalog()
+                    .publication_observer
+                    .record(crate::DataPublication::Reference);
+            }
             Ok(MarketDataInstrumentSynchronizationReceipt {
                 batch_digest: digest(batch_digest),
                 submitted: prepared.len(),

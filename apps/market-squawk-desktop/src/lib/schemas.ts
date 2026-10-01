@@ -451,7 +451,7 @@ export const desktopEventSchema = z
       z
         .object({
           type: z.literal("invalidate"),
-          domains: z.array(desktopInvalidationDomainSchema).min(1).max(2),
+          domains: z.array(desktopInvalidationDomainSchema).min(1).max(desktopInvalidationDomainSchema.options.length),
         })
         .strict(),
       z.object({ type: z.literal("resync_required") }).strict(),

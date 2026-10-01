@@ -258,7 +258,7 @@ async fn forward_service_events(
                 return;
             }
         }
-        let empty = values.is_empty();
+        let page_drained = values.len() < limit.get();
         cursor = Some(next);
         let cursor_retained = match retained_cursor.lock() {
             Ok(mut retained) => {
@@ -274,7 +274,9 @@ async fn forward_service_events(
             ));
             return;
         }
-        if empty {
+        // Keep the existing polling cadence when caught up, including continuous market
+        // updates. Only a full retained page warrants immediately draining another page.
+        if page_drained {
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 () = tokio::time::sleep(EMPTY_POLL_INTERVAL) => {}
@@ -290,6 +292,28 @@ fn authority_changed(
     operations: &BTreeMap<String, String>,
 ) -> Option<DesktopEvent> {
     let object = value.as_object()?;
+    if object.get("type")?.as_str()? == "application.domains_changed" {
+        if object.len() != 2 {
+            return None;
+        }
+        let changed = object.get("domains")?.as_array()?;
+        if changed.is_empty() || changed.len() > 14 {
+            return None;
+        }
+        let mut domains = Vec::with_capacity(changed.len());
+        for value in changed {
+            let domain = invalidation_domain(value.as_str()?)?;
+            if domains.contains(&domain) {
+                return None;
+            }
+            domains.push(domain);
+        }
+        return Some(DesktopEvent::invalidate(
+            product_session_token,
+            sequence,
+            domains,
+        ));
+    }
     if object.len() != 3 || object.get("type")?.as_str()? != "application.changed" {
         return None;
     }
@@ -310,23 +334,7 @@ fn authority_changed(
 }
 
 fn invalidation_domains(domain: &str, operation: &str) -> Option<Vec<DesktopInvalidationDomain>> {
-    let primary = match domain {
-        "job" => DesktopInvalidationDomain::Job,
-        "decision" => DesktopInvalidationDomain::Decision,
-        "operations" => DesktopInvalidationDomain::Operations,
-        "source" => DesktopInvalidationDomain::Source,
-        "market" => DesktopInvalidationDomain::Market,
-        "research" => DesktopInvalidationDomain::Research,
-        "fundamental" => DesktopInvalidationDomain::Fundamental,
-        "macro" => DesktopInvalidationDomain::Macro,
-        "portfolio" => DesktopInvalidationDomain::Portfolio,
-        "analysis" => DesktopInvalidationDomain::Analysis,
-        "model" => DesktopInvalidationDomain::Model,
-        "fair_value" => DesktopInvalidationDomain::FairValue,
-        "bot" => DesktopInvalidationDomain::Bot,
-        "execution" => DesktopInvalidationDomain::Execution,
-        _ => return None,
-    };
+    let primary = invalidation_domain(domain)?;
     let mut domains = vec![primary];
     if primary == DesktopInvalidationDomain::Source
         && matches!(
@@ -343,4 +351,24 @@ fn invalidation_domains(domain: &str, operation: &str) -> Option<Vec<DesktopInva
         domains.push(DesktopInvalidationDomain::Market);
     }
     Some(domains)
+}
+
+fn invalidation_domain(domain: &str) -> Option<DesktopInvalidationDomain> {
+    Some(match domain {
+        "job" => DesktopInvalidationDomain::Job,
+        "decision" => DesktopInvalidationDomain::Decision,
+        "operations" => DesktopInvalidationDomain::Operations,
+        "source" => DesktopInvalidationDomain::Source,
+        "market" => DesktopInvalidationDomain::Market,
+        "research" => DesktopInvalidationDomain::Research,
+        "fundamental" => DesktopInvalidationDomain::Fundamental,
+        "macro" => DesktopInvalidationDomain::Macro,
+        "portfolio" => DesktopInvalidationDomain::Portfolio,
+        "analysis" => DesktopInvalidationDomain::Analysis,
+        "model" => DesktopInvalidationDomain::Model,
+        "fair_value" => DesktopInvalidationDomain::FairValue,
+        "bot" => DesktopInvalidationDomain::Bot,
+        "execution" => DesktopInvalidationDomain::Execution,
+        _ => return None,
+    })
 }

@@ -2,7 +2,7 @@
 
 ## Current execution — 2026-10-01
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed `30736a9a` (PR #43 comment5942143016), following `5b25ac44` (comment5941104580)
+Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed `32382832` (PR #43 comment5942357301), after `30736a9a` (comment5942143016), following `5b25ac44` (comment5941104580)
 isolates retained reads and adds failed-request stage attribution. The current completed-close/display
 batch below has one successful native initial load after earlier deadline failures; full screen/data
 acceptance remains open. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
@@ -13,13 +13,40 @@ One worktree, three local and three origin branches; protected backup refs remai
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — completed-close and display integration | Pushed30736a9a: original-receipt completed-close projection; independent SQLite projection reads; page-level display authority; retained native Money conversion; actual observation timestamp. Shared plumbing, Git, builds and runtime remain lead-owned. | Four critical checks pass. Fresh native initial Home now loads all nine saved closes in6.9s without Refresh. Earlier15s failures remain part of the evidence; no general latency or streaming acceptance claim. Accepted as this bounded checkpoint; full streaming and all-screen contracts remain open. |
-| GPT-6.1 Sol projection_reads — original publication discovery | Owns data `catalog/provider_logical/original.rs`, `catalog/read_snapshot.rs`, `ingest/provider_logical_original.rs` only. Reuse the exact origin query on endpoint-bound read snapshots; candidate and exact published-origin lookups must not take the writer. Keep pending-original/publication mutations unchanged. | Independent of app caller changes; smallest existing positive original/restart check and held-writer regression. No agent builds/Git. Propose any additional file need before editing. |
-| Astra collection_read — macro read owner | Owns only app `application/research/macro_context.rs` and children `board.rs`, `energy.rs`, `census.rs`, `provider_periods.rs`. Move pure macro original discovery/reopen to existing retained-read worker; add bounded branch error attribution where try_join currently discards first-failure identity. Do not swallow a source error or replace it with missing values. | Lead owns manifest/analytical read plumbing below, all build/runtime checks. Freeze for one integrated build and repeat failed native Macro query. |
-| Lead — macro shared read integration | Owns data manifest/catalog.rs and analytical_read.rs only, plus docs/Git/runtime. Use existing endpoint snapshot for macro exact-manifest and capture-origin discovery with configured limits. | Proven source defect: these read-only paths use shared try_lock and can report AuthorityBusy as unavailable. Current live log does not prove which branch failed first; queued sibling warnings are try_join cancellation fallout. |
-| Lead — remaining product/data update contract | Required data-to-screen closure below remains authoritative. Existing rich quote and committed-domain event designs are source-traced, not implemented. | Next: reduce retained display lookup cost where measured, close macro error, wire committed-domain invalidation and rich quote fields together; then remaining family details and saved Investment Brief. |
+| Lead — committed data-to-screen updates | Owns runtime events.rs/lib.rs and existing runtime event test; service/research composition, display actor and history wake plumbing, shared contracts, native events.rs, macro query-key correction and all integration/Git/builds. Reuse closed ServiceDomain union and existing sequenced event journal; coalesce committed background changes without an added worker or timer. | Freeze typed signal API before producer edits. Preserve command-response ordering, cursor gaps/restarts and retained dirty state on publication failure. |
+| GPT-6.1 Sol — Desktop refresh consumer | Owns app/product-context.tsx, app/product-events.ts, one cohesive app/domain-refresh.ts helper if needed, and the existing critical event tests only. Coalesce active-query updates without canceling successful in-flight reads; preserve one follow-up for changes during reads, inactive invalidation and scope cleanup. | Existing Desktop invalidate event shape stays unchanged. Lead owns native conversion and shared DTOs. Critical check covers event-during-read loss and cancellation starvation only; no component matrix. |
+| Astra publication_edges — committed data notification | Delegated preparation in data src/catalog.rs, catalog/types.rs, ingest.rs, lib.rs, manifest/catalog.rs, catalog/market_event_store.rs, catalog/market_data_instruments.rs and children alpaca_asset_reference.rs/option_reference.rs/issuer_reference.rs, catalog/listing_reference/persistence.rs, catalog/official_options_reference.rs, catalog/company_security.rs, catalog/chart_projection.rs; existing tests/publication_recovery.rs critical case. One data-owned synchronous callback, explicit semantic post-commit sites; no read-side/control/rights write notifications. | Runtime ApplicationChanges::record(ServiceDomain) API frozen. Lead owns callback composition, actor/history wake, shared integration and checks; agent has no Git/build/runtime authority. Publication after caller cancellation must still notify; replay/no-op must not. |
+| Lead — accepted macro snapshot checkpoint | Pushed32382832, three critical checks and live native Home/Macro/Research success below. Both prior owners released. | Macro0/15 coverage, crypto faults, log-drain shutdown and complete rich quote/family contracts remain open. |
 
-Macro wave is frozen for lead verification. Three critical checks pass: manifest discovery during an
+
+Data-update wave is integrated and frozen for lead verification. Runtime event coalescing/gap
+check PASS1/1; Desktop event-during-read/reconnect checks PASS2/2 (2.60s) and TypeScript build PASS;
+existing complete-history/clock/restart check with committed-cancellation/replay notifications
+PASS1/1 (2.24s). Evidence: `domain-event-critical.log`, `domain-refresh-{critical,typecheck}.log`,
+`domain-publication-critical.log` in ignored `.agents/tmp/v1-first-stock/`. Service build PASS5m32s; native automation build PASS5m47s. Native observation below completed; implementation owners are released.
+Data uses one shared synchronous post-commit observer and an atomic domain union, with no event
+payload queue or producer timer. Pure reads, rights writes, replay and physical compaction remain
+silent. Current display actors signal after apply/terminal change; Market also invalidates current
+portfolio reads. Native event polling retains its existing cadence after draining a page. The
+Desktop preserves in-flight reads and one later refresh, while inactive queries remain stale.
+New history commits wake the existing source-owned worker for coalesced retained-only projection
+updates, with no extra provider acquisition. Macro query keys now match the Macro domain.
+The callback is bound once in installed product composition; offline restore's temporary research
+services do not attempt to replace it. Source lifecycle health, job/paper/model/decision publication edges, rich quote DTOs,
+remaining typed family detail, populated macro data and complete installed proof remain required.
+
+Data-update native evidence: service29252 and hidden Desktop29257 connected without a password.
+During a91.57s observation with no Refresh or user mutation, Home's market-information query
+completed nine successful reads, zero errors and automatic follow-ups after changes during reads.
+All nine retained closes remained visible; this after-hours check does not prove current streaming
+quotes. Advanced Research completed all four active queries without errors; macro coverage remains
+0/15. Evidence: `domain-updates-native-{initial,home,research}.json`, matching build/live/native logs.
+The observation exposed a presentation error: background fetching incorrectly relabeled verified
+saved prices as unchecked. Collection cards now distinguish updating the last checked availability
+from an actual failed refresh/disconnection; TypeScript recheck passes. Crypto publication/health
+and orderly log-drain shutdown remain separate open defects. No CI, release gate or RAM claim.
+
+Macro wave is accepted as a bounded read-contention checkpoint. Three critical checks pass: manifest discovery during an
 active write (1/1,0.56s), publication/origin reads during a write (1/1,7.89s), and Tiingo original
 history restart/corruption (1/1,0.95s). Logs: `macro-snapshot-{manifest,origin,original-restart}-critical.log`
 in ignored `.agents/tmp/v1-first-stock/`. Service build PASS5m28s. Native startup verification below is complete for this bounded slice. Source changes reuse existing snapshot/query logic;

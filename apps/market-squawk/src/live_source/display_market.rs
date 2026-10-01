@@ -1136,6 +1136,7 @@ struct DirectoryInner {
     lifecycle: Mutex<()>,
     entries: Mutex<Vec<ActorEntry>>,
     cancellation: CancellationToken,
+    application_changes: market_squawk_runtime::ApplicationChanges,
 }
 
 impl Drop for DirectoryInner {
@@ -1149,6 +1150,7 @@ impl DisplayMarketDirectory {
     pub(crate) fn try_new(
         maximum_routes: NonZeroUsize,
         cancellation: CancellationToken,
+        application_changes: market_squawk_runtime::ApplicationChanges,
     ) -> Result<Self, DisplayMarketDirectoryError> {
         if maximum_routes.get() > MAX_DISPLAY_MARKET_ROUTES {
             return Err(DisplayMarketDirectoryError::Configuration(
@@ -1168,6 +1170,7 @@ impl DisplayMarketDirectory {
                 lifecycle: Mutex::new(()),
                 entries: Mutex::new(entries),
                 cancellation,
+                application_changes,
             }),
         })
     }
@@ -1229,6 +1232,7 @@ impl DisplayMarketDirectory {
             terminal_request_receiver,
             status_sender,
             worker_cancellation,
+            self.inner.application_changes.clone(),
         ));
         let read_client = ReadClient {
             commands: read_sender,
@@ -1496,6 +1500,7 @@ async fn run_actor(
     mut terminal_requests: watch::Receiver<Option<DisplayMarketTerminalFailure>>,
     status: watch::Sender<Option<DisplayMarketTerminalFailure>>,
     cancellation: CancellationToken,
+    application_changes: market_squawk_runtime::ApplicationChanges,
 ) {
     let mut state = DisplayMarketState::default();
     let mut ingress_open = true;
@@ -1519,6 +1524,7 @@ async fn run_actor(
                                 &status,
                                 &mut ingress,
                                 &mut ingress_open,
+                                &application_changes,
                             );
                         }
                     }
@@ -1541,7 +1547,11 @@ async fn run_actor(
                             &status,
                             &mut ingress,
                             &mut ingress_open,
+                            &application_changes,
                         );
+                    } else {
+                        application_changes.record(market_squawk_services::ServiceDomain::Market);
+                        application_changes.record(market_squawk_services::ServiceDomain::Portfolio);
                     }
                     drop(_ticket);
                 }
@@ -1556,6 +1566,7 @@ async fn run_actor(
                             &status,
                             &mut ingress,
                             &mut ingress_open,
+                            &application_changes,
                         );
                     }
                 }
@@ -1563,6 +1574,8 @@ async fn run_actor(
             },
         }
     }
+    application_changes.record(market_squawk_services::ServiceDomain::Market);
+    application_changes.record(market_squawk_services::ServiceDomain::Portfolio);
 }
 
 fn enter_terminal(
@@ -1571,11 +1584,14 @@ fn enter_terminal(
     status: &watch::Sender<Option<DisplayMarketTerminalFailure>>,
     ingress: &mut mpsc::Receiver<IngressCommand>,
     ingress_open: &mut bool,
+    application_changes: &market_squawk_runtime::ApplicationChanges,
 ) {
     state.virtual_paper.revoke();
     if state.terminal_failure.is_none() {
         state.terminal_failure = Some(failure);
         status.send_replace(Some(failure));
+        application_changes.record(market_squawk_services::ServiceDomain::Market);
+        application_changes.record(market_squawk_services::ServiceDomain::Portfolio);
     }
     ingress.close();
     while let Ok(command) = ingress.try_recv() {

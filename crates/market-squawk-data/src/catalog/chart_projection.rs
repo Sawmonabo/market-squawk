@@ -220,6 +220,7 @@ impl ChartProjectionCatalogCapability {
             first_time: first,
             last_time: last,
         };
+        let new_projection = prior.is_none();
         if let Some((saved, saved_metadata)) = prior {
             if saved != reference || saved_metadata != metadata {
                 return Err(ChartProjectionError::Invalid);
@@ -229,6 +230,12 @@ impl ChartProjectionCatalogCapability {
         }
         check(deadline, cancellation)?;
         tx.commit()?;
+        if new_projection {
+            authority
+                .catalog()
+                .publication_observer
+                .record(crate::DataPublication::ChartProjection);
+        }
         Ok(reference)
     }
 

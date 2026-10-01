@@ -400,6 +400,49 @@ pub struct ResearchService {
     provider_capture_worker: ResearchIoWorker,
     retained_read_worker: ResearchIoWorker,
     retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
+    application_changes: market_squawk_runtime::ApplicationChanges,
+    history_publications: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug)]
+struct ResearchPublicationObserver {
+    changes: market_squawk_runtime::ApplicationChanges,
+    history: Arc<tokio::sync::Notify>,
+}
+
+impl market_squawk_data::DataPublicationObserver for ResearchPublicationObserver {
+    fn published(&self, publication: market_squawk_data::DataPublication) {
+        use market_squawk_data::DataPublication;
+        use market_squawk_services::ServiceDomain;
+
+        let domains: &[ServiceDomain] = match publication {
+            DataPublication::ResearchGeneration { market_history } => {
+                if market_history {
+                    self.history.notify_one();
+                }
+                &[
+                    ServiceDomain::Research,
+                    ServiceDomain::Fundamental,
+                    ServiceDomain::Macro,
+                    ServiceDomain::Market,
+                ]
+            }
+            DataPublication::MacroGeneration => &[ServiceDomain::Research, ServiceDomain::Macro],
+            DataPublication::MarketEvents => &[ServiceDomain::Market, ServiceDomain::Portfolio],
+            DataPublication::Reference => &[
+                ServiceDomain::Market,
+                ServiceDomain::Research,
+                ServiceDomain::Fundamental,
+            ],
+            DataPublication::ChartProjection => &[ServiceDomain::Market],
+            DataPublication::DerivedGeneration => {
+                &[ServiceDomain::Research, ServiceDomain::Analysis]
+            }
+        };
+        for &domain in domains {
+            self.changes.record(domain);
+        }
+    }
 }
 
 impl ResearchService {
@@ -590,13 +633,37 @@ impl ResearchService {
         paths: &LocalPaths,
         analytical: Arc<AnalyticalDataService>,
     ) -> Result<Self, ResearchServiceError> {
+        let application_changes = market_squawk_runtime::ApplicationChanges::default();
+        let history_publications = Arc::new(tokio::sync::Notify::new());
         Ok(Self {
             analytical,
             provider_captures: Arc::new(paths.sealed_research_journal_store()?),
             provider_capture_worker: ResearchIoWorker::new(),
             retained_read_worker: ResearchIoWorker::new(),
             retained_use_policies: retained_use::current_policies()?.into(),
+            application_changes,
+            history_publications,
         })
+    }
+
+    /// Shares committed domain changes with the installed event journal and display actors.
+    pub(crate) fn application_changes(&self) -> market_squawk_runtime::ApplicationChanges {
+        self.application_changes.clone()
+    }
+
+    /// Installed composition binds once before starting any provider or publication worker.
+    /// Offline restore can create temporary read services without replacing this binding.
+    pub(crate) fn bind_application_changes(&self) -> Result<(), ResearchServiceError> {
+        self.analytical
+            .install_publication_observer(Arc::new(ResearchPublicationObserver {
+                changes: self.application_changes.clone(),
+                history: Arc::clone(&self.history_publications),
+            }))
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn history_publications(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.history_publications)
     }
 
     /// Creates a retained recovery cursor without scanning history or delaying startup.

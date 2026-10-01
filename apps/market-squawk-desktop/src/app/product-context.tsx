@@ -15,6 +15,7 @@ import type {
   SystemTransport,
 } from "@/lib/transport"
 
+import { createDomainRefresh } from "./domain-refresh"
 import {
   affectedDomains,
   rejectsProductEvent,
@@ -151,6 +152,7 @@ export function ProductProvider({
     }
 
     const scope = startup.productSessionToken
+    let domainRefresh = createDomainRefresh(queryClient, scope)
     let active = true
     let failed = false
     let subscription: DesktopEventSubscription | null = null
@@ -170,6 +172,7 @@ export function ProductProvider({
     const unavailable = (retainAdmittedSession = false) => {
       if (!active) return
       failed = true
+      domainRefresh.dispose()
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
       reconnectTimer = null
       if (!retainAdmittedSession) setEventAdmittedProductSession(null)
@@ -214,6 +217,10 @@ export function ProductProvider({
             return
           }
         }
+        if (recovering) {
+          domainRefresh.dispose()
+          domainRefresh = createDomainRefresh(queryClient, scope)
+        }
         const connected = await transport.system.subscribe(
           { productSessionToken: scope, afterSequence: requestedSequence },
           (event) => {
@@ -224,6 +231,7 @@ export function ProductProvider({
               event.sequence === previousSequence
             ) {
               disconnected = true
+              domainRefresh.dispose()
               serviceReconnectRequired = true
               connecting()
               // Preserve last successful query results when in-flight reads lose transport.
@@ -241,13 +249,7 @@ export function ProductProvider({
               productSessionToken: scope,
               sequence: previousSequence,
             }
-            void Promise.all(
-              affectedDomains(event).map((domain) =>
-                queryClient.invalidateQueries({
-                  queryKey: productKeys.domain(scope, domain),
-                }),
-              ),
-            )
+            domainRefresh.invalidate(affectedDomains(event))
           },
           () => unavailable(),
         )
@@ -276,7 +278,7 @@ export function ProductProvider({
           resumed: receipt.resumed,
         })
         if (recovering) {
-          void queryClient.invalidateQueries({ queryKey: productKeys.root(scope) })
+          domainRefresh.invalidate()
         }
       } catch {
         unavailable(true)
@@ -288,6 +290,7 @@ export function ProductProvider({
 
     return () => {
       active = false
+      domainRefresh.dispose()
       if (reconnectTimer !== null) clearTimeout(reconnectTimer)
       void release().catch(() => undefined)
     }

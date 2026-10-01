@@ -50,23 +50,33 @@ impl ProductionSourceLifecycleAuthority {
     ) {
         let mut pending = None;
         let mut attempted_generation = None;
+        let history_publications = self.research.history_publications();
         loop {
-            let request = if let Some(request) = pending.take() {
-                request
+            let (request, retained_only) = if let Some(request) = pending.take() {
+                (request, false)
             } else {
-                tokio::select! {
+                let retained_only = tokio::select! {
                     biased;
                     () = shutdown.cancelled() => return,
                     changed = requests.changed() => {
                         if changed.is_err() {
                             return;
                         }
+                        false
                     }
-                }
-                let Some(request) = requests.borrow_and_update().clone() else {
+                    () = history_publications.notified() => true,
+                };
+                // A publication wake must not consume an activation racing with it: that
+                // activation still owns its one acquisition pass on the next iteration.
+                let request = if retained_only {
+                    requests.borrow().clone()
+                } else {
+                    requests.borrow_and_update().clone()
+                };
+                let Some(request) = request else {
                     continue;
                 };
-                request
+                (request, retained_only)
             };
             if shutdown.is_cancelled() {
                 return;
@@ -75,10 +85,12 @@ impl ProductionSourceLifecycleAuthority {
                 continue;
             }
             let generation = request.runtime.group_generation();
-            if attempted_generation == Some(generation) {
+            if !retained_only && attempted_generation == Some(generation) {
                 continue;
             }
-            attempted_generation = Some(generation);
+            if !retained_only {
+                attempted_generation = Some(generation);
+            }
             // Shared setup is bounded separately. Each instrument receives its own ordinary
             // recovery window when admitted; this generation is never retried by a duplicate.
             let Some(deadline) = Instant::now().checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
@@ -87,8 +99,12 @@ impl ProductionSourceLifecycleAuthority {
                 continue;
             };
             let cancellation = shutdown.child_token();
-            let preparation =
-                self.prepare_display_history(&request.runtime, deadline, &cancellation);
+            let preparation = self.prepare_display_history(
+                &request.runtime,
+                retained_only,
+                deadline,
+                &cancellation,
+            );
             tokio::pin!(preparation);
             loop {
                 tokio::select! {
@@ -134,6 +150,7 @@ impl ProductionSourceLifecycleAuthority {
     async fn prepare_display_history(
         &self,
         runtime: &AlpacaHistoricalRuntimeCapability,
+        retained_only: bool,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
@@ -156,7 +173,7 @@ impl ProductionSourceLifecycleAuthority {
         let reader = self.research.market_data_instruments();
         let records = self
             .research
-            .run_owned_research_io(deadline, cancellation, move |operation_cancellation| {
+            .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
                 instruments
                     .into_iter()
                     .map(|instrument| {
@@ -215,7 +232,7 @@ impl ProductionSourceLifecycleAuthority {
             );
             let result = self
                 .display_history
-                .prepare_market_display_history(runtime, record, &context)
+                .prepare_market_display_history(runtime, record, retained_only, &context)
                 .await;
             if cancellation.is_cancelled() || result == Err(ServiceError::Cancelled) {
                 return Err(ServiceError::Cancelled);

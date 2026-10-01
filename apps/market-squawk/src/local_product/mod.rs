@@ -631,6 +631,7 @@ impl LocalProduct {
         let (research, onboarding_catalog, feature_dataset_production_publisher) =
             open_research(&paths)?;
         let research = Arc::new(research);
+        research.bind_application_changes()?;
         // Recovery owns a bounded cursor; selected reads still verify their exact objects.
         // Historical storage size must not hold ordinary application startup behind a full scan.
         let provider_capture_recovery = research.create_provider_capture_recovery()?;
@@ -863,6 +864,7 @@ impl LocalProduct {
             prepared_market_configuration,
             prepared_schwab_service,
             Arc::clone(&live_fair_value),
+            research.application_changes(),
         )?;
         let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
         let schwab_market_doctor = schwab_oauth_installation

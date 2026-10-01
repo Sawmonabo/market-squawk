@@ -174,6 +174,7 @@ async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> Tes
         Arc::new(EventHub::try_new(
             runtime.service_generation(),
             EventHubLimits::try_new(2, 4_096)?,
+            ApplicationChanges::default(),
         )?),
         Arc::new(InputStager::new(
             paths.artifacts()?.clone(),
@@ -343,7 +344,12 @@ async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> Tes
 fn event_overflow_requires_snapshot_resynchronization() -> TestResult {
     let generation = ServiceGeneration::try_new(9)?;
     let client = client_id(5)?;
-    let hub = EventHub::try_new(generation, EventHubLimits::try_new(2, 64)?)?;
+    let changes = ApplicationChanges::default();
+    let hub = EventHub::try_new(
+        generation,
+        EventHubLimits::try_new(2, 256)?,
+        changes.clone(),
+    )?;
     let initial = EventCursor::try_new(client, generation, 0, Timestamp::from_unix_nanos(1_000))?;
     hub.publish(json!({"sequence": 1}))?;
     hub.publish(json!({"sequence": 2}))?;
@@ -360,6 +366,77 @@ fn event_overflow_requires_snapshot_resynchronization() -> TestResult {
         Err(EventReadError::SequenceGap {
             oldest_available: 2
         })
+    );
+    // Background producers coalesce without consuming one journal slot per observation.
+    let last_command =
+        EventCursor::try_new(client, generation, 3, Timestamp::from_unix_nanos(1_000))?;
+    for _ in 0..1_000 {
+        changes.record(market_squawk_services::ServiceDomain::Market);
+    }
+    changes.record(market_squawk_services::ServiceDomain::Macro);
+    let page = hub.read_after(
+        client,
+        Some(&last_command),
+        EventPageLimit::try_new(4)?,
+        Timestamp::from_unix_nanos(100),
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].sequence(), 4);
+    assert_eq!(
+        page.events()[0].payload(),
+        &json!({
+            "type": "application.domains_changed", "domains": ["market", "macro"]
+        })
+    );
+    // Another subscriber sees the same journaled event; draining the signal does not consume it.
+    assert_eq!(
+        hub.read_after(
+            client,
+            Some(&last_command),
+            EventPageLimit::try_new(4)?,
+            Timestamp::from_unix_nanos(100),
+            Timestamp::from_unix_nanos(1_000),
+        )?,
+        page
+    );
+    assert!(
+        hub.read_after(
+            client,
+            Some(page.cursor()),
+            EventPageLimit::try_new(4)?,
+            Timestamp::from_unix_nanos(100),
+            Timestamp::from_unix_nanos(1_000),
+        )?
+        .events()
+        .is_empty()
+    );
+
+    // Failed append must not consume a committed change.
+    let undersized =
+        EventHub::try_new(generation, EventHubLimits::try_new(2, 1)?, changes.clone())?;
+    changes.record(market_squawk_services::ServiceDomain::Research);
+    assert_eq!(
+        undersized.read_after(
+            client,
+            None,
+            EventPageLimit::try_new(4)?,
+            Timestamp::from_unix_nanos(100),
+            Timestamp::from_unix_nanos(1_000),
+        ),
+        Err(EventReadError::InvalidEvent)
+    );
+    let recovered = hub.read_after(
+        client,
+        Some(page.cursor()),
+        EventPageLimit::try_new(4)?,
+        Timestamp::from_unix_nanos(100),
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    assert_eq!(recovered.events()[0].sequence(), 5);
+    assert_eq!(
+        recovered.events()[0].payload()["domains"],
+        json!(["research"])
     );
     Ok(())
 }

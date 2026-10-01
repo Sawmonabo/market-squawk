@@ -418,6 +418,11 @@ impl CatalogAuthority {
             )?;
             listing_rights_policy(&transaction, &listing, trusted_catalog_now(&transaction)?)?;
             transaction.commit()?;
+            if changed != 0 {
+                self.catalog()
+                    .publication_observer
+                    .record(crate::DataPublication::Reference);
+            }
             Ok(result)
         })();
         let progress_cleanup = clear_progress_handler(connection);

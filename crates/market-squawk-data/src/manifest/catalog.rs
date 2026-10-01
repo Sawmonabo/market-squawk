@@ -160,6 +160,7 @@ impl PinnedDataset {
 
 /// SQLite-backed immutable analytical generation registry.
 pub struct AnalyticalManifestCatalog {
+    pub(crate) publication_observer: crate::ingest::DataPublicationObserverSlot,
     connection: Mutex<Connection>,
     location: CatalogLocation,
     max_objects_per_generation: usize,
@@ -924,6 +925,7 @@ impl AnalyticalManifestCatalog {
         catalog_file.validate_identity()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            publication_observer: crate::ingest::DataPublicationObserverSlot::default(),
             location: location.clone(),
             max_objects_per_generation,
             catalog_binding,
@@ -1088,6 +1090,7 @@ impl AnalyticalManifestCatalog {
                 catalog_now,
             );
             validate_generation_anchor(plan, &artifacts, &anchor, schema)?;
+            let new_generation = manifest_for_anchor(&transaction, anchor.manifest_id())?.is_none();
             let publication = publish_artifact_manifest_in_transaction(
                 &transaction,
                 result_limits,
@@ -1143,6 +1146,12 @@ impl AnalyticalManifestCatalog {
             }
             super::finalize_generation_availability(&transaction, &manifest)?;
             transaction.commit()?;
+            if new_generation {
+                self.publication_observer
+                    .record(crate::DataPublication::ResearchGeneration {
+                        market_history: market_bar_history.is_some(),
+                    });
+            }
             Ok(manifest)
         };
         match source_evidence {
@@ -1323,6 +1332,7 @@ impl AnalyticalManifestCatalog {
             catalog_now,
         );
         validate_generation_anchor(plan, &artifacts, &anchor, schema)?;
+        let new_generation = manifest_for_anchor(&transaction, anchor.manifest_id())?.is_none();
         let publication = publish_artifact_manifest_in_transaction(
             &transaction,
             result_limits,
@@ -1431,6 +1441,10 @@ impl AnalyticalManifestCatalog {
         )?;
         super::finalize_generation_availability(&transaction, &manifest)?;
         transaction.commit()?;
+        if new_generation {
+            self.publication_observer
+                .record(crate::DataPublication::MacroGeneration);
+        }
         Ok((manifest, receipt_digest))
     }
 
@@ -1578,6 +1592,7 @@ impl AnalyticalManifestCatalog {
             catalog_now,
         );
         validate_generation_anchor(plan, &artifacts, &anchor, schema)?;
+        let new_generation = manifest_for_anchor(&transaction, anchor.manifest_id())?.is_none();
         let publication = publish_artifact_manifest_in_transaction(
             &transaction,
             result_limits,
@@ -1633,6 +1648,10 @@ impl AnalyticalManifestCatalog {
         )?;
         super::finalize_generation_availability(&transaction, &manifest)?;
         transaction.commit()?;
+        if new_generation {
+            self.publication_observer
+                .record(crate::DataPublication::MacroGeneration);
+        }
         Ok((manifest, receipt))
     }
 
@@ -2016,6 +2035,8 @@ impl AnalyticalManifestCatalog {
         )?;
         super::finalize_generation_availability(&transaction, &manifest)?;
         transaction.commit()?;
+        self.publication_observer
+            .record(crate::DataPublication::DerivedGeneration);
         Ok(manifest)
     }
 

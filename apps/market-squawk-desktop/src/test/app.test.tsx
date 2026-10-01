@@ -1,8 +1,9 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
-import { QueryClientProvider } from "@tanstack/react-query"
-import { createProductQueryClient } from "@/app/query-client"
+import { QueryClientProvider, QueryObserver } from "@tanstack/react-query"
+import { ProductProvider } from "@/app/product-context"
+import { createProductQueryClient, productKeys } from "@/app/query-client"
 import { describe, expect, it, vi } from "vitest"
 
 import { App } from "@/app/app"
@@ -1533,6 +1534,83 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(pendingSignal?.aborted).toBe(true))
     resolvePending?.(impact(reads[1]!))
     await waitFor(() => expect(screen.queryByLabelText("Position comparison results")).toBeNull())
+  })
+
+  it("coalesces committed updates during a read without cancelling or losing the next refresh", async () => {
+    const queryClient = createProductQueryClient()
+    const scope = blockedBootstrap.productSessionToken
+    const queryKey = productKeys.operation(scope, "market", "marketOverview", {})
+    const inactiveKey = productKeys.operation(scope, "market", "marketInstrument", { selectionToken: marketSelectionToken })
+    const savedKey = productKeys.operation(scope, "decision", "decisionInvestmentAnalysis", { actionToken: "saved" })
+    queryClient.setQueryData(queryKey, marketOverviewResult)
+    queryClient.setQueryData(inactiveKey, marketOverviewResult)
+    queryClient.setQueryData(savedKey, { original: true })
+    const reads: { signal: AbortSignal; resolve: (result: ApplicationResult) => void; reject: (error: Error) => void }[] = []
+    const observer = new QueryObserver(queryClient, {
+      queryKey,
+      queryFn: ({ signal }) => new Promise<ApplicationResult>((resolve, reject) => {
+        reads.push({ signal, resolve, reject })
+      }),
+    })
+    const releaseObserver = observer.subscribe(() => undefined)
+    const subscriptions: Parameters<SystemTransport["subscribe"]>[1][] = []
+    const base = transport()
+    const view = render(<QueryClientProvider client={queryClient}>
+      <ProductProvider transport={{ ...base, system: { ...base.system,
+        subscribe: async (request, onEvent, onError) => {
+          subscriptions.push(onEvent)
+          return base.system.subscribe(request, onEvent, onError)
+        },
+      } }}>{null}</ProductProvider>
+    </QueryClientProvider>)
+    let sequence = 0
+    const invalidate = () => subscriptions[0]!({ productSessionToken: scope,
+      sequence: String(++sequence), body: { type: "invalidate", domains: ["market"] } })
+    try {
+      await waitFor(() => expect(subscriptions).toHaveLength(1))
+      const initial = observer.refetch()
+      expect(reads).toHaveLength(1)
+      await act(async () => { invalidate(); invalidate(); invalidate() })
+      expect(reads).toHaveLength(1)
+      expect(reads[0]!.signal.aborted).toBe(false)
+      expect(queryClient.getQueryState(inactiveKey)?.isInvalidated).toBe(true)
+      expect(queryClient.getQueryState(savedKey)?.isInvalidated).toBe(false)
+
+      const updated = marketResult({ ...marketOverviewRow, price: { value: "68001.15", currency: "USD" } })
+      await act(async () => { reads[0]!.resolve(updated); await initial })
+      await waitFor(() => expect(reads).toHaveLength(2))
+      expect(queryClient.getQueryData(queryKey)).toEqual(updated)
+      // Further updates belong to one follow-up after this refresh, not three
+      // replacement requests that repeatedly abort and starve a slow read.
+      await act(async () => { invalidate(); invalidate(); invalidate() })
+      expect(reads).toHaveLength(2)
+      expect(reads[1]!.signal.aborted).toBe(false)
+      await act(async () => { reads[1]!.resolve(marketOverviewResult) })
+      await waitFor(() => expect(reads).toHaveLength(3))
+      await act(async () => {
+        invalidate()
+        reads[2]!.reject(new Error("Current evidence could not be read."))
+      })
+      await waitFor(() => expect(queryClient.getQueryState(queryKey)?.fetchStatus).toBe("idle"))
+      expect(reads).toHaveLength(3)
+      expect(queryClient.getQueryData(queryKey)).toEqual(marketOverviewResult)
+      expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(true)
+
+      await act(async () => { invalidate() })
+      expect(reads).toHaveLength(4)
+      await act(async () => {
+        invalidate()
+        subscriptions[0]!({ productSessionToken: scope, sequence: String(sequence), body: { type: "stream_disconnected" } })
+      })
+      expect(reads[3]!.signal.aborted).toBe(true)
+      await act(async () => { reads[3]!.resolve(updated) })
+      expect(reads).toHaveLength(4)
+      expect(queryClient.getQueryData(queryKey)).toEqual(marketOverviewResult)
+    } finally {
+      view.unmount()
+      releaseObserver()
+      queryClient.clear()
+    }
   })
 
   it("admits secure startup and reconnects the workspace without accepting an old session", async () => {

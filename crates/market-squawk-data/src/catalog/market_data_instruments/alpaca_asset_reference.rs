@@ -156,6 +156,7 @@ impl CatalogAuthority {
                     return Err(Error::ReferencePositionConflict);
                 }
             }
+            let mut changed = false;
             let record = if let Some(current) = current.as_ref()
                 && already_accepted(current, &input)?
             {
@@ -193,6 +194,7 @@ impl CatalogAuthority {
                             identity_is_new,
                             commit_at,
                         )?;
+                        changed = true;
                         MarketDataInstrumentRecord {
                             definition: prepared.definition,
                             revision_digest: digest(prepared.digest),
@@ -234,6 +236,11 @@ impl CatalogAuthority {
                 .validate_catalog_precommit(self)
                 .map_err(reference_precommit_error)?;
             transaction.commit()?;
+            if changed {
+                self.catalog()
+                    .publication_observer
+                    .record(crate::DataPublication::Reference);
+            }
             Ok(record)
         })();
         let progress_cleanup = clear_progress_handler(connection);

@@ -749,6 +749,7 @@ impl AuditEvent {
 
 /// The sole process-local writer for one catalog path.
 pub struct Catalog {
+    pub(crate) publication_observer: crate::ingest::DataPublicationObserverSlot,
     pub(super) connection: Connection,
     pub(super) location: CatalogLocation,
     pub(super) _catalog_file: CatalogFileGuard,

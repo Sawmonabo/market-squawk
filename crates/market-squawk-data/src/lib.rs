@@ -260,12 +260,12 @@ pub use fund_holdings::{
 };
 pub use ingest::{
     AdmittedAnalyticalOperation, AnalyticalDataService, CommittedDataset, CompactionRequest,
-    CompletedProviderMacroPlanReceipt, GenerationOwnedProviderCaptureEvidence,
-    GenerationOwnedProviderCaptureInputEvidence, GenerationOwnedProviderCaptureObjectEvidence,
-    IngestError, IngestPrecommitAuthority, ListingReferenceAdmissionCapability,
-    MarketEventArchiveLimits, MarketEventArchiveTurn, PendingProviderMacroPlanPublication,
-    PinnedArtifactQueryRequest, ProviderCaptureRecovery, ProviderMacroMetadataCapture,
-    ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
+    CompletedProviderMacroPlanReceipt, DataPublication, DataPublicationObserver,
+    GenerationOwnedProviderCaptureEvidence, GenerationOwnedProviderCaptureInputEvidence,
+    GenerationOwnedProviderCaptureObjectEvidence, IngestError, IngestPrecommitAuthority,
+    ListingReferenceAdmissionCapability, MarketEventArchiveLimits, MarketEventArchiveTurn,
+    PendingProviderMacroPlanPublication, PinnedArtifactQueryRequest, ProviderCaptureRecovery,
+    ProviderMacroMetadataCapture, ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
     ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
     ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, ProviderMacroPlanSessionInput,
     ProviderMacroPlanSessionReceipt, ProviderMacroPlanStagedPage, ProviderMacroPlanTerminal,
@@ -349,7 +349,8 @@ pub use research_use::{
     ResearchUseError, ResearchUseGeneration, ResearchUseGrantInput, ResearchUseGraph,
     ResearchUseGraphDigest, ResearchUseGraphEdge, ResearchUseLimits, ResearchUsePermit,
     ResearchUseRequest, ResearchUseRevocationInput, ResearchUseRevocationReason,
-    ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput, RetainedResearchUsePolicy,
+    ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput,
+    RetainedResearchUsePolicy,
 };
 pub use rights::{
     ImportedUserInputBasis, ImportedUserInputEvidence, IngestIdentity, RegisteredRightsGrant,

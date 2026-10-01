@@ -3,10 +3,14 @@
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, Ordering},
+    },
 };
 
 use market_squawk_domain::Timestamp;
+use market_squawk_services::ServiceDomain;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -15,6 +19,51 @@ use crate::{
     ClientId, EventCursor, EventCursorError, EventPageLimit, RuntimeContractError,
     ServiceGeneration,
 };
+
+/// Coalesced committed changes shared by producers and their service's event journal.
+/// Producers record only affected domains, never payloads or one allocation per observation.
+#[derive(Clone, Debug, Default)]
+pub struct ApplicationChanges(Arc<AtomicU16>);
+
+const DOMAINS: [ServiceDomain; 14] = [
+    ServiceDomain::Job,
+    ServiceDomain::Decision,
+    ServiceDomain::Operations,
+    ServiceDomain::Source,
+    ServiceDomain::Market,
+    ServiceDomain::Research,
+    ServiceDomain::Fundamental,
+    ServiceDomain::Macro,
+    ServiceDomain::Portfolio,
+    ServiceDomain::Analysis,
+    ServiceDomain::Model,
+    ServiceDomain::FairValue,
+    ServiceDomain::Bot,
+    ServiceDomain::Execution,
+];
+
+impl ApplicationChanges {
+    /// Call after a visible state change commits or an actor applies an admitted observation.
+    pub fn record(&self, domain: ServiceDomain) {
+        let bit = match domain {
+            ServiceDomain::Job => 0,
+            ServiceDomain::Decision => 1,
+            ServiceDomain::Operations => 2,
+            ServiceDomain::Source => 3,
+            ServiceDomain::Market => 4,
+            ServiceDomain::Research => 5,
+            ServiceDomain::Fundamental => 6,
+            ServiceDomain::Macro => 7,
+            ServiceDomain::Portfolio => 8,
+            ServiceDomain::Analysis => 9,
+            ServiceDomain::Model => 10,
+            ServiceDomain::FairValue => 11,
+            ServiceDomain::Bot => 12,
+            ServiceDomain::Execution => 13,
+        };
+        self.0.fetch_or(1 << bit, Ordering::Release);
+    }
+}
 
 /// Hard retention and encoded-size ceilings for one event hub.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +144,7 @@ pub struct EventHub {
     generation: ServiceGeneration,
     limits: EventHubLimits,
     state: Mutex<EventState>,
+    changes: ApplicationChanges,
 }
 
 #[derive(Debug)]
@@ -108,11 +158,13 @@ impl EventHub {
     pub fn try_new(
         generation: ServiceGeneration,
         limits: EventHubLimits,
+        changes: ApplicationChanges,
     ) -> Result<Self, EventReadError> {
         let retained = VecDeque::with_capacity(limits.retained_events.get());
         Ok(Self {
             generation,
             limits,
+            changes,
             state: Mutex::new(EventState {
                 next_sequence: 1,
                 retained,
@@ -122,11 +174,15 @@ impl EventHub {
 
     /// Publishes one bounded event without waiting for any client.
     pub fn publish(&self, payload: Value) -> Result<u64, EventReadError> {
+        let mut state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
+        self.append(&mut state, payload)
+    }
+
+    fn append(&self, state: &mut EventState, payload: Value) -> Result<u64, EventReadError> {
         let encoded = serde_json::to_vec(&payload).map_err(|_| EventReadError::InvalidEvent)?;
         if encoded.len() > self.limits.maximum_event_bytes.get() {
             return Err(EventReadError::InvalidEvent);
         }
-        let mut state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
         let sequence = state.next_sequence;
         state.next_sequence = sequence
             .checked_add(1)
@@ -159,7 +215,24 @@ impl EventHub {
                 .ensure_current(client_id, self.generation, now)
                 .map_err(EventReadError::Cursor)?;
         }
-        let state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
+        let mut state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
+        let dirty = self.changes.0.swap(0, Ordering::AcqRel);
+        if dirty != 0 {
+            let domains: Vec<_> = DOMAINS
+                .iter()
+                .enumerate()
+                .filter_map(|(bit, domain)| (dirty & (1 << bit) != 0).then_some(domain))
+                .collect();
+            let payload = serde_json::json!({
+                "type": "application.domains_changed",
+                "domains": domains,
+            });
+            if let Err(error) = self.append(&mut state, payload) {
+                // Preserve both this batch and any producer updates racing with the drain.
+                self.changes.0.fetch_or(dirty, Ordering::Release);
+                return Err(error);
+            }
+        }
         let requested_sequence = cursor.map_or(0, EventCursor::sequence);
         let oldest_available = state
             .retained

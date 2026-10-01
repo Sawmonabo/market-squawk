@@ -15,6 +15,7 @@ impl SourceActionPreparationCapability {
         &self,
         runtime: &AlpacaHistoricalRuntimeCapability,
         instrument: &MarketDataInstrumentRecord,
+        retained_only: bool,
         context: &RequestContext,
     ) -> Result<(), ServiceError> {
         let started = Instant::now();
@@ -26,24 +27,44 @@ impl SourceActionPreparationCapability {
                 .require_current(context.deadline(), context.cancellation())
                 .await
                 .map_err(map_capability_error)?;
-            stage = "current-calendar-selection";
-            let analysis_at = now()?;
-            let calendar = self
-                .calendars
-                .select(
-                    analysis_at,
-                    context.deadline(),
-                    context.cancellation().clone(),
-                )
-                .await
-                .map_err(map_calendar_error)?
-                .ok_or(ServiceError::Unavailable)?;
-            stage = "current-calendar-venue";
-            if calendar.venue_id().as_str() != "iex" {
-                return Err(ServiceError::InvalidResult);
-            }
             let history = MarketHistoryReadCapability::new(self.research.analytical_reader());
             let published = async {
+                // A later committed history generation only refreshes its retained projection.
+                // It never turns a data-change notification into another provider acquisition.
+                if retained_only {
+                    if let Some(retained) = history
+                        .prepare_latest_previous_close(
+                            &self.research,
+                            instrument_id,
+                            now()?,
+                            context,
+                        )
+                        .await?
+                    {
+                        if retained.instrument_id() != instrument_id
+                            || retained.currency() != instrument.definition().quote_currency()
+                        {
+                            return Err(ServiceError::InvalidResult);
+                        }
+                    }
+                    return Ok(false);
+                }
+                stage = "current-calendar-selection";
+                let analysis_at = now()?;
+                let calendar = self
+                    .calendars
+                    .select(
+                        analysis_at,
+                        context.deadline(),
+                        context.cancellation().clone(),
+                    )
+                    .await
+                    .map_err(map_calendar_error)?
+                    .ok_or(ServiceError::Unavailable)?;
+                stage = "current-calendar-venue";
+                if calendar.venue_id().as_str() != "iex" {
+                    return Err(ServiceError::InvalidResult);
+                }
                 stage = "configured-iex-mapping";
                 let mut listings = instrument
                     .definition()

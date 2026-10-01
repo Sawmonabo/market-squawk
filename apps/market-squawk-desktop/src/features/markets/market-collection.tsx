@@ -102,8 +102,8 @@ export function MarketCollection({
   const removed = entries.filter((entry) => !entry.kept)
   const disconnected = eventConnection.status !== "connected"
   const busy = disconnected || choice.isPending || collection.isFetching || collection.isError
-  const marketInformationUnverified = collection.isError || collection.isFetching
-    || marketInformation.isError || marketInformation.isFetching || disconnected
+  const marketInformationUnverified = collection.isError || marketInformation.isError || disconnected
+  const refreshing = collection.isFetching || marketInformation.isFetching
 
   return <section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Your market collection">
     <div className="flex items-start justify-between gap-3">
@@ -139,7 +139,7 @@ export function MarketCollection({
               {kept.map((entry) => <li key={entry.symbol} className={layout === "grid" ? "rounded-lg border border-border bg-background/35 p-3" : "py-3 first:pt-0 last:pb-0"}>
                 <div className="flex items-center gap-3">
                   <div className="min-w-0 flex-1">
-                    <CollectionInvestment symbol={entry.symbol} market={entry.market} unverified={marketInformationUnverified} onSelect={onSelect} />
+                    <CollectionInvestment symbol={entry.symbol} market={entry.market} unverified={marketInformationUnverified} refreshing={refreshing} onSelect={onSelect} />
                   </div>
                   <Button type="button" size="xs" variant="ghost" disabled={busy}
                     aria-label={`Remove ${entry.symbol} from your collection`}
@@ -172,10 +172,11 @@ export function MarketCollection({
   </section>
 }
 
-function CollectionInvestment({ symbol, market, unverified, onSelect }: {
+function CollectionInvestment({ symbol, market, unverified, refreshing, onSelect }: {
   symbol: string
   market: MarketProductRow | null
   unverified: boolean
+  refreshing: boolean
   onSelect?: (selectionToken: string) => void
 }) {
   const label = <><span className="block text-xs font-medium">{symbol}</span>
@@ -187,7 +188,9 @@ function CollectionInvestment({ symbol, market, unverified, onSelect }: {
     {market === null ? <p className="mt-2 text-[10px] text-muted-foreground">Investment details are not available yet.</p>
       : <div className="mt-2 text-[10px] text-muted-foreground">
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
-        <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : availabilityLabel(market)}{market.changePercent !== null ? ` · ${market.changePercent}%` : ""}</p>
+        <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : refreshing
+          ? `${availabilityLabel(market)} at last check · Updating`
+          : availabilityLabel(market)}{market.changePercent !== null ? ` · ${market.changePercent}%` : ""}</p>
         {market.asOf ? <time dateTime={market.asOf}>{new Date(market.asOf).toLocaleString()}</time> : null}
       </div>}
   </>

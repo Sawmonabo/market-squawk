@@ -236,6 +236,8 @@ impl Catalog {
         )?;
         check_cancelled(cancellation)?;
         transaction.commit()?;
+        self.publication_observer
+            .record(crate::DataPublication::MarketEvents);
         Ok(commit)
     }
 }

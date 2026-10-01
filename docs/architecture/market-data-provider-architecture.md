@@ -395,6 +395,19 @@ The sources are complementary layers. No single provider is expected to supply t
 and the frontend never calls a provider directly. Desktop, CLI, and MCP consume only fixed typed
 application operations over admitted canonical data.
 
+Committed data changes reach Desktop through the shared service event journal. One synchronous
+data-publication observer marks closed application domains immediately after a semantic commit,
+even if its caller later cancels. Display actors mark changes after applying current observations.
+An atomic domain union coalesces these marks until the existing event reader appends one sequenced
+notification; native forwarding preserves cursor/restart checks and its existing polling cadence.
+Desktop invalidates the affected query families without canceling in-flight reads and retains a
+follow-up refresh for changes arriving during a read. Read-only work, rights bookkeeping, replay
+and physical compaction do not generate updates. New market-history commits wake the existing
+source-owned worker to refresh retained close projections without starting another acquisition.
+This path does not replace separate job, decision, model or paper-result publication ownership;
+current coverage and verification are recorded in the delivery ledger.
+
+
 Provider identity and provider-runtime plumbing stop at the application boundary for ordinary
 product reads. Home, Markets, Opportunities, Portfolio, Paper Execution, Research, Models,
 Forecasts, Backtests, Valuation, and Risk receive canonical domain results and plain-language data

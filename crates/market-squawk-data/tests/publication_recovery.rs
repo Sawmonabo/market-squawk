@@ -4458,13 +4458,64 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 64, Duration::from_secs(60))?,
     )?);
+    #[derive(Debug)]
+    struct CommitObserver {
+        publications: AtomicUsize,
+        history_publications: AtomicUsize,
+        cancellation: CancellationToken,
+    }
+    impl market_squawk_data::DataPublicationObserver for CommitObserver {
+        fn published(&self, publication: market_squawk_data::DataPublication) {
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            if publication == market_squawk_data::DataPublication::Reference {
+                // Cancel at the committed boundary, before the publisher's final classification.
+                self.cancellation.cancel();
+            }
+            if publication
+                == (market_squawk_data::DataPublication::ResearchGeneration {
+                    market_history: true,
+                })
+            {
+                self.history_publications.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    let observer = Arc::new(CommitObserver {
+        publications: AtomicUsize::new(0),
+        history_publications: AtomicUsize::new(0),
+        cancellation: CancellationToken::new(),
+    });
+    service.install_publication_observer(observer.clone())?;
+    assert!(matches!(
+        service.install_publication_observer(observer.clone()),
+        Err(IngestError::Catalog(CatalogError::InvalidConfiguration))
+    ));
     let definition_synchronizer = service.market_data_instrument_synchronization();
+    let interrupted = definition_synchronizer.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![definition.clone()], 1)?,
+        Instant::now() + Duration::from_secs(10),
+        &observer.cancellation,
+    );
+    assert!(matches!(
+        interrupted,
+        Err(market_squawk_data::MarketDataInstrumentCatalogError::Cancelled)
+    ));
+    assert_eq!(observer.publications.load(Ordering::SeqCst), 1);
     let synchronized = definition_synchronizer.synchronize(
-        MarketDataInstrumentSynchronization::try_new(vec![definition], 1)?,
+        MarketDataInstrumentSynchronization::try_new(vec![definition.clone()], 1)?,
         Instant::now() + Duration::from_secs(10),
         &CancellationToken::new(),
     )?;
-    assert_eq!((synchronized.inserted(), synchronized.replayed()), (1, 0));
+    assert_eq!((synchronized.inserted(), synchronized.replayed()), (0, 1));
+    assert!(matches!(
+        definition_synchronizer.synchronize(
+            MarketDataInstrumentSynchronization::try_new(vec![definition], 1)?,
+            Instant::now() + Duration::from_secs(10),
+            &observer.cancellation,
+        ),
+        Err(market_squawk_data::MarketDataInstrumentCatalogError::Cancelled)
+    ));
+    assert_eq!(observer.publications.load(Ordering::SeqCst), 1);
     drop(definition_synchronizer);
     let identity_at = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
@@ -4583,6 +4634,8 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             "unexpected publication rejection for case {ordinal}: {error:?}"
         );
     }
+    // Failed canonical publications, identity reads and rights writes never emit changes.
+    assert_eq!(observer.publications.load(Ordering::SeqCst), 1);
     let older_wide = publish_complete_history_fixture(
         &service,
         &source,
@@ -4603,6 +4656,9 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         "alpaca:paper-iex:complete-daily-history:aapl:older-wide:v1",
     )
     .await?;
+
+    assert_eq!(observer.publications.load(Ordering::SeqCst), 2);
+    assert_eq!(observer.history_publications.load(Ordering::SeqCst), 1);
 
     let cutoff = Timestamp::from_unix_nanos(i64::MAX - 1);
     let reader = service.analytical_reader();
