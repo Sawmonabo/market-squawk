@@ -1184,6 +1184,52 @@ async fn exercise_market_collection(
         comparison.result()["value"]["data"]["kind"],
         "profile_options"
     );
+    // Critical dispatch gap: absent fiscal inputs must return the complete unavailable plan,
+    // not fail the investment workflow because its declared operation has no installed handler.
+    let profile = client
+        .invoke_operation(
+            RequestId::try_string(format!("fiscal-profile-{restored}"))?,
+            "AnalyticalProfile.Resolve",
+            json!({"resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await?;
+    anyhow::ensure!(profile.result()["ok"] == true, "{}", profile.result());
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let instrument = "641d80ba-1a54-4efc-ab36-81875f37815f";
+    let fiscal = client
+        .invoke_operation(
+            RequestId::try_string(format!("fiscal-plan-{restored}"))?,
+            "Analysis.GetFiscalPreparationPlan",
+            json!({
+                "instrumentId": instrument,
+                "sourceCutoffUnixNanos": cutoff,
+                "financialProfile": profile.result()["value"]["data"],
+                "resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}
+            }),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await?;
+    anyhow::ensure!(fiscal.result()["ok"] == true, "{}", fiscal.result());
+    let plan = &fiscal.result()["value"]["data"];
+    anyhow::ensure!(plan["instrumentId"] == instrument);
+    anyhow::ensure!(plan["sourceCutoffUnixNanos"] == cutoff);
+    anyhow::ensure!(
+        plan["financialProfileDigest"] == profile.result()["value"]["data"]["configurationDigest"]
+    );
+    let targets = plan["targets"]
+        .as_array()
+        .context("fiscal target coverage")?;
+    anyhow::ensure!(targets.len() == 9);
+    anyhow::ensure!(targets.iter().all(|target| {
+        target["availability"]["state"] == "unavailable"
+            && target["availability"]["reason"] == "source_population_unavailable"
+    }));
     assert_eq!(response.result()["ok"], true, "{}", response.result());
     let data = &response.result()["value"]["data"];
     let entries = data["entries"].as_array().context("collection entries")?;

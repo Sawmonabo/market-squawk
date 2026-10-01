@@ -11,7 +11,7 @@ use std::{
 use market_squawk_data::{
     CurrentListedPopulation, CurrentListedPopulationAdmission,
     CurrentListedPopulationScope, CurrentPopulationError, CurrentPopulationExclusionReason,
-    MarketDataInstrumentPopulationQuery,
+    MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentRecord, Sha256Digest,
 };
 use market_squawk_services::ServiceError;
@@ -641,6 +641,9 @@ pub(crate) async fn prepare_fixed_current_population(
                 .instruments
                 .pin_population_as_of(query, deadline, &token)
                 .map_err(map_instrument_service_error)?;
+            if selected.disposition() != MarketDataInstrumentPopulationDisposition::Complete {
+                return Err(ServiceError::Unavailable);
+            }
             let admission = CurrentListedPopulationAdmission::try_new_fixed_cohort(
                 selected,
                 financial_profile_digest,

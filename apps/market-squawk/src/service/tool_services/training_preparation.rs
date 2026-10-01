@@ -38,6 +38,7 @@ const MAXIMUM_DATASET_RESULT_BYTES: usize = 16 * 1024;
 #[derive(Clone)]
 pub(crate) struct InstalledProductTraining {
     paths: LocalPaths,
+    research: Arc<crate::ResearchService>,
     instruments: Option<Arc<crate::application::InstrumentContextReadCapability>>,
     artifacts: Arc<dyn ArtifactRepository>,
     jobs: Arc<SqliteJobRepository>,
@@ -47,6 +48,7 @@ impl InstalledProductTraining {
         Self {
             instruments: product.instrument_context_read_capability().map(Arc::new),
             paths: product.paths().clone(),
+            research: product.research(),
             artifacts: product.artifacts(),
             jobs: jobs.repository(),
         }
@@ -192,6 +194,45 @@ impl InstalledProductTraining {
             .map(|(selection, _)| selection)
     }
 
+    /// Verifies exact exports on the existing owned I/O lane under the original request budget.
+    pub(crate) async fn verify_dataset_export(
+        &self,
+        export: Sha256Digest,
+        contract: FeatureDatasetProductContract,
+        as_of: Timestamp,
+        context: &RequestContext,
+    ) -> Result<PythonDatasetSelection, ServiceError> {
+        super::ensure_live(context)?;
+        let paths = self.paths.clone();
+        let deadline = context.deadline();
+        let limits = PythonDatasetVerificationLimits::try_new(100_000, 256 * 1024 * 1024)
+            .map_err(|_| ServiceError::Internal)?;
+        let selection = self
+            .research
+            .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+                verify_python_dataset(
+                    paths.root(),
+                    export,
+                    contract,
+                    as_of,
+                    limits,
+                    deadline,
+                    &cancellation,
+                )
+            })
+            .await
+            .map_err(crate::application::map_source_research_error)?
+            .map_err(|error| match error {
+                market_squawk_data::PythonDatasetCatalogError::Cancelled => ServiceError::Cancelled,
+                market_squawk_data::PythonDatasetCatalogError::DeadlineExceeded => {
+                    ServiceError::DeadlineExceeded
+                }
+                _ => ServiceError::InvalidResult,
+            })?;
+        super::ensure_live(context)?;
+        Ok(selection)
+    }
+
     async fn read_prepared_dataset(
         &self,
         snapshot: &JobSnapshot,
@@ -266,23 +307,14 @@ impl InstalledProductTraining {
         }
         // Native verification resolves the exact catalog production receipt, reopens all
         // immutable objects, and checks current Train rights and the complete row selection.
-        let selection = verify_python_dataset(
-            self.paths.root(),
-            digest(&wire.phase_one_descriptor_sha256)?,
-            contract,
-            Timestamp::from_unix_nanos(wire.selection_as_of_unix_nanos),
-            PythonDatasetVerificationLimits::try_new(100_000, 256 * 1024 * 1024)
-                .map_err(|_| ServiceError::Internal)?,
-            context.deadline(),
-            context.cancellation(),
-        )
-        .map_err(|error| match error {
-            market_squawk_data::PythonDatasetCatalogError::Cancelled => ServiceError::Cancelled,
-            market_squawk_data::PythonDatasetCatalogError::DeadlineExceeded => {
-                ServiceError::DeadlineExceeded
-            }
-            _ => ServiceError::InvalidResult,
-        })?;
+        let selection = self
+            .verify_dataset_export(
+                digest(&wire.phase_one_descriptor_sha256)?,
+                contract,
+                Timestamp::from_unix_nanos(wire.selection_as_of_unix_nanos),
+                context,
+            )
+            .await?;
         let identity = selection.identity();
         let manifest = identity.manifest();
         let training=matches!(contract,FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1

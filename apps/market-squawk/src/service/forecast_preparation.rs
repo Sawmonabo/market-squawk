@@ -1,6 +1,9 @@
 //! Installed-service adapter for evidence-derived forecast preparation.
 
 mod fiscal;
+pub(super) use fiscal::{
+    GET_FISCAL_PREPARATION_PLAN, START_FISCAL_DATASET_BUILD, START_FISCAL_FORECAST,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -49,6 +52,7 @@ const MAXIMUM_CATALOG_INSTRUMENTS: usize = 4_096;
 /// One process-owned preparation authority, absent only when no model runtime is admitted.
 pub(super) struct InstalledForecastPreparation {
     authority: Option<Arc<ForecastPreparationAuthority>>,
+    research: Arc<crate::ResearchService>,
     instruments: Option<InstrumentContextReadCapability>,
     runtime: RuntimeIdentity,
     calendars: CompletedMarketSessionReadCapability,
@@ -62,6 +66,7 @@ impl InstalledForecastPreparation {
     ) -> Self {
         Self {
             authority,
+            research: product.research(),
             instruments: product.instrument_context_read_capability(),
             calendars: CompletedMarketSessionReadCapability::new(
                 product.research(),

@@ -5355,3 +5355,21 @@ Desktop's exclusive local receipt owner. Existing startup/reconnect renderer tes
 PASS. The Home saved collection renders all nine starters; its includeMarket request remains
 rejected and is part of the separate active price-remediation wave. No complete market-data or
 installed-release acceptance is claimed.
+
+Window checkpoint pushed as `62a9be27`. Native Ready/Home recovery verified; no pricing claim.
+Astra calendar_currentness_failure released stable metadata identity and now traces read-only
+`application/paper/market/durable_product.rs` and market history previous-close reading to identify
+the exact InvalidResult behind includeMarket rejection. No edits in this diagnostic follow-up;
+lead retains shared history/read contracts. Alpaca ingress lane remains disjoint and active.
+
+Lead adds closed, failure-only stages to `research/market_history/previous_close.rs` before the
+next build. VTI stored21-bar publication is present and timestamp checks inspected so far pass;
+exact failed reader/rejoin/projection predicate remains unproven. Diagnostics expose only stage,
+instrument and closed service error, preserving all existing admission/integrity behavior.
+
+Fiscal dispatch checkpoint: shared installed service startup/restart critical check PASS1/1
+(86.29s; serialized compile8m55s) after shared dataset-export verification integration. The
+three current fiscal operations now dispatch through existing dataset/forecast owners; absent
+source population returns the complete nine-target unavailable plan. Positive fiscal forecasts
+still require SEC issuer population and an admitted model runtime; no complete analysis claim.
+Source metadata/backpressure and saved-price diagnostics remain separate uncommitted work.

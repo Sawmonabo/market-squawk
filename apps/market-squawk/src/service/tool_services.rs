@@ -53,7 +53,10 @@ use super::{
         GENERATE_INVESTMENT_ANALYSIS, InstalledDecisionOperations, RUN_SCREEN,
         investment_generation::InvestmentGenerationOperations,
     },
-    forecast_preparation::{InstalledForecastPreparation, START_PREPARED_FORECAST},
+    forecast_preparation::{
+        GET_FISCAL_PREPARATION_PLAN, InstalledForecastPreparation, START_FISCAL_DATASET_BUILD,
+        START_FISCAL_FORECAST, START_PREPARED_FORECAST,
+    },
     historical_study::{
         COMPLETE_HISTORICAL_STUDY_FISCAL_PAGE, GET_HISTORICAL_STUDY_PLAN, InstalledHistoricalStudy,
         START_HISTORICAL_STUDY_DATASET, START_HISTORICAL_STUDY_TRAINING,
@@ -646,6 +649,25 @@ impl InstalledToolServices {
                     JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
                 )
             }
+            START_FISCAL_DATASET_BUILD => {
+                let prepared = self
+                    .forecast_preparation
+                    .prepare_fiscal_dataset(
+                        self.dataset_preparation.authority().as_ref(),
+                        request,
+                        context,
+                    )
+                    .await?;
+                let admission = self
+                    .runners
+                    .analysis_phase_one_feature_derived_generation()
+                    .admit_prepared(prepared, captured_at)
+                    .map_err(map_research_admission)?;
+                (
+                    admission,
+                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                )
+            }
             START_HISTORICAL_STUDY_DATASET => {
                 let prepared = self
                     .historical_study
@@ -832,8 +854,20 @@ impl InstalledToolServices {
                     .map_err(map_training_admission)?;
                 (admission, JobAdmissionOwner::Training)
             }
-            START_PREPARED_FORECAST => {
-                let terminal = self.forecast_preparation.consume(request, context).await?;
+            START_PREPARED_FORECAST | START_FISCAL_FORECAST => {
+                let terminal = if request.name() == START_FISCAL_FORECAST {
+                    self.forecast_preparation
+                        .prepare_fiscal_forecast(
+                            self.dataset_preparation.authority().as_ref(),
+                            &self.training_preparation,
+                            self.runners.training().ok_or(ServiceError::Unavailable)?,
+                            request,
+                            context,
+                        )
+                        .await?
+                } else {
+                    self.forecast_preparation.consume(request, context).await?
+                };
                 let admission = self
                     .runners
                     .forecast()
@@ -1576,7 +1610,9 @@ impl InstalledToolServices {
                 return Ok(result);
             });
         }
-        if InstalledForecastPreparation::owns(request.name()) {
+        if InstalledForecastPreparation::owns(request.name())
+            || request.name() == GET_FISCAL_PREPARATION_PLAN
+        {
             return Box::pin(async move {
                 let descriptor = self
                     .application
@@ -1589,7 +1625,17 @@ impl InstalledToolServices {
                 {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let result = self.forecast_preparation.call(&request, &context).await?;
+                let result = if request.name() == GET_FISCAL_PREPARATION_PLAN {
+                    self.forecast_preparation
+                        .fiscal_plan(
+                            self.dataset_preparation.authority().as_ref(),
+                            &request,
+                            &context,
+                        )
+                        .await?
+                } else {
+                    self.forecast_preparation.call(&request, &context).await?
+                };
                 result
                     .validate_for(&descriptor)
                     .map_err(ServiceError::from)?;
@@ -1987,6 +2033,8 @@ fn owns_job_start(name: &str) -> bool {
             | START_PREPARED_TRAINING
             | START_INVESTMENT_DATASET
             | START_HISTORICAL_STUDY_DATASET
+            | START_FISCAL_DATASET_BUILD
+            | START_FISCAL_FORECAST
             | START_PROBABILITY_DATASET
             | START_HISTORICAL_STUDY_TRAINING
             | START_RECOMMENDATION_BACKTEST
