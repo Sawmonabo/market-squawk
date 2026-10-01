@@ -86,7 +86,21 @@ impl Catalog {
             .map_err(|_| CatalogError::InvalidRecord)?;
         self.market_recovery_read(deadline, cancellation, || {
             let mut statement = self.connection.prepare(
-                "SELECT DISTINCT generation.dataset_id, indexed.source_id, indexed.venue_id
+                "WITH datasets AS (
+                   SELECT DISTINCT dataset_id FROM analytical_available_generations
+                   WHERE available_at_ns<=?3 AND generation_kind='ingest'
+                     AND schema_name=?4 AND schema_version=?5 AND schema_fingerprint=?6
+                 ), routes AS (
+                   SELECT DISTINCT source_id, venue_id FROM provider_market_event_selection_index
+                   WHERE instrument_id=?1
+                     AND source_timestamp_ns IS NOT NULL AND source_timestamp_ns<=?2
+                     AND available_at_ns<=?3 AND ingested_at_ns<=?3
+                     AND event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 )
+                 SELECT datasets.dataset_id, routes.source_id, routes.venue_id
+                 FROM datasets CROSS JOIN routes
+                 WHERE EXISTS (
+                 SELECT 1
                  FROM provider_market_event_selection_index AS indexed
                  JOIN analytical_generation_provider_publication_bindings AS publication
                    ON publication.publication_digest=indexed.publication_digest
@@ -106,8 +120,12 @@ impl Catalog {
                    AND generation.schema_name=?4 AND generation.schema_version=?5
                    AND generation.schema_fingerprint=?6
                    AND indexed.event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                 ORDER BY generation.dataset_id COLLATE BINARY,
-                          indexed.source_id COLLATE BINARY, indexed.venue_id COLLATE BINARY
+                   AND generation.dataset_id=datasets.dataset_id
+                   AND indexed.source_id=routes.source_id
+                   AND indexed.venue_id=routes.venue_id
+                 )
+                 ORDER BY datasets.dataset_id COLLATE BINARY,
+                          routes.source_id COLLATE BINARY, routes.venue_id COLLATE BINARY
                  LIMIT ?15",
             )?;
             let mut rows = statement.query(params![

@@ -2,7 +2,7 @@
 
 ## Active startup, optional-lock and previous-close integration — 2026-09-30
 
-Current pushed data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
+Current pushed currentness checkpoint: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
 History integration audit base: `a0e8b77b`; both preserved on `feature/v1-installed-product-experience`.
 One primary worktree, three local branches and three origin branches; no linked worktrees.
 Original session and recovery backups remain protected. No CI or release gate has run for this wave.
@@ -14,6 +14,8 @@ Lock/Forget, and a user-selected reauthentication interval. Saved pages remain u
 supersedes forced password storage in development and any conflicting import-only guidance.
 
 ### Current outcomes and verification
+
+Durable route discovery is corrected without schema/cache changes: compact dataset/source/venue keys and EXISTS preserve the exact original eligibility joins. Existing provider-event restart/cutoff/corruption case passes (0.99s). Read-only preserved-catalog comparisons match all 36 result sets across nine instruments and four clock/event cases; current Quote/Trade routes drop from 9.41s to 16ms total. Evidence: `route-query-{critical.log,results.json,measure.py,original.sql}`. The integrated native build is running; no Desktop timeout-closure claim yet.
 
 Exact publication reads are critically verified in the existing restart case (1.01s), including inherited selection and unrelated/selected file corruption. Complete history/restart passes (1.19s); adapter contract case passes. Native three-binary build passes (5m52s). The native sweep still reports Home/Markets failures, so no screen-completion claim: the subsequent live retry exposed an extraction stack overflow and additional currentness contention. This data-read checkpoint is independently useful and does not claim to close those remaining defects.
 
@@ -39,6 +41,8 @@ Evidence under `.agents/tmp/v1-first-stock/`:
 
 ### Dependency and ownership
 
+Measured market query correction: Astra `research_options_failure` exclusively owns `crates/market-squawk-data/src/catalog/market_recovery.rs`, only durable-route SQL. Existing route query costs 1.34–1.51s for one instrument in the preserved catalog; nine sequential reads consume most of the native deadline. Compact dataset/route keys plus an exact EXISTS eligibility join measured 46.95ms for all nine. Preserve all source-input/schema/clock predicates, ordering, limits and cancellation. No other query changes, schema/index/cache or new test harness. Lead runs the existing publication/restart critical case and native proof.
+
 Parallel read-only diagnosis: Astra `research_options_failure` traces Home/Markets timeout after the selected-object fix, through `application/paper/market/durable_product.rs`, market-history previous-close selection and shared I/O admission. No edits, builds, Git or runtime actions. Return only demonstrated repeated/blocking work and the smallest fix proposal; lead owns any resulting implementation.
 
 Authorized extraction-stack correction: Astra `credential_runtime_lifecycle` exclusively owns app `application/research/ingest.rs`, `ingest/alpaca_historical.rs`, and sources `extraction/capture.rs`. Heap-own managed extraction/handoff payloads and optional semantic capture payload so large results are not copied through every nested async frame. Bounded crash disassembly confirms cumulative frame pressure (ingest_inner approximately459KiB), not a large RawTask frame alone. Preserve capture serialization/digests and AbortOnDrop/cancellation; no increased stack limit, extra runtime or data cap.
@@ -47,7 +51,7 @@ Authorized Desktop reconnect correction: Sol `desktop_disconnect_recovery` owns 
 
 Authorized currentness correction: Astra `calendar_currentness_failure` exclusively owns `provider_onboarding/{service.rs,service/lifecycle_runtime.rs,mod.rs}`, `provider_activation/{account.rs,eia.rs,census.rs}`, plus guard comments in `market_runtime/alpaca_historical/calendar/publication.rs` and `market_calendar/alpaca/completed.rs`. Replace the single activation mutex with one reader/writer authority: immutable exact lease/currentness and publication guards share reads; mutations retain exclusive writes. Preserve pending-writer failure, durable lease/expiry checks and cancellation. Add only the critical shared-read/exclusive-revocation assertion within existing onboarding tests. Lead serializes verification and integration.
 
-The extraction-stack, shared-currentness and Desktop reconnect slices are returned and released to the lead. Actual changes have been inspected; no agent ran builds or Git. The complete-history/restart case still passes after the heap-ownership change (1.24s). The exact shared-read/revocation regression passes (0.47s; `shared-lease-critical.log`); Desktop typecheck passes. Renderer recovery verification and one integrated native build follow. Native proof must exercise real history ingestion, simultaneous ordinary screen reads and backend replacement. None of these three fixes is yet live verified.
+The extraction-stack, shared-currentness and Desktop reconnect slices are returned and released to the lead. Actual changes have been inspected; no agent ran builds or Git. The complete-history/restart case still passes after the heap-ownership change (1.24s). The exact shared-read/revocation regression passes (0.47s; `shared-lease-critical.log`); Desktop typecheck and the existing reconnect critical case pass (1.02s). Its two initial assertion failures were the wrong loading label and an unflushed React Query notification under fake timers; replacement receipt, cursor and failure assertions remain intact. The measured route-query correction and one integrated native build follow. Native proof must exercise real history ingestion, simultaneous ordinary screen reads and backend replacement. None of these three fixes is yet live verified.
 
 The observed failure remains explicit: service PID3969 aborted during real history extraction, and Desktop then remained on Loading workspace. The earlier rebuilt sweep had Home/Markets timeouts with the other 15 routes loading. Currentness diagnostics identified activation-busy at history receipt authorization. These are the concrete acceptance barriers; passing narrow checks alone does not close them.
 
