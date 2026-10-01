@@ -413,7 +413,10 @@ pub(crate) enum DashboardQueryCommand {
         text: String,
         categories: Option<Vec<String>>,
     },
-    MarketCollection,
+    MarketCollection {
+        #[serde(default)]
+        include_market: bool,
+    },
     MarketSetCollectionChoice {
         expected_revision: String,
         symbol: String,

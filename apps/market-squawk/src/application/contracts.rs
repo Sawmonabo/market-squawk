@@ -603,6 +603,10 @@ const ANALYSIS_LOOKUP_ARGUMENTS: &[ArgumentSpec] = &[
         ArgumentKind::EnumerationArray(PRODUCT_LOOKUP_CATEGORIES),
     ),
 ];
+const MARKET_COLLECTION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
+    "includeMarket",
+    ArgumentKind::Boolean,
+)];
 const MARKET_COLLECTION_CHOICE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("expectedRevision", ArgumentKind::PositiveUnsignedText),
     ArgumentSpec::required(
@@ -1898,10 +1902,10 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     read(
         "Market.GetCollection",
-        "Read saved starter investments and their available market information.",
+        "Read saved starter investments, optionally including available market information.",
         ServiceDomain::Market,
         JOB_SCOPE,
-        NO_ARGUMENTS,
+        MARKET_COLLECTION_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     OperationSpec {

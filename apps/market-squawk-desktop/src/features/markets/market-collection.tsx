@@ -29,6 +29,7 @@ const choicesSchema = z.object({ revision: revisionSchema, choices: z.array(choi
     message: "Collection symbols must be unique.",
   })
 const collectionInput = { query: "marketCollection" } as const
+const marketInformationInput = { ...collectionInput, includeMarket: true } as const
 
 export function parseMarketCollectionResult(result: ApplicationResult) {
   return collectionSchema.parse(result.data)
@@ -39,6 +40,11 @@ export function useMarketCollection(transport: ProductTransport, scope: ProductS
   const collection = useQuery({
     queryKey: productKeys.operation(scope, "market", "Market.GetCollection", collectionInput),
     queryFn: async ({ signal }) => parseMarketCollectionResult(await transport.query(collectionInput, { signal })),
+  })
+  const marketInformation = useQuery({
+    queryKey: productKeys.operation(scope, "market", "Market.GetCollection", marketInformationInput),
+    enabled: collection.isSuccess,
+    queryFn: async ({ signal }) => parseMarketCollectionResult(await transport.query(marketInformationInput, { signal })),
   })
   const refresh = () => queryClient.invalidateQueries({
     queryKey: productKeys.domain(scope, "market"),
@@ -58,10 +64,11 @@ export function useMarketCollection(transport: ProductTransport, scope: ProductS
       }
       return result
     },
-    onSuccess: refresh,
-    onError: refresh,
+    // Saving is complete when the choice is durable; price refresh must not prolong it.
+    onSuccess: () => { void refresh() },
+    onError: () => { void refresh() },
   })
-  return { collection, choice }
+  return { collection, marketInformation, choice }
 }
 
 export function MarketCollection({
@@ -73,9 +80,22 @@ export function MarketCollection({
   onSelect?: (selectionToken: string) => void
   layout?: "list" | "grid"
 }) {
-  const { collection, choice } = state
-  const kept = collection.data?.entries.filter((entry) => entry.kept) ?? []
-  const removed = collection.data?.entries.filter((entry) => !entry.kept) ?? []
+  const { collection, marketInformation, choice } = state
+  const savedCollection = collection.data
+  const marketCollection = marketInformation.isSuccess ? marketInformation.data : null
+  const marketInformationMatches = savedCollection !== undefined && marketCollection !== null
+    && savedCollection.revision === marketCollection.revision
+    && savedCollection.entries.length === marketCollection.entries.length
+    && savedCollection.entries.every((entry) => marketCollection.entries.some((marketEntry) =>
+      marketEntry.symbol === entry.symbol && marketEntry.kept === entry.kept))
+  const entries = savedCollection?.entries.map((entry) => ({
+    ...entry,
+    market: marketInformationMatches
+      ? marketCollection?.entries.find((marketEntry) => marketEntry.symbol === entry.symbol)?.market ?? null
+      : null,
+  })) ?? []
+  const kept = entries.filter((entry) => entry.kept)
+  const removed = entries.filter((entry) => !entry.kept)
   const busy = choice.isPending || collection.isFetching || collection.isError
 
   return <section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Your market collection">
@@ -90,9 +110,16 @@ export function MarketCollection({
     {collection.isPending ? <Skeleton className="mt-5 h-40 rounded-lg" />
       : collection.isError ? <Alert className="mt-5">
         <CircleAlert aria-hidden="true" /><AlertTitle>Your market collection is unavailable</AlertTitle>
-        <AlertDescription>Reload to check your saved choices and current market information.</AlertDescription>
+        <AlertDescription>Reload to check your saved choices.</AlertDescription>
       </Alert>
         : <>
+          {marketInformation.isError ? <Alert className="mt-5">
+            <CircleAlert aria-hidden="true" /><AlertTitle>Market information is unavailable</AlertTitle>
+            <AlertDescription>Your saved collection is available. Prices and investment details could not be checked. Refresh to try again.</AlertDescription>
+          </Alert> : marketInformation.isSuccess && !marketInformationMatches ? <Alert className="mt-5">
+            <CircleAlert aria-hidden="true" /><AlertTitle>Market information needs refreshing</AlertTitle>
+            <AlertDescription>The market information does not match your latest saved collection. Refresh to check again.</AlertDescription>
+          </Alert> : marketInformation.isFetching ? <p role="status" className="mt-4 text-xs text-muted-foreground">Checking market information…</p> : null}
           {kept.length === 0 ? <p className="mt-5 rounded-lg border border-dashed border-border p-5 text-xs text-muted-foreground">Your collection is empty. Keep an investment below to show it here again.</p>
             : <ul className={layout === "grid" ? "mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3" : "mt-5 divide-y divide-border"}>
               {kept.map((entry) => <li key={entry.symbol} className={layout === "grid" ? "rounded-lg border border-border bg-background/35 p-3" : "py-3 first:pt-0 last:pb-0"}>
@@ -122,7 +149,10 @@ export function MarketCollection({
     {choice.isError ? <p role="alert" className="mt-3 text-xs text-destructive">Your choice could not be saved. Check the refreshed collection and try again.</p> : null}
     <div className="mt-4 flex flex-wrap gap-2">
       <Button type="button" size="sm" variant="outline" disabled={collection.isFetching || choice.isPending}
-        onClick={() => void collection.refetch()}>Refresh collection</Button>
+        onClick={() => {
+          void collection.refetch()
+          if (collection.isSuccess) void marketInformation.refetch()
+        }}>Refresh collection</Button>
       <Button asChild size="sm" variant="outline"><Link to="/markets">Explore markets</Link></Button>
     </div>
   </section>

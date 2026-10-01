@@ -563,11 +563,11 @@ async fn market(
             )
             .await
         }
-        MarketCommand::Collection => {
+        MarketCommand::Collection { include_market } => {
             invoke_without_result_limits(
                 authority,
                 "Market.GetCollection",
-                json!({}),
+                json!({"includeMarket": include_market}),
                 "market collection read",
             )
             .await

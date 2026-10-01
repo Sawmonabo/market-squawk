@@ -189,6 +189,8 @@ receives only exact code-owned official-provider URLs. Setup stays in Settings â
 private installed-client operations reuse the durable session, saved recipe, and credential owner.
 The provider OAuth callback transport remains scoped to authorization and serves no setup website.
 
+Saved starter choices use `Market.GetCollection` without market enrichment. This reads the durable collection directly, so provider reads cannot block the identities or Keep/Remove controls. Desktop requests `includeMarket: true` separately and attaches prices/details only when the returned collection revision and choices match. CLI exposes the same option as `market collection --include-market`; MCP uses the shared operation argument. Market-data errors remain explicit and never become fabricated prices.
+
 ### MCP request
 
 The service exposes MCP through its authenticated loopback Streamable HTTP route. The named

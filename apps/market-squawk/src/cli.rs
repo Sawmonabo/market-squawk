@@ -498,8 +498,12 @@ pub enum SourceCommand {
 /// Unified market-data operation.
 #[derive(Debug, Subcommand)]
 pub enum MarketCommand {
-    /// Read saved starter investments and their current information.
-    Collection,
+    /// Read saved starter investments.
+    Collection {
+        /// Also read current market information for the saved collection.
+        #[arg(long)]
+        include_market: bool,
+    },
     /// Keep or remove a starter investment at the displayed collection revision.
     SetCollectionChoice {
         #[arg(long)]

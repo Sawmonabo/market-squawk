@@ -16,6 +16,39 @@ impl MarketDomainService {
         limits: ServiceLimits,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        let collection = if matches!(request.name(), MARKET_GET_OVERVIEW | "Market.GetCollection") {
+            Some(
+                self.market_collection
+                    .snapshot()
+                    .map_err(|_| ServiceError::Unavailable)?,
+            )
+        } else {
+            None
+        };
+        if request.name() == "Market.GetCollection"
+            && !request
+                .arguments()
+                .get("includeMarket")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            let collection = collection.ok_or(ServiceError::InvalidResult)?;
+            let entries: Vec<_> = collection
+                .choices
+                .iter()
+                .map(|choice| {
+                    json!({"symbol": choice.symbol, "kept": choice.kept, "market": Value::Null})
+                })
+                .collect();
+            ensure_live(context)?;
+            return TypedToolResult::try_new(
+                json!({"revision": collection.revision.to_string(), "entries": entries}),
+                entries.len(),
+                ToolResultMetadata::complete_not_applicable(),
+                limits,
+            )
+            .map_err(|_| ServiceError::ResourceExhausted);
+        }
         let selections = MarketProductSelectionReadCapability::new(
             Arc::clone(&self.product_research),
             self.market_data_instruments.clone(),
@@ -26,15 +59,6 @@ impl MarketDomainService {
         let argument = |name: &str| request.arguments().get(name).and_then(Value::as_str);
         let mut identities =
             product::product_market_identities(&records, reference_at, argument("query"))?;
-        let collection = if matches!(request.name(), MARKET_GET_OVERVIEW | "Market.GetCollection") {
-            Some(
-                self.market_collection
-                    .snapshot()
-                    .map_err(|_| ServiceError::Unavailable)?,
-            )
-        } else {
-            None
-        };
         if let Some(collection) = &collection {
             identities.retain(|identity| {
                 let choice = matches!(identity.asset_class(), "equity" | "fund")

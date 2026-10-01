@@ -72,7 +72,7 @@ export type ProductQuery =
       text: string
       categories?: ProductLookupCategory[]
     }
-  | { query: "marketCollection" }
+  | { query: "marketCollection"; includeMarket?: boolean }
   | { query: "marketSetCollectionChoice"; expectedRevision: string; symbol: string; kept: boolean; confirmed: boolean }
   | { query: "marketOverview"; pageToken?: string }
   | ({ query: "marketSessionContext"; confirmed: boolean } & MarketSessionRequest)

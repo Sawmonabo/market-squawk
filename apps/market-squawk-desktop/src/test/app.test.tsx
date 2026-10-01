@@ -661,6 +661,9 @@ describe("Market Squawk desktop boundary", () => {
   it("renders one provider-neutral market journey with current price and explicit selection", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
+    let collectionRevision = 3
+    let collectionChoices = ["SPY", "QQQ", "DIA", "IWM", "VTI", "AAPL", "MSFT", "NVDA", "TSLA"]
+      .map((symbol) => ({ symbol, kept: symbol !== "QQQ" }))
     const historyToken = "history_0123456789abcdef0123456789abcdef"
     const generationToken = "a".repeat(64)
     const historyResult: ApplicationResult = {
@@ -688,6 +691,23 @@ describe("Market Squawk desktop boundary", () => {
         <App
           transport={transport(readyBootstrap, undefined, async (request, options) => {
             issuedQueries.push(request)
+            if (request.query === "marketCollection") {
+              if (request.includeMarket === true) throw new Error("Current market evidence could not be read.")
+              return {
+                data: { revision: collectionRevision.toString(), entries: collectionChoices.map((choice) => ({ ...choice, market: null })) },
+                metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
+              }
+            }
+            if (request.query === "marketSetCollectionChoice") {
+              if (request.expectedRevision !== collectionRevision.toString()) throw new Error("Collection revision is stale.")
+              collectionChoices = collectionChoices.map((choice) => choice.symbol === request.symbol
+                ? { ...choice, kept: request.kept } : choice)
+              collectionRevision += 1
+              return {
+                data: { revision: collectionRevision.toString(), choices: collectionChoices },
+                metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
+              }
+            }
             if (request.query === "marketOverview") return marketOverviewResult
             if (request.query === "marketInstrument") return marketResult({ ...marketOverviewRow, historyToken })
             if (request.query === "marketHistory") {
@@ -715,6 +735,26 @@ describe("Market Squawk desktop boundary", () => {
     expect(
       issuedQueries.filter((request) => request.query === "marketInstrument"),
     ).toHaveLength(0)
+
+    const collection = within(screen.getByRole("region", { name: "Your market collection" }))
+    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
+    await user.click(collection.getByText("Removed investments (1)"))
+    for (const choice of collectionChoices) expect(collection.getByText(choice.symbol)).toBeTruthy()
+    expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false)
+    expect((collection.getByRole("button", { name: "Keep QQQ in your collection" }) as HTMLButtonElement).disabled).toBe(false)
+    expect(collection.queryByText("68000.15 USD")).toBeNull()
+    expect(issuedQueries).toContainEqual({ query: "marketCollection", includeMarket: true })
+    await user.click(collection.getByRole("button", { name: "Remove SPY from your collection" }))
+    const restore = await collection.findByRole("button", { name: "Keep SPY in your collection" })
+    await waitFor(() => expect((restore as HTMLButtonElement).disabled).toBe(false))
+    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
+    await user.click(restore)
+    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false))
+    expect(issuedQueries.filter((request) => request.query === "marketSetCollectionChoice")).toEqual([
+      { query: "marketSetCollectionChoice", expectedRevision: "3", symbol: "SPY", kept: false, confirmed: true },
+      { query: "marketSetCollectionChoice", expectedRevision: "4", symbol: "SPY", kept: true, confirmed: true },
+    ])
+    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
 
     await user.click(marketCard)
     await waitFor(() => {

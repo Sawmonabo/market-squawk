@@ -85,7 +85,11 @@ pub(crate) async fn dashboard_query(
             insert_optional(&mut arguments, "categories", categories);
             ("Analysis.Lookup", arguments)
         }
-        DashboardQueryCommand::MarketCollection => ("Market.GetCollection", Map::new()),
+        DashboardQueryCommand::MarketCollection { include_market } => {
+            let mut arguments = Map::new();
+            arguments.insert("includeMarket".to_owned(), json!(include_market));
+            ("Market.GetCollection", arguments)
+        }
         DashboardQueryCommand::MarketSetCollectionChoice {
             expected_revision,
             symbol,
