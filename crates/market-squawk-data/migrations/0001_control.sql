@@ -338,34 +338,7 @@ BEGIN
     SELECT RAISE(ABORT, 'dataset manifest does not close an exact artifact group');
 END;
 
-CREATE TRIGGER ingest_runs_publication_guarded_success
-BEFORE UPDATE ON ingest_runs
-WHEN NEW.state = 'succeeded'
- AND NEW.operation IN ('persist', 'cache')
- AND NOT EXISTS (
-    SELECT 1
-    FROM dataset_manifests AS manifest
-    JOIN artifacts AS anchor
-      ON anchor.artifact_id = manifest.artifact_id
-     AND anchor.run_id = manifest.run_id
-    WHERE manifest.run_id = NEW.run_id
-      AND (SELECT COUNT(*) FROM artifacts AS member
-           WHERE member.run_id = NEW.run_id) BETWEEN 1 AND 1024
-      AND anchor.publication_ordinal = (
-          SELECT COUNT(*) - 1 FROM artifacts AS member
-          WHERE member.run_id = NEW.run_id
-      )
-      AND (SELECT MIN(member.publication_ordinal) FROM artifacts AS member
-           WHERE member.run_id = NEW.run_id) = 0
-      AND (SELECT MAX(member.publication_ordinal) FROM artifacts AS member
-           WHERE member.run_id = NEW.run_id) = (
-          SELECT COUNT(*) - 1 FROM artifacts AS member
-          WHERE member.run_id = NEW.run_id
-      )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'successful ingest run lacks a closed artifact group');
-END;
+
 
 CREATE TRIGGER artifacts_immutable_update
 BEFORE UPDATE ON artifacts BEGIN

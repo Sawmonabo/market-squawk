@@ -1187,7 +1187,7 @@ impl SchwabRestQuoteSealFirstSink {
             || generation.provider_dataset() != self.authority.provider_dataset()
             || generation.event_count() != expected_count
             || generation.oauth_generation() != oauth.generation()
-            || generation.restart_selector().manifest() != generation.committed().manifest()
+            || generation.restart_selector().commit() != generation.commit()
             || generation.restart_selector().publication_digest() != expected_digest
             || generation.restart_selector().publication_kind()
                 != ProviderMarketEventPublicationKind::ResponseMarketEvent
@@ -1199,7 +1199,7 @@ impl SchwabRestQuoteSealFirstSink {
             );
         }
         let durable_receipt = match MarketEventPublicationReceipt::try_new(
-            generation.restart_selector().manifest().clone(),
+            generation.restart_selector().commit().clone(),
             generation.restart_selector().publication_digest(),
             generation.restart_selector().publication_kind(),
             ProviderNativeLineageImplementation::SchwabRestMarketDataV1,

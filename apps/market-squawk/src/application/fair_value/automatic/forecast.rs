@@ -179,10 +179,7 @@ impl FairValueDomainService {
                 expires_at = expires_at.min(end);
             }
         }
-        let mut roots = reference.parent_manifests().to_vec();
-        if !roots.contains(market_selection.publication().manifest()) {
-            roots.push(market_selection.publication().manifest().clone());
-        }
+        let roots = reference.parent_manifests().to_vec();
         let authorization = research
             .authorize_research_use(
                 ResearchUseRequest::try_new(
@@ -209,10 +206,18 @@ impl FairValueDomainService {
             .await
             .map_err(|error| map_research_use_worker_error(error, context))?
             .map_err(|error| map_research_use_error(error, context))?;
-        expires_at = expires_at.min(authorization.expires_at());
-        let rights = ValuationRightsReceipt::try_from_authorization(authorization)
-            .map_err(|_| ServiceError::Unavailable)?;
-        let graph = rights.graph_digest();
+        let (event_authorization, _) = market_reader.authorize_local_analysis(
+            market_selection.publication(),
+            context.deadline(),
+            context.cancellation(),
+        )?;
+        let rights = ValuationRightsReceipt::try_from_authorization(
+            authorization,
+            vec![event_authorization],
+        )
+        .map_err(|_| ServiceError::Unavailable)?;
+        expires_at = expires_at.min(rights.expires_at());
+        let rights_input_digest = rights.rights_input_digest();
         let output_scale = market.amount().scale();
         let currency = market.amount().money().currency();
         let evidence = reference.identity();
@@ -269,7 +274,7 @@ impl FairValueDomainService {
             .map_err(map_fair_value_error)?;
             points.push(ForecastDistributionPoint {
                 point_id: name.clone().into_boxed_str(),
-                terminal_value: point_input(input, graph, knowledge_at, expires_at)?,
+                terminal_value: point_input(input, rights_input_digest, knowledge_at, expires_at)?,
                 terminal_at: source
                     .distribution()
                     .target_at()
@@ -315,7 +320,7 @@ impl FairValueDomainService {
                 amount_basis: ValuationAmountBasis::PerInstrumentUnit,
                 current_market: point_input(
                     market,
-                    graph,
+                    rights_input_digest,
                     market_selection.reference().source_cutoff()?,
                     expires_at,
                 )?,

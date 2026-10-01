@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use market_squawk_data::DatasetManifestRef;
+use market_squawk_data::MarketEventCommitRef;
 use market_squawk_domain::{EvidenceDigest, InstrumentId, LiveProvenance, MarketEvent, VenueId};
 use tokio_util::sync::CancellationToken;
 
@@ -36,18 +36,18 @@ pub struct CryptoInstalledPublicationProbe {
     metadata_revision: String,
 }
 
-/// Typed events reopened from the exact original manifest and native publication evidence.
+/// Typed events reopened from the exact original commit and native publication evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CryptoInstalledTypedRead {
-    manifest: DatasetManifestRef,
+    commit: MarketEventCommitRef,
     publication_digest: EvidenceDigest,
     source_id: String,
     events: Vec<MarketEvent>,
 }
 
 impl CryptoInstalledTypedRead {
-    pub fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    pub fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub const fn publication_digest(&self) -> EvidenceDigest {
@@ -143,8 +143,8 @@ impl CryptoInstalledPublicationReader {
 }
 
 impl CryptoInstalledPublicationProbe {
-    pub fn manifest(&self) -> &DatasetManifestRef {
-        self.selector.manifest()
+    pub fn commit(&self) -> &MarketEventCommitRef {
+        self.selector.commit()
     }
 
     pub const fn publication_digest(&self) -> EvidenceDigest {
@@ -169,9 +169,7 @@ impl CryptoInstalledPublicationProbe {
             .selector
             .reopen(research.as_ref(), deadline, CancellationToken::new())
             .await
-            .context(
-                "reopen exact installed crypto raw/native evidence and typed Parquet events",
-            )?;
+            .context("reopen exact installed crypto raw/native evidence and committed events")?;
         let events = reopened.events().events();
         if events.is_empty()
             || events.iter().any(|event| {
@@ -187,7 +185,7 @@ impl CryptoInstalledPublicationProbe {
             bail!("reopened crypto events escaped their selected source, instrument, or venue");
         }
         Ok(CryptoInstalledTypedRead {
-            manifest: self.selector.manifest().clone(),
+            commit: self.selector.commit().clone(),
             publication_digest: self.selector.publication_digest(),
             source_id: self.selector.source_id().as_str().to_owned(),
             events: events.to_vec(),

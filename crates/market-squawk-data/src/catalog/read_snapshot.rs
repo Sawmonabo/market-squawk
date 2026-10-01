@@ -230,6 +230,7 @@ impl CatalogReadSnapshot {
         kinds: &[market_squawk_domain::LiveEventClass],
         as_of: market_squawk_domain::Timestamp,
         knowledge_cutoff: market_squawk_domain::Timestamp,
+        after: Option<&super::market_recovery::ProviderMarketEventDurableRoute>,
         maximum_routes: usize,
     ) -> Result<Vec<super::market_recovery::ProviderMarketEventDurableRoute>, CatalogError> {
         super::market_recovery::load_provider_market_event_durable_routes(
@@ -239,6 +240,7 @@ impl CatalogReadSnapshot {
             kinds,
             as_of,
             knowledge_cutoff,
+            after,
             maximum_routes,
             self.deadline,
             &self.cancellation,

@@ -24,6 +24,7 @@ mod fund_holdings;
 mod ingest;
 mod manifest;
 mod market_event;
+mod market_event_store;
 mod migrations;
 mod option_market;
 mod parquet_store;
@@ -293,6 +294,7 @@ pub use manifest::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
 pub use market_event::ProviderMarketEventArrowBatch;
+pub use market_event_store::MarketEventCommitRef;
 pub use option_market::{
     OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
     ProviderOptionMarketArrowBatch,
@@ -334,16 +336,18 @@ pub use query::{
     QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,
 };
 pub use research_use::{
-    AuthorizedResearchUse, DerivedOutputObjectInput, DerivedPublicationDigest,
-    DerivedPublicationInput, DerivedPublicationObject, DerivedRetentionOperation,
-    MAX_DERIVED_PUBLICATION_OBJECTS, MAX_RESEARCH_USE_EDGES, MAX_RESEARCH_USE_GRAPH_NODES,
-    MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS, MAX_RESEARCH_USE_RETAINED_BYTES, MAX_RESEARCH_USE_ROOTS,
-    MAX_RESEARCH_USE_SOURCES, MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS, PublishedDerivedGeneration,
-    RegisteredResearchUseGrant, ResearchUse, ResearchUseAuthorityEvidence, ResearchUseCatalogError,
-    ResearchUseDecisionDigest, ResearchUseDecisionInput, ResearchUseDecisionOutcome,
-    ResearchUseDenialReason, ResearchUseError, ResearchUseGeneration, ResearchUseGrantInput,
-    ResearchUseGraph, ResearchUseGraphDigest, ResearchUseGraphEdge, ResearchUseLimits,
-    ResearchUsePermit, ResearchUseRequest, ResearchUseRevocationInput, ResearchUseRevocationReason,
+    AuthorizedMarketEventUse, AuthorizedResearchUse, DerivedOutputObjectInput,
+    DerivedPublicationDigest, DerivedPublicationInput, DerivedPublicationObject,
+    DerivedRetentionOperation, MAX_DERIVED_PUBLICATION_OBJECTS, MAX_RESEARCH_USE_EDGES,
+    MAX_RESEARCH_USE_GRAPH_NODES, MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
+    MAX_RESEARCH_USE_RETAINED_BYTES, MAX_RESEARCH_USE_ROOTS, MAX_RESEARCH_USE_SOURCES,
+    MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS, MarketEventUseInput, MarketEventUseRequest,
+    PublishedDerivedGeneration, RegisteredResearchUseGrant, ResearchUse,
+    ResearchUseAuthorityEvidence, ResearchUseCatalogError, ResearchUseDecisionDigest,
+    ResearchUseDecisionInput, ResearchUseDecisionOutcome, ResearchUseDenialReason,
+    ResearchUseError, ResearchUseGeneration, ResearchUseGrantInput, ResearchUseGraph,
+    ResearchUseGraphDigest, ResearchUseGraphEdge, ResearchUseLimits, ResearchUsePermit,
+    ResearchUseRequest, ResearchUseRevocationInput, ResearchUseRevocationReason,
     ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput,
 };
 pub use rights::{

@@ -83,6 +83,9 @@ impl ProductionSourceLifecycleAuthority {
         self.credential_access
             .suspended
             .store(true, Ordering::Release);
+        let _public_exclusion = self
+            .exclude_public_preparation(None, deadline, cancellation)
+            .await?;
         let has_gate = self
             .credential_access
             .mutation
@@ -261,7 +264,7 @@ impl ProductionSourceLifecycleAuthority {
             }
             _ => SourceLifecycleError::Unavailable,
         })?;
-        self.restore_ready_research_sources_owned(deadline, cancellation)
+        self.restore_ready_research_sources_owned(deadline, None, cancellation)
             .await?;
         let report = self
             .restore_active_live_sources(deadline, cancellation)
@@ -294,13 +297,24 @@ impl ProductionSourceLifecycleAuthority {
             .operation_before(deadline, cancellation)
             .await?;
         self.credential_access.ensure_resumed()?;
-        self.restore_ready_research_sources_owned(deadline, cancellation)
+        self.restore_ready_research_sources_owned(deadline, None, cancellation)
+            .await
+    }
+
+    pub(crate) async fn restore_ready_research_sources_independently(
+        &self,
+        operation_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SourceLifecycleError> {
+        let deadline = operation_deadline(Instant::now(), Some(operation_timeout))?;
+        self.restore_ready_research_sources_owned(deadline, Some(operation_timeout), cancellation)
             .await
     }
 
     async fn restore_ready_research_sources_owned(
         &self,
         deadline: Instant,
+        operation_timeout: Option<Duration>,
         cancellation: &CancellationToken,
     ) -> Result<(), SourceLifecycleError> {
         ensure_status_live(cancellation, deadline)?;
@@ -314,12 +328,23 @@ impl ProductionSourceLifecycleAuthority {
             return Ok(());
         }
         for surface_id in super::super::provider_activation_state::RESTORABLE_RESEARCH_SURFACES {
+            let deadline = operation_deadline(deadline, operation_timeout)?;
             let provider = SourceIdentifier::try_from(surface_id)
                 .map_err(|_| SourceLifecycleError::InvalidResult)?;
-            let gate = self
-                .lifecycle_gate_before(surface_id, deadline, cancellation)
-                .await?;
             let result = async {
+                let _operation = if operation_timeout.is_some() {
+                    Some(
+                        self.credential_access
+                            .operation_before(deadline, cancellation)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                self.credential_access.ensure_resumed()?;
+                let _gate = self
+                    .lifecycle_gate_before(surface_id, deadline, cancellation)
+                    .await?;
                 let record = self
                     .durable
                     .source_lifecycle_record(surface_id)
@@ -359,13 +384,12 @@ impl ProductionSourceLifecycleAuthority {
                 Ok::<_, SourceLifecycleError>(())
             }
             .await;
-            drop(gate);
-            ensure_status_live(cancellation, deadline)?;
+            let result = result.and_then(|()| ensure_status_live(cancellation, deadline));
             if let Err(error) = result {
-                if matches!(
-                    error,
-                    SourceLifecycleError::Cancelled | SourceLifecycleError::DeadlineExceeded
-                ) {
+                if error == SourceLifecycleError::Cancelled
+                    || error == SourceLifecycleError::DeadlineExceeded
+                        && operation_timeout.is_none()
+                {
                     return Err(error);
                 }
                 tracing::warn!(provider = %provider.as_str(), %error,

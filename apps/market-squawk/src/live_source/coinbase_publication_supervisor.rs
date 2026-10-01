@@ -3,6 +3,7 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use market_squawk_adapter_coinbase::CoinbaseMarketNonPublicationReason;
 use market_squawk_live::CommittedResearchMarketObservationReceiver;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -15,7 +16,10 @@ use crate::application::{
 };
 use crate::provider_activation::CoinbaseMarketPublicationPackage;
 
-use super::super::sink::{CoinbaseCapturedPublicationInput, CoinbaseCapturedPublicationReceiver};
+use super::super::sink::{
+    CoinbaseCapturedPublicationDisposition, CoinbaseCapturedPublicationInput,
+    CoinbaseCapturedPublicationReceiver,
+};
 
 /// Sole application-owned lifecycle for one Coinbase Advanced Trade public generation.
 #[derive(Debug)]
@@ -76,7 +80,11 @@ impl CoinbasePublicationSupervisor {
             .await;
             match &outcome {
                 Err(error) => trace_publication_worker_failure("raw", error),
-                Ok(()) => tracing::info!(worker = "raw", cancelled = raw_terminal.is_cancelled(), "Coinbase publication worker stopped"),
+                Ok(()) => tracing::info!(
+                    worker = "raw",
+                    cancelled = raw_terminal.is_cancelled(),
+                    "Coinbase publication worker stopped"
+                ),
             }
             raw_terminal.cancel();
             outcome
@@ -92,7 +100,11 @@ impl CoinbasePublicationSupervisor {
                         .await;
                 match &outcome {
                     Err(error) => trace_publication_worker_failure("committed", error),
-                    Ok(()) => tracing::info!(worker = "committed", cancelled = committed_terminal.is_cancelled(), "Coinbase publication worker stopped"),
+                    Ok(()) => tracing::info!(
+                        worker = "committed",
+                        cancelled = committed_terminal.is_cancelled(),
+                        "Coinbase publication worker stopped"
+                    ),
                 }
                 committed_terminal.cancel();
                 outcome
@@ -271,8 +283,10 @@ async fn publish_raw(
 ) -> Result<(), CoinbasePublicationSupervisorError> {
     authority.validate_precommit()?;
     let publication = authority.publication();
-    let outcome = match input {
+    let (outcome, _frame_admission) = match input {
         CoinbaseCapturedPublicationInput::Public {
+            disposition,
+            frame_admission,
             rejoin,
             seal_request,
             observed_at,
@@ -290,22 +304,35 @@ async fn publish_raw(
                     deadline,
                 )
                 .await?;
-            let idempotency = coinbase_idempotency_key(&material)?;
-            pending
-                .publish_coinbase_when_committed(
-                    publication.as_ref(),
-                    material,
-                    authority.analytical_dataset().clone(),
-                    idempotency,
-                    observed_at,
-                    authority.precommit_authority(),
-                )
-                .await?
+            let outcome = match disposition {
+                CoinbaseCapturedPublicationDisposition::AwaitCommittedRows => {
+                    let idempotency = coinbase_idempotency_key(&material)?;
+                    pending
+                        .publish_coinbase_when_committed(
+                            publication.as_ref(),
+                            material,
+                            authority.analytical_dataset().clone(),
+                            idempotency,
+                            observed_at,
+                            authority.precommit_authority(),
+                        )
+                        .await?
+                }
+                CoinbaseCapturedPublicationDisposition::FreshnessUnqualified => {
+                    CoinbaseMarketApplicationOutcome::SealedRaw(
+                        material.into_sealed_raw(
+                            CoinbaseMarketNonPublicationReason::CanonicalQualificationUnavailable,
+                        ).map_err(CryptoMarketPublicationError::from)?,
+                    )
+                }
+            };
+            (outcome, frame_admission)
         }
         CoinbaseCapturedPublicationInput::Direct { .. } => {
             return Err(CoinbasePublicationSupervisorError::InvalidTopology);
         }
     };
+    // Retain end-to-end admission until the durable read owner has retained this commit too.
     if let CoinbaseMarketApplicationOutcome::Published(receipt) = outcome {
         durable_writer.retain(receipt).await?;
     }
@@ -563,7 +590,10 @@ pub(in crate::live_source) enum CoinbasePublicationSupervisorError {
 }
 
 // Only code-owned variant names cross this diagnostic boundary, never provider material.
-fn trace_publication_worker_failure(worker: &'static str, error: &CoinbasePublicationSupervisorError) {
+fn trace_publication_worker_failure(
+    worker: &'static str,
+    error: &CoinbasePublicationSupervisorError,
+) {
     let category = match error {
         CoinbasePublicationSupervisorError::Cancelled => "cancelled",
         CoinbasePublicationSupervisorError::PublicationWorkerOwnership => "worker_ownership",
@@ -576,7 +606,9 @@ fn trace_publication_worker_failure(worker: &'static str, error: &CoinbasePublic
         CoinbasePublicationSupervisorError::Publication(error) => match error {
             CryptoMarketPublicationError::AuthorityInvalid => "publication_authority_invalid",
             CryptoMarketPublicationError::FamilyMismatch => "publication_family_mismatch",
-            CryptoMarketPublicationError::RendezvousUnavailable => "publication_rendezvous_unavailable",
+            CryptoMarketPublicationError::RendezvousUnavailable => {
+                "publication_rendezvous_unavailable"
+            }
             CryptoMarketPublicationError::Coinbase(_) => "publication_coinbase",
             CryptoMarketPublicationError::Kraken(_) => "publication_kraken",
             CryptoMarketPublicationError::Research(_) => "publication_research",

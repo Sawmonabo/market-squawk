@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::catalog::CatalogReadSnapshot;
 use crate::{
-    CatalogError, DatasetId, DatasetManifestRef, ManifestCatalogError,
+    CatalogError, DatasetId, ManifestCatalogError, MarketEventCommitRef,
     PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
     ProviderMarketEventPublicationKind,
 };
@@ -52,14 +52,14 @@ pub struct ProviderMarketEventPointInTimeRequest {
     effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
     maximum_candidates: usize,
     tie_policy: ProviderMarketEventTiePolicy,
-    exact_manifest: Option<DatasetManifestRef>,
+    exact_commit: Option<MarketEventCommitRef>,
     exact_source_surface: Option<SourceId>,
     exact_product: Option<ProviderProduct>,
     exact_channel: Option<ProviderChannel>,
 }
 
 impl ProviderMarketEventPointInTimeRequest {
-    /// Builds a request that resolves the newest eligible immutable generation at the cutoff.
+    /// Builds a request that resolves the newest eligible logical commit at the cutoff.
     #[allow(
         clippy::too_many_arguments,
         reason = "the exact financial key, clocks, basis, and work ceiling remain explicit"
@@ -89,7 +89,7 @@ impl ProviderMarketEventPointInTimeRequest {
         )
     }
 
-    /// Builds a request pinned to one complete immutable generation.
+    /// Builds a request pinned to one complete logical commit.
     #[allow(
         clippy::too_many_arguments,
         reason = "the exact financial key, clocks, basis, and work ceiling remain explicit"
@@ -103,7 +103,7 @@ impl ProviderMarketEventPointInTimeRequest {
         knowledge_cutoff: Timestamp,
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
-        exact_manifest: DatasetManifestRef,
+        exact_commit: MarketEventCommitRef,
         exact_source_surface: Option<SourceId>,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
         Self::try_new(
@@ -115,7 +115,7 @@ impl ProviderMarketEventPointInTimeRequest {
             knowledge_cutoff,
             effective_time_basis,
             maximum_candidates,
-            Some(exact_manifest),
+            Some(exact_commit),
             exact_source_surface,
         )
     }
@@ -133,7 +133,7 @@ impl ProviderMarketEventPointInTimeRequest {
         knowledge_cutoff: Timestamp,
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
-        exact_manifest: Option<DatasetManifestRef>,
+        exact_commit: Option<MarketEventCommitRef>,
         exact_source_surface: Option<SourceId>,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
         if event_kind == LiveEventClass::Screener {
@@ -148,14 +148,14 @@ impl ProviderMarketEventPointInTimeRequest {
             knowledge_cutoff,
             effective_time_basis,
             maximum_candidates,
-            exact_manifest,
+            exact_commit,
             exact_source_surface,
             None,
             None,
         )
     }
 
-    /// Selects one exact source cohort from the newest eligible immutable generation.
+    /// Selects one exact source cohort from the newest eligible logical commit.
     #[allow(
         clippy::too_many_arguments,
         reason = "exact cohort scope and bounds are mandatory"
@@ -188,7 +188,7 @@ impl ProviderMarketEventPointInTimeRequest {
         )
     }
 
-    /// Pins an exact source cohort to an immutable manifest, including genuinely empty cohorts.
+    /// Pins an exact source cohort to an immutable commit, including genuinely empty cohorts.
     #[allow(
         clippy::too_many_arguments,
         reason = "exact cohort scope and bounds are mandatory"
@@ -204,7 +204,7 @@ impl ProviderMarketEventPointInTimeRequest {
         knowledge_cutoff: Timestamp,
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
-        exact_manifest: DatasetManifestRef,
+        exact_commit: MarketEventCommitRef,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
         Self::try_scoped(
             dataset,
@@ -215,7 +215,7 @@ impl ProviderMarketEventPointInTimeRequest {
             knowledge_cutoff,
             effective_time_basis,
             maximum_candidates,
-            Some(exact_manifest),
+            Some(exact_commit),
             Some(source),
             Some(product),
             Some(channel),
@@ -235,7 +235,7 @@ impl ProviderMarketEventPointInTimeRequest {
         knowledge_cutoff: Timestamp,
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
-        exact_manifest: Option<DatasetManifestRef>,
+        exact_commit: Option<MarketEventCommitRef>,
         exact_source_surface: Option<SourceId>,
         exact_product: Option<ProviderProduct>,
         exact_channel: Option<ProviderChannel>,
@@ -251,17 +251,17 @@ impl ProviderMarketEventPointInTimeRequest {
         }
         if maximum_candidates == 0
             || maximum_candidates > MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES
-            || exact_manifest
+            || exact_commit
                 .as_ref()
-                .is_some_and(|manifest| manifest.dataset_id() != &dataset)
+                .is_some_and(|commit| commit.dataset_id() != &dataset)
         {
             return Err(ProviderMarketEventSelectionError::InvalidRequest);
         }
-        if let Some(manifest) = exact_manifest.as_ref() {
+        if let Some(commit) = exact_commit.as_ref() {
             let registered = crate::schema::DatasetSchemaRegistry::local()
                 .canonical_market_events()
                 .map_err(|_| ProviderMarketEventSelectionError::InvalidRequest)?;
-            if manifest.schema() != &registered {
+            if commit.schema() != &registered {
                 return Err(ProviderMarketEventSelectionError::InvalidRequest);
             }
         }
@@ -275,7 +275,7 @@ impl ProviderMarketEventPointInTimeRequest {
             effective_time_basis,
             maximum_candidates,
             tie_policy: ProviderMarketEventTiePolicy::AllNewestEffectiveTimeTies,
-            exact_manifest,
+            exact_commit,
             exact_source_surface,
             exact_product,
             exact_channel,
@@ -342,9 +342,9 @@ impl ProviderMarketEventPointInTimeRequest {
         self.maximum_candidates
     }
 
-    /// Returns the caller-selected immutable generation when supplied.
-    pub const fn exact_manifest(&self) -> Option<&DatasetManifestRef> {
-        self.exact_manifest.as_ref()
+    /// Returns the caller-selected logical commit when supplied.
+    pub const fn exact_commit(&self) -> Option<&MarketEventCommitRef> {
+        self.exact_commit.as_ref()
     }
 
     /// Returns the exact source surface when provider selection occurred upstream.
@@ -372,7 +372,7 @@ impl ProviderMarketEventPointInTimeRequest {
 
     fn restart_request(
         &self,
-        manifest: DatasetManifestRef,
+        commit: MarketEventCommitRef,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
         Self::try_scoped(
             self.dataset.clone(),
@@ -383,7 +383,7 @@ impl ProviderMarketEventPointInTimeRequest {
             self.knowledge_cutoff,
             self.effective_time_basis,
             self.maximum_candidates,
-            Some(manifest),
+            Some(commit),
             self.exact_source_surface.clone(),
             self.exact_product.clone(),
             self.exact_channel.clone(),
@@ -427,7 +427,7 @@ pub enum ProviderMarketEventComponentKind {
     Stream,
 }
 
-/// Exact durable catalog and Parquet coordinate for one selected typed event.
+/// Exact durable catalog row coordinate for one selected typed event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMarketEventSelectionCoordinate {
     publication: ProviderMarketEventExactPublication,
@@ -450,7 +450,7 @@ pub struct ProviderMarketEventSelectionCoordinate {
     source_sequence: Option<u64>,
     provider_event_id: SourceIdentifier,
     coordinate_digest: EvidenceDigest,
-    origin_generation_published_at: Timestamp,
+    origin_committed_at: Timestamp,
 }
 
 impl ProviderMarketEventSelectionCoordinate {
@@ -552,9 +552,9 @@ impl ProviderMarketEventSelectionCoordinate {
         self.coordinate_digest
     }
 
-    /// Returns when the publication first entered an immutable analytical generation.
-    pub const fn origin_generation_published_at(&self) -> Timestamp {
-        self.origin_generation_published_at
+    /// Returns when the publication first entered an logical event commit.
+    pub const fn origin_committed_at(&self) -> Timestamp {
+        self.origin_committed_at
     }
 }
 
@@ -688,8 +688,8 @@ pub enum ProviderMarketEventSelectionCompleteness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMarketEventPointInTimeSelection {
     request: ProviderMarketEventPointInTimeRequest,
-    manifest: DatasetManifestRef,
-    manifest_published_at: Timestamp,
+    commit: MarketEventCommitRef,
+    commit_available_at: Timestamp,
     sources: Box<[ProviderMarketEventSourceSelection]>,
     exclusions: ProviderMarketEventExclusionCounts,
     completeness: ProviderMarketEventSelectionCompleteness,
@@ -697,19 +697,19 @@ pub struct ProviderMarketEventPointInTimeSelection {
 }
 
 impl ProviderMarketEventPointInTimeSelection {
-    /// Returns the semantic request. The resolved manifest is separately retained below.
+    /// Returns the semantic request. The resolved commit is separately retained below.
     pub const fn request(&self) -> &ProviderMarketEventPointInTimeRequest {
         &self.request
     }
 
-    /// Returns the exact immutable generation used by every selected row.
-    pub const fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    /// Returns the exact logical commit used by every selected row.
+    pub const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     /// Returns when the selected generation became queryable.
-    pub const fn manifest_published_at(&self) -> Timestamp {
-        self.manifest_published_at
+    pub const fn commit_available_at(&self) -> Timestamp {
+        self.commit_available_at
     }
 
     /// Returns bounded latest candidates separated by exact source surface.
@@ -727,26 +727,26 @@ impl ProviderMarketEventPointInTimeSelection {
         self.completeness
     }
 
-    /// Returns the digest of the semantic request, manifest, exclusions, ties, and evidence rows.
+    /// Returns the digest of the semantic request, commit, exclusions, ties, and evidence rows.
     pub const fn selection_digest(&self) -> EvidenceDigest {
         self.selection_digest
     }
 
-    /// Returns an exact-manifest request suitable for a restart replay.
+    /// Returns an exact-commit request suitable for a restart replay.
     pub fn exact_restart_request(
         &self,
     ) -> Result<ProviderMarketEventPointInTimeRequest, ProviderMarketEventSelectionError> {
-        self.request.restart_request(self.manifest.clone())
+        self.request.restart_request(self.commit.clone())
     }
 
-    /// Requires a restarted exact-manifest replay to reproduce the complete original receipt.
+    /// Requires a restarted exact-commit replay to reproduce the complete original receipt.
     pub fn verify_restart_replay(
         &self,
         replay: &Self,
     ) -> Result<(), ProviderMarketEventSelectionError> {
-        if replay.request.exact_manifest() != Some(&self.manifest)
-            || replay.manifest != self.manifest
-            || replay.manifest_published_at != self.manifest_published_at
+        if replay.request.exact_commit() != Some(&self.commit)
+            || replay.commit != self.commit
+            || replay.commit_available_at != self.commit_available_at
             || replay.sources != self.sources
             || replay.exclusions != self.exclusions
             || replay.completeness != self.completeness
@@ -764,11 +764,11 @@ impl ProviderMarketEventPointInTimeSelection {
     ) -> Result<Self, ProviderMarketEventSelectionError> {
         if reconstructed.len() != plan.candidates.len()
             || reconstructed.len() > request.maximum_candidates
-            || plan.manifest.dataset_id() != request.dataset()
-            || plan.manifest_published_at > request.knowledge_cutoff()
+            || plan.commit.dataset_id() != request.dataset()
+            || plan.commit_available_at > request.knowledge_cutoff()
             || request
-                .exact_manifest()
-                .is_some_and(|exact| exact != &plan.manifest)
+                .exact_commit()
+                .is_some_and(|exact| exact != &plan.commit)
             || plan.candidates.windows(2).any(|pair| {
                 pair[0].source_surface > pair[1].source_surface
                     || (pair[0].source_surface == pair[1].source_surface
@@ -825,8 +825,8 @@ impl ProviderMarketEventPointInTimeSelection {
         }
         let mut selection = Self {
             request,
-            manifest: plan.manifest,
-            manifest_published_at: plan.manifest_published_at,
+            commit: plan.commit,
+            commit_available_at: plan.commit_available_at,
             sources: sources.into_boxed_slice(),
             exclusions: plan.exclusions,
             completeness: ProviderMarketEventSelectionCompleteness::Complete,
@@ -844,7 +844,7 @@ pub(crate) struct ProviderMarketEventCatalogCandidate {
     pub(crate) coordinate_digest: EvidenceDigest,
     pub(crate) source_surface: SourceId,
     pub(crate) effective_at: Timestamp,
-    pub(crate) origin_generation_published_at: Timestamp,
+    pub(crate) origin_committed_at: Timestamp,
 }
 
 impl ProviderMarketEventCatalogCandidate {
@@ -861,31 +861,34 @@ impl ProviderMarketEventCatalogCandidate {
             && self.coordinate_digest == coordinate.coordinate_digest
             && self.source_surface == coordinate.source_surface
             && self.effective_at == effective_at
-            && self.origin_generation_published_at == coordinate.origin_generation_published_at
+            && self.origin_committed_at == coordinate.origin_committed_at
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderMarketEventCatalogPlan {
-    pub(crate) manifest: DatasetManifestRef,
-    pub(crate) manifest_published_at: Timestamp,
+    pub(crate) commit: MarketEventCommitRef,
+    pub(crate) commit_available_at: Timestamp,
     pub(crate) candidates: Vec<ProviderMarketEventCatalogCandidate>,
     pub(crate) exclusions: ProviderMarketEventExclusionCounts,
 }
 
 impl ProviderMarketEventCatalogPlan {
     pub(crate) fn try_new(
-        manifest: DatasetManifestRef,
-        manifest_published_at: Timestamp,
+        commit: MarketEventCommitRef,
+        commit_available_at: Timestamp,
         candidates: Vec<ProviderMarketEventCatalogCandidate>,
         exclusions: ProviderMarketEventExclusionCounts,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
+        if commit_available_at != commit.available_at() {
+            return Err(ProviderMarketEventSelectionError::EvidenceMismatch);
+        }
         if candidates.len() > MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES {
             return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
         }
         Ok(Self {
-            manifest,
-            manifest_published_at,
+            commit,
+            commit_available_at,
             candidates,
             exclusions,
         })
@@ -983,7 +986,7 @@ impl ProviderMarketEventSelectedCandidate {
             provider_event_id: SourceIdentifier::try_from(indexed.provider_event_id().to_owned())
                 .map_err(|_| ProviderMarketEventSelectionError::EvidenceMismatch)?,
             coordinate_digest: indexed.coordinate_digest(),
-            origin_generation_published_at: planned.origin_generation_published_at,
+            origin_committed_at: planned.origin_committed_at,
         };
         if !planned.matches_selected(&coordinate, request)
             || coordinate.scope != request.scope
@@ -999,7 +1002,7 @@ impl ProviderMarketEventSelectedCandidate {
             || coordinate.event_kind != request.event_kind
             || coordinate.available_at > request.knowledge_cutoff
             || coordinate.ingested_at > request.knowledge_cutoff
-            || coordinate.origin_generation_published_at > request.knowledge_cutoff
+            || coordinate.origin_committed_at > request.knowledge_cutoff
             || effective_time(&coordinate, request.effective_time_basis)? > request.as_of_cutoff
             || request
                 .exact_source_surface
@@ -1071,8 +1074,8 @@ fn selection_digest(
         &mut hash,
         request.exact_source_surface.as_ref().map(SourceId::as_str),
     )?;
-    hash_manifest(&mut hash, &selection.manifest)?;
-    hash.update(selection.manifest_published_at.unix_nanos().to_be_bytes());
+    hash_commit(&mut hash, &selection.commit)?;
+    hash.update(selection.commit_available_at.unix_nanos().to_be_bytes());
     hash.update(selection.exclusions.missing_source_timestamp.to_be_bytes());
     hash.update(selection.exclusions.after_as_of.to_be_bytes());
     hash.update(selection.exclusions.available_after_knowledge.to_be_bytes());
@@ -1114,16 +1117,18 @@ fn selection_digest(
     ))
 }
 
-fn hash_manifest(
+fn hash_commit(
     hash: &mut Sha256,
-    manifest: &DatasetManifestRef,
+    commit: &MarketEventCommitRef,
 ) -> Result<(), ProviderMarketEventSelectionError> {
-    hash_field(hash, manifest.dataset_id().as_str().as_bytes())?;
-    hash.update(manifest.manifest_version().to_be_bytes());
-    hash_field(hash, manifest.schema().name().as_bytes())?;
-    hash.update(manifest.schema().version().get().to_be_bytes());
-    hash.update(manifest.schema().fingerprint());
-    hash.update(manifest.content_hash().bytes());
+    hash_field(hash, commit.dataset_id().as_str().as_bytes())?;
+    hash.update(commit.sequence().to_be_bytes());
+    hash_field(hash, commit.schema().name().as_bytes())?;
+    hash.update(commit.schema().version().get().to_be_bytes());
+    hash.update(commit.schema().fingerprint());
+    hash.update(commit.content_hash().bytes());
+    hash.update(commit.publication_digest().bytes());
+    hash.update(commit.row_count().to_be_bytes());
     Ok(())
 }
 
@@ -1172,12 +1177,7 @@ fn hash_coordinate(
     hash_optional_u64(hash, coordinate.source_sequence);
     hash_field(hash, coordinate.provider_event_id.as_str().as_bytes())?;
     hash.update(coordinate.coordinate_digest.bytes());
-    hash.update(
-        coordinate
-            .origin_generation_published_at
-            .unix_nanos()
-            .to_be_bytes(),
-    );
+    hash.update(coordinate.origin_committed_at.unix_nanos().to_be_bytes());
     Ok(())
 }
 
@@ -1255,7 +1255,7 @@ pub(crate) const fn event_kind_name(kind: LiveEventClass) -> &'static str {
 /// Provider-market-event PIT request, selection, or restart failure.
 #[derive(Debug, Error)]
 pub enum ProviderMarketEventSelectionError {
-    /// A required identity, schema, exact manifest, or work ceiling is invalid.
+    /// A required identity, schema, exact commit, or work ceiling is invalid.
     #[error("provider market-event point-in-time request is invalid")]
     InvalidRequest,
     /// More eligible exact rows exist than the caller authorized retaining.
@@ -1264,7 +1264,7 @@ pub enum ProviderMarketEventSelectionError {
     /// Catalog coordinates, Parquet events, or persisted provider evidence disagree.
     #[error("provider market-event point-in-time evidence does not match")]
     EvidenceMismatch,
-    /// An exact-manifest restart did not reproduce the original selection receipt.
+    /// An exact-commit restart did not reproduce the original selection receipt.
     #[error("provider market-event point-in-time restart replay differs")]
     RestartMismatch,
     /// Fallible bounded result allocation failed.
@@ -1273,8 +1273,8 @@ pub enum ProviderMarketEventSelectionError {
     /// Canonical selection-digest length accounting overflowed.
     #[error("provider market-event point-in-time digest accounting overflowed")]
     DigestOverflow,
-    /// The immutable analytical manifest catalog rejected the selection.
-    #[error("provider market-event manifest selection failed")]
+    /// The immutable analytical commit catalog rejected the selection.
+    #[error("provider market-event commit selection failed")]
     Manifest(#[from] ManifestCatalogError),
     /// The provider evidence catalog rejected the selected coordinate.
     #[error("provider market-event evidence selection failed")]

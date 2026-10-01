@@ -10,7 +10,8 @@ use market_squawk_analytics::FeatureKey;
 use market_squawk_data::{
     DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry, FairValueCatalogLink,
     FairValueCatalogOperation, FairValueCatalogRecord, FairValueCatalogSnapshot,
-    FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind, Sha256Digest,
+    FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind, MarketEventCommitRef,
+    Sha256Digest,
 };
 use market_squawk_domain::{
     Currency, DataQuality, DigestAlgorithm, EvidenceDigest, FairValueHierarchy, InstrumentId,
@@ -83,7 +84,7 @@ enum OriginPayload {
         financial_origin: bool,
     },
     PublishedMarket {
-        manifest: ManifestPayload,
+        commit: MarketEventCommitPayload,
         selection_digest: [u8; 32],
         publication_digest: [u8; 32],
         publication_row: u32,
@@ -93,8 +94,8 @@ enum OriginPayload {
         definition_content: [u8; 32],
         definition_audit: [u8; 32],
         knowledge_at_ns: i64,
-        manifest_published_at_ns: i64,
-        origin_published_at_ns: i64,
+        commit_available_at_ns: i64,
+        origin_committed_at_ns: i64,
     },
     Market {
         venue_id: String,
@@ -191,7 +192,7 @@ struct ForecastReferencePayload {
 struct MarketPublicationPayload {
     qualified_input_id: [u8; 32],
     qualified_amount: AmountPayload,
-    manifest: ManifestPayload,
+    commit: MarketEventCommitPayload,
     selection_digest: [u8; 32],
     publication_digest: [u8; 32],
     publication_row: u32,
@@ -199,8 +200,8 @@ struct MarketPublicationPayload {
     canonical_event_digest: [u8; 32],
     canonical_event: String,
     knowledge_at_ns: i64,
-    manifest_published_at_ns: i64,
-    origin_published_at_ns: i64,
+    commit_available_at_ns: i64,
+    origin_committed_at_ns: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,8 +217,10 @@ struct AutomaticReceiptPayload {
     peer_identities: Vec<String>,
     rights_decision: [u8; 32],
     rights_graph: [u8; 32],
+    rights_input_digest: [u8; 32],
     rights_expires_at_ns: i64,
     admitted_input_manifests: Vec<ManifestPayload>,
+    admitted_event_inputs: Vec<EventRightsAdmissionPayload>,
     current_market_input: [u8; 32],
     method_base_input: Option<[u8; 32]>,
     inputs: Vec<AutomaticInputPayload>,
@@ -265,7 +268,7 @@ struct AutomaticInputPayload {
     evidence: EvidencePayload,
     market_access: Option<MarketAccessPayload>,
     selection_receipt: [u8; 32],
-    rights_graph: [u8; 32],
+    rights_input_digest: [u8; 32],
     knowledge_at_ns: i64,
     expires_at_ns: i64,
 }
@@ -318,6 +321,43 @@ struct AutomaticIntermediatePayload {
     result_mantissa: String,
     result_scale: u32,
     evidence: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MarketEventCommitPayload {
+    dataset_id: String,
+    sequence: u64,
+    schema_name: String,
+    schema_version: u16,
+    schema_fingerprint: [u8; 32],
+    content_hash: [u8; 32],
+    available_at_ns: i64,
+    publication_digest: [u8; 32],
+    row_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EventRightsAdmissionPayload {
+    commit: MarketEventCommitPayload,
+    inputs: Vec<EventUseInputPayload>,
+    rights_input_digest: [u8; 32],
+    decision_digest: [u8; 32],
+    evaluated_at_ns: i64,
+    expires_at_ns: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EventUseInputPayload {
+    publication_digest: [u8; 32],
+    publication_kind: String,
+    row_ordinal: u32,
+    coordinate_digest: [u8; 32],
+    canonical_event_digest: [u8; 32],
+    source_id: String,
+    origin_committed_at_ns: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

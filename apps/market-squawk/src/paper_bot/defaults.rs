@@ -233,14 +233,28 @@ pub(crate) struct CoinbaseDirectLiveMarketComposition {
 
 impl CoinbaseDirectLiveMarketComposition {
     /// Starts the source-only Direct runtime and retains individual provider orders centrally.
-    pub(crate) async fn start_with_order_level(
+    // Box before the lifecycle deadline wrapper embeds this large startup future. Keep its
+    // construction out of the caller's poll frame, including when another provider is selected.
+    #[inline(never)]
+    pub(crate) fn start_with_order_level(
         self,
         order_level: OrderLevelDirectory,
         cancellation: CancellationToken,
-    ) -> Result<crate::CoinbaseDirectLiveRuntime, crate::CoinbaseDirectSupervisorError> {
-        self.activation
-            .start_live_with_order_level(self.runtime_config, order_level, cancellation)
-            .await
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                Output = Result<
+                    crate::CoinbaseDirectLiveRuntime,
+                    crate::CoinbaseDirectSupervisorError,
+                >,
+            > + Send,
+        >,
+    > {
+        Box::pin(self.activation.start_live_with_order_level(
+            self.runtime_config,
+            order_level,
+            cancellation,
+        ))
     }
 }
 
@@ -263,8 +277,16 @@ impl ProductionLiveMarketComposition {
         deadline: std::time::Instant,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Self, ProductionLiveSourceRuntimeError> {
-        self.source = self.source
-            .with_public_crypto_reference(reader, synchronizer, capture_store, execution, deadline, cancellation)
+        self.source = self
+            .source
+            .with_public_crypto_reference(
+                reader,
+                synchronizer,
+                capture_store,
+                execution,
+                deadline,
+                cancellation,
+            )
             .await?;
         Ok(self)
     }
@@ -272,10 +294,8 @@ impl ProductionLiveMarketComposition {
     /// Returns the quote/book source retained by the bounded fair-value export.
     pub(crate) fn qualified_market_export_source_id(
         &self,
-    ) -> std::result::Result<
-        &market_squawk_domain::SourceId,
-        ProductionLiveSourceCompositionError,
-    > {
+    ) -> std::result::Result<&market_squawk_domain::SourceId, ProductionLiveSourceCompositionError>
+    {
         self.source.qualified_market_export_source_id()
     }
 
@@ -812,7 +832,8 @@ where
     let repository = PaperCheckpointRepository::open_stopped(
         paths.artifacts()?.clone(),
         nonzero_usize(LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)?,
-    )?.ok_or_else(|| anyhow!("create and confirm the virtual account before starting a session"))?;
+    )?
+    .ok_or_else(|| anyhow!("create and confirm the virtual account before starting a session"))?;
     if repository.original_account_cash(account_id)? != cash {
         bail!("selected paper cash differs from the original virtual account");
     }
@@ -950,7 +971,11 @@ where
         .ok_or_else(|| anyhow!("release benchmark instrument has no venue mapping"))?
         .venue_id()
         .clone();
-    initialize_paper_fixture_account(&config, Money::new(Decimal::new(1_000_000, 0), definition.quote_currency()), 0)?;
+    initialize_paper_fixture_account(
+        &config,
+        Money::new(Decimal::new(1_000_000, 0), definition.quote_currency()),
+        0,
+    )?;
     build_local_paper_bot(
         config,
         PaperBotBuildSource::ReleaseBenchmark,
@@ -972,16 +997,25 @@ where
 /// Existing test/release fixtures explicitly fund through the same original ledger owner.
 /// This helper is absent from ordinary installed-product builds.
 #[cfg(any(test, feature = "release-evidence"))]
-fn initialize_paper_fixture_account(config: &AppConfig, cash: Money, fee_basis_points: u32) -> Result<()> {
+fn initialize_paper_fixture_account(
+    config: &AppConfig,
+    cash: Money,
+    fee_basis_points: u32,
+) -> Result<()> {
     let paths = LocalPaths::prepare(config.data_dir())?;
     let maximum = nonzero_usize(LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)?;
     let account = AccountId::from_str(LOCAL_PAPER_ACCOUNT_ID)?;
-    if let Some(repository) = PaperCheckpointRepository::open_stopped(paths.artifacts()?.clone(), maximum)? {
-        if repository.original_account_cash(account)? != cash { bail!("fixture cash differs from original account"); }
+    if let Some(repository) =
+        PaperCheckpointRepository::open_stopped(paths.artifacts()?.clone(), maximum)?
+    {
+        if repository.original_account_cash(account)? != cash {
+            bail!("fixture cash differs from original account");
+        }
         return Ok(());
     }
     let policy = local_paper_account_configuration(cash.currency(), fee_basis_points)?;
-    let mut repository = PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), policy, maximum)?;
+    let mut repository =
+        PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), policy, maximum)?;
     repository.initialize_cash_account(account, cash, current_timestamp()?)?;
     Ok(())
 }
@@ -1155,8 +1189,17 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
     let source = configured_source(&config, provider)?;
     let paths = LocalPaths::prepare(config.data_dir())?;
     let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
-    let currency = source.routes.first().ok_or_else(|| anyhow!("Kraken fixture has no route"))?.definition().quote_currency();
-    initialize_paper_fixture_account(&config, Money::new(initial_cash, currency), fee_basis_points)?;
+    let currency = source
+        .routes
+        .first()
+        .ok_or_else(|| anyhow!("Kraken fixture has no route"))?
+        .definition()
+        .quote_currency();
+    initialize_paper_fixture_account(
+        &config,
+        Money::new(initial_cash, currency),
+        fee_basis_points,
+    )?;
     let mut strategy = Some(strategy);
     build_local_paper_bot(
         config,

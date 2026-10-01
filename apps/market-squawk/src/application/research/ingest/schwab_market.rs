@@ -31,11 +31,12 @@ use market_squawk_adapter_schwab::{
 };
 use market_squawk_data::{
     CommittedDataset, DatasetId, IngestError, IngestIdentity, IngestPrecommitAuthority,
-    PersistedProviderCaptureBindingEvidence, PersistedProviderOptionMarketBindingEvidence,
-    PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
-    ProviderOptionMarketArrowBatch, ProviderOptionMarketPublicationSelector, RightsError,
-    SourceOperation, extraction_provider_payload_digest, provider_market_event_publication_digest,
+    MarketEventCommitRef, PersistedProviderCaptureBindingEvidence,
+    PersistedProviderOptionMarketBindingEvidence, PersistedProviderPublicationEvidence,
+    ProviderMarketEventArrowBatch, ProviderMarketEventPublicationKind,
+    ProviderMarketEventPublicationSelector, ProviderOptionMarketArrowBatch,
+    ProviderOptionMarketPublicationSelector, RightsError, SourceOperation,
+    extraction_provider_payload_digest, provider_market_event_publication_digest,
     provider_option_market_publication_digest,
 };
 use market_squawk_domain::{
@@ -936,13 +937,13 @@ impl SchwabMarketPublicationClosure {
             .await?;
         Ok(SchwabMarketEventPublicationReceipt {
             restart: SchwabMarketEventRestartSelector {
-                manifest: committed.manifest().clone(),
+                commit: committed.clone(),
                 publication_digest,
                 publication_kind: kind,
                 source_id: self.generation.metadata().source_id().clone(),
                 expected_event_count: event_count,
             },
-            committed,
+            commit: committed,
             sealed_receipt_digest,
             provider_dataset,
             event_count,
@@ -1176,7 +1177,7 @@ impl IngestPrecommitAuthority for SchwabMarketPublicationLease {
 /// Exact generation-owned selector for one durable Schwab quote or Streamer publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SchwabMarketEventRestartSelector {
-    manifest: market_squawk_data::DatasetManifestRef,
+    commit: MarketEventCommitRef,
     publication_digest: EvidenceDigest,
     publication_kind: ProviderMarketEventPublicationKind,
     source_id: SourceId,
@@ -1184,8 +1185,8 @@ pub(crate) struct SchwabMarketEventRestartSelector {
 }
 
 impl SchwabMarketEventRestartSelector {
-    pub(crate) const fn manifest(&self) -> &market_squawk_data::DatasetManifestRef {
-        &self.manifest
+    pub(crate) const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub(crate) const fn publication_digest(&self) -> EvidenceDigest {
@@ -1196,18 +1197,21 @@ impl SchwabMarketEventRestartSelector {
         self.publication_kind
     }
 
-    /// Reopens the exact kind-qualified raw evidence and typed Parquet rows after restart.
+    /// Reopens the exact kind-qualified raw evidence and committed rows after restart.
     pub(crate) async fn reopen(
         &self,
         research: &ResearchService,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<SchwabMarketEventRestartReceipt, SchwabMarketPublicationError> {
-        if !research.analytical().has_provider_publication(
-            &self.manifest,
-            self.publication_digest,
-            self.publication_kind.as_str(),
-        )? {
+        if !research
+            .analytical()
+            .has_provider_market_event_publication(
+                &self.commit,
+                self.publication_digest,
+                self.publication_kind,
+            )?
+        {
             return Err(SchwabMarketPublicationError::RestartInvalid);
         }
         let selector = ProviderMarketEventPublicationSelector::new(
@@ -1217,12 +1221,12 @@ impl SchwabMarketEventRestartSelector {
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()
-            .provider_market_event_publication_evidence(&self.manifest, selector, store.as_ref())?;
+            .provider_market_event_publication_evidence(&self.commit, selector, store.as_ref())?;
         validate_restart_evidence(self, &evidence)?;
         let events = research
             .analytical()
             .read_provider_market_event_publication(
-                &self.manifest,
+                &self.commit,
                 selector,
                 store,
                 deadline,
@@ -1257,7 +1261,7 @@ impl SchwabMarketEventRestartReceipt {
 
 #[derive(Debug)]
 pub(crate) struct SchwabMarketEventPublicationReceipt {
-    committed: CommittedDataset,
+    commit: MarketEventCommitRef,
     restart: SchwabMarketEventRestartSelector,
     sealed_receipt_digest: EvidenceDigest,
     provider_dataset: SourceIdentifier,
@@ -1267,8 +1271,8 @@ pub(crate) struct SchwabMarketEventPublicationReceipt {
 }
 
 impl SchwabMarketEventPublicationReceipt {
-    pub(crate) const fn committed(&self) -> &CommittedDataset {
-        &self.committed
+    pub(crate) const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub(crate) const fn restart_selector(&self) -> &SchwabMarketEventRestartSelector {

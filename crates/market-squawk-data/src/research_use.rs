@@ -6,7 +6,12 @@ mod decision;
 mod derived;
 mod graph;
 mod identity;
+mod market_event;
 mod model;
+pub use market_event::{AuthorizedMarketEventUse, MarketEventUseInput, MarketEventUseRequest};
+pub(crate) use market_event::{
+    authorize_market_event_use_in_snapshot, recheck_market_event_use_in_snapshot,
+};
 mod permit;
 mod persistence;
 pub(crate) use persistence::{

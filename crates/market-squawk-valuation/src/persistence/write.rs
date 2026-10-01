@@ -1,7 +1,8 @@
 //! Canonical immutable records, relationships, and append operations.
 
 use super::recovery::{
-    amount_payload, digest_algorithm_tag, hierarchy_tag, manifest_payload, use_assessment_payload,
+    amount_payload, digest_algorithm_tag, hierarchy_tag, manifest_payload,
+    market_event_commit_payload, use_assessment_payload,
 };
 use super::*;
 
@@ -356,7 +357,7 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
             }
         }
         EvidenceOrigin::PublishedMarket { evidence } => OriginPayload::PublishedMarket {
-            manifest: manifest_payload(&evidence.manifest),
+            commit: market_event_commit_payload(&evidence.commit),
             selection_digest: evidence.selection_digest.bytes(),
             publication_digest: evidence.publication_digest.bytes(),
             publication_row: evidence.publication_row,
@@ -366,8 +367,8 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
             definition_content: evidence.definition_content.bytes(),
             definition_audit: evidence.definition_audit.bytes(),
             knowledge_at_ns: evidence.knowledge_at.unix_nanos(),
-            manifest_published_at_ns: evidence.manifest_published_at.unix_nanos(),
-            origin_published_at_ns: evidence.origin_published_at.unix_nanos(),
+            commit_available_at_ns: evidence.commit_available_at.unix_nanos(),
+            origin_committed_at_ns: evidence.origin_committed_at.unix_nanos(),
         },
         EvidenceOrigin::Market {
             venue_id,
@@ -392,7 +393,7 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
             publication: publication.as_ref().map(|value| MarketPublicationPayload {
                 qualified_input_id: value.qualified_input_id.bytes(),
                 qualified_amount: amount_payload(value.qualified_amount),
-                manifest: manifest_payload(&value.manifest),
+                commit: market_event_commit_payload(&value.commit),
                 selection_digest: value.selection_digest.bytes(),
                 publication_digest: value.publication_digest.bytes(),
                 publication_row: value.publication_row,
@@ -400,8 +401,8 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
                 canonical_event_digest: value.canonical_event_digest.bytes(),
                 canonical_event: value.canonical_event.to_string(),
                 knowledge_at_ns: value.knowledge_at.unix_nanos(),
-                manifest_published_at_ns: value.manifest_published_at.unix_nanos(),
-                origin_published_at_ns: value.origin_published_at.unix_nanos(),
+                commit_available_at_ns: value.commit_available_at.unix_nanos(),
+                origin_committed_at_ns: value.origin_committed_at.unix_nanos(),
             }),
         },
         EvidenceOrigin::Research {
@@ -524,7 +525,7 @@ fn automatic_receipt_payload(
                 .market_access_assessment()
                 .map(market_access_payload),
             selection_receipt: input.selection_receipt().bytes(),
-            rights_graph: input.rights_graph().bytes(),
+            rights_input_digest: input.rights_input_digest().bytes(),
             knowledge_at_ns: input.knowledge_at().unix_nanos(),
             expires_at_ns: input.expires_at().unix_nanos(),
         });
@@ -581,12 +582,31 @@ fn automatic_receipt_payload(
             .collect::<Result<Vec<_>, _>>()?,
         rights_decision: value.rights_decision().bytes(),
         rights_graph: value.rights_graph().bytes(),
+        rights_input_digest: value.rights_input_digest().bytes(),
         rights_expires_at_ns: value.rights_expires_at().unix_nanos(),
         admitted_input_manifests: value
             .admitted_input_manifests()
             .iter()
             .map(manifest_payload)
             .collect(),
+        admitted_event_inputs: value.admitted_event_inputs().iter().map(|admission| {
+            EventRightsAdmissionPayload {
+                commit: market_event_commit_payload(admission.commit()),
+                inputs: admission.inputs().iter().map(|input| EventUseInputPayload {
+                    publication_digest: input.publication_digest().bytes(),
+                    publication_kind: input.publication_kind().as_str().to_owned(),
+                    row_ordinal: input.row_ordinal(),
+                    coordinate_digest: input.coordinate_digest().bytes(),
+                    canonical_event_digest: input.canonical_event_digest().bytes(),
+                    source_id: input.source_id().as_str().to_owned(),
+                    origin_committed_at_ns: input.origin_committed_at().unix_nanos(),
+                }).collect(),
+                rights_input_digest: admission.rights_input_digest().bytes(),
+                decision_digest: admission.decision_digest().bytes(),
+                evaluated_at_ns: admission.evaluated_at().unix_nanos(),
+                expires_at_ns: admission.expires_at().unix_nanos(),
+            }
+        }).collect(),
         current_market_input: value.current_market_input().bytes(),
         method_base_input: value.method_base_input().map(InputId::bytes),
         inputs,

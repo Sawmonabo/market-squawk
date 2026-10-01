@@ -397,7 +397,7 @@ pub(crate) fn research_schema(
     )))
 }
 
-pub(crate) fn market_event_compaction_schema(
+pub(crate) fn market_event_dataset_schema(
     dataset: &SourceIdentifier,
 ) -> Result<SchemaRef, DatasetSchemaError> {
     let registry = DatasetSchemaRegistry::local();
@@ -415,7 +415,7 @@ pub(crate) fn market_event_schema(
     publication_digest: EvidenceDigest,
     publication_kind: &str,
 ) -> Result<SchemaRef, DatasetSchemaError> {
-    let schema = market_event_compaction_schema(dataset)?;
+    let schema = market_event_dataset_schema(dataset)?;
     let mut metadata = schema.metadata().clone();
     metadata.insert(
         PROVIDER_PUBLICATION_DIGEST_KEY.to_owned(),

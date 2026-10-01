@@ -558,6 +558,37 @@ impl LiveRuntime {
         None
     }
 
+    /// Waits for one fair, coalesced snapshot-change hint from the existing shard channels.
+    ///
+    /// Cancellation does not consume a hint unless this future returns it. Returns `None` only
+    /// once every channel is closed and drained. A hint is not readiness: reload the snapshots
+    /// and validate the complete required topology after each notification.
+    pub async fn next_snapshot_notification(&mut self) -> Option<ShardId> {
+        std::future::poll_fn(|cx| {
+            let count = self.snapshot_notifications.len();
+            let mut closed = 0;
+            for offset in 0..count {
+                let index = (self.notification_cursor + offset) % count;
+                match self.snapshot_notifications[index].poll_recv(cx) {
+                    std::task::Poll::Ready(Some(())) => {
+                        self.notification_cursor = (index + 1) % count;
+                        // Startup constructs exactly one receiver for every configured u16 shard.
+                        let shard = ShardId::new(index as u16, self.config.shard_count().get());
+                        return std::task::Poll::Ready(shard.ok());
+                    }
+                    std::task::Poll::Ready(None) => closed += 1,
+                    std::task::Poll::Pending => {}
+                }
+            }
+            if closed == count {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+
     /// Returns the nonzero process-local incarnation carried by every shard snapshot.
     pub const fn incarnation(&self) -> NonZeroU64 {
         self.incarnation

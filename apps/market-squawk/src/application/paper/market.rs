@@ -339,7 +339,7 @@ fn durable_cohort_recency_key(
     candidate: &ProviderMarketEventSelectedCandidate,
 ) -> (Timestamp, Timestamp, Timestamp, u64, Timestamp) {
     (
-        candidate.coordinate().origin_generation_published_at(),
+        candidate.coordinate().origin_committed_at(),
         candidate.coordinate().available_at(),
         candidate.coordinate().received_at(),
         candidate.coordinate().connection_generation(),
@@ -709,6 +709,7 @@ impl ApplicationDomainService for MarketDomainService {
                 )?;
                 let market_data_records = load_market_data_instrument_records(
                     &self.market_data_instruments,
+                    &definitions,
                     &display_instrument_ids,
                     &display_batches,
                     reference_at,
@@ -1073,16 +1074,43 @@ fn kraken_projection_refs(
 
 fn load_market_data_instrument_records(
     reader: &MarketDataInstrumentReadCapability,
-    instrument_ids: &[InstrumentId],
+    execution_definitions: &[InstrumentDefinition],
+    display_instrument_ids: &[InstrumentId],
     display_batches: &[MarketDisplaySnapshotBatch],
     reference_at: Timestamp,
     context: &RequestContext,
 ) -> Result<Vec<MarketDataInstrumentRecord>, ServiceError> {
-    if display_batches.len() != instrument_ids.len() {
+    if display_batches.len() != display_instrument_ids.len() {
         return Err(ServiceError::Unavailable);
     }
-    if instrument_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+    if display_instrument_ids
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
         return Err(ServiceError::InvalidResult);
+    }
+    // Live crypto routes carry execution definitions independently of display feeds, but their
+    // official reference revisions are stored in the same canonical market-data catalog.
+    let mut instrument_ids = Vec::new();
+    instrument_ids
+        .try_reserve_exact(
+            display_instrument_ids
+                .len()
+                .checked_add(execution_definitions.len())
+                .ok_or(ServiceError::ResourceExhausted)?,
+        )
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    instrument_ids.extend_from_slice(display_instrument_ids);
+    instrument_ids.extend(
+        execution_definitions
+            .iter()
+            .filter(|definition| definition.asset_class() == AssetClass::Crypto)
+            .map(InstrumentDefinition::instrument_id),
+    );
+    instrument_ids.sort_unstable();
+    instrument_ids.dedup();
+    if instrument_ids.len() > MAXIMUM_UNIFIED_MARKET_INSTRUMENTS {
+        return Err(ServiceError::ResourceExhausted);
     }
     let mut records = Vec::new();
     records
@@ -1131,7 +1159,7 @@ fn load_market_data_instrument_records(
     if records.len() != instrument_ids.len() {
         return Err(ServiceError::InvalidResult);
     }
-    for (index, (record, instrument_id)) in records.iter().zip(instrument_ids).enumerate() {
+    for (record, instrument_id) in records.iter().zip(&instrument_ids) {
         ensure_live(context)?;
         let definition = record.definition();
         let interval = definition.effective_interval();
@@ -1144,9 +1172,13 @@ fn load_market_data_instrument_records(
         {
             return Err(ServiceError::Unavailable);
         }
-        let batch = display_batches
-            .get(index)
-            .ok_or(ServiceError::Unavailable)?;
+    }
+    for (instrument_id, batch) in display_instrument_ids.iter().zip(display_batches) {
+        ensure_live(context)?;
+        let index = records
+            .binary_search_by_key(instrument_id, |record| record.definition().instrument_id())
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let record = &records[index];
         if batch.snapshots().is_empty()
             || batch.snapshots().iter().any(|snapshot| {
                 snapshot.lease().key().instrument_id() != *instrument_id

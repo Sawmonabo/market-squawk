@@ -22,8 +22,8 @@ use market_squawk_adapter_kraken::{
     KrakenSealedPublication,
 };
 use market_squawk_data::{
-    DatasetId, DatasetManifestRef, DatasetSchemaRegistry, IngestError, IngestIdentity,
-    IngestPrecommitAuthority, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
+    DatasetId, DatasetSchemaRegistry, IngestError, IngestIdentity, IngestPrecommitAuthority,
+    MarketEventCommitRef, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
     ProviderMarketEventPublicationSelector, ProviderMarketEventSelectionError,
@@ -220,7 +220,7 @@ impl CryptoMarketPublicationClosure {
                     .await?;
                 Ok(CoinbaseMarketApplicationOutcome::Published(
                     MarketEventPublicationReceipt::try_new(
-                        committed.manifest().clone(),
+                        committed,
                         publication_digest,
                         prepared.publication_kind,
                         surface.native_implementation(),
@@ -313,7 +313,7 @@ impl CryptoMarketPublicationClosure {
             .await?;
         Ok(CoinbaseMarketApplicationOutcome::Published(
             MarketEventPublicationReceipt::try_new(
-                committed.manifest().clone(),
+                committed,
                 publication_digest,
                 prepared.publication_kind,
                 CryptoMarketSurface::CoinbaseAdvancedTrade.native_implementation(),
@@ -429,7 +429,7 @@ impl CryptoMarketPublicationClosure {
             .await?;
         Ok(KrakenMarketApplicationOutcome::Published(
             MarketEventPublicationReceipt::try_new(
-                committed.manifest().clone(),
+                committed,
                 publication_digest,
                 prepared.publication_kind,
                 CryptoMarketSurface::KrakenSpot.native_implementation(),
@@ -917,7 +917,7 @@ impl MarketEventPointInTimeSelector {
         knowledge_cutoff: Timestamp,
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
-        exact_manifest: DatasetManifestRef,
+        exact_commit: MarketEventCommitRef,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<Option<MarketEventPointInTimeReceipt>, MarketEventReadError> {
@@ -932,7 +932,7 @@ impl MarketEventPointInTimeSelector {
             knowledge_cutoff,
             effective_time_basis,
             maximum_candidates,
-            exact_manifest,
+            exact_commit,
         )?;
         let store = self.research.provider_capture_store();
         let selection = self
@@ -945,7 +945,7 @@ impl MarketEventPointInTimeSelector {
             .transpose()
     }
 
-    /// Reopens the original selection's exact manifest and rejects any request, source, row,
+    /// Reopens the original selection's exact commit and rejects any request, source, row,
     /// exclusion, tie, evidence, or selection-digest drift after process restart.
     pub(crate) async fn verify_restart(
         &self,
@@ -1023,22 +1023,22 @@ impl MarketEventDurableReadWriter {
         &self,
         receipt: MarketEventPublicationReceipt,
     ) -> Result<bool, MarketEventReadError> {
-        if receipt.manifest.dataset_id() != &self.analytical_dataset
-            || !is_canonical_market_event_manifest(&receipt.manifest)
-            || receipt.restart.manifest() != &receipt.manifest
+        if receipt.commit.dataset_id() != &self.analytical_dataset
+            || !is_canonical_market_event_commit(&receipt.commit)
+            || receipt.restart.commit() != &receipt.commit
             || &receipt.restart.source_id != &self.source_surface
         {
             return Err(MarketEventReadError::DurableGenerationInvalid);
         }
 
-        let candidate_version = receipt.manifest.manifest_version();
+        let candidate_sequence = receipt.commit.sequence();
         let mut latest = self.latest.lock().await;
         match latest.as_ref() {
             None => {
                 *latest = Some(Arc::new(receipt));
                 Ok(true)
             }
-            Some(current) => match candidate_version.cmp(&current.manifest.manifest_version()) {
+            Some(current) => match candidate_sequence.cmp(&current.commit.sequence()) {
                 std::cmp::Ordering::Greater => {
                     *latest = Some(Arc::new(receipt));
                     Ok(true)
@@ -1065,7 +1065,7 @@ impl MarketEventPointInTimeReceipt {
         selection: ProviderMarketEventPointInTimeSelection,
     ) -> Result<Self, MarketEventReadError> {
         if selection.request().dataset() != &selector.analytical_dataset
-            || selection.manifest().dataset_id() != &selector.analytical_dataset
+            || selection.commit().dataset_id() != &selector.analytical_dataset
             || selection.request().exact_source_surface() != Some(&selector.source_surface)
             || selection
                 .sources()
@@ -1179,11 +1179,10 @@ struct PreparedMarketEventPublication {
 /// Successful source-qualified market-event publication and its exact restart coordinate.
 ///
 /// This receipt intentionally retains only compact immutable identities. The catalog owns the
-/// cumulative pinned generation graph; a continuously running source must not retain that graph
-/// once publication commits.
+/// logical event history; a continuously running source retains only this commit coordinate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MarketEventPublicationReceipt {
-    manifest: DatasetManifestRef,
+    commit: MarketEventCommitRef,
     restart: MarketEventRestartSelector,
     provider_dataset: SourceIdentifier,
     sealed_receipts: MarketEventSealedReceiptEvidence,
@@ -1196,7 +1195,7 @@ impl MarketEventPublicationReceipt {
         reason = "immutable generation, publication, lineage, source, and capture identities stay explicit"
     )]
     pub(crate) fn try_new(
-        manifest: DatasetManifestRef,
+        commit: MarketEventCommitRef,
         publication_digest: EvidenceDigest,
         publication_kind: ProviderMarketEventPublicationKind,
         native_implementation: ProviderNativeLineageImplementation,
@@ -1218,7 +1217,9 @@ impl MarketEventPublicationReceipt {
         );
         if publication_digest.algorithm() != DigestAlgorithm::Sha256
             || publication_digest.bytes() == [0; 32]
-            || !is_canonical_market_event_manifest(&manifest)
+            || !is_canonical_market_event_commit(&commit)
+            || commit.publication_digest() != publication_digest
+            || u64::try_from(event_count).ok() != Some(commit.row_count())
             || persisted_market_event_implementation(native_implementation).is_none()
             || sealed_receipts.has_zero_digest()
             || event_count == 0
@@ -1228,22 +1229,22 @@ impl MarketEventPublicationReceipt {
         }
         Ok(Self {
             restart: MarketEventRestartSelector {
-                manifest: manifest.clone(),
+                commit: commit.clone(),
                 publication_digest,
                 publication_kind,
                 native_implementation,
                 source_id,
                 expected_event_count: event_count,
             },
-            manifest,
+            commit,
             provider_dataset,
             sealed_receipts,
             event_count,
         })
     }
 
-    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    pub(crate) const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub(crate) const fn restart_selector(&self) -> &MarketEventRestartSelector {
@@ -1263,16 +1264,16 @@ impl MarketEventPublicationReceipt {
     }
 }
 
-fn is_canonical_market_event_manifest(manifest: &DatasetManifestRef) -> bool {
+fn is_canonical_market_event_commit(commit: &MarketEventCommitRef) -> bool {
     DatasetSchemaRegistry::local()
         .canonical_market_events()
-        .is_ok_and(|registered| manifest.schema() == &registered)
+        .is_ok_and(|registered| commit.schema() == &registered)
 }
 
-/// Exact manifest/digest/kind/lineage selector for one source-qualified market publication.
+/// Exact commit/digest/kind/lineage selector for one source-qualified market publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MarketEventRestartSelector {
-    manifest: DatasetManifestRef,
+    commit: MarketEventCommitRef,
     publication_digest: EvidenceDigest,
     publication_kind: ProviderMarketEventPublicationKind,
     native_implementation: ProviderNativeLineageImplementation,
@@ -1281,8 +1282,8 @@ pub(crate) struct MarketEventRestartSelector {
 }
 
 impl MarketEventRestartSelector {
-    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    pub(crate) const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub(crate) const fn publication_digest(&self) -> EvidenceDigest {
@@ -1297,7 +1298,7 @@ impl MarketEventRestartSelector {
         &self.source_id
     }
 
-    /// Reopens the exact raw/native evidence and Parquet events after process restart. It never
+    /// Reopens the exact raw/native evidence and committed events after process restart. It never
     /// substitutes a newer generation or another venue.
     pub(crate) async fn reopen(
         &self,
@@ -1305,11 +1306,14 @@ impl MarketEventRestartSelector {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<MarketEventRestartReceipt, MarketEventReadError> {
-        if !research.analytical().has_provider_publication(
-            &self.manifest,
-            self.publication_digest,
-            self.publication_kind.as_str(),
-        )? {
+        if !research
+            .analytical()
+            .has_provider_market_event_publication(
+                &self.commit,
+                self.publication_digest,
+                self.publication_kind,
+            )?
+        {
             return Err(MarketEventReadError::RestartInvalid);
         }
         let selector = ProviderMarketEventPublicationSelector::new(
@@ -1319,12 +1323,12 @@ impl MarketEventRestartSelector {
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()
-            .provider_market_event_publication_evidence(&self.manifest, selector, store.as_ref())?;
+            .provider_market_event_publication_evidence(&self.commit, selector, store.as_ref())?;
         validate_restart_evidence(self, &evidence)?;
         let events = research
             .analytical()
             .read_provider_market_event_publication(
-                &self.manifest,
+                &self.commit,
                 selector,
                 store,
                 deadline,
@@ -1626,8 +1630,8 @@ mod tests {
                 .await
                 .as_ref()
                 .expect("latest receipt")
-                .manifest()
-                .manifest_version(),
+                .commit()
+                .sequence(),
             2
         );
         assert!(matches!(
@@ -1639,21 +1643,24 @@ mod tests {
     fn receipt(
         dataset: DatasetId,
         source_id: SourceId,
-        manifest_version: u64,
+        sequence: u64,
         marker: u8,
     ) -> MarketEventPublicationReceipt {
-        let manifest = DatasetManifestRef::try_new_with_schema(
+        let publication_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]);
+        let commit = MarketEventCommitRef::try_new(
             dataset,
-            manifest_version,
+            sequence,
             DatasetSchemaRegistry::local()
                 .canonical_market_events()
                 .expect("canonical schema"),
             Sha256Digest::new([marker; 32]),
+            Timestamp::from_unix_nanos(1),
+            publication_digest,
+            1,
         )
-        .expect("valid manifest");
-        let publication_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]);
+        .expect("valid commit");
         MarketEventPublicationReceipt::try_new(
-            manifest,
+            commit,
             publication_digest,
             ProviderMarketEventPublicationKind::EventMicrobatch,
             ProviderNativeLineageImplementation::KrakenSpotV1,

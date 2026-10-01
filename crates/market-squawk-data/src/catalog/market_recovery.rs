@@ -17,7 +17,7 @@ const MAX_DURABLE_ROUTES: usize = 256;
 const MAX_EVENT_KINDS: usize = 8;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 
-/// A retained route to reopen through the existing point-in-time event selector.
+/// A retained route and stable keyset cursor for the point-in-time event selector.
 ///
 /// Discovery does not select an event or grant permission to use its source data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +61,7 @@ pub(super) fn load_provider_market_event_durable_routes(
     event_kinds: &[LiveEventClass],
     as_of_cutoff: Timestamp,
     knowledge_cutoff: Timestamp,
+    after: Option<&ProviderMarketEventDurableRoute>,
     maximum_routes: usize,
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -70,6 +71,7 @@ pub(super) fn load_provider_market_event_durable_routes(
         || event_kinds.len() > MAX_EVENT_KINDS
         || maximum_routes == 0
         || maximum_routes > MAX_DURABLE_ROUTES
+        || after.is_some_and(|cursor| cursor.instrument_id != instrument_id)
         || event_kinds
             .iter()
             .enumerate()
@@ -86,47 +88,28 @@ pub(super) fn load_provider_market_event_durable_routes(
         .map_err(|_| CatalogError::InvalidRecord)?;
     check_read(deadline, cancellation)?;
     let mut statement = connection.prepare(
-        "WITH datasets AS (
-                   SELECT DISTINCT dataset_id FROM analytical_available_generations
-                   WHERE available_at_ns<=?3 AND generation_kind='ingest'
-                     AND schema_name=?4 AND schema_version=?5 AND schema_fingerprint=?6
-                 ), routes AS (
-                   SELECT DISTINCT source_id, venue_id FROM provider_market_event_selection_index
-                   WHERE instrument_id=?1
-                     AND source_timestamp_ns IS NOT NULL AND source_timestamp_ns<=?2
-                     AND available_at_ns<=?3 AND ingested_at_ns<=?3
-                     AND event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                 )
-                 SELECT datasets.dataset_id, routes.source_id, routes.venue_id
-                 FROM datasets CROSS JOIN routes
-                 WHERE EXISTS (
-                 SELECT 1
-                 FROM provider_market_event_selection_index AS indexed
-                 JOIN analytical_generation_provider_publication_bindings AS publication
-                   ON publication.publication_digest=indexed.publication_digest
-                  AND publication.publication_kind=indexed.publication_kind
-                  AND publication.source_id=indexed.source_id
-                 JOIN analytical_available_generations AS generation
-                   ON generation.generation_sequence=publication.generation_sequence
-                 JOIN analytical_generation_source_inputs AS source_input
-                   ON source_input.generation_sequence=generation.generation_sequence
-                  AND source_input.run_id=publication.run_id
-                  AND source_input.source_id=indexed.source_id
-                 WHERE indexed.instrument_id=?1
-                   AND indexed.source_timestamp_ns IS NOT NULL
-                   AND indexed.source_timestamp_ns<=?2
-                   AND indexed.available_at_ns<=?3 AND indexed.ingested_at_ns<=?3
-                   AND generation.available_at_ns<=?3 AND generation.generation_kind='ingest'
-                   AND generation.schema_name=?4 AND generation.schema_version=?5
-                   AND generation.schema_fingerprint=?6
-                   AND indexed.event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                   AND generation.dataset_id=datasets.dataset_id
-                   AND indexed.source_id=routes.source_id
-                   AND indexed.venue_id=routes.venue_id
-                 )
-                 ORDER BY datasets.dataset_id COLLATE BINARY,
-                          routes.source_id COLLATE BINARY, routes.venue_id COLLATE BINARY
-                 LIMIT ?15",
+        "SELECT DISTINCT indexed.dataset_id, indexed.source_id, indexed.venue_id
+         FROM provider_market_event_selection_index AS indexed
+         JOIN market_event_complete_commits AS committed
+           ON committed.dataset_id=indexed.dataset_id
+          AND committed.commit_sequence=indexed.commit_sequence
+          AND committed.publication_digest=indexed.publication_digest
+          AND committed.publication_kind=indexed.publication_kind
+         JOIN ingest_runs AS run ON run.run_id=committed.run_id
+          AND run.source_id=indexed.source_id AND run.state='succeeded'
+          AND run.completed_at_ns=committed.available_at_ns
+         WHERE indexed.instrument_id=?1
+           AND indexed.source_timestamp_ns IS NOT NULL AND indexed.source_timestamp_ns<=?2
+           AND indexed.available_at_ns<=?3 AND indexed.ingested_at_ns<=?3
+           AND committed.available_at_ns<=?3
+           AND committed.schema_name=?4 AND committed.schema_version=?5
+           AND committed.schema_fingerprint=?6
+           AND indexed.event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+           AND (?16 IS NULL OR (indexed.dataset_id COLLATE BINARY,
+               indexed.source_id COLLATE BINARY, indexed.venue_id COLLATE BINARY)>(?16,?17,?18))
+         ORDER BY indexed.dataset_id COLLATE BINARY,
+                  indexed.source_id COLLATE BINARY, indexed.venue_id COLLATE BINARY
+         LIMIT ?15",
     )?;
     let mut rows = statement.query(params![
         instrument_id.as_uuid().as_bytes().as_slice(),
@@ -143,7 +126,10 @@ pub(super) fn load_provider_market_event_durable_routes(
         kinds[5],
         kinds[6],
         kinds[7],
-        i64::try_from(maximum_routes + 1).map_err(|_| CatalogError::InvalidLimit)?,
+        i64::try_from(maximum_routes).map_err(|_| CatalogError::InvalidLimit)?,
+        after.map(|route| route.dataset.as_str()),
+        after.map(|route| route.source_surface.as_str()),
+        after.map(|route| route.venue_id.as_str()),
     ])?;
     let mut budget = ResultBudget::new(result_limits);
     let mut routes = Vec::new();
@@ -152,9 +138,6 @@ pub(super) fn load_provider_market_event_durable_routes(
         .map_err(|_| CatalogError::Allocation)?;
     while let Some(row) = rows.next()? {
         check_read(deadline, cancellation)?;
-        if routes.len() == maximum_routes {
-            return Err(CatalogError::ResultRowLimitExceeded);
-        }
         let dataset = row
             .get_ref(0)?
             .as_str()

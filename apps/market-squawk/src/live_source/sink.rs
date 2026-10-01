@@ -1,10 +1,12 @@
 //! Capture-first Coinbase sink and bounded live-route activation.
 
-#[path = "coinbase_publication.rs"]
-mod coinbase_publication;
 #[path = "alpaca_publication.rs"]
 mod alpaca_publication;
-pub(crate) use alpaca_publication::{AlpacaCapturedPublicationIngress, AlpacaCapturedPublicationReceiver};
+#[path = "coinbase_publication.rs"]
+mod coinbase_publication;
+pub(crate) use alpaca_publication::{
+    AlpacaCapturedPublicationIngress, AlpacaCapturedPublicationReceiver,
+};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -17,18 +19,19 @@ use super::{
     display_market::{
         DisplayMarketIngress, DisplayMarketRouteIdentity, DisplayMarketTerminalFailure,
     },
-    kraken_publication::KrakenCapturedPublicationIngress,
+    kraken_publication::{KrakenCapturedPublicationIngress, KrakenCapturedPublicationInput},
     provider::{ProductionDecodeOutcome, ProductionMarketDecoder, StartupReadinessPolicy},
+    publication_admission::PublicationReservation,
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{
         GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
     },
 };
 pub(super) use coinbase_publication::{
-    CoinbaseCapturedPublicationIngress, CoinbaseCapturedPublicationInput,
-    CoinbaseCapturedPublicationReceiver,
+    CoinbaseCapturedPublicationDisposition, CoinbaseCapturedPublicationIngress,
+    CoinbaseCapturedPublicationInput, CoinbaseCapturedPublicationReceiver,
 };
-use market_squawk_adapter_coinbase::CoinbaseMarketDecodeOutcome;
+use market_squawk_adapter_coinbase::{CoinbaseMarketDecodeOutcome, CoinbaseMarketSealRejoin};
 use market_squawk_domain::{ExactPayloadEvidence, StreamIntegrityState, Timestamp};
 use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
@@ -103,6 +106,13 @@ impl ProductionCapturedPublicationIngress {
     }
 }
 
+/// Exact frame admission and queue slot owned by the source sink until submission or drop.
+#[derive(Debug)]
+enum CapturedPublicationPermit {
+    Coinbase(PublicationReservation<CoinbaseCapturedPublicationInput>),
+    Kraken(PublicationReservation<KrakenCapturedPublicationInput>),
+}
+
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
 #[derive(Debug)]
 pub(super) struct ProductionRawMarketSink<'a> {
@@ -112,10 +122,12 @@ pub(super) struct ProductionRawMarketSink<'a> {
     health_reporter: CurrentHealthReporter,
     decoder: Option<ProductionMarketDecoder>,
     publication: ProductionCapturedPublicationIngress,
+    publication_permit: Option<CapturedPublicationPermit>,
     metadata: SourceMetadata,
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
     pending_data: PendingDataBuffer,
+    pending_acknowledgement_at: Option<Timestamp>,
     pending_raw_capture: Option<(
         RawMarketFrame,
         market_squawk_sources::CaptureAdmissionReceipt,
@@ -244,10 +256,12 @@ impl<'a> ProductionRawMarketSink<'a> {
             health_reporter,
             decoder,
             publication,
+            publication_permit: None,
             metadata,
             generation: GenerationIdentity::from_session(session),
             subscription,
             pending_data,
+            pending_acknowledgement_at: None,
             pending_raw_capture: None,
             output,
             startup_readiness: None,
@@ -309,7 +323,10 @@ impl<'a> ProductionRawMarketSink<'a> {
             .decoder
             .as_mut()
             .ok_or(ProductionSinkFailure::MissingDecoder)?
-            .decode(&validated_frame, system_timestamp().map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?)
+            .decode(
+                &validated_frame,
+                system_timestamp().map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?,
+            )
             .map_err(ProductionSinkFailure::Decode)?;
         match outcome {
             ProductionDecodeOutcome::Kraken {
@@ -345,8 +362,13 @@ impl<'a> ProductionRawMarketSink<'a> {
                     else {
                         return Err(ProductionSinkFailure::PublicationTopologyMismatch);
                     };
+                    let Some(CapturedPublicationPermit::Kraken(permit)) =
+                        self.publication_permit.take()
+                    else {
+                        return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+                    };
                     publication
-                        .try_submit(pending, available_at)
+                        .submit_reserved(permit, pending, available_at)
                         .map_err(|_| ProductionSinkFailure::PublicationBackpressure)?;
                 }
                 self.process_captured_outcome(outcome, receipt)
@@ -354,20 +376,35 @@ impl<'a> ProductionRawMarketSink<'a> {
             ProductionDecodeOutcome::Alpaca(handoff) => {
                 let (outcome, prepared) = handoff.into_parts();
                 if let Some(prepared) = prepared {
-                    let material = receipt.try_issue_provider_event_microbatch_material(
-                        &frame, prepared.dataset().clone(), prepared.stream_identity().clone(),
-                    ).map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
-                    let (rejoin, seal_request) = prepared.into_pending_publication(&validated_frame, material)
+                    let material = receipt
+                        .try_issue_provider_event_microbatch_material(
+                            &frame,
+                            prepared.dataset().clone(),
+                            prepared.stream_identity().clone(),
+                        )
                         .map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
-                    let ProductionCapturedPublicationIngress::Alpaca(publication) = &self.publication else {
+                    let (rejoin, seal_request) = prepared
+                        .into_pending_publication(&validated_frame, material)
+                        .map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
+                    let ProductionCapturedPublicationIngress::Alpaca(publication) =
+                        &self.publication
+                    else {
                         return Err(ProductionSinkFailure::PublicationTopologyMismatch);
                     };
-                    let observed_at = system_timestamp().map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
-                    publication.try_submit(rejoin, seal_request, observed_at)
+                    let observed_at = system_timestamp()
+                        .map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
+                    publication
+                        .try_submit(rejoin, seal_request, observed_at)
                         .map_err(|error| match error {
-                            alpaca_publication::AlpacaPublicationQueueError::Closed => ProductionSinkFailure::AlpacaPublicationWorkerClosed,
-                            alpaca_publication::AlpacaPublicationQueueError::Full => ProductionSinkFailure::PublicationBackpressure,
-                            alpaca_publication::AlpacaPublicationQueueError::Bounds => ProductionSinkFailure::AlpacaPublicationMaterial,
+                            alpaca_publication::AlpacaPublicationQueueError::Closed => {
+                                ProductionSinkFailure::AlpacaPublicationWorkerClosed
+                            }
+                            alpaca_publication::AlpacaPublicationQueueError::Full => {
+                                ProductionSinkFailure::PublicationBackpressure
+                            }
+                            alpaca_publication::AlpacaPublicationQueueError::Bounds => {
+                                ProductionSinkFailure::AlpacaPublicationMaterial
+                            }
                         })?;
                 }
                 self.process_captured_outcome(outcome, receipt)
@@ -393,12 +430,36 @@ impl<'a> ProductionRawMarketSink<'a> {
                 let (batch, rejoin, seal_request) = handoff
                     .into_pending_publication(&validated_frame, material, available_at)
                     .map_err(|_| ProductionSinkFailure::CoinbasePublicationMaterial)?;
+                if self.subscription.phase() == SubscriptionPhase::AwaitingAcknowledgement
+                    && self.buffers_coinbase_publications()
+                {
+                    return self.process_captured_outcome_with_pending_publication(
+                        DecodeOutcome::Data(batch),
+                        receipt,
+                        Some(Box::new(PendingCoinbasePublication {
+                            rejoin,
+                            seal_request,
+                            observed_at: available_at,
+                        })),
+                    );
+                }
                 let ProductionCapturedPublicationIngress::Coinbase(publication) = &self.publication
                 else {
                     return Err(ProductionSinkFailure::PublicationTopologyMismatch);
                 };
+                let Some(CapturedPublicationPermit::Coinbase(permit)) =
+                    self.publication_permit.take()
+                else {
+                    return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+                };
                 publication
-                    .try_submit(rejoin, seal_request, available_at)
+                    .submit_reserved(
+                        permit,
+                        CoinbaseCapturedPublicationDisposition::AwaitCommittedRows,
+                        rejoin,
+                        seal_request,
+                        available_at,
+                    )
                     .map_err(|_| ProductionSinkFailure::PublicationBackpressure)?;
                 self.process_captured_outcome(DecodeOutcome::Data(batch), receipt)
             }
@@ -455,30 +516,27 @@ impl<'a> ProductionRawMarketSink<'a> {
         &mut self,
         frame: &RawMarketFrame,
     ) -> Result<market_squawk_sources::CaptureAdmissionReceipt, ProductionSinkFailure> {
-        let receipt = self
-            .capture
-            .try_publish(frame)
-            .map_err(|error| {
-                // These closed errors/reasons contain only classifications and byte counts.
-                // Never include the frame, payload, or capture publisher's debug representation.
+        let receipt = self.capture.try_publish(frame).map_err(|error| {
+            // These closed errors/reasons contain only classifications and byte counts.
+            // Never include the frame, payload, or capture publisher's debug representation.
+            tracing::warn!(
+                source = self.session.source_id().as_str(),
+                generation = self.session.generation().get(),
+                capture_error = %error,
+                dropped_health_events = self.capture.dropped_health_events(),
+                "raw capture publication rejected"
+            );
+            while let Some(event) = self.capture.try_next_health() {
                 tracing::warn!(
-                    source = self.session.source_id().as_str(),
-                    generation = self.session.generation().get(),
-                    capture_error = %error,
-                    dropped_health_events = self.capture.dropped_health_events(),
-                    "raw capture publication rejected"
+                    source = event.identity().source_id().as_str(),
+                    generation = event.identity().connection_generation().get(),
+                    reason = ?event.reason(),
+                    integrity = ?event.integrity(),
+                    "retained capture health event after publication rejection"
                 );
-                while let Some(event) = self.capture.try_next_health() {
-                    tracing::warn!(
-                        source = event.identity().source_id().as_str(),
-                        generation = event.identity().connection_generation().get(),
-                        reason = ?event.reason(),
-                        integrity = ?event.integrity(),
-                        "retained capture health event after publication rejection"
-                    );
-                }
-                ProductionSinkFailure::Capture(error)
-            })?;
+            }
+            ProductionSinkFailure::Capture(error)
+        })?;
         self.output.poll_failures()?;
         Ok(receipt)
     }
@@ -487,6 +545,15 @@ impl<'a> ProductionRawMarketSink<'a> {
         &mut self,
         outcome: DecodeOutcome,
         receipt: market_squawk_sources::CaptureAdmissionReceipt,
+    ) -> Result<(), ProductionSinkFailure> {
+        self.process_captured_outcome_with_pending_publication(outcome, receipt, None)
+    }
+
+    fn process_captured_outcome_with_pending_publication(
+        &mut self,
+        outcome: DecodeOutcome,
+        receipt: market_squawk_sources::CaptureAdmissionReceipt,
+        publication: Option<Box<PendingCoinbasePublication>>,
     ) -> Result<(), ProductionSinkFailure> {
         self.output.poll_failures()?;
         let latest_source_at = latest_source_timestamp(&outcome);
@@ -506,7 +573,7 @@ impl<'a> ProductionRawMarketSink<'a> {
                 received_at,
             ),
             ValidatedSessionDecodeOutcome::Data(data) => {
-                self.process_data(data, latest_source_at, received_at)
+                self.process_data(data, latest_source_at, received_at, publication)
             }
             ValidatedSessionDecodeOutcome::Ignored(ignored) => self
                 .subscription
@@ -598,7 +665,12 @@ impl<'a> ProductionRawMarketSink<'a> {
                     .map_err(ProductionSinkFailure::Subscription)?;
                 self.acknowledgement_evidence =
                     Some(ExactPayloadEvidence::from_content_digest(payload_digest));
-                self.flush_pending_data(received_at)?;
+                if self.buffers_coinbase_publications() {
+                    // The receive hook drains exact raw/decoded pairs under active admission.
+                    self.pending_acknowledgement_at = Some(received_at);
+                } else {
+                    self.flush_pending_data(received_at)?;
+                }
             }
             ControlFrameKind::Heartbeat => {
                 self.subscription
@@ -630,6 +702,7 @@ impl<'a> ProductionRawMarketSink<'a> {
         data: market_squawk_sources::CapturedDecodedProviderBatch,
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
+        publication: Option<Box<PendingCoinbasePublication>>,
     ) -> Result<(), ProductionSinkFailure> {
         if self.subscription.phase() == SubscriptionPhase::AwaitingAcknowledgement
             && self.subscription.accepts_first_validated_data()
@@ -646,7 +719,10 @@ impl<'a> ProductionRawMarketSink<'a> {
         {
             return self
                 .pending_data
-                .try_push(data, latest_source_at, received_at);
+                .try_push(data, latest_source_at, received_at, publication);
+        }
+        if publication.is_some() {
+            return Err(ProductionSinkFailure::PublicationTopologyMismatch);
         }
         match self.process_active_data(data, latest_source_at, received_at, received_at)? {
             ActiveDataDisposition::Published => self.publish_startup_readiness(),
@@ -663,16 +739,19 @@ impl<'a> ProductionRawMarketSink<'a> {
         let mut published = false;
         let mut freshness_unqualified = false;
         while let Some(pending) = self.pending_data.try_pop_front()? {
-            match self.process_active_data(
-                pending.data,
-                pending.latest_source_at,
-                pending.received_at,
-                acknowledgement_received_at.max(pending.received_at),
-            )? {
+            match self.process_pending_data(pending, acknowledgement_received_at)? {
                 ActiveDataDisposition::Published => published = true,
                 ActiveDataDisposition::FreshnessUnqualified => freshness_unqualified = true,
             }
         }
+        self.finish_pending_flush(published, freshness_unqualified)
+    }
+
+    fn finish_pending_flush(
+        &mut self,
+        published: bool,
+        freshness_unqualified: bool,
+    ) -> Result<(), ProductionSinkFailure> {
         if published
             || freshness_unqualified
                 && self.startup_readiness_policy
@@ -681,6 +760,91 @@ impl<'a> ProductionRawMarketSink<'a> {
             self.publish_startup_readiness()?;
         }
         Ok(())
+    }
+
+    fn buffers_coinbase_publications(&self) -> bool {
+        self.pending_data.is_enabled()
+            && matches!(
+                self.decoder.as_ref(),
+                Some(ProductionMarketDecoder::Coinbase(_))
+            )
+            && matches!(
+                self.publication,
+                ProductionCapturedPublicationIngress::Coinbase(_)
+            )
+    }
+
+    fn process_pending_data(
+        &mut self,
+        pending: PendingDecodedData,
+        acknowledgement_received_at: Timestamp,
+    ) -> Result<ActiveDataDisposition, ProductionSinkFailure> {
+        let disposition = self.process_active_data(
+            pending.data,
+            pending.latest_source_at,
+            pending.received_at,
+            acknowledgement_received_at.max(pending.received_at),
+        )?;
+        if let Some(publication) = pending.publication {
+            let ProductionCapturedPublicationIngress::Coinbase(ingress) = &self.publication else {
+                return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+            };
+            let Some(CapturedPublicationPermit::Coinbase(permit)) = self.publication_permit.take()
+            else {
+                return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+            };
+            let PendingCoinbasePublication {
+                rejoin,
+                seal_request,
+                observed_at,
+            } = *publication;
+            ingress
+                .submit_reserved(
+                    permit,
+                    match disposition {
+                        ActiveDataDisposition::Published => {
+                            CoinbaseCapturedPublicationDisposition::AwaitCommittedRows
+                        }
+                        ActiveDataDisposition::FreshnessUnqualified => {
+                            CoinbaseCapturedPublicationDisposition::FreshnessUnqualified
+                        }
+                    },
+                    rejoin,
+                    seal_request,
+                    observed_at,
+                )
+                .map_err(|_| ProductionSinkFailure::PublicationBackpressure)?;
+        }
+        Ok(disposition)
+    }
+
+    async fn flush_pending_publications(&mut self) -> Result<(), SinkError> {
+        let Some(acknowledgement_received_at) = self.pending_acknowledgement_at else {
+            return Ok(());
+        };
+        let mut published = false;
+        let mut freshness_unqualified = false;
+        while !self.pending_data.entries.is_empty() {
+            // Keep the pair in its charged buffer until admission completes. Cancellation
+            // therefore cannot strand a popped frame or lose its captured decoder evidence.
+            self.reserve_publication_capacity().await?;
+            let pending = self
+                .pending_data
+                .try_pop_front()
+                .map_err(|failure| self.fail(failure))?
+                .ok_or(ProductionSinkFailure::PreAcknowledgementBufferAccounting)
+                .map_err(|failure| self.fail(failure))?;
+            match self
+                .process_pending_data(pending, acknowledgement_received_at)
+                .map_err(|failure| self.fail(failure))?
+            {
+                ActiveDataDisposition::Published => published = true,
+                ActiveDataDisposition::FreshnessUnqualified => freshness_unqualified = true,
+            }
+        }
+        self.pending_acknowledgement_at = None;
+        self.finish_pending_flush(published, freshness_unqualified)
+            .map_err(|failure| self.fail(failure))
     }
 
     fn process_active_data(
@@ -826,6 +990,23 @@ struct PendingDecodedData {
     latest_source_at: Option<Timestamp>,
     received_at: Timestamp,
     retained_bytes: usize,
+    publication: Option<Box<PendingCoinbasePublication>>,
+}
+
+#[derive(Debug)]
+struct PendingCoinbasePublication {
+    rejoin: CoinbaseMarketSealRejoin,
+    seal_request: market_squawk_sources::ProviderCaptureSealRequest,
+    observed_at: Timestamp,
+}
+
+impl PendingCoinbasePublication {
+    fn retained_bytes(&self) -> Option<usize> {
+        self.rejoin
+            .pending_public_retained_bytes()?
+            .checked_add(self.seal_request.checked_plain_retained_bytes().ok()?)?
+            .checked_add(size_of::<Self>())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -867,6 +1048,7 @@ impl PendingDataBuffer {
         data: market_squawk_sources::CapturedDecodedProviderBatch,
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
+        publication: Option<Box<PendingCoinbasePublication>>,
     ) -> Result<(), ProductionSinkFailure> {
         if self.entries.len() == self.maximum_messages {
             return Err(ProductionSinkFailure::PreAcknowledgementBufferCountSaturated);
@@ -875,6 +1057,14 @@ impl PendingDataBuffer {
             .retained_bytes()
             .map_err(|_error| ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?
             .checked_add(size_of::<PendingDecodedData>())
+            .ok_or(ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?;
+        let retained_bytes = retained_bytes
+            .checked_add(match publication.as_ref() {
+                Some(publication) => publication
+                    .retained_bytes()
+                    .ok_or(ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?,
+                None => 0,
+            })
             .ok_or(ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?;
         let next_total = self
             .retained_bytes
@@ -888,6 +1078,7 @@ impl PendingDataBuffer {
             latest_source_at,
             received_at,
             retained_bytes,
+            publication,
         });
         self.retained_bytes = next_total;
         Ok(())
@@ -1211,7 +1402,83 @@ struct PreparedQualifiedRoute {
     batch: CurrentDecodedProviderBatch,
 }
 
+impl ProductionRawMarketSink<'_> {
+    async fn reserve_publication_capacity(&mut self) -> Result<(), SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        let permit = match &self.publication {
+            ProductionCapturedPublicationIngress::Coinbase(publication) => {
+                if publication.is_closed() {
+                    return Err(self.fail(ProductionSinkFailure::PublicationBackpressure));
+                }
+                match &self.publication_permit {
+                    Some(CapturedPublicationPermit::Coinbase(_)) => return Ok(()),
+                    Some(_) => {
+                        return Err(self.fail(ProductionSinkFailure::PublicationTopologyMismatch));
+                    }
+                    None => {}
+                }
+                match publication.reserve().await {
+                    Ok(permit) => CapturedPublicationPermit::Coinbase(permit),
+                    Err(_) => {
+                        return Err(self.fail(ProductionSinkFailure::PublicationBackpressure));
+                    }
+                }
+            }
+            ProductionCapturedPublicationIngress::Kraken(publication) => {
+                if publication.is_closed() {
+                    return Err(self.fail(ProductionSinkFailure::PublicationBackpressure));
+                }
+                match &self.publication_permit {
+                    Some(CapturedPublicationPermit::Kraken(_)) => return Ok(()),
+                    Some(_) => {
+                        return Err(self.fail(ProductionSinkFailure::PublicationTopologyMismatch));
+                    }
+                    None => {}
+                }
+                match publication.reserve().await {
+                    Ok(permit) => CapturedPublicationPermit::Kraken(permit),
+                    Err(_) => {
+                        return Err(self.fail(ProductionSinkFailure::PublicationBackpressure));
+                    }
+                }
+            }
+            ProductionCapturedPublicationIngress::None
+            | ProductionCapturedPublicationIngress::Alpaca(_) => return Ok(()),
+        };
+        // Control frames retain this slot. Cancellation before admission owns no permit;
+        // cancellation afterward releases it when the generation drops its sink.
+        self.publication_permit = Some(permit);
+        Ok(())
+    }
+}
+
 impl RawMarketSink for ProductionRawMarketSink<'_> {
+    fn wait_for_capacity(&mut self) -> futures_util::future::BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async move {
+            if let Some(failure) = self.terminal {
+                return Err(failure.as_sink_error());
+            }
+            if self.subscription.phase() == SubscriptionPhase::AwaitingAcknowledgement
+                && self.buffers_coinbase_publications()
+            {
+                if let ProductionCapturedPublicationIngress::Coinbase(publication) =
+                    &self.publication
+                {
+                    if publication.is_closed() {
+                        return Err(self.fail(ProductionSinkFailure::PublicationBackpressure));
+                    }
+                }
+                // Bootstrap rows cannot commit until ACK. Their existing bounded buffer owns
+                // raw and decoded material without occupying the active publication budget.
+                return Ok(());
+            }
+            self.flush_pending_publications().await?;
+            self.reserve_publication_capacity().await
+        })
+    }
+
     fn bind_active_request_budget(&mut self, request: BudgetPermitLease) -> Result<(), SinkError> {
         if self.active_request_budget.is_some() {
             return Err(self.fail(ProductionSinkFailure::DuplicateActiveRequestBudget));
@@ -1329,7 +1596,7 @@ pub enum ProductionSinkFailure {
     MissingDecoder,
     #[error("decoded sink cannot accept an adapter-predecoded frame")]
     UnexpectedDecoder,
-    #[error("subscription state failed")]
+    #[error("subscription state failed: {0}")]
     Subscription(SubscriptionFailure),
     #[error("source requested resynchronization: {0:?}")]
     Resynchronize(ResynchronizationReason),

@@ -202,8 +202,8 @@ pub use automatic::{
     ModeledGovernmentAnnualReturn, PointInTimeValuationInput, REPORTED_COMMON_SHARE_ASSUMPTION,
     ResidualIncomePeriod, ResidualIncomeTerminalAudit, ResidualIncomeTerminalConvention,
     ResidualIncomeTerminalReceipt, ResidualIncomeValuationRequest, ValuationArithmeticPolicy,
-    ValuationRightsReceipt, calculate_comparable_companies, calculate_discounted_cash_flow,
-    calculate_forecast_distribution, calculate_residual_income,
+    ValuationEventRightsAdmission, ValuationRightsReceipt, calculate_comparable_companies,
+    calculate_discounted_cash_flow, calculate_forecast_distribution, calculate_residual_income,
 };
 pub use evidence::{
     EvidenceOrigin, EvidenceVerification, FairValueEvidence, FairValueEvidenceHash,

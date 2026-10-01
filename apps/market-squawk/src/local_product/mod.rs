@@ -1346,14 +1346,21 @@ impl LocalProduct {
         let startup_tasks = startup::ProductStartupTasks::start(
             Arc::clone(&research_domains),
             startup_cancellation,
-            [fred_startup, fiscal_startup, daily_startup, display_history_startup],
+            [
+                fred_startup,
+                fiscal_startup,
+                daily_startup,
+                display_history_startup,
+            ],
         );
+        source_lifecycle.bind_public_startup_tasks(Arc::downgrade(&startup_tasks))?;
         let application = Arc::new(application.with_startup_tasks(Arc::clone(&startup_tasks)));
         let credential_access = Arc::new(credential_access::CredentialAccessCoordinator::new(
             Arc::clone(&onboarding),
             Arc::clone(&provider_portal_activation),
             source_lifecycle.clone(),
             paper.credential_runtime_control(),
+            Arc::clone(&startup_tasks),
         ));
         Ok(Self {
             paths,
@@ -1688,20 +1695,15 @@ impl LocalProduct {
         self.source_lifecycle.clone()
     }
 
-    pub(crate) async fn restore_active_live_sources(
+    pub(crate) fn admit_source_startup(
         &self,
-        deadline: std::time::Instant,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<
-        source_lifecycle::LiveSourceRestoreReport,
-        crate::application::source::SourceLifecycleError,
-    > {
-        self.source_lifecycle
-            .restore_ready_research_sources(deadline, cancellation)
-            .await?;
-        self.source_lifecycle
-            .restore_active_live_sources(deadline, cancellation)
-            .await
+        operation_timeout: std::time::Duration,
+    ) -> Result<(), crate::application::source::SourceLifecycleError> {
+        self.startup_tasks
+            .admit_public_sources(Arc::clone(&self.source_lifecycle))
+            .map_err(|_| crate::application::source::SourceLifecycleError::Unavailable)?;
+        self.startup_tasks
+            .admit_source_restoration(Arc::clone(&self.source_lifecycle), operation_timeout)
     }
 
     pub(crate) fn paper_runtime_activity_authority(
@@ -2078,6 +2080,9 @@ pub enum LocalProductError {
     /// Source-domain lifecycle construction failed.
     #[error(transparent)]
     Source(#[from] crate::application::SourceApplicationError),
+    /// Retained source startup ownership could not be bound.
+    #[error(transparent)]
+    SourceLifecycle(#[from] crate::application::source::SourceLifecycleError),
     /// Portfolio authority recovery failed.
     #[error(transparent)]
     Portfolio(#[from] PortfolioApplicationServiceError),

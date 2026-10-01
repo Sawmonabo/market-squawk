@@ -27,9 +27,9 @@ use market_squawk_platform::{
     ResearchObjectReceipt, SealedResearchJournalStore,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationGrant, BudgetDispatchDecision,
-    BudgetReservationDecision, CoverageTopology, EndpointPolicy,
-    FreshnessPolicy, HistoricalCapability, HttpCaptureMethod, HttpRequestBounds,
+    AuthoritativeSourceRegistry, AuthorizationGrant, BudgetDispatchDecision, BudgetPermit,
+    BudgetReservationDecision, BudgetUnavailableReason, CoverageTopology, CurrentSourceSession,
+    EndpointPolicy, FreshnessPolicy, HistoricalCapability, HttpCaptureMethod, HttpRequestBounds,
     InstrumentCoverage, NetworkAccessPolicy, ProviderBudgetPolicy, ProviderRateAuthority,
     SessionId, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
     SourceMetadataInput, SourceProtocolProfile, TransportFrameKind,
@@ -164,8 +164,8 @@ pub(super) async fn reopen_original(
     Ok(result)
 }
 
-/// The profile budget is supplied by the installed market source, so references share the exact
-/// provider allocation rather than declaring a competing budget for the same provider.
+/// The endpoint's canonical policy is supplied by composition, so reference acquisition and
+/// onboarding share the same provider allocation on their common network authority.
 pub(super) fn metadata(
     source: &'static str,
     venue: &'static str,
@@ -256,10 +256,16 @@ fn open_registry(
     source: &'static str,
 ) -> Result<AuthoritativeSourceRegistry, CryptoReferenceError> {
     let store = LocalAuthorityStateStore::try_open(paths.root().join("authority").join(source))
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(stage = "authority_store_open", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
     AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
         store, Arc::new(provider_rate.clone()), provider_rate,
-    ).map_err(|_| CryptoReferenceError::CatalogUnavailable)
+    ).map_err(|error| {
+            tracing::warn!(stage = "registry_open", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })
 }
 
 pub(super) async fn coinbase_product(
@@ -285,7 +291,10 @@ pub(super) async fn coinbase_product(
     .await;
     let closed = registry
         .shutdown()
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable);
+        .map_err(|error| {
+            tracing::warn!(stage = "coinbase_registry_shutdown", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        });
     match (result, closed) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -311,7 +320,10 @@ async fn coinbase_product_inner(
         .map_err(|_| CryptoReferenceError::InvalidEvidence)?;
     let registered = registry
         .register_or_resume_exact(metadata, super::crypto_reference::trusted_now()?)
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(stage = "coinbase_register", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
     let session = registry
         .begin_session(
             &registered,
@@ -322,26 +334,21 @@ async fn coinbase_product_inner(
             next_generation()?,
             super::crypto_reference::trusted_now()?,
         )
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(stage = "coinbase_begin_session", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
     let result = async {
         let mut frames = registry
             .take_raw_frame_factory(&session)
-            .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+            .map_err(|error| {
+            tracing::warn!(stage = "coinbase_frame_factory", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
         let budget = session
             .budget()
             .ok_or(CryptoReferenceError::TransportUnavailable)?;
-        let reservation = match budget.try_reserve_request() {
-            BudgetReservationDecision::Ready(value) => value,
-            _ => return Err(CryptoReferenceError::TransportUnavailable),
-        };
-        super::crypto_reference::check_operation(deadline, cancellation)?;
-        session
-            .validate_current_lease()
-            .map_err(|_| CryptoReferenceError::TransportUnavailable)?;
-        let permit = match reservation.commit_dispatch() {
-            BudgetDispatchDecision::Ready(value) => value,
-            _ => return Err(CryptoReferenceError::TransportUnavailable),
-        };
+        let permit = commit_reference_dispatch(&session, deadline, cancellation).await?;
         let operation = async {
             let client = Client::builder()
                 .redirect(Policy::none())
@@ -459,7 +466,10 @@ async fn coinbase_product_inner(
     .await;
     let ended = registry
         .end_session(&session, session.started_at())
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable);
+        .map_err(|error| {
+            tracing::warn!(stage = "coinbase_end_session", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        });
     match (result, ended) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -492,7 +502,10 @@ pub(super) async fn kraken_instrument(
     .await;
     let closed = registry
         .shutdown()
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable);
+        .map_err(|error| {
+            tracing::warn!(stage = "kraken_registry_shutdown", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        });
     match (result, closed) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -518,7 +531,10 @@ async fn kraken_instrument_inner(
         .map_err(|_| CryptoReferenceError::InvalidEvidence)?;
     let registered = registry
         .register_or_resume_exact(metadata, super::crypto_reference::trusted_now()?)
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(stage = "kraken_register", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
     let session = registry
         .begin_session(
             &registered,
@@ -529,26 +545,21 @@ async fn kraken_instrument_inner(
             next_generation()?,
             super::crypto_reference::trusted_now()?,
         )
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(stage = "kraken_begin_session", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
     let result = async {
         let mut frames = registry
             .take_raw_frame_factory(&session)
-            .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+            .map_err(|error| {
+            tracing::warn!(stage = "kraken_frame_factory", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?;
         let budget = session
             .budget()
             .ok_or(CryptoReferenceError::TransportUnavailable)?;
-        let reservation = match budget.try_reserve_request() {
-            BudgetReservationDecision::Ready(value) => value,
-            _ => return Err(CryptoReferenceError::TransportUnavailable),
-        };
-        super::crypto_reference::check_operation(deadline, cancellation)?;
-        session
-            .validate_current_lease()
-            .map_err(|_| CryptoReferenceError::TransportUnavailable)?;
-        let permit = match reservation.commit_dispatch() {
-            BudgetDispatchDecision::Ready(value) => value,
-            _ => return Err(CryptoReferenceError::TransportUnavailable),
-        };
+        let permit = commit_reference_dispatch(&session, deadline, cancellation).await?;
         let operation = async {
             let (mut socket, _) = super::crypto_reference::within(deadline, cancellation, async {
                 tokio_tungstenite::connect_async(endpoint)
@@ -650,11 +661,93 @@ async fn kraken_instrument_inner(
     .await;
     let ended = registry
         .end_session(&session, session.started_at())
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable);
+        .map_err(|error| {
+            tracing::warn!(stage = "kraken_end_session", %error, "public crypto reference authority operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        });
     match (result, ended) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
         (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+/// Waiting consumes no request or permit and never extends the caller's operation deadline.
+async fn commit_reference_dispatch(
+    session: &CurrentSourceSession,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<BudgetPermit, CryptoReferenceError> {
+    const CONCURRENCY_RECHECK: Duration = Duration::from_millis(25);
+    let budget = session
+        .budget()
+        .ok_or(CryptoReferenceError::TransportUnavailable)?;
+    loop {
+        super::crypto_reference::check_operation(deadline, cancellation)?;
+        session
+            .validate_current_lease()
+            .map_err(|_| CryptoReferenceError::TransportUnavailable)?;
+        let reservation = match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(until) => {
+                let wait = budget
+                    .remaining_wait(until)
+                    .map_err(|_| CryptoReferenceError::TransportUnavailable)?;
+                wait_for_reference_budget(wait, deadline, cancellation).await?;
+                continue;
+            }
+            BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted,
+            ) => {
+                wait_for_reference_budget(CONCURRENCY_RECHECK, deadline, cancellation).await?;
+                continue;
+            }
+            BudgetReservationDecision::Unavailable(_) => {
+                return Err(CryptoReferenceError::TransportUnavailable);
+            }
+        };
+        super::crypto_reference::check_operation(deadline, cancellation)?;
+        session
+            .validate_current_lease()
+            .map_err(|_| CryptoReferenceError::TransportUnavailable)?;
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(until) => {
+                let wait = budget
+                    .remaining_wait(until)
+                    .map_err(|_| CryptoReferenceError::TransportUnavailable)?;
+                wait_for_reference_budget(wait, deadline, cancellation).await?;
+            }
+            BudgetDispatchDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted) => {
+                wait_for_reference_budget(CONCURRENCY_RECHECK, deadline, cancellation).await?;
+            }
+            BudgetDispatchDecision::Unavailable(_) => {
+                return Err(CryptoReferenceError::TransportUnavailable);
+            }
+        }
+    }
+}
+
+async fn wait_for_reference_budget(
+    wait: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), CryptoReferenceError> {
+    super::crypto_reference::check_operation(deadline, cancellation)?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(CryptoReferenceError::DeadlineElapsed)?;
+    if wait >= remaining {
+        let not_before = Instant::now()
+            .checked_add(wait)
+            .ok_or(CryptoReferenceError::ClockUnavailable)?;
+        return Err(CryptoReferenceError::RateDeferred { not_before });
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(CryptoReferenceError::Cancelled),
+        () = tokio::time::sleep_until(deadline.into()) => Err(CryptoReferenceError::DeadlineElapsed),
+        () = tokio::time::sleep(wait) => super::crypto_reference::check_operation(deadline, cancellation),
     }
 }
 

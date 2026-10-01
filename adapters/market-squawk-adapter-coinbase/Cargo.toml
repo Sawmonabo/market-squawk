@@ -27,6 +27,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

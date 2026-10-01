@@ -1275,7 +1275,7 @@ fn durable_source_candidate(
         CandidateIntegrity::new(
             IntegrityState::Verified,
             Some(provenance.connection_generation()),
-            primary.coordinate().origin_generation_published_at(),
+            primary.coordinate().origin_committed_at(),
         ),
         ExecutionEligibility::Ineligible,
     );

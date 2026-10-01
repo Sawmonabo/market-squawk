@@ -13,9 +13,8 @@ use super::storage::{
 use super::types::*;
 use super::{
     PreparedProviderCaptureBinding, PreparedProviderOptionMarketBinding,
-    PreparedProviderPublicationBinding, ProviderArtifactInputCoordinate,
-    retain_prepared_provider_capture_binding, retain_prepared_provider_option_market_binding,
-    retain_prepared_provider_publication_binding,
+    ProviderArtifactInputCoordinate, retain_prepared_provider_capture_binding,
+    retain_prepared_provider_option_market_binding,
     retain_sealed_provider_logical_publication_binding,
 };
 use market_squawk_sources::SealedProviderLogicalPublicationBinding;
@@ -39,11 +38,6 @@ pub(crate) enum PublicationSourceEvidence<'a> {
     StagedProviderMacroPlan(
         &'a super::ProviderMacroPlanPublicationCommit,
         &'a [ProviderArtifactInputCoordinate],
-    ),
-    /// The provider publication consumes one exact typed event/composite binding.
-    ProviderEvent(
-        &'a PreparedProviderPublicationBinding,
-        ProviderArtifactInputCoordinate,
     ),
     /// The provider publication consumes one exact sealed option-market binding.
     ProviderOptionMarket(
@@ -445,15 +439,6 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
                 catalog_now,
             )?;
         }
-        PublicationSourceEvidence::ProviderEvent(binding, coordinate) => {
-            retain_prepared_provider_publication_binding(
-                transaction,
-                reservation.run_id,
-                binding,
-                coordinate,
-                catalog_now,
-            )?;
-        }
         PublicationSourceEvidence::ProviderOptionMarket(binding, coordinate) => {
             retain_prepared_provider_option_market_binding(
                 transaction,
@@ -615,16 +600,6 @@ fn publication_source_evidence_matches(
                     coordinates,
                 )?)
         }
-        PublicationSourceEvidence::ProviderEvent(binding, coordinate) => Ok(capture_count == 0
-            && publication_count == 1
-            && retained_publication_input_matches(
-                transaction,
-                run_id,
-                binding.publication_digest(),
-                binding.publication_kind_name(),
-                binding.source_id(),
-                coordinate,
-            )?),
         PublicationSourceEvidence::ProviderOptionMarket(binding, coordinate) => Ok(capture_count
             == 0
             && publication_count == 1

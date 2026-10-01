@@ -74,6 +74,18 @@ struct SourceReference {
     observed_at: Timestamp,
 }
 
+/// Uses the same REST declaration as public onboarding on `api.coinbase.com`.
+/// The live WebSocket profile has a different network authority and its own policy.
+pub(super) fn coinbase_reference_budget() -> Result<ProviderBudgetPolicy, CryptoReferenceError> {
+    let profiles = market_squawk_sources::built_in_provider_profiles()
+        .map_err(|_| CryptoReferenceError::InvalidEvidence)?;
+    profiles
+        .get("coinbase.public-market-data")
+        .and_then(|profile| profile.capability().rate_policy().enforcement_policy())
+        .cloned()
+        .ok_or(CryptoReferenceError::InvalidEvidence)
+}
+
 /// Acquires original governed reference captures, commits accepted catalog identities,
 /// and returns the exact requests A1 must select before live market sessions start.
 #[allow(
@@ -313,7 +325,10 @@ async fn try_reuse_coinbase(
             .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
     let Some(selection) = reader
         .select_provider_identity_as_of(query, deadline, cancellation)
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?
+        .map_err(|error| {
+            tracing::warn!(stage = "coinbase_identity_selection", %error, "public crypto catalog operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?
     else {
         return Ok(None);
     };
@@ -400,7 +415,10 @@ async fn try_reuse_kraken(
             .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
     let Some(selection) = reader
         .select_provider_identity_as_of(query, deadline, cancellation)
-        .map_err(|_| CryptoReferenceError::CatalogUnavailable)?
+        .map_err(|error| {
+            tracing::warn!(stage = "kraken_identity_selection", %error, "public crypto catalog operation failed");
+            CryptoReferenceError::CatalogUnavailable
+        })?
     else {
         return Ok(None);
     };
@@ -525,7 +543,10 @@ pub(crate) async fn synchronize_accepted_catalog_references(
         let expected = &expected_by_id[&id];
         let existing = reader
             .latest(id, deadline, cancellation)
-            .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+            .map_err(|error| {
+                tracing::warn!(stage = "latest_definition", %error, "public crypto catalog operation failed");
+                CryptoReferenceError::CatalogUnavailable
+            })?;
         let definition = prepare_definition(
             existing.as_ref().map(|record| record.definition()),
             expected,
@@ -563,8 +584,19 @@ pub(crate) async fn synchronize_accepted_catalog_references(
         )
     })
     .await
-    .map_err(|_| CryptoReferenceError::CatalogUnavailable)?
-    .map_err(|_| CryptoReferenceError::CatalogUnavailable)?;
+    .map_err(|error| {
+        tracing::warn!(
+            stage = "synchronization_join",
+            panicked = error.is_panic(),
+            cancelled = error.is_cancelled(),
+            "public crypto catalog worker failed"
+        );
+        CryptoReferenceError::CatalogUnavailable
+    })?
+    .map_err(|error| {
+        tracing::warn!(stage = "synchronization", %error, "public crypto catalog operation failed");
+        CryptoReferenceError::CatalogUnavailable
+    })?;
     // The selected query cutoff must include the durable definition publication, whose catalog
     // timestamp can be later than the initial source receipt.
     let knowledge_at = trusted_now()?;
@@ -805,6 +837,8 @@ pub(crate) enum CryptoReferenceError {
     CatalogUnavailable,
     #[error("canonical crypto identity has no approved catalog or code-owned first-run anchor")]
     CanonicalIdentityUnapproved,
+    #[error("public crypto reference awaits provider rate admission")]
+    RateDeferred { not_before: Instant },
     #[error("public crypto reference deadline elapsed")]
     DeadlineElapsed,
     #[error("public crypto reference was cancelled")]

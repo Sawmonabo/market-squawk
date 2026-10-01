@@ -475,7 +475,10 @@ async fn start_publication_supervisors(
         .try_reserve_exact(specs.len())
         .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
     for (package, committed) in packages.into_iter().zip(committed_receivers) {
-        let (ingress, receiver) = CoinbaseCapturedPublicationIngress::try_channel(maximum_inflight);
+        let (ingress, receiver) = CoinbaseCapturedPublicationIngress::try_channel(
+            maximum_inflight,
+            Arc::new(tokio::sync::Semaphore::new(maximum_inflight.get())),
+        );
         match CoinbasePublicationSupervisor::start(
             package,
             receiver,

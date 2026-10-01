@@ -1537,15 +1537,92 @@ CREATE TABLE ingest_run_provider_capture_bindings (
 
 CREATE INDEX ingest_run_capture_metadata_dependency ON ingest_run_provider_capture_bindings(metadata_dependency_digest);
 
+CREATE TABLE market_event_storage_heads (
+    dataset_id TEXT PRIMARY KEY CHECK (length(CAST(dataset_id AS BLOB)) BETWEEN 1 AND 256),
+    committed_sequence INTEGER NOT NULL CHECK (committed_sequence>=0),
+    content_digest BLOB CHECK (length(content_digest)=32),
+    CHECK ((committed_sequence=0 AND content_digest IS NULL)
+        OR (committed_sequence>0 AND content_digest IS NOT NULL))
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE market_event_commits (
+    dataset_id TEXT NOT NULL REFERENCES market_event_storage_heads(dataset_id),
+    commit_sequence INTEGER NOT NULL CHECK (commit_sequence>0),
+    run_id TEXT NOT NULL UNIQUE REFERENCES ingest_runs(run_id),
+    publication_digest BLOB NOT NULL UNIQUE CHECK (length(publication_digest)=32),
+    publication_kind TEXT NOT NULL CHECK (publication_kind IN
+        ('response_market_event','event_microbatch','composite_response_event')),
+    schema_name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    schema_fingerprint BLOB NOT NULL CHECK (length(schema_fingerprint)=32),
+    previous_content_digest BLOB CHECK (length(previous_content_digest)=32),
+    content_digest BLOB NOT NULL CHECK (length(content_digest)=32),
+    lineage_digest BLOB NOT NULL CHECK (length(lineage_digest)=32),
+    row_count INTEGER NOT NULL CHECK (row_count>0),
+    available_at_ns INTEGER NOT NULL,
+    PRIMARY KEY (dataset_id,commit_sequence),
+    UNIQUE (dataset_id,commit_sequence,publication_digest),
+    CHECK ((commit_sequence=1 AND previous_content_digest IS NULL)
+        OR (commit_sequence>1 AND previous_content_digest IS NOT NULL)),
+    CHECK (schema_name='market_squawk.market_events' AND schema_version=1
+        AND schema_fingerprint=X'e0bf8cc9a74c880cc772d3987907b13eb3d4d8fc2dc3ca1a239873d650a151f0')
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER market_event_commits_guarded_insert
+BEFORE INSERT ON market_event_commits
+WHEN NOT EXISTS (
+    SELECT 1 FROM market_event_storage_heads AS head
+    JOIN ingest_runs AS run ON run.run_id=NEW.run_id
+    WHERE head.dataset_id=NEW.dataset_id
+      AND head.committed_sequence=NEW.commit_sequence-1
+      AND head.content_digest IS NEW.previous_content_digest
+      AND run.state='reserved' AND run.operation='persist'
+      AND run.payload_algorithm=1 AND run.payload_digest=NEW.publication_digest
+      AND NEW.available_at_ns>=run.requested_at_ns
+      AND (NEW.commit_sequence=1 OR EXISTS (
+          SELECT 1 FROM market_event_commits AS previous
+          WHERE previous.dataset_id=NEW.dataset_id
+            AND previous.commit_sequence=NEW.commit_sequence-1
+            AND previous.content_digest=NEW.previous_content_digest
+            AND previous.available_at_ns<=NEW.available_at_ns
+      ))
+) BEGIN SELECT RAISE(ABORT,'invalid active event commit'); END;
+
+CREATE TRIGGER market_event_heads_guarded_insert
+BEFORE INSERT ON market_event_storage_heads
+WHEN NEW.committed_sequence<>0 OR NEW.content_digest IS NOT NULL
+BEGIN SELECT RAISE(ABORT,'invalid active event head'); END;
+
+CREATE TRIGGER market_event_heads_guarded_update
+BEFORE UPDATE ON market_event_storage_heads
+WHEN NEW.dataset_id<>OLD.dataset_id OR NEW.committed_sequence<>OLD.committed_sequence+1
+ OR NOT EXISTS (
+    SELECT 1 FROM market_event_commits AS committed
+    WHERE committed.dataset_id=NEW.dataset_id
+      AND committed.commit_sequence=NEW.committed_sequence
+      AND committed.content_digest=NEW.content_digest
+      AND committed.previous_content_digest IS OLD.content_digest
+ )
+BEGIN SELECT RAISE(ABORT,'invalid active event head transition'); END;
+
+CREATE TRIGGER market_event_commits_immutable_update BEFORE UPDATE ON market_event_commits
+BEGIN SELECT RAISE(ABORT,'market event commits are immutable'); END;
+CREATE TRIGGER market_event_commits_immutable_delete BEFORE DELETE ON market_event_commits
+BEGIN SELECT RAISE(ABORT,'market event commits are immutable'); END;
+CREATE TRIGGER market_event_heads_immutable_delete BEFORE DELETE ON market_event_storage_heads
+BEGIN SELECT RAISE(ABORT,'market event heads cannot be deleted'); END;
+
 CREATE TABLE ingest_run_provider_publication_bindings (
     run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
     input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
-    output_artifact_ordinal INTEGER NOT NULL CHECK (
+    output_artifact_ordinal INTEGER CHECK (
         output_artifact_ordinal BETWEEN 0 AND 1023
     ),
-    object_input_ordinal INTEGER NOT NULL CHECK (
+    object_input_ordinal INTEGER CHECK (
         object_input_ordinal BETWEEN 0 AND 4095
     ),
+    active_dataset_id TEXT,
+    active_commit_sequence INTEGER,
     publication_digest BLOB NOT NULL UNIQUE CHECK (
         length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
     ),
@@ -1569,6 +1646,15 @@ CREATE TABLE ingest_run_provider_publication_bindings (
         REFERENCES provider_option_market_bindings(option_binding_digest),
     logical_binding_digest BLOB
         REFERENCES provider_logical_publication_bindings(binding_digest),
+    FOREIGN KEY (active_dataset_id,active_commit_sequence,publication_digest)
+        REFERENCES market_event_commits(dataset_id,commit_sequence,publication_digest),
+    CHECK ((output_artifact_ordinal IS NOT NULL AND object_input_ordinal IS NOT NULL
+            AND active_dataset_id IS NULL AND active_commit_sequence IS NULL
+            AND publication_kind IN ('option_snapshots','option_expirations','provider_logical'))
+        OR (output_artifact_ordinal IS NULL AND object_input_ordinal IS NULL
+            AND active_dataset_id IS NOT NULL AND active_commit_sequence IS NOT NULL
+            AND input_ordinal=0 AND publication_kind IN
+                ('response_market_event','event_microbatch','composite_response_event'))),
     PRIMARY KEY (run_id, input_ordinal),
     UNIQUE (run_id, publication_digest),
     UNIQUE (run_id, output_artifact_ordinal, object_input_ordinal),
@@ -1804,6 +1890,8 @@ END;
 -- Immutable row-level coordinates for bounded provider-neutral current-market selection. This
 -- table retains no provider preference: later application policy compares these exact candidates.
 CREATE TABLE provider_market_event_selection_index (
+    dataset_id TEXT NOT NULL,
+    commit_sequence INTEGER NOT NULL,
     publication_digest BLOB NOT NULL CHECK (
         length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
     ),
@@ -1867,6 +1955,8 @@ CREATE TABLE provider_market_event_selection_index (
          AND cohort_key = provider_event_id)
         OR (event_kind <> 'screener' AND instrument_id IS NOT NULL AND cohort_key IS NULL)
     ),
+    FOREIGN KEY (dataset_id,commit_sequence,publication_digest)
+        REFERENCES market_event_commits(dataset_id,commit_sequence,publication_digest),
     PRIMARY KEY (publication_digest, publication_row_ordinal),
     UNIQUE (
         publication_digest,
@@ -1911,6 +2001,66 @@ ON provider_market_event_selection_index(
 )
 WHERE instrument_id IS NULL;
 
+CREATE INDEX provider_market_event_active_source_time
+ON provider_market_event_selection_index(dataset_id,source_id,instrument_id,venue_id,event_kind,
+    source_timestamp_ns DESC,received_at_ns DESC,available_at_ns,ingested_at_ns,
+    commit_sequence,publication_digest,publication_row_ordinal)
+WHERE dataset_id IS NOT NULL AND source_timestamp_ns IS NOT NULL;
+CREATE INDEX provider_market_event_active_received_time
+ON provider_market_event_selection_index(dataset_id,source_id,instrument_id,venue_id,event_kind,
+    received_at_ns DESC,available_at_ns,ingested_at_ns,
+    commit_sequence,publication_digest,publication_row_ordinal)
+WHERE dataset_id IS NOT NULL;
+CREATE INDEX provider_market_event_active_cohort
+ON provider_market_event_selection_index(dataset_id,source_id,provider_product,provider_channel,
+    cohort_key,venue_id,event_kind,source_timestamp_ns DESC,received_at_ns DESC,
+    commit_sequence,publication_digest,publication_row_ordinal)
+WHERE dataset_id IS NOT NULL AND instrument_id IS NULL;
+CREATE INDEX provider_market_event_active_commit_order
+ON provider_market_event_selection_index(dataset_id,commit_sequence,publication_row_ordinal)
+WHERE dataset_id IS NOT NULL;
+
+CREATE TABLE market_event_active_rows (
+    publication_digest BLOB NOT NULL,
+    publication_row_ordinal INTEGER NOT NULL,
+    event_json BLOB NOT NULL CHECK (length(event_json)>0),
+    PRIMARY KEY (publication_digest,publication_row_ordinal),
+    FOREIGN KEY (publication_digest,publication_row_ordinal)
+        REFERENCES provider_market_event_selection_index(publication_digest,publication_row_ordinal)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER market_event_active_rows_guarded_insert
+BEFORE INSERT ON market_event_active_rows
+WHEN NOT EXISTS (
+    SELECT 1 FROM market_event_commits AS committed
+    JOIN ingest_runs AS run ON run.run_id=committed.run_id
+    WHERE committed.publication_digest=NEW.publication_digest
+      AND NEW.publication_row_ordinal>=0 AND NEW.publication_row_ordinal<committed.row_count
+      AND run.state='reserved'
+) BEGIN SELECT RAISE(ABORT,'invalid canonical active event row'); END;
+CREATE TRIGGER market_event_active_rows_immutable_update BEFORE UPDATE ON market_event_active_rows
+BEGIN SELECT RAISE(ABORT,'canonical active event rows are immutable'); END;
+CREATE TRIGGER market_event_active_rows_immutable_delete BEFORE DELETE ON market_event_active_rows
+BEGIN SELECT RAISE(ABORT,'canonical active event rows require archival before deletion'); END;
+
+CREATE VIEW market_event_complete_commits AS
+SELECT committed.* FROM market_event_commits AS committed
+JOIN ingest_run_provider_publication_bindings AS publication
+  ON publication.run_id=committed.run_id
+ AND publication.publication_digest=committed.publication_digest
+ AND publication.publication_kind=committed.publication_kind
+ AND publication.active_dataset_id=committed.dataset_id
+ AND publication.active_commit_sequence=committed.commit_sequence
+JOIN market_event_storage_heads AS head ON head.dataset_id=committed.dataset_id
+WHERE head.committed_sequence>=committed.commit_sequence
+ AND publication.output_artifact_ordinal IS NULL AND publication.object_input_ordinal IS NULL
+ AND (SELECT COUNT(*) FROM market_event_active_rows AS active
+      WHERE active.publication_digest=committed.publication_digest)=committed.row_count
+ AND (SELECT COUNT(*) FROM provider_market_event_selection_index AS indexed
+      WHERE indexed.publication_digest=committed.publication_digest
+        AND indexed.dataset_id=committed.dataset_id
+        AND indexed.commit_sequence=committed.commit_sequence)=committed.row_count
+ AND NOT EXISTS (SELECT 1 FROM artifacts WHERE run_id=committed.run_id);
+
 CREATE TRIGGER provider_market_event_selection_index_guarded_insert
 BEFORE INSERT ON provider_market_event_selection_index
 WHEN NOT EXISTS (
@@ -1919,6 +2069,8 @@ WHEN NOT EXISTS (
     WHERE publication.publication_digest = NEW.publication_digest
       AND publication.publication_kind = NEW.publication_kind
       AND publication.source_id = NEW.source_id
+      AND publication.active_dataset_id IS NEW.dataset_id
+      AND publication.active_commit_sequence IS NEW.commit_sequence
       AND (
           (
               NEW.component_kind = 'response'
@@ -1986,7 +2138,13 @@ WHEN NOT EXISTS (
           WHERE retained.run_id=NEW.run_id
       )
       AND (
-          (NEW.input_ordinal=0 AND NEW.output_artifact_ordinal=0
+          (NEW.input_ordinal=0 AND NEW.active_dataset_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM market_event_commits AS committed
+               WHERE committed.dataset_id=NEW.active_dataset_id
+                 AND committed.commit_sequence=NEW.active_commit_sequence
+                 AND committed.run_id=NEW.run_id
+                 AND committed.publication_digest=NEW.publication_digest))
+          OR (NEW.input_ordinal=0 AND NEW.output_artifact_ordinal=0
            AND NEW.object_input_ordinal=0)
           OR EXISTS (
               SELECT 1 FROM ingest_run_provider_publication_bindings AS prior
@@ -3764,7 +3922,7 @@ BEFORE UPDATE ON ingest_runs
 WHEN NEW.state = 'succeeded'
  AND EXISTS (
      SELECT 1 FROM ingest_run_provider_publication_bindings AS input
-     WHERE input.run_id = NEW.run_id
+     WHERE input.run_id = NEW.run_id AND input.active_dataset_id IS NULL
  )
  AND NOT EXISTS (
      SELECT 1 FROM ingest_run_provider_publication_bindings
@@ -3820,23 +3978,6 @@ WHEN NEW.state = 'succeeded'
                OR object.row_count <> COALESCE((
                    SELECT SUM(
                        CASE input.publication_kind
-                           WHEN 'response_market_event' THEN (
-                               SELECT binding.canonical_event_count
-                               FROM provider_response_market_event_bindings AS binding
-                               WHERE binding.response_event_binding_digest =
-                                     input.response_binding_digest
-                           )
-                           WHEN 'event_microbatch' THEN (
-                               SELECT binding.canonical_event_count
-                               FROM provider_event_bindings AS binding
-                               WHERE binding.event_binding_digest = input.event_binding_digest
-                           )
-                           WHEN 'composite_response_event' THEN (
-                               SELECT binding.response_row_count + binding.event_row_count
-                               FROM provider_composite_response_event_bindings AS binding
-                               WHERE binding.composite_binding_digest =
-                                     input.composite_binding_digest
-                           )
                            WHEN 'option_snapshots' THEN 1 + (
                                SELECT binding.canonical_row_count
                                FROM provider_option_market_bindings AS binding
@@ -4430,4 +4571,38 @@ END;
 CREATE TRIGGER market_data_native_reference_immutable_delete
 BEFORE DELETE ON market_data_native_reference_captures BEGIN
     SELECT RAISE(ABORT,'native reference custody is retained for recovery');
+END;
+
+-- Install the success guard after both physical and active publication schemas exist.
+CREATE TRIGGER ingest_runs_publication_guarded_success
+BEFORE UPDATE ON ingest_runs
+WHEN NEW.state = 'succeeded'
+ AND NEW.operation IN ('persist', 'cache')
+ AND NOT EXISTS (
+    SELECT 1
+    FROM dataset_manifests AS manifest
+    JOIN artifacts AS anchor
+      ON anchor.artifact_id = manifest.artifact_id
+     AND anchor.run_id = manifest.run_id
+    WHERE manifest.run_id = NEW.run_id
+      AND (SELECT COUNT(*) FROM artifacts AS member
+           WHERE member.run_id = NEW.run_id) BETWEEN 1 AND 1024
+      AND anchor.publication_ordinal = (
+          SELECT COUNT(*) - 1 FROM artifacts AS member
+          WHERE member.run_id = NEW.run_id
+      )
+      AND (SELECT MIN(member.publication_ordinal) FROM artifacts AS member
+           WHERE member.run_id = NEW.run_id) = 0
+      AND (SELECT MAX(member.publication_ordinal) FROM artifacts AS member
+           WHERE member.run_id = NEW.run_id) = (
+          SELECT COUNT(*) - 1 FROM artifacts AS member
+          WHERE member.run_id = NEW.run_id
+      )
+)
+AND NOT EXISTS (
+    SELECT 1 FROM market_event_complete_commits AS committed
+    WHERE committed.run_id=NEW.run_id AND committed.available_at_ns=NEW.completed_at_ns
+)
+BEGIN
+    SELECT RAISE(ABORT, 'successful ingest run lacks a closed publication');
 END;

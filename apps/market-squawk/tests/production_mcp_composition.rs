@@ -4018,6 +4018,10 @@ impl ExactPublicCryptoInput {
 #[test]
 #[ignore = "requires both reviewed public-source JSON files and authorized live Coinbase/Kraken access"]
 fn installed_public_crypto_exact_publication_reopens_after_restart() -> TestResult {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
     let scenario = std::thread::Builder::new()
         .name("market-squawk-installed-public-crypto-exact".to_owned())
         .stack_size(INSTALLED_SERVICE_MAIN_STACK_BYTES)
@@ -4068,6 +4072,53 @@ async fn installed_public_crypto_exact_journey(input: ExactPublicCryptoInput) ->
         &config,
         temporary.path().join(".market-squawk-installed-service"),
     )?;
+    // Retain one interrupted no-credential setup before enabling its configured runtime.
+    // Coinbase exercises entirely fresh default setup; Kraken must reuse this exact session.
+    let prepared_session = if matches!(input.fixture, ExactPublicCryptoFixture::Kraken) {
+        let empty_environment = BTreeMap::<OsString, OsString>::new();
+        let unconfigured = AppConfig::load(ConfigSources::new(
+            None,
+            &empty_environment,
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("product")),
+                source_shutdown_ms: Some(60_000),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let seed =
+            InstalledService::start_with_secret_store(unconfigured, Arc::clone(&secrets)).await?;
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(seed.run(shutdown.clone()));
+        let prepared = async {
+            let desktop = connector.connect_with_timeout(
+                NamedClient::Desktop,
+                Some("tauri://localhost".to_owned()),
+                Duration::from_secs(120),
+            )?;
+            let started = invoke_exact_public_crypto(
+                &desktop,
+                "prepare-default",
+                0,
+                "Source.Onboarding.Apply",
+                json!({
+                    "request": {"action": "start", "surfaceId": input.fixture.surface()},
+                    "confirm": true,
+                }),
+            )
+            .await?;
+            assert_eq!(started["outcome"], "completed", "{started}");
+            assert_eq!(started["value"]["state"], "anonymous_available");
+            required_uuid_string(&started["value"]["session_id"], "prepared crypto session")
+        }
+        .await;
+        shutdown.cancel();
+        let stopped = task.await?;
+        let session = prepared?;
+        assert_eq!(stopped?, InstalledServiceRunOutcome::Stopped);
+        Some(session)
+    } else {
+        None
+    };
     let service =
         InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await?;
     let initial_reader = service.crypto_installed_publication_reader();
@@ -4079,40 +4130,38 @@ async fn installed_public_crypto_exact_journey(input: ExactPublicCryptoInput) ->
             Some("tauri://localhost".to_owned()),
             Duration::from_secs(120),
         )?;
-        let registered = invoke_exact_public_crypto(&desktop, "register", 0, "Source.Register", json!({
-            "provider": input.fixture.surface(),
-            "sourceCoverage": [input.fixture.surface()],
-            "confirm": true,
-            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
-        })).await?;
-        assert_eq!(registered["profile"]["id"], input.fixture.surface());
-        let started = invoke_exact_public_crypto(&desktop, "start", 0, "Source.Onboarding.Apply", json!({
-            "request": {"action": "start", "surfaceId": input.fixture.surface()},
-            "confirm": true,
-        })).await?;
-        assert_eq!(started["outcome"], "completed", "{started}");
-        let session = required_uuid_string(&started["value"]["session_id"], "crypto onboarding session")?;
-        let activated = invoke_exact_public_crypto(&desktop, "activate", 0, "Source.Onboarding.Apply", json!({
-            "request": {"action": "activate", "sessionId": session, "request": {"kind": "source"}},
-            "confirm": true,
-        })).await?;
-        assert_eq!(activated["outcome"], "completed", "{activated}");
-        assert_eq!(activated["value"]["profile"], input.fixture.surface());
-        wait_for_exact_public_crypto_publication(&desktop, &initial_reader, &input).await
-    }.await;
+        // Service readiness does not wait for rate-governed background source preparation.
+        let (probe, before) =
+            wait_for_exact_public_crypto_publication(&desktop, &initial_reader, &input).await?;
+        let status = exact_public_crypto_status(&desktop, input.fixture, "default-active").await?;
+        assert_eq!(status["lifecycle"]["state"], "active", "{status}");
+        let session = required_uuid_string(
+            &status["lifecycle"]["configurationSessionId"],
+            "default crypto session",
+        )?;
+        if let Some(prepared) = prepared_session.as_ref() {
+            assert_eq!(
+                &session, prepared,
+                "interrupted anonymous preparation was replaced"
+            );
+        }
+        Ok::<_, anyhow::Error>((session, probe, before))
+    }
+    .await;
     initial_shutdown.cancel();
     let initial_run = initial_task
         .await
         .context("join first installed crypto service")?;
-    let (probe, before) = initial?;
+    let (session, probe, before) = initial.context("first installed public source publication")?;
     assert_eq!(initial_run?, InstalledServiceRunOutcome::Stopped);
     assert!(!before.events().is_empty());
-    assert_eq!(before.manifest(), probe.manifest());
+    assert_eq!(before.commit(), probe.commit());
     assert_eq!(before.publication_digest(), probe.publication_digest());
     assert_eq!(before.source_id(), probe.source_id());
     drop(initial_reader);
 
-    let restarted = InstalledService::start_with_secret_store(config, Arc::clone(&secrets)).await?;
+    let restarted =
+        InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await?;
     let restarted_reader = restarted.crypto_installed_publication_reader();
     let restarted_shutdown = CancellationToken::new();
     let restarted_task = tokio::spawn(restarted.run(restarted_shutdown.clone()));
@@ -4123,26 +4172,92 @@ async fn installed_public_crypto_exact_journey(input: ExactPublicCryptoInput) ->
             Duration::from_secs(120),
         )?;
         desktop.bootstrap(CancellationToken::new()).await?;
+        let _resumed_publication =
+            wait_for_exact_public_crypto_publication(&desktop, &restarted_reader, &input).await?;
+        let status = exact_public_crypto_status(&desktop, input.fixture, "restored-active").await?;
+        assert_eq!(status["lifecycle"]["state"], "active", "{status}");
+        assert_eq!(status["lifecycle"]["configurationSessionId"], session);
         let read_deadline = Instant::now() + Duration::from_secs(30);
-        tokio::time::timeout_at(
+        let after = tokio::time::timeout_at(
             read_deadline.into(),
             probe.reopen(&restarted_reader, read_deadline),
         )
         .await
-        .context("exact crypto reopen after installed restart timed out")?
+        .context("exact crypto reopen after installed restart timed out")??;
+        invoke_exact_public_crypto(
+            &desktop,
+            "stop-default",
+            0,
+            "Source.Stop",
+            json!({
+                "provider": input.fixture.surface(),
+                "expectedStateRevision": status["lifecycle"]["stateRevision"],
+                "reason": "owner-stopped-public-default",
+                "sourceCoverage": [input.fixture.surface()],
+                "confirm": true,
+                "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+            }),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(after)
     }
     .await;
     restarted_shutdown.cancel();
     let restarted_run = restarted_task
         .await
         .context("join restarted installed crypto service")?;
-    let after = reopened?;
+    let after = reopened.context("resumed public source and original publication after restart")?;
     assert_eq!(restarted_run?, InstalledServiceRunOutcome::Stopped);
     assert_eq!(
         after, before,
         "restarted typed events or publication coordinate changed"
     );
+    drop(restarted_reader);
+    let stopped_service =
+        InstalledService::start_with_secret_store(config, Arc::clone(&secrets)).await?;
+    let stopped_shutdown = CancellationToken::new();
+    let stopped_task = tokio::spawn(stopped_service.run(stopped_shutdown.clone()));
+    let stopped_status = async {
+        let desktop = connector.connect_with_timeout(
+            NamedClient::Desktop,
+            Some("tauri://localhost".to_owned()),
+            Duration::from_secs(120),
+        )?;
+        exact_public_crypto_status(&desktop, input.fixture, "stopped-after-restart").await
+    }
+    .await;
+    stopped_shutdown.cancel();
+    let stopped_run = stopped_task.await?;
+    let status = stopped_status?;
+    assert_eq!(stopped_run?, InstalledServiceRunOutcome::Stopped);
+    assert_eq!(status["lifecycle"]["state"], "stopped", "{status}");
+    assert_eq!(status["lifecycle"]["configurationSessionId"], session);
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+async fn exact_public_crypto_status(
+    client: &LoopbackApplicationClient,
+    fixture: ExactPublicCryptoFixture,
+    phase: &str,
+) -> TestResult<Value> {
+    let status = invoke_exact_public_crypto(
+        client,
+        phase,
+        0,
+        "Source.GetStatus",
+        json!({
+            "sourceCoverage": [fixture.surface()],
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+        }),
+    )
+    .await?;
+    let rows = status
+        .as_array()
+        .context("crypto source status was not an array")?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["profile"]["id"], fixture.surface());
+    Ok(rows[0].clone())
 }
 
 #[cfg(debug_assertions)]
@@ -4231,12 +4346,10 @@ async fn wait_for_exact_public_crypto_publication(
                 .await?
                 .context("selected crypto source has not committed a publication")?;
             let read_deadline = deadline.min(Instant::now() + Duration::from_secs(30));
-            let read = tokio::time::timeout_at(
-                read_deadline.into(),
-                probe.reopen(reader, read_deadline),
-            )
-            .await
-            .context("exact crypto pre-restart read timed out")??;
+            let read =
+                tokio::time::timeout_at(read_deadline.into(), probe.reopen(reader, read_deadline))
+                    .await
+                    .context("exact crypto pre-restart read timed out")??;
             Ok::<_, anyhow::Error>((probe, read))
         }
         .await;

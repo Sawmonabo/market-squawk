@@ -27,9 +27,9 @@ use std::{sync::Arc, time::Duration};
 use market_squawk_data::{
     CompanySecurityIdentityDisposition, CompanySecurityIdentityQuery,
     CompanySecurityIdentitySelectionReceipt, DatasetManifestRef, IndustryClassificationScheme,
-    IndustryClassificationVersion, IndustryCohortCompleteness, PointInTimeLimits,
-    PointInTimeRevisionMode, ResearchUse, ResearchUseLimits, ResearchUseRequest, SecResearchFamily,
-    SecResearchIdentityOutcome, SecResearchIdentityReadRequest,
+    IndustryClassificationVersion, IndustryCohortCompleteness, MarketEventUseRequest,
+    PointInTimeLimits, PointInTimeRevisionMode, ResearchUse, ResearchUseLimits, ResearchUseRequest,
+    SecResearchFamily, SecResearchIdentityOutcome, SecResearchIdentityReadRequest,
 };
 use market_squawk_domain::{
     CalendarDate, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, FundamentalCadence,
@@ -381,6 +381,7 @@ impl FairValueDomainService {
             peers.push(selected);
         }
         let mut roots = Vec::new();
+        let mut event_authorizations = Vec::with_capacity(peers.len() + 1);
         let mut expires_at = request.expires_at;
         for selected in std::iter::once(&subject).chain(peers.iter()) {
             market_reader
@@ -390,6 +391,12 @@ impl FairValueDomainService {
                     context.cancellation().clone(),
                 )
                 .await?;
+            let (authorization, _) = market_reader.authorize_local_analysis(
+                selected.market_selection.receipt().publication(),
+                context.deadline(),
+                context.cancellation(),
+            )?;
+            event_authorizations.push(authorization);
             expires_at = expires_at.min(
                 selected
                     .market_selection
@@ -442,10 +449,11 @@ impl FairValueDomainService {
             .await
             .map_err(|error| map_research_use_worker_error(error, context))?
             .map_err(|error| map_research_use_error(error, context))?;
-        expires_at = expires_at.min(authorization.expires_at());
-        let rights = ValuationRightsReceipt::try_from_authorization(authorization)
-            .map_err(|_| ServiceError::Unavailable)?;
-        let graph = rights.graph_digest();
+        let rights =
+            ValuationRightsReceipt::try_from_authorization(authorization, event_authorizations)
+                .map_err(|_| ServiceError::Unavailable)?;
+        expires_at = expires_at.min(rights.expires_at());
+        let rights_input_digest = rights.rights_input_digest();
         let subject_value = subject.fundamentals.metric.amount().money().amount();
         let output_scale = subject.market.amount().scale();
         let peer_count = u32::try_from(peers.len()).map_err(|_| ServiceError::Internal)?;
@@ -498,11 +506,11 @@ impl FairValueDomainService {
                 company_security: peer.fundamentals.identity,
                 metric: point_input(
                     peer.fundamentals.metric,
-                    graph,
+                    rights_input_digest,
                     request.knowledge_at,
                     expires_at,
                 )?,
-                value: point_input(peer.market, graph, market_cutoff, expires_at)?,
+                value: point_input(peer.market, rights_input_digest, market_cutoff, expires_at)?,
                 weight_ppm,
                 weight_assumption: assumption(
                     AutomaticValuationAssumptionKind::ComparableWeight,
@@ -563,7 +571,12 @@ impl FairValueDomainService {
                 instrument_id: request.subject,
                 currency,
                 amount_basis: ValuationAmountBasis::PerInstrumentUnit,
-                current_market: point_input(subject.market, graph, market_cutoff, expires_at)?,
+                current_market: point_input(
+                    subject.market,
+                    rights_input_digest,
+                    market_cutoff,
+                    expires_at,
+                )?,
                 rights,
                 measurement_at: request.knowledge_at,
                 calculated_at,
@@ -578,7 +591,7 @@ impl FairValueDomainService {
             },
             subject_metric: point_input(
                 subject.fundamentals.metric,
-                graph,
+                rights_input_digest,
                 request.knowledge_at,
                 expires_at,
             )?,
@@ -708,6 +721,40 @@ impl FairValueDomainService {
             .map_err(|error| map_research_use_worker_error(error, context))?
             .map_err(|error| map_research_use_error(error, context))?;
         ensure_request_live(context, &self.lifecycle)?;
+        let mut event_authorizations = Vec::with_capacity(receipt.admitted_event_inputs().len());
+        for admission in receipt.admitted_event_inputs() {
+            ensure_request_live(context, &self.lifecycle)?;
+            let request = MarketEventUseRequest::try_from_retained(
+                admission.commit().clone(),
+                admission.inputs().to_vec(),
+                ResearchUse::LocalAnalysis,
+                limits,
+            )
+            .map_err(|error| map_research_use_error(error, context))?;
+            let analytical = research.analytical_service();
+            let event_authorization = research
+                .run_owned_research_io(
+                    context.deadline(),
+                    context.cancellation(),
+                    move |cancellation| {
+                        analytical.authorize_market_event_use(request, &cancellation)
+                    },
+                )
+                .await
+                .map_err(|error| map_research_use_worker_error(error, context))?
+                .map_err(|error| map_research_use_error(error, context))?;
+            if event_authorization.rights_input_digest() != admission.rights_input_digest() {
+                return Err(ServiceError::InvalidResult);
+            }
+            event_authorizations.push(event_authorization);
+        }
+        let rights =
+            ValuationRightsReceipt::try_from_authorization(authorization, event_authorizations)
+                .map_err(|_| ServiceError::Unavailable)?;
+        if rights.rights_input_digest() != receipt.rights_input_digest() {
+            return Err(ServiceError::InvalidResult);
+        }
+        ensure_request_live(context, &self.lifecycle)?;
         let admitted_at = calculation_clock()?;
         let evidence = market_squawk_decisions::ValuationEvidence::try_from_automatic_measurement(
             &measurement,
@@ -716,10 +763,10 @@ impl FairValueDomainService {
             currency,
             horizon_at,
             admitted_at,
-            receipt.expires_at().min(authorization.expires_at()),
+            receipt.expires_at().min(rights.expires_at()),
         )
         .map_err(|_| ServiceError::Unavailable)?;
-        let _consumed = authorization.into_permit();
+        drop(rights);
         Ok(evidence)
     }
 
@@ -814,7 +861,7 @@ impl FairValueDomainService {
         request: &ObservedComparableValuationRequest,
         context: &RequestContext,
     ) -> Result<SelectedComparable<'a>, ServiceError> {
-        let mut fundamentals = Self::select_comparable_fundamentals(
+        let fundamentals = Self::select_comparable_fundamentals(
             research,
             instrument_id,
             request.knowledge_at,
@@ -825,9 +872,6 @@ impl FairValueDomainService {
         if market_selection.receipt().reference().instrument_id() != instrument_id {
             return Err(ServiceError::InvalidRequest);
         }
-        fundamentals
-            .roots
-            .push(market_selection.receipt().publication().manifest().clone());
         let market = ValuationInput::from_published_market_selection(
             market_selection.receipt().publication(),
             market_selection.receipt().market_definitions(),
@@ -1108,7 +1152,7 @@ fn is_complete_annual_period(period: FundamentalPeriod) -> bool {
 
 fn point_input(
     input: ValuationInput,
-    graph: market_squawk_data::ResearchUseGraphDigest,
+    rights_input_digest: EvidenceDigest,
     knowledge_at: Timestamp,
     expires_at: Timestamp,
 ) -> Result<PointInTimeValuationInput, ServiceError> {
@@ -1119,8 +1163,14 @@ fn point_input(
     if cutoff != knowledge_at {
         return Err(ServiceError::InvalidResult);
     }
-    PointInTimeValuationInput::try_new(input, selection, graph, knowledge_at, expires_at)
-        .map_err(|_| ServiceError::Unavailable)
+    PointInTimeValuationInput::try_new(
+        input,
+        selection,
+        rights_input_digest,
+        knowledge_at,
+        expires_at,
+    )
+    .map_err(|_| ServiceError::Unavailable)
 }
 
 fn assumption(

@@ -285,7 +285,7 @@ async fn publish_raw(
     let deadline = Instant::now()
         .checked_add(limits.frame_timeout())
         .ok_or(KrakenPublicationSupervisorError::DeadlineRange)?;
-    let (raw, observed_at) = input.into_parts();
+    let (raw, observed_at, _frame_admission) = input.into_parts();
     let publication = authority.publication();
     let outcome = publication
         .seal_kraken(
@@ -311,6 +311,7 @@ async fn publish_raw(
             authority.precommit_authority(),
         )
         .await?;
+    // Keep the shared book/trade frame admission through the final durable-read handoff.
     if let KrakenMarketApplicationOutcome::Published(receipt) = outcome {
         durable_writer.retain(receipt).await?;
     }

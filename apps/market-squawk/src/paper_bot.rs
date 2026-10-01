@@ -77,10 +77,10 @@ struct ProductionPaperRecovery {
 }
 
 pub(crate) use defaults::{
-    LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES, local_paper_account_configuration,
-    PaperStrategyMode, local_coinbase_direct_live_market_with_activation,
+    LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES, PaperStrategyMode, ProductionLiveMarketComposition,
+    local_coinbase_direct_live_market_with_activation,
     local_coinbase_direct_paper_bot_on_existing_market_with_strategy_mode, local_equity_paper_bot,
-    local_live_market_with_provider_rate,
+    local_live_market_with_provider_rate, local_paper_account_configuration,
     local_paper_bot_on_existing_public_market_with_strategy_mode, manual_paper_account_id,
     manual_paper_reason_code, manual_paper_strategy_id,
 };
@@ -205,7 +205,8 @@ impl ProductionPaperBotComposition {
         mut self,
         publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
     ) -> anyhow::Result<Self> {
-        self.execution.portfolio = self.execution
+        self.execution.portfolio = self
+            .execution
             .portfolio_publication
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("paper portfolio publication is unavailable"))?

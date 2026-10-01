@@ -316,7 +316,7 @@ fn origin_from_payload(
             }
         }
         OriginPayload::PublishedMarket {
-            manifest,
+            commit,
             selection_digest,
             publication_digest,
             publication_row,
@@ -326,11 +326,11 @@ fn origin_from_payload(
             definition_content,
             definition_audit,
             knowledge_at_ns,
-            manifest_published_at_ns,
-            origin_published_at_ns,
+            commit_available_at_ns,
+            origin_committed_at_ns,
         } => EvidenceOrigin::PublishedMarket {
             evidence: Box::new(crate::evidence::PublishedMarketValuationEvidence {
-                manifest: manifest_from_payload(manifest)?,
+                commit: market_event_commit_from_payload(commit)?,
                 selection_digest: digest(1, selection_digest)?,
                 publication_digest: digest(1, publication_digest)?,
                 publication_row,
@@ -340,8 +340,8 @@ fn origin_from_payload(
                 definition_content: digest(1, definition_content)?,
                 definition_audit: digest(1, definition_audit)?,
                 knowledge_at: Timestamp::from_unix_nanos(knowledge_at_ns),
-                manifest_published_at: Timestamp::from_unix_nanos(manifest_published_at_ns),
-                origin_published_at: Timestamp::from_unix_nanos(origin_published_at_ns),
+                commit_available_at: Timestamp::from_unix_nanos(commit_available_at_ns),
+                origin_committed_at: Timestamp::from_unix_nanos(origin_committed_at_ns),
             }),
         },
         OriginPayload::Market {
@@ -371,7 +371,7 @@ fn origin_from_payload(
                     Ok::<_, FairValueError>(Box::new(crate::evidence::MarketValuationPublication {
                         qualified_input_id: InputId(value.qualified_input_id),
                         qualified_amount: amount_from_payload(value.qualified_amount)?,
-                        manifest: manifest_from_payload(value.manifest)?,
+                        commit: market_event_commit_from_payload(value.commit)?,
                         selection_digest: digest(1, value.selection_digest)?,
                         publication_digest: digest(1, value.publication_digest)?,
                         publication_row: value.publication_row,
@@ -379,11 +379,11 @@ fn origin_from_payload(
                         canonical_event_digest: digest(1, value.canonical_event_digest)?,
                         canonical_event: value.canonical_event.into_boxed_str(),
                         knowledge_at: Timestamp::from_unix_nanos(value.knowledge_at_ns),
-                        manifest_published_at: Timestamp::from_unix_nanos(
-                            value.manifest_published_at_ns,
+                        commit_available_at: Timestamp::from_unix_nanos(
+                            value.commit_available_at_ns,
                         ),
-                        origin_published_at: Timestamp::from_unix_nanos(
-                            value.origin_published_at_ns,
+                        origin_committed_at: Timestamp::from_unix_nanos(
+                            value.origin_committed_at_ns,
                         ),
                     }))
                 })
@@ -485,7 +485,7 @@ fn automatic_receipt_from_payload(
 ) -> Result<crate::AutomaticValuationMethodReceipt, FairValueError> {
     use crate::AutomaticValuationIntermediateKind as Step;
     if value.inputs.len() > 512
-        || value.admitted_input_manifests.is_empty()
+        || (value.admitted_input_manifests.is_empty() && value.admitted_event_inputs.is_empty())
         || value.admitted_input_manifests.len() > 4096
         || value.assumptions.len() > 128
         || value.intermediates.len() > 513
@@ -516,8 +516,7 @@ fn automatic_receipt_from_payload(
             crate::PointInTimeValuationInput::try_new(
                 input,
                 digest(1, item.selection_receipt)?,
-                market_squawk_data::ResearchUseGraphDigest::try_from_bytes(item.rights_graph)
-                    .map_err(|_| FairValueError::CorruptPersistence)?,
+                digest(1, item.rights_input_digest)?,
                 Timestamp::from_unix_nanos(item.knowledge_at_ns),
                 Timestamp::from_unix_nanos(item.expires_at_ns),
             )
@@ -591,11 +590,18 @@ fn automatic_receipt_from_payload(
                 value.rights_graph,
             )
             .map_err(|_| FairValueError::CorruptPersistence)?,
+            rights_input_digest: digest(1, value.rights_input_digest)?,
             rights_expires_at: Timestamp::from_unix_nanos(value.rights_expires_at_ns),
             admitted_input_manifests: value
                 .admitted_input_manifests
                 .into_iter()
                 .map(manifest_from_payload)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            admitted_event_inputs: value
+                .admitted_event_inputs
+                .into_iter()
+                .map(event_rights_admission_from_payload)
                 .collect::<Result<Vec<_>, _>>()?
                 .into_boxed_slice(),
             current_market_input: InputId(value.current_market_input),
@@ -830,6 +836,83 @@ fn use_assessment_from_payload(
         actor(&value.assessed_by)?,
         Timestamp::from_unix_nanos(value.assessed_at_ns),
     )
+}
+
+pub(super) fn market_event_commit_payload(
+    value: &MarketEventCommitRef,
+) -> MarketEventCommitPayload {
+    MarketEventCommitPayload {
+        dataset_id: value.dataset_id().as_str().to_owned(),
+        sequence: value.sequence(),
+        schema_name: value.schema().name().to_owned(),
+        schema_version: value.schema().version().get(),
+        schema_fingerprint: value.schema().fingerprint(),
+        content_hash: value.content_hash().bytes(),
+        available_at_ns: value.available_at().unix_nanos(),
+        publication_digest: value.publication_digest().bytes(),
+        row_count: value.row_count(),
+    }
+}
+
+fn market_event_commit_from_payload(
+    value: MarketEventCommitPayload,
+) -> Result<MarketEventCommitRef, FairValueError> {
+    let schema = DatasetSchemaRef::try_new(
+        value.schema_name,
+        SchemaVersion::new(value.schema_version).map_err(|_| FairValueError::CorruptPersistence)?,
+        value.schema_fingerprint,
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)?;
+    // These are checked coordinates; reopening and rights authorization still verify the catalog.
+    MarketEventCommitRef::try_new(
+        DatasetId::try_from(value.dataset_id.as_str())
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+        value.sequence,
+        schema,
+        Sha256Digest::new(value.content_hash),
+        Timestamp::from_unix_nanos(value.available_at_ns),
+        digest(1, value.publication_digest)?,
+        value.row_count,
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
+}
+
+fn event_rights_admission_from_payload(
+    value: EventRightsAdmissionPayload,
+) -> Result<crate::automatic::ValuationEventRightsAdmission, FairValueError> {
+    use market_squawk_data::ProviderMarketEventPublicationKind as Kind;
+    let inputs = value
+        .inputs
+        .into_iter()
+        .map(|input| {
+            market_squawk_data::MarketEventUseInput::try_new(
+                digest(1, input.publication_digest)?,
+                match input.publication_kind.as_str() {
+                    "response_market_event" => Kind::ResponseMarketEvent,
+                    "event_microbatch" => Kind::EventMicrobatch,
+                    "composite_response_event" => Kind::CompositeResponseEvent,
+                    _ => return Err(FairValueError::CorruptPersistence),
+                },
+                input.row_ordinal,
+                digest(1, input.coordinate_digest)?,
+                digest(1, input.canonical_event_digest)?,
+                SourceId::try_from(input.source_id.as_str())
+                    .map_err(|_| FairValueError::CorruptPersistence)?,
+                Timestamp::from_unix_nanos(input.origin_committed_at_ns),
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::automatic::ValuationEventRightsAdmission::try_recover(
+        market_event_commit_from_payload(value.commit)?,
+        inputs,
+        digest(1, value.rights_input_digest)?,
+        market_squawk_data::ResearchUseDecisionDigest::try_from_bytes(value.decision_digest)
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+        Timestamp::from_unix_nanos(value.evaluated_at_ns),
+        Timestamp::from_unix_nanos(value.expires_at_ns),
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
 }
 
 pub(super) fn manifest_payload(value: &DatasetManifestRef) -> ManifestPayload {

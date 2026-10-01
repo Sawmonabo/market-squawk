@@ -11,6 +11,7 @@ mod fair_value;
 mod forecast_inventory;
 mod listing_reference;
 mod market_data_instruments;
+pub(crate) mod market_event_store;
 mod market_recovery;
 mod migration_preflight;
 mod model_inventory;
@@ -20,7 +21,7 @@ mod official_options_reference_stage;
 mod onboarding;
 mod portfolio_planning;
 mod provider_capture;
-mod provider_event;
+pub(crate) mod provider_event;
 mod provider_logical;
 mod provider_macro_plan;
 mod provider_option;
@@ -55,7 +56,6 @@ pub use self::portfolio_planning::{
 };
 
 pub(crate) use self::authority::exact_catalog_file_binding;
-pub(crate) use self::read_snapshot::CatalogReadSnapshot;
 pub use self::backup::BackupReceipt;
 pub(crate) use self::backup::{
     InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,
@@ -169,10 +169,11 @@ pub use self::onboarding::{
     OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
     ResumedProviderOnboarding,
 };
-pub(crate) use self::storage::trusted_catalog_now;
+pub(crate) use self::read_snapshot::CatalogReadSnapshot;
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,
 };
+pub(crate) use self::storage::{now_timestamp, trusted_catalog_now};
 pub(crate) use self::storage::{verify_integrity, verify_migration_identities};
 use self::types::WriterPermit;
 pub use self::types::{
@@ -194,14 +195,12 @@ pub use provider_capture::{
     PersistedProviderCapturePhysicalClaim, PersistedProviderNativeLineageSchema,
     ProviderCaptureOriginalReceipt,
 };
+pub(crate) use provider_event::PreparedProviderPublicationBinding;
 pub use provider_event::{
     PersistedProviderEventBindingEvidence, PersistedProviderEventBindingRow,
     PersistedProviderEventNativeLineage, PersistedProviderPublicationEvidence,
     PersistedProviderResponseMarketEventBindingEvidence,
     PersistedProviderResponseMarketEventBindingRow,
-};
-pub(crate) use provider_event::{
-    PreparedProviderPublicationBinding, retain_prepared_provider_publication_binding,
 };
 pub(crate) use provider_logical::{
     MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES, load_provider_logical_publication_binding,

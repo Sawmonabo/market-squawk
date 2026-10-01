@@ -403,7 +403,7 @@ impl AnalyticalManifestCatalog {
         snapshot: &CatalogReadSnapshot,
     ) -> Result<Option<ProviderMarketEventCatalogPlan>, ProviderMarketEventSelectionError> {
         let connection = snapshot.connection();
-        let Some(selected) = selected_provider_market_event_generation(connection, request)? else {
+        let Some(selected) = selected_provider_market_event_commit(connection, request)? else {
             return Ok(None);
         };
         let clock = match request.effective_time_basis() {
@@ -414,36 +414,24 @@ impl AnalyticalManifestCatalog {
             .maximum_candidates()
             .checked_add(1)
             .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
-        let membership =
-            lineage::generation_contains_origin_sql("?2", "publication.generation_sequence");
-        let mut statement = connection.prepare(&format!(
-            "WITH publication_origin AS (
-             SELECT publication.publication_digest,
-                    MIN(generation.available_at_ns) AS origin_published_at_ns
-             FROM analytical_generation_provider_publication_bindings AS publication
-             JOIN analytical_available_generations AS generation
-               ON generation.generation_sequence=publication.generation_sequence
-             JOIN analytical_generation_source_inputs AS source_input
-               ON source_input.generation_sequence=generation.generation_sequence
-              AND source_input.run_id=publication.run_id
-             WHERE generation.dataset_id=?1
-               AND generation.generation_kind='ingest'
-             GROUP BY publication.publication_digest
-         ), keyed_rows AS (
-             SELECT publication.publication_digest, publication.publication_kind,
+        let mut statement = connection.prepare(
+            "WITH keyed_rows AS (
+             SELECT indexed.publication_digest, indexed.publication_kind,
                     indexed.publication_row_ordinal, indexed.coordinate_digest,
                     indexed.source_id, indexed.received_at_ns,
                     CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
                          ELSE indexed.received_at_ns END AS effective_at_ns,
-                    origin.origin_published_at_ns
-             FROM analytical_generation_provider_publication_bindings AS publication
-             JOIN provider_market_event_selection_index AS indexed
-               ON indexed.publication_digest=publication.publication_digest
-              AND indexed.publication_kind=publication.publication_kind
-              AND indexed.source_id=publication.source_id
-             JOIN publication_origin AS origin
-               ON origin.publication_digest=publication.publication_digest
-             WHERE {membership}
+                    committed.available_at_ns AS origin_committed_at_ns
+             FROM provider_market_event_selection_index AS indexed
+             JOIN market_event_complete_commits AS committed
+               ON committed.dataset_id=indexed.dataset_id
+              AND committed.commit_sequence=indexed.commit_sequence
+              AND committed.publication_digest=indexed.publication_digest
+              AND committed.publication_kind=indexed.publication_kind
+             JOIN ingest_runs AS run ON run.run_id=committed.run_id
+              AND run.source_id=indexed.source_id AND run.state='succeeded'
+              AND run.completed_at_ns=committed.available_at_ns
+             WHERE indexed.dataset_id=?1 AND indexed.commit_sequence<=?2
                AND ((?3 IS NOT NULL AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL)
                     OR (?3 IS NULL AND indexed.instrument_id IS NULL AND indexed.cohort_key=?11
                         AND indexed.provider_product=?12 AND indexed.provider_channel=?13))
@@ -455,7 +443,7 @@ impl AnalyticalManifestCatalog {
                     OR (?6=1 AND indexed.received_at_ns<=?7))
                AND indexed.available_at_ns<=?8
                AND indexed.ingested_at_ns<=?8
-               AND origin.origin_published_at_ns<=?8
+               AND committed.available_at_ns<=?8
          ), newest_by_source AS (
              SELECT *, MAX(effective_at_ns) OVER (
                  PARTITION BY source_id
@@ -466,17 +454,17 @@ impl AnalyticalManifestCatalog {
              FROM keyed_rows
          )
          SELECT publication_digest, publication_kind, publication_row_ordinal,
-                coordinate_digest, source_id, effective_at_ns, origin_published_at_ns
+                coordinate_digest, source_id, effective_at_ns, origin_committed_at_ns
          FROM newest_by_source
          WHERE effective_at_ns=newest_effective_at_ns
            AND (?14=0 OR received_at_ns=newest_received_at_ns)
          ORDER BY source_id, publication_digest, publication_row_ordinal
          LIMIT ?10",
-        ))?;
+        )?;
         let instrument = request.instrument_id().map(|id| id.as_uuid());
         let mut rows = statement.query(params![
             request.dataset().as_str(),
-            selected.generation_sequence,
+            to_i64(selected.sequence())?,
             instrument.as_ref().map(|id| id.as_bytes().as_slice()),
             request.venue_id().as_str(),
             crate::provider_event_selection::event_kind_name(request.event_kind()),
@@ -525,22 +513,111 @@ impl AnalyticalManifestCatalog {
                 coordinate_digest,
                 source_surface,
                 effective_at: Timestamp::from_unix_nanos(row.get(5)?),
-                origin_generation_published_at: Timestamp::from_unix_nanos(row.get(6)?),
+                origin_committed_at: Timestamp::from_unix_nanos(row.get(6)?),
             });
         }
         let exclusions = provider_market_event_exclusion_counts(
             connection,
             request,
-            selected.generation_sequence,
+            to_i64(selected.sequence())?,
             clock,
         )?;
         ProviderMarketEventCatalogPlan::try_new(
-            selected.manifest,
-            selected.published_at,
+            selected.clone(),
+            selected.available_at(),
             candidates,
             exclusions,
         )
         .map(Some)
+    }
+
+    pub(crate) fn has_market_event_publication(
+        &self,
+        horizon: &crate::MarketEventCommitRef,
+        digest: EvidenceDigest,
+        kind: ProviderMarketEventPublicationKind,
+    ) -> Result<bool, ManifestCatalogError> {
+        let connection = self.lock()?;
+        let exact = crate::catalog::market_event_store::load_market_event_commit(
+            &connection,
+            horizon.dataset_id(),
+            horizon.sequence(),
+        )?
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+        if &exact != horizon {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        let Some(origin) =
+            crate::catalog::market_event_store::load_market_event_commit_for_publication(
+                &connection,
+                horizon.dataset_id(),
+                digest,
+            )?
+        else {
+            return Ok(false);
+        };
+        let kind_matches: bool = connection.query_row(
+            "SELECT publication_kind=?3 FROM market_event_commits WHERE dataset_id=?1 AND commit_sequence=?2",
+            params![horizon.dataset_id().as_str(), to_i64(origin.sequence())?, kind.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(kind_matches
+            && origin.sequence() <= horizon.sequence()
+            && origin.available_at() <= horizon.available_at()
+            && origin.schema() == horizon.schema())
+    }
+
+    pub(crate) fn market_event_publications(
+        &self,
+        horizon: &crate::MarketEventCommitRef,
+        after: Option<EvidenceDigest>,
+        limit: usize,
+    ) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
+        if limit == 0
+            || limit > MAX_GENERATION_CAPTURE_INPUTS
+            || after.is_some_and(|digest| digest.algorithm() != DigestAlgorithm::Sha256)
+        {
+            return Err(ManifestCatalogError::CaptureInputLimitExceeded {
+                max: MAX_GENERATION_CAPTURE_INPUTS,
+            });
+        }
+        let connection = self.lock()?;
+        let exact = crate::catalog::market_event_store::load_market_event_commit(
+            &connection,
+            horizon.dataset_id(),
+            horizon.sequence(),
+        )?
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+        if &exact != horizon {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        let mut statement = connection.prepare(
+            "SELECT committed.publication_digest, committed.publication_kind
+             FROM market_event_complete_commits AS committed
+             JOIN ingest_runs AS run ON run.run_id=committed.run_id
+              AND run.state='succeeded' AND run.completed_at_ns=committed.available_at_ns
+             WHERE committed.dataset_id=?1 AND committed.commit_sequence<=?2
+               AND (?3 IS NULL OR committed.publication_digest>?3)
+             ORDER BY committed.publication_digest LIMIT ?4",
+        )?;
+        let after = after.map(|digest| digest.bytes());
+        let mut rows = statement.query(params![
+            horizon.dataset_id().as_str(),
+            to_i64(horizon.sequence())?,
+            after.as_ref().map(|digest| digest.as_slice()),
+            to_i64(limit as u64)?
+        ])?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(limit)
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        while let Some(row) = rows.next()? {
+            values.push((
+                parse_digest(&row.get::<_, Vec<u8>>(0)?)?.evidence(),
+                row.get(1)?,
+            ));
+        }
+        Ok(values)
     }
 
     pub(crate) fn has_provider_publication(
@@ -551,16 +628,6 @@ impl AnalyticalManifestCatalog {
     ) -> Result<bool, ManifestCatalogError> {
         let connection = self.lock()?;
         Ok(lineage::publication_origin(&connection, manifest, digest, kind)?.is_some())
-    }
-
-    pub(crate) fn has_provider_publication_in_snapshot(
-        &self,
-        manifest: &DatasetManifestRef,
-        digest: EvidenceDigest,
-        kind: &str,
-        snapshot: &CatalogReadSnapshot,
-    ) -> Result<bool, ManifestCatalogError> {
-        Ok(lineage::publication_origin(snapshot.connection(), manifest, digest, kind)?.is_some())
     }
 
     pub(crate) fn has_provider_capture_binding(
@@ -581,116 +648,6 @@ impl AnalyticalManifestCatalog {
     ) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
         let connection = self.lock()?;
         lineage::publication_page(&connection, manifest, after, limit, options)
-    }
-
-    /// Resolves a retained publication's original objects in its verified creating ancestor.
-    /// Compaction preserves the publication binding but replaces the current generation's objects;
-    /// exact publication reads retain and verify the original immutable object metadata.
-    pub(crate) fn provider_publication_objects_bounded(
-        &self,
-        pinned: &PinnedDataset,
-        publication: &ProviderMarketEventExactPublication,
-        snapshot: &CatalogReadSnapshot,
-    ) -> Result<(PinnedDataset, Vec<(Uuid, usize)>), ManifestCatalogError> {
-        let connection = snapshot.connection();
-        let manifest = pinned.manifest();
-        let (origin_sequence, run_id) = lineage::publication_origin(
-            connection,
-            manifest,
-            publication.digest(),
-            publication.kind().as_str(),
-        )?
-        .ok_or(ManifestCatalogError::GenerationConflict)?;
-        let (dataset, version, schema_name, schema_version, fingerprint, digest) = connection
-            .query_row(
-                "SELECT dataset_id, manifest_version, schema_name, schema_version,
-                    schema_fingerprint, content_hash
-             FROM analytical_available_generations WHERE generation_sequence=?1",
-                [origin_sequence],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                    ))
-                },
-            )?;
-        let origin_manifest = DatasetManifestRef::try_new_with_schema(
-            DatasetId::try_from(dataset.as_str())?,
-            from_i64(version)?,
-            parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
-            parse_digest(&digest)?,
-        )?;
-        if origin_manifest.schema() != manifest.schema() {
-            return Err(ManifestCatalogError::SchemaMismatch);
-        }
-        let origin = self.pinned_in_snapshot(&origin_manifest, snapshot)?;
-        let manifest = origin.manifest();
-        let mut statement = connection.prepare(
-            "SELECT output.publication_ordinal, output.artifact_id,
-                    output.content_algorithm, output.content_digest, output.size_bytes,
-                    output.relative_reference, object.ordinal,
-                    object.content_hash, object.row_count, object.size_bytes
-             FROM artifacts AS output
-             LEFT JOIN analytical_generation_objects AS object
-               ON object.dataset_id=?1 AND object.manifest_version=?2
-              AND object.artifact_id=output.artifact_id
-             WHERE output.run_id=?3
-             ORDER BY output.publication_ordinal LIMIT 1025",
-        )?;
-        let mut rows = statement.query(params![
-            manifest.dataset_id().as_str(),
-            to_i64(manifest.manifest_version())?,
-            run_id.to_string()
-        ])?;
-        let mut outputs = Vec::new();
-        let mut count = 0usize;
-        while let Some(row) = rows.next()? {
-            let output_ordinal: i64 = row.get(0)?;
-            let artifact_id = Uuid::parse_str(&row.get::<_, String>(1)?)
-                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let algorithm: i64 = row.get(2)?;
-            let digest = parse_digest(&row.get::<_, Vec<u8>>(3)?)?;
-            let bytes = u64::try_from(row.get::<_, i64>(4)?)
-                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let reference: String = row.get(5)?;
-            if count >= 1024
-                || usize::try_from(output_ordinal).ok() != Some(count)
-                || algorithm != 1
-                || bytes == 0
-            {
-                return Err(ManifestCatalogError::CorruptCatalog);
-            }
-            count += 1;
-            let ordinal = row
-                .get::<_, Option<i64>>(6)?
-                .ok_or(ManifestCatalogError::CorruptCatalog)?;
-            let ordinal =
-                usize::try_from(ordinal).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let object = origin
-                .objects()
-                .get(ordinal)
-                .ok_or(ManifestCatalogError::CorruptCatalog)?;
-            if object.artifact_id() != artifact_id
-                || object.relative_reference() != reference
-                || object.object().content_hash() != digest
-                || object.object().size_bytes() != bytes
-                || parse_digest(&row.get::<_, Vec<u8>>(7)?)? != digest
-                || u64::try_from(row.get::<_, i64>(8)?).ok() != Some(object.object().row_count())
-                || u64::try_from(row.get::<_, i64>(9)?).ok() != Some(bytes)
-                || outputs.iter().any(|(_, prior)| *prior == ordinal)
-            {
-                return Err(ManifestCatalogError::CorruptCatalog);
-            }
-            outputs.push((artifact_id, ordinal));
-        }
-        if count == 0 || outputs.len() != count {
-            return Err(ManifestCatalogError::CorruptCatalog);
-        }
-        Ok((origin, outputs))
     }
 
     /// Returns one digest-ordered page of exact inherited capture membership.
@@ -997,27 +954,6 @@ impl AnalyticalManifestCatalog {
 
     pub(crate) const fn catalog_binding(&self) -> [u8; 32] {
         self.catalog_binding
-    }
-
-    /// Returns the exact market-event head requiring compaction before an append.
-    pub(crate) fn market_event_compaction_source(
-        &self,
-        dataset: &DatasetId,
-        additional_objects: usize,
-    ) -> Result<Option<DatasetManifestRef>, ManifestCatalogError> {
-        let connection = self.lock()?;
-        let Some(head) = load_latest(&connection, dataset, self.max_objects_per_generation)? else {
-            return Ok(None);
-        };
-        if head.manifest().schema() != &DatasetSchemaRegistry::local().canonical_market_events()? {
-            return Err(ManifestCatalogError::SchemaMismatch);
-        }
-        let needed = head
-            .objects()
-            .len()
-            .checked_add(additional_objects)
-            .ok_or(ManifestCatalogError::CountOverflow)?;
-        Ok((needed > self.max_objects_per_generation).then(|| head.manifest().clone()))
     }
 
     /// Builds the exact next ingest plan while the process-owned catalog writer is serialized.
@@ -3236,145 +3172,72 @@ fn classify_sqlite_interrupt(
     }
 }
 
-struct SelectedProviderMarketEventGeneration {
-    generation_sequence: i64,
-    manifest: DatasetManifestRef,
-    published_at: Timestamp,
-}
-
-fn selected_provider_market_event_generation(
+fn selected_provider_market_event_commit(
     connection: &Connection,
     request: &ProviderMarketEventPointInTimeRequest,
-) -> Result<Option<SelectedProviderMarketEventGeneration>, ManifestCatalogError> {
-    type RetainedGeneration = (i64, i64, String, i64, Vec<u8>, Vec<u8>, i64);
-    let retained: Option<RetainedGeneration> = if let Some(exact) = request.exact_manifest() {
-        connection
-            .query_row(
-                "SELECT generation_sequence, manifest_version, schema_name, schema_version,
-                        schema_fingerprint, content_hash, available_at_ns
-                 FROM analytical_available_generations
-                 WHERE dataset_id=?1 AND manifest_version=?2
-                   AND schema_name=?3 AND schema_version=?4
-                   AND schema_fingerprint=?5 AND content_hash=?6
-                   AND available_at_ns<=?7",
-                params![
-                    request.dataset().as_str(),
-                    to_i64(exact.manifest_version())?,
-                    exact.schema().name(),
-                    i64::from(exact.schema().version().get()),
-                    exact.schema().fingerprint().as_slice(),
-                    exact.content_hash().bytes().as_slice(),
-                    request.knowledge_cutoff().unix_nanos(),
-                ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?
-    } else {
-        connection
-            .query_row(
-                "SELECT generation_sequence, manifest_version, schema_name, schema_version,
-                        schema_fingerprint, content_hash, available_at_ns
-                 FROM analytical_available_generations
-                 WHERE dataset_id=?1 AND schema_name='market_squawk.market_events'
-                   AND available_at_ns<=?2
-                 ORDER BY manifest_version DESC LIMIT 1",
-                params![
-                    request.dataset().as_str(),
-                    request.knowledge_cutoff().unix_nanos(),
-                ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?
-    };
-    let Some(retained) = retained else {
-        return if request.exact_manifest().is_some() {
-            Err(ManifestCatalogError::GenerationConflict)
-        } else {
-            Ok(None)
-        };
-    };
-    let version = from_i64(retained.1)?;
-    let schema = parse_schema_identity(&retained.2, retained.3, &retained.4)?;
-    let registered = DatasetSchemaRegistry::local().canonical_market_events()?;
-    if schema != registered {
-        return Err(ManifestCatalogError::SchemaMismatch);
+) -> Result<Option<crate::MarketEventCommitRef>, ManifestCatalogError> {
+    if let Some(exact) = request.exact_commit() {
+        let retained = crate::catalog::market_event_store::load_market_event_commit(
+            connection,
+            request.dataset(),
+            exact.sequence(),
+        )?
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+        if &retained != exact || retained.available_at() > request.knowledge_cutoff() {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        return Ok(Some(retained));
     }
-    let manifest = DatasetManifestRef::try_new_with_schema(
-        request.dataset().clone(),
-        version,
-        schema,
-        parse_digest(&retained.5)?,
-    )?;
-    if request
-        .exact_manifest()
-        .is_some_and(|exact| exact != &manifest)
-    {
-        return Err(ManifestCatalogError::GenerationConflict);
-    }
-    Ok(Some(SelectedProviderMarketEventGeneration {
-        generation_sequence: retained.0,
-        manifest,
-        published_at: Timestamp::from_unix_nanos(retained.6),
-    }))
+    let sequence: Option<i64> = connection
+        .query_row(
+            "SELECT committed.commit_sequence FROM market_event_complete_commits AS committed
+         JOIN ingest_runs AS run ON run.run_id=committed.run_id
+          AND run.state='succeeded' AND run.completed_at_ns=committed.available_at_ns
+         WHERE committed.dataset_id=?1 AND committed.available_at_ns<=?2
+         ORDER BY committed.commit_sequence DESC LIMIT 1",
+            params![
+                request.dataset().as_str(),
+                request.knowledge_cutoff().unix_nanos()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    sequence
+        .map(|sequence| {
+            crate::catalog::market_event_store::load_market_event_commit(
+                connection,
+                request.dataset(),
+                from_i64(sequence)?,
+            )?
+            .ok_or(ManifestCatalogError::CorruptCatalog)
+        })
+        .transpose()
 }
 
 fn provider_market_event_exclusion_counts(
     connection: &Connection,
     request: &ProviderMarketEventPointInTimeRequest,
-    generation_sequence: i64,
+    commit_sequence: i64,
     clock: i64,
 ) -> Result<ProviderMarketEventExclusionCounts, ManifestCatalogError> {
     let instrument = request.instrument_id().map(|id| id.as_uuid());
-    let membership =
-        lineage::generation_contains_origin_sql("?2", "publication.generation_sequence");
     let counts: (i64, i64, i64, i64, i64, i64, i64) = connection.query_row(
-        &format!(
-            "WITH publication_origin AS (
-             SELECT publication.publication_digest,
-                    MIN(generation.available_at_ns) AS origin_published_at_ns
-             FROM analytical_generation_provider_publication_bindings AS publication
-             JOIN analytical_available_generations AS generation
-               ON generation.generation_sequence=publication.generation_sequence
-             JOIN analytical_generation_source_inputs AS source_input
-               ON source_input.generation_sequence=generation.generation_sequence
-              AND source_input.run_id=publication.run_id
-             WHERE generation.dataset_id=?1
-               AND generation.generation_kind='ingest'
-             GROUP BY publication.publication_digest
-         ), keyed_rows AS (
+        "WITH keyed_rows AS (
              SELECT indexed.source_id, indexed.source_timestamp_ns, indexed.received_at_ns,
                     indexed.available_at_ns, indexed.ingested_at_ns,
                     CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
                          ELSE indexed.received_at_ns END AS effective_at_ns,
-                    origin.origin_published_at_ns
-             FROM analytical_generation_provider_publication_bindings AS publication
-             JOIN provider_market_event_selection_index AS indexed
-               ON indexed.publication_digest=publication.publication_digest
-              AND indexed.publication_kind=publication.publication_kind
-              AND indexed.source_id=publication.source_id
-             JOIN publication_origin AS origin
-               ON origin.publication_digest=publication.publication_digest
-             WHERE {membership}
+                    committed.available_at_ns AS origin_committed_at_ns
+             FROM provider_market_event_selection_index AS indexed
+             JOIN market_event_complete_commits AS committed
+               ON committed.dataset_id=indexed.dataset_id
+              AND committed.commit_sequence=indexed.commit_sequence
+              AND committed.publication_digest=indexed.publication_digest
+              AND committed.publication_kind=indexed.publication_kind
+             JOIN ingest_runs AS run ON run.run_id=committed.run_id
+              AND run.source_id=indexed.source_id AND run.state='succeeded'
+              AND run.completed_at_ns=committed.available_at_ns
+             WHERE indexed.dataset_id=?1 AND indexed.commit_sequence<=?2
                AND ((?3 IS NOT NULL AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL)
                     OR (?3 IS NULL AND indexed.instrument_id IS NULL AND indexed.cohort_key=?10
                         AND indexed.provider_product=?11 AND indexed.provider_channel=?12))
@@ -3394,7 +3257,7 @@ fn provider_market_event_exclusion_counts(
                     OR (?6=1 AND received_at_ns<=?7))
                AND available_at_ns<=?8
                AND ingested_at_ns<=?8
-               AND origin_published_at_ns<=?8
+               AND origin_committed_at_ns<=?8
          )
          SELECT
            COALESCE((SELECT COUNT(*) FROM keyed_rows
@@ -3418,16 +3281,15 @@ fn provider_market_event_exclusion_counts(
                                       AND source_timestamp_ns<=?7)
                             OR (?6=1 AND received_at_ns<=?7))
                        AND available_at_ns<=?8 AND ingested_at_ns<=?8
-                       AND origin_published_at_ns>?8), 0),
+                       AND origin_committed_at_ns>?8), 0),
            COALESCE((SELECT COUNT(*) FROM eligible
                      WHERE effective_at_ns<newest_effective_at_ns), 0),
            COALESCE((SELECT COUNT(*) FROM eligible
                      WHERE ?13=1 AND effective_at_ns=newest_effective_at_ns
-                       AND received_at_ns<newest_received_at_ns), 0)"
-        ),
+                       AND received_at_ns<newest_received_at_ns), 0)",
         params![
             request.dataset().as_str(),
-            generation_sequence,
+            commit_sequence,
             instrument.as_ref().map(|id| id.as_bytes().as_slice()),
             request.venue_id().as_str(),
             crate::provider_event_selection::event_kind_name(request.event_kind()),

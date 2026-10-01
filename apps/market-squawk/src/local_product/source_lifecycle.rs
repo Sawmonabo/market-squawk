@@ -2,14 +2,15 @@
 
 mod credential_access;
 mod display_history;
+mod public_preparation;
 mod reconnect;
 
 use std::{
     future::Future,
     num::NonZeroU64,
     pin::Pin,
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, OnceLock, Weak},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -29,7 +30,8 @@ use crate::application::source::{
 use crate::application::{
     AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
     MarketRuntimeRegistry, MarketSourceRuntimeGeneration, PreparedAccountStop,
-    PreparedMarketProviderConfigurationRequest,
+    PreparedMarketProviderConfigurationRequest, PreparedPublicMarketStart,
+    PublicMarketStartPreparation,
 };
 use crate::provider_activation::{FredPointInTimeReadCapability, ProviderMarketAccount};
 use crate::{
@@ -98,6 +100,7 @@ impl LiveSourceRestoreFailure {
 /// Single lifecycle authority injected into the Source application domain.
 pub(crate) struct ProductionSourceLifecycleAuthority {
     credential_access: credential_access::CredentialRuntimeAccess,
+    public_startup_tasks: OnceLock<Weak<super::startup::ProductStartupTasks>>,
     paths: LocalPaths,
     onboarding: Arc<ProviderOnboardingService>,
     activation: Arc<ProviderAdapterActivation>,
@@ -126,6 +129,7 @@ impl ProductionSourceLifecycleAuthority {
     ) -> Self {
         Self {
             credential_access: credential_access::CredentialRuntimeAccess::default(),
+            public_startup_tasks: OnceLock::new(),
             paths,
             onboarding,
             activation,
@@ -139,15 +143,38 @@ impl ProductionSourceLifecycleAuthority {
         }
     }
 
-    /// Restores every live source whose durable desired state is active.
+    /// Restores nonpublic live sources whose durable desired state is active.
     ///
     /// Installed-service shutdown deliberately stops process-owned sockets without changing the
     /// user's durable source choice. On the next service generation, this method re-establishes
-    /// that exact source before the service publishes readiness. Provider, credential, budget, or
+    /// that exact source. Public sources use the independently retained preparation owner.
+    /// Provider, credential, budget, or
     /// network failures remain explicit lifecycle blockers and do not fabricate an active runtime.
     pub(crate) async fn restore_active_live_sources(
         &self,
         deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<LiveSourceRestoreReport, SourceLifecycleError> {
+        self.restore_live_sources(deadline, None, cancellation)
+            .await
+    }
+
+    pub(crate) async fn restore_active_live_sources_independently(
+        &self,
+        operation_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<LiveSourceRestoreReport, SourceLifecycleError> {
+        let deadline = Instant::now()
+            .checked_add(operation_timeout)
+            .ok_or(SourceLifecycleError::InvalidRequest)?;
+        self.restore_live_sources(deadline, Some(operation_timeout), cancellation)
+            .await
+    }
+
+    async fn restore_live_sources(
+        &self,
+        deadline: Instant,
+        operation_timeout: Option<Duration>,
         cancellation: &CancellationToken,
     ) -> Result<LiveSourceRestoreReport, SourceLifecycleError> {
         ensure_status_live(cancellation, deadline)?;
@@ -164,6 +191,11 @@ impl ProductionSourceLifecycleAuthority {
             .try_reserve_exact(LIVE_SURFACES.len())
             .map_err(|_error| SourceLifecycleError::Unavailable)?;
         for surface in LIVE_SURFACES {
+            // Public reference I/O belongs to the retained, independently admitted startup tasks.
+            if PUBLIC_LIVE_SURFACES.contains(&surface) {
+                continue;
+            }
+            let deadline = operation_deadline(deadline, operation_timeout)?;
             let provider = SourceIdentifier::try_from(surface)
                 .map_err(|_error| SourceLifecycleError::InvalidResult)?;
             let mut record = match self.durable.source_lifecycle_record(surface) {
@@ -179,9 +211,20 @@ impl ProductionSourceLifecycleAuthority {
             if let Some(account_surface) = AccountMarketSurface::parse(surface)
                 && record.account().is_some_and(|pending| !pending.finished)
             {
-                let _gate = self
+                let _gate = match self
                     .lifecycle_gate_before(surface, deadline, cancellation)
-                    .await?;
+                    .await
+                {
+                    Ok(gate) => gate,
+                    Err(error)
+                        if operation_timeout.is_some()
+                            && error != SourceLifecycleError::Cancelled =>
+                    {
+                        failures.push(LiveSourceRestoreFailure { provider, error });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 match self
                     .continue_account_transition(
                         record,
@@ -203,47 +246,6 @@ impl ProductionSourceLifecycleAuthority {
             match record.phase() {
                 DurableSourceLifecyclePhase::Active => active.push((provider, record)),
                 DurableSourceLifecyclePhase::Stopped
-                    if PUBLIC_LIVE_SURFACES.contains(&surface)
-                        && self.live.is_account_free_source_configured(&provider)
-                        && record.revision() == NonZeroU64::MIN
-                        && record.operation_id().is_none() =>
-                {
-                    active.push((provider, record));
-                }
-                DurableSourceLifecyclePhase::Applying
-                | DurableSourceLifecyclePhase::ReconciliationRequired
-                    if PUBLIC_LIVE_SURFACES.contains(&surface)
-                        && self.live.is_account_free_source_configured(&provider)
-                        && record.operation_id()
-                            == Some(&default_public_start_operation_id(&provider)?) =>
-                {
-                    let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
-                        provider: provider.clone(),
-                        action: SourceLifecycleAction::Retry,
-                        expected_state_revision: record.revision(),
-                        expected_generation: None,
-                        expected_runtime_generation_digest: None,
-                        onboarding_session_id: None,
-                        public_configuration_digest: None,
-                        reason: Some(
-                            SourceIdentifier::try_from("automatic-public-source-recovery")
-                                .map_err(|_error| SourceLifecycleError::Internal)?,
-                        ),
-                        cancellation: cancellation.child_token(),
-                        deadline,
-                    })?;
-                    match self.execute_owned(&command).await {
-                        Ok(receipt) if receipt.fields().provider == provider => {
-                            restored.push(provider)
-                        }
-                        Ok(_receipt) => failures.push(LiveSourceRestoreFailure {
-                            provider,
-                            error: SourceLifecycleError::InvalidResult,
-                        }),
-                        Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
-                    }
-                }
-                DurableSourceLifecyclePhase::Stopped
                 | DurableSourceLifecyclePhase::Removed
                 | DurableSourceLifecyclePhase::Applying
                 | DurableSourceLifecyclePhase::ReconciliationRequired => {}
@@ -251,29 +253,9 @@ impl ProductionSourceLifecycleAuthority {
         }
 
         for (provider, record) in active {
+            let deadline = operation_deadline(deadline, operation_timeout)?;
             ensure_status_live(cancellation, deadline)?;
-            if record.phase() == DurableSourceLifecyclePhase::Stopped {
-                let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
-                    provider: provider.clone(),
-                    action: SourceLifecycleAction::Start,
-                    expected_state_revision: record.revision(),
-                    expected_generation: None,
-                    expected_runtime_generation_digest: None,
-                    onboarding_session_id: None,
-                    public_configuration_digest: None,
-                    reason: None,
-                    cancellation: cancellation.child_token(),
-                    deadline,
-                })?;
-                match self.execute_owned(&command).await {
-                    Ok(receipt) if receipt.fields().provider == provider => restored.push(provider),
-                    Ok(_receipt) => failures.push(LiveSourceRestoreFailure {
-                        provider,
-                        error: SourceLifecycleError::InvalidResult,
-                    }),
-                    Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
-                }
-            } else if let Some(surface) = AccountMarketSurface::parse(provider.as_str()) {
+            if let Some(surface) = AccountMarketSurface::parse(provider.as_str()) {
                 let command = if surface == AccountMarketSurface::AlpacaBasic {
                     // Retry owns fresh doctor verification when a saved proof expired while
                     // the application was stopped. Saved keys alone never authorize a runtime.
@@ -357,10 +339,61 @@ impl ProductionSourceLifecycleAuthority {
     ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
         ensure_live(command)?;
         self.credential_access.ensure_resumed()?;
+        if PUBLIC_LIVE_SURFACES.contains(&command.provider().as_str())
+            && public_preparation::public_action_prepares(command.action())
+            && let Some(owner) = self.public_startup_tasks.get().and_then(Weak::upgrade)
+        {
+            return owner.execute_public_command(command).await;
+        }
+        let _exclusion = if PUBLIC_LIVE_SURFACES.contains(&command.provider().as_str())
+            && command.action() != SourceLifecycleAction::Verify
+        {
+            self.exclude_public_preparation(
+                Some(command.provider()),
+                command.deadline(),
+                command.cancellation(),
+            )
+            .await?
+        } else {
+            None
+        };
+        let (expected, prepared) = self.prepare_public_command(command).await?;
+        self.execute_prepared_owned(command, expected.as_ref(), prepared)
+            .await
+    }
+
+    async fn execute_prepared_owned(
+        &self,
+        command: &SourceLifecycleCommand,
+        expected: Option<&DurableSourceLifecycleRecord>,
+        prepared: Option<Box<PreparedPublicMarketStart>>,
+    ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
+        let mut prepared = prepared;
+        let result = self
+            .execute_prepared_commit(command, expected, &mut prepared)
+            .await;
+        if let Some(prepared) = prepared {
+            self.live
+                .discard_prepared_public(prepared)
+                .await
+                .map_err(map_live_error)?;
+        }
+        result
+    }
+
+    async fn execute_prepared_commit(
+        &self,
+        command: &SourceLifecycleCommand,
+        expected: Option<&DurableSourceLifecycleRecord>,
+        prepared: &mut Option<Box<PreparedPublicMarketStart>>,
+    ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
+        ensure_live(command)?;
+        self.credential_access.ensure_resumed()?;
         let provider = command.provider().as_str().to_owned();
-        let _mutation = self
-            .lifecycle_gate_before(&provider, command.deadline(), command.cancellation())
-            .await?;
+        let mut mutation = Some(
+            self.lifecycle_gate_before(&provider, command.deadline(), command.cancellation())
+                .await?,
+        );
         self.credential_access.ensure_resumed()?;
         let command_digest = command_digest(command)?;
         let operation_id = operation_id(command_digest)?;
@@ -368,6 +401,9 @@ impl ProductionSourceLifecycleAuthority {
             .durable
             .source_lifecycle_record(&provider)
             .map_err(map_durable_error)?;
+        if expected.is_some_and(|expected| expected != &current) {
+            return Err(SourceLifecycleError::Conflict);
+        }
         if let Some(surface) = AccountMarketSurface::parse(&provider) {
             if command.action() != SourceLifecycleAction::Verify {
                 return self
@@ -417,6 +453,8 @@ impl ProductionSourceLifecycleAuthority {
                 )
                 .await;
         }
+        let public_preparation = prepared.is_some();
+        let prepared_transition = transition.record().clone();
         let transition_digest = transition.transition_digest();
         let prior_session_id = transition.record().session_id();
         let prior_public_configuration_digest = transition.record().public_configuration_digest();
@@ -424,6 +462,68 @@ impl ProductionSourceLifecycleAuthority {
             transition.record().runtime_verification_receipt_digest();
         let prior_credential_generation = transition.record().credential_generation();
         let prior_record = current;
+        if public_preparation {
+            let predecessor = if matches!(
+                command.action(),
+                SourceLifecycleAction::Resynchronize | SourceLifecycleAction::Reconfigure
+            ) {
+                match expected_market_runtime_generation(command)? {
+                    Some(expected) => Some(expected),
+                    None if command.action() == SourceLifecycleAction::Reconfigure => Some(
+                        self.live
+                            .verify(
+                                command.provider(),
+                                command.deadline(),
+                                command.cancellation(),
+                            )
+                            .await
+                            .map_err(map_live_error)?
+                            .ok_or(SourceLifecycleError::Unavailable)?
+                            .generation,
+                    ),
+                    None => return Err(SourceLifecycleError::InvalidRequest),
+                }
+            } else {
+                None
+            };
+            drop(mutation.take());
+            let admission = async {
+                self.live
+                    .prepare_public_runtime(
+                        prepared.as_mut().ok_or(SourceLifecycleError::Internal)?,
+                        predecessor,
+                        command.deadline(),
+                        command.cancellation(),
+                    )
+                    .await
+                    .map_err(map_live_error)?;
+                mutation = Some(
+                    self.lifecycle_gate_before(
+                        &provider,
+                        command.deadline(),
+                        command.cancellation(),
+                    )
+                    .await?,
+                );
+                self.credential_access.ensure_resumed()?;
+                let current = self
+                    .durable
+                    .source_lifecycle_record(&provider)
+                    .map_err(map_durable_error)?;
+                if current != prepared_transition {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+                self.preflight_runtime_lease(command, &current)?;
+                ensure_live(command)
+            }
+            .await;
+            if let Err(error) = admission {
+                let _blocked = self
+                    .durable
+                    .require_source_lifecycle_reconciliation(&provider, transition_digest);
+                return Err(error);
+            }
+        }
         let result = if LIVE_SURFACES.contains(&provider.as_str()) {
             let execution: Pin<
                 Box<
@@ -445,6 +545,7 @@ impl ProductionSourceLifecycleAuthority {
                     command,
                     prior_session_id,
                     prior_public_configuration_digest,
+                    prepared.take(),
                 ))
             };
             execution.await
@@ -478,6 +579,11 @@ impl ProductionSourceLifecycleAuthority {
             }
         };
         if let Err(error) = ensure_live(command) {
+            if public_preparation {
+                drop(mutation.take());
+                self.drain_uncommitted_public(command.provider()).await?;
+            }
+
             let _blocked = self
                 .durable
                 .require_source_lifecycle_reconciliation(&provider, transition_digest);
@@ -494,6 +600,11 @@ impl ProductionSourceLifecycleAuthority {
         ) {
             Ok(record) => record,
             Err(error) => {
+                if public_preparation {
+                    drop(mutation.take());
+                    self.drain_uncommitted_public(command.provider()).await?;
+                }
+
                 let _blocked = self
                     .durable
                     .require_source_lifecycle_reconciliation(&provider, transition_digest);
@@ -1652,6 +1763,7 @@ impl ProductionSourceLifecycleAuthority {
         command: &SourceLifecycleCommand,
         prior_session_id: Option<uuid::Uuid>,
         prior_public_configuration_digest: Option<EvidenceDigest>,
+        prepared: Option<Box<PreparedPublicMarketStart>>,
     ) -> Result<LifecycleOutcome, SourceLifecycleError> {
         let supplied_lease = self.optional_exact_lease(command)?;
         let lease = match supplied_lease {
@@ -1731,15 +1843,22 @@ impl ProductionSourceLifecycleAuthority {
         }
         match command.action() {
             SourceLifecycleAction::Start | SourceLifecycleAction::Retry => {
-                self.live
-                    .start(
-                        command.provider(),
-                        session_id,
-                        command.deadline(),
-                        command.cancellation(),
-                    )
-                    .await
-                    .map_err(map_live_error)?;
+                if let Some(prepared) = prepared {
+                    self.live
+                        .start_prepared_public(prepared, command.deadline(), command.cancellation())
+                        .await
+                        .map_err(map_live_error)?;
+                } else {
+                    self.live
+                        .start(
+                            command.provider(),
+                            session_id,
+                            command.deadline(),
+                            command.cancellation(),
+                        )
+                        .await
+                        .map_err(map_live_error)?;
+                }
                 Ok(LifecycleOutcome::active(
                     session_id,
                     public_configuration_digest,
@@ -1764,7 +1883,11 @@ impl ProductionSourceLifecycleAuthority {
                 ))
             }
             SourceLifecycleAction::Resynchronize | SourceLifecycleAction::Reconfigure => {
-                let expected = match expected_market_runtime_generation(command)? {
+                let expected = match prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.previous_generation())
+                    .or(expected_market_runtime_generation(command)?)
+                {
                     Some(expected) => expected,
                     None if command.action() == SourceLifecycleAction::Reconfigure => self
                         .live
@@ -1781,10 +1904,11 @@ impl ProductionSourceLifecycleAuthority {
                 };
                 let (previous, _current) = self
                     .live
-                    .resynchronize(
+                    .resynchronize_prepared(
                         command.provider(),
                         expected,
                         session_id,
+                        prepared,
                         command.deadline(),
                         command.cancellation(),
                     )
@@ -2597,6 +2721,18 @@ impl ProductionSourceLifecycleAuthority {
     }
 }
 
+fn operation_deadline(
+    deadline: Instant,
+    timeout: Option<Duration>,
+) -> Result<Instant, SourceLifecycleError> {
+    match timeout {
+        Some(timeout) => Instant::now()
+            .checked_add(timeout)
+            .ok_or(SourceLifecycleError::InvalidRequest),
+        None => Ok(deadline),
+    }
+}
+
 fn saved_source_retry_command(
     provider: SourceIdentifier,
     expected_state_revision: NonZeroU64,
@@ -2717,8 +2853,40 @@ const fn live_action_requires_current_lease(action: SourceLifecycleAction) -> bo
     )
 }
 
+fn is_default_public_recovery(
+    provider: &SourceIdentifier,
+    record: &DurableSourceLifecycleRecord,
+) -> Result<bool, SourceLifecycleError> {
+    let start = default_public_start_operation_id(
+        provider,
+        record.session_id(),
+        record.public_configuration_digest(),
+    )?;
+    if record.operation_id() == Some(&start) {
+        return Ok(true);
+    }
+    let Some(previous_revision) = record
+        .revision()
+        .get()
+        .checked_sub(1)
+        .and_then(NonZeroU64::new)
+    else {
+        return Ok(false);
+    };
+    let retry = saved_source_retry_command(
+        provider.clone(),
+        previous_revision,
+        "automatic-public-source-recovery",
+        Instant::now() + std::time::Duration::from_secs(1),
+        CancellationToken::new(),
+    )?;
+    Ok(record.operation_id() == Some(&operation_id(command_digest(&retry)?)?))
+}
+
 fn default_public_start_operation_id(
     provider: &SourceIdentifier,
+    session_id: Option<uuid::Uuid>,
+    public_configuration_digest: Option<EvidenceDigest>,
 ) -> Result<SourceIdentifier, SourceLifecycleError> {
     let deadline = Instant::now()
         .checked_add(std::time::Duration::from_secs(1))
@@ -2729,8 +2897,8 @@ fn default_public_start_operation_id(
         expected_state_revision: NonZeroU64::MIN,
         expected_generation: None,
         expected_runtime_generation_digest: None,
-        onboarding_session_id: None,
-        public_configuration_digest: None,
+        onboarding_session_id: session_id,
+        public_configuration_digest,
         reason: None,
         cancellation: CancellationToken::new(),
         deadline,
@@ -3149,6 +3317,87 @@ mod tests {
             .unwrap_err(),
             SourceLifecycleError::DeadlineExceeded,
         );
+        // Recovery recognizes the actual bound Start and successive interrupted automatic
+        // retries, while an explicit Stop/Remove replaces that recoverable intent.
+        let temporary = tempfile::tempdir()?;
+        let durable = DurableProviderActivationState::new(temporary.path().to_path_buf());
+        let provider = SourceIdentifier::try_from(COINBASE_PUBLIC_LIVE_SURFACE)?;
+        let session = uuid::Uuid::new_v4();
+        let configuration = EvidenceDigest::new(DigestAlgorithm::Sha256, [9; 32]);
+        let start = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+            provider: provider.clone(),
+            action: SourceLifecycleAction::Start,
+            expected_state_revision: NonZeroU64::MIN,
+            expected_generation: None,
+            expected_runtime_generation_digest: None,
+            onboarding_session_id: Some(session),
+            public_configuration_digest: Some(configuration),
+            reason: None,
+            cancellation: CancellationToken::new(),
+            deadline,
+        })?;
+        let start_digest = command_digest(&start)?;
+        durable.begin_source_lifecycle_transition(
+            provider.as_str(),
+            NonZeroU64::MIN,
+            operation_id(start_digest)?,
+            start_digest,
+            false,
+            Some(session),
+            Some(configuration),
+        )?;
+        for _ in 0..2 {
+            let record = durable.source_lifecycle_record(provider.as_str())?;
+            assert!(is_default_public_recovery(&provider, &record)?);
+            assert_eq!(record.session_id(), Some(session));
+            assert_eq!(record.public_configuration_digest(), Some(configuration));
+            let retry = saved_source_retry_command(
+                provider.clone(),
+                record.revision(),
+                "automatic-public-source-recovery",
+                deadline,
+                CancellationToken::new(),
+            )?;
+            let digest = command_digest(&retry)?;
+            durable.begin_source_lifecycle_transition(
+                provider.as_str(),
+                record.revision(),
+                operation_id(digest)?,
+                digest,
+                true,
+                None,
+                None,
+            )?;
+        }
+        for action in [SourceLifecycleAction::Stop, SourceLifecycleAction::Remove] {
+            let record = durable.source_lifecycle_record(provider.as_str())?;
+            let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                provider: provider.clone(),
+                action,
+                expected_state_revision: record.revision(),
+                expected_generation: None,
+                expected_runtime_generation_digest: None,
+                onboarding_session_id: None,
+                public_configuration_digest: None,
+                reason: Some(SourceIdentifier::try_from("explicit-owner-stop")?),
+                cancellation: CancellationToken::new(),
+                deadline,
+            })?;
+            let digest = command_digest(&command)?;
+            durable.begin_source_lifecycle_transition(
+                provider.as_str(),
+                record.revision(),
+                operation_id(digest)?,
+                digest,
+                true,
+                None,
+                None,
+            )?;
+            assert!(!is_default_public_recovery(
+                &provider,
+                &durable.source_lifecycle_record(provider.as_str())?,
+            )?);
+        }
         Ok(())
     }
 }

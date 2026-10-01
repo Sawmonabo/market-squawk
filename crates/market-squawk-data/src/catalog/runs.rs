@@ -631,7 +631,15 @@ pub(crate) fn complete_ingest_in_transaction(
             |row| row.get(0),
         )?;
         if !has_closed_group {
-            return Err(CatalogError::RunStateConflict);
+            let has_active_group: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM market_event_complete_commits
+                 WHERE run_id=?1 AND available_at_ns=?2)",
+                params![reservation.run_id.to_string(), completed_at.unix_nanos()],
+                |row| row.get(0),
+            )?;
+            if !has_active_group {
+                return Err(CatalogError::RunStateConflict);
+            }
         }
     }
     if let Some(company_identity) = company_identity {

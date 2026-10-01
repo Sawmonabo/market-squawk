@@ -122,6 +122,29 @@ pub(crate) const KRAKEN_PUBLIC_SURFACE_ID: &str = "kraken.spot-public-market-dat
 const MAXIMUM_CONCURRENT_MARKET_SURFACES: usize = 16;
 const ACCOUNT_HEALTH_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Owns reference preparation and any unpublished runtime until exact registry commit.
+#[derive(Debug)]
+pub(crate) struct PreparedPublicMarketStart {
+    provider: SourceIdentifier,
+    session_id: uuid::Uuid,
+    composition: Option<crate::paper_bot::ProductionLiveMarketComposition>,
+    entry: Option<Box<MarketRuntimeEntry>>,
+    durable_routes: Vec<MarketEventDurableRouteRead>,
+    previous: Option<MarketSourceRuntimeGeneration>,
+}
+
+impl PreparedPublicMarketStart {
+    pub(crate) fn previous_generation(&self) -> Option<MarketSourceRuntimeGeneration> {
+        self.previous
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PublicMarketStartPreparation {
+    Ready(Box<PreparedPublicMarketStart>),
+    Deferred { not_before: Instant },
+}
+
 /// Exact live evidence returned after one registry-owned source lifecycle operation.
 #[derive(Clone, Debug)]
 pub(crate) struct MarketSourceLifecycleEvidence {
@@ -478,6 +501,375 @@ impl MarketRuntimeRegistry {
         }
     }
 
+    /// Performs provider reference I/O without the registry mutation lock.
+    pub(crate) async fn prepare_public_start(
+        &self,
+        provider: &SourceIdentifier,
+        session_id: uuid::Uuid,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PublicMarketStartPreparation, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let MarketSurface::Public { provider: kind, .. } =
+            MarketSurface::parse(provider, Some(session_id))?
+        else {
+            return Err(ServiceError::InvalidRequest);
+        };
+        let composition = local_live_market_with_provider_rate(
+            self.config.clone(),
+            kind,
+            self.provider_rate.clone(),
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "public market preparation composition failed");
+            ServiceError::Unavailable
+        })?
+        .with_completion_notification(Arc::clone(&self.public_completion));
+        let owned_cancellation = cancellation.child_token();
+        await_owned_configuration_resolution(
+            deadline,
+            cancellation,
+            owned_cancellation.clone(),
+            async {
+                match composition
+                    .with_public_crypto_reference(
+                        self.provider_activation.market_data_instruments(),
+                        self.provider_activation
+                            .market_data_instrument_synchronization(),
+                        self.provider_activation.provider_capture_store(),
+                        &self.provider_activation.instrument_definitions(),
+                        deadline,
+                        &owned_cancellation,
+                    )
+                    .await
+                {
+                    Ok(composition) => Ok(PublicMarketStartPreparation::Ready(Box::new(
+                        PreparedPublicMarketStart {
+                            provider: provider.clone(),
+                            session_id,
+                            composition: Some(composition),
+                            entry: None,
+                            durable_routes: Vec::new(),
+                            previous: None,
+                        },
+                    ))),
+                    Err(ProductionLiveSourceRuntimeError::ProviderRateDeferred { not_before }) => {
+                        Ok(PublicMarketStartPreparation::Deferred { not_before })
+                    }
+                    Err(error) => {
+                        ensure_before(deadline, cancellation)?;
+                        tracing::error!(%error, "public market reference preparation failed");
+                        Err(ServiceError::Unavailable)
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// Retains an unpublished runtime while its existing supervisors await network readiness.
+    pub(crate) async fn prepare_public_runtime(
+        &self,
+        prepared: &mut PreparedPublicMarketStart,
+        predecessor: Option<MarketSourceRuntimeGeneration>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        {
+            let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
+            ensure_active(&self.accepting, deadline, cancellation)?;
+            self.require_existing_session(
+                &prepared.provider,
+                Some(prepared.session_id),
+                deadline,
+                cancellation,
+            )
+            .await?;
+            if let Some(previous) = predecessor {
+                prepared.previous = self
+                    .stop_owned(&prepared.provider, Some(previous), deadline, cancellation)
+                    .await?;
+                if prepared.previous != Some(previous) {
+                    return Err(ServiceError::InvalidRequest);
+                }
+            } else {
+                match self.verify_owned(&prepared.provider).await {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) | Err(ServiceError::Unavailable) => {}
+                    Err(error) => return Err(error),
+                }
+                self.remove_unhealthy_owned(&prepared.provider, deadline, cancellation)
+                    .await?;
+            }
+        }
+        let MarketSurface::Public { provider: kind, .. } =
+            MarketSurface::parse(&prepared.provider, Some(prepared.session_id))?
+        else {
+            return Err(ServiceError::InvalidRequest);
+        };
+        let composition = prepared
+            .composition
+            .take()
+            .ok_or(ServiceError::InvalidRequest)?;
+        let (entry, routes) = self
+            .build_public_entry(
+                &prepared.provider,
+                kind,
+                prepared.session_id,
+                composition,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        prepared.entry = Some(entry);
+        prepared.durable_routes = routes;
+        Ok(())
+    }
+
+    pub(crate) async fn discard_prepared_public(
+        &self,
+        mut prepared: Box<PreparedPublicMarketStart>,
+    ) -> Result<(), ServiceError> {
+        if let Some(entry) = prepared.entry.take() {
+            entry.shutdown(self.config.source_shutdown()).await?;
+        }
+        Ok(())
+    }
+
+    // Keep the source/readiness future and its completed payload off the retained task stack.
+    #[inline(never)]
+    fn build_public_entry<'a>(
+        &'a self,
+        provider: &'a SourceIdentifier,
+        provider_kind: ProductionSourceProvider,
+        session_id: uuid::Uuid,
+        composition: crate::paper_bot::ProductionLiveMarketComposition,
+        deadline: Instant,
+        cancellation: &'a CancellationToken,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (Box<MarketRuntimeEntry>, Vec<MarketEventDurableRouteRead>),
+                        ServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let runtime_cancellation = self.lifecycle.child_token();
+            let metadata = composition.source_metadata().map_err(|error| {
+                tracing::error!(
+                    provider = ?provider_kind,
+                    %error,
+                    "market source metadata-set construction failed"
+                );
+                ServiceError::Unavailable
+            })?;
+            let activation_lease = self
+                        .provider_activation
+                        .activate_public_live_metadata(session_id, provider_kind, metadata.as_ref())
+                        .map_err(|error| {
+                            tracing::error!(provider = ?provider_kind, %error, "public market activation binding failed");
+                            ServiceError::Unavailable
+                        })?;
+            if activation_lease.session_id() != session_id
+                || activation_lease.surface_id() != provider
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            let publication_cancellation = CancellationToken::new();
+            let publication_package = match provider_kind {
+                ProductionSourceProvider::Coinbase => {
+                    let source = metadata.first().ok_or(ServiceError::Unavailable)?;
+                    if metadata.len() != 1 {
+                        return Err(ServiceError::Unavailable);
+                    }
+                    await_before(
+                        deadline,
+                        cancellation,
+                        self.provider_activation
+                            .acquire_coinbase_market_publication_package(
+                                &activation_lease,
+                                source,
+                                publication_cancellation.clone(),
+                            ),
+                    )
+                    .await?
+                }
+                ProductionSourceProvider::Kraken => {
+                    let book = metadata.first().ok_or(ServiceError::Unavailable)?;
+                    let trades = metadata.get(1).ok_or(ServiceError::Unavailable)?;
+                    if metadata.len() != 2 {
+                        return Err(ServiceError::Unavailable);
+                    }
+                    await_before(
+                        deadline,
+                        cancellation,
+                        self.provider_activation
+                            .acquire_kraken_market_publication_package(
+                                &activation_lease,
+                                book,
+                                trades,
+                                publication_cancellation.clone(),
+                            ),
+                    )
+                    .await?
+                }
+            };
+            let route_keys = clone_route_keys(composition.live_routes())?;
+            let topology =
+                MarketRuntimeTopology::try_new(provider, Arc::clone(&metadata), route_keys)?;
+            let mut durable_reads = Vec::new();
+            durable_reads
+                .try_reserve_exact(publication_package.durable_read_count())
+                .map_err(|_error| ServiceError::ResourceExhausted)?;
+            publication_package.append_durable_reads(&mut durable_reads);
+            let durable_routes =
+                durable_route_bindings(provider, Arc::clone(&metadata), &topology, durable_reads)?;
+            let (exports, drains) = LiveFairValueExportDrains::try_start(
+                composition
+                    .qualified_market_export_source_id()
+                    .map_err(|_| ServiceError::Unavailable)?
+                    .clone(),
+                composition.live_routes(),
+                composition.maximum_message_bytes(),
+                Arc::clone(&self.live_fair_value),
+                runtime_cancellation.clone(),
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(provider = ?provider_kind, %error, "market export startup failed");
+                ServiceError::Unavailable
+            })?;
+            let started = await_public_runtime_start(
+                deadline,
+                cancellation,
+                runtime_cancellation.clone(),
+                async {
+                    composition
+                        .start_with_qualified_market_exports_and_crypto_publication(
+                            exports,
+                            publication_package,
+                            publication_cancellation,
+                            runtime_cancellation.clone(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            tracing::error!(%error, "public runtime readiness failed");
+                            ServiceError::Unavailable
+                        })
+                },
+            )
+            .await;
+            let runtime = match started {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    drains.begin_shutdown();
+                    runtime_cancellation.cancel();
+                    let cleanup = CancellationToken::new();
+                    let _cleanup = drains
+                        .finish_before(self.cleanup_deadline()?, &cleanup)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let mut entry = Box::new(MarketRuntimeEntry {
+                surface_id: provider.clone(),
+                onboarding_session_id: Some(session_id),
+                metadata,
+                topology: Some(topology),
+                cancellation: runtime_cancellation,
+                runtime: MarketRuntime::Public(runtime),
+                exports: Some(drains),
+                action_hooks_installed: false,
+            });
+            if let Err(error) = entry
+                .wait_for_public_snapshots(deadline, cancellation)
+                .await
+            {
+                tracing::warn!(
+                    provider = provider.as_str(), %error,
+                    "public market snapshot readiness failed"
+                );
+                let _cleanup = self.shutdown_started_entry(*entry).await;
+                return Err(error);
+            }
+            Ok((entry, durable_routes))
+        })
+    }
+
+    pub(crate) async fn start_prepared_public(
+        self: &Arc<Self>,
+        prepared: Box<PreparedPublicMarketStart>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketSourceLifecycleEvidence, ServiceError> {
+        let provider = prepared.provider.clone();
+        let session = prepared.session_id;
+        let admission = async {
+            self.ensure_account_health_drain_started(deadline, cancellation)
+                .await?;
+            bounded_lock(&self.mutation, deadline, cancellation).await
+        }
+        .await;
+        let _mutation = match admission {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.discard_prepared_public(prepared).await?;
+                return Err(error);
+            }
+        };
+        self.start_owned(
+            &provider,
+            Some(session),
+            Some(prepared),
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn prepare_public_before(
+        &self,
+        provider: &SourceIdentifier,
+        session: Option<uuid::Uuid>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Box<PreparedPublicMarketStart>>, ServiceError> {
+        if !matches!(
+            MarketSurface::parse(provider, session)?,
+            MarketSurface::Public { .. }
+        ) {
+            return Ok(None);
+        }
+        loop {
+            match self
+                .prepare_public_start(
+                    provider,
+                    session.ok_or(ServiceError::InvalidRequest)?,
+                    deadline,
+                    cancellation,
+                )
+                .await?
+            {
+                PublicMarketStartPreparation::Ready(prepared) => return Ok(Some(prepared)),
+                PublicMarketStartPreparation::Deferred { not_before } => {
+                    if not_before <= Instant::now() {
+                        return Err(ServiceError::Unavailable);
+                    }
+                    tokio::select! { biased;
+                        () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+                        () = tokio::time::sleep_until(deadline.into()) => return Err(ServiceError::DeadlineExceeded),
+                        () = tokio::time::sleep_until(not_before.into()) => {},
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) async fn start(
         self: &Arc<Self>,
         provider: &SourceIdentifier,
@@ -485,11 +877,32 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketSourceLifecycleEvidence, ServiceError> {
+        let prepared = self
+            .prepare_public_before(provider, onboarding_session_id, deadline, cancellation)
+            .await?;
+        if let Some(mut prepared) = prepared {
+            if let Err(error) = self
+                .prepare_public_runtime(&mut prepared, None, deadline, cancellation)
+                .await
+            {
+                self.discard_prepared_public(prepared).await?;
+                return Err(error);
+            }
+            return self
+                .start_prepared_public(prepared, deadline, cancellation)
+                .await;
+        }
         self.ensure_account_health_drain_started(deadline, cancellation)
             .await?;
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
-        self.start_owned(provider, onboarding_session_id, deadline, cancellation)
-            .await
+        self.start_owned(
+            provider,
+            onboarding_session_id,
+            None,
+            deadline,
+            cancellation,
+        )
+        .await
     }
 
     /// Starts one exact account-backed provider group and publishes it only after every required
@@ -800,13 +1213,42 @@ impl MarketRuntimeRegistry {
         AccountGroupPublicationAttempt::Published
     }
 
-    // Return the heap-owned startup future before polling it. Its construction must not
-    // enlarge the live lifecycle caller's stack throughout nested provider startup.
+    // Construct each startup phase behind a heap boundary before its caller polls it.
     #[inline(never)]
     fn start_owned<'a>(
         &'a self,
         provider: &'a SourceIdentifier,
         onboarding_session_id: Option<uuid::Uuid>,
+        prepared: Option<Box<PreparedPublicMarketStart>>,
+        deadline: Instant,
+        cancellation: &'a CancellationToken,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<MarketSourceLifecycleEvidence, ServiceError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut prepared = prepared;
+            let result = self
+                .start_entry_owned(
+                    provider,
+                    onboarding_session_id,
+                    &mut prepared,
+                    deadline,
+                    cancellation,
+                )
+                .await;
+            if let Some(prepared) = prepared {
+                self.discard_prepared_public(prepared).await?;
+            }
+            result
+        })
+    }
+
+    #[inline(never)]
+    fn start_entry_owned<'a>(
+        &'a self,
+        provider: &'a SourceIdentifier,
+        onboarding_session_id: Option<uuid::Uuid>,
+        prepared: &'a mut Option<Box<PreparedPublicMarketStart>>,
         deadline: Instant,
         cancellation: &'a CancellationToken,
     ) -> Pin<
@@ -831,264 +1273,54 @@ impl MarketRuntimeRegistry {
                 .await?;
             let runtime_cancellation = self.lifecycle.child_token();
             let entry = match surface {
-                MarketSurface::Public {
-                    provider: provider_kind,
-                    session_id,
-                } => {
-                    let composition = local_live_market_with_provider_rate(
-                        self.config.clone(),
-                        provider_kind,
-                        self.provider_rate.clone(),
-                    )
-                    .map_err(|error| {
-                        tracing::error!(provider = ?provider_kind, %error, "market source composition failed");
-                        ServiceError::Unavailable
-                    })?;
-                    let composition = composition
-                        .with_completion_notification(Arc::clone(&self.public_completion));
-                    let composition = await_before(
-                        deadline,
-                        cancellation,
-                        composition.with_public_crypto_reference(
-                            self.provider_activation.market_data_instruments(),
-                            self.provider_activation
-                                .market_data_instrument_synchronization(),
-                            self.provider_activation.provider_capture_store(),
-                            &self.provider_activation.instrument_definitions(),
-                            deadline,
-                            cancellation,
-                        ),
-                    )
-                    .await?;
-                    let metadata = composition.source_metadata().map_err(|error| {
-                        tracing::error!(
-                            provider = ?provider_kind,
-                            %error,
-                            "market source metadata-set construction failed"
-                        );
-                        ServiceError::Unavailable
-                    })?;
-                    let activation_lease = self
-                        .provider_activation
-                        .activate_public_live_metadata(session_id, provider_kind, metadata.as_ref())
-                        .map_err(|error| {
-                            tracing::error!(provider = ?provider_kind, %error, "public market activation binding failed");
-                            ServiceError::Unavailable
-                        })?;
-                    if activation_lease.session_id() != session_id
-                        || activation_lease.surface_id() != provider
-                    {
-                        return Err(ServiceError::Unavailable);
+                MarketSurface::Public { session_id, .. } => {
+                    let prepared = prepared.as_mut().ok_or(ServiceError::InvalidRequest)?;
+                    if prepared.provider != *provider || prepared.session_id != session_id {
+                        return Err(ServiceError::InvalidRequest);
                     }
-                    let publication_cancellation = CancellationToken::new();
-                    let publication_package = match provider_kind {
-                        ProductionSourceProvider::Coinbase => {
-                            let source = metadata.first().ok_or(ServiceError::Unavailable)?;
-                            if metadata.len() != 1 {
-                                return Err(ServiceError::Unavailable);
-                            }
-                            await_before(
-                                deadline,
-                                cancellation,
-                                self.provider_activation
-                                    .acquire_coinbase_market_publication_package(
-                                        &activation_lease,
-                                        source,
-                                        publication_cancellation.clone(),
-                                    ),
-                            )
-                            .await?
-                        }
-                        ProductionSourceProvider::Kraken => {
-                            let book = metadata.first().ok_or(ServiceError::Unavailable)?;
-                            let trades = metadata.get(1).ok_or(ServiceError::Unavailable)?;
-                            if metadata.len() != 2 {
-                                return Err(ServiceError::Unavailable);
-                            }
-                            await_before(
-                                deadline,
-                                cancellation,
-                                self.provider_activation
-                                    .acquire_kraken_market_publication_package(
-                                        &activation_lease,
-                                        book,
-                                        trades,
-                                        publication_cancellation.clone(),
-                                    ),
-                            )
-                            .await?
-                        }
-                    };
-                    let route_keys = clone_route_keys(composition.live_routes())?;
-                    let topology = MarketRuntimeTopology::try_new(
-                        provider,
-                        Arc::clone(&metadata),
-                        route_keys,
-                    )?;
-                    let mut durable_reads = Vec::new();
-                    durable_reads
-                        .try_reserve_exact(publication_package.durable_read_count())
-                        .map_err(|_error| ServiceError::ResourceExhausted)?;
-                    publication_package.append_durable_reads(&mut durable_reads);
-                    let durable_routes = durable_route_bindings(
-                        provider,
-                        Arc::clone(&metadata),
-                        &topology,
-                        durable_reads,
-                    )?;
                     self.replace_durable_market_routes(
                         provider,
-                        durable_routes,
+                        std::mem::take(&mut prepared.durable_routes),
                         deadline,
                         cancellation,
                     )
                     .await?;
-                    let (exports, drains) = LiveFairValueExportDrains::try_start(
-                        composition
-                            .qualified_market_export_source_id()
-                            .map_err(|_| ServiceError::Unavailable)?
-                            .clone(),
-                        composition.live_routes(),
-                        composition.maximum_message_bytes(),
-                        Arc::clone(&self.live_fair_value),
-                        runtime_cancellation.clone(),
-                        deadline,
-                    )
-                    .await
-                    .map_err(|error| {
-                        tracing::error!(provider = ?provider_kind, %error, "market export startup failed");
-                        ServiceError::Unavailable
-                    })?;
-                    let started = await_before(
-                        deadline,
-                        cancellation,
-                        composition.start_with_qualified_market_exports_and_crypto_publication(
-                            exports,
-                            publication_package,
-                            publication_cancellation,
-                            runtime_cancellation.clone(),
-                        ),
-                    )
-                    .await;
-                    let runtime = match started {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            drains.begin_shutdown();
-                            runtime_cancellation.cancel();
-                            let cleanup = CancellationToken::new();
-                            let _cleanup = drains.finish_before(deadline, &cleanup).await;
-                            return Err(error);
-                        }
-                    };
-                    MarketRuntimeEntry {
-                        surface_id: provider.clone(),
-                        onboarding_session_id: Some(session_id),
-                        metadata,
-                        topology: Some(topology),
-                        cancellation: runtime_cancellation,
-                        runtime: MarketRuntime::Public(runtime),
-                        exports: Some(drains),
-                        action_hooks_installed: false,
-                    }
+                    *prepared.entry.take().ok_or(ServiceError::InvalidRequest)?
                 }
                 MarketSurface::CoinbaseDirect { session_id } => {
-                    let composition = await_before(
+                    self.build_coinbase_direct_entry(
+                        provider,
+                        session_id,
+                        runtime_cancellation,
                         deadline,
                         cancellation,
-                        local_coinbase_direct_live_market_with_activation(
-                            self.config.clone(),
-                            session_id,
-                            self.provider_activation.as_ref(),
-                            runtime_cancellation.clone(),
-                        ),
                     )
-                    .await?;
-                    let started = await_before(
-                        deadline,
-                        cancellation,
-                        composition.start_with_order_level(
-                            self.order_level.clone(),
-                            runtime_cancellation.clone(),
-                        ),
-                    )
-                    .await;
-                    let runtime = match started {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            runtime_cancellation.cancel();
-                            return Err(error);
-                        }
-                    };
-                    let metadata = runtime.metadata();
-                    let routes = runtime.routes();
-                    let topology = match MarketRuntimeTopology::try_new(
-                        provider,
-                        Arc::clone(&metadata),
-                        routes,
-                    ) {
-                        Ok(topology) => topology,
-                        Err(error) => {
-                            runtime_cancellation.cancel();
-                            let _cleanup = runtime.shutdown().await;
-                            return Err(error);
-                        }
-                    };
-                    let durable_reads = runtime.durable_reads();
-                    let durable_routes = match durable_route_bindings(
-                        provider,
-                        Arc::clone(&metadata),
-                        &topology,
-                        durable_reads.iter().cloned().collect(),
-                    ) {
-                        Ok(routes) => routes,
-                        Err(error) => {
-                            runtime_cancellation.cancel();
-                            let _cleanup = runtime.shutdown().await;
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = self
-                        .replace_durable_market_routes(
-                            provider,
-                            durable_routes,
-                            deadline,
-                            cancellation,
-                        )
-                        .await
-                    {
-                        runtime_cancellation.cancel();
-                        let _cleanup = runtime.shutdown().await;
-                        return Err(error);
-                    }
-                    MarketRuntimeEntry {
-                        surface_id: provider.clone(),
-                        onboarding_session_id: Some(session_id),
-                        metadata,
-                        topology: Some(topology),
-                        cancellation: runtime_cancellation,
-                        runtime: MarketRuntime::CoinbaseDirect(runtime),
-                        exports: None,
-                        action_hooks_installed: false,
-                    }
+                    .await?
                 }
             };
             if let Err(error) = ensure_active(&self.accepting, deadline, cancellation) {
-                let _cleanup = entry.shutdown(self.config.source_shutdown()).await;
+                let _cleanup = self.shutdown_started_entry(entry).await;
                 return Err(error);
             }
             if !entry.is_healthy() {
-                entry.shutdown(self.config.source_shutdown()).await?;
+                self.shutdown_started_entry(entry).await?;
                 return Err(ServiceError::Unavailable);
             }
             {
-                let mut entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+                let mut entries = match bounded_lock(&self.entries, deadline, cancellation).await {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        let _cleanup = self.shutdown_started_entry(entry).await;
+                        return Err(error);
+                    }
+                };
                 if entries.len() == MAXIMUM_CONCURRENT_MARKET_SURFACES
                     || entries
                         .iter()
                         .any(|current| current.surface_id == entry.surface_id)
                 {
                     drop(entries);
-                    entry.shutdown(self.config.source_shutdown()).await?;
+                    self.shutdown_started_entry(entry).await?;
                     return Err(ServiceError::ResourceExhausted);
                 }
                 entries.push(entry);
@@ -1097,7 +1329,7 @@ impl MarketRuntimeRegistry {
                 // this notification or a later producer completion observes the published entry.
                 if entries.last().is_some_and(|entry| {
                     matches!(&entry.runtime, MarketRuntime::Public(runtime)
-                        if runtime.completed_incarnation().is_some())
+                    if runtime.completed_incarnation().is_some())
                 }) {
                     self.public_completion.notify_one();
                 }
@@ -1111,7 +1343,7 @@ impl MarketRuntimeRegistry {
                         .take_entry(provider, self.cleanup_deadline()?, &cleanup)
                         .await?
                         .ok_or(ServiceError::Unavailable)?;
-                    entry.shutdown(self.config.source_shutdown()).await?;
+                    self.shutdown_started_entry(entry).await?;
                     Err(ServiceError::Unavailable)
                 }
                 Err(error) => {
@@ -1120,12 +1352,103 @@ impl MarketRuntimeRegistry {
                         .take_entry(provider, self.cleanup_deadline()?, &cleanup)
                         .await?
                     {
-                        entry.shutdown(self.config.source_shutdown()).await?;
+                        self.shutdown_started_entry(entry).await?;
                     }
                     Err(error)
                 }
             }
         })
+    }
+
+    #[inline(never)]
+    fn build_coinbase_direct_entry<'a>(
+        &'a self,
+        provider: &'a SourceIdentifier,
+        session_id: uuid::Uuid,
+        runtime_cancellation: CancellationToken,
+        deadline: Instant,
+        cancellation: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<MarketRuntimeEntry, ServiceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let composition = await_before(
+                deadline,
+                cancellation,
+                local_coinbase_direct_live_market_with_activation(
+                    self.config.clone(),
+                    session_id,
+                    self.provider_activation.as_ref(),
+                    runtime_cancellation.clone(),
+                ),
+            )
+            .await?;
+            let started = await_before(
+                deadline,
+                cancellation,
+                composition
+                    .start_with_order_level(self.order_level.clone(), runtime_cancellation.clone()),
+            )
+            .await;
+            let runtime = match started {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    runtime_cancellation.cancel();
+                    return Err(error);
+                }
+            };
+            let metadata = runtime.metadata();
+            let routes = runtime.routes();
+            let topology =
+                match MarketRuntimeTopology::try_new(provider, Arc::clone(&metadata), routes) {
+                    Ok(topology) => topology,
+                    Err(error) => {
+                        runtime_cancellation.cancel();
+                        let _cleanup = runtime.shutdown().await;
+                        return Err(error);
+                    }
+                };
+            let durable_reads = runtime.durable_reads();
+            let durable_routes = match durable_route_bindings(
+                provider,
+                Arc::clone(&metadata),
+                &topology,
+                durable_reads.iter().cloned().collect(),
+            ) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    runtime_cancellation.cancel();
+                    let _cleanup = runtime.shutdown().await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self
+                .replace_durable_market_routes(provider, durable_routes, deadline, cancellation)
+                .await
+            {
+                runtime_cancellation.cancel();
+                let _cleanup = runtime.shutdown().await;
+                return Err(error);
+            }
+            Ok(MarketRuntimeEntry {
+                surface_id: provider.clone(),
+                onboarding_session_id: Some(session_id),
+                metadata,
+                topology: Some(topology),
+                cancellation: runtime_cancellation,
+                runtime: MarketRuntime::CoinbaseDirect(runtime),
+                exports: None,
+                action_hooks_installed: false,
+            })
+        })
+    }
+
+    // Repeated cleanup branches must retain only a pointer to the shutdown future in their
+    // poll frame; each shutdown still owns the runtime and awaits its original bounded drain.
+    #[inline(never)]
+    fn shutdown_started_entry(
+        &self,
+        entry: MarketRuntimeEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send>> {
+        Box::pin(entry.shutdown(self.config.source_shutdown()))
     }
 
     pub(crate) async fn verify(
@@ -1628,38 +1951,90 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(MarketSourceRuntimeGeneration, MarketSourceLifecycleEvidence), ServiceError> {
-        let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
-        let previous = self
-            .stop_owned(provider, Some(expected_generation), deadline, cancellation)
-            .await?
-            .ok_or(ServiceError::Unavailable)?;
-        let current = self
-            .start_owned(provider, onboarding_session_id, deadline, cancellation)
+        let mut prepared = self
+            .prepare_public_before(provider, onboarding_session_id, deadline, cancellation)
             .await?;
-        let replaced = match (previous, current.generation) {
-            (
-                MarketSourceRuntimeGeneration::Scalar(previous),
-                MarketSourceRuntimeGeneration::Scalar(current),
-            ) => current.get() > previous.get(),
-            (
-                MarketSourceRuntimeGeneration::Group(previous),
-                MarketSourceRuntimeGeneration::Group(current),
-            ) => current != previous,
-            _ => false,
-        };
-        if !replaced {
-            let cleanup = CancellationToken::new();
-            let _stopped = self
-                .stop_owned(
+        if let Some(prepared) = prepared.as_mut() {
+            self.prepare_public_runtime(
+                prepared,
+                Some(expected_generation),
+                deadline,
+                cancellation,
+            )
+            .await?;
+        }
+        self.resynchronize_prepared(
+            provider,
+            expected_generation,
+            onboarding_session_id,
+            prepared,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn resynchronize_prepared(
+        &self,
+        provider: &SourceIdentifier,
+        expected_generation: MarketSourceRuntimeGeneration,
+        onboarding_session_id: Option<uuid::Uuid>,
+        prepared: Option<Box<PreparedPublicMarketStart>>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(MarketSourceRuntimeGeneration, MarketSourceLifecycleEvidence), ServiceError> {
+        let mut prepared = prepared;
+        let result = async {
+            let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
+            let previous = if let Some(prepared) = &prepared {
+                prepared
+                    .previous
+                    .filter(|previous| *previous == expected_generation)
+                    .ok_or(ServiceError::InvalidRequest)?
+            } else {
+                self.stop_owned(provider, Some(expected_generation), deadline, cancellation)
+                    .await?
+                    .ok_or(ServiceError::Unavailable)?
+            };
+            let current = self
+                .start_owned(
                     provider,
-                    Some(current.generation),
-                    self.cleanup_deadline()?,
-                    &cleanup,
+                    onboarding_session_id,
+                    prepared.take(),
+                    deadline,
+                    cancellation,
                 )
                 .await?;
-            return Err(ServiceError::Unavailable);
+            let replaced = match (previous, current.generation) {
+                (
+                    MarketSourceRuntimeGeneration::Scalar(previous),
+                    MarketSourceRuntimeGeneration::Scalar(current),
+                ) => current.get() > previous.get(),
+                (
+                    MarketSourceRuntimeGeneration::Group(previous),
+                    MarketSourceRuntimeGeneration::Group(current),
+                ) => current != previous,
+                _ => false,
+            };
+            if !replaced {
+                let cleanup = CancellationToken::new();
+                let _stopped = self
+                    .stop_owned(
+                        provider,
+                        Some(current.generation),
+                        self.cleanup_deadline()?,
+                        &cleanup,
+                    )
+                    .await?;
+                return Err(ServiceError::Unavailable);
+            }
+            Ok((previous, current))
         }
-        Ok((previous, current))
+        .await;
+        if let Some(prepared) = prepared {
+            self.discard_prepared_public(prepared).await?;
+        }
+        result
     }
 
     pub(crate) async fn remove(
@@ -2762,6 +3137,53 @@ struct MarketRuntimeEntry {
 }
 
 impl MarketRuntimeEntry {
+    /// A producer's startup signal admits work; only the published snapshot proves route readiness.
+    async fn wait_for_public_snapshots(
+        &mut self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let mut waiting_reported = false;
+        loop {
+            ensure_before(deadline, cancellation)?;
+            if !self.is_healthy() {
+                tracing::warn!(
+                    provider = self.surface_id.as_str(),
+                    "public runtime ended before complete snapshot publication"
+                );
+                return Err(ServiceError::Unavailable);
+            }
+            match aggregate(
+                self.surface_id.clone(),
+                self.topology()?,
+                self.scalar_snapshots()?,
+            ) {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) | Err(ServiceError::Unavailable) => {}
+                Err(error) => return Err(error),
+            }
+            if !waiting_reported {
+                tracing::debug!(
+                    provider = self.surface_id.as_str(),
+                    "public source admitted data before complete snapshot publication"
+                );
+                waiting_reported = true;
+            }
+            let MarketRuntime::Public(runtime) = &mut self.runtime else {
+                return Err(ServiceError::InvalidRequest);
+            };
+            tokio::select! { biased;
+                () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+                () = tokio::time::sleep_until(deadline.into()) => return Err(ServiceError::DeadlineExceeded),
+                hint = runtime.next_snapshot_notification() => {
+                    if hint.is_none() {
+                        return Err(ServiceError::Unavailable);
+                    }
+                }
+            }
+        }
+    }
+
     fn is_healthy(&self) -> bool {
         !self.cancellation.is_cancelled()
             && self.runtime.is_healthy()
@@ -3141,6 +3563,31 @@ impl fmt::Debug for MarketRuntime {
             .field("healthy", &self.is_healthy())
             .finish_non_exhaustive()
     }
+}
+
+async fn await_public_runtime_start<F>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    owned_cancellation: CancellationToken,
+    future: F,
+) -> Result<ProductionLiveSourceRuntime, ServiceError>
+where
+    F: Future<Output = Result<ProductionLiveSourceRuntime, ServiceError>>,
+{
+    tokio::pin!(future);
+    let cause = tokio::select! { biased;
+        () = cancellation.cancelled() => ServiceError::Cancelled,
+        () = tokio::time::sleep_until(deadline.into()) => ServiceError::DeadlineExceeded,
+        result = &mut future => return result,
+    };
+    owned_cancellation.cancel();
+    if let Ok(runtime) = future.await {
+        runtime.shutdown().await.map_err(|error| {
+            tracing::error!(%error, "cancelled public startup shutdown failed");
+            ServiceError::Unavailable
+        })?;
+    }
+    Err(cause)
 }
 
 async fn await_before<T, E, F>(

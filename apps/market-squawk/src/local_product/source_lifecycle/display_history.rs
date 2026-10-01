@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub(crate) struct StarterHistoryRequest {
     runtime: AlpacaHistoricalRuntimeCapability,
-    deadline: Instant,
 }
 
 pub(crate) type StarterHistorySender = watch::Sender<Option<StarterHistoryRequest>>;
@@ -38,7 +37,7 @@ impl ProductionSourceLifecycleAuthority {
             return Err(ServiceError::Unavailable);
         }
         self.display_history_requests
-            .send(Some(StarterHistoryRequest { runtime, deadline }))
+            .send(Some(StarterHistoryRequest { runtime }))
             .map_err(|_| ServiceError::Unavailable)
     }
 
@@ -71,12 +70,20 @@ impl ProductionSourceLifecycleAuthority {
             if shutdown.is_cancelled() {
                 return;
             }
-            if request.runtime.is_revoked() || Instant::now() >= request.deadline {
+            if request.runtime.is_revoked() {
                 continue;
             }
+            // Source activation admitted this work; its request has already completed. Start
+            // this owned recovery operation's lifetime here, once, without renewing it on
+            // duplicate notifications or while processing instruments.
+            let Some(deadline) = Instant::now().checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+            else {
+                record_history_outcome(Err(ServiceError::Internal));
+                continue;
+            };
             let cancellation = shutdown.child_token();
             let preparation =
-                self.prepare_display_history(&request.runtime, request.deadline, &cancellation);
+                self.prepare_display_history(&request.runtime, deadline, &cancellation);
             tokio::pin!(preparation);
             loop {
                 tokio::select! {

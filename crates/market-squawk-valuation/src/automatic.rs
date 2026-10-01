@@ -9,9 +9,9 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use market_squawk_data::{
-    AuthorizedResearchUse, CompanySecurityIdentityDisposition,
-    CompanySecurityIdentitySelectionReceipt, DatasetManifestRef, FinancialAmountBasis,
-    FinancialAmountRole, ResearchUse, ResearchUseDecisionDigest, ResearchUseGraphDigest,
+    CompanySecurityIdentityDisposition, CompanySecurityIdentitySelectionReceipt,
+    DatasetManifestRef, FinancialAmountBasis, FinancialAmountRole, MarketEventCommitRef,
+    MarketEventUseInput, ResearchUseDecisionDigest, ResearchUseGraphDigest,
 };
 use market_squawk_domain::{
     AccountId, Currency, DigestAlgorithm, EvidenceDigest, FundamentalCadence, FundamentalPeriod,
@@ -175,7 +175,7 @@ impl ValuationArithmeticPolicy {
 pub struct PointInTimeValuationInput {
     input: ValuationInput,
     selection_receipt: EvidenceDigest,
-    rights_graph: ResearchUseGraphDigest,
+    rights_input_digest: EvidenceDigest,
     knowledge_at: Timestamp,
     expires_at: Timestamp,
 }
@@ -185,7 +185,7 @@ impl PointInTimeValuationInput {
     pub fn try_new(
         input: ValuationInput,
         selection_receipt: EvidenceDigest,
-        rights_graph: ResearchUseGraphDigest,
+        rights_input_digest: EvidenceDigest,
         knowledge_at: Timestamp,
         expires_at: Timestamp,
     ) -> Result<Self, AutomaticValuationError> {
@@ -196,7 +196,8 @@ impl PointInTimeValuationInput {
         };
         let publication_ceiling =
             forecast_source.map_or(knowledge_at, |source| source.reference().selected_at());
-        if !valid_sha256(selection_receipt)
+        if !valid_sha256(rights_input_digest)
+            || !valid_sha256(selection_receipt)
             || evidence.verification() != EvidenceVerification::Verified
             || !evidence.producer_verification_is_current_at(knowledge_at)
             || evidence.available_at().is_none()
@@ -218,7 +219,7 @@ impl PointInTimeValuationInput {
         Ok(Self {
             input,
             selection_receipt,
-            rights_graph,
+            rights_input_digest,
             knowledge_at,
             expires_at,
         })
@@ -234,9 +235,9 @@ impl PointInTimeValuationInput {
         self.selection_receipt
     }
 
-    /// Returns the exact rights graph that admitted this selected input.
-    pub const fn rights_graph(&self) -> ResearchUseGraphDigest {
-        self.rights_graph
+    /// Returns the exact physical and logical rights inputs that admitted this selected input.
+    pub const fn rights_input_digest(&self) -> EvidenceDigest {
+        self.rights_input_digest
     }
 
     /// Returns the exact knowledge cutoff used by the selection.
@@ -367,52 +368,9 @@ impl AutomaticValuationUncertainty {
     }
 }
 
-/// Single-use local-analysis authority retained until calculation completes.
-#[derive(Debug)]
-pub struct ValuationRightsReceipt {
-    authorization: AuthorizedResearchUse,
-}
-
-impl ValuationRightsReceipt {
-    /// Retains the catalog-authenticated graph and its single-use calculation authority.
-    pub fn try_from_authorization(
-        authorization: AuthorizedResearchUse,
-    ) -> Result<Self, AutomaticValuationError> {
-        if authorization.research_use() != ResearchUse::LocalAnalysis {
-            return Err(AutomaticValuationError::Unavailable(
-                AutomaticValuationUnavailable::Rights,
-            ));
-        }
-        Ok(Self { authorization })
-    }
-
-    /// Returns the durable authorization decision identity.
-    pub const fn decision_digest(&self) -> ResearchUseDecisionDigest {
-        self.authorization.decision_digest()
-    }
-
-    /// Returns the exact transitive source graph identity.
-    pub const fn graph_digest(&self) -> ResearchUseGraphDigest {
-        self.authorization.graph().digest()
-    }
-
-    /// Returns exclusive permit expiry.
-    pub const fn expires_at(&self) -> Timestamp {
-        self.authorization.expires_at()
-    }
-
-    fn admits(&self, input: &ValuationInput) -> bool {
-        let manifests = automatic_input_manifests(input);
-        !manifests.is_empty()
-            && manifests.iter().all(|manifest| {
-                self.authorization
-                    .graph()
-                    .nodes()
-                    .iter()
-                    .any(|node| node.manifest() == manifest)
-            })
-    }
-}
+mod rights;
+pub use rights::{ValuationEventRightsAdmission, ValuationRightsReceipt};
+use rights::{combined_rights_input_digest, hash_event_admission};
 
 /// Common exact authority, identity, market, unit, and time coordinates.
 #[derive(Debug)]
@@ -856,6 +814,8 @@ pub struct AutomaticValuationMethodReceipt {
     peer_identities: Box<[CompanySecurityIdentitySelectionReceipt]>,
     rights_decision: ResearchUseDecisionDigest,
     rights_graph: ResearchUseGraphDigest,
+    rights_input_digest: EvidenceDigest,
+    admitted_event_inputs: Box<[ValuationEventRightsAdmission]>,
     rights_expires_at: Timestamp,
     admitted_input_manifests: Box<[DatasetManifestRef]>,
     current_market_input: InputId,
@@ -899,6 +859,10 @@ pub(crate) struct AutomaticValuationRecoveryInput {
     pub rights_decision: ResearchUseDecisionDigest,
     /// Original transitive source graph.
     pub rights_graph: ResearchUseGraphDigest,
+    /// Combined exact physical and logical input identity.
+    pub rights_input_digest: EvidenceDigest,
+    /// Original event-use admissions; recovery does not grant renewed use.
+    pub admitted_event_inputs: Box<[ValuationEventRightsAdmission]>,
     /// Original exclusive authorization expiry.
     pub rights_expires_at: Timestamp,
     /// Exact input manifests admitted against the authentic authorization graph.
@@ -953,6 +917,8 @@ impl AutomaticValuationMethodReceipt {
             peer_identities: input.peer_identities,
             rights_decision: input.rights_decision,
             rights_graph: input.rights_graph,
+            rights_input_digest: input.rights_input_digest,
+            admitted_event_inputs: input.admitted_event_inputs,
             rights_expires_at: input.rights_expires_at,
             admitted_input_manifests: input.admitted_input_manifests,
             current_market_input: input.current_market_input,
@@ -1003,6 +969,17 @@ impl AutomaticValuationMethodReceipt {
         total = crate::checked_add(total, size_of_val(&*self.admitted_input_manifests))?;
         for manifest in &self.admitted_input_manifests {
             total = crate::checked_add(total, crate::evidence::manifest_retained_bytes(manifest)?)?;
+        }
+        total = crate::checked_add(total, size_of_val(&*self.admitted_event_inputs))?;
+        for admission in &self.admitted_event_inputs {
+            total = crate::checked_add(
+                total,
+                crate::evidence::market_event_commit_retained_bytes(&admission.commit)?,
+            )?;
+            total = crate::checked_add(total, size_of_val(&*admission.inputs))?;
+            for input in &admission.inputs {
+                total = crate::checked_add(total, input.source_id().as_str().len())?;
+            }
         }
         total = crate::checked_add(total, size_of_val(&*self.inputs))?;
         for input in &self.inputs {
@@ -1073,6 +1050,14 @@ impl AutomaticValuationMethodReceipt {
     /// Returns the authorized exact transitive graph identity.
     pub const fn rights_graph(&self) -> ResearchUseGraphDigest {
         self.rights_graph
+    }
+    /// Returns the combined exact physical and logical rights input identity.
+    pub const fn rights_input_digest(&self) -> EvidenceDigest {
+        self.rights_input_digest
+    }
+    /// Returns exact original event admissions, requiring fresh grants for subsequent use.
+    pub fn admitted_event_inputs(&self) -> &[ValuationEventRightsAdmission] {
+        &self.admitted_event_inputs
     }
     /// Returns the original exclusive research authorization lifetime.
     pub const fn rights_expires_at(&self) -> Timestamp {
@@ -2021,6 +2006,7 @@ fn finish(
 
     let rights_decision = request.common.rights.decision_digest();
     let rights_graph = request.common.rights.graph_digest();
+    let rights_input_digest = request.common.rights.rights_input_digest();
     let rights_expires_at = request.common.rights.expires_at();
     if request
         .inputs
@@ -2054,6 +2040,8 @@ fn finish(
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
+    let admitted_event_inputs = request.common.rights.event_admissions;
+    let _consumed_event_authorities = request.common.rights.event_authorizations;
     let _consumed_single_use_permit = request.common.rights.authorization.into_permit();
 
     let mut receipt = AutomaticValuationMethodReceipt {
@@ -2067,6 +2055,8 @@ fn finish(
         peer_identities: request.peer_identities.into_boxed_slice(),
         rights_decision,
         rights_graph,
+        rights_input_digest,
+        admitted_event_inputs,
         rights_expires_at,
         admitted_input_manifests,
         current_market_input,
@@ -2108,6 +2098,11 @@ fn receipt_identity(
     hash.fixed(receipt.company_security.receipt_digest().bytes());
     hash.fixed(receipt.rights_decision.bytes());
     hash.fixed(receipt.rights_graph.bytes());
+    hash.fixed(receipt.rights_input_digest.bytes());
+    hash.u64(receipt.admitted_event_inputs.len() as u64);
+    for admission in &receipt.admitted_event_inputs {
+        hash_event_admission(&mut hash, admission);
+    }
     hash.i64(receipt.rights_expires_at.unix_nanos());
     hash.u64(
         u64::try_from(receipt.admitted_input_manifests.len())
@@ -2290,6 +2285,18 @@ fn verify_recovered_receipt(
         || receipt.rights_expires_at < receipt.expires_at
         || receipt.rights_decision.bytes() == [0; 32]
         || receipt.rights_graph.bytes() == [0; 32]
+        || receipt.admitted_event_inputs.is_empty()
+        || receipt.admitted_event_inputs.len() > MAX_METHOD_INPUTS
+        || receipt.rights_input_digest
+            != combined_rights_input_digest(receipt.rights_graph, &receipt.admitted_event_inputs)
+        || receipt
+            .admitted_event_inputs
+            .windows(2)
+            .any(|pair| pair[0].rights_input_digest.bytes() >= pair[1].rights_input_digest.bytes())
+        || receipt.admitted_event_inputs.iter().any(|admission| {
+            admission.evaluated_at > receipt.calculated_at
+                || admission.expires_at < receipt.rights_expires_at
+        })
         || receipt
             .inputs
             .windows(2)
@@ -2309,6 +2316,7 @@ fn verify_recovered_receipt(
             AutomaticValuationConflict::Evidence,
         ));
     }
+    verify_event_admission_coverage(&receipt.inputs, &receipt.admitted_event_inputs)?;
     validate_company_security(
         &receipt.company_security,
         receipt.instrument_id,
@@ -2344,7 +2352,7 @@ fn verify_recovered_receipt(
         };
         if selected.knowledge_at() != expected_cutoff
             || selected.expires_at() < receipt.expires_at
-            || selected.rights_graph() != receipt.rights_graph
+            || selected.rights_input_digest() != receipt.rights_input_digest
             || !derived_input_completed_by(input, receipt.calculated_at)
             || !input
                 .evidence()
@@ -2918,7 +2926,7 @@ fn validate_common(common: &AutomaticValuationInput) -> Result<(), AutomaticValu
     if market.knowledge_at() < common.measurement_at
         || market.knowledge_at() > common.calculated_at
         || market.expires_at() < common.expires_at
-        || market.rights_graph() != common.rights.graph_digest()
+        || market.rights_input_digest() != common.rights.rights_input_digest()
         || input.subject_instrument_id() != common.instrument_id
         || input.reference_instrument_id() != common.instrument_id
         || input.relationship() != InputInstrumentRelation::Identical
@@ -2960,13 +2968,106 @@ fn is_published_market_input(selected: &PointInTimeValuationInput) -> bool {
         == Some((selected.selection_receipt(), selected.knowledge_at()))
 }
 
-fn automatic_input_manifests(input: &ValuationInput) -> &[DatasetManifestRef] {
+fn automatic_event_input(
+    input: &ValuationInput,
+) -> Option<(&MarketEventCommitRef, EvidenceDigest, u32, EvidenceDigest)> {
     match input.evidence().origin() {
         EvidenceOrigin::Market {
             publication: Some(publication),
             ..
-        } => std::slice::from_ref(publication.manifest()),
-        EvidenceOrigin::PublishedMarket { evidence } => std::slice::from_ref(evidence.manifest()),
+        } => Some((
+            &publication.commit,
+            publication.publication_digest,
+            publication.publication_row,
+            publication.canonical_event_digest,
+        )),
+        EvidenceOrigin::PublishedMarket { evidence } => Some((
+            &evidence.commit,
+            evidence.publication_digest,
+            evidence.publication_row,
+            evidence.canonical_event_digest,
+        )),
+        _ => None,
+    }
+}
+
+fn matches_event_input(
+    input: &ValuationInput,
+    admission: &ValuationEventRightsAdmission,
+    event: &MarketEventUseInput,
+) -> bool {
+    let Some((commit, publication, row, canonical_digest)) = automatic_event_input(input) else {
+        return false;
+    };
+    let (origin, coordinate) = match input.evidence().origin() {
+        EvidenceOrigin::Market {
+            publication: Some(publication),
+            ..
+        } => (
+            publication.origin_committed_at,
+            Some(publication.coordinate_digest),
+        ),
+        EvidenceOrigin::PublishedMarket { evidence } => (evidence.origin_committed_at, None),
+        _ => return false,
+    };
+    admission.commit() == commit
+        && event.publication_digest() == publication
+        && event.row_ordinal() == row
+        && event.canonical_event_digest() == canonical_digest
+        && event.source_id() == input.evidence().source_id()
+        && event.origin_committed_at() == origin
+        && coordinate.is_none_or(|value| value == event.coordinate_digest())
+}
+
+fn verify_event_admission_coverage(
+    inputs: &[PointInTimeValuationInput],
+    admissions: &[ValuationEventRightsAdmission],
+) -> Result<(), AutomaticValuationError> {
+    let input_count = admissions
+        .iter()
+        .try_fold(0usize, |count, admission| {
+            count.checked_add(admission.inputs().len())
+        })
+        .ok_or(AutomaticValuationError::InvalidContract)?;
+    if input_count > MAX_METHOD_INPUTS {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    for input in inputs {
+        if automatic_event_input(input.input()).is_some()
+            && !admissions.iter().any(|admission| {
+                admission
+                    .inputs()
+                    .iter()
+                    .any(|event| matches_event_input(input.input(), admission, event))
+            })
+        {
+            return Err(AutomaticValuationError::Unavailable(
+                AutomaticValuationUnavailable::Rights,
+            ));
+        }
+    }
+    for admission in admissions {
+        for event in admission.inputs() {
+            if !inputs
+                .iter()
+                .any(|input| matches_event_input(input.input(), admission, event))
+            {
+                return Err(AutomaticValuationError::Conflict(
+                    AutomaticValuationConflict::Evidence,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn automatic_input_manifests(input: &ValuationInput) -> &[DatasetManifestRef] {
+    match input.evidence().origin() {
+        EvidenceOrigin::Market {
+            publication: Some(_),
+            ..
+        }
+        | EvidenceOrigin::PublishedMarket { .. } => &[],
         EvidenceOrigin::Research { manifest, .. }
         | EvidenceOrigin::Analytics { manifest, .. }
         | EvidenceOrigin::Fundamental { manifest, .. } => std::slice::from_ref(manifest),
@@ -2994,7 +3095,7 @@ fn exact_input_manifests<'a>(
         .map_err(|_| AutomaticValuationError::Arithmetic)?;
     for input in inputs {
         let source_manifests = automatic_input_manifests(input.input());
-        if source_manifests.is_empty() {
+        if source_manifests.is_empty() && automatic_event_input(input.input()).is_none() {
             return Err(AutomaticValuationError::Unavailable(
                 AutomaticValuationUnavailable::Rights,
             ));
@@ -3131,7 +3232,8 @@ fn validate_method_input(
             AutomaticValuationUnavailable::MethodInput,
         ));
     }
-    if value.rights_graph() != common.rights.graph_digest() || !common.rights.admits(value.input())
+    if value.rights_input_digest() != common.rights.rights_input_digest()
+        || !common.rights.admits(value.input())
     {
         return Err(AutomaticValuationError::Unavailable(
             AutomaticValuationUnavailable::Rights,
@@ -3439,7 +3541,7 @@ fn input_set_identity(
         hash.fixed(value.input().id().bytes());
         hash.fixed(value.input().evidence().hash().bytes());
         hash.fixed(value.selection_receipt().bytes());
-        hash.fixed(value.rights_graph().bytes());
+        hash.fixed(value.rights_input_digest().bytes());
         hash.i64(value.knowledge_at().unix_nanos());
         hash.i64(value.expires_at().unix_nanos());
     }

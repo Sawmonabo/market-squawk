@@ -146,6 +146,11 @@ impl LiveRuntimeComposition {
         self.runtime.try_next_snapshot_notification()
     }
 
+    /// Waits for an existing shard snapshot-change hint without polling or consuming on cancellation.
+    pub async fn next_snapshot_notification(&mut self) -> Option<ShardId> {
+        self.runtime.next_snapshot_notification().await
+    }
+
     /// Transfers one complete route-hook group into the running actors while it remains disabled.
     pub async fn prepare_action_hooks(
         &mut self,

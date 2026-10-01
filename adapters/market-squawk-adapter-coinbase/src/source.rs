@@ -1,6 +1,10 @@
 //! One-generation Coinbase transport implementation.
 
-use std::{future::Future, time::Instant};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
@@ -121,11 +125,14 @@ impl CoinbaseExchangeSource {
         let permit = Self::commit_budget(reservation)?;
         let connect =
             connect_async_with_config(self.config.endpoint(), Some(websocket_config), true);
-        let (socket, _response) =
-            await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
-                map_connect_error(error, &self.budget)
-            })
-            .await?;
+        let (socket, _response) = await_websocket(
+            "connect",
+            &cancellation,
+            limits.connect_timeout(),
+            connect,
+            |error| map_connect_error(error, &self.budget),
+        )
+        .await?;
         self.run_socket(socket, permit, sink, cancellation).await
     }
 
@@ -243,6 +250,7 @@ impl LiveMarketSource for CoinbaseExchangeSource {
 }
 
 async fn await_websocket<T, E, F>(
+    stage: &'static str,
     cancellation: &CancellationToken,
     deadline: std::time::Duration,
     operation: impl Future<Output = Result<T, E>>,
@@ -256,8 +264,15 @@ where
         () = cancellation.cancelled() => Err(SourceError::Cancelled),
         result = tokio::time::timeout(deadline, operation) => match result {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(map_error(error)),
-            Err(_) => Err(SourceError::Network),
+            Ok(Err(error)) => {
+                let classified = map_error(error);
+                tracing::warn!(stage, error = %classified, "Coinbase transport operation failed");
+                Err(classified)
+            }
+            Err(_) => {
+                tracing::warn!(stage, "Coinbase transport deadline elapsed");
+                Err(SourceError::Network)
+            }
         }
     }
 }
@@ -271,9 +286,13 @@ async fn send_with_deadline<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    await_websocket(cancellation, deadline, socket.send(message), |_error| {
-        SourceError::Network
-    })
+    await_websocket(
+        "send",
+        cancellation,
+        deadline,
+        socket.send(message),
+        |_error| SourceError::Network,
+    )
     .await
 }
 
@@ -285,7 +304,7 @@ async fn flush_with_deadline<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    await_websocket(cancellation, deadline, socket.flush(), |_| {
+    await_websocket("flush", cancellation, deadline, socket.flush(), |_| {
         SourceError::Network
     })
     .await
@@ -302,6 +321,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let deadline = ReceiveDeadline::strictest(sink, transport_timeout)?;
+    let admitted = AtomicBool::new(false);
     let next = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Err(SourceError::Cancelled),
@@ -310,9 +330,17 @@ where
                 sink.poll_deadline(Instant::now())?;
                 return Err(SourceError::InvalidProtocolState);
             }
+            tracing::warn!(
+                stage = if admitted.load(Ordering::Relaxed) { "receive" } else { "publication_admission" },
+                "Coinbase receive deadline elapsed"
+            );
             return Err(SourceError::Network);
         }
-        result = socket.next() => result,
+        result = async {
+            sink.wait_for_capacity().await?;
+            admitted.store(true, Ordering::Relaxed);
+            Ok::<_, market_squawk_sources::SinkError>(socket.next().await)
+        } => result?,
     };
     match next {
         Some(Ok(message)) => Ok(message),
@@ -321,7 +349,10 @@ where
                 max: maximum_frame_bytes,
             })
         }
-        Some(Err(_error)) => Err(SourceError::Network),
+        Some(Err(_error)) => {
+            tracing::warn!(stage = "receive", "Coinbase websocket read failed");
+            Err(SourceError::Network)
+        }
         None => Err(SourceError::ProviderUnavailable),
     }
 }

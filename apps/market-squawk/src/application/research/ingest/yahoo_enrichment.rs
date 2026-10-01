@@ -19,13 +19,14 @@ use market_squawk_adapter_yahoo::{
 use market_squawk_data::{
     AnalyticalMarketBarOutput, AnalyticalMarketBarReadRequest, AnalyticalReadError,
     CommittedDataset, DatasetId, DatasetManifestRef, IngestError, IngestIdentity,
-    IngestPrecommitAuthority, OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
-    PersistedProviderCaptureBindingEvidence, PersistedProviderOptionMarketBindingEvidence,
-    PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
-    ProviderOptionMarketArrowBatch, ProviderOptionMarketPublicationSelector, QueryLimits,
-    RightsError, SourceOperation, extraction_provider_payload_digest,
-    provider_market_event_publication_digest, provider_option_market_publication_digest,
+    IngestPrecommitAuthority, MarketEventCommitRef, OptionMarketPointInTimeRequest,
+    OptionMarketPointInTimeSelection, PersistedProviderCaptureBindingEvidence,
+    PersistedProviderOptionMarketBindingEvidence, PersistedProviderPublicationEvidence,
+    ProviderMarketEventArrowBatch, ProviderMarketEventPublicationKind,
+    ProviderMarketEventPublicationSelector, ProviderOptionMarketArrowBatch,
+    ProviderOptionMarketPublicationSelector, QueryLimits, RightsError, SourceOperation,
+    extraction_provider_payload_digest, provider_market_event_publication_digest,
+    provider_option_market_publication_digest,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
@@ -349,7 +350,7 @@ impl YahooEnrichmentPublicationClosure {
                     .await?;
                 Ok(YahooQuoteApplicationOutcome::Published(
                     YahooQuotePublicationReceipt {
-                        committed: prepared.committed,
+                        commit: prepared.commit,
                         restart: prepared.restart,
                         sealed_receipt_digest: prepared.sealed_receipt_digest,
                         provider_dataset: prepared.provider_dataset,
@@ -508,12 +509,12 @@ impl YahooEnrichmentPublicationClosure {
             .await?;
         Ok(YahooPreparedMarketEventPublication {
             restart: YahooMarketEventRestartSelector {
-                manifest: committed.manifest().clone(),
+                commit: committed.clone(),
                 publication_digest,
                 source_id: self.source.source_id().clone(),
                 expected_event_count: event_count,
             },
-            committed,
+            commit: committed,
             sealed_receipt_digest,
             provider_dataset,
             event_count,
@@ -587,7 +588,7 @@ impl YahooEnrichmentPublicationClosure {
 
 #[derive(Debug)]
 struct YahooPreparedMarketEventPublication {
-    committed: CommittedDataset,
+    commit: MarketEventCommitRef,
     restart: YahooMarketEventRestartSelector,
     sealed_receipt_digest: EvidenceDigest,
     provider_dataset: SourceIdentifier,
@@ -724,7 +725,7 @@ pub(crate) enum YahooQuoteApplicationOutcome {
 
 #[derive(Debug)]
 pub(crate) struct YahooQuotePublicationReceipt {
-    committed: CommittedDataset,
+    commit: MarketEventCommitRef,
     restart: YahooMarketEventRestartSelector,
     sealed_receipt_digest: EvidenceDigest,
     provider_dataset: SourceIdentifier,
@@ -733,8 +734,8 @@ pub(crate) struct YahooQuotePublicationReceipt {
 }
 
 impl YahooQuotePublicationReceipt {
-    pub(crate) const fn committed(&self) -> &CommittedDataset {
-        &self.committed
+    pub(crate) const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub(crate) const fn restart_selector(&self) -> &YahooMarketEventRestartSelector {
@@ -868,18 +869,18 @@ impl YahooHistoricalRestartReceipt {
     }
 }
 
-/// Exact immutable quote generation and kind-qualified response selector.
+/// Exact quote commit and kind-qualified response selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct YahooMarketEventRestartSelector {
-    manifest: DatasetManifestRef,
+    commit: MarketEventCommitRef,
     publication_digest: EvidenceDigest,
     source_id: SourceId,
     expected_event_count: usize,
 }
 
 impl YahooMarketEventRestartSelector {
-    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    pub(crate) const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 
     pub(crate) const fn publication_digest(&self) -> EvidenceDigest {
@@ -892,11 +893,14 @@ impl YahooMarketEventRestartSelector {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<YahooMarketEventRestartReceipt, YahooEnrichmentPublicationError> {
-        if !research.analytical().has_provider_publication(
-            &self.manifest,
-            self.publication_digest,
-            ProviderMarketEventPublicationKind::ResponseMarketEvent.as_str(),
-        )? {
+        if !research
+            .analytical()
+            .has_provider_market_event_publication(
+                &self.commit,
+                self.publication_digest,
+                ProviderMarketEventPublicationKind::ResponseMarketEvent,
+            )?
+        {
             return Err(YahooEnrichmentPublicationError::RestartInvalid);
         }
         let selector = ProviderMarketEventPublicationSelector::new(
@@ -906,7 +910,7 @@ impl YahooMarketEventRestartSelector {
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()
-            .provider_market_event_publication_evidence(&self.manifest, selector, store.as_ref())?;
+            .provider_market_event_publication_evidence(&self.commit, selector, store.as_ref())?;
         let PersistedProviderPublicationEvidence::ResponseMarketEvent(response) = &evidence else {
             return Err(YahooEnrichmentPublicationError::RestartInvalid);
         };
@@ -919,7 +923,7 @@ impl YahooMarketEventRestartSelector {
         let events = research
             .analytical()
             .read_provider_market_event_publication(
-                &self.manifest,
+                &self.commit,
                 selector,
                 store,
                 deadline,
@@ -1140,7 +1144,7 @@ impl ProductionResearchIngestCoordinator {
                 receipt,
             )) => {
                 let YahooQuotePublicationReceipt {
-                    committed: _,
+                    commit: _,
                     restart,
                     sealed_receipt_digest: _,
                     provider_dataset,
@@ -1149,7 +1153,7 @@ impl ProductionResearchIngestCoordinator {
                 } = receipt;
                 YahooPublicationSummary::Published {
                     restart: YahooRestartCoordinates::Quotes {
-                        manifest: restart.manifest,
+                        commit: restart.commit,
                         publication_digest: restart.publication_digest,
                         source_id: restart.source_id,
                         expected_event_count: restart.expected_event_count,
@@ -1252,7 +1256,7 @@ impl ProductionResearchIngestCoordinator {
             }
             (
                 YahooRestartCoordinates::Quotes {
-                    manifest,
+                    commit,
                     publication_digest,
                     source_id,
                     expected_event_count,
@@ -1260,7 +1264,7 @@ impl ProductionResearchIngestCoordinator {
                 YahooRestartRequest::Quotes { deadline },
             ) => {
                 let receipt = YahooMarketEventRestartSelector {
-                    manifest,
+                    commit,
                     publication_digest,
                     source_id,
                     expected_event_count,

@@ -3430,7 +3430,7 @@ mod tests {
         let market = json!({
             "instrumentId": instrument, "sourceCutoffUnixNanos": now,
             "maximumMarkAgeNanos": "1000000000", "evidenceDigest": digest,
-            "sourceSelectionDigest": digest, "rightsGraphDigest": digest,
+            "sourceSelectionDigest": digest, "rightsInputDigest": digest,
             "publicationSelectionDigest": digest, "definitionSelectionDigest": digest,
             "priceAuthorityDigest": digest, "sourceScopeDigests": null
         });

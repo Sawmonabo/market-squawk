@@ -10,7 +10,7 @@ use std::{io, mem::size_of};
 
 use market_squawk_analytics::FeatureKey;
 use market_squawk_data::{
-    CompanySecurityIdentityDisposition, DatasetManifestRef,
+    CompanySecurityIdentityDisposition, DatasetManifestRef, MarketEventCommitRef,
     ProviderMarketEventPointInTimeSelection, SecResearchDisposition, SecResearchIdentityOutcome,
     SecResearchIdentitySelection,
 };
@@ -49,7 +49,7 @@ pub enum EvidenceVerification {
 pub struct MarketValuationPublication {
     pub(crate) qualified_input_id: crate::InputId,
     pub(crate) qualified_amount: ValuationAmount,
-    pub(crate) manifest: DatasetManifestRef,
+    pub(crate) commit: MarketEventCommitRef,
     pub(crate) selection_digest: EvidenceDigest,
     pub(crate) publication_digest: EvidenceDigest,
     pub(crate) publication_row: u32,
@@ -57,14 +57,14 @@ pub struct MarketValuationPublication {
     pub(crate) canonical_event_digest: EvidenceDigest,
     pub(crate) canonical_event: Box<str>,
     pub(crate) knowledge_at: Timestamp,
-    pub(crate) manifest_published_at: Timestamp,
-    pub(crate) origin_published_at: Timestamp,
+    pub(crate) commit_available_at: Timestamp,
+    pub(crate) origin_committed_at: Timestamp,
 }
 
 impl MarketValuationPublication {
-    /// Returns the exact catalog generation containing the selected event.
-    pub const fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    /// Returns the exact logical catalog horizon containing the selected event.
+    pub const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
     /// Returns the complete source-qualified PIT selection identity.
     pub const fn selection_digest(&self) -> EvidenceDigest {
@@ -94,7 +94,7 @@ enum PublishedMarketPriceAuthority {
 /// Archived source price and the exact catalog authority that establishes its financial meaning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedMarketValuationEvidence {
-    pub(crate) manifest: DatasetManifestRef,
+    pub(crate) commit: MarketEventCommitRef,
     pub(crate) selection_digest: EvidenceDigest,
     pub(crate) publication_digest: EvidenceDigest,
     pub(crate) publication_row: u32,
@@ -104,14 +104,14 @@ pub struct PublishedMarketValuationEvidence {
     pub(crate) definition_content: EvidenceDigest,
     pub(crate) definition_audit: EvidenceDigest,
     pub(crate) knowledge_at: Timestamp,
-    pub(crate) manifest_published_at: Timestamp,
-    pub(crate) origin_published_at: Timestamp,
+    pub(crate) commit_available_at: Timestamp,
+    pub(crate) origin_committed_at: Timestamp,
 }
 
 impl PublishedMarketValuationEvidence {
-    /// Returns the exact price's catalog generation and rights parent.
-    pub const fn manifest(&self) -> &DatasetManifestRef {
-        &self.manifest
+    /// Returns the exact price's logical catalog horizon and event-rights parent.
+    pub const fn commit(&self) -> &MarketEventCommitRef {
+        &self.commit
     }
 }
 
@@ -253,7 +253,7 @@ impl EvidenceOrigin {
                     hash.u8(1);
                     hash.fixed(value.qualified_input_id.bytes());
                     value.qualified_amount.hash_into(hash);
-                    hash_manifest(hash, &value.manifest);
+                    hash_market_event_commit(hash, &value.commit);
                     for digest in [
                         value.selection_digest,
                         value.publication_digest,
@@ -265,8 +265,8 @@ impl EvidenceOrigin {
                     hash.u32(value.publication_row);
                     hash.bytes(value.canonical_event.as_bytes());
                     hash.i64(value.knowledge_at.unix_nanos());
-                    hash.i64(value.manifest_published_at.unix_nanos());
-                    hash.i64(value.origin_published_at.unix_nanos());
+                    hash.i64(value.commit_available_at.unix_nanos());
+                    hash.i64(value.origin_committed_at.unix_nanos());
                 }
             }
             Self::Research {
@@ -355,7 +355,7 @@ impl EvidenceOrigin {
             }
             Self::PublishedMarket { evidence } => {
                 hash.u8(7);
-                hash_manifest(hash, &evidence.manifest);
+                hash_market_event_commit(hash, &evidence.commit);
                 for digest in [
                     evidence.selection_digest,
                     evidence.publication_digest,
@@ -369,8 +369,8 @@ impl EvidenceOrigin {
                 hash.bytes(evidence.canonical_event.as_bytes());
                 hash.bytes(evidence.canonical_price_authority.as_bytes());
                 hash.i64(evidence.knowledge_at.unix_nanos());
-                hash.i64(evidence.manifest_published_at.unix_nanos());
-                hash.i64(evidence.origin_published_at.unix_nanos());
+                hash.i64(evidence.commit_available_at.unix_nanos());
+                hash.i64(evidence.origin_committed_at.unix_nanos());
             }
             Self::ForecastDistribution { evidence } => {
                 hash.u8(8);
@@ -395,7 +395,7 @@ impl EvidenceOrigin {
                         checked_add(
                             size_of::<MarketValuationPublication>(),
                             checked_add(
-                                manifest_retained_bytes(&value.manifest)?,
+                                market_event_commit_retained_bytes(&value.commit)?,
                                 value.canonical_event.len(),
                             )?,
                         )?,
@@ -426,7 +426,7 @@ impl EvidenceOrigin {
             Self::PublishedMarket { evidence } => checked_add(
                 size_of::<PublishedMarketValuationEvidence>(),
                 checked_add(
-                    manifest_retained_bytes(&evidence.manifest)?,
+                    market_event_commit_retained_bytes(&evidence.commit)?,
                     checked_add(
                         evidence.canonical_event.len(),
                         evidence.canonical_price_authority.len(),
@@ -977,7 +977,7 @@ impl ValuationInput {
             _ => return Err(FairValueError::InvalidProducerEvidence),
         };
         let published = PublishedMarketValuationEvidence {
-            manifest: selected.manifest().clone(),
+            commit: selected.commit().clone(),
             selection_digest: selected.selection_digest(),
             publication_digest: candidate.coordinate().publication().digest(),
             publication_row: candidate.coordinate().publication_row_ordinal(),
@@ -987,8 +987,8 @@ impl ValuationInput {
             definition_content,
             definition_audit,
             knowledge_at,
-            manifest_published_at: selected.manifest_published_at(),
-            origin_published_at: candidate.coordinate().origin_generation_published_at(),
+            commit_available_at: selected.commit_available_at(),
+            origin_committed_at: candidate.coordinate().origin_committed_at(),
         };
         let (amount, quality) = published_market_amount(candidate.event(), &published)?;
         let evidence = FairValueEvidence::try_from_parts(FairValueEvidenceParts {
@@ -1059,7 +1059,7 @@ impl ValuationInput {
         *publication = Some(Box::new(MarketValuationPublication {
             qualified_input_id: self.id(),
             qualified_amount: self.amount(),
-            manifest: selected.manifest().clone(),
+            commit: selected.commit().clone(),
             selection_digest: selected.selection_digest(),
             publication_digest: coordinate.publication().digest(),
             publication_row: coordinate.publication_row_ordinal(),
@@ -1067,8 +1067,8 @@ impl ValuationInput {
             canonical_event_digest: coordinate.canonical_event_digest(),
             canonical_event,
             knowledge_at: selected.request().knowledge_cutoff(),
-            manifest_published_at: selected.manifest_published_at(),
-            origin_published_at: coordinate.origin_generation_published_at(),
+            commit_available_at: selected.commit_available_at(),
+            origin_committed_at: coordinate.origin_committed_at(),
         }));
         let evidence = FairValueEvidence::try_from_parts(evidence.parts_with_origin(origin))?;
         Self::try_from_spec(self.spec_with_evidence(evidence))
@@ -1272,7 +1272,7 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
             }
         }
         EvidenceOrigin::PublishedMarket { evidence } => {
-            if evidence.manifest.content_hash().bytes() == [0; 32]
+            if evidence.commit.content_hash().bytes() == [0; 32]
                 || [
                     evidence.selection_digest,
                     evidence.publication_digest,
@@ -1286,8 +1286,10 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
                 })
                 || evidence.canonical_event_digest.bytes()
                     != <[u8; 32]>::from(Sha256::digest(evidence.canonical_event.as_bytes()))
-                || evidence.manifest_published_at > evidence.knowledge_at
-                || evidence.origin_published_at > evidence.knowledge_at
+                || evidence.commit_available_at != evidence.commit.available_at()
+                || evidence.origin_committed_at > evidence.commit_available_at
+                || evidence.commit_available_at > evidence.knowledge_at
+                || evidence.origin_committed_at > evidence.knowledge_at
                 || parts.ingested_at > evidence.knowledge_at
                 || parts
                     .available_at
@@ -1325,7 +1327,7 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
         } => {
             if value.canonical_event.is_empty()
                 || value.canonical_event.len() > MAXIMUM_FUNDAMENTAL_EVIDENCE_BYTES
-                || value.manifest.content_hash().bytes() == [0; 32]
+                || value.commit.content_hash().bytes() == [0; 32]
                 || [
                     value.selection_digest,
                     value.publication_digest,
@@ -1338,8 +1340,10 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
                 })
                 || value.canonical_event_digest.bytes()
                     != <[u8; 32]>::from(Sha256::digest(value.canonical_event.as_bytes()))
-                || value.manifest_published_at > value.knowledge_at
-                || value.origin_published_at > value.knowledge_at
+                || value.commit_available_at != value.commit.available_at()
+                || value.origin_committed_at > value.commit_available_at
+                || value.commit_available_at > value.knowledge_at
+                || value.origin_committed_at > value.knowledge_at
                 || parts.ingested_at > value.knowledge_at
                 || parts
                     .available_at
@@ -1701,5 +1705,28 @@ pub(crate) fn manifest_retained_bytes(
     checked_add(
         manifest.dataset_id().as_str().len(),
         manifest.schema().name().len(),
+    )
+}
+
+/// Hashes logical event identity without incorporating hot/archive placement.
+pub(crate) fn hash_market_event_commit(hash: &mut CanonicalHasher, commit: &MarketEventCommitRef) {
+    hash.bytes(b"market-squawk/market-event-commit/v1");
+    hash.bytes(commit.dataset_id().as_str().as_bytes());
+    hash.u64(commit.sequence());
+    hash.bytes(commit.schema().name().as_bytes());
+    hash.u32(u32::from(commit.schema().version().get()));
+    hash.fixed(commit.schema().fingerprint());
+    hash.fixed(commit.content_hash().bytes());
+    hash.i64(commit.available_at().unix_nanos());
+    hash_digest(hash, commit.publication_digest());
+    hash.u64(commit.row_count());
+}
+
+pub(crate) fn market_event_commit_retained_bytes(
+    commit: &MarketEventCommitRef,
+) -> Result<usize, FairValueError> {
+    checked_add(
+        commit.dataset_id().as_str().len(),
+        commit.schema().name().len(),
     )
 }

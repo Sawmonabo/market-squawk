@@ -17,9 +17,9 @@ use market_squawk_adapter_yahoo::{
 };
 use market_squawk_data::{
     AnalyticalMarketBarOutput, AnalyticalMarketBarReadRequest, DatasetId, DatasetManifestRef,
-    PersistedProviderCaptureBindingEvidence, PersistedProviderOptionMarketBindingEvidence,
-    PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderOptionMarketArrowBatch, QueryLimits,
+    MarketEventCommitRef, PersistedProviderCaptureBindingEvidence,
+    PersistedProviderOptionMarketBindingEvidence, PersistedProviderPublicationEvidence,
+    ProviderMarketEventArrowBatch, ProviderOptionMarketArrowBatch, QueryLimits,
 };
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_sources::OptionMarketBatchKind;
@@ -402,7 +402,7 @@ pub(crate) enum YahooRestartCoordinates {
         expected_record_count: usize,
     },
     Quotes {
-        manifest: DatasetManifestRef,
+        commit: MarketEventCommitRef,
         publication_digest: EvidenceDigest,
         source_id: market_squawk_domain::SourceId,
         expected_event_count: usize,
@@ -414,16 +414,6 @@ pub(crate) enum YahooRestartCoordinates {
         source_id: market_squawk_domain::SourceId,
         expected_option_row_count: usize,
     },
-}
-
-impl YahooRestartCoordinates {
-    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        match self {
-            Self::Historical { manifest, .. }
-            | Self::Quotes { manifest, .. }
-            | Self::Options { manifest, .. } => manifest,
-        }
-    }
 }
 
 #[derive(Debug)]

@@ -113,7 +113,6 @@ impl AlpacaMarketPublicationClosure {
         idempotency_key: impl Into<String>,
         observed_at: Timestamp,
         precommit_authority: Arc<dyn IngestPrecommitAuthority>,
-        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<MarketEventPublicationReceipt, AlpacaMarketPublicationError> {
         self.validate_current_authority(observed_at)?;
@@ -121,34 +120,6 @@ impl AlpacaMarketPublicationClosure {
         let prepared = self.validate_market_binding(&binding, observed_at)?;
         let publication_digest = provider_market_event_publication_digest(&binding)?;
         require_digest(publication_digest)?;
-        if let Some(compaction) = self
-            .research
-            .analytical()
-            .market_event_compaction_request(&analytical_dataset, 1)?
-        {
-            let digest = compaction.payload_digest();
-            let key = format!(
-                "market-compaction-{}",
-                digest
-                    .bytes()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let reservation = self
-                .reserve(digest, key, observed_at, &cancellation)
-                .await?;
-            self.research
-                .analytical()
-                .compact_provider_market_events(
-                    reservation,
-                    compaction,
-                    deadline,
-                    cancellation.clone(),
-                    Arc::clone(&precommit_authority),
-                )
-                .await?;
-        }
         let reservation = self
             .reserve(
                 publication_digest,
@@ -169,7 +140,7 @@ impl AlpacaMarketPublicationClosure {
             )
             .await?;
         MarketEventPublicationReceipt::try_new(
-            committed.manifest().clone(),
+            committed,
             publication_digest,
             prepared.kind,
             prepared.implementation,
@@ -1129,7 +1100,6 @@ impl AlpacaPublicationRuntimeInput {
                 idempotency,
                 observed_at,
                 precommit,
-                deadline,
                 operation.cancellation().clone(),
             )
             .await?;

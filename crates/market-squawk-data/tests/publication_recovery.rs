@@ -1724,7 +1724,8 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
             cancellation,
         )
         .await?;
-    let binding_digests = service.provider_capture_binding_digests(committed.manifest(), None, 2)?;
+    let binding_digests =
+        service.provider_capture_binding_digests(committed.manifest(), None, 2)?;
     assert_eq!(binding_digests.len(), 1);
     let retained_binding = service.provider_capture_binding_evidence(
         committed.manifest(),
@@ -3206,6 +3207,12 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
         permitted_operations: vec![SourceOperation::Persist],
     })?;
+    authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(44),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
     let reservation = authority.reserve_ingest(
         &IngestIdentity::try_new(
             source.source_id().clone(),
@@ -3215,6 +3222,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         )?,
         &rights,
     )?;
+    let retry_reservation = reservation.clone();
     let service = AnalyticalDataService::initialize(
         authority,
         AnalyticalManifestCatalog::open(&location, 2)?,
@@ -3230,14 +3238,32 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             Arc::new(AllowProviderEventPublication),
         )
         .await?;
-    let manifest = committed.manifest().clone();
-    let selectors = service.provider_market_event_publications(&manifest, None, 2)?;
+    let first_commit = committed.clone();
+    assert_eq!(first_commit.sequence(), 1);
+    assert_eq!(first_commit.row_count(), 1);
+    let selectors = service.provider_market_event_publications(&first_commit, None, 2)?;
     assert_eq!(selectors.len(), 1);
     assert_eq!(selectors[0].publication_digest(), publication_digest);
     assert_eq!(
         selectors[0].publication_kind(),
         ProviderMarketEventPublicationKind::EventMicrobatch
     );
+    let (retry_publication, _, _) =
+        sealed_market_event_microbatch(&capture_store, 1, &[(500, 10_150)])?;
+    assert_eq!(
+        provider_market_event_publication_digest(&retry_publication)?,
+        publication_digest
+    );
+    let retried = service
+        .ingest_provider_market_events(
+            retry_reservation,
+            first_commit.dataset_id().clone(),
+            retry_publication,
+            CancellationToken::new(),
+            Arc::new(AllowProviderEventPublication),
+        )
+        .await?;
+    assert_eq!(retried, first_commit);
     drop(committed);
     drop(service);
     drop(capture_store);
@@ -3249,11 +3275,12 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?);
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
-    let restarted_selectors = restarted.provider_market_event_publications(&manifest, None, 2)?;
+    let restarted_selectors =
+        restarted.provider_market_event_publications(&first_commit, None, 2)?;
     assert_eq!(restarted_selectors, selectors);
     let reopened = restarted
         .read_provider_market_event_publication(
-            &manifest,
+            &first_commit,
             restarted_selectors[0],
             Arc::clone(&capture_store),
             Instant::now() + Duration::from_secs(5),
@@ -3262,7 +3289,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         .await?;
     assert_eq!(reopened.events(), expected_event.as_slice());
     let evidence = restarted.provider_market_event_publication_evidence(
-        &manifest,
+        &first_commit,
         restarted_selectors[0],
         &capture_store,
     )?;
@@ -3283,12 +3310,13 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         &[LiveEventClass::Trade],
         Timestamp::from_unix_nanos(490),
         Timestamp::from_unix_nanos(i64::MAX),
+        None,
         1,
         deadline,
         &cancellation,
     )?;
     assert_eq!(retained_routes.len(), 1);
-    assert_eq!(retained_routes[0].dataset(), manifest.dataset_id());
+    assert_eq!(retained_routes[0].dataset(), first_commit.dataset_id());
     assert_eq!(retained_routes[0].source_surface(), source.source_id());
     assert_eq!(retained_routes[0].instrument_id(), instrument);
     assert_eq!(retained_routes[0].venue_id().as_str(), "iex");
@@ -3300,6 +3328,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     &[LiveEventClass::Trade],
                     Timestamp::from_unix_nanos(as_of),
                     Timestamp::from_unix_nanos(knowledge),
+                    None,
                     1,
                     deadline,
                     &cancellation,
@@ -3314,6 +3343,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 &[LiveEventClass::Trade, LiveEventClass::Trade],
                 Timestamp::from_unix_nanos(490),
                 Timestamp::from_unix_nanos(i64::MAX),
+                None,
                 1,
                 deadline,
                 &cancellation,
@@ -3345,7 +3375,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         serde_json::to_vec(&source)?
     );
     let selection_request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
-        manifest.dataset_id().clone(),
+        first_commit.dataset_id().clone(),
         instrument,
         retained_routes[0].venue_id().clone(),
         LiveEventClass::Trade,
@@ -3353,7 +3383,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         Timestamp::from_unix_nanos(i64::MAX),
         market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
         1,
-        manifest.clone(),
+        first_commit.clone(),
         Some(source.source_id().clone()),
     )?;
     let selected = restarted
@@ -3366,6 +3396,86 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         .await?
         .ok_or("missing supervised exact market-event selection")?;
     assert_eq!(selected.sources().len(), 1);
+    assert_eq!(selected.commit(), &first_commit);
+    assert_eq!(selected.commit_available_at(), first_commit.available_at());
+    let coordinates = selected
+        .sources()
+        .iter()
+        .flat_map(|source| source.tied_candidates())
+        .map(|candidate| candidate.coordinate().clone())
+        .collect::<Vec<_>>();
+    assert!(
+        coordinates
+            .iter()
+            .all(|coordinate| coordinate.origin_committed_at() == first_commit.available_at())
+    );
+    let research_limits = ResearchUseLimits::try_new(
+        8,
+        32,
+        32,
+        8,
+        1024 * 1024,
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+    )?;
+    let authorized = restarted.authorize_market_event_use(
+        market_squawk_data::MarketEventUseRequest::try_new(
+            first_commit.clone(),
+            coordinates.clone(),
+            ResearchUse::LocalAnalysis,
+            research_limits,
+        )?,
+        &cancellation,
+    )?;
+    assert_eq!(authorized.commit(), &first_commit);
+    restarted.recheck_market_event_use(&authorized, deadline, &cancellation)?;
+    let retained_request = market_squawk_data::MarketEventUseRequest::try_from_retained(
+        authorized.commit().clone(),
+        authorized.inputs().to_vec(),
+        authorized.research_use(),
+        research_limits,
+    )?;
+    let reauthorized = restarted.authorize_market_event_use(retained_request, &cancellation)?;
+    assert_eq!(
+        reauthorized.rights_input_digest(),
+        authorized.rights_input_digest()
+    );
+    let retained = &authorized.inputs()[0];
+    let mut altered_digest = retained.canonical_event_digest().bytes();
+    altered_digest[0] ^= 1;
+    let altered = market_squawk_data::MarketEventUseInput::try_new(
+        retained.publication_digest(),
+        retained.publication_kind(),
+        retained.row_ordinal(),
+        retained.coordinate_digest(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, altered_digest),
+        retained.source_id().clone(),
+        retained.origin_committed_at(),
+    )?;
+    assert!(matches!(
+        restarted.authorize_market_event_use(
+            market_squawk_data::MarketEventUseRequest::try_from_retained(
+                authorized.commit().clone(),
+                vec![altered],
+                authorized.research_use(),
+                research_limits,
+            )?,
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidPublication)
+    ));
+    assert!(matches!(
+        restarted.authorize_market_event_use(
+            market_squawk_data::MarketEventUseRequest::try_new(
+                first_commit.clone(),
+                coordinates,
+                ResearchUse::Train,
+                research_limits,
+            )?,
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidGrant)
+    ));
     restarted
         .verify_provider_market_event_point_in_time_restart(
             &selected,
@@ -3410,7 +3520,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     // Repeated observations of one provider event must not exhaust a current mark's tie
     // budget. A conflict at the newest exact receive time remains an explicit two-row tie.
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
-    let mut compacted_manifest = None;
+    let mut latest_commit = None;
     for (batch_number, observations, expected_ties) in [
         (
             2,
@@ -3452,7 +3562,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let writer = Arc::clone(&restarted);
-            let dataset = manifest.dataset_id().clone();
+            let dataset = first_commit.dataset_id().clone();
             let publication_cancellation = cancellation.clone();
             let publication_task = tokio::spawn(async move {
                 writer
@@ -3489,6 +3599,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 &[LiveEventClass::Trade],
                 Timestamp::from_unix_nanos(490),
                 Timestamp::from_unix_nanos(i64::MAX),
+                None,
                 32,
                 Instant::now() + Duration::from_secs(5),
                 &cancellation,
@@ -3516,7 +3627,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             restarted
                 .ingest_provider_market_events(
                     reservation,
-                    manifest.dataset_id().clone(),
+                    first_commit.dataset_id().clone(),
                     publication,
                     cancellation.clone(),
                     Arc::new(AllowProviderEventPublication),
@@ -3524,7 +3635,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 .await?
         };
         let request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
-            manifest.dataset_id().clone(),
+            first_commit.dataset_id().clone(),
             instrument,
             retained_routes[0].venue_id().clone(),
             LiveEventClass::Trade,
@@ -3532,7 +3643,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             Timestamp::from_unix_nanos(i64::MAX),
             market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
             32,
-            committed.manifest().clone(),
+            committed.clone(),
             Some(source.source_id().clone()),
         )?;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3589,7 +3700,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         // A larger explicitly admitted historical request still returns every source-time tie.
         let historical_request =
             market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
-                manifest.dataset_id().clone(),
+                first_commit.dataset_id().clone(),
                 instrument,
                 retained_routes[0].venue_id().clone(),
                 LiveEventClass::Trade,
@@ -3597,7 +3708,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 Timestamp::from_unix_nanos(i64::MAX),
                 market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
                 64,
-                committed.manifest().clone(),
+                committed.clone(),
                 Some(source.source_id().clone()),
             )?;
         let historical = restarted
@@ -3614,18 +3725,32 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             33 + expected_ties
         );
         assert_eq!(historical.exclusions().superseded_received_observation(), 0);
+        assert_eq!(u128::from(committed.sequence()), batch_number);
+        assert_eq!(committed.row_count(), observations.len() as u64);
         if batch_number == 2 {
-            // Current selection must inspect its own publication, not reopen every inherited
-            // file. The selected file still has to pass the existing exact integrity checks.
-            for (ordinal, selected) in [(0, false), (1, true)] {
-                let path = paths
-                    .artifacts()?
-                    .root()
-                    .join(committed.pinned().objects()[ordinal].relative_reference());
-                let original = std::fs::read(&path)?;
+            // Only selected publications are reopened, but their canonical JSON must match
+            // the immutable row digest even when SQLite itself remains structurally valid.
+            for (digest, is_selected) in [
+                (first_commit.publication_digest(), false),
+                (publication_digest, true),
+            ] {
+                let connection = rusqlite::Connection::open(location.path())?;
+                let trigger: String = connection.query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='market_event_active_rows_immutable_update'",
+                    [], |row| row.get(0),
+                )?;
+                let original: Vec<u8> = connection.query_row(
+                    "SELECT event_json FROM market_event_active_rows WHERE publication_digest=?1 AND publication_row_ordinal=0",
+                    [digest.bytes().as_slice()], |row| row.get(0),
+                )?;
                 let mut corrupt = original.clone();
                 corrupt[0] ^= 1;
-                std::fs::write(&path, corrupt)?;
+                connection
+                    .execute_batch("DROP TRIGGER market_event_active_rows_immutable_update")?;
+                connection.execute(
+                    "UPDATE market_event_active_rows SET event_json=?1 WHERE publication_digest=?2 AND publication_row_ordinal=0",
+                    params![corrupt, digest.bytes().as_slice()],
+                )?;
                 let result = restarted
                     .read_provider_market_event_point_in_time(
                         &current_request,
@@ -3634,76 +3759,37 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                         cancellation.clone(),
                     )
                     .await;
-                std::fs::write(&path, original)?;
-                if selected {
+                // Restore before inspecting the result so a failed assertion leaves no mutated fixture.
+                connection.execute(
+                    "UPDATE market_event_active_rows SET event_json=?1 WHERE publication_digest=?2 AND publication_row_ordinal=0",
+                    params![original, digest.bytes().as_slice()],
+                )?;
+                connection.execute_batch(&trigger)?;
+                if is_selected {
                     assert!(matches!(
                         result,
-                        Err(IngestError::Parquet(
-                            ParquetStoreError::ObjectMetadataMismatch
-                        ))
+                        Err(IngestError::Catalog(CatalogError::CorruptCatalog))
                     ));
                 } else {
-                    let selected = result?.ok_or("unrelated file blocked current selection")?;
+                    let selected =
+                        result?.ok_or("unrelated canonical row blocked current selection")?;
                     assert_eq!(selected.sources()[0].tied_candidates().len(), 1);
                 }
             }
-            // The third append crosses the configured two-object generation threshold.
-            // Compact with real source rights, then prove exact old publication reads survive.
-            let compaction = restarted
-                .market_event_compaction_request(manifest.dataset_id(), 1)?
-                .ok_or("full event generation did not request compaction")?;
-            let payload_digest = compaction.payload_digest();
-            let reservation = restarted
-                .reserve_source_ingest(
-                    &source,
-                    Timestamp::from_unix_nanos(10),
-                    RightsDecisionInput {
-                        source_id: source.source_id().clone(),
-                        payload_digest,
-                        retrieved_at: Timestamp::from_unix_nanos(533),
-                        basis: RightsBasis::reviewed_terms(
-                            "https://example.test/alpaca-terms/v1",
-                            digest(41),
-                        )?,
-                        authorization_evidence: digest(43),
-                        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-                        permitted_operations: vec![SourceOperation::Persist],
-                    },
-                    &IngestIdentity::try_new(
-                        source.source_id().clone(),
-                        payload_digest,
-                        SourceOperation::Persist,
-                        "alpaca-events-streaming-compaction",
-                    )?,
-                    &cancellation,
-                )
-                .await?;
-            let compacted = restarted
-                .compact_provider_market_events(
-                    reservation,
-                    compaction,
-                    deadline,
-                    cancellation.clone(),
-                    Arc::new(AllowProviderEventPublication),
-                )
-                .await?;
-            assert_eq!(compacted.pinned().objects().len(), 1);
-            assert_eq!(
-                compacted.pinned().plan().row_count(),
-                committed.pinned().plan().row_count()
-            );
-            assert_eq!(
-                compacted.pinned().plan().lineage_digest(),
-                committed.pinned().plan().lineage_digest()
-            );
-            assert!(
-                restarted
-                    .market_event_compaction_request(manifest.dataset_id(), 1)?
-                    .is_none()
-            );
-            compacted_manifest = Some(compacted.manifest().clone());
         }
+        latest_commit = Some(committed);
     }
+    let connection = rusqlite::Connection::open(location.path())?;
+    let (commits, rows, artifacts, manifests): (i64, i64, i64, i64) = connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM market_event_commits WHERE dataset_id=?1),
+                (SELECT COUNT(*) FROM market_event_active_rows AS row JOIN market_event_commits AS committed USING(publication_digest) WHERE committed.dataset_id=?1),
+                (SELECT COUNT(*) FROM artifacts AS artifact JOIN market_event_commits AS committed USING(run_id) WHERE committed.dataset_id=?1),
+                (SELECT COUNT(*) FROM dataset_manifests AS manifest JOIN market_event_commits AS committed USING(run_id) WHERE committed.dataset_id=?1)",
+        [first_commit.dataset_id().as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!((commits, rows, artifacts, manifests), (3, 35, 0, 0));
+    drop(connection);
     drop(restarted);
     let reopened_service = AnalyticalDataService::open(
         CatalogAuthority::open(catalog_config.clone())?,
@@ -3711,10 +3797,10 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
-    let compacted_manifest = compacted_manifest.ok_or("missing compacted market generation")?;
+    let latest_commit = latest_commit.ok_or("missing latest logical event commit")?;
     let original = reopened_service
         .read_provider_market_event_publication(
-            &compacted_manifest,
+            &latest_commit,
             selectors[0],
             Arc::clone(&capture_store),
             Instant::now() + Duration::from_secs(5),
@@ -3723,14 +3809,14 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         .await?;
     assert_eq!(original.events(), expected_event.as_slice());
     let original_evidence = reopened_service.provider_market_event_publication_evidence(
-        &compacted_manifest,
+        &latest_commit,
         selectors[0],
         &capture_store,
     )?;
     assert_eq!(
         original_evidence
             .event()
-            .ok_or("missing compacted raw evidence")?
+            .ok_or("missing original raw evidence")?
             .physical_claim(),
         &expected_claim
     );
@@ -4281,7 +4367,8 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(short_after_compaction.bars().len(), 1);
     drop(short_after_compaction);
 
-    let short_first_lineage = service.provider_capture_binding_digests(short.manifest(), None, 3)?;
+    let short_first_lineage =
+        service.provider_capture_binding_digests(short.manifest(), None, 3)?;
     assert_eq!(short_first_lineage.len(), 1);
     let short_append = publish_complete_history_fixture(
         &service,

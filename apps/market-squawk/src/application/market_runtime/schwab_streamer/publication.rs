@@ -431,7 +431,7 @@ impl Consumer {
         if let SchwabStreamerApplicationOutcome::Published(published) = outcome {
             let generation = published.generation();
             let receipt = MarketEventPublicationReceipt::try_new(
-                generation.restart_selector().manifest().clone(),
+                generation.restart_selector().commit().clone(),
                 generation.publication_digest(),
                 market_squawk_data::ProviderMarketEventPublicationKind::EventMicrobatch,
                 ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1,

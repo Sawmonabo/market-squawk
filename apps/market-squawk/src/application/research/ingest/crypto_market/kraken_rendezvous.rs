@@ -229,6 +229,10 @@ impl CryptoPendingFrameIngress {
     /// future; the rendezvous never creates detached timeout tasks.
     pub(crate) async fn run_expiry_driver(&self) {
         loop {
+            // Register before inspecting state so a newly inserted deadline cannot lose its wake.
+            let changed = self.core.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let next_deadline = {
                 let state = self.core.state.lock().await;
                 state.deadlines.values().copied().min()
@@ -240,12 +244,12 @@ impl CryptoPendingFrameIngress {
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                         self.expire_due(Instant::now()).await;
                     }
-                    () = self.core.changed.notified() => {}
+                    () = &mut changed => {}
                 },
                 None => tokio::select! {
                     biased;
                     () = self.core.cancellation.cancelled() => break,
-                    () = self.core.changed.notified() => {}
+                    () = &mut changed => {}
                 },
             }
         }
@@ -494,6 +498,10 @@ impl CryptoPendingFrameIngress {
             return None;
         }
         loop {
+            // Register before inspecting rows; submit may notify while that state lock is awaited.
+            let wake = self.core.changed.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
             if self.core.cancellation.is_cancelled() || Instant::now() >= deadline {
                 self.discard(&key).await;
                 return None;
@@ -501,12 +509,11 @@ impl CryptoPendingFrameIngress {
             if let Some(rows) = self.take_complete_rows(&key, expected).await {
                 return Some(rows);
             }
-            let wake = self.core.changed.notified();
             tokio::select! {
                 biased;
                 () = self.core.cancellation.cancelled() => {}
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
-                () = wake => continue,
+                () = &mut wake => continue,
             }
         }
     }
@@ -594,6 +601,12 @@ impl CryptoCommittedRowIngress {
             || observation.wire_ordinal() != wire_ordinal
             || observation.row_count() != row_count
         {
+            tracing::warn!(
+                cancelled = self.core.cancellation.is_cancelled(),
+                row_count,
+                wire_ordinal,
+                "committed publication row rejected at admission"
+            );
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
         let key = SourceObjectKey::from_lease(&lease)?;
@@ -607,6 +620,11 @@ impl CryptoCommittedRowIngress {
             Some(deadline) => deadline,
             None => {
                 if state.deadlines.len() >= self.core.limits.maximum_pending_frames.get() {
+                    tracing::warn!(
+                        pending_frames = state.deadlines.len(),
+                        maximum_pending_frames = self.core.limits.maximum_pending_frames.get(),
+                        "committed publication exceeds admitted frame capacity"
+                    );
                     return Err(CryptoMarketPublicationError::RendezvousUnavailable);
                 }
                 let deadline = now
@@ -617,6 +635,7 @@ impl CryptoCommittedRowIngress {
             }
         };
         if now >= deadline {
+            tracing::warn!("committed publication arrived after its frame deadline");
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
         if !state.rows.contains_key(&key) {
@@ -625,6 +644,11 @@ impl CryptoCommittedRowIngress {
                 .checked_add(row_slot_bytes)
                 .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
             if total > self.core.limits.maximum_retained_bytes.get() {
+                tracing::warn!(
+                    required_bytes = total,
+                    maximum_bytes = self.core.limits.maximum_retained_bytes.get(),
+                    "committed publication row slots exceed retained byte budget"
+                );
                 return Err(CryptoMarketPublicationError::RendezvousUnavailable);
             }
             let mut rows = Vec::new();
@@ -645,6 +669,11 @@ impl CryptoCommittedRowIngress {
             .checked_add(retained_bytes)
             .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
         if total > self.core.limits.maximum_retained_bytes.get() {
+            tracing::warn!(
+                required_bytes = total,
+                maximum_bytes = self.core.limits.maximum_retained_bytes.get(),
+                "committed publication rows exceed retained byte budget"
+            );
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
         let pending = state
@@ -652,6 +681,12 @@ impl CryptoCommittedRowIngress {
             .get_mut(&key)
             .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
         if pending.rows.len() != row_count || pending.rows[wire_ordinal].is_some() {
+            tracing::warn!(
+                retained_row_count = pending.rows.len(),
+                row_count,
+                wire_ordinal,
+                "committed publication row count conflicts or ordinal is duplicated"
+            );
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
         pending.rows[wire_ordinal] = Some(lease);

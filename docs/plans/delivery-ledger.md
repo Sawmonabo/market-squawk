@@ -15,6 +15,250 @@ supersedes forced password storage in development and any conflicting import-onl
 
 ### Current outcomes and verification
 
+**Current integration checkpoint — SQLite active events and independent source startup (2026-10-01).**
+Lead owns integration, Git and the sole compiler; all implementation-agent files are frozen.
+Active event ingestion and exact current/PIT readers now use logical SQLite commits. Existing
+restart/integrity, bulk-history and Fund NAV checks pass. Bounded archive handoff/reclamation and
+incremental raw custody remain required, unimplemented dependencies; this is not continuous-
+ingestion or complete installed-workflow acceptance.
+
+Current source fixes include independent retained preparation, snapshot-based readiness,
+end-to-end frame admission, and official crypto reference selection in the unified feed.
+The most recent correction removes a pre-acknowledgement circular wait: Coinbase retains exact
+raw/decoded pairs in its existing bootstrap buffer, then drains them through normal publication
+admission after ACK. Original clocks, evidence and limits are preserved. Kraken book/trade share
+the same active permit budget. Direct/Alpaca async admission is outside this correction.
+
+**Current check:** build passes4m33s (`sqlite-bootstrap-raw-only-build.log`, executable
+`control_plane-8273362dac5f04d9`). The unchanged live case fails79.21s
+(`sqlite-bootstrap-raw-only-live-current.log`): transport reports
+`stage="publication_admission"`, then the unified row has no selected source. Official reference
+assertions now pass. This isolates local pipeline admission, not an external network outage.
+An accidental old-executable run was immediately terminated and supplies no evidence.
+Astra research_options_failure owns read-only end-to-end admission/rendezvous diagnosis; lead
+owns all edits, builds and integration. Do not enlarge timeouts/caps or weaken assertions.
+The financial restart fixture remains open because it lacks the current-share proof already
+required at HEAD. No continuous-ingestion or installed completion is claimed.
+
+**Coherent checkpoint verification:** the current executable passes the shared-service
+startup/restart/optional-access check1/1 in100.15s
+(`sqlite-current-shared-service-critical.log`). The unchanged data restart/integrity,
+bulk-history and Fund NAV checks below also pass. This checkpoint implements SQLite active-event
+storage and its exact consumers plus independent startup preparation; it does not approve live
+crypto startup or continuous ingestion. Lead is committing this integrated work before the next
+bounded actor/publication outcome correction. No tests or authority checks were weakened.
+
+Read-only source diagnosis identifies a missing terminal outcome: actor nonfatal rejection can
+produce health/snapshot without committed research rows, while raw publication continues waiting.
+The actor export also uses frame capacity as a per-observation channel capacity. Astra is tracing
+exact rejection categories and a cohesive batch/outcome handoff before implementation ownership
+is assigned. No compiler or live source process remains running from this checkpoint.
+
+The capacity candidate compiles (7m49s; `sqlite-public-capacity-build.log`) and the existing
+shared-service startup/restart critical passes1/1 in101.32s (`sqlite-shared-service-critical.log`).
+The real public-feed restart case still fails after132.82s: preparation returns `Unavailable` and
+no exact publication is selected (`sqlite-public-capacity-live.log`). That run contains no
+full-queue error or stack overflow; it does not establish completed startup.
+
+A concrete readiness race was then identified: the sink signals when its first batch is enqueued,
+while activation immediately requires a complete published snapshot. The unpublished public
+runtime now awaits the existing per-shard notification channels and rechecks the complete route
+and source topology under its original deadline/cancellation. No new queue, task, poller, delayed
+sleep or larger deadline. All five affected files are frozen: Astra research_options_failure
+finished the live-runtime async notification and two wrappers; lead integrated composition and
+market-runtime readiness/cleanup. A closed onboarding-activation diagnostic preserves the error
+phase. The sole compiler is rebuilding in `sqlite-snapshot-readiness-build.log`; the same live
+publication/restart/Stop check follows. The enqueue race is established in source; the prior log
+alone does not prove it was the cause of that particular run.
+
+Snapshot readiness build passes5m51s. The live rerun now exposes a more specific failure:
+Coinbase's committed publication worker reports `publication_rendezvous_unavailable`, followed by
+snapshot-readiness unavailability and shutdown failures (`sqlite-snapshot-readiness-live.log`).
+Lead retains all implementation ownership; Astra research_options_failure has read-only ownership
+of the publication supervisor/rendezvous error trace. No evidence checks are loosened and no queue
+or deadline is raised. Determine the concrete pairing failure before the next correction.
+
+The pairing trace identifies a concrete admission mismatch: a four-slot raw channel can release
+slots into four concurrent raw publications while more committed frame keys arrive at a four-key
+rendezvous. Queue capacity alone does not bound the complete pipeline. The correction retains one
+existing-capacity admission permit from pre-read through raw/committed pairing and publication;
+Kraken book/trade share that same budget. Astra research_options_failure owns only
+`live_source/{publication_admission,coinbase_publication,kraken_publication,sink,coinbase_publication_supervisor,kraken_publication_supervisor}.rs`.
+Lead owns module declaration, composition and Direct constructor alignment plus closed-reason
+rendezvous diagnostics. No cap increase; Direct's existing synchronous submission behavior remains
+explicitly outside public-feed async admission. Freeze all files before the next serialized build.
+
+End-to-end admission build passes4m39s (`sqlite-public-frame-admission-build.log`). Live case
+reaches a real Coinbase unified investment row but fails79.03s at its missing `referenceEvidence`
+assertion (`sqlite-public-frame-admission-live.log`, production_mcp_composition.rs4322). That run
+shows no preceding queue/rendezvous/snapshot failure; full restart remains unverified. Sol
+desktop_disconnect_recovery owns read-only tracing of `application/paper/market.rs` and
+`market/unified.rs` reference-record selection into crypto rows. Lead retains all edits, Git and
+checks until exact missing producer-to-consumer wiring is identified. Do not relax the assertion.
+
+Reference wiring correction: the unified feed now loads canonical official records for the union
+of display identities and live crypto execution identities, then validates display batches against
+exact selected records separately. Crypto definitions are durably published during public source
+preparation; they were omitted by the display-only consumer query. Lead owns this single-file
+correction; all implementation files are frozen for `sqlite-crypto-reference-build.log` and the
+existing exact public publication/restart live case.
+
+Reference-query build passes4m38s. Live check fails132.54s before obtaining a usable feed;
+Coinbase reports a subscription-state resynchronization during readiness
+(`sqlite-crypto-reference-live.log`). Astra research_options_failure owns read-only diagnosis of
+subscription acknowledgement and end-to-end permit ordering, including pre-ack buffered data.
+Lead owns diagnostic clarity, exact phase context and all edits/checks. No timeout/cap increases.
+
+Confirmed source dependency cycle: Coinbase submits pre-ack data to raw publication while
+normalized rows wait for ACK; four retained frame permits can prevent reading ACK itself. Astra
+research_options_failure owns `live_source/sink.rs` and Coinbase adapter `publication.rs` only:
+retain exact raw work in the existing bounded pre-ack buffer, then asynchronously drain under
+normal publication permits after ACK. Preserve Direct/Alpaca synchronous paths, original clocks,
+byte accounting, deadlines and Kraken zero-pre-ack semantics. Lead owns checks/integration.
+
+An affected financial restart check also fails before persistence: existing
+`decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease` returns
+"complete restart fixture must generate a buy proposal" (0.30s,
+`sqlite-decision-restart-critical.log`). Astra calendar_currentness_failure owns read-only
+tracing of that exact proposal fixture and current generator; distinguish stale fixture inputs
+from real financial behavior. No changed thresholds, test weakening, builds or Git.
+
+Financial-check diagnosis: unchanged HEAD fixture constructs `InvestmentAnalysisEvidence::new`
+without a current-share projection, while unchanged HEAD authority requires it. This is a
+pre-existing fixture gap, not evidence of a SQLite regression; the check remains failed/open.
+A valid repair needs actual automatic-valuation and share-conversion receipts through the existing
+production path, including the fixture’s no-action variant. Do not synthesize a digest, relax the
+gate or count this check as passed. Pair its repair with the genuine saved Investment Brief
+workflow; storage/startup evidence is separately reported.
+
+Bootstrap correction is implemented and frozen in the two assigned files. Lead inspected
+FIFO ownership, byte charges, original clocks, cancellation before dequeue and shared active
+admission. Existing source error display now includes its closed subscription failure; live test
+errors identify first-start versus resumed-start phase. Single compiler runs
+`sqlite-bootstrap-admission-build.log`; same real source/restart case follows. No source edits
+during compilation.
+
+Bootstrap build passes5m39s. Live case fails132.40s on first start with generic source
+network failure (`sqlite-bootstrap-admission-live.log`). No completion claim. Lead owns bounded
+closed-stage diagnostics in Coinbase source transport. Astra research_options_failure owns
+read-only follow-up on stale pre-ACK rows: only admitted output may wait for paired canonical
+publication; preserve raw capture and do not fabricate fresh clocks. No timeout/cap increase.
+
+Direct public endpoint diagnostic opens in385ms and receives real subscription/data frames
+within903ms, including data between partial subscription messages. One unauthenticated connection,
+no payloads/credentials logged. This does not prove the app transport path. Source tracing now logs
+only closed operation stages; existing workspace tracing dependency added to Coinbase manifest/lock.
+Astra research_options_failure owns sink.rs, coinbase_publication.rs and its supervisor: qualify
+buffered output before raw handoff; freshness-unqualified frames still seal exact custody via the
+existing raw-only disposition, but do not await nonexistent committed rows. Current rendezvous
+wait is finite; the defect is occupying admission until that timeout, not an infinite wait.
+
+Stale bootstrap correction frozen/released and inspected: input carries a closed
+AwaitCommittedRows/FreshnessUnqualified disposition; both seal exact raw evidence, only admitted
+rows wait for canonical publication. Lead transport diagnostics distinguish connect/send/flush,
+receive and publication-admission timeout without frame bodies or credentials. Single-job build:
+`sqlite-bootstrap-raw-only-build.log`; existing live restart case follows on unchanged source.
+
+The data restart, bulk-history and Fund NAV critical checks below pass. Next dependency after the
+coherent pushed checkpoint: bounded archive handoff/read/reclamation and incremental raw custody.
+No live or installed completion, broad CI, whole-app measurement or new branches/worktrees.
+
+The following dated investigation records retain the evidence and ownership handoffs that led to
+this candidate; their earlier compile/assignment states are superseded by the current paragraph.
+
+The second live run exits normally with a failed assertion (132.64s), without a stack overflow:
+`sqlite-public-live-restart-rerun.log`. The concrete remaining source failure is four-slot raw
+publication admission using `try_send` before async workers can drain a burst. Lead owns the
+shared `sources/src/live.rs` capacity hook; Astra research_options_failure owns the corresponding
+Coinbase adapter receive loop and application `live_source/{sink.rs,coinbase_publication.rs}`.
+Reserve existing channel capacity before receiving the next frame, retain the owned permit until
+that frame's atomic submission, and use the same strictest deadline/cancellation for waiting and
+receiving. No larger queue, discarded input, replacement runtime or new branch. All other source
+is frozen; lead rebuilds/reruns after this bounded producer-to-consumer correction freezes.
+The same defect exists in Kraken's adjacent public feed. Extend the shared sink reservation enum
+to Kraken: Astra owns `live_source/kraken_publication.rs` as well; lead owns the existing Kraken
+adapter `session.rs` receive loop. Both providers use the same capacity hook and their original
+receive deadline; Kraken retains quarantine and subscription-release semantics on failures.
+
+Integrated build passes (5m29s) after lead updated two paper-market timestamp callers. The rebuilt
+live public-source restart case still aborts on worker stack overflow after Coinbase's durable
+publication queue fills; evidence `sqlite-public-live-restart.log`, executable UUID
+`A12542C9-72E1-32BE-8F7E-62D6564FD76D`. The first boxing change reduced the two startup poll frames
+from 1,481,920 to 852,992 bytes but does not close the crash. Source checkpoint is not accepted.
+Next bounded remediation: Astra live_stack_failure owns startup future layout inside
+`application/market_runtime.rs::start_owned` and its cohesive private helpers only, coordinating any
+other path with lead; Astra research_options_failure investigates the publication queue stall
+read-only in live-source sinks/data ingest. All other source stays frozen; lead owns integration,
+Git and the next single-job check. No thread-stack inflation or dropped market data as a fix.
+Queue investigation found no missing consumer or proven SQLite lock cycle. It did identify a
+state-check-before-notification-registration race in the shared crypto rendezvous. Astra
+research_options_failure now owns only `research/ingest/crypto_market/kraken_rendezvous.rs` to
+register the existing waiter before reading state (including expiry driver), preserving deadlines
+and cancellation. This small substantiated correction joins the startup fix before compilation;
+no queue capacity increase or unproven broad backpressure change is authorized for this check.
+
+Active-event/valuation integration status (2026-10-01, audit base `4d0893d5`): all agent-owned
+implementation files are frozen and released. Lead owns the integrated candidate and single-job
+compiler. The extended existing event restart case passes 1/1 in 1.57s, including retained exact
+input reconstruction and rejection of a changed canonical-event digest; evidence
+`.agents/tmp/v1-first-stock/sqlite-active-events-retained-rights-critical.log`. Existing bulk-stock
+history and Fund NAV restart cases also pass against the revised schema. Fresh and retained
+valuation callers now distinguish physical research roots from logical event inputs, without
+changing financial formulas. The combined application control-plane harness is compiling in
+`sqlite-app-integration-build.log`; next is the previously crashing live public-source restart case
+with the boxed child future. These are implemented changes under critical verification, not a
+live/installed completion claim. Archive handoff/reclamation and incremental raw-custody recovery
+remain subsequent dependencies; no new branches, worktrees, broad CI or RAM measurement.
+
+While compilation runs, Astra first_brief_readiness has a read-only dependency brief: identify the
+smallest bounded archive transaction and reader handoff using the current event store and existing
+Parquet/pin owners, including exact files and reuse points. No source edits, builds, Git or new
+framework; report the concrete integration seam to lead before the next implementation dispatch.
+
+Archive dependency handoff is complete (read-only): export whole publications in bounded commit
+order using the existing staged Parquet writer/finalizer, then atomically admit object metadata,
+publication row offsets and keyset progress. Resolve active versus archived placement inside the
+existing WAL snapshot; preserve all logical coordinates. Before payload deletion, integrate the
+complete-commit view, guarded delete/retry paths, referenced-object recovery/backup enumeration
+and existing verified-file reader. Analytical query admission must use genuine logical event
+authority, never fabricated manifest roots. This is the next coupled checkpoint after current
+producer/consumer checks, not implemented behavior or a separate task queue.
+
+Astra calendar_currentness_failure has a read-only integration follow-up while source is frozen:
+trace whether transient source-use permit expiry improperly prevents historical saved-valuation
+display, distinguishing that display from current decision admission. Return a concrete affected
+workflow and minimal correction only if substantiated; no implementation or separate review round.
+Follow-up resolved without code changes: historical valuation/Brief reads retain original receipts
+without current permit expiry admission. Active decision reuse is already bounded by the selected
+market's freshness (current V1 policy 60 seconds), stricter than the 300-second source-use permit.
+Fresh authorization must not revive that stale market input; combined event recovery clocks agree.
+
+Active SQLite focused check passes: existing publication recovery case 1/1 in1.46s (compile43.47s), including exact succeeded retry, independent reads while writer is held, selected-row digest corruption rejection, all PIT ties, original raw/native evidence after newest commit/restart, and3 logical commits/35 canonical rows/0 Parquet artifacts. Source trigger placement and physical-only output coverage guard were corrected in the active schema; no forward migration. Evidence `sqlite-active-events-critical.log`. Valuation consumer/retained-rights integration remains in progress, so this is data-slice verification only, not a complete application or archival claim.
+
+Financial caller integration: Sol desktop_disconnect_recovery owns application/fair_value/automatic.rs and automatic/{forecast,financial}.rs plus service/market_evidence.rs. Dependency is the Astra canonical valuation rights/evidence contract; no financial formula changes. Lead reserves shared data/valuation exports and market_selection/investment.rs visibility. Complete both fresh calculations and saved-result reauthorization with exact event inputs.
+
+Valuation integration ownership extension: first_brief_readiness owns evidence.rs and valuation persistence{.rs,/write.rs,/recovery.rs}; calendar_currentness_failure owns valuation automatic.rs exact event admissions alongside existing physical-source rights, and its data research_use/market_event.rs only after compiler release. Lead owns application valuation callers, shared exports and all checks. Logical events remain exact retained evidence and are never represented as fake physical manifests. This closes affected required financial consumers, not a new architecture project.
+
+Newly traced financial consumer: Astra first_brief_readiness owns `crates/market-squawk-valuation/src/evidence.rs` event-publication identity/validation conversion only. Existing valuation paths still expected a physical event manifest; update to logical commits with unchanged financial rules. Lead owns any shared serialization contract and downstream composition, and compiles after freeze.
+
+Integration ownership refresh: all active-event implementation slices are frozen; lead integrates shared modules, rights wrappers, canonical SQL hashes and application fixtures. Astra live_stack_failure owns only `apps/market-squawk/src/paper_bot/defaults.rs` to box the identified large child future before the deadline wrapper; no larger thread stack. Astra research_options_failure owns only the existing `provider_market_event_publication_is_restart_queryable` case in `data/tests/publication_recovery.rs`, converting its physical event assumptions to logical commits while preserving exact/PIT/retry/restart and selected-evidence integrity checks. No other test expansion, builds, Git or runtime by agents. Lead runs the single compiler after these files freeze.
+
+Live source check failure: unchanged compiled control-plane executable aborts on Tokio worker stack overflow after Coinbase publication queue reports full (independent-startup-public-live.log). Source checkpoint remains staged, uncommitted and unaccepted pending cause/fix. New Astra live_stack_failure owns read-only crash/backtrace investigation and smallest exact correction proposal; no builds/Git/source edits. Database lanes continue in their assigned files.
+
+Source-readiness integration: the existing installed shared-service critical passes (1/1,106.80s; compile6m08s), including native/MCP authority, concurrent reads, optional access and restart. Service admission now schedules saved research/account restoration in the existing retained startup owner instead of awaiting provider network work before transport readiness. Public source preparation remains independently retained and cancellable. This does not establish native live-price/startup completion; the existing public-source live publication/restart case is next using the unchanged compiled executable.
+
+Active-event implementation wave (2026-10-01): direct-lineage checkpoint `4d0893d5` is pushed. Lead owns SQL, exported logical commit types, shared `ingest.rs`/module registration, application composition and all verification. Source-readiness critical check occupies the only compiler slot; no agent edits compiled files until released. Dependency contract is `.agents/tmp/v1-first-stock/active-row-contract.md`.
+
+| Owner | Finishable active-event outcome and exclusive files | Dependency / critical check |
+| --- | --- | --- |
+| Astra first_brief_readiness | Active SQLite writer/retry and canonical row reconstruction in new cohesive `data/src/catalog/market_event_store.rs` and `data/src/ingest/market_event_store.rs`; propose exact changes to existing `catalog/provider_event.rs`, publication transaction and SQL for lead integration before editing those shared files | Lead logical commit/SQL contract; acknowledge only atomically committed native evidence + rows + successful run. Existing publication restart/retry case. |
+| Astra research_options_failure | Indexed event PIT/current selection and exact row reopening; initial contract alignment only, then `provider_event_selection.rs`, `catalog/market_recovery.rs`, event portions of `manifest/catalog.rs`, and cohesive `ingest/market_event_read.rs` after lead releases them | Writer logical commit/row contract; preserve all equal-time candidates, clocks and raw evidence. Existing PIT/restart case. |
+| Sol desktop_disconnect_recovery | Application event receipts/publishers in research/ingest/{crypto_market,schwab_market,yahoo_enrichment,alpaca_historical/market}.rs; market_selection/investment.rs; market_runtime/{schwab_sink,schwab_streamer/publication}.rs; source provider_runtime discovery wrapper and service crypto fixture after exact path confirmation | Logical commit APIs and paged route discovery; update all affected application consumers together, lead owns shared exports/tests. |
+| Astra calendar_currentness_failure | Exact event research-use authority boundary: inspect existing grant selection/permit revalidation and propose the smallest shared implementation contract; no source edits until lead assigns ownership | Active event receipts cannot impersonate physical manifest roots or bypass source-use rights. Lead owns shared authority integration. |
+| Lead | Source readiness completion, shared contracts/schema and application integration; archive/query ownership follows these exact APIs | Producer and consumer must integrate together. Active SQLite slice does not claim completed archival, bounded retention or continuous-ingestion acceptance. |
+
+Agents first return exact API/signature amendments, then receive one coordinated implementation release; no replacement plans, new database/runtime, Git/builds or branches. Reuse current canonical payload encoding and precision. Archive publication/reclamation remains required and follows the active read/write slice. Raw-capture custody also has a confirmed cumulative 25,000-object/512-GiB admission/recovery boundary (`catalog/provider_capture.rs`, `ingest.rs`, `ingest/source_backup.rs`). Its current whole-store recovery ownership must become incremental/indexed before continuous-ingestion acceptance; merely removing its constants would leave the platform recovery ceiling and startup scan. Preserve all raw evidence while resolving this after the active-event checkpoint.
+
 Direct-lineage integration evidence, 2026-10-01: existing event restart/compaction case passes (1.44s), complete stock-history/PIT/native-evidence restart passes (1.52s), and Fund NAV exact vertical passes (0.69s). The first event run exposed stale embedded schema hashes; lead updated the two current schema fingerprints in place and the rerun passed. No new migration or compatibility path. The application control-plane harness compiles with all changed callers (6m37s); no live or lifetime-scale acceptance is claimed. All implementation agents are frozen; the lead is closing the source-readiness wait before resuming active-row edits. The active-row implementation contract is recorded at `.agents/tmp/v1-first-stock/active-row-contract.md` and awaits the coherent integration checkpoint, not further owner approval.
 
 Owner authorized the recommended database-primary implementation on 2026-10-01; the lead owns the design choice. No further design permission is pending.

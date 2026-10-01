@@ -180,7 +180,9 @@ pub struct ProductionLiveSourceComposition {
 #[derive(Debug)]
 enum ProductionSourceInstallation {
     Single(ProductionSourceProfile),
-    KrakenPending { local_endpoint: Option<String> },
+    KrakenPending {
+        local_endpoint: Option<String>,
+    },
     Kraken {
         book: ProductionSourceProfile,
         trades: ProductionSourceProfile,
@@ -383,32 +385,23 @@ impl ProductionLiveSourceComposition {
         let kraken = self.installation.is_kraken();
         let paths = LocalPaths::prepare(self.config.data_dir())
             .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
-        let kraken_budget = if kraken {
-            Some(
-                super::kraken::reference_budget(
-                    self.config
-                        .kraken()
-                        .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
-                )
-                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+        let reference_budget = if kraken {
+            super::kraken::reference_budget(
+                self.config
+                    .kraken()
+                    .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
             )
+            .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?
         } else {
-            None
+            super::crypto_reference::coinbase_reference_budget()
+                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?
         };
-        let reference_budget = kraken_budget
-            .as_ref()
-            .or_else(|| {
-                self.installation
-                    .primary()
-                    .and_then(|profile| profile.metadata().budget_policy())
-            })
-            .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
         let selected = super::crypto_reference::synchronize_public_crypto_reference(
             reader,
             synchronizer,
             &paths,
             self.provider_rate.clone(),
-            reference_budget,
+            &reference_budget,
             capture_store,
             if kraken { None } else { self.config.coinbase() },
             if kraken { self.config.kraken() } else { None },
@@ -416,9 +409,14 @@ impl ProductionLiveSourceComposition {
             cancellation,
         )
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, "public crypto reference selection failed");
-            ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable
+        .map_err(|error| match error {
+            super::crypto_reference::CryptoReferenceError::RateDeferred { not_before } => {
+                ProductionLiveSourceRuntimeError::ProviderRateDeferred { not_before }
+            }
+            error => {
+                tracing::warn!(%error, "public crypto reference selection failed");
+                ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable
+            }
         })?;
         let requests = if kraken {
             selected.kraken_requests
@@ -466,13 +464,17 @@ impl ProductionLiveSourceComposition {
                             deadline,
                             cancellation,
                         )
-                        .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+                        .map_err(|_| {
+                            ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable
+                        })?,
                 );
             }
         }
         #[cfg(all(test, debug_assertions))]
         let local_kraken_endpoint = match &self.installation {
-            ProductionSourceInstallation::KrakenPending { local_endpoint } => local_endpoint.clone(),
+            ProductionSourceInstallation::KrakenPending { local_endpoint } => {
+                local_endpoint.clone()
+            }
             _ => None,
         };
         let mut composition = self
@@ -828,16 +830,25 @@ impl ProductionLiveSourceComposition {
             .ok_or(ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
         let (committed_exports, committed_receivers) =
             committed_research_exports(&self.routes, capacity, maximum_retained_bytes)?;
+        // One budget spans queued and in-flight frames, including both Kraken channels.
+        let publication_frames = Arc::new(tokio::sync::Semaphore::new(capacity.get()));
         let captured = match &package {
             CryptoMarketPublicationPackage::Coinbase(_) => {
-                let (ingress, receiver) = CoinbaseCapturedPublicationIngress::try_channel(capacity);
+                let (ingress, receiver) = CoinbaseCapturedPublicationIngress::try_channel(
+                    capacity,
+                    Arc::clone(&publication_frames),
+                );
                 CryptoCapturedPublicationStartup::Coinbase { ingress, receiver }
             }
             CryptoMarketPublicationPackage::Kraken(_) => {
-                let (book_ingress, book_receiver) =
-                    KrakenCapturedPublicationIngress::try_channel(capacity);
-                let (trade_ingress, trade_receiver) =
-                    KrakenCapturedPublicationIngress::try_channel(capacity);
+                let (book_ingress, book_receiver) = KrakenCapturedPublicationIngress::try_channel(
+                    capacity,
+                    Arc::clone(&publication_frames),
+                );
+                let (trade_ingress, trade_receiver) = KrakenCapturedPublicationIngress::try_channel(
+                    capacity,
+                    Arc::clone(&publication_frames),
+                );
                 CryptoCapturedPublicationStartup::Kraken {
                     book_ingress,
                     book_receiver,
@@ -1107,11 +1118,11 @@ impl ProductionLiveSourceComposition {
                         }
                     }
                 }
-                ProductionSourceInstallation::KrakenPending { .. } => Err(
-                    ProductionLiveSourceRuntimeError::Supervisor(
+                ProductionSourceInstallation::KrakenPending { .. } => {
+                    Err(ProductionLiveSourceRuntimeError::Supervisor(
                         ProductionSupervisorError::MissingCatalogSelection,
-                    ),
-                ),
+                    ))
+                }
             }
         } else {
             Err(ProductionLiveSourceRuntimeError::Supervisor(
@@ -1379,6 +1390,13 @@ impl ProductionLiveSourceRuntime {
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
+    }
+
+    /// Waits for a coalesced hint; callers recheck the complete immutable snapshot.
+    pub(crate) async fn next_snapshot_notification(
+        &mut self,
+    ) -> Option<market_squawk_live::ShardId> {
+        self.live.next_snapshot_notification().await
     }
 
     /// Installs one complete disabled action-hook group without reconnecting the source.
@@ -1984,6 +2002,8 @@ pub enum ProductionLiveSourceRuntimeError {
     DuplicateQualifiedMarketExportRoute { route: ShardKey },
     #[error("public crypto durable publication does not match its exact source topology")]
     CryptoPublicationAuthorityMismatch,
+    #[error("public source preparation awaits provider rate admission")]
+    ProviderRateDeferred { not_before: Instant },
     #[error("current public crypto reference and economic terms are unavailable")]
     CryptoReferenceUnavailable,
     #[error("public crypto durable-publication bounds are invalid")]

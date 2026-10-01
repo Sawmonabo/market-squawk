@@ -647,7 +647,16 @@ impl KrakenSource {
                     }
                     return Err(SourceError::ConnectionIdle);
                 },
-                message = socket.next() => message,
+                message = async {
+                    sink.wait_for_capacity().await?;
+                    Ok::<_, market_squawk_sources::SinkError>(socket.next().await)
+                } => match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        self.decode_control.release_subscription_after_sink_rejection()?;
+                        return Err(SourceError::Sink(error));
+                    }
+                },
             };
             let Some(message) = message else {
                 self.decode_control.mark_quarantined()?;

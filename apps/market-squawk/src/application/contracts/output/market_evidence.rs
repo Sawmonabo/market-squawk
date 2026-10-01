@@ -18,7 +18,7 @@ pub(crate) fn reference() -> Value {
         ("publicationSelectionDigest", sha256()),
         ("definitionSelectionDigest", sha256()),
         ("priceAuthorityDigest", sha256()),
-        ("rightsGraphDigest", sha256()),
+        ("rightsInputDigest", sha256()),
         ("sourceScopeDigests", nullable(bounded_array(sha256(), 256))),
     ])
 }

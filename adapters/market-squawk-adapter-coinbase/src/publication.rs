@@ -609,6 +609,21 @@ impl CoinbaseMarketSealRejoin {
         }
     }
 
+    /// Returns the retained charge for an unsealed public continuation, excluding its seal request.
+    ///
+    /// The caller must also charge `ProviderCaptureSealRequest::checked_plain_retained_bytes`,
+    /// which accounts for the raw records and the witness shared with this continuation.
+    pub fn pending_public_retained_bytes(&self) -> Option<usize> {
+        let CoinbasePublicPublicationState::AwaitingSeal {
+            decoded_retained_bytes,
+            ..
+        } = &self.public_state
+        else {
+            return None;
+        };
+        self.public_continuation_retained_bytes(*decoded_retained_bytes)
+    }
+
     /// Returns a checked conservative charge for the sealed continuation retained in rendezvous.
     pub fn conservative_retained_bytes(&self) -> Option<usize> {
         let (decoded_retained_bytes, receipt) = match &self.public_state {
@@ -620,7 +635,6 @@ impl CoinbaseMarketSealRejoin {
             CoinbasePublicPublicationState::NotApplicable
             | CoinbasePublicPublicationState::AwaitingSeal { .. } => return None,
         };
-        let event_ids = size_of::<[u8; 16]>().checked_mul(self.physical_event_ids.len())?;
         let capture = receipt.capture();
         let receipt_bytes = capture
             .source_id()
@@ -636,10 +650,15 @@ impl CoinbaseMarketSealRejoin {
             .checked_add(size_of_val(capture.frames()))?
             .checked_add(receipt.segment().relative_reference().len())?
             .checked_add(size_of_val(receipt.segment().frames()))?;
+        self.public_continuation_retained_bytes(decoded_retained_bytes)?
+            .checked_add(receipt_bytes)
+    }
+
+    fn public_continuation_retained_bytes(&self, decoded_retained_bytes: usize) -> Option<usize> {
+        let event_ids = size_of::<[u8; 16]>().checked_mul(self.physical_event_ids.len())?;
         size_of::<Self>()
             .checked_add(decoded_retained_bytes)?
             .checked_add(event_ids)?
-            .checked_add(receipt_bytes)?
             .checked_add(self.dataset.retained_bytes())?
             .checked_add(self.stream_identity.retained_bytes())?
             .checked_add(

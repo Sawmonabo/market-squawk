@@ -7,12 +7,12 @@ use std::{
 };
 
 use market_squawk_data::{
-    AuthorizedResearchUse, CatalogLimit, DatasetManifestRef, InstrumentDefinitionReadCapability,
+    AuthorizedMarketEventUse, CatalogLimit, InstrumentDefinitionReadCapability,
     MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
-    MarketDataInstrumentReadCapability, PinnedInstrumentDefinitions,
+    MarketDataInstrumentReadCapability, MarketEventUseRequest, PinnedInstrumentDefinitions,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
     ProviderMarketEventSelectionCompleteness, ResearchUse, ResearchUseCatalogError,
-    ResearchUseGraphDigest, ResearchUseLimits, ResearchUseRequest,
+    ResearchUseLimits,
 };
 
 use market_squawk_domain::{
@@ -472,7 +472,7 @@ pub struct MarketInvestmentReadReference {
     maximum_mark_age_nanos: String,
     evidence_digest: String,
     source_selection_digest: String,
-    rights_graph_digest: String,
+    rights_input_digest: String,
     publication_selection_digest: String,
     definition_selection_digest: String,
     price_authority_digest: String,
@@ -513,7 +513,7 @@ impl MarketInvestmentReadReference {
         for digest in [
             &self.evidence_digest,
             &self.source_selection_digest,
-            &self.rights_graph_digest,
+            &self.rights_input_digest,
             &self.publication_selection_digest,
             &self.definition_selection_digest,
             &self.price_authority_digest,
@@ -556,7 +556,7 @@ pub(crate) struct MarketInvestmentReadReceipt {
     market_definitions: MarketDataInstrumentPopulationSelection,
     source_scope: Option<Box<[SourceId]>>,
     evidence_digest: EvidenceDigest,
-    authorization: AuthorizedResearchUse,
+    authorization: AuthorizedMarketEventUse,
     authorized_at: Timestamp,
 }
 
@@ -571,7 +571,7 @@ struct DurableInvestmentSource {
     basis: MarketInvestmentMarkBasis,
     fresh_until: Timestamp,
     observation_id: SourceIdentifier,
-    rights_graph_digest: ResearchUseGraphDigest,
+    rights_input_digest: EvidenceDigest,
 }
 
 impl MarketInvestmentReadReceipt {
@@ -588,7 +588,7 @@ impl MarketInvestmentReadReceipt {
                 .to_string(),
             evidence_digest: hex(self.evidence_digest.bytes()),
             source_selection_digest: hex(self.selection.source_evidence_digest().bytes()),
-            rights_graph_digest: hex(self.source.rights_graph_digest.bytes()),
+            rights_input_digest: hex(self.source.rights_input_digest.bytes()),
             publication_selection_digest: hex(self.publication().selection_digest().bytes()),
             definition_selection_digest: hex(self.definition_digest.bytes()),
             price_authority_digest: hex(self.price_authority_digest),
@@ -899,8 +899,7 @@ impl MarketInvestmentReadCapability {
                 {
                     fresh_until = fresh_until.min(until);
                 }
-                if fresh_until < as_of || receipt.selection().manifest_published_at() > fresh_until
-                {
+                if fresh_until < as_of || receipt.selection().commit_available_at() > fresh_until {
                     continue;
                 }
                 let native_price = match candidate.event() {
@@ -967,7 +966,7 @@ impl MarketInvestmentReadCapability {
                     continue;
                 }
                 let (authorization, authorized_at) = match self.authorize_local_analysis(
-                    receipt.selection().manifest(),
+                    receipt.selection(),
                     deadline,
                     &cancellation,
                 ) {
@@ -1014,9 +1013,9 @@ impl MarketInvestmentReadCapability {
                     basis,
                     fresh_until,
                     observation_id,
-                    rights_graph_digest: authorization.graph().digest(),
+                    rights_input_digest: authorization.rights_input_digest(),
                 });
-                // The candidate retains exact decision facts and a graph digest only. A full
+                // The candidate retains exact decision facts and a rights-input digest only. A full
                 // current authorization is retained exclusively for the selected final read.
                 drop(authorization);
             }
@@ -1071,12 +1070,9 @@ impl MarketInvestmentReadCapability {
             .position(|source| &source.observation_id == selected_id)
             .ok_or(ServiceError::InvalidResult)?;
         let source = sources.swap_remove(index);
-        let (authorization, authorized_at) = self.authorize_local_analysis(
-            source.receipt.selection().manifest(),
-            deadline,
-            &cancellation,
-        )?;
-        if authorization.graph().digest() != source.rights_graph_digest {
+        let (authorization, authorized_at) =
+            self.authorize_local_analysis(source.receipt.selection(), deadline, &cancellation)?;
+        if authorization.rights_input_digest() != source.rights_input_digest {
             return Err(ServiceError::InvalidResult);
         }
         let instrument_definitions = terms.filter(|_| source.terms.is_some());
@@ -1128,12 +1124,12 @@ impl MarketInvestmentReadCapability {
         Ok(Some(receipt))
     }
 
-    fn authorize_local_analysis(
+    pub(crate) fn authorize_local_analysis(
         &self,
-        manifest: &DatasetManifestRef,
+        selection: &ProviderMarketEventPointInTimeSelection,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(AuthorizedResearchUse, Timestamp), ServiceError> {
+    ) -> Result<(AuthorizedMarketEventUse, Timestamp), ServiceError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if cancellation.is_cancelled() {
             return Err(ServiceError::Cancelled);
@@ -1151,12 +1147,14 @@ impl MarketInvestmentReadCapability {
             Duration::from_secs(300),
         )
         .map_err(|_| ServiceError::InvalidRequest)?;
+        let candidate = single_candidate(selection).map_err(|_| ServiceError::InvalidResult)?;
         let authorization = self
             .research
             .analytical()
-            .authorize_research_use(
-                ResearchUseRequest::try_new(
-                    vec![manifest.clone()],
+            .authorize_market_event_use(
+                MarketEventUseRequest::try_new(
+                    selection.commit().clone(),
+                    vec![candidate.coordinate().clone()],
                     ResearchUse::LocalAnalysis,
                     limits,
                 )
@@ -1177,7 +1175,7 @@ impl MarketInvestmentReadCapability {
         let admitted_at = current_market_time()?;
         check_market_read(admitted_at, deadline, cancellation)?;
         if authorization.research_use() != ResearchUse::LocalAnalysis
-            || authorization.graph().roots() != [manifest.clone()]
+            || authorization.commit() != selection.commit()
             || admitted_at >= authorization.expires_at()
         {
             return Err(ServiceError::Unauthorized);
@@ -1192,25 +1190,39 @@ impl MarketInvestmentReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Vec<market_squawk_data::ProviderMarketEventDurableRoute>, ServiceError> {
-        check_market_read(as_of, deadline, cancellation)?;
-        let routes = self
-            .research
-            .analytical()
-            .provider_market_event_durable_routes(
-                instrument_id,
-                &[LiveEventClass::Quote, LiveEventClass::Trade],
-                as_of,
-                as_of,
-                MAX_INVESTMENT_MARKET_CANDIDATES,
-                deadline,
-                cancellation,
-            )
-            .map_err(map_durable_market_ingest_error)?;
-        check_market_read(as_of, deadline, cancellation)?;
+        let mut routes = Vec::new();
+        let mut after = None;
+        loop {
+            check_market_read(as_of, deadline, cancellation)?;
+            let page = self
+                .research
+                .analytical()
+                .provider_market_event_durable_routes(
+                    instrument_id,
+                    &[LiveEventClass::Quote, LiveEventClass::Trade],
+                    as_of,
+                    as_of,
+                    after.as_ref(),
+                    MAX_INVESTMENT_MARKET_CANDIDATES,
+                    deadline,
+                    cancellation,
+                )
+                .map_err(map_durable_market_ingest_error)?;
+            check_market_read(as_of, deadline, cancellation)?;
+            let exhausted = page.len() < MAX_INVESTMENT_MARKET_CANDIDATES;
+            after = page.last().cloned();
+            routes
+                .try_reserve(page.len())
+                .map_err(|_| ServiceError::ResourceExhausted)?;
+            routes.extend(page);
+            if exhausted {
+                break;
+            }
+        }
         Ok(routes)
     }
 
-    /// Reopens exact raw/native/Parquet evidence and rejects changed source selection or terms.
+    /// Reopens exact raw/native/committed evidence and rejects changed source selection or terms.
     pub(crate) async fn recheck(
         &self,
         expected: &MarketInvestmentReadReceipt,
@@ -1417,7 +1429,7 @@ fn durable_candidate(
     definition: &market_squawk_data::MarketDataInstrumentRecord,
     observation_id: &SourceIdentifier,
     as_of: Timestamp,
-    authorization: &AuthorizedResearchUse,
+    authorization: &AuthorizedMarketEventUse,
     authorized_at: Timestamp,
 ) -> Result<SourceCandidate, ServiceError> {
     let candidate =
@@ -1512,8 +1524,8 @@ fn durable_candidate(
             provenance.received_at(),
             provenance
                 .available_at()
-                .max(candidate.coordinate().origin_generation_published_at()),
-            receipt.selection().manifest_published_at(),
+                .max(candidate.coordinate().origin_committed_at()),
+            receipt.selection().commit_available_at(),
         )
         .map_err(|_| ServiceError::InvalidResult)?,
         CandidateAdmissionState::new(
@@ -1524,7 +1536,7 @@ fn durable_candidate(
             CandidateIntegrity::new(
                 IntegrityState::Unverified,
                 Some(provenance.connection_generation()),
-                candidate.coordinate().origin_generation_published_at(),
+                candidate.coordinate().origin_committed_at(),
             ),
             ExecutionEligibility::Ineligible,
         ),
@@ -1538,7 +1550,7 @@ fn durable_mark_digest(
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/durable-investment-mark/v1\0");
     hash.update(receipt.selection.source_evidence_digest().bytes());
-    hash.update(receipt.source.rights_graph_digest.bytes());
+    hash.update(receipt.source.rights_input_digest.bytes());
     hash.update(receipt.publication().selection_digest().bytes());
     hash.update(receipt.definition_digest.bytes());
     hash.update(receipt.price_authority_digest);

@@ -612,11 +612,10 @@ impl InstalledService {
                                 bootstrap::BootstrapAdmission::EncryptedFallbackUnlock
                             }
                             BootstrapRequirement::ForegroundKeyringCredential => {
-                                let [expected_reference] = runtime::credential_references(
-                                    &installation_paths,
-                                )?
-                                .try_into()
-                                .map_err(|_| InstalledServiceError::InvalidRuntimeState)?;
+                                let [expected_reference] =
+                                    runtime::credential_references(&installation_paths)?
+                                        .try_into()
+                                        .map_err(|_| InstalledServiceError::InvalidRuntimeState)?;
                                 bootstrap::BootstrapAdmission::ForegroundKeyringCredential {
                                     expected_reference,
                                 }
@@ -653,19 +652,25 @@ impl InstalledService {
             let config = config.bind_selected_workspace(workspace_paths.root().to_path_buf());
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             let product = match board_fixture {
-                Some(fixture) => LocalProduct::try_new_at_selected_workspace_with_board_fixture(
-                    config.clone(),
-                    &selected_workspace_guard,
-                    &installation_paths,
-                    installation_id,
-                    fixture,
-                ).await?,
-                None => LocalProduct::try_new_at_selected_workspace(
-                    config.clone(),
-                    &selected_workspace_guard,
-                    &installation_paths,
-                    installation_id,
-                ).await?,
+                Some(fixture) => {
+                    LocalProduct::try_new_at_selected_workspace_with_board_fixture(
+                        config.clone(),
+                        &selected_workspace_guard,
+                        &installation_paths,
+                        installation_id,
+                        fixture,
+                    )
+                    .await?
+                }
+                None => {
+                    LocalProduct::try_new_at_selected_workspace(
+                        config.clone(),
+                        &selected_workspace_guard,
+                        &installation_paths,
+                        installation_id,
+                    )
+                    .await?
+                }
             };
             #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
             let product = LocalProduct::try_new_at_selected_workspace(
@@ -673,33 +678,13 @@ impl InstalledService {
                 &selected_workspace_guard,
                 &installation_paths,
                 installation_id,
-            ).await?;
-            let source_recovery_deadline = std::time::Instant::now()
-                .checked_add(CLIENT_TIMEOUT)
-                .ok_or(InstalledServiceError::InvalidComposition)?;
-            match product
-                .restore_active_live_sources(source_recovery_deadline, &CancellationToken::new())
-                .await
-            {
-                Ok(report) => {
-                    tracing::info!(
-                        restored_source_count = report.restored().len(),
-                        "durably active live sources restored during service startup"
-                    );
-                    for failure in report.failures() {
-                        tracing::warn!(
-                            provider = %failure.provider().as_str(),
-                            error = %failure.error(),
-                            "durably active live source could not be restored during service startup"
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "durably active live-source restoration could not be completed during service startup"
-                    );
-                }
+            )
+            .await?;
+            if let Err(error) = product.admit_source_startup(CLIENT_TIMEOUT) {
+                tracing::warn!(
+                    error = %error,
+                    "saved source restoration could not be scheduled"
+                );
             }
             let prepared_operations = PreparedInstalledOperations::prepare(
                 &config,

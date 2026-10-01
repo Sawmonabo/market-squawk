@@ -240,9 +240,14 @@ impl NativeMethodInputs {
 
 impl FairValueDomainService {
     /// Selects true source-owned native monetary roles before running either fundamental method.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source and market authorities, financial method, assumptions and request stay explicit"
+    )]
     pub(super) async fn calculate_native_financial_valuation(
         &self,
         research: &ResearchService,
+        market_reader: &MarketInvestmentReadCapability,
         market: &MarketInvestmentReadReceipt,
         sources: &[Arc<ForecastValuationSource>],
         method: AutomaticValuationMethod,
@@ -317,9 +322,6 @@ impl FairValueDomainService {
                 }
             }
         }
-        if !roots.contains(market.publication().manifest()) {
-            roots.push(market.publication().manifest().clone());
-        }
         let authorization = research
             .authorize_research_use(
                 ResearchUseRequest::try_new(
@@ -346,7 +348,17 @@ impl FairValueDomainService {
             .await
             .map_err(|error| map_research_use_worker_error(error, context))?
             .map_err(|error| map_research_use_error(error, context))?;
-        expires_at = expires_at.min(authorization.expires_at());
+        let (event_authorization, _) = market_reader.authorize_local_analysis(
+            market.publication(),
+            context.deadline(),
+            context.cancellation(),
+        )?;
+        let rights = ValuationRightsReceipt::try_from_authorization(
+            authorization,
+            vec![event_authorization],
+        )
+        .map_err(|_| ServiceError::Unavailable)?;
+        expires_at = expires_at.min(rights.expires_at());
         for candidate in identity.receipt().ordered_candidates() {
             for end in [
                 candidate.effective_end(),
@@ -417,9 +429,7 @@ impl FairValueDomainService {
             )?,
         )
         .map_err(|_| ServiceError::InvalidResult)?;
-        let rights = ValuationRightsReceipt::try_from_authorization(authorization)
-            .map_err(|_| ServiceError::Unavailable)?;
-        let graph = rights.graph_digest();
+        let rights_input_digest = rights.rights_input_digest();
         let common = AutomaticValuationInput {
             account_id: request.account_id,
             company_security: identity.receipt().clone(),
@@ -428,7 +438,7 @@ impl FairValueDomainService {
             amount_basis: ValuationAmountBasis::TotalCommonEquity,
             current_market: point_input(
                 current_market,
-                graph,
+                rights_input_digest,
                 market.reference().source_cutoff()?,
                 expires_at,
             )?,
@@ -444,7 +454,7 @@ impl FairValueDomainService {
         let mut points = native
             .inputs
             .into_iter()
-            .map(|input| point_input(input, graph, request.knowledge_at, expires_at))
+            .map(|input| point_input(input, rights_input_digest, request.knowledge_at, expires_at))
             .collect::<Result<Vec<_>, _>>()?;
         let n = usize::from(FISCAL_PROJECTION_EXPLICIT_PERIODS);
         let calculation = if method == AutomaticValuationMethod::ResidualIncome {

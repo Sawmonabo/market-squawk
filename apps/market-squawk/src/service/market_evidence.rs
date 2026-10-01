@@ -928,7 +928,7 @@ fn available(
     let available_at = observation
         .timestamps()
         .available_at()
-        .max(receipt.publication().manifest_published_at());
+        .max(receipt.publication().commit_available_at());
     let fresh_until = mark.fresh_until().ok_or(ServiceError::InvalidResult)?;
     let mark_result = InvestmentMark {
         value: mark.value().normalize().to_string(),

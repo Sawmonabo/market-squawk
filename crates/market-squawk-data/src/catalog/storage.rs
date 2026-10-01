@@ -709,7 +709,7 @@ fn is_windows_reserved_name(component: &str) -> bool {
             })
 }
 
-pub(super) fn now_timestamp() -> Result<Timestamp, CatalogError> {
+pub(crate) fn now_timestamp() -> Result<Timestamp, CatalogError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| CatalogError::InvalidConfiguration)?;

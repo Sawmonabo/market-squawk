@@ -51,7 +51,8 @@ impl Drop for NotifyAccessChange<'_> {
 pub(crate) struct CredentialAccessCoordinator {
     onboarding: Arc<ProviderOnboardingService>,
     portal: Arc<dyn ProviderPortalActivationAuthority>,
-    lifecycle: Arc<dyn SourceLifecycleAuthority>,
+    lifecycle: Arc<super::source_lifecycle::ProductionSourceLifecycleAuthority>,
+    startup_tasks: Arc<super::startup::ProductStartupTasks>,
     paper: crate::application::PaperCredentialRuntimeControl,
     mutation: Mutex<RuntimeTransition>,
     changed: Notify,
@@ -63,14 +64,16 @@ impl CredentialAccessCoordinator {
     pub(crate) fn new(
         onboarding: Arc<ProviderOnboardingService>,
         portal: Arc<dyn ProviderPortalActivationAuthority>,
-        lifecycle: Arc<dyn SourceLifecycleAuthority>,
+        lifecycle: Arc<super::source_lifecycle::ProductionSourceLifecycleAuthority>,
         paper: crate::application::PaperCredentialRuntimeControl,
+        startup_tasks: Arc<super::startup::ProductStartupTasks>,
     ) -> Self {
         Self {
             onboarding,
             portal,
             lifecycle,
             paper,
+            startup_tasks,
             mutation: Mutex::new(RuntimeTransition::Open),
             changed: Notify::new(),
             suspended: AtomicBool::new(false),
@@ -296,6 +299,9 @@ impl CredentialAccessCoordinator {
                     self.lifecycle
                         .resume_credential_runtimes(deadline, cancellation)
                         .await?;
+                    self.startup_tasks
+                        .admit_public_sources(Arc::clone(&self.lifecycle))
+                        .map_err(|_| SourceLifecycleError::Unavailable)?;
                     *transition = RuntimeTransition::Resuming(ResumeStep::Paper);
                 }
                 RuntimeTransition::Resuming(ResumeStep::Paper) => {

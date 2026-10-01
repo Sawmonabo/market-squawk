@@ -3,7 +3,7 @@
 use market_squawk_live::{
     LiveRouteConfig, LiveRuntime, LiveRuntimeConfig, LiveRuntimeExportPlan, LiveRuntimeIngress,
     LiveSnapshotReader, PreparedLiveActionHookGroup, RouteActionHook,
-    RouteCommittedResearchMarketExport, RouteQualifiedMarketExport,
+    RouteCommittedResearchMarketExport, RouteQualifiedMarketExport, ShardId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +40,13 @@ impl ProductionLiveRuntimeOwner {
         match self {
             Self::Standard(runtime) => runtime.snapshots(),
             Self::ResearchExports(runtime) => runtime.snapshots(),
+        }
+    }
+
+    pub(in crate::live_source) async fn next_snapshot_notification(&mut self) -> Option<ShardId> {
+        match self {
+            Self::Standard(runtime) => runtime.next_snapshot_notification().await,
+            Self::ResearchExports(runtime) => runtime.next_snapshot_notification().await,
         }
     }
 

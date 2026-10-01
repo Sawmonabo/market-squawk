@@ -242,7 +242,7 @@ flowchart LR
     OwnerLive --> Canonical
     OwnerRest --> Canonical
     Cold["SEC + macro + Alpaca history + IEX HIST"] --> Canonical
-    Canonical --> Store["Retained raw evidence + canonical Parquet generations"]
+    Canonical --> Store["Retained raw evidence + SQLite active events + Parquet analytical data"]
     Store --> Read["PIT selectors + fixed typed application reads"]
     Read --> Product["Markets + research + models + decisions"]
 ```
@@ -408,7 +408,7 @@ flowchart LR
     Sources["Alpaca · public Coinbase/Kraken crypto · optional Coinbase Direct · owner-enabled Schwab · SEC · government APIs · Tiingo · Yahoo · IEX HIST · exchange reference files"]
     Raw["Bounded raw evidence"]
     Canonical["Canonical typed schemas"]
-    Store["Immutable Parquet generations + manifests"]
+    Store["SQLite active events + Parquet analytical data + exact evidence"]
     Select["PIT selectors + typed application reads"]
     UI["Markets · Funds · Options · Opportunities · Portfolio · Paper"]
 
@@ -546,11 +546,11 @@ identity in the registry.
 ### Physical storage and publication
 
 The [2026-10-01 storage research](../research/2026-10-01-market-data-storage/final-report.md)
-recommends revising the current boundary below: transactional SQLite microbatches for active
-events and indexed current/as-of reads, with bounded Parquet archives queried through DataFusion.
-That design is not yet implemented or performance-verified. Whole-generation compaction below
-is an interim behavior, not the accepted continuous-ingestion solution. The delivery ledger owns
-implementation status and the required producer-to-consumer refresh.
+defines the approved boundary: transactional SQLite microbatches for active events and indexed
+current/as-of reads, with bounded Parquet archives queried through DataFusion. The active-event
+slice is implemented and has focused restart/integrity evidence; archive handoff and reclamation
+remain required work. Whole-history event compaction is removed. No throughput or whole-app
+memory claim follows from this change. The delivery ledger owns integration and acceptance status.
 
 The durable layout extends the existing [research data plane](research-data-plane.md); it does not
 replace it with a second database or a new data application.
@@ -560,20 +560,22 @@ replace it with a second database or a new data application.
 | Live hot state | Bounded actor-owned memory for current subscriptions, latest observations, sequence/gap state, and feature windows. It is restartable state, not the durable archive. |
 | Raw evidence | Exact bounded HTTP response/page bytes or bounded stream-frame micro-batches, written atomically and addressed by digest with a secret-free request/receipt. Never one file per event and never an unbounded response. |
 | Canonical batches | Code-owned Arrow schemas and validators convert one exact raw receipt into typed rows. Conversion rejects schema drift, impossible clocks/values, unresolved required identity, and partial pagination represented as complete. |
-| Durable analytical data | Immutable, content-addressed Parquet generations with ZSTD, code-owned schema metadata, exact parents, row/time bounds, quality summary, and manifests. Compaction creates a new generation; it never mutates an admitted one. |
-| SQLite control plane | Provider declarations, entitlements, quota windows, permits, jobs, cursors/checkpoints, raw-object indexes, dataset/manifest authority, pins, health, and recovery. It is not a synchronous per-tick warehouse. |
+| Active market events | SQLite commits canonical rows, exact publication/source evidence and successful ingest state atomically per microbatch. Indexed logical commit and row identities survive restart and remain independent of physical placement. No per-tick file or transaction is required. |
+| Bulk and cold analytical data | Immutable, content-addressed Parquet generations with code-owned schema metadata, exact parents, row/time bounds, quality summary, and manifests. Cold event export must publish bounded ranges with coherent reader visibility before reclaiming active rows; this handoff remains incomplete. Compression/statistics depend on the actual writer and must not be assumed. |
+| SQLite control plane | The same database owns provider declarations, entitlements, quota windows, permits, jobs, cursors/checkpoints, raw-object indexes, logical event commits, dataset/manifest authority, pins, health, and recovery. |
 | Derived datasets | Separate immutable Parquet generations for local bars, features, statements/ratios, model inputs/outputs, backtests, and decision evidence. Each binds all source generations and implementation identities. |
 | Product reads | Fixed, bounded typed application operations over exact pins/PIT selectors. Desktop receives closed results; operator DataFusion/Python access cannot become an unbounded frontend query path. |
 
 Logical partition keys are data family, effective/session date, provider/feed where material, and a
 bounded instrument bucket. They improve locality but never define identity; identity remains in the
-row and manifest. The writer micro-batches by bounded bytes/records/time, seals atomically, and
-compacts small objects later under a new manifest. A raw capture receipt is not a disk
+canonical row and logical evidence. The event writer micro-batches by bounded bytes/records/time
+and acknowledges the canonical database transaction only after required raw custody is durable.
+Bulk writers retain their bounded immutable publication path. A raw capture receipt is not a disk
 acknowledgement, and a physical file that is not admitted by the SQLite/manifest authority is not a
 published dataset.
 
 Market-event PIT reads use an independent, endpoint-bound read-only SQLite WAL transaction
-inside their existing supervised I/O worker. Selection, manifest membership, publication and
+inside their existing supervised I/O worker. Selection, logical commit membership, publication and
 native identity, metadata and reconstruction share that snapshot; ingestion retains its writer
 coordination. Reads preserve their original cutoffs, cancellation/deadline and bounded selected
 object verification without acquiring the writer or manifest connection mutex. The snapshot ends

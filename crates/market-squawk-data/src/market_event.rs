@@ -97,6 +97,111 @@ impl ProviderMarketEventArrowBatch {
         build_event_batch(dataset, digest, kind, rows)
     }
 
+    /// Rebuilds one complete canonical publication from bounded retained JSON rows and its
+    /// original native evidence. The same Arrow validation is used for hot and archived reads.
+    pub(crate) fn try_from_canonical_json_with_publication_evidence(
+        payloads: Vec<Vec<u8>>,
+        evidence: &PersistedProviderPublicationEvidence,
+        maximum_retained_bytes: usize,
+    ) -> Result<Self, ArrowConversionError> {
+        evidence
+            .verify_integrity()
+            .map_err(|_| ArrowConversionError::InvalidMarketEventRow)?;
+        if maximum_retained_bytes == 0 || maximum_retained_bytes > MAX_EVENT_RESTART_BYTES {
+            return Err(ArrowConversionError::InvalidRetainedByteLimit {
+                requested_bytes: maximum_retained_bytes,
+                maximum_bytes: MAX_EVENT_RESTART_BYTES,
+            });
+        }
+        if payloads.len() != publication_row_count(evidence)? {
+            return Err(ArrowConversionError::InvalidMarketEventRow);
+        }
+        let retained = payloads.iter().try_fold(0usize, |total, payload| {
+            total
+                .checked_add(payload.len())
+                .ok_or(ArrowConversionError::RetainedSizeOverflow)
+        })?;
+        if retained > maximum_retained_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: retained,
+                limit_bytes: maximum_retained_bytes,
+            });
+        }
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(payloads.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        for payload in payloads {
+            let event: MarketEvent = serde_json::from_slice(&payload)?;
+            if serde_json::to_vec(&event)? != payload {
+                return Err(ArrowConversionError::InvalidMarketEventRow);
+            }
+            events.push(event);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(events.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        for (ordinal, event) in events.iter().enumerate() {
+            let expected = expected_row(evidence, ordinal)
+                .ok_or(ArrowConversionError::InvalidMarketEventRow)?;
+            rows.push(match expected {
+                ExpectedRow::Response(row) => EventProjection {
+                    event,
+                    event_digest: row.canonical_event_digest(),
+                    native_payload: row.native_semantic_payload(),
+                    identity_selection: row.identity_selection(),
+                    native_digest: row.native_semantic_digest(),
+                    component_kind: RESPONSE_KIND,
+                    logical_ordinal: row.capture_page_ordinal(),
+                    physical_ordinal: row.physical_frame_ordinal(),
+                    event_id: None,
+                    connection_id: None,
+                    source_sequence: row.source_sequence(),
+                    raw_payload_digest: row.payload_digest(),
+                },
+                ExpectedRow::Event(row) => EventProjection {
+                    event,
+                    event_digest: row.canonical_event_digest(),
+                    native_payload: row.native_semantic_payload(),
+                    identity_selection: row.identity_selection(),
+                    native_digest: row.native_semantic_digest(),
+                    component_kind: EVENT_KIND,
+                    logical_ordinal: row.event_frame_ordinal(),
+                    physical_ordinal: row.physical_frame_ordinal(),
+                    event_id: Some(row.event_id()),
+                    connection_id: Some(row.connection_id()),
+                    source_sequence: row.source_sequence(),
+                    raw_payload_digest: row.payload_digest(),
+                },
+            });
+        }
+        let provider_dataset = match evidence {
+            PersistedProviderPublicationEvidence::ResponseMarketEvent(response) => {
+                response.capture().dataset()
+            }
+            PersistedProviderPublicationEvidence::EventMicrobatch(event) => {
+                event.capture().dataset()
+            }
+            PersistedProviderPublicationEvidence::CompositeResponseEvent { response, .. } => {
+                response.capture().dataset()
+            }
+        };
+        let kind = match evidence.publication_kind() {
+            RESPONSE_KIND => RESPONSE_KIND,
+            EVENT_KIND => EVENT_KIND,
+            COMPOSITE_KIND => COMPOSITE_KIND,
+            _ => return Err(ArrowConversionError::InvalidMarketEventRow),
+        };
+        let rebuilt =
+            build_event_batch(provider_dataset, evidence.publication_digest(), kind, rows)?;
+        drop(events);
+        Self::try_from_record_batch_with_publication_evidence(
+            rebuilt.dataset.record_batch().clone(),
+            evidence,
+            maximum_retained_bytes,
+        )
+    }
+
     /// Reopens typed Parquet rows and verifies exact catalog publication evidence.
     pub fn try_from_record_batch_with_publication_evidence(
         batch: RecordBatch,

@@ -1676,8 +1676,11 @@ credential import, activation, scheduling, fallback, product composition, and re
 No frontend calls a provider. Every source must complete
 `configured -> entitled -> producing -> durably published -> queryable -> workflow-composed ->
 restart/release-proven` through the existing protected secret store, provider-rate authority,
-bounded raw capture, closed canonical families, Arrow validation, immutable Parquet generations,
-SQLite manifests/control state, point-in-time selectors, and bounded typed application operations.
+bounded raw capture, closed canonical families, Arrow validation, transactional SQLite active-event
+microbatches, immutable Parquet for bulk/cold analytical data, point-in-time selectors, and bounded
+typed application operations. The owner-approved 2026-10-01 storage decision keeps logical event
+evidence independent of physical placement; bounded archive handoff/reclamation remains required.
+The delivery ledger distinguishes implemented storage from verified continuous-ingestion behavior.
 Schwab uses only the code-owned market-data route allowlist plus minimum read-only User Preference
 bootstrap; it grants no account, position, transaction, or order use. The credential file remains a
 32-field one-time import/probe-intent format and must not become another provider, adapter, crate,

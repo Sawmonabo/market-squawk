@@ -246,7 +246,14 @@ impl FairValueDomainService {
                         Ok(binding) => {
                             stage = AutomaticValuationStage::NativeCalculationPublication;
                             self.calculate_native_financial_valuation(
-                                &research, market, &fiscal, method, binding, &request, context,
+                                &research,
+                                market_reader,
+                                market,
+                                &fiscal,
+                                method,
+                                binding,
+                                &request,
+                                context,
                             )
                             .await
                         }

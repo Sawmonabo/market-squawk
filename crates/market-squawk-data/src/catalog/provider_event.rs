@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use super::provider_capture::{
     MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
-    ProviderArtifactInputCoordinate, native_implementation_name, parse_native_implementation,
-    parse_source_sequence, raw_claim_digest, source_sequence_blob,
+    native_implementation_name, parse_native_implementation, parse_source_sequence,
+    raw_claim_digest, source_sequence_blob,
 };
 use super::storage::{append_audit, parse_digest, sha256};
 use super::{Catalog, CatalogError};
@@ -1732,9 +1732,16 @@ pub(crate) fn retain_prepared_provider_publication_binding(
     connection: &Transaction<'_>,
     run_id: Uuid,
     prepared: &PreparedProviderPublicationBinding,
-    coordinate: ProviderArtifactInputCoordinate,
+    commit: &crate::MarketEventCommitRef,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
+    if commit.publication_digest() != prepared.publication_digest()
+        || commit.row_count()
+            != u64::try_from(prepared_provider_publication_row_count(prepared)?)
+                .map_err(|_| CatalogError::ProviderEventMismatch)?
+    {
+        return Err(CatalogError::ProviderEventMismatch);
+    }
     match prepared {
         PreparedProviderPublicationBinding::ResponseMarketEvent(response) => {
             retain_response_event_binding_evidence(connection, run_id, response, recorded_at)?;
@@ -1747,11 +1754,12 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 Some(response.evidence.binding_digest),
                 None,
                 None,
-                coordinate,
+                commit,
                 recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
                 connection,
+                commit,
                 response.evidence.binding_digest,
                 "response_market_event",
                 0,
@@ -1770,11 +1778,12 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 None,
                 Some(event.evidence.binding_digest),
                 None,
-                coordinate,
+                commit,
                 recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
                 connection,
+                commit,
                 event.evidence.binding_digest,
                 "event_microbatch",
                 0,
@@ -1817,11 +1826,12 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 Some(response.evidence.binding_digest),
                 Some(event.evidence.binding_digest),
                 Some(*composite_binding_digest),
-                coordinate,
+                commit,
                 recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
                 connection,
+                commit,
                 *composite_binding_digest,
                 "composite_response_event",
                 0,
@@ -1830,6 +1840,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
             )?;
             retain_provider_market_event_selection_rows(
                 connection,
+                commit,
                 *composite_binding_digest,
                 "composite_response_event",
                 u32::try_from(*response_row_count)
@@ -1916,6 +1927,7 @@ fn require_current_market_data_reference(
 
 fn retain_provider_market_event_selection_rows(
     connection: &Connection,
+    commit: &crate::MarketEventCommitRef,
     publication_digest: EvidenceDigest,
     publication_kind: &'static str,
     first_publication_row_ordinal: u32,
@@ -1963,9 +1975,10 @@ fn retain_provider_market_event_selection_rows(
               canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
               source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
               connection_generation_be, source_sequence_be, provider_event_id,
-              coordinate_digest, cohort_key, provider_product, provider_channel)
+              coordinate_digest, cohort_key, provider_product, provider_channel,
+              dataset_id, commit_sequence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 digest_bytes(candidate.publication_digest),
                 candidate.publication_kind.as_ref(),
@@ -1991,6 +2004,8 @@ fn retain_provider_market_event_selection_rows(
                 candidate.cohort_key(),
                 candidate.provider_product.as_source_identifier().as_str(),
                 candidate.provider_channel.as_source_identifier().as_str(),
+                commit.dataset_id().as_str(),
+                to_i64(commit.sequence())?,
             ],
         )?;
         if inserted > 1 {
@@ -2543,7 +2558,7 @@ fn associate_provider_publication(
     response_digest: Option<EvidenceDigest>,
     event_digest: Option<EvidenceDigest>,
     composite_digest: Option<EvidenceDigest>,
-    coordinate: ProviderArtifactInputCoordinate,
+    commit: &crate::MarketEventCommitRef,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     let used: bool = connection.query_row(
@@ -2567,20 +2582,18 @@ fn associate_provider_publication(
         "INSERT INTO ingest_run_provider_publication_bindings
          (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
           publication_digest, publication_kind, source_id, response_binding_digest,
-          event_binding_digest, composite_binding_digest)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          event_binding_digest, composite_binding_digest, active_dataset_id, active_commit_sequence)
+         VALUES (?1, 0, NULL, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             run_id.to_string(),
-            i64::try_from(coordinate.output_artifact_ordinal())
-                .map_err(|_| CatalogError::ProviderEventConflict)?,
-            i64::try_from(coordinate.object_input_ordinal())
-                .map_err(|_| CatalogError::ProviderEventConflict)?,
             digest_bytes(publication_digest),
             kind,
             source_id,
             response_digest.map(digest_bytes),
             event_digest.map(digest_bytes),
             composite_digest.map(digest_bytes),
+            commit.dataset_id().as_str(),
+            to_i64(commit.sequence())?,
         ],
     )?;
     if inserted != 1 {
@@ -3455,7 +3468,7 @@ fn copy_identity_selection(payload: Option<&[u8]>) -> Result<Option<Vec<u8>>, Ca
 }
 
 /// Loads exact publication coordinates on the caller's retained read transaction.
-pub(super) fn provider_market_event_selection_for_publication(
+pub(crate) fn provider_market_event_selection_for_publication(
     connection: &Connection,
     publication_digest: EvidenceDigest,
 ) -> Result<Vec<ProviderMarketEventSelectionCandidate>, CatalogError> {

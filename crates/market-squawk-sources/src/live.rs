@@ -437,8 +437,21 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
     }
 }
 
-/// Nonblocking bounded sink used by a live source reader before decoding.
+/// Bounded sink used by a live source reader before decoding.
 pub trait RawMarketSink: Send {
+    /// Reserves admission before the next transport frame is read.
+    ///
+    /// Readers await this under the same cancellation and strictest deadline as receiving the
+    /// frame. A sink with an asynchronous publication queue retains its capacity reservation
+    /// until publication or drop; sinks without that queue can accept immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sink error if its publication owner has closed or the generation is terminal.
+    fn wait_for_capacity(&mut self) -> BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Binds an exact provider request or established transport to this live stream's health.
     ///
     /// Sources call this once after the transport handshake and before publishing the first
