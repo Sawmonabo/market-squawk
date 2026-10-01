@@ -11,7 +11,7 @@ use std::{
     fmt,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    sync::MutexGuard,
+    sync::{MutexGuard, RwLockWriteGuard},
 };
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -535,6 +535,7 @@ enum RecoverySessionState {
 pub struct SealedResearchRecoverySession<'store, 'control> {
     store: &'store SealedResearchJournalStore,
     _operation: MutexGuard<'store, ()>,
+    _recovery: RwLockWriteGuard<'store, ()>,
     control: &'control dyn ResearchObjectControl,
     admission: SealedResearchRecoveryAdmission,
     retained: Vec<RetainedRawObject>,
@@ -1244,12 +1245,8 @@ impl SealedResearchJournalStore {
         claim: &ResearchObjectClaim,
         control: &dyn ResearchObjectControl,
     ) -> Result<VerifiedResearchObject, SealedResearchJournalStoreError> {
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        let _read = self.immutable_read_with_control(control)?;
         self.validate_owner()?;
-        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
         let verified = self.open_verified_logical_claim_inner_with_control(claim, Some(control))?;
         control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
         Ok(verified)
@@ -1270,6 +1267,12 @@ impl SealedResearchJournalStore {
             .operation
             .lock()
             .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        // Mutations take only operation; immutable verification takes only the shared guard.
+        // Recovery takes both in this order and retains them until reconciliation completes.
+        let recovery = self
+            .recovery_exclusion
+            .write()
+            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
         self.validate_owner()?;
         let mut retained = Vec::new();
         retained
@@ -1278,6 +1281,7 @@ impl SealedResearchJournalStore {
         Ok(SealedResearchRecoverySession {
             store: self,
             _operation: operation,
+            _recovery: recovery,
             control,
             admission,
             retained,

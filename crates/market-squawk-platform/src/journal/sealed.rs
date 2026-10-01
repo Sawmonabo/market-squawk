@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -482,8 +482,9 @@ impl SealedResearchJournalStoreError {
 /// Single-owner sealed `MSJ1` research-segment authority.
 ///
 /// The retained filesystem lock prevents two store instances from racing publication or startup
-/// recovery. The in-process mutex serializes seal/open/recovery on this owner. Recovery must be
-/// called only after the caller has supplied the complete authoritative catalog receipt set.
+/// recovery. The mutation mutex serializes seals and recovery; immutable reads share a separate
+/// guard that excludes recovery without blocking seals or other reads. Recovery must be called
+/// only after the caller has supplied the complete authoritative catalog receipt set.
 #[derive(Debug)]
 pub struct SealedResearchJournalStore {
     root: Arc<Dir>,
@@ -493,6 +494,7 @@ pub struct SealedResearchJournalStore {
     _owner_lock: File,
     owner_identity: FileIdentity,
     operation: Mutex<()>,
+    recovery_exclusion: RwLock<()>,
 }
 
 impl SealedResearchJournalStore {
@@ -542,6 +544,7 @@ impl SealedResearchJournalStore {
             _owner_lock: owner_lock,
             owner_identity,
             operation: Mutex::new(()),
+            recovery_exclusion: RwLock::new(()),
         })
     }
 
@@ -566,9 +569,9 @@ impl SealedResearchJournalStore {
         &self,
         receipt: &SealedResearchJournalSegmentReceipt,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
-        let _operation = self
-            .operation
-            .lock()
+        let _read = self
+            .recovery_exclusion
+            .read()
             .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
         self.validate_owner()?;
         self.open_verified_claim_inner(receipt.claim())
@@ -579,9 +582,9 @@ impl SealedResearchJournalStore {
         &self,
         claim: &SealedResearchJournalSegmentClaim,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
-        let _operation = self
-            .operation
-            .lock()
+        let _read = self
+            .recovery_exclusion
+            .read()
             .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
         self.validate_owner()?;
         self.open_verified_claim_inner(claim)
@@ -589,23 +592,14 @@ impl SealedResearchJournalStore {
 
     /// Reopens a persisted claim under caller-owned cooperative cancellation and deadline checks.
     ///
-    /// Verification reuses the bounded streaming verifier used by recovery. The operation mutex is
-    /// acquired without waiting so a contended owner cannot outlive the caller's absolute deadline.
+    /// Verification reuses the bounded streaming verifier used by recovery. The shared read guard
+    /// is acquired without waiting so recovery cannot outlive the caller's absolute deadline.
     pub fn open_verified_claim_with_control(
         &self,
         claim: &SealedResearchJournalSegmentClaim,
         control: &dyn ResearchObjectControl,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
-        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
-        let _operation = match self.operation.try_lock() {
-            Ok(operation) => operation,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ResearchObjectControlError::Unavailable.into());
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(SealedResearchJournalStoreError::OperationLockPoisoned);
-            }
-        };
+        let _read = self.immutable_read_with_control(control)?;
         self.validate_owner()?;
         let verified = self.open_verified_claim_inner_with_control(claim, Some(control))?;
         control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
@@ -621,21 +615,28 @@ impl SealedResearchJournalStore {
         claim: &SealedResearchJournalSegmentClaim,
         control: &dyn ResearchObjectControl,
     ) -> Result<SealedResearchJournalSegmentReceipt, SealedResearchJournalStoreError> {
-        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
-        let _operation = match self.operation.try_lock() {
-            Ok(operation) => operation,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ResearchObjectControlError::Unavailable.into());
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(SealedResearchJournalStoreError::OperationLockPoisoned);
-            }
-        };
+        let _read = self.immutable_read_with_control(control)?;
         self.validate_owner()?;
         let receipt =
             self.visit_verified_claim_inner_with_control(claim, Some(control), |_| Ok(()))?;
         control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
         Ok(receipt)
+    }
+
+    fn immutable_read_with_control(
+        &self,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<RwLockReadGuard<'_, ()>, SealedResearchJournalStoreError> {
+        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+        match self.recovery_exclusion.try_read() {
+            Ok(read) => Ok(read),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Err(ResearchObjectControlError::Unavailable.into())
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err(SealedResearchJournalStoreError::OperationLockPoisoned)
+            }
+        }
     }
 
     fn validate_owner(&self) -> Result<(), SealedResearchJournalStoreError> {
@@ -2073,6 +2074,24 @@ mod tests {
             store.verify_claim_with_control(receipt.claim(), &Allow)?,
             receipt
         );
+        // An in-progress seal and another immutable reader do not deny exact retained reads.
+        {
+            let _seal = store.operation.lock().map_err(|_| "seal lock poisoned")?;
+            let _reader = store
+                .recovery_exclusion
+                .read()
+                .map_err(|_| "read lock poisoned")?;
+            assert_eq!(
+                store
+                    .open_verified_claim_with_control(receipt.claim(), &Allow)?
+                    .records(),
+                std::slice::from_ref(&first)
+            );
+            assert_eq!(
+                store.verify_claim_with_control(receipt.claim(), &Allow)?,
+                receipt
+            );
+        }
         // A self-consistent physical claim still cannot change metadata in the raw envelope.
         let mut wrong_sequence = receipt.claim().clone();
         wrong_sequence.frames[0].source_sequence = Some(7);
@@ -2118,6 +2137,18 @@ mod tests {
         let authoritative = SealedResearchRawClaim::JournalSegment(receipt.claim().clone());
         let mut recovery =
             store.begin_recovery(SealedResearchRecoveryAdmission::try_new(4, 32)?, &Allow)?;
+        assert!(matches!(
+            store.open_verified_claim_with_control(receipt.claim(), &Allow),
+            Err(super::SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::Unavailable
+            ))
+        ));
+        assert!(matches!(
+            store.verify_claim_with_control(receipt.claim(), &Allow),
+            Err(super::SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::Unavailable
+            ))
+        ));
         recovery.observe_claim(&authoritative)?;
         let recovery = recovery.finish()?;
         assert!(recovery.quarantined_staging().is_empty());
