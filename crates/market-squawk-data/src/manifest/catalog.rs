@@ -712,6 +712,7 @@ impl AnalyticalManifestCatalog {
         knowledge_cutoff: Timestamp,
         before_version: Option<u64>,
         limit: usize,
+        result_limits: CatalogResultLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<DatasetManifestRef>, bool), ManifestCatalogError> {
@@ -722,9 +723,15 @@ impl AnalyticalManifestCatalog {
         }
         let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
         let before_version = before_version.map(to_i64).transpose()?;
-        self.read_bounded(deadline, cancellation, |connection| {
-            let mut statement = connection.prepare(
-                "SELECT generation.dataset_id, generation.manifest_version,
+        let snapshot = self
+            .read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))?;
+        snapshot
+            .read(|snapshot| {
+                let connection = snapshot.connection();
+                let mut statement = connection.prepare(
+                    "SELECT generation.dataset_id, generation.manifest_version,
                         generation.schema_name, generation.schema_version,
                         generation.schema_fingerprint, generation.content_hash
                  FROM analytical_available_generations AS generation
@@ -749,31 +756,33 @@ impl AnalyticalManifestCatalog {
                      WHERE source_input.generation_sequence=generation.generation_sequence
                    )
                  ORDER BY generation.manifest_version DESC LIMIT ?7",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    dataset_id.as_str(),
-                    knowledge_cutoff.unix_nanos(),
-                    before_version,
-                    schema.name(),
-                    i64::from(schema.version().get()),
-                    schema.fingerprint().as_slice(),
-                    i64::try_from(limit + 1).map_err(|_| ManifestCatalogError::CountOverflow)?
-                ],
-                manifest_reference_from_row,
-            )?;
-            let mut references = Vec::new();
-            references
-                .try_reserve_exact(limit + 1)
-                .map_err(|_| ManifestCatalogError::CountOverflow)?;
-            for row in rows {
-                check_read_operation(deadline, cancellation)?;
-                references.push(row??);
-            }
-            let has_more = references.len() > limit;
-            references.truncate(limit);
-            Ok((references, has_more))
-        })
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        dataset_id.as_str(),
+                        knowledge_cutoff.unix_nanos(),
+                        before_version,
+                        schema.name(),
+                        i64::from(schema.version().get()),
+                        schema.fingerprint().as_slice(),
+                        i64::try_from(limit + 1)
+                            .map_err(|_| ManifestCatalogError::CountOverflow)?
+                    ],
+                    manifest_reference_from_row,
+                )?;
+                let mut references = Vec::new();
+                references
+                    .try_reserve_exact(limit + 1)
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?;
+                for row in rows {
+                    check_read_operation(deadline, cancellation)?;
+                    references.push(row??);
+                }
+                let has_more = references.len() > limit;
+                references.truncate(limit);
+                Ok((references, has_more))
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     /// Resolves one exact creating generation by its retained capture and content identities.
@@ -2298,6 +2307,7 @@ impl AnalyticalManifestCatalog {
         &self,
         after: Option<&DatasetId>,
         limit: usize,
+        result_limits: CatalogResultLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<CatalogGenerationPage, ManifestCatalogError> {
@@ -2307,9 +2317,15 @@ impl AnalyticalManifestCatalog {
             .ok_or(ManifestCatalogError::CountOverflow)?;
         let retrieval_limit =
             i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?;
-        let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "WITH latest AS (
+        let snapshot = self
+            .read_snapshot(result_limits, deadline, cancellation)
+            .map_err(ManifestCatalogError::from)
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))?;
+        snapshot
+            .read(|snapshot| {
+                let connection = snapshot.connection();
+                let mut statement = connection.prepare(
+                    "WITH latest AS (
                  SELECT dataset_id, MAX(manifest_version) AS manifest_version
                  FROM analytical_available_generations
                  WHERE dataset_id>?1
@@ -2323,44 +2339,47 @@ impl AnalyticalManifestCatalog {
              FROM analytical_available_generations AS generations
              JOIN latest USING (dataset_id, manifest_version)
              ORDER BY generations.dataset_id",
-        )?;
-        let rows = statement.query_map(
-            params![
-                after.map(DatasetId::as_str).unwrap_or_default(),
-                retrieval_limit
-            ],
-            manifest_reference_from_row,
-        )?;
-        let mut references = Vec::new();
-        references
-            .try_reserve_exact(
-                usize::try_from(retrieval_limit)
-                    .map_err(|_| ManifestCatalogError::CountOverflow)?,
-            )
-            .map_err(|_| ManifestCatalogError::CountOverflow)?;
-        for row in rows {
-            check_read_operation(deadline, cancellation)?;
-            references.push(row??);
-        }
-        drop(statement);
-        let has_more = references.len() > limit;
-        references.truncate(limit);
-        let mut generations = Vec::new();
-        generations
-            .try_reserve_exact(references.len())
-            .map_err(|_| ManifestCatalogError::CountOverflow)?;
-        for reference in references {
-            check_read_operation(deadline, cancellation)?;
-            let pinned = load_pinned(&connection, &reference, self.max_objects_per_generation)?;
-            let source_id = generation_source(&connection, &reference)?;
-            let python_export_sha256 = generation_python_export(&connection, &reference)?;
-            generations.push((pinned, source_id, python_export_sha256));
-        }
-        check_read_operation(deadline, cancellation)?;
-        Ok(CatalogGenerationPage {
-            generations,
-            has_more,
-        })
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        after.map(DatasetId::as_str).unwrap_or_default(),
+                        retrieval_limit
+                    ],
+                    manifest_reference_from_row,
+                )?;
+                let mut references = Vec::new();
+                references
+                    .try_reserve_exact(
+                        usize::try_from(retrieval_limit)
+                            .map_err(|_| ManifestCatalogError::CountOverflow)?,
+                    )
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?;
+                for row in rows {
+                    check_read_operation(deadline, cancellation)?;
+                    references.push(row??);
+                }
+                drop(statement);
+                let has_more = references.len() > limit;
+                references.truncate(limit);
+                let mut generations = Vec::new();
+                generations
+                    .try_reserve_exact(references.len())
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?;
+                for reference in references {
+                    check_read_operation(deadline, cancellation)?;
+                    let pinned =
+                        load_pinned(connection, &reference, self.max_objects_per_generation)?;
+                    let source_id = generation_source(connection, &reference)?;
+                    let python_export_sha256 = generation_python_export(connection, &reference)?;
+                    generations.push((pinned, source_id, python_export_sha256));
+                }
+                check_read_operation(deadline, cancellation)?;
+                Ok(CatalogGenerationPage {
+                    generations,
+                    has_more,
+                })
+            })
+            .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     pub(crate) fn read_history(
@@ -5798,6 +5817,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let cancellation = CancellationToken::new();
         let original = catalog.read_exact(&manifest, deadline, &cancellation)?;
+        let original_page =
+            catalog.read_latest_page(None, 2, result_limits, deadline, &cancellation)?;
         let instrument: InstrumentId = "0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1".parse()?;
         let cutoff = Timestamp::from_unix_nanos(100);
         let policy = MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1;
@@ -5834,6 +5855,22 @@ mod tests {
         assert_eq!(
             catalog.read_exact_snapshot(&manifest, result_limits, deadline, &cancellation)?,
             original
+        );
+        // Macro discovery uses the same independent snapshot even while a writer is admitted.
+        let page = catalog.read_latest_page(None, 2, result_limits, deadline, &cancellation)?;
+        assert_eq!(page.generations, original_page.generations);
+        assert_eq!(page.has_more, original_page.has_more);
+        assert_eq!(
+            catalog.provider_capture_origin_candidates(
+                manifest.dataset_id(),
+                cutoff,
+                None,
+                1,
+                result_limits,
+                deadline,
+                &cancellation,
+            )?,
+            (Vec::new(), false),
         );
         assert!(
             catalog

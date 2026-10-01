@@ -77,7 +77,7 @@ impl MacroContextReadCapability {
             SourceId::try_from(BOARD_DDP_SOURCE_ID).map_err(|_| ServiceError::Unavailable)?;
         let data = research.analytical_service();
         let (mut origins, _has_older_origins) = research
-            .run_owned_research_io(deadline, &cancellation, move |worker| {
+            .run_owned_research_read(deadline, &cancellation, move |worker| {
                 data.provider_logical_origin_candidates(
                     &dataset,
                     &source,
@@ -116,7 +116,7 @@ impl MacroContextReadCapability {
         let data = research.analytical_service();
         let store = research.provider_capture_store();
         let read = research
-            .run_owned_research_io(deadline, &cancellation, move |worker| {
+            .run_owned_research_read(deadline, &cancellation, move |worker| {
                 let native = data.reopen_board_full_history_macro_selection(
                     &origin, &output, &store, deadline, &worker,
                 )?;
@@ -182,7 +182,7 @@ impl MacroContextReadCapability {
         };
         let manifest = if let Some(research) = self.energy_store.as_ref() {
             research
-                .run_owned_research_io(deadline, &cancellation, select)
+                .run_owned_research_read(deadline, &cancellation, select)
                 .await
                 .map_err(map_board_worker_error)??
         } else {

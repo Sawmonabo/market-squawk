@@ -2,7 +2,7 @@
 
 ## Current execution — 2026-10-01
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed `5b25ac44` (PR #43 comment5941104580)
+Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed `30736a9a` (PR #43 comment5942143016), following `5b25ac44` (comment5941104580)
 isolates retained reads and adds failed-request stage attribution. The current completed-close/display
 batch below has one successful native initial load after earlier deadline failures; full screen/data
 acceptance remains open. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
@@ -13,9 +13,34 @@ One worktree, three local and three origin branches; protected backup refs remai
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — completed-close and display integration | Frozen current batch: original-receipt completed-close projection; independent SQLite projection reads; page-level display authority; retained native Money conversion; actual observation timestamp. Shared plumbing, Git, builds and runtime remain lead-owned. | Four critical checks pass. Fresh native initial Home now loads all nine saved closes in6.9s without Refresh. Earlier15s failures remain part of the evidence; no general latency or streaming acceptance claim. Commit/push this coherent slice before next implementation. |
-| Astra collection_read — macro startup failure diagnosis | Read-only application/research/macro_context.rs and children, actual data/worker callees. No edits/builds/runtime/Git. |17-route native sweep finds Macro.GetContext rejected on Advanced Research. Trace exact error boundary and repeated work; propose the smallest correction preserving other independent values, original evidence, cancellation and cutoffs. |
+| Lead — completed-close and display integration | Pushed30736a9a: original-receipt completed-close projection; independent SQLite projection reads; page-level display authority; retained native Money conversion; actual observation timestamp. Shared plumbing, Git, builds and runtime remain lead-owned. | Four critical checks pass. Fresh native initial Home now loads all nine saved closes in6.9s without Refresh. Earlier15s failures remain part of the evidence; no general latency or streaming acceptance claim. Accepted as this bounded checkpoint; full streaming and all-screen contracts remain open. |
+| GPT-6.1 Sol projection_reads — original publication discovery | Owns data `catalog/provider_logical/original.rs`, `catalog/read_snapshot.rs`, `ingest/provider_logical_original.rs` only. Reuse the exact origin query on endpoint-bound read snapshots; candidate and exact published-origin lookups must not take the writer. Keep pending-original/publication mutations unchanged. | Independent of app caller changes; smallest existing positive original/restart check and held-writer regression. No agent builds/Git. Propose any additional file need before editing. |
+| Astra collection_read — macro read owner | Owns only app `application/research/macro_context.rs` and children `board.rs`, `energy.rs`, `census.rs`, `provider_periods.rs`. Move pure macro original discovery/reopen to existing retained-read worker; add bounded branch error attribution where try_join currently discards first-failure identity. Do not swallow a source error or replace it with missing values. | Lead owns manifest/analytical read plumbing below, all build/runtime checks. Freeze for one integrated build and repeat failed native Macro query. |
+| Lead — macro shared read integration | Owns data manifest/catalog.rs and analytical_read.rs only, plus docs/Git/runtime. Use existing endpoint snapshot for macro exact-manifest and capture-origin discovery with configured limits. | Proven source defect: these read-only paths use shared try_lock and can report AuthorityBusy as unavailable. Current live log does not prove which branch failed first; queued sibling warnings are try_join cancellation fallout. |
 | Lead — remaining product/data update contract | Required data-to-screen closure below remains authoritative. Existing rich quote and committed-domain event designs are source-traced, not implemented. | Next: reduce retained display lookup cost where measured, close macro error, wire committed-domain invalidation and rich quote fields together; then remaining family details and saved Investment Brief. |
+
+Macro wave is frozen for lead verification. Three critical checks pass: manifest discovery during an
+active write (1/1,0.56s), publication/origin reads during a write (1/1,7.89s), and Tiingo original
+history restart/corruption (1/1,0.95s). Logs: `macro-snapshot-{manifest,origin,original-restart}-critical.log`
+in ignored `.agents/tmp/v1-first-stock/`. Service build PASS5m28s. Native startup verification below is complete for this bounded slice. Source changes reuse existing snapshot/query logic;
+no new connection pool, runtime, timeouts or data caps. The existing manifest and publication
+held-writer regressions are extended for read-only discovery; the original Tiingo logical-history
+restart/corruption case supplies positive lineage coverage. A later same-native Macro query before
+these changes returned successfully in81ms but had0/15observed indicators, so it proves transient
+failure behavior only, not populated macro coverage. Both earlier owned native sessions were closed and
+service14945 exited0 before the serialized checks. No additional branch/worktree was created.
+
+Macro snapshot native evidence: direct service20477 and hidden native20485 reached Ready without
+password; the initial Home request returned all nine saved closes with no Refresh. Macro context
+requested concurrently with Home returned in201ms, and the Advanced Research route then completed
+all active queries without request errors. The observation from WebDriver attachment to settled
+Home was31.63s including service readiness; it is not a201ms overall-startup claim. The result
+still has0/15observed macro indicators, so populated macro coverage remains open. No macro-family
+failure was logged. Existing public crypto resynchronization/health and capture-shutdown failures
+remain separately visible. Evidence: `macro-snapshot-native-{initial,home,macro,research}.json`,
+`macro-snapshot-{service-build,live,native}.log`. WebDriver session closed; native20485 stopped143,
+service20477 stopped1 because the structured-log drain was incomplete, so clean installed shutdown remains unproven. No foreground automation,
+CI, final release gate or whole-app RAM measurement ran.
 
 Current integrated evidence (2026-10-01): service build PASS5m21s, current source with timing
 verbosity reduced from INFO to DEBUG after capture (no behavior change). The actual first native

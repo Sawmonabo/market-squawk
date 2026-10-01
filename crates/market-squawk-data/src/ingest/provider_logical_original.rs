@@ -216,11 +216,13 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<ProviderLogicalPublicationOrigin>, bool), IngestError> {
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        authority
-            .catalog()
-            .market_recovery_read(deadline, cancellation, || {
-                authority.provider_logical_origins(
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| {
+                snapshot.provider_logical_origins(
                     dataset,
                     source,
                     native_schema,
@@ -248,11 +250,13 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ProviderLogicalPublicationOrigin>, IngestError> {
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        let (mut origins, has_more) = authority
-            .catalog()
-            .market_recovery_read(deadline, cancellation, || {
-                authority.provider_logical_origins(
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        let (mut origins, has_more) = snapshot
+            .read(|snapshot| {
+                snapshot.provider_logical_origins(
                     dataset,
                     source,
                     native_schema,

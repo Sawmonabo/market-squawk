@@ -50,7 +50,7 @@ impl MacroContextReadCapability {
             .map_err(|_| ServiceError::Unavailable)?;
         let reader = self.reader.clone();
         let (mut origins, _has_older_origins) = research
-            .run_owned_research_io(deadline, &cancellation, move |worker_cancellation| {
+            .run_owned_research_read(deadline, &cancellation, move |worker_cancellation| {
                 reader.provider_capture_origin_candidates(
                     &dataset,
                     cutoffs.knowledge_cutoff,

@@ -631,6 +631,13 @@ This follows Tokio's [blocking task lifetime guidance](https://docs.rs/tokio/lat
 the original work. Full selected-history validation remains; no repeated-read cache or throughput
 claim is implied. Live screen acceptance remains in the delivery ledger.
 
+Macro origin discovery, dataset paging and exact analytical generation reads use the same
+endpoint-bound snapshots. Published logical-original lookup no longer needs the catalog writer;
+pending-original retention, publication and actual rights changes keep their existing authority.
+Macro discovery and original evidence reopening run on the retained-read owner. Independent family
+errors remain real errors and identify the failing family before sibling work is cancelled; missing
+observations remain distinct from a failed read.
+
 Market-data instrument definition, population, search, enumeration and retained native-reference
 reads also use endpoint-bound snapshots. Latest execution-instrument definitions use the same
 snapshot owner; execution-definition pinning and search retain their existing authority path. Service composition captures the endpoint before sharing

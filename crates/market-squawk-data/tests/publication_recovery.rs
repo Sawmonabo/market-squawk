@@ -3811,6 +3811,8 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             )
             .await?;
         let committed = if batch_number == 2 {
+            let absent_logical_dataset =
+                DatasetId::try_from("market_squawk.absent_logical_origin")?;
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let writer = Arc::clone(&restarted);
@@ -3870,6 +3872,26 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 Instant::now() + Duration::from_secs(5),
                 &cancellation,
             );
+            let logical_origins_during_write = restarted.provider_logical_origin_candidates(
+                &absent_logical_dataset,
+                source.source_id(),
+                digest(191),
+                Timestamp::from_unix_nanos(i64::MAX),
+                None,
+                1,
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            );
+            let logical_origin_during_write = restarted.provider_logical_origin(
+                &absent_logical_dataset,
+                source.source_id(),
+                digest(191),
+                digest(192),
+                Sha256Digest::new([193; 32]),
+                Timestamp::from_unix_nanos(i64::MAX),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            );
             // Release before propagating a read failure, so the writer cannot outlive this check.
             let released = release_tx.send(());
             let publication = publication_task.await;
@@ -3882,6 +3904,8 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             assert_eq!(routes_during_write, retained_routes);
             assert_eq!(metadata_during_write, Some(source.clone()));
             assert!(definitions_during_write?.is_empty());
+            assert_eq!(logical_origins_during_write?, (Vec::new(), false));
+            assert!(logical_origin_during_write?.is_none());
             committed
         } else {
             restarted

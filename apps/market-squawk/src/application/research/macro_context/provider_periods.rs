@@ -43,7 +43,7 @@ impl MacroContextReadCapability {
         };
         let reader = self.reader.clone();
         research
-            .run_owned_research_io(deadline, cancellation, move |cancel| {
+            .run_owned_research_read(deadline, cancellation, move |cancel| {
                 let mut cursor = None;
                 let mut manifests = Vec::new();
                 let mut datasets = std::collections::BTreeSet::new();
@@ -145,7 +145,7 @@ impl MacroContextReadCapability {
             let analytical = research.analytical_service();
             let selected_manifest = manifest.clone();
             let selector = research
-                .run_owned_research_io(deadline, &cancellation, move |_| {
+                .run_owned_research_read(deadline, &cancellation, move |_| {
                     analytical.recover_provider_macro_plan_selector(&selected_manifest)
                 })
                 .await

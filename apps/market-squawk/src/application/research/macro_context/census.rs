@@ -53,7 +53,7 @@ impl MacroContextReadCapability {
         };
         let reader = self.reader.clone();
         let manifests = research
-            .run_owned_research_io(
+            .run_owned_research_read(
                 deadline,
                 &cancellation,
                 move |cancel| -> Result<_, ServiceError> {
@@ -205,10 +205,13 @@ impl MacroContextReadCapability {
             let output = receipt.output();
             // The full generation may select an inherited row. Decode that row's original
             // native evidence, rather than attaching the creating run's newer binding.
-            for (original, observation) in receipt.evidence().rows().iter().zip(output.observations()) {
+            for (original, observation) in
+                receipt.evidence().rows().iter().zip(output.observations())
+            {
                 if decode_census_qwi_employment_series(original.row().native_semantic_payload())
                     .map_err(|_| ServiceError::InvalidResult)?
-                    .as_ref() != Some(observation.series())
+                    .as_ref()
+                    != Some(observation.series())
                 {
                     return Err(ServiceError::InvalidResult);
                 }
@@ -221,7 +224,10 @@ impl MacroContextReadCapability {
                 semantic_query_identity: require_sha256(output.output().semantic_query_identity())?,
                 result_digest: require_sha256(output.output().result_digest())?,
                 selection_digest: require_sha256(output.selection_digest())?,
-                native_binding_digest: receipt.selected_binding_digest().map(require_sha256).transpose()?,
+                native_binding_digest: receipt
+                    .selected_binding_digest()
+                    .map(require_sha256)
+                    .transpose()?,
             });
             consulted.push(Arc::clone(&source_receipt));
             if output.observations().len() > 1 {
@@ -279,7 +285,9 @@ fn selection_key(observation: &MacroObservation) -> Result<(u16, u16, i64), Serv
         available.unix_nanos(),
     ))
 }
-pub(super) fn completed_quarter(date: CalendarDate) -> Result<Option<ResearchPeriod>, ServiceError> {
+pub(super) fn completed_quarter(
+    date: CalendarDate,
+) -> Result<Option<ResearchPeriod>, ServiceError> {
     let Some((mut year, month, _)) = super::energy::completed_month(date)? else {
         return Ok(None);
     };
@@ -325,7 +333,9 @@ pub(super) fn map_census_worker_error(error: crate::ResearchServiceError) -> Ser
     }
 }
 
-pub(super) fn map_census_restart_error(error: super::super::CensusMacroApplicationError) -> ServiceError {
+pub(super) fn map_census_restart_error(
+    error: super::super::CensusMacroApplicationError,
+) -> ServiceError {
     use super::super::CensusMacroApplicationError;
     match error {
         CensusMacroApplicationError::Research(error) => map_census_worker_error(error),

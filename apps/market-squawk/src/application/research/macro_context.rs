@@ -241,18 +241,36 @@ impl MacroContextReadCapability {
         let board_cancellation = cancellation.child_token();
         let fred_cancellation = cancellation.child_token();
         let treasury_cancellation = cancellation.child_token();
-        let board =
-            Box::pin(async move { self.read_board(cutoffs, deadline, board_cancellation).await });
-        let fred =
-            Box::pin(async move { self.read_fred(cutoffs, deadline, fred_cancellation).await });
+        let board = Box::pin(async move {
+            self.read_board(cutoffs, deadline, board_cancellation)
+                .await
+                .inspect_err(|error| trace_macro_family_error("board", error))
+        });
+        let fred = Box::pin(async move {
+            self.read_fred(cutoffs, deadline, fred_cancellation)
+                .await
+                .inspect_err(|error| trace_macro_family_error("fred", error))
+        });
         let treasury = Box::pin(async move {
             self.read_treasury(cutoffs, deadline, treasury_cancellation)
                 .await
+                .inspect_err(|error| trace_macro_family_error("treasury", error))
         });
-        let energy = self.read_energy(cutoffs, deadline, cancellation.child_token());
-        let census = Box::pin(self.read_census(cutoffs, deadline, cancellation.child_token()));
-        let periods =
-            Box::pin(self.read_provider_periods(cutoffs, deadline, cancellation.child_token()));
+        let energy = async {
+            self.read_energy(cutoffs, deadline, cancellation.child_token())
+                .await
+                .inspect_err(|error| trace_macro_family_error("energy", error))
+        };
+        let census = Box::pin(async {
+            self.read_census(cutoffs, deadline, cancellation.child_token())
+                .await
+                .inspect_err(|error| trace_macro_family_error("census", error))
+        });
+        let periods = Box::pin(async {
+            self.read_provider_periods(cutoffs, deadline, cancellation.child_token())
+                .await
+                .inspect_err(|error| trace_macro_family_error("provider_periods", error))
+        });
         let (board, fred, (treasury_fiscal, treasury_daily), energy, census, (labor, income)) =
             tokio::try_join!(board, fred, treasury, energy, census, periods)?;
         product_snapshot(
@@ -324,6 +342,10 @@ impl MacroContextReadCapability {
         };
         tokio::try_join!(fiscal, daily)
     }
+}
+
+fn trace_macro_family_error(family: &'static str, error: &ServiceError) {
+    tracing::warn!(family, ?error, "macro context family read failed");
 }
 
 impl fmt::Debug for MacroContextReadCapability {

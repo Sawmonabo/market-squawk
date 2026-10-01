@@ -295,7 +295,9 @@ impl Catalog {
             })
             .transpose()
     }
+}
 
+impl crate::catalog::CatalogReadSnapshot {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn provider_logical_origins(
         &self,
@@ -324,7 +326,8 @@ impl Catalog {
             .canonical_research_observations()
             .map_err(|_| CatalogError::InvalidRecord)?;
         let before_version = before_version.map(to_i64).transpose()?;
-        let mut statement = self.connection.prepare(
+        let connection = self.connection();
+        let mut statement = connection.prepare(
             "SELECT generation.manifest_version, generation.content_hash, input.publication_digest, original.coordinate_digest
              FROM analytical_available_generations AS generation
              JOIN dataset_manifests AS anchor ON anchor.manifest_id=generation.anchor_manifest_id
@@ -378,13 +381,13 @@ impl Catalog {
             let content = parse_digest(1, &row.get::<_, Vec<u8>>(1)?)?;
             let binding = parse_digest(1, &row.get::<_, Vec<u8>>(2)?)?;
             let original = load_original(
-                &self.connection,
+                connection,
                 parse_digest(1, &row.get::<_, Vec<u8>>(3)?)?,
                 deadline,
                 cancellation,
             )?
             .ok_or(CatalogError::CorruptCatalog)?;
-            let publication = load_provider_logical_publication_binding(&self.connection, binding)?
+            let publication = load_provider_logical_publication_binding(connection, binding)?
                 .ok_or(CatalogError::CorruptCatalog)?;
             verify_original_binding(&original, dataset, &publication)?;
             if original.receipt.publication_digest() != Some(binding) {

@@ -2093,7 +2093,13 @@ impl AnalyticalReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<AnalyticalGenerationPage, AnalyticalReadError> {
         self.manifests
-            .read_latest_page(after, limit.get(), deadline, cancellation)
+            .read_latest_page(
+                after,
+                limit.get(),
+                self.catalog_read_limits,
+                deadline,
+                cancellation,
+            )
             .map(AnalyticalGenerationPage::from_catalog)
             .map_err(Into::into)
     }
@@ -2248,6 +2254,7 @@ impl AnalyticalReadCapability {
                 knowledge_cutoff,
                 before_version,
                 limit.get(),
+                self.catalog_read_limits,
                 deadline,
                 cancellation,
             )
@@ -2283,9 +2290,12 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<AnalyticalGeneration, AnalyticalReadError> {
-        let (pinned, source_id, export) =
-            self.manifests
-                .read_exact(manifest, deadline, cancellation)?;
+        let (pinned, source_id, export) = self.manifests.read_exact_snapshot(
+            manifest,
+            self.catalog_read_limits,
+            deadline,
+            cancellation,
+        )?;
         Ok(AnalyticalGeneration::from_pinned(pinned, source_id, export))
     }
 
@@ -2433,9 +2443,12 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<AnalyticalMacroLatestKnownOutput, AnalyticalReadError> {
-        let (pinned, source_id, _) =
-            self.manifests
-                .read_exact(request.manifest(), deadline, &cancellation)?;
+        let (pinned, source_id, _) = self.manifests.read_exact_snapshot(
+            request.manifest(),
+            self.catalog_read_limits,
+            deadline,
+            &cancellation,
+        )?;
         if source_id != request.source_id {
             return Err(AnalyticalReadError::MacroSnapshotSourceOwnerMismatch);
         }
