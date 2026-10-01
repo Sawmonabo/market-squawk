@@ -62,7 +62,7 @@ use market_squawk_sources::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::{
-    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard, OwnedSemaphorePermit,
+    OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, RwLockReadGuard, RwLockWriteGuard,
     Semaphore, oneshot,
 };
 use tokio::task::JoinHandle;
@@ -226,7 +226,7 @@ pub struct ProviderOnboardingService {
     probe_rates: ProbeRateAuthority,
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     board_doctor_executor: Option<BoardScriptedDoctorExecutor>,
-    activation: Arc<AsyncMutex<()>>,
+    activation: Arc<RwLock<()>>,
     secret_operations: Arc<Semaphore>,
 }
 
@@ -272,18 +272,24 @@ struct AlpacaRuntimeVerificationIssuance {
 /// preventing a lease transition from racing the source-map change.
 pub(crate) struct ProviderOnboardingMutationAuthority<'a> {
     service: &'a ProviderOnboardingService,
-    _guard: AsyncMutexGuard<'a, ()>,
+    _guard: RwLockWriteGuard<'a, ()>,
 }
 
-/// Owned form of the same onboarding mutation authority for a bounded publication operation.
+/// Immutable lease validation that shares admission with other readers and excludes mutations.
+pub(crate) struct ProviderOnboardingReadAuthority<'a> {
+    service: &'a ProviderOnboardingService,
+    _guard: RwLockReadGuard<'a, ()>,
+}
+
+/// Owned immutable lease authority for a bounded publication operation.
 ///
 /// The guard is acquired after provider acquisition and retained through durable publication.
-/// It serializes against every existing activation mutation without borrowing a temporary
-/// runtime owner or creating another mutex.
+/// It excludes activation mutation while permitting independent currentness/publication readers.
+/// It exposes no mutation operation and does not create another lock.
 #[derive(Debug)]
-pub(crate) struct ProviderOnboardingOwnedMutationAuthority {
+pub(crate) struct ProviderOnboardingOwnedReadAuthority {
     service: Arc<ProviderOnboardingService>,
-    _guard: OwnedMutexGuard<()>,
+    _guard: OwnedRwLockReadGuard<()>,
 }
 
 /// Exact durable runtime-session authority admitted during startup reconciliation.
@@ -329,12 +335,33 @@ impl ProviderRuntimeStartupAdmissions {
 }
 
 impl ProviderOnboardingService {
+    pub(crate) async fn acquire_runtime_read_authority(
+        &self,
+    ) -> ProviderOnboardingReadAuthority<'_> {
+        ProviderOnboardingReadAuthority {
+            service: self,
+            _guard: self.activation.read().await,
+        }
+    }
+
+    pub(crate) fn try_acquire_runtime_read_authority(
+        &self,
+    ) -> Result<ProviderOnboardingReadAuthority<'_>, ProviderOnboardingError> {
+        Ok(ProviderOnboardingReadAuthority {
+            service: self,
+            _guard: self
+                .activation
+                .try_read()
+                .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?,
+        })
+    }
+
     pub(crate) async fn acquire_runtime_mutation_authority(
         &self,
     ) -> ProviderOnboardingMutationAuthority<'_> {
         ProviderOnboardingMutationAuthority {
             service: self,
-            _guard: self.activation.lock().await,
+            _guard: self.activation.write().await,
         }
     }
 
@@ -345,33 +372,69 @@ impl ProviderOnboardingService {
             service: self,
             _guard: self
                 .activation
-                .try_lock()
+                .try_write()
                 .map_err(|_error| ProviderOnboardingError::ActivationUnavailable)?,
         })
     }
 
-    /// Waits for the existing activation mutex without treating another mutation as revocation.
+    /// Waits for shared activation ownership without treating another reader as revocation.
     /// The caller must bound this future by its original deadline and cancellation.
-    pub(crate) async fn acquire_owned_runtime_mutation_authority(
+    pub(crate) async fn acquire_owned_runtime_read_authority(
         self: &Arc<Self>,
-    ) -> ProviderOnboardingOwnedMutationAuthority {
-        let guard = Arc::clone(&self.activation).lock_owned().await;
-        ProviderOnboardingOwnedMutationAuthority {
+    ) -> ProviderOnboardingOwnedReadAuthority {
+        let guard = Arc::clone(&self.activation).read_owned().await;
+        ProviderOnboardingOwnedReadAuthority {
             service: Arc::clone(self),
             _guard: guard,
         }
     }
 
-    pub(crate) fn try_acquire_owned_runtime_mutation_authority(
+    pub(crate) fn try_acquire_owned_runtime_read_authority(
         self: &Arc<Self>,
-    ) -> Result<ProviderOnboardingOwnedMutationAuthority, ProviderOnboardingError> {
+    ) -> Result<ProviderOnboardingOwnedReadAuthority, ProviderOnboardingError> {
         let guard = Arc::clone(&self.activation)
-            .try_lock_owned()
+            .try_read_owned()
             .map_err(|_error| ProviderOnboardingError::ActivationUnavailable)?;
-        Ok(ProviderOnboardingOwnedMutationAuthority {
+        Ok(ProviderOnboardingOwnedReadAuthority {
             service: Arc::clone(self),
             _guard: guard,
         })
+    }
+
+    // Call only through an already-held read or mutation authority. These helpers never
+    // reacquire activation ownership, including when a writer is waiting behind this reader.
+    fn require_active_lease(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let current = self.activation_lease(expected.session_id())?;
+        require_same_active_lease(&current, expected)
+    }
+
+    fn require_active_lease_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let current = self.activation_lease_in_catalog(catalog, expected.session_id())?;
+        require_same_active_lease(&current, expected)
+    }
+
+    fn require_prepared_or_active_lease(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let resumed = self
+            .catalog
+            .resume_provider_onboarding(expected.session_id())?;
+        let profile = self.current_profile_for(&resumed)?;
+        match self.lease_from_resumed(&resumed, profile) {
+            Ok(current) if require_same_active_lease(&current, expected).is_ok() => return Ok(()),
+            Ok(_) | Err(ProviderOnboardingError::ActivationUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+        let prepared = self.prepared_lease_from_resumed(&resumed, profile)?;
+        require_same_active_lease(&prepared, expected)
     }
 
     pub(crate) fn prepared_activation_lease(
@@ -472,7 +535,7 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<SchwabOAuthBootstrapLease, ProviderOnboardingError> {
-        let _activation = self.activation.lock().await;
+        let _activation = self.activation.write().await;
         loop {
             if cancellation.is_cancelled() {
                 return Err(ProviderOnboardingError::OperationCancelled);
@@ -608,7 +671,7 @@ impl ProviderOnboardingService {
             () = cancellation.cancelled() => {
                 return Err(ProviderOnboardingError::OperationCancelled);
             }
-            activation = self.activation.lock() => activation,
+            activation = self.activation.write() => activation,
         };
         if cancellation.is_cancelled() {
             return Err(ProviderOnboardingError::OperationCancelled);
@@ -827,7 +890,7 @@ impl ProviderOnboardingService {
             () = cancellation.cancelled() => {
                 return Err(ProviderOnboardingError::OperationCancelled);
             }
-            activation = self.activation.lock() => activation,
+            activation = self.activation.write() => activation,
         };
         if cancellation.is_cancelled() {
             return Err(ProviderOnboardingError::OperationCancelled);
@@ -1048,7 +1111,7 @@ impl ProviderOnboardingService {
             probe_rates,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             board_doctor_executor,
-            activation: Arc::new(AsyncMutex::new(())),
+            activation: Arc::new(RwLock::new(())),
             secret_operations: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_SECRET_OPERATIONS)),
         };
         for profile in service.profiles.iter() {
@@ -1193,7 +1256,7 @@ impl ProviderOnboardingService {
         cancellation: &CancellationToken,
     ) -> Result<(), ProviderOnboardingError> {
         let join = async {
-            let _activation = self.activation.lock().await;
+            let _activation = self.activation.write().await;
             let _secrets = self
                 .secret_operations
                 .acquire()
@@ -1579,10 +1642,10 @@ impl ProviderOnboardingService {
         );
         let mut activation = Some(if source_doctor_session {
             self.activation
-                .try_lock()
+                .try_write()
                 .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?
         } else {
-            self.activation.lock().await
+            self.activation.write().await
         });
         loop {
             if cancellation.is_cancelled() {
@@ -1681,7 +1744,7 @@ impl ProviderOnboardingService {
                         },
                     )
                     .await?;
-                    // Source doctors perform provider I/O outside the onboarding mutex.
+                    // Source doctors perform provider I/O outside the activation write guard.
                     // Their result is admitted only after reacquiring and checking this exact sequence.
                     let source_doctor = matches!(profile.id(), "eia.api-v2" | "census.data-api");
                     if source_doctor {
@@ -1696,7 +1759,7 @@ impl ProviderOnboardingService {
                     if source_doctor {
                         activation = Some(
                             self.activation
-                                .try_lock()
+                                .try_write()
                                 .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?,
                         );
                         let current = self.catalog.resume_provider_onboarding(session_id)?;
@@ -1872,7 +1935,7 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
-        let activation = self.activation.lock().await;
+        let activation = self.activation.write().await;
         if cancellation.is_cancelled() {
             return Err(ProviderOnboardingError::OperationCancelled);
         }
@@ -2103,7 +2166,7 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
-        let _activation = self.activation.lock().await;
+        let _activation = self.activation.write().await;
         loop {
             if cancellation.is_cancelled() {
                 return Err(ProviderOnboardingError::OperationCancelled);
@@ -3193,26 +3256,39 @@ impl ProviderOnboardingService {
     }
 }
 
-impl ProviderOnboardingOwnedMutationAuthority {
+impl ProviderOnboardingReadAuthority<'_> {
+    pub(crate) fn require_active(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        self.service.require_active_lease(expected)
+    }
+
+    pub(crate) fn require_prepared_or_active(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        self.service.require_prepared_or_active_lease(expected)
+    }
+}
+
+impl ProviderOnboardingOwnedReadAuthority {
     /// Validates the exact active lease before acquiring the publication catalog lock.
     pub(crate) fn require_active(
         &self,
         expected: &ProviderActivationLease,
     ) -> Result<(), ProviderOnboardingError> {
-        let current = self.service.activation_lease(expected.session_id())?;
-        require_same_active_lease(&current, expected)
+        self.service.require_active_lease(expected)
     }
 
-    /// Validates durable currentness without reacquiring either retained mutation or catalog lock.
+    /// Validates durable currentness without reacquiring either retained read or catalog lock.
     pub(crate) fn require_active_in_catalog(
         &self,
         catalog: &CatalogAuthority,
         expected: &ProviderActivationLease,
     ) -> Result<(), ProviderOnboardingError> {
-        let current = self
-            .service
-            .activation_lease_in_catalog(catalog, expected.session_id())?;
-        require_same_active_lease(&current, expected)
+        self.service
+            .require_active_lease_in_catalog(catalog, expected)
     }
 }
 
@@ -3228,28 +3304,14 @@ impl ProviderOnboardingMutationAuthority<'_> {
         &self,
         expected: &ProviderActivationLease,
     ) -> Result<(), ProviderOnboardingError> {
-        let current = self.service.activation_lease(expected.session_id())?;
-        require_same_active_lease(&current, expected)
+        self.service.require_active_lease(expected)
     }
 
     pub(crate) fn require_prepared_or_active(
         &self,
         expected: &ProviderActivationLease,
     ) -> Result<(), ProviderOnboardingError> {
-        let resumed = self
-            .service
-            .catalog
-            .resume_provider_onboarding(expected.session_id())?;
-        let profile = self.service.current_profile_for(&resumed)?;
-        match self.service.lease_from_resumed(&resumed, profile) {
-            Ok(current) if require_same_active_lease(&current, expected).is_ok() => return Ok(()),
-            Ok(_) | Err(ProviderOnboardingError::ActivationUnavailable) => {}
-            Err(error) => return Err(error),
-        }
-        let prepared = self
-            .service
-            .prepared_lease_from_resumed(&resumed, profile)?;
-        require_same_active_lease(&prepared, expected)
+        self.service.require_prepared_or_active_lease(expected)
     }
 
     pub(crate) fn commit_prepared_activation(
@@ -4476,6 +4538,90 @@ mod tests {
                 OnboardingState::RefreshRequired
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_lease_reads_preserve_exclusive_mutation_and_revocation() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+        let (_research, catalog, _publisher) =
+            ResearchService::open_or_initialize_with_provider_onboarding(
+                &paths,
+                CatalogConfig::try_new(
+                    paths.catalog()?.clone(),
+                    Duration::from_millis(750),
+                    CatalogLimit::new(64)?,
+                    CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+                )?,
+                8,
+                ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
+            )?;
+        let provider_rate =
+            ProviderRateAuthority::try_new(Arc::new(SqliteProviderRateStore::try_open(
+                directory.path().join("shared-lease-provider-rate.sqlite3"),
+            )?))?;
+        let secrets = Arc::new(EncryptedFileSecretStore::try_open(
+            directory.path().join("shared-lease-secrets"),
+            SecretValue::new("shared lease fixture unlock".to_owned())?,
+        )?);
+        let service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
+            catalog,
+            secrets,
+            provider_rate,
+        )?);
+        let prepared = service
+            .prepare_noncredential_test_activation(
+                "federal-reserve-board.data-download-program",
+                ProviderPublicConfiguration::default(),
+                "shared-lease-revocation",
+            )
+            .await?;
+        let lease = service.commit_prepared_activation(&prepared).await?;
+
+        let reader = service.acquire_runtime_read_authority().await;
+        reader.require_active(&lease)?;
+        reader.require_prepared_or_active(&lease)?;
+        let publication = service.try_acquire_owned_runtime_read_authority()?;
+        publication.require_active(&lease)?;
+        service
+            .try_acquire_runtime_read_authority()?
+            .require_active(&lease)?;
+
+        // Queue the writer deterministically. Existing readers must validate without
+        // reacquiring a read behind that writer; new readers must fail closed.
+        let mut pending_writer = Box::pin(service.acquire_runtime_mutation_authority());
+        assert!(futures_util::poll!(pending_writer.as_mut()).is_pending());
+        assert!(matches!(
+            service.try_acquire_runtime_read_authority(),
+            Err(ProviderOnboardingError::ActivationUnavailable)
+        ));
+        reader.require_active(&lease)?;
+        reader.require_prepared_or_active(&lease)?;
+        publication.require_active(&lease)?;
+        drop(reader);
+        assert!(futures_util::poll!(pending_writer.as_mut()).is_pending());
+        drop(publication);
+
+        let writer = tokio::time::timeout(Duration::from_secs(1), pending_writer).await?;
+        writer.require_active(&lease)?;
+        assert!(matches!(
+            service.try_acquire_runtime_read_authority(),
+            Err(ProviderOnboardingError::ActivationUnavailable)
+        ));
+        writer.invalidate_activation_recipe(
+            lease.session_id(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [17; 32]),
+        )?;
+        assert!(writer.require_active(&lease).is_err());
+        drop(writer);
+
+        let reader = service.acquire_runtime_read_authority().await;
+        assert!(reader.require_active(&lease).is_err());
+        assert!(reader.require_prepared_or_active(&lease).is_err());
+        let publication = service.try_acquire_owned_runtime_read_authority()?;
+        assert!(publication.require_active(&lease).is_err());
+        assert!(service.activation_recipe_is_invalidated(lease.session_id())?);
         Ok(())
     }
 

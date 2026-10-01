@@ -53,6 +53,6 @@ pub(crate) use schwab_oauth_runtime::{
 };
 pub use service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 pub(crate) use service::{
-    ProviderOnboardingMutationAuthority, ProviderOnboardingOwnedMutationAuthority,
+    ProviderOnboardingMutationAuthority, ProviderOnboardingOwnedReadAuthority,
     ProviderRuntimeStartupAdmissions, SchwabMarketDoctorRunPreparation,
 };

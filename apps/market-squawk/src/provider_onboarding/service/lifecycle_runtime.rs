@@ -291,7 +291,7 @@ impl ProviderOnboardingService {
         &self,
         session_id: Uuid,
     ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
-        let _activation = self.activation.lock().await;
+        let _activation = self.activation.write().await;
         let _current = self.resume(session_id)?;
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
         let profile = self.current_profile_for(&resumed)?;
@@ -627,7 +627,7 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
-        let _activation = self.activation.lock().await;
+        let _activation = self.activation.write().await;
         self.cleanup_superseded_unlocked(session_id, cancellation)
             .await?;
         self.resume(session_id)

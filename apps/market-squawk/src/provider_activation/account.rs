@@ -9,7 +9,7 @@ use market_squawk_sources::{
     AuthorizationMode, DataUseOperation, ProviderRateAuthority, SourceMetadata,
 };
 
-use crate::provider_onboarding::ProviderOnboardingOwnedMutationAuthority;
+use crate::provider_onboarding::ProviderOnboardingOwnedReadAuthority;
 use crate::{ProviderActivationLease, ProviderOnboardingService};
 
 /// Closed user-authorized market-data account surfaces supported by V1 activation.
@@ -192,7 +192,7 @@ pub(super) struct ProviderAccountRuntimeAuthority {
 /// Weak-only currentness view of one provider-account runtime owner.
 ///
 /// Ordinary checks borrow the runtime owner only for validation. A bounded publication may
-/// explicitly acquire an owned mutation guard that retains the exact account owner until the
+/// explicitly acquire an owned read guard that retains the exact account owner until the
 /// publication completes. After every strong owner is dropped, every check fails closed.
 #[derive(Clone)]
 pub(crate) struct ProviderAccountRuntimeCurrentness {
@@ -200,11 +200,11 @@ pub(crate) struct ProviderAccountRuntimeCurrentness {
 }
 
 impl ProviderAccountRuntimeCurrentness {
-    /// Acquires the existing activation mutex for one bounded durable publication.
+    /// Acquires shared activation ownership for one bounded durable publication.
     ///
     /// Call after provider acquisition, before taking the catalog lock, and retain the returned
     /// authority through commit. Subsequent checks must use that authority's methods; calling
-    /// this currentness handle again would try to acquire its already retained mutation guard.
+    /// this currentness handle again could wait behind a writer blocked by the retained read.
     pub(crate) fn try_acquire_publication_authority(
         &self,
     ) -> Result<ProviderAccountPublicationAuthority, crate::ProviderOnboardingError> {
@@ -214,7 +214,7 @@ impl ProviderAccountRuntimeCurrentness {
             .ok_or(crate::ProviderOnboardingError::ActivationUnavailable)?;
         let onboarding = authority
             .onboarding
-            .try_acquire_owned_runtime_mutation_authority()?;
+            .try_acquire_owned_runtime_read_authority()?;
         onboarding.require_active(&authority.lease)?;
         Ok(ProviderAccountPublicationAuthority {
             authority,
@@ -234,7 +234,7 @@ impl ProviderAccountRuntimeCurrentness {
             .ok_or(crate::ProviderOnboardingError::ActivationUnavailable)?;
         let onboarding = authority
             .onboarding
-            .acquire_owned_runtime_mutation_authority()
+            .acquire_owned_runtime_read_authority()
             .await;
         onboarding.require_active(&authority.lease)?;
         Ok(ProviderAccountPublicationAuthority {
@@ -261,19 +261,25 @@ impl ProviderAccountRuntimeCurrentness {
         authority.require_prepared_or_active().await.is_ok()
     }
 
-    /// Performs the active-lease check without waiting for onboarding mutation ownership.
+    /// Performs the active-lease check without waiting for activation read ownership.
     pub(crate) fn is_active_now(&self) -> bool {
-        self.authority
-            .upgrade()
-            .is_some_and(|authority| authority.require_current_now().is_ok())
+        let Some(authority) = self.authority.upgrade() else {
+            tracing::warn!(
+                stage = "account-currentness-owner",
+                failure = "owner-unavailable",
+                "synchronous account currentness unavailable"
+            );
+            return false;
+        };
+        authority.require_current_now().is_ok()
     }
 }
 
-/// Exact account owner and its existing onboarding mutation guard held through publication.
+/// Exact account owner and its existing onboarding read guard held through publication.
 #[derive(Debug)]
 pub(crate) struct ProviderAccountPublicationAuthority {
     authority: Arc<ProviderAccountRuntimeAuthority>,
-    onboarding: ProviderOnboardingOwnedMutationAuthority,
+    onboarding: ProviderOnboardingOwnedReadAuthority,
 }
 
 impl ProviderAccountPublicationAuthority {
@@ -375,7 +381,7 @@ impl ProviderAccountRuntimeAuthority {
 
     pub(super) async fn require_current(&self) -> Result<(), crate::ProviderOnboardingError> {
         self.onboarding
-            .acquire_runtime_mutation_authority()
+            .acquire_runtime_read_authority()
             .await
             .require_active(&self.lease)
     }
@@ -384,17 +390,50 @@ impl ProviderAccountRuntimeAuthority {
         &self,
     ) -> Result<(), crate::ProviderOnboardingError> {
         self.onboarding
-            .acquire_runtime_mutation_authority()
+            .acquire_runtime_read_authority()
             .await
             .require_prepared_or_active(&self.lease)
     }
 
-    /// Revalidates this exact active account lease without waiting for the onboarding mutation
-    /// lock. Synchronous downstream callbacks must fail closed while that lock is unavailable.
+    /// Revalidates this exact active account lease alongside other immutable readers.
+    /// Synchronous callbacks fail closed while an activation writer owns or awaits the gate.
     pub(super) fn require_current_now(&self) -> Result<(), crate::ProviderOnboardingError> {
-        self.onboarding
-            .try_acquire_runtime_mutation_authority()?
-            .require_active(&self.lease)
+        let onboarding = self
+            .onboarding
+            .try_acquire_runtime_read_authority()
+            .inspect_err(|_| {
+                tracing::warn!(
+                    account = ?self.binding.account(),
+                    stage = "account-currentness-activation-lock",
+                    failure = "activation-busy",
+                    "synchronous account currentness unavailable"
+                );
+            })?;
+        onboarding.require_active(&self.lease).inspect_err(|error| {
+            use crate::ProviderOnboardingError as E;
+            let failure = match error {
+                E::ActivationUnavailable => "activation-unavailable",
+                E::ActivationExpired => "activation-expired",
+                E::InvalidSessionState => "session-state-or-lease-mismatch",
+                E::EvidenceRefreshRequired => "profile-refresh-required",
+                E::UnknownProfile => "profile-unknown",
+                E::InvalidProfile => "profile-invalid",
+                E::RightsBlocked => "rights-blocked",
+                E::Clock => "clock-unavailable",
+                E::Catalog(market_squawk_data::CatalogError::AuthorityBusy) => "catalog-busy",
+                E::Catalog(market_squawk_data::CatalogError::AuthorityLockPoisoned) => {
+                    "catalog-lock-poisoned"
+                }
+                E::Catalog(_) => "catalog-error",
+                _ => "onboarding-error",
+            };
+            tracing::warn!(
+                account = ?self.binding.account(),
+                stage = "account-currentness-active-lease",
+                failure,
+                "synchronous account currentness unavailable"
+            );
+        })
     }
 
     pub(super) fn next_persisted_nonce(

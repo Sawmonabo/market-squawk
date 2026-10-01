@@ -30,7 +30,7 @@ use crate::application::{
     CensusPublicationReceipt, CensusSealFirstExtractionLimits, ResearchProviderRuntimeGeneration,
     ResearchProviderRuntimeReplacement,
 };
-use crate::provider_onboarding::ProviderOnboardingOwnedMutationAuthority;
+use crate::provider_onboarding::ProviderOnboardingOwnedReadAuthority;
 
 pub(super) const CENSUS_SURFACE: &str = "census.data-api";
 
@@ -288,7 +288,7 @@ impl ProviderAdapterActivation {
             .as_ref()
             .cloned()
             .ok_or(CensusProductError::SetupRequired)?;
-        let onboarding = self.onboarding.try_acquire_runtime_mutation_authority()?;
+        let onboarding = self.onboarding.try_acquire_runtime_read_authority()?;
         onboarding.require_active(&activation.lease)?;
         if self
             .research
@@ -308,7 +308,7 @@ impl ProviderAdapterActivation {
                 |deadline, cancellation| {
                     let onboarding = self
                         .onboarding
-                        .try_acquire_owned_runtime_mutation_authority()
+                        .try_acquire_owned_runtime_read_authority()
                         .map_err(|_| CensusMacroApplicationError::AuthorityInvalid)?;
                     let authority = CensusPublicationAuthority {
                         onboarding,
@@ -362,10 +362,10 @@ fn trace_census_publication_failure(error: &CensusMacroApplicationError) {
     }
 }
 
-/// Retains the sole onboarding mutation guard from completed acquisition through catalog commit.
+/// Retains a shared onboarding read guard through catalog commit, excluding activation mutation.
 #[derive(Debug)]
 struct CensusPublicationAuthority {
-    onboarding: ProviderOnboardingOwnedMutationAuthority,
+    onboarding: ProviderOnboardingOwnedReadAuthority,
     lease: ProviderActivationLease,
     deadline: Instant,
     cancellation: CancellationToken,

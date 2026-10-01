@@ -31,7 +31,7 @@ use crate::application::{
     EiaMacroApplicationError, EiaMacroPublicationReceipt, ResearchProviderRuntimeGeneration,
     ResearchProviderRuntimeReplacement,
 };
-use crate::provider_onboarding::ProviderOnboardingOwnedMutationAuthority;
+use crate::provider_onboarding::ProviderOnboardingOwnedReadAuthority;
 
 pub(super) const EIA_SURFACE: &str = "eia.api-v2";
 const ANALYTICAL_DATASET: &str = crate::application::RESIDENTIAL_ELECTRICITY_PRICE_DATASET;
@@ -299,7 +299,7 @@ impl ProviderAdapterActivation {
                 .cloned()
                 .ok_or(EiaProductError::SetupRequired)?;
             stage = "onboarding_guard";
-            let onboarding = self.onboarding.try_acquire_runtime_mutation_authority()?;
+            let onboarding = self.onboarding.try_acquire_runtime_read_authority()?;
             stage = "active_lease";
             onboarding.require_active(&activation.lease)?;
             stage = "runtime_generation";
@@ -324,7 +324,7 @@ impl ProviderAdapterActivation {
                     |deadline, cancellation| {
                         let onboarding = self
                             .onboarding
-                            .try_acquire_owned_runtime_mutation_authority()
+                            .try_acquire_owned_runtime_read_authority()
                             .map_err(|_| EiaMacroApplicationError::AuthorityInvalid)?;
                         let authority = EiaPublicationAuthority {
                             onboarding,
@@ -412,10 +412,10 @@ fn trace_eia_product_failure(stage: &'static str, error: &EiaProductError) {
     }
 }
 
-/// Retains the sole onboarding mutation guard from completed acquisition through catalog commit.
+/// Retains a shared onboarding read guard through catalog commit, excluding activation mutation.
 #[derive(Debug)]
 struct EiaPublicationAuthority {
-    onboarding: ProviderOnboardingOwnedMutationAuthority,
+    onboarding: ProviderOnboardingOwnedReadAuthority,
     lease: ProviderActivationLease,
     deadline: Instant,
     cancellation: CancellationToken,
