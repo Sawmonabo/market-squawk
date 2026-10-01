@@ -179,6 +179,70 @@ struct PaperRuntimeActivityControl {
     controller: Arc<PaperController>,
 }
 
+/// Reversible private-market suspension of the existing paper owner.
+#[derive(Clone, Debug)]
+pub(crate) struct PaperCredentialRuntimeControl {
+    controller: Arc<PaperController>,
+}
+
+impl PaperCredentialRuntimeControl {
+    pub(crate) async fn suspend(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let _owner = bounded_lock(&self.controller.owner_gate, deadline, cancellation).await?;
+        self.controller
+            .credentials_suspended
+            .store(true, Ordering::Release);
+        let private_run = {
+            let state = bounded_lock(&self.controller.state, deadline, cancellation).await?;
+            let surface = match &*state {
+                PaperState::Stopped { last_complete } => {
+                    return if last_complete == &Some(false) {
+                        Err(ServiceError::Unavailable)
+                    } else {
+                        Ok(())
+                    };
+                }
+                PaperState::Running { surface_id, .. } => surface_id,
+                PaperState::Starting { retained, .. } | PaperState::Stopping(retained) => {
+                    retained.surface_id()
+                }
+            };
+            !matches!(
+                surface.as_str(),
+                COINBASE_PUBLIC_SURFACE_ID | KRAKEN_PUBLIC_SURFACE_ID
+            )
+        };
+        if private_run
+            && !self
+                .controller
+                .stop_paper_before_owned(deadline, cancellation)
+                .await?
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+
+    /// Reopens private-market admission; restarting paper execution remains an explicit action.
+    pub(crate) async fn resume(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let _owner = bounded_lock(&self.controller.owner_gate, deadline, cancellation).await?;
+        if !self.controller.accepting.load(Ordering::Acquire) {
+            return Err(ServiceError::Unavailable);
+        }
+        self.controller
+            .credentials_suspended
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
 impl PaperRuntimeActivityAuthority for PaperRuntimeActivityControl {
     fn activity(&self) -> Result<PaperRuntimeActivitySnapshot, ServiceError> {
         let state = self
@@ -278,6 +342,12 @@ impl PaperApplicationServices {
         Arc::new(PaperRuntimeActivityControl {
             controller: Arc::clone(&self.controller),
         })
+    }
+
+    pub(crate) fn credential_runtime_control(&self) -> PaperCredentialRuntimeControl {
+        PaperCredentialRuntimeControl {
+            controller: Arc::clone(&self.controller),
+        }
     }
 
     /// Returns a read-only factory without paper state, action hooks, risk, or order authority.
@@ -466,6 +536,7 @@ impl ApplicationDomainService for ExecutionDomainService {
 }
 
 struct PaperController {
+    credentials_suspended: AtomicBool,
     portfolio_publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
     equity: EquityPaperServices,
     config: AppConfig,
@@ -498,6 +569,7 @@ impl PaperController {
     ) -> Self {
         Self {
             portfolio_publisher,
+            credentials_suspended: AtomicBool::new(false),
             equity,
             config,
             decisions,
@@ -823,6 +895,14 @@ impl PaperController {
         }
         let provider = PaperProvider::from_selection(&market_selection)?;
         let surface_id = provider.surface_id()?;
+        if self.credentials_suspended.load(Ordering::Acquire)
+            && !matches!(
+                surface_id.as_str(),
+                COINBASE_PUBLIC_SURFACE_ID | KRAKEN_PUBLIC_SURFACE_ID
+            )
+        {
+            return Err(ServiceError::Unavailable);
+        }
         let onboarding_session_id = provider.onboarding_session_id();
         let strategy_mode = prepared.strategy_mode;
         let composition = match provider {

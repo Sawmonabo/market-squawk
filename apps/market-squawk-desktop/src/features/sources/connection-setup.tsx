@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Link } from "react-router-dom"
 import { CheckCircle2, KeyRound, LoaderCircle } from "lucide-react"
 import { BeaSelectionFields, beaSelection } from "./macro-selection-fields"
 import { CensusSelectionFields, censusConfiguration } from "./census-selection-fields"
@@ -71,11 +72,17 @@ export function ConnectionSetup({
         already stored securely and checks access before using them. Public
         connections need no account or key.
       </p>
-      <CredentialStorage
-        fallback={connections.encryptedFileFallback}
-        transport={transport}
-        onChanged={onChanged}
-      />
+      {connections.credentialAccess.access !== "ready" ? <div className="mt-5 rounded-lg border border-border bg-background/45 p-4">
+        <p className="text-sm font-medium">
+          {connections.credentialAccess.access === "locked" ? "Saved connection credentials are locked" : "Credential access needs recovery"}
+        </p>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">
+          Manage credential access in General Settings. Ordinary screens and saved results remain available.
+        </p>
+        <Link to="/system/settings" className="mt-3 inline-block text-sm text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary">
+          Open application lock settings
+        </Link>
+      </div> : null}
       <Label htmlFor="connection-provider" className="mt-5 block">Provider</Label>
       <select
         id="connection-provider"
@@ -102,63 +109,6 @@ export function ConnectionSetup({
       /> : null}
     </section>
   )
-}
-
-function CredentialStorage({ fallback, transport, onChanged }: {
-  fallback: ProviderBootstrap["encryptedFileFallback"]
-  transport: SystemTransport
-  onChanged: () => Promise<void>
-}) {
-  const [pending, setPending] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
-  const [notice, setNotice] = React.useState<string | null>(null)
-  if (fallback === "disabled") return null
-
-  const run = async (request: { action: "unlockFallback"; secret: string } | { action: "lockFallback" }) => {
-    setPending(true)
-    setError(null)
-    setNotice(null)
-    try {
-      await transport.onboard(request)
-      await onChanged()
-      setNotice(request.action === "unlockFallback" ? "Credential storage unlocked." : "Credential storage locked.")
-    } catch (failure) {
-      setError(messageFrom(failure))
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return <div className="mt-5 rounded-lg border border-border bg-background/45 p-4">
-    <p className="text-sm font-medium">Credential storage</p>
-    {fallback === "locked" ? <form
-      className="mt-3 space-y-3"
-      onSubmit={(event) => {
-        event.preventDefault()
-        const form = event.currentTarget
-        const secret = field(new FormData(form), "unlock")
-        form.reset()
-        void run({ action: "unlockFallback", secret })
-      }}
-    >
-      <p className="text-sm text-muted-foreground">
-        Unlock secure storage before importing a credential file or using saved credentials.
-      </p>
-      <Field name="unlock" label="Secure storage password" type="password" maxLength={8192} />
-      <Button disabled={pending}>Unlock storage</Button>
-    </form> : <div className="mt-3 flex flex-wrap items-center gap-3">
-      <p className="text-sm text-muted-foreground">Secure storage is unlocked.</p>
-      <Button
-        variant="outline"
-        disabled={pending}
-        onClick={() => void run({ action: "lockFallback" })}
-      >
-        Lock credential storage
-      </Button>
-    </div>}
-    {notice ? <p role="status" className="mt-3 text-sm text-emerald-300">{notice}</p> : null}
-    {error ? <p role="alert" className="mt-3 text-sm text-red-400">{error}</p> : null}
-  </div>
 }
 
 function SelectedConnection({

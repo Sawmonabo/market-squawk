@@ -213,6 +213,12 @@ pub(super) async fn authenticate_preface(stream: &mut Stream) -> Result<(), Inst
     }
 }
 
+// Connection/request admission starts with the short I/O deadline. The shared protocol selects
+// the bounded command deadline before waiting for an unlock response or acknowledging it.
+pub(super) fn set_transaction_deadline(stream: &mut Stream, deadline: Instant) {
+    stream.deadline = deadline;
+}
+
 pub(super) async fn finish_request(stream: &mut Stream) -> Result<(), InstalledServiceError> {
     if !stream.read.is_empty() || stream.read_offset != 0 {
         return Err(InstalledServiceError::BootstrapProtocol);

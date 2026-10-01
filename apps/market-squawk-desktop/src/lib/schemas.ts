@@ -174,11 +174,17 @@ export const providerOAuthSchema = z.object({
   refresh_expires_at: z.union([z.number().int(), z.string()]).nullable(),
 }).strict()
 
-export const encryptedFileFallbackSchema = z.enum([
-  "disabled",
-  "locked",
-  "ready",
-])
+export const secretAccessPolicySchema = z.object({
+  enabled: z.boolean(),
+  rememberInKeychain: z.boolean(),
+  reauthenticateAfterSeconds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+}).strict()
+
+export const secretAccessStatusSchema = secretAccessPolicySchema.extend({
+  access: z.enum(["ready", "locked", "recovery_required"]),
+  rememberedAccessAvailable: z.boolean(),
+  reauthenticateAtUnixSeconds: z.number().int().max(Number.MAX_SAFE_INTEGER).nullable(),
+}).strict()
 
 export const desktopSystemBootstrapSchema = z.object({
   contractVersion: z.literal("market-squawk-desktop-v1"),
@@ -296,7 +302,7 @@ export const providerBootstrapSchema = z.object({
     savedConfigurationSessionId: z.string().uuid().nullable(),
     activationKind: z.enum(["source", "sec", "bls", "bea", "census", "treasury_fiscal", "treasury_daily_rates", "fred_alfred", "eia_electricity_price", "federal_reserve_board_h15", "yahoo_enrichment", "tiingo_starter_eod_nav"]).nullable(),
   }).strict()).max(32),
-  encryptedFileFallback: encryptedFileFallbackSchema,
+  credentialAccess: secretAccessStatusSchema,
   capabilities: z.object({
     credentialImport: z.boolean(),
     health: z.boolean(),
@@ -498,9 +504,9 @@ export type DesktopInvalidationDomain = z.infer<
 export type DesktopEventSubscriptionReceipt = z.infer<
   typeof desktopEventSubscriptionReceiptSchema
 >
-export type EncryptedFileFallback = z.infer<
-  typeof encryptedFileFallbackSchema
->
+
+export type SecretAccessPolicy = z.infer<typeof secretAccessPolicySchema>
+export type SecretAccessStatus = z.infer<typeof secretAccessStatusSchema>
 export type InstallationControlResult = z.infer<
   typeof installationControlResultSchema
 >

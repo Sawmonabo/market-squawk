@@ -79,9 +79,10 @@ pub use paths::{
 };
 pub use raw_record::{RawCaptureRecord, RawCaptureRecordError};
 pub use secrets::{
-    EncryptedFileFallbackStatus, EncryptedFileSecretFallback, EncryptedFileSecretStore,
-    EncryptedFileUnlockCapability, LocalSecretStoreError, OsKeyringSecretStore,
-    PreferredSecretStore, RotationAuthority, RotationOutcome, SecretBackend, SecretCancellation,
+    AccessControlledSecretStore, EncryptedFileFallbackStatus, EncryptedFileSecretFallback,
+    EncryptedFileSecretStore, EncryptedFileUnlockCapability, LocalSecretStoreError,
+    OsKeyringSecretStore, PreferredSecretStore, RotationAuthority, RotationOutcome,
+    SecretAccessPolicy, SecretAccessState, SecretAccessStatus, SecretBackend, SecretCancellation,
     SecretDeadlineCapability, SecretDeletionDisposition, SecretGeneration,
     SecretInteractionCapability, SecretInteractionPolicy, SecretKey, SecretMutationDisposition,
     SecretMutationEffect, SecretMutationFailure, SecretMutationKind, SecretMutationPlan,

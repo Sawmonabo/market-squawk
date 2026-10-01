@@ -652,7 +652,7 @@ impl ApplicationDomainService for ResearchDomainService {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
         let limits = effective_service_limits(&request, &context)?;
         match request.name() {
-            RESEARCH_LIST_DATASETS => self.controller.datasets(&request, &context, limits),
+            RESEARCH_LIST_DATASETS => self.controller.datasets(&request, &context, limits).await,
             RESEARCH_GET_MANIFEST => self.controller.manifest(&request, &context, limits),
             RESEARCH_GET_HISTORY => {
                 self.controller
@@ -852,7 +852,7 @@ struct ResearchController {
 }
 
 impl ResearchController {
-    fn datasets(
+    async fn datasets(
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
@@ -860,14 +860,16 @@ impl ResearchController {
     ) -> Result<TypedToolResult, ServiceError> {
         let after = optional_dataset(request, "afterDataset")?;
         let page_limit = limits.maximum_result_items().min(MAX_ANALYTICAL_PAGE);
+        let page_limit = AnalyticalReadLimit::try_new(page_limit).map_err(map_read_error)?;
+        let reader = self.reader.clone();
+        let deadline = context.deadline();
         let page = self
-            .reader
-            .datasets(
-                after.as_ref(),
-                AnalyticalReadLimit::try_new(page_limit).map_err(map_read_error)?,
-                context.deadline(),
-                context.cancellation(),
-            )
+            .authority
+            .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+                reader.datasets(after.as_ref(), page_limit, deadline, &cancellation)
+            })
+            .await
+            .map_err(corporate_actions::map_research_error)?
             .map_err(map_read_error)?;
         let returned = page.generations().len();
         if returned == 0 {

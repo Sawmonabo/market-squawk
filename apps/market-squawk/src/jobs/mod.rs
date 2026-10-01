@@ -144,7 +144,7 @@ impl InstalledJobRunners {
             let descriptor = crate::application::internal_forecast_generation_descriptor()
                 .map_err(|_| InstalledJobError::RunnerComposition)?;
             let evidence = Arc::new(crate::application::AnalyticalForecastEvidenceReader::new(
-                product.research().analytical_reader(),
+                product.research(),
                 Some(product.macro_context_read_capability()),
                 Some(crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
                     product.research(),

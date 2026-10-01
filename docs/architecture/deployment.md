@@ -9,7 +9,7 @@ order, complete release boundary, and recovery surfaces.
 | Document type | Deployment architecture |
 | Audience | Operators, maintainers, security reviewers, and integrators |
 | Status | Current |
-| Last substantive review | 2026-08-03 |
+| Last substantive review | 2026-09-30 (credential access); other boundaries 2026-08-03 |
 
 ## Contents
 
@@ -104,7 +104,7 @@ flowchart LR
         Relays["Named MCP stdio relays"]
         Capture["capture helper process"]
         Onnx["ONNX worker process"]
-        Keyring["Operating-system keyring"]
+        Secrets["Managed encrypted credential vaults\nand optional OS-remembered access"]
 
         subgraph DataRoot["Configured local data root"]
             Catalog["catalog.sqlite3 and SQLite sidecars"]
@@ -133,7 +133,7 @@ flowchart LR
     ServiceMain <-->|"configured provider interfaces"| Kraken
     ServiceMain <-->|"configured provider interfaces"| Official
     Inputs -->|"controlled reads"| ServiceMain
-    ServiceMain <-->|"opaque secret references"| Keyring
+    ServiceMain <-->|"opaque secret references"| Secrets
     ServiceMain -->|"bounded capture protocol"| Capture
     Capture --> Journal
     ServiceMain -->|"bounded model protocol"| Onnx
@@ -325,12 +325,23 @@ expiry; consumers retrieve bounded verified chunks through `query artifact` or
 Configuration files are operator-selected and need not live under the data root. Effective
 configuration retains the origin of each value and redacts secret references from reports.
 
-The reviewed `LocalProduct` composes `PreferredSecretStore` with the OS keyring as primary and a
-code-owned encrypted-file fallback rooted under `control/secrets/provider-credentials/`. The
-fallback starts locked in every process and accepts its bounded unlock only through the foreground
-Settings connection flow. It becomes eligible only when the primary cannot provide its exact lifecycle;
-retained references never migrate between backends. Provider release availability and clean-machine
-onboarding acceptance remain tracked in the [delivery ledger](../plans/delivery-ledger.md).
+`LocalProduct` uses `AccessControlledSecretStore` under
+`control/secrets/provider-credentials/`; the installed service uses a separate store under
+`control/secrets/installed-runtime/` for private client credentials. New generations use managed
+encrypted storage; retained OS-keyring references continue to route to their exact backend.
+Automatic access retains a generated random unlock in private local authority state and reuses
+saved credentials across launches, service restarts and development rebuilds. Build/signing type
+does not force an application password. User passwords are never retained in that local state.
+
+Settings → General offers optional Application lock, OS-remembered access, explicit Lock and
+Forget controls, and a user-selected reauthentication interval with none imposed by default.
+Lock and interval expiry suspend credential-bearing runtimes while ordinary screens and saved
+results remain usable. Unlock resumes connection recovery without automatically starting paper
+trading. Forget removes remembered access, retaining provider credentials and the current unlocked
+session. Older password vaults require their original unlock once to adopt automatic access;
+provider and runtime vault recovery remain separate. Provider expiry, revocation and key replacement
+affect that connection independently of the application lock. Installed native remembering,
+restart and onboarding acceptance remain tracked in the [delivery ledger](../plans/delivery-ledger.md).
 
 ## Startup and shutdown
 
@@ -341,8 +352,8 @@ The installed service starts in authority order:
 1. load and validate safe defaults, optional file, supplied `MARKET_SQUAWK_*` environment, and CLI
    overrides;
 2. prepare the local root and open the catalog, object-store authority, and durable source state;
-3. recover provider onboarding/activation recipes, portfolio revisions, governed backtests, and
-   model admissions;
+3. restore credential access according to the retained policy and recover provider
+   onboarding/activation recipes, portfolio revisions, governed backtests, and model admissions;
 4. require the configured verified training release if durable model admissions exist, and when one
    is configured verify the running application and sibling ONNX worker against it;
 5. construct every required application-domain service;
@@ -352,6 +363,8 @@ The installed service starts in authority order:
 
 Partial composition is not published. Corrupt or unverifiable durable state produces a typed
 startup failure or quarantines only the affected provider where that isolation is safe.
+Optional provider locking does not prevent composing saved-data services or publishing normal
+application readiness; it reports credential access separately.
 
 ### Desktop startup
 
@@ -434,8 +447,9 @@ manifest/object state is not a valid application backup procedure.
   merely because they are local.
 - Prepared paths use canonical roots, directory capabilities, no-follow/regular-file checks, stable
   identities, bounded reads, no-clobber publication, and explicit locks.
-- Secrets reside in the OS keyring for the current composition. The catalog and artifacts retain
-  only opaque references and non-secret evidence.
+- New secrets reside in managed encrypted vaults, with private automatic access by default and
+  optional OS-remembered application unlocking. Retained secret references resolve only through
+  their exact backend. Catalog and result artifacts retain opaque references and non-secret evidence.
 - Native onboarding requires the exact installed Desktop client and active workspace. Protected
   staged activation separately requires the exact CLI client; ordinary MCP tools cannot inherit
   those private operations. OAuth callback admission remains provider-specific and bounded.
@@ -486,6 +500,8 @@ must be produced on documented hardware by the final release evidence lane descr
 - [Desktop composition root](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
 - [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Local product startup](../../apps/market-squawk/src/local_product/mod.rs)
+- [Automatic and optional credential access](../../crates/market-squawk-platform/src/secrets/access.rs)
+- [Credential runtime drain and resume](../../apps/market-squawk/src/local_product/credential_access.rs)
 - [Application lifecycle](../../apps/market-squawk/src/application.rs)
 - [Production source supervisor](../../apps/market-squawk/src/live_source/supervisor.rs)
 - [Capture helper configuration](../../crates/market-squawk-platform/src/capture/process_journal/config.rs)

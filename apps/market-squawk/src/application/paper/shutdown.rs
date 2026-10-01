@@ -25,6 +25,7 @@ type Preparation = Pin<Box<dyn Future<Output = PreparationOutcome> + Send>>;
 type Drain = Pin<Box<dyn Future<Output = StopOutcome> + Send>>;
 
 pub(super) struct RetainedPaperRun {
+    surface: SourceIdentifier,
     progress: Mutex<Progress>,
     cancellation: CancellationToken,
     market: Arc<MarketRuntimeRegistry>,
@@ -95,6 +96,7 @@ impl RetainedPaperRun {
         definitions: market_squawk_data::MarketDataInstrumentReadCapability,
         context: market_squawk_services::RequestContext,
     ) -> Arc<Self> {
+        let retained_surface = surface.clone();
         let preparation = prepare(
             composition,
             snapshots,
@@ -109,6 +111,7 @@ impl RetainedPaperRun {
             context,
         );
         Arc::new(Self {
+            surface: retained_surface,
             progress: Mutex::new(Progress::Preparing(Box::pin(preparation))),
             cancellation,
             market,
@@ -127,13 +130,14 @@ impl RetainedPaperRun {
         let cleanup = hooks.map(|hooks| {
             let disabled = hooks.disable();
             HookCleanup {
-                surface,
+                surface: surface.clone(),
                 incarnation: disabled.runtime_incarnation(),
                 generation: disabled.generation(),
             }
         });
         cancellation.cancel();
         Arc::new(Self {
+            surface,
             progress: Mutex::new(Progress::Draining(Box::pin(stop_runtime(
                 runtime,
                 cleanup,
@@ -149,6 +153,10 @@ impl RetainedPaperRun {
 
     pub(super) fn requires_reconciliation(&self) -> bool {
         matches!(&*self.progress.lock(), Progress::Stopped(outcome) if !outcome.is_complete())
+    }
+
+    pub(super) fn surface_id(&self) -> &SourceIdentifier {
+        &self.surface
     }
 
     pub(super) fn begin_shutdown(&self) {

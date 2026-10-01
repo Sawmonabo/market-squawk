@@ -81,6 +81,7 @@ pub(crate) type SchwabOAuthMarketDrainFuture<'a> =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SchwabOAuthMarketDrainPurpose {
     ProcessShutdown,
+    CredentialLock,
     Unlink,
     CredentialReplacement,
 }
@@ -301,6 +302,49 @@ impl SchwabOAuthRuntime {
         self.shutdown.cancel();
     }
 
+    /// Closes credential admission without terminating the installation's reusable OAuth owner.
+    pub(crate) fn begin_credential_suspension(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    /// Releases protected in-memory state while preserving the saved OAuth session on disk.
+    pub(crate) async fn suspend_credentials(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        self.begin_credential_suspension();
+        self.finish_drain(deadline, SchwabOAuthMarketDrainPurpose::CredentialLock)
+            .await?;
+        let mut sessions =
+            tokio::time::timeout_at(TokioInstant::from_std(deadline), self.sessions.lock())
+                .await
+                .map_err(|_| SchwabOAuthRuntimeError::ShutdownStillDraining)?;
+        if sessions
+            .values()
+            .any(|session| Arc::strong_count(&session.authority) != 1)
+        {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRetained);
+        }
+        sessions.clear();
+        Ok(())
+    }
+
+    /// Subsequent exact-session reads reopen the unchanged saved protected authority lazily.
+    pub(crate) async fn resume_credentials(&self) -> Result<(), SchwabOAuthRuntimeError> {
+        if self.shutdown.is_cancelled()
+            || self.onboarding.credential_access_status()?.access
+                != market_squawk_platform::SecretAccessState::Ready
+        {
+            return Err(SchwabOAuthRuntimeError::ShuttingDown);
+        }
+        let sessions = self.sessions.lock().await;
+        if !self.accepting.load(Ordering::Acquire) && !sessions.is_empty() {
+            return Err(SchwabOAuthRuntimeError::ShutdownStillDraining);
+        }
+        self.accepting.store(true, Ordering::Release);
+        self.require_admission()
+    }
+
     /// Drains all market generations and joins callback receivers by `deadline`.
     ///
     /// Only receiver-only work may be aborted at expiry. A token exchange or credential
@@ -312,13 +356,35 @@ impl SchwabOAuthRuntime {
         deadline: Instant,
     ) -> Result<(), SchwabOAuthRuntimeError> {
         self.begin_shutdown();
+        self.finish_drain(deadline, SchwabOAuthMarketDrainPurpose::ProcessShutdown)
+            .await
+    }
+
+    async fn finish_drain(
+        &self,
+        deadline: Instant,
+        purpose: SchwabOAuthMarketDrainPurpose,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
         let deadline = TokioInstant::from_std(deadline);
         self.wait_for_operations(deadline).await?;
         let mut sessions = tokio::time::timeout_at(deadline, self.sessions.lock())
             .await
             .map_err(|_| SchwabOAuthRuntimeError::ShutdownDeadline)?;
-        self.finish_credential_replacement(&mut sessions, Some(deadline))
-            .await?;
+        if let Err(error) = self
+            .finish_credential_replacement(&mut sessions, Some(deadline))
+            .await
+        {
+            // A joined replacement restores the exact resulting authority before reporting its
+            // operation error. Credential locking only needs that custody back, including when
+            // the already sealed vault caused the admitted replacement to fail.
+            let replacement_drained = self
+                .credential_replacement
+                .try_lock()
+                .is_ok_and(|retained| retained.is_none());
+            if purpose != SchwabOAuthMarketDrainPurpose::CredentialLock || !replacement_drained {
+                return Err(error);
+            }
+        }
         let mut first_error = None;
         let mut market_sessions = Vec::new();
         // Exchange and receiver tasks do not acquire the session-map lock.
@@ -329,7 +395,9 @@ impl SchwabOAuthRuntime {
                 match tokio::time::timeout_at(deadline, exchange.join()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        first_error.get_or_insert(error);
+                        if purpose != SchwabOAuthMarketDrainPurpose::CredentialLock {
+                            first_error.get_or_insert(error);
+                        }
                     }
                     Err(_) => return Err(SchwabOAuthRuntimeError::ShutdownStillDraining),
                 }
@@ -339,7 +407,9 @@ impl SchwabOAuthRuntime {
                 match tokio::time::timeout_at(deadline, pending.join()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        first_error.get_or_insert(error);
+                        if purpose != SchwabOAuthMarketDrainPurpose::CredentialLock {
+                            first_error.get_or_insert(error);
+                        }
                     }
                     Err(_) => {
                         // Receiver-only abort is allowed, but the handle stays owned until joined.
@@ -353,12 +423,9 @@ impl SchwabOAuthRuntime {
         drop(sessions);
         for session_id in market_sessions {
             let drain_cancellation = CancellationToken::new();
-            let drain = self.market_drain.drain(
-                session_id,
-                None,
-                SchwabOAuthMarketDrainPurpose::ProcessShutdown,
-                drain_cancellation.clone(),
-            );
+            let drain =
+                self.market_drain
+                    .drain(session_id, None, purpose, drain_cancellation.clone());
             match tokio::time::timeout_at(deadline, drain).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -908,7 +975,11 @@ impl SchwabOAuthRuntime {
     }
 
     fn require_admission(&self) -> Result<(), SchwabOAuthRuntimeError> {
-        if self.accepting.load(Ordering::Acquire) {
+        if self.accepting.load(Ordering::Acquire)
+            && !self.shutdown.is_cancelled()
+            && self.onboarding.credential_access_status()?.access
+                == market_squawk_platform::SecretAccessState::Ready
+        {
             Ok(())
         } else {
             Err(SchwabOAuthRuntimeError::ShuttingDown)

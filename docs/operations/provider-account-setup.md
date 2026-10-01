@@ -8,8 +8,8 @@ then fill the local credential template. It does not enable providers by itself.
 | Document type | Operator setup runbook |
 | Audience | Local Market Squawk owner/operator |
 | Status | Account preparation and one-time installed credential import are implemented; provider activation/publication/workflow integration remains in flight |
-| Last substantive review | 2026-08-12 |
-| Implementation review basis | Provider documentation and capacity review current through 2026-08-12; repository audit base `8fd91dad` plus the Wave 8B profile/documentation candidate; not frozen-head acceptance |
+| Last substantive review | 2026-09-30 (credential access); provider documentation through 2026-08-12 |
+| Implementation review basis | Credential access reviewed against current platform/service/Settings source; provider audit base `8fd91dad` plus the Wave 8B profile/documentation candidate; not frozen-head acceptance |
 
 ## Important current boundary
 
@@ -52,8 +52,21 @@ Supply the normal explicit `--config <PATH>` option too when the installed servi
 non-default product configuration. Keep the source file until the secret-free receipt is retained;
 the importer does not delete it.
 
-If Settings → Onboarding reports locked encrypted credential storage, unlock that workspace's
-provider vault before importing. The installed CLI offers the same explicit action:
+Configured connections reuse saved credentials and sessions across launches, service restarts,
+and development rebuilds without an application-password prompt. Repeat import only when changing
+the saved credential configuration, not to reopen existing connections.
+
+Application locking is optional, under Settings → General → Application lock. Enable it with a
+chosen password; optionally remember access in the OS keychain and choose a reauthentication
+interval in whole days. No interval is imposed by default. **Lock** requires explicit unlocking
+even after restart. **Forget remembered access** removes the remembered unlock while retaining
+provider credentials and the current unlocked session. Ordinary screens and saved results remain
+available while locked; credential-dependent activity resumes through its existing recovery flows
+after unlock. Paper trading does not restart automatically.
+
+If application locking is enabled, unlock there before importing or using saved credentials.
+An older password-protected vault may also require its existing password once to adopt automatic
+access. The installed CLI offers the same provider-credential unlock action:
 
 ```bash
 market-squawk source unlock-credentials --confirm
@@ -61,10 +74,15 @@ market-squawk source unlock-credentials --confirm
 
 The command prompts without echo. For a protected pipe, add `--stdin`; input is limited to 4,096
 bytes and one trailing line ending is removed. Never put the password in a command argument or
-ordinary environment variable. The unlock is held only by the running service. This provider vault
-is separate from the installation's runtime-credential vault: `service bootstrap` unlocking the
-latter does not unlock provider storage. The action uses the existing authenticated staged setup
-operation and does not contact providers or activate collection.
+ordinary environment variable. The action uses the existing authenticated staged setup operation;
+unlocking itself makes no provider request, while saved credential-dependent runtimes can resume
+afterward. The installation's runtime-credential vault has separate authority and automatic access;
+an older runtime vault may need its own `service bootstrap` recovery once.
+
+Provider OAuth expiry, revocation, and key replacement are connection-specific recovery. Use that
+connection's renewal or authorization flow; changing the application lock does not renew provider
+consent. Installed native OS-keychain and restart acceptance evidence belongs in the
+[delivery ledger](../plans/delivery-ledger.md).
 
 The 17 receipt-provider mappings are:
 

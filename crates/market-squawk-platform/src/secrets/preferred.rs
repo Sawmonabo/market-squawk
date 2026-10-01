@@ -26,6 +26,10 @@ impl EncryptedFileUnlockCapability {
     pub fn new(unlock: SecretValue) -> Self {
         Self(unlock)
     }
+
+    pub(super) fn into_secret(self) -> SecretValue {
+        self.0
+    }
 }
 
 impl fmt::Debug for EncryptedFileUnlockCapability {
@@ -206,6 +210,7 @@ impl ConfiguredEncryptedFileFallback {
 pub struct PreferredSecretStore {
     primary: Option<OsKeyringSecretStore>,
     fallback: Option<ConfiguredEncryptedFileFallback>,
+    prefer_encrypted_file: bool,
 }
 
 impl PreferredSecretStore {
@@ -221,6 +226,7 @@ impl PreferredSecretStore {
         Ok(Self {
             primary: Some(OsKeyringSecretStore::try_new(service)?),
             fallback: fallback.map(ConfiguredEncryptedFileFallback::ready),
+            prefer_encrypted_file: false,
         })
     }
 
@@ -240,6 +246,7 @@ impl PreferredSecretStore {
     ) -> Result<Self, LocalSecretStoreError> {
         Ok(Self {
             primary: Some(OsKeyringSecretStore::try_new(service)?),
+            prefer_encrypted_file: false,
             fallback: Some(ConfiguredEncryptedFileFallback::locked(
                 root.as_ref().to_path_buf(),
             )),
@@ -256,6 +263,7 @@ impl PreferredSecretStore {
     ) -> Result<Self, LocalSecretStoreError> {
         Ok(Self {
             primary: None,
+            prefer_encrypted_file: false,
             fallback: Some(ConfiguredEncryptedFileFallback::locked(
                 root.as_ref().to_path_buf(),
             )),
@@ -266,6 +274,64 @@ impl PreferredSecretStore {
         self.fallback
             .as_ref()
             .ok_or(LocalSecretStoreError::UnsupportedOperation)
+    }
+
+    // Managed access keeps existing OS references routable, while new generations use the
+    // retained encrypted vault without asking an OS backend to admit a rebuilt executable.
+    pub(super) fn managed(service: &str, root: &Path) -> Result<Self, LocalSecretStoreError> {
+        let mut store = Self::try_new_with_locked_encrypted_file_fallback(service, root)?;
+        store.prefer_encrypted_file = true;
+        Ok(store)
+    }
+
+    pub(super) fn open_managed_fallback(
+        &self,
+        unlock: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<(), LocalSecretStoreError> {
+        control.read_postflight()?;
+        let fallback = self.fallback()?;
+        let mut state = fallback
+            .store
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        if state.is_some() {
+            return Err(LocalSecretStoreError::AlreadyLocked);
+        }
+        let opened = EncryptedFileSecretStore::try_open(&fallback.root, unlock)?;
+        opened.recover_rotation()?;
+        opened.validate_current_unlock(control)?;
+        *state = Some(opened);
+        Ok(())
+    }
+
+    pub(super) fn close_managed_fallback(&self) -> Result<(), LocalSecretStoreError> {
+        drop(
+            self.fallback()?
+                .store
+                .lock()
+                .map_err(|_| LocalSecretStoreError::WriterUnavailable)?
+                .take(),
+        );
+        Ok(())
+    }
+
+    pub(super) fn rotate_managed_fallback(
+        &self,
+        unlock: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<(), LocalSecretStoreError> {
+        control.read_postflight()?;
+        let mut state = self
+            .fallback()?
+            .store
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        state
+            .as_mut()
+            .ok_or(LocalSecretStoreError::Locked)?
+            .rotate_unlock(unlock)?;
+        control.mutation_postflight()
     }
 
     fn use_fallback<T>(
@@ -386,6 +452,9 @@ impl SecretStore for PreferredSecretStore {
         &self,
         control: &SecretOperationControl,
     ) -> Result<SecretStoreCapabilities, LocalSecretStoreError> {
+        if self.prefer_encrypted_file {
+            return self.use_fallback(|fallback| fallback.probe(control));
+        }
         let Some(primary) = self.primary.as_ref() else {
             return self.use_fallback(|fallback| fallback.probe(control));
         };
@@ -406,6 +475,9 @@ impl SecretStore for PreferredSecretStore {
         generation: SecretGeneration,
         control: &SecretOperationControl,
     ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
+        if self.prefer_encrypted_file {
+            return self.use_fallback(|fallback| fallback.plan_create(key, generation, control));
+        }
         let Some(primary) = self.primary.as_ref() else {
             return self.use_fallback(|fallback| fallback.plan_create(key, generation, control));
         };
@@ -536,6 +608,9 @@ impl SecretStore for PreferredSecretStore {
         value: SecretValue,
         control: &SecretOperationControl,
     ) -> Result<SecretRef, LocalSecretStoreError> {
+        if self.prefer_encrypted_file {
+            return self.use_fallback(|fallback| fallback.create(key, generation, value, control));
+        }
         let Some(primary) = self.primary.as_ref() else {
             return self.use_fallback(|fallback| fallback.create(key, generation, value, control));
         };
@@ -606,10 +681,16 @@ impl SecretStore for PreferredSecretStore {
     }
 
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), LocalSecretStoreError> {
+        if self.prefer_encrypted_file {
+            return self.use_fallback(|fallback| fallback.store(key, value));
+        }
         self.primary()?.store(key, value)
     }
 
     fn load(&self, key: &SecretKey) -> Result<SecretValue, LocalSecretStoreError> {
+        if self.prefer_encrypted_file {
+            return self.use_fallback(|fallback| fallback.load(key));
+        }
         self.primary()?.load(key)
     }
 }

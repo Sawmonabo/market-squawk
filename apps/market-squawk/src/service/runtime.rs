@@ -675,7 +675,7 @@ fn signing_secret_key() -> Result<SecretKey, InstalledServiceError> {
         .map_err(|_error| InstalledServiceError::SecretStore)
 }
 
-fn secret_control(
+pub(super) fn secret_control(
     owner: &'static str,
     interaction: SecretInteractionPolicy,
 ) -> Result<SecretOperationControl, InstalledServiceError> {

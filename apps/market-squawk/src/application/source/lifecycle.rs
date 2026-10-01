@@ -814,6 +814,26 @@ pub trait SourceLifecycleAuthority: Send + Sync {
     /// Joins pending source-owned cleanup before portal credentials/runtime authorities close.
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), SourceLifecycleError>;
 
+    /// Drains credential-bearing connections while retaining the user's desired source choices.
+    async fn suspend_credential_runtimes(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SourceLifecycleError> {
+        let _ = (deadline, cancellation);
+        Err(SourceLifecycleError::Unavailable)
+    }
+
+    /// Reopens retained desired connections after explicit credential access becomes ready.
+    async fn resume_credential_runtimes(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SourceLifecycleError> {
+        let _ = (deadline, cancellation);
+        Err(SourceLifecycleError::Unavailable)
+    }
+
     /// Reports whether this owner implements lifecycle controls for the provider.
     /// This describes control support only; it does not establish data or runtime readiness.
     fn supports(&self, provider: &SourceIdentifier) -> bool;

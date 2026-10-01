@@ -18,8 +18,8 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod analysis;
-pub mod analytical_workflow;
 pub(crate) mod analytical_profile;
+pub mod analytical_workflow;
 pub mod backup;
 pub(crate) mod company_security_resolution;
 mod contracts;
@@ -40,13 +40,13 @@ pub mod operations;
 mod paper;
 pub(crate) mod recommendation;
 mod research;
+pub(crate) use research::fiscal_projection::fiscal_projection_targets;
+pub(crate) use research::map_current_population_error;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 pub use research::{
     H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
 };
 pub(crate) use research::{benchmark, saved_benchmark};
-pub(crate) use research::map_current_population_error;
-pub(crate) use research::fiscal_projection::fiscal_projection_targets;
 pub mod settings;
 pub mod setup;
 pub mod source;
@@ -72,73 +72,48 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub(crate) use market_runtime::{
-    ensure_alpaca_iex_asset_reference,
-    AlpacaPublicationRuntime,
-    AlpacaOptionChainRuntime, OptionChainDemand, OptionChainDemandError, OptionChainDemandResult,
-    AccountGroupStopReceipt, AccountMarketRuntimeReconnect, PreparedAccountStop,
-    EquityPaperRouteEvidence, EquityPaperSourceBinding, EquityPaperSourceRoute,
-    AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
-    MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
+    AccountGroupStopReceipt, AccountMarketRuntimeReconnect, AccountMarketSurface,
+    AlpacaOptionChainRuntime, AlpacaPublicationRuntime, EquityPaperRouteEvidence,
+    EquityPaperSourceBinding, EquityPaperSourceRoute, MarketProviderGroupLifecycleEvidence,
+    MarketRuntimeGroupGeneration, MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
+    OptionChainDemand, OptionChainDemandError, OptionChainDemandResult, PreparedAccountStop,
     PreparedMarketProviderConfigurationRequest, PreparedMarketProviderConfigurationResolver,
     PreparedSchwabMarketRuntimeResolver, SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
     SchwabRestQuoteCurrentRuntimeInput, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
-    SchwabRestQuoteSourceEvidence,
+    SchwabRestQuoteSourceEvidence, ensure_alpaca_iex_asset_reference,
 };
 pub use paper::PaperApplicationServices;
+pub(crate) use paper::PaperCredentialRuntimeControl;
 pub(crate) use paper::{
-    EquityPaperServices,
-    PaperStoppedBackupAuthority, PaperStoppedBackupLease, PaperAuditBackupKind,
-    PaperStoppedBackupStreamCustody,
-    MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,
-    MarketReferenceSearchPage, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
-};
-pub(crate) use research::{
-    PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource, ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
-    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError, AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
-    AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector, AlpacaOptionMarketPointInTimeSelector,MACRO_CONTEXT_INDICATOR_COUNT, RESIDENTIAL_ELECTRICITY_PRICE_DATASET};
-pub(crate) use research::fiscal_projection::FiscalProjectionTarget;
-pub(crate) use research::{
-    PreparedFindPopulation, PreparedCurrentFindFeatures, PreparedCurrentFindFeaturePartition,
-    CurrentFindPartitionPreparationEvidence, CurrentFindScreenPartition,
-    HistoricalFiscalTrainingAuthority,
-    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGES,
-    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs, HistoricalFiscalJobReference,
-    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalStudyBinding,
-    HistoricalFiscalForecastReadCapability, HistoricalFiscalUnavailableReference,
-    PreparedHistoricalFiscalDatasets, prepare_fixed_current_population,
-    FindPopulationExclusionReason, prepare_find_population, read_find_population,
-};
-pub(crate) use research::{
-    BoardFullHistoryApplicationError, EquityPremiumReadError, InstrumentContextRead,
-    RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
-    SelectedRecommendationBenchmark, TiingoLatestApplicationError, required_annual_source_dates,
-    map_market_definition_read_error,
+    EquityPaperServices, MarketReferenceMatchKind, MarketReferenceRecord,
+    MarketReferenceSearchAuthority, MarketReferenceSearchPage, PaperAuditBackupKind,
+    PaperRuntimeActivityAuthority, PaperStoppedBackupAuthority, PaperStoppedBackupLease,
+    PaperStoppedBackupStreamCustody, PortfolioCandidateResolutionFactory,
 };
 pub(crate) use research::corporate_actions::{
-    ApplicableActionPlanError, ForecastOutcomeSourcePreparation,
+    ApplicableActionPlanError, ForecastOutcomeSourcePreparation, PendingCurrentPriceActions,
+    SourceActionPreparationCapability, SourceAppliedCorporateActionPlan,
+    SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability,
     map_analytical_error as map_source_analytical_error,
     map_research_error as map_source_research_error,
-    SourceActionPreparationCapability, SourceAppliedCorporateActionPlan, SourceAppliedCorporateActionPlanReference,
-    SourceAppliedCorporateActionReadCapability,
-    PendingCurrentPriceActions,
 };
+pub(crate) use research::fiscal_projection::FiscalProjectionTarget;
 pub(crate) use research::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    AnalyticalForecastEvidenceReader, CoinbaseMarketApplicationOutcome,
-    CensusLiveComposition, CensusMacroApplicationClosure, CensusMacroApplicationError,
-    CensusPublicationReceipt, CensusSealFirstExtractionLimits,
-    CompanyResearchReadCapability, CryptoCommittedRowIngress, CryptoMarketPublicationAuthority,
-    CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
-    DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
-    DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-    DatasetPreparationSelection, DatasetPreparationUse, EiaApplicationAcquisitionLimits,
-    EiaLiveComposition, EiaMacroApplicationClosure, EiaMacroApplicationError,
-    EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest, EiaMacroPublicationReceipt,
-    EiaMacroRestartReceipt, EiaMacroRestartSelector, FeatureDatasetProductionFinalizer,
-    FredLatestKnownOperation, FredPublishedGenerationHandoff, InstrumentContext,
-    InstrumentContextOutcome, InstrumentContextReadCapability, InstrumentContextReadError,
-    InstrumentContextRequest, InstrumentIdentityReadCapability,
+    AnalyticalForecastEvidenceReader, CensusLiveComposition, CensusMacroApplicationClosure,
+    CensusMacroApplicationError, CensusPublicationReceipt, CensusSealFirstExtractionLimits,
+    CoinbaseMarketApplicationOutcome, CompanyResearchReadCapability, CryptoCommittedRowIngress,
+    CryptoMarketPublicationAuthority, CryptoMarketPublicationError, CryptoPendingFrameIngress,
+    CryptoPublicationRendezvousLimits, DatasetPreparationAuthority, DatasetPreparationError,
+    DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
+    DatasetPreparationReceipt, DatasetPreparationSelection, DatasetPreparationUse,
+    EiaApplicationAcquisitionLimits, EiaLiveComposition, EiaMacroApplicationClosure,
+    EiaMacroApplicationError, EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest,
+    EiaMacroPublicationReceipt, EiaMacroRestartReceipt, EiaMacroRestartSelector,
+    FeatureDatasetProductionFinalizer, FredLatestKnownOperation, FredPublishedGenerationHandoff,
+    InstrumentContext, InstrumentContextOutcome, InstrumentContextReadCapability,
+    InstrumentContextReadError, InstrumentContextRequest, InstrumentIdentityReadCapability,
     InstrumentIdentityResolutionOutcome, InstrumentIdentityResolutionRead,
     InstrumentIdentityResolutionRequest, InstrumentOfficialLifecycleEvidence,
     InstrumentSearchCandidate, InstrumentSearchListing, InstrumentSearchMatchReason,
@@ -153,8 +128,8 @@ pub(crate) use research::{
     SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
     SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
     SchwabRestQuoteSourceHealthOutcome, SchwabStreamerApplicationOutcome,
-    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt, SecFundamentalsResearchError,
-    SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
+    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt,
+    SecFundamentalsResearchError, SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
     SecFundamentalsResearchStatus, SecLiveFundApplicationError, SecLiveFundRequest,
     SecLiveFundSource, SecResearchFamilyBinding, TiingoCompletedEodActionRead,
     TiingoCompletedEodHistoryReference, TiingoEodHistoryPublicationReceipt,
@@ -162,8 +137,35 @@ pub(crate) use research::{
     TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest, read_macro_feature_vector,
 };
 pub(crate) use research::{
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
+    AlpacaOptionMarketPointInTimeSelector, AlpacaOptionMarketPublicationReceipt,
+    AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
+    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput, MACRO_CONTEXT_INDICATOR_COUNT,
+    PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource,
+    ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
+    RESIDENTIAL_ELECTRICITY_PRICE_DATASET,
+};
+pub(crate) use research::{
     BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
     BlsMacroCapabilityState,
+};
+pub(crate) use research::{
+    BoardFullHistoryApplicationError, EquityPremiumReadError, InstrumentContextRead,
+    RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
+    SelectedRecommendationBenchmark, TiingoLatestApplicationError,
+    map_market_definition_read_error, required_annual_source_dates,
+};
+pub(crate) use research::{
+    CurrentFindPartitionPreparationEvidence, CurrentFindScreenPartition,
+    FindPopulationExclusionReason, HISTORICAL_FISCAL_MAXIMUM_ORIGINS,
+    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_MAXIMUM_PAGES,
+    HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs,
+    HistoricalFiscalForecastReadCapability, HistoricalFiscalJobReference,
+    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalStudyBinding,
+    HistoricalFiscalTrainingAuthority, HistoricalFiscalUnavailableReference,
+    PreparedCurrentFindFeaturePartition, PreparedCurrentFindFeatures, PreparedFindPopulation,
+    PreparedHistoricalFiscalDatasets, prepare_find_population, prepare_fixed_current_population,
+    read_find_population,
 };
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
@@ -602,8 +604,11 @@ impl Application {
                     report.failures[index] = report.failures[index].or(market_failure);
                 }
             }
-            let blocked = dependency_failure(service.domain())
-                .or(if research_domain { market_failure } else { None });
+            let blocked = dependency_failure(service.domain()).or(if research_domain {
+                market_failure
+            } else {
+                None
+            });
             if let Some(error) = blocked {
                 // A failed Market drain may still own originals. Keep the research capture
                 // worker available for retained cleanup, and report the unmet dependency.

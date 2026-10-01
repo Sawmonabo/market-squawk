@@ -827,10 +827,15 @@ impl DatasetPreparationAuthority {
         check_control(deadline, &cancellation)?;
         let limit = AnalyticalReadLimit::try_new(MAXIMUM_GENERATIONS)
             .map_err(|_| DatasetPreparationError::Capacity)?;
+        let reader = self.reader.clone();
         let page = self
-            .reader
-            .datasets(None, limit, deadline, &cancellation)
-            .map_err(|_| DatasetPreparationError::Unavailable)?;
+            .research
+            .run_owned_research_io(deadline, &cancellation, move |worker_cancellation| {
+                reader.datasets(None, limit, deadline, &worker_cancellation)
+            })
+            .await
+            .map_err(|error| preparation_worker_error("catalog_worker", error))?
+            .map_err(|error| preparation_read_error("catalog_read", error))?;
         if page.has_more() {
             return Err(DatasetPreparationError::Capacity);
         }
@@ -899,14 +904,21 @@ impl DatasetPreparationAuthority {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(Vec<ResearchObservation>, usize), DatasetPreparationError> {
-        self.observation_selection(
-            generation,
-            AnalyticalObservationTemplate::All,
-            Vec::new(),
-            deadline,
-            cancellation,
-        )
-        .await
+        let reader = self.reader.clone();
+        let manifest = generation.manifest().clone();
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| DatasetPreparationError::Unavailable)?;
+        self.research
+            .run_owned_research_io(deadline, &cancellation, move |worker_cancellation| {
+                runtime.block_on(read_preparation_observations(
+                    reader,
+                    manifest,
+                    deadline,
+                    worker_cancellation,
+                ))
+            })
+            .await
+            .map_err(|error| preparation_worker_error("observation_worker", error))?
     }
 
     async fn observation_selection(
@@ -935,11 +947,24 @@ impl DatasetPreparationAuthority {
             QUERY_DURATION,
         )
         .map_err(|_| DatasetPreparationError::Capacity)?;
-        let output = self
-            .reader
-            .read_observations(request, limits, deadline, cancellation)
-            .await
+        let reader = self.reader.clone();
+        let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| DatasetPreparationError::Unavailable)?;
+        // Keep the exact-manifest read and its query in the existing I/O lane. The worker
+        // releases its permit before decoding or deriving options that may read macro sources.
+        let output = self
+            .research
+            .run_owned_research_io(deadline, &cancellation, move |worker_cancellation| {
+                runtime.block_on(reader.read_observations(
+                    request,
+                    limits,
+                    deadline,
+                    worker_cancellation,
+                ))
+            })
+            .await
+            .map_err(|error| preparation_worker_error("observation_worker", error))?
+            .map_err(|error| preparation_read_error("observation_read", error))?;
         let QueryResult::Inline { batches, .. } = output.output().result() else {
             return Err(DatasetPreparationError::Capacity);
         };
@@ -973,6 +998,175 @@ impl DatasetPreparationAuthority {
         }
         Ok((observations, retained_bytes))
     }
+}
+
+/// Exhausts an immutable cursor before deriving options. The guided catalog needs every row,
+/// but does not need a DataFusion plan, sort buffers or retained Arrow output for that scan.
+async fn read_preparation_observations(
+    reader: AnalyticalReadCapability,
+    manifest: DatasetManifestRef,
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> Result<(Vec<ResearchObservation>, usize), DatasetPreparationError> {
+    let deadline = deadline.min(
+        Instant::now()
+            .checked_add(QUERY_DURATION)
+            .ok_or(DatasetPreparationError::Capacity)?,
+    );
+    check_control(deadline, &cancellation)?;
+    let mut cursor = reader
+        .observation_batch_cursor(
+            &manifest,
+            0,
+            0,
+            None,
+            128,
+            MAXIMUM_QUERY_BYTES * 2,
+            deadline,
+            &cancellation,
+        )
+        .map_err(|error| preparation_read_error("observation_cursor", error))?;
+    let mut observations = Vec::new();
+    let mut retained_bytes = 0_usize;
+    loop {
+        check_control(deadline, &cancellation)?;
+        let batch = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            cursor.next_batch(),
+        )
+        .await
+        .map_err(|_| DatasetPreparationError::Cancelled)?
+        .map_err(|error| preparation_read_error("observation_batch", error.into()))?;
+        let Some(batch) = batch else {
+            break;
+        };
+        if observations.len().saturating_add(batch.num_rows()) > MAXIMUM_OBSERVATIONS_PER_GENERATION
+        {
+            return Err(DatasetPreparationError::Capacity);
+        }
+        let ordering_bytes = batch
+            .num_rows()
+            .checked_mul(std::mem::size_of::<[u8; 32]>())
+            .ok_or(DatasetPreparationError::Capacity)?;
+        let remaining = MAXIMUM_QUERY_BYTES
+            .checked_sub(retained_bytes)
+            .and_then(|bytes| bytes.checked_sub(ordering_bytes))
+            .ok_or(DatasetPreparationError::Capacity)?;
+        let (decoded, decoded_bytes) =
+            ResearchArrowBatch::decode_query_projection_bounded(batch.clone(), remaining).map_err(
+                |error| {
+                    let error_class = match error {
+                        market_squawk_data::ArrowConversionError::RetainedLimitExceeded {
+                            ..
+                        } => "decode_memory",
+                        _ => "decode_invalid",
+                    };
+                    tracing::warn!(
+                        stage = "observation_decode",
+                        error_class,
+                        "guided dataset preparation I/O failed"
+                    );
+                    DatasetPreparationError::InvalidEvidence
+                },
+            )?;
+        let digests = batch
+            .column_by_name("payload_sha256")
+            .and_then(|column| column.as_any().downcast_ref::<arrow::array::BinaryArray>())
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        observations
+            .try_reserve_exact(decoded.len())
+            .map_err(|_| DatasetPreparationError::Capacity)?;
+        for (index, observation) in decoded.into_iter().enumerate() {
+            let digest: [u8; 32] = digests
+                .value(index)
+                .try_into()
+                .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+            observations.push((observation, digest));
+        }
+        retained_bytes = retained_bytes
+            .checked_add(decoded_bytes)
+            .and_then(|bytes| bytes.checked_add(ordering_bytes))
+            .filter(|bytes| *bytes <= MAXIMUM_QUERY_BYTES)
+            .ok_or(DatasetPreparationError::Capacity)?;
+    }
+    check_control(deadline, &cancellation)?;
+    // Preserve the original closed query's ordering, including its revision tie-breaker.
+    observations.sort_unstable_by(|(left, left_digest), (right, right_digest)| {
+        let left = observation_context(left);
+        let right = observation_context(right);
+        left.provenance()
+            .source_id()
+            .cmp(right.provenance().source_id())
+            .then_with(|| {
+                left.provenance()
+                    .source_identifier()
+                    .cmp(right.provenance().source_identifier())
+            })
+            .then_with(|| {
+                left.time()
+                    .revision()
+                    .get()
+                    .cmp(&right.time().revision().get())
+            })
+            .then_with(|| left_digest.cmp(right_digest))
+    });
+    let ordering_bytes = observations.len() * std::mem::size_of::<[u8; 32]>();
+    let observations = observations.into_iter().map(|(value, _)| value).collect();
+    check_control(deadline, &cancellation)?;
+    Ok((observations, retained_bytes - ordering_bytes))
+}
+
+fn preparation_worker_error(
+    stage: &'static str,
+    error: crate::ResearchServiceError,
+) -> DatasetPreparationError {
+    let error_class = match error {
+        crate::ResearchServiceError::Ingest(market_squawk_data::IngestError::Cancelled) => {
+            "cancelled"
+        }
+        crate::ResearchServiceError::Ingest(market_squawk_data::IngestError::DeadlineExceeded) => {
+            "deadline_exceeded"
+        }
+        crate::ResearchServiceError::ProviderCaptureSealWorkerUnavailable => "worker_unavailable",
+        _ => "worker_other",
+    };
+    tracing::warn!(stage, error_class, "guided dataset preparation I/O failed");
+    DatasetPreparationError::Unavailable
+}
+
+fn preparation_read_error(
+    stage: &'static str,
+    error: market_squawk_data::AnalyticalReadError,
+) -> DatasetPreparationError {
+    use market_squawk_data::{
+        AnalyticalReadError, ManifestCatalogError, ParquetStoreError, QueryError,
+    };
+
+    // Never format the source error: nested SQL, paths and provider payloads are not diagnostics.
+    let error_class = match error {
+        AnalyticalReadError::Manifest(ManifestCatalogError::LockPoisoned) => "catalog_lock",
+        AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled) => "catalog_cancelled",
+        AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded) => "catalog_deadline",
+        AnalyticalReadError::Manifest(_) => "catalog_other",
+        AnalyticalReadError::Query(QueryError::Cancelled) => "query_cancelled",
+        AnalyticalReadError::Query(QueryError::DeadlineExceeded) => "query_deadline",
+        AnalyticalReadError::Query(QueryError::MemoryLimitExceeded { .. }) => "query_memory",
+        AnalyticalReadError::Query(QueryError::ReaderMemoryBoundExceeded) => "query_reader_memory",
+        AnalyticalReadError::Query(QueryError::RowLimitExceeded { .. }) => "query_rows",
+        AnalyticalReadError::Query(QueryError::ByteLimitExceeded { .. }) => "query_bytes",
+        AnalyticalReadError::Query(QueryError::BlockingTaskLimitExceeded) => "query_workers",
+        AnalyticalReadError::Query(QueryError::UnsupportedSourceSchema) => "query_schema",
+        AnalyticalReadError::Query(QueryError::DependencyAllocationContract) => "query_allocation",
+        AnalyticalReadError::Query(QueryError::DataFusion(_)) => "query_datafusion",
+        AnalyticalReadError::Query(_) => "query_other",
+        AnalyticalReadError::Parquet(ParquetStoreError::ReadLimitExceeded) => "cursor_memory",
+        AnalyticalReadError::Parquet(ParquetStoreError::Cancelled) => "cursor_cancelled",
+        AnalyticalReadError::Parquet(ParquetStoreError::ReadDeadlineExceeded) => "cursor_deadline",
+        AnalyticalReadError::Parquet(_) => "cursor_other",
+        _ => "read_other",
+    };
+    tracing::warn!(stage, error_class, "guided dataset preparation I/O failed");
+    DatasetPreparationError::Unavailable
 }
 
 impl fmt::Debug for DatasetPreparationAuthority {

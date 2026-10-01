@@ -9,7 +9,7 @@ import type {
   DesktopEvent,
   DesktopEventSubscriptionReceipt,
   DesktopSystemStartup,
-  EncryptedFileFallback,
+  SecretAccessStatus,
   InstallationControlResult,
   InputTicket,
   McpClientsStatus,
@@ -19,6 +19,7 @@ import type {
   ProviderOAuth,
   ProviderSession,
   ProviderSetupInspection,
+  SecretAccessPolicy,
 } from "@/lib/schemas"
 
 export type DesktopEventSubscriptionRequest = {
@@ -287,6 +288,12 @@ export type DesktopServiceBootstrapRequest =
   | { action: "unlock_encrypted_fallback"; unlock: string }
   | { action: "complete_foreground_keyring" }
 
+export type CredentialAccessRequest =
+  | { action: "configureAccess"; policy: SecretAccessPolicy; secret?: string }
+  | { action: "unlockAccess"; secret: string }
+  | { action: "lockAccess" }
+  | { action: "forgetRememberedAccess" }
+
 export type ProviderOnboardingRequest =
   | { action: "bootstrap" }
   | { action: "inspect"; sessionId: string }
@@ -297,8 +304,7 @@ export type ProviderOnboardingRequest =
       administrativeEmail?: string
     }
   | { action: "resume"; sessionId: string }
-  | { action: "unlockFallback"; secret: string }
-  | { action: "lockFallback" }
+  | CredentialAccessRequest
   | { action: "submitSecret"; sessionId: string; secret: string }
   | {
       action: "activate"
@@ -319,8 +325,8 @@ export type ProviderOnboardingResult<
   ? ProviderBootstrap
   : Request extends { action: "inspect" }
     ? ProviderSetupInspection
-    : Request extends { action: "unlockFallback" | "lockFallback" }
-    ? EncryptedFileFallback
+    : Request extends CredentialAccessRequest
+    ? SecretAccessStatus
     : Request extends { action: "activate" | "verifySaved" | "resumePublication" }
       ? ProviderActivation
       : Request extends { action: "schwabOAuth" }

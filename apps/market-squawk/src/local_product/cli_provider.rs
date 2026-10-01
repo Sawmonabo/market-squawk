@@ -19,12 +19,13 @@ use market_squawk_adapter_bea::{bea_api_endpoint_rule, bea_provider_rate_declara
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata, bls_application_provider_budget,
 };
-use market_squawk_adapter_census::{CensusParseLimits, CensusSourceConfig, census_api_endpoint_rules};
+use market_squawk_adapter_census::{
+    CensusParseLimits, CensusSourceConfig, census_api_endpoint_rules,
+};
 use market_squawk_adapter_eia::{EiaParseLimits, EiaTransportLimits, eia_api_endpoint_rules};
 use market_squawk_adapter_federal_reserve::{
     BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
-    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
-    BoardDatasetProfile,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT, BoardDatasetProfile,
 };
 use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
 use market_squawk_adapter_fred::{
@@ -78,10 +79,9 @@ use crate::provider_activation::eia_configuration::{
 };
 use crate::provider_activation::{
     BEA_SOURCE_ID, BEA_SURFACE, BeaAdapterActivation, BoardAdapterActivation,
-    CensusAdapterActivation, CensusRequestConfiguration,
-    CommittedProviderAdapterReplacement, ControlledLocalFileAdapterActivation,
-    PreparedProviderAdapterReplacement, TiingoAdapterActivation, YahooAdapterActivation,
-    selected_regional_source_config,
+    CensusAdapterActivation, CensusRequestConfiguration, CommittedProviderAdapterReplacement,
+    ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
+    TiingoAdapterActivation, YahooAdapterActivation, selected_regional_source_config,
 };
 use crate::provider_onboarding::SecCikInput;
 use crate::provider_onboarding::{
@@ -345,6 +345,7 @@ impl ProviderResearchActivationService {
         if cancellation.is_cancelled() || session_id.is_nil() {
             return Err(ProviderPortalActivationError::Unavailable);
         }
+        self.require_credential_access()?;
         let runtime = self
             .schwab_oauth_lifecycle
             .runtime(
@@ -357,6 +358,20 @@ impl ProviderResearchActivationService {
             .market_authority(session_id, cancellation)
             .await
             .map_err(map_schwab_oauth_error)
+    }
+
+    fn require_credential_access(&self) -> Result<(), ProviderPortalActivationError> {
+        if self
+            .onboarding
+            .credential_access_status()
+            .map_err(|_| ProviderPortalActivationError::StateUnavailable)?
+            .access
+            == market_squawk_platform::SecretAccessState::Ready
+        {
+            Ok(())
+        } else {
+            Err(ProviderPortalActivationError::Unavailable)
+        }
     }
 
     /// Publishes one exact workspace-controlled local-file bundle through the same durable
@@ -868,6 +883,7 @@ struct SchwabOAuthServiceLifecycleState {
 /// waits for that exact initializer before discovering and draining the sole `OnceCell` runtime.
 struct SchwabOAuthServiceLifecycle {
     accepting: AtomicBool,
+    credential_suspended: AtomicBool,
     state: AsyncMutex<SchwabOAuthServiceLifecycleState>,
 }
 
@@ -875,6 +891,7 @@ impl SchwabOAuthServiceLifecycle {
     fn new() -> Self {
         Self {
             accepting: AtomicBool::new(true),
+            credential_suspended: AtomicBool::new(false),
             state: AsyncMutex::new(SchwabOAuthServiceLifecycleState::default()),
         }
     }
@@ -907,6 +924,10 @@ impl SchwabOAuthServiceLifecycle {
             runtime.begin_shutdown();
             return Err(ProviderPortalActivationError::Unavailable);
         }
+        if self.credential_suspended.load(Ordering::Acquire) {
+            runtime.begin_credential_suspension();
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
         drop(state);
         Ok(runtime)
     }
@@ -917,7 +938,9 @@ impl SchwabOAuthServiceLifecycle {
     ) -> Result<(), ProviderPortalActivationError> {
         if cancellation.is_cancelled() {
             Err(ProviderPortalActivationError::Cancelled)
-        } else if self.accepting.load(Ordering::Acquire) {
+        } else if self.accepting.load(Ordering::Acquire)
+            && !self.credential_suspended.load(Ordering::Acquire)
+        {
             Ok(())
         } else {
             Err(ProviderPortalActivationError::Unavailable)
@@ -929,6 +952,49 @@ impl SchwabOAuthServiceLifecycle {
         if let Some(runtime) = runtime {
             runtime.begin_shutdown();
         }
+    }
+
+    fn begin_credential_suspension(&self, runtime: Option<&Arc<SchwabOAuthRuntime>>) {
+        self.credential_suspended.store(true, Ordering::Release);
+        if let Some(runtime) = runtime {
+            runtime.begin_credential_suspension();
+        }
+    }
+
+    async fn suspend_credentials(
+        &self,
+        cell: &OnceCell<Arc<SchwabOAuthRuntime>>,
+        deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        self.begin_credential_suspension(cell.get());
+        let _state = tokio::time::timeout_at(TokioInstant::from_std(deadline), self.state.lock())
+            .await
+            .map_err(|_| ProviderPortalActivationError::DeadlineExceeded)?;
+        if let Some(runtime) = cell.get() {
+            runtime
+                .suspend_credentials(deadline)
+                .await
+                .map_err(map_schwab_oauth_error)?;
+        }
+        Ok(())
+    }
+
+    async fn resume_credentials(
+        &self,
+        cell: &OnceCell<Arc<SchwabOAuthRuntime>>,
+    ) -> Result<(), ProviderPortalActivationError> {
+        let state = self.state.lock().await;
+        if state.drained || !self.accepting.load(Ordering::Acquire) {
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        if let Some(runtime) = cell.get() {
+            runtime
+                .resume_credentials()
+                .await
+                .map_err(map_schwab_oauth_error)?;
+        }
+        self.credential_suspended.store(false, Ordering::Release);
+        self.require_admission(&CancellationToken::new())
     }
 
     async fn finish_shutdown(
@@ -1333,6 +1399,41 @@ impl SchwabMarketDoctorTaskAuthority {
         self.shutdown.cancel();
     }
 
+    fn begin_credential_suspension(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    async fn suspend_credentials(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), CliProviderActivationError> {
+        self.begin_credential_suspension();
+        let deadline = TokioInstant::from_std(deadline);
+        let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
+            .await
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        if let Some(retained) = slot.as_mut() {
+            retained.cancellation.cancel();
+            let joined = tokio::time::timeout_at(deadline, &mut retained.task)
+                .await
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+            *slot = None;
+            joined.map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        }
+        Ok(())
+    }
+
+    fn resume_credentials(&self) -> Result<(), CliProviderActivationError> {
+        if self.shutdown.is_cancelled() {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        self.accepting.store(true, Ordering::Release);
+        if self.shutdown.is_cancelled() {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        Ok(())
+    }
+
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), CliProviderActivationError> {
         self.begin_shutdown();
         let deadline = TokioInstant::from_std(deadline);
@@ -1725,7 +1826,8 @@ pub(super) async fn publish_activated_macro_data(
             .await
             .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     } else {
-        Box::pin(activation.publish_eia_macro(&context)).await
+        Box::pin(activation.publish_eia_macro(&context))
+            .await
             .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     }
     Ok(())
@@ -2370,6 +2472,7 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         action: SchwabOAuthLifecycleAction,
         cancellation: CancellationToken,
     ) -> Result<SchwabOAuthLifecycleView, ProviderPortalActivationError> {
+        self.require_credential_access()?;
         if action == SchwabOAuthLifecycleAction::Unlink {
             self.schwab_doctor_tasks
                 .cancel_session(session_id, cancellation.child_token())
@@ -2446,6 +2549,32 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .await
             .map_err(map_portal_activation_error)?;
         Ok(view)
+    }
+
+    async fn suspend_credential_access(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        self.schwab_oauth_lifecycle
+            .begin_credential_suspension(self.schwab_oauth.get());
+        self.schwab_doctor_tasks.begin_credential_suspension();
+        self.schwab_doctor_tasks
+            .suspend_credentials(deadline)
+            .await
+            .map_err(map_portal_activation_error)?;
+        self.schwab_oauth_lifecycle
+            .suspend_credentials(&self.schwab_oauth, deadline)
+            .await
+    }
+
+    async fn resume_credential_access(&self) -> Result<(), ProviderPortalActivationError> {
+        self.require_credential_access()?;
+        self.schwab_oauth_lifecycle
+            .resume_credentials(&self.schwab_oauth)
+            .await?;
+        self.schwab_doctor_tasks
+            .resume_credentials()
+            .map_err(map_portal_activation_error)
     }
 
     fn begin_shutdown(&self) {
@@ -2637,7 +2766,7 @@ pub(super) fn restore_research_providers(
             Ok(ResearchProviderRecovery::ResumeRequired) => {
                 tracing::warn!(
                     surface_id,
-                    "provider activation remains disabled until an explicit user resume"
+                    "provider activation awaits credential-ready runtime restoration"
                 );
             }
             Err(error) => {
@@ -2648,9 +2777,9 @@ pub(super) fn restore_research_providers(
     }
 }
 
-/// Reconstructs one exact retained research recipe for explicit source-lifecycle resume.
+/// Reconstructs one exact retained research recipe for source-lifecycle restoration or resume.
 ///
-/// Unlike startup recovery, this path may unlock the already admitted credential generation. It
+/// Unlike synchronous startup recovery, this path reads the admitted credential generation. It
 /// never accepts provider configuration from the lifecycle caller: the existing durable recipe,
 /// digest-addressed evidence, active onboarding lease, and provider-specific builder remain the
 /// sole construction authority.
@@ -2798,6 +2927,7 @@ fn recover_research_replacement(
                     );
                 if restored {
                     match restore_prepared_research_provider(
+                        onboarding,
                         activation_authority,
                         prepared_predecessor,
                     ) {
@@ -2813,7 +2943,7 @@ fn recover_research_replacement(
                         Ok(ResearchProviderRecovery::ResumeRequired) => {
                             tracing::warn!(
                                 surface_id,
-                                "restored predecessor remains disabled until an explicit user resume"
+                                "restored predecessor awaits credential-ready runtime restoration"
                             );
                             return;
                         }
@@ -2906,22 +3036,25 @@ fn recover_research_replacement(
         );
         return;
     }
-    let recovery =
-        match restore_prepared_research_provider(activation_authority, prepared_candidate) {
-            Ok(recovery) => recovery,
-            Err(error) => {
-                quarantine_failed_replacement_recovery(
-                    onboarding,
-                    state,
-                    surface_id,
-                    predecessor_session,
-                    candidate_session,
-                    cutover_digest,
-                    recovery_quarantine_reason(&error),
-                );
-                return;
-            }
-        };
+    let recovery = match restore_prepared_research_provider(
+        onboarding,
+        activation_authority,
+        prepared_candidate,
+    ) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            quarantine_failed_replacement_recovery(
+                onboarding,
+                state,
+                surface_id,
+                predecessor_session,
+                candidate_session,
+                cutover_digest,
+                recovery_quarantine_reason(&error),
+            );
+            return;
+        }
+    };
     if !matches!(
         state.complete_cutover_recipe(surface_id, cutover_digest),
         Ok(desired) if desired == desired_candidate_digest
@@ -2940,7 +3073,7 @@ fn recover_research_replacement(
     if matches!(recovery, ResearchProviderRecovery::ResumeRequired) {
         tracing::warn!(
             surface_id,
-            "restored candidate remains disabled until an explicit user resume"
+            "restored candidate awaits credential-ready runtime restoration"
         );
     }
     if state.reconcile_evidence_objects().is_err() {
@@ -2979,7 +3112,7 @@ fn restore_research_provider(
         surface_id,
         &recipe,
     )?;
-    restore_prepared_research_provider(activation_authority, prepared)
+    restore_prepared_research_provider(onboarding, activation_authority, prepared)
 }
 
 fn prepare_research_provider_recovery(
@@ -3078,9 +3211,17 @@ fn prepare_research_provider_recovery_with_lease(
 }
 
 fn restore_prepared_research_provider(
+    onboarding: &crate::ProviderOnboardingService,
     activation_authority: &crate::ProviderAdapterActivation,
     prepared: PreparedResearchProviderRecovery,
 ) -> Result<ResearchProviderRecovery, CliProviderActivationError> {
+    if prepared.lease.secret_reference().is_some()
+        && !onboarding
+            .credential_access_status()
+            .is_ok_and(|status| status.access == market_squawk_platform::SecretAccessState::Ready)
+    {
+        return Ok(ResearchProviderRecovery::ResumeRequired);
+    }
     let outcome =
         match activation_authority.restore_active_profile(prepared.session_id, prepared.request) {
             Ok(outcome) => outcome,
@@ -3405,7 +3546,8 @@ fn build_research_activation(
         }
         ProviderRequest::Census { configuration } => {
             require_surface(lease, ProviderSurface::Exact(CENSUS_SURFACE))?;
-            let contract = configuration.into_contract()
+            let contract = configuration
+                .into_contract()
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let parse_limits = CensusParseLimits::default();
             let config = CensusSourceConfig::try_new([contract.clone()], parse_limits)
@@ -3413,27 +3555,48 @@ fn build_research_activation(
             let network = EndpointPolicy::try_from_api_rules(
                 census_api_endpoint_rules(&config)
                     .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-                request_bounds(u64::try_from(parse_limits.max_bytes())
-                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?)?,
-            ).map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-            let policy = lease.provider_budget_policy().cloned()
+                request_bounds(
+                    u64::try_from(parse_limits.max_bytes())
+                        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                )?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let policy = lease
+                .provider_budget_policy()
+                .cloned()
                 .ok_or(CliProviderActivationError::InvalidMetadata)?;
             let declaration = ProviderRateDeclaration::try_for_authorization_subject(
-                policy, &authorization_subject(lease)?,
-            ).map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+                policy,
+                &authorization_subject(lease)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
             let metadata = metadata(
-                lease, activation_evidence, "census", "us-census",
-                SourceClass::OfficialAgency, CoverageDomain::Macroeconomic,
-                AuthorizationMode::UserAuthorized, HistoricalCapability::Historical,
-                metadata_effective, network, declaration.policy().clone(),
+                lease,
+                activation_evidence,
+                "census",
+                "us-census",
+                SourceClass::OfficialAgency,
+                CoverageDomain::Macroeconomic,
+                AuthorizationMode::UserAuthorized,
+                HistoricalCapability::Historical,
+                metadata_effective,
+                network,
+                declaration.policy().clone(),
             )?;
-            ProviderAdapterActivationRequest::Census(CensusAdapterActivation::try_new(
-                metadata, contract, parse_limits,
-                NonZeroU32::new(u32::try_from(parse_limits.max_rows())
-                    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?)
+            ProviderAdapterActivationRequest::Census(
+                CensusAdapterActivation::try_new(
+                    metadata,
+                    contract,
+                    parse_limits,
+                    NonZeroU32::new(
+                        u32::try_from(parse_limits.max_rows())
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+                    )
                     .ok_or(CliProviderActivationError::ProviderConfiguration)?,
-                nonzero_u64(64 * 1024 * 1024)?,
-            ).map_err(|_| CliProviderActivationError::ProviderConfiguration)?)
+                    nonzero_u64(64 * 1024 * 1024)?,
+                )
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+            )
         }
         ProviderRequest::EiaElectricityPrice {
             start_period,
@@ -3667,11 +3830,15 @@ fn portal_provider_request(
         ProviderPortalActivationRequest::Source => Err(CliProviderActivationError::SurfaceMismatch),
         ProviderPortalActivationRequest::Census { configuration } => {
             require_surface(lease, ProviderSurface::Exact(CENSUS_SURFACE))?;
-            configuration.into_contract()
+            configuration
+                .into_contract()
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-            Ok((ProviderRequest::Census { configuration }, LoadedActivationEvidence {
-                objects: BTreeMap::new(),
-            }))
+            Ok((
+                ProviderRequest::Census { configuration },
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
         }
         ProviderPortalActivationRequest::EiaElectricityPrice {
             start_period,
@@ -4151,7 +4318,8 @@ fn evidence_references(
         | ProviderRequest::TiingoStarterEodNav
         | ProviderRequest::ControlledLocalFiles { .. } => {}
         ProviderRequest::Census { configuration } => {
-            configuration.into_contract()
+            configuration
+                .into_contract()
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
         }
         ProviderRequest::EiaElectricityPrice {
@@ -6112,14 +6280,17 @@ mod tests {
         for profile in product.provider_onboarding().profiles() {
             let surface = SourceIdentifier::try_from(profile.id())?;
             assert_eq!(
-                activation.retained_setup_session(&surface).map_err(|error| format!("fresh setup lookup for {surface}: {error:?}"))?,
+                activation
+                    .retained_setup_session(&surface)
+                    .map_err(|error| format!("fresh setup lookup for {surface}: {error:?}"))?,
                 None,
                 "fresh setup unexpectedly retained a research selection for {surface}"
             );
         }
         let activated = activation
             .activate_from_portal(lease.session_id(), request, CancellationToken::new())
-            .await.map_err(|error| format!("BLS activation: {error:?}"))?;
+            .await
+            .map_err(|error| format!("BLS activation: {error:?}"))?;
         let value = serde_json::to_value(activated)?;
         let dataset = value
             .get("provider_dataset_identifier")
@@ -6149,7 +6320,8 @@ mod tests {
                 ProviderPortalActivationRequest::FederalReserveBoardH15,
                 CancellationToken::new(),
             )
-            .await.map_err(|error| format!("Board activation: {error:?}"))?;
+            .await
+            .map_err(|error| format!("Board activation: {error:?}"))?;
         let board_value = serde_json::to_value(board_activated)?;
         let board_dataset = board_value
             .get("provider_dataset_identifier")
@@ -6177,11 +6349,15 @@ mod tests {
                 .is_profile_registered(board_lease.surface_id())?
         );
         assert_eq!(
-            activation.retained_setup_session(lease.surface_id()).map_err(|error| format!("saved BLS setup lookup: {error:?}"))?,
+            activation
+                .retained_setup_session(lease.surface_id())
+                .map_err(|error| format!("saved BLS setup lookup: {error:?}"))?,
             Some(lease.session_id())
         );
         assert_eq!(
-            activation.retained_setup_session(board_lease.surface_id()).map_err(|error| format!("saved Board setup lookup: {error:?}"))?,
+            activation
+                .retained_setup_session(board_lease.surface_id())
+                .map_err(|error| format!("saved Board setup lookup: {error:?}"))?,
             Some(board_lease.session_id())
         );
         drop(activation);
@@ -6212,11 +6388,15 @@ mod tests {
             Some(board_dataset.clone())
         );
         assert_eq!(
-            recovered_activation.retained_setup_session(lease.surface_id()).map_err(|error| format!("restored BLS setup lookup: {error:?}"))?,
+            recovered_activation
+                .retained_setup_session(lease.surface_id())
+                .map_err(|error| format!("restored BLS setup lookup: {error:?}"))?,
             Some(lease.session_id())
         );
         assert_eq!(
-            recovered_activation.retained_setup_session(board_lease.surface_id()).map_err(|error| format!("restored Board setup lookup: {error:?}"))?,
+            recovered_activation
+                .retained_setup_session(board_lease.surface_id())
+                .map_err(|error| format!("restored Board setup lookup: {error:?}"))?,
             Some(board_lease.session_id())
         );
         let status = crate::local_product::execute_cli_command(

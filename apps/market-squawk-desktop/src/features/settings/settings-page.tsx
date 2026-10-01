@@ -33,9 +33,11 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
 import { compareLosslessIntegers, type LosslessInteger } from "@/lib/lossless-integer"
 import { formatTimestamp } from "@/lib/time"
+import type { ProviderBootstrap } from "@/lib/schemas"
 import type { OperationSettingValue, SystemTransport } from "@/lib/transport"
 
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { ApplicationLock } from "./application-lock"
 
 import {
   asOperationSettingValue,
@@ -148,6 +150,12 @@ function SettingsWorkspace({
   const [announcement, setAnnouncement] = React.useState("")
 
   const settingsKey = productKeys.operation(scope, "operations", "Operations.GetSettings", {})
+  const connectionsKey = [...productKeys.domain(scope, "source"), "connections-bootstrap"]
+  const connections = useQuery({
+    queryKey: connectionsKey,
+    queryFn: () => transport.onboard({ action: "bootstrap" }),
+    refetchInterval: false,
+  })
   const workspaceNavigation = useCursorNavigation()
   const workspaceKey = productKeys.operation(scope, "operations", "Operations.ListWorkspaces", {
     limit: WORKSPACE_PAGE_LIMIT,
@@ -335,15 +343,38 @@ function SettingsWorkspace({
           onClick={() => {
             void settings.refetch()
             void workspaces.refetch()
+            void connections.refetch()
           }}
-          disabled={settings.isFetching || workspaces.isFetching}
+          disabled={settings.isFetching || workspaces.isFetching || connections.isFetching}
         >
-          <RefreshCw className={settings.isFetching || workspaces.isFetching ? "animate-spin" : ""} aria-hidden="true" />
+          <RefreshCw className={settings.isFetching || workspaces.isFetching || connections.isFetching ? "animate-spin" : ""} aria-hidden="true" />
           Refresh facts
         </Button>
       }
     >
       <p className="sr-only" aria-live="polite">{announcement}</p>
+
+      {connections.isError ? <Alert className="mt-5">
+        <CircleAlert aria-hidden="true" />
+        <AlertTitle>Application lock settings could not be read</AlertTitle>
+        <AlertDescription>{messageFrom(connections.error)} Use Refresh facts to try again.</AlertDescription>
+      </Alert> : connections.isPending ? <Skeleton className="mt-6 h-44 rounded-xl" /> : (
+        <ApplicationLock
+          status={connections.data.credentialAccess}
+          disabled={connections.isFetching}
+          onSubmit={async (request) => {
+            const next = await transport.onboard(request)
+            queryClient.setQueryData<ProviderBootstrap>(connectionsKey, (current) =>
+              current ? { ...current, credentialAccess: next } : current,
+            )
+            await Promise.all([
+              queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "source") }),
+              queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "market") }),
+            ])
+            return next
+          }}
+        />
+      )}
 
       {mutationError ? <MutationFailure error={mutationError} /> : null}
       {settings.isError ? (

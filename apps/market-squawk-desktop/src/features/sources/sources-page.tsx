@@ -325,7 +325,7 @@ export function ConnectionsWorkspace({
         />
       <ProviderCredentialImport
         available={credentialImportAvailable}
-        fallback={connections.data.encryptedFileFallback}
+        credentialAccess={connections.data.credentialAccess}
         transport={transport}
         onAttempted={() => {
           void refreshAuthority()

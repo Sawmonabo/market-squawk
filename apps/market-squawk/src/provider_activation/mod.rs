@@ -828,6 +828,25 @@ impl ProviderAdapterActivation {
         self.restore_with_lease(lease, request)
     }
 
+    /// Drains secret-bearing research adapters and drops their retained credential copies.
+    pub(crate) async fn suspend_credential_research_runtimes(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProviderAdapterActivationError> {
+        let generations = self.research_mutation.retained_credential_generations()?;
+        for generation in generations {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ProviderAdapterActivationError::SourceBinding),
+                _ = tokio::time::sleep_until(deadline.into()) => return Err(ProviderAdapterActivationError::SourceBinding),
+                result = self.revoke_research_runtime_owned(&generation, true) => result?,
+            }
+            self.research_mutation.release_suspended_provider_generation(&generation)?;
+        }
+        Ok(())
+    }
+
     /// Returns the exact provider generation currently published into the research runtime.
     pub(crate) fn research_runtime_generation(
         &self,
@@ -941,6 +960,14 @@ impl ProviderAdapterActivation {
         &self,
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ProviderAdapterActivationError> {
+        self.revoke_research_runtime_owned(expected, false).await
+    }
+
+    async fn revoke_research_runtime_owned(
+        &self,
+        expected: &ResearchProviderRuntimeGeneration,
+        require_exclusive: bool,
+    ) -> Result<(), ProviderAdapterActivationError> {
         let _onboarding_authority = self.onboarding.acquire_runtime_mutation_authority().await;
         if expected.profile().as_str() == SEC_EDGAR_PROFILE_ID {
             self.research_mutation
@@ -969,6 +996,9 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
+                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                        return Err(ProviderAdapterActivationError::SourceBinding);
+                    }
                     retained.take();
                 }
             }
@@ -981,6 +1011,9 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
+                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                        return Err(ProviderAdapterActivationError::SourceBinding);
+                    }
                     retained.take();
                 }
             }
@@ -993,6 +1026,9 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
+                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                        return Err(ProviderAdapterActivationError::SourceBinding);
+                    }
                     retained.take();
                 }
             }
@@ -1005,6 +1041,9 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
+                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                        return Err(ProviderAdapterActivationError::SourceBinding);
+                    }
                     retained.take();
                 }
             }
@@ -1020,6 +1059,9 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
+                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                        return Err(ProviderAdapterActivationError::SourceBinding);
+                    }
                     retained.take();
                 }
             }
@@ -1032,6 +1074,9 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
+                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                        return Err(ProviderAdapterActivationError::SourceBinding);
+                    }
                     retained.take();
                 }
             }

@@ -10,7 +10,7 @@ durable state or an order adapter.
 | Document type | Security architecture explanation |
 | Audience | Maintainers, security reviewers, operators, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-08-03 |
+| Last substantive review | 2026-09-30 (credential access); other boundaries 2026-08-03 |
 
 ## Contents
 
@@ -97,7 +97,7 @@ flowchart LR
         App["Application services<br/>closed descriptors, bounds, cancellation, deadlines"]
         Onboarding["Provider onboarding service<br/>session and credential workflow"]
         Activation["Provider activation authority<br/>adapter-specific durable activation"]
-        Secrets["Current secret authority<br/>OS keyring-backed"]
+        Secrets["Current secret authority<br/>managed vault and optional OS-remembered access"]
         Source["Authoritative source registry<br/>rights, metadata, coverage, session, capture"]
         Live["Instrument-owned live shards<br/>integrity, quality, process-local capability"]
         Research["Research authority<br/>catalog, manifests, publication, point-in-time"]
@@ -188,12 +188,21 @@ Credential material is not ordinary configuration:
   catalog-safe metadata.
 - Creation, read, replacement, and deletion use exact generations. Replacement does not silently
   erase the current generation before the candidate is known.
-- The reviewed `LocalProduct` composes the operating-system keyring first and a code-owned,
-  initially locked encrypted-file fallback. Only an explicit foreground native Settings operation
-  can submit the fallback unlock; configuration, environment, command arguments, disk, and
-  background restart cannot.
-- A new secret can use the unlocked fallback only after the primary backend proves unavailable or
-  unable to provide the exact lifecycle.
+- `LocalProduct` and installed-service credential storage use `AccessControlledSecretStore`.
+  New credential generations use the managed encrypted vault. Automatic access is the default:
+  a separately generated random unlock is retained in private local authority state, allowing
+  saved credentials to reopen across service restarts and development rebuilds. No default
+  password is embedded, and user passwords are never stored in that filesystem authority.
+- Application locking is an explicit Settings choice. Enabling it rotates out the automatic
+  unlock; optional remembering stores the user unlock in the OS credential store. Startup reads
+  remembered access without permission to display a platform prompt. Explicit Lock and a
+  user-selected reauthentication deadline require fresh authentication even after restart;
+  no deadline is imposed by default. Forget removes remembered access without deleting provider
+  credentials or ending the current unlocked session.
+- Lock seals new credential reads and drains credential-bearing runtimes before reporting a
+  completed lock. Saved-data services and ordinary screens remain available. Unlock resumes
+  retained connection recovery; paper trading requires a new explicit start. Provider OAuth
+  expiry, revocation and key replacement remain separate, connection-specific recovery.
 - Once a reference exists, its backend is authoritative. The router does not probe another backend
   with that reference or copy secret bytes between stores.
 - Interaction policy distinguishes a forbidden prompt from an explicitly permitted
@@ -201,6 +210,11 @@ Credential material is not ordinary configuration:
 - Cancellation and deadlines are checked at operation boundaries. If a mutation may have completed
   when cancellation or expiry is observed, the result is `IndeterminateCompletion`, not a false
   rollback claim.
+
+An older password vault may require its original unlock once before automatic access can be
+adopted; unavailable unlock authority never authorizes replacing its saved credential generations.
+Installed native OS remembering and restart verification are evidence claims maintained in the
+[delivery ledger](../plans/delivery-ledger.md), separate from these source-defined controls.
 
 Native onboarding requires the exact installed Desktop client and current workspace before the
 existing service can touch session, credential, or activation authority. Selected credential-file
@@ -379,6 +393,8 @@ publication contexts are process-local and must be newly admitted.
 - [ADR 0002: Evidence-derived execution quality](decisions/0002-evidence-derived-execution-quality.md)
 - [ADR 0005: Central risk and execution authority](decisions/0005-central-risk-and-execution-authority.md)
 - [Secret-store contracts](../../crates/market-squawk-platform/src/secrets.rs)
+- [Automatic and optional credential access](../../crates/market-squawk-platform/src/secrets/access.rs)
+- [Credential runtime drain and resume](../../apps/market-squawk/src/local_product/credential_access.rs)
 - [Controlled local paths and artifacts](../../crates/market-squawk-platform/src/paths.rs)
 - [Authoritative source registry](../../crates/market-squawk-sources/src/registry/catalog.rs)
 - [Live execution capability](../../crates/market-squawk-live/src/authority.rs)

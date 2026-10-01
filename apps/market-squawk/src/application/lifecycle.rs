@@ -17,7 +17,7 @@ use market_squawk_runtime::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Monotonic identity that fences every request and event after a workspace transition.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -328,7 +328,7 @@ struct LifecycleState {
 
 /// Single-writer authority for active-workspace identity and request admission.
 pub struct WorkspaceLifecycleAuthority {
-    state: Mutex<LifecycleState>,
+    state: RwLock<LifecycleState>,
     journal: Arc<dyn WorkspaceTransitionJournal>,
 }
 
@@ -342,7 +342,7 @@ impl WorkspaceLifecycleAuthority {
             return Err(LifecycleError::InvalidGeneration);
         }
         Ok(Self {
-            state: Mutex::new(LifecycleState {
+            state: RwLock::new(LifecycleState {
                 active,
                 fenced: false,
             }),
@@ -353,7 +353,7 @@ impl WorkspaceLifecycleAuthority {
     /// Returns the current identity for reconnect and event-cursor reset.
     pub fn current(&self) -> Result<WorkspaceRuntimeIdentity, LifecycleError> {
         self.state
-            .try_lock()
+            .try_read()
             .map(|state| state.active)
             .map_err(|_| LifecycleError::AuthorityBusy)
     }
@@ -362,7 +362,7 @@ impl WorkspaceLifecycleAuthority {
     pub fn admit_request(&self, presented: WorkspaceRuntimeIdentity) -> Result<(), LifecycleError> {
         let state = self
             .state
-            .try_lock()
+            .try_read()
             .map_err(|_| LifecycleError::AuthorityBusy)?;
         if state.fenced {
             return Err(LifecycleError::RequestsFenced);
@@ -384,7 +384,7 @@ impl WorkspaceLifecycleAuthority {
     ) -> Result<WorkspaceSwitchPreview, LifecycleError> {
         let state = self
             .state
-            .try_lock()
+            .try_read()
             .map_err(|_| LifecycleError::AuthorityBusy)?;
         if state.fenced || state.active.workspace_id() == target {
             return Err(LifecycleError::InvalidTarget);
@@ -421,7 +421,7 @@ impl WorkspaceLifecycleAuthority {
         if timeout.is_zero() || timeout > Duration::from_secs(10 * 60) {
             return Err(LifecycleError::InvalidTimeout);
         }
-        let mut state = self.state.lock().await;
+        let mut state = self.state.write().await;
         if state.fenced || state.active != approval.active {
             return Err(LifecycleError::StaleApproval);
         }
@@ -457,7 +457,7 @@ impl WorkspaceLifecycleAuthority {
     ) -> Result<(), LifecycleError> {
         let state = self
             .state
-            .try_lock()
+            .try_write()
             .map_err(|_| LifecycleError::AuthorityBusy)?;
         if state.active != record.active {
             return Err(LifecycleError::InvalidRestartHandoff);
@@ -574,10 +574,41 @@ mod tests {
             WorkspaceRuntimeIdentity::try_new(original, 7)?,
             journal.clone(),
         )?;
+        // Ordinary startup reads must coexist without becoming false authority failures.
+        let shared_read = authority.state.read().await;
+        assert_eq!(authority.current()?, shared_read.active);
+        authority.admit_request(shared_read.active)?;
+        assert!(matches!(
+            authority.admit_request(WorkspaceRuntimeIdentity::try_new(target, 7)?),
+            Err(LifecycleError::WrongWorkspace)
+        ));
+        assert!(matches!(
+            authority.admit_request(WorkspaceRuntimeIdentity::try_new(original, 6)?),
+            Err(LifecycleError::StaleWorkspaceGeneration)
+        ));
         let preview = authority.preview_switch(
             target,
             WorkspaceActivitySnapshot::quiescent(1_000_000, 500_000, 1),
         )?;
+        drop(shared_read);
+        // A transition still owns exclusive admission until its durable handoff completes.
+        let transition_write = authority.state.write().await;
+        assert!(matches!(
+            authority.current(),
+            Err(LifecycleError::AuthorityBusy)
+        ));
+        assert!(matches!(
+            authority.admit_request(WorkspaceRuntimeIdentity::try_new(original, 7)?),
+            Err(LifecycleError::AuthorityBusy)
+        ));
+        assert!(matches!(
+            authority.preview_switch(
+                target,
+                WorkspaceActivitySnapshot::quiescent(1_000_000, 500_000, 1),
+            ),
+            Err(LifecycleError::AuthorityBusy)
+        ));
+        drop(transition_write);
         let approval = preview.try_approve()?;
         let transition = FixtureTransition {
             current: WorkspaceRuntimeIdentity::try_new(original, 7)?,

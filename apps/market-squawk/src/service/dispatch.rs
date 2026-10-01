@@ -114,8 +114,8 @@ impl InstalledApplicationDispatcher {
         let onboarding = product.provider_onboarding();
         let profiles = serde_json::to_value(onboarding.profiles())
             .map_err(|_error| DispatchError::Unavailable)?;
-        let encrypted_fallback = onboarding
-            .encrypted_file_fallback_status()
+        let credential_access = onboarding
+            .credential_access_status()
             .map_err(|_error| DispatchError::Unavailable)?;
         let bootstrap = json!({
             "schemaVersion": 1,
@@ -136,7 +136,7 @@ impl InstalledApplicationDispatcher {
             },
             "sources": {
                 "profiles": profiles,
-                "encryptedFileFallback": encrypted_fallback,
+                "credentialAccess": credential_access,
             },
             "mcpAuthority": {
                 "endpointIdentity": format!("{:x}", Sha256::digest(endpoint.to_string())),

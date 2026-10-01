@@ -14,9 +14,9 @@ use clap::Parser;
 use market_squawk::{
     AppConfig,
     service::{
-        EphemeralVerificationRoot, InstalledSecretBackendPolicy, InstalledService,
-        InstalledServiceInstance, InstalledServiceLogging, InstalledServiceRunOutcome,
-        TerminalLogFormat, complete_foreground_keyring_bootstrap_at_installation_root,
+        EphemeralVerificationRoot, InstalledService, InstalledServiceInstance,
+        InstalledServiceLogging, InstalledServiceRunOutcome, TerminalLogFormat,
+        complete_foreground_keyring_bootstrap_at_installation_root,
     },
     termination::TerminationSignals,
 };
@@ -117,7 +117,6 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
             .map(|()| InstalledServiceRunOutcome::Stopped)
             .map_err(|_error| anyhow::anyhow!("secure startup could not be completed"));
     }
-    let secret_backend_policy = installed_secret_backend_policy(&installation_data_root)?;
     let ephemeral_verification_root = if arguments.ephemeral_verification_credentials {
         Some(EphemeralVerificationRoot::try_new(&installation_data_root)?)
     } else {
@@ -181,14 +180,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
             phase: ServiceStartupPhase::LoggingReady,
         },
     )?;
-    let result = run_installed_service(
-        config,
-        logging.store(),
-        instance,
-        secret_backend_policy,
-        startup.as_ref(),
-    )
-    .await;
+    let result = run_installed_service(config, logging.store(), instance, startup.as_ref()).await;
     let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
         if evidence.accepted == evidence.persisted
             && evidence.dropped_overflow == 0
@@ -214,7 +206,6 @@ async fn run_installed_service(
     config: AppConfig,
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
     instance: InstalledServiceInstance,
-    secret_backend_policy: InstalledSecretBackendPolicy,
     startup: Option<&ServiceStartupEvidenceWriter>,
 ) -> Result<InstalledServiceRunOutcome> {
     publish_startup(
@@ -234,10 +225,7 @@ async fn run_installed_service(
         }
     };
     let mut starting = Box::pin(InstalledService::start_with_logging_store(
-        config,
-        instance,
-        logs,
-        secret_backend_policy,
+        config, instance, logs,
     ));
     let service_result = tokio::select! {
         result = &mut starting => result,
@@ -318,8 +306,7 @@ async fn run_foreground_keyring_broker(
     arguments: &ServiceArguments,
     installation_data_root: &Path,
 ) -> Result<()> {
-    if installed_secret_backend_policy(installation_data_root)?
-        != InstalledSecretBackendPolicy::PlatformKeyring
+    if !installed_keyring_broker_allowed(installation_data_root)?
         || arguments.ephemeral_verification_credentials
         || arguments.data_dir.is_some()
         || arguments.config.is_some()
@@ -345,40 +332,31 @@ async fn run_foreground_keyring_broker(
     .map_err(Into::into)
 }
 
-fn installed_secret_backend_policy(
-    installation_data_root: &Path,
-) -> Result<InstalledSecretBackendPolicy> {
+fn installed_keyring_broker_allowed(installation_data_root: &Path) -> Result<bool> {
     let executable = std::env::current_exe()?;
     let Some(program_root) =
         installation_root_for_installed_program(&executable, ProgramName::Service)?
     else {
-        return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+        return Ok(false);
     };
     let Some(expected_data_root) = program_root.parent() else {
-        return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+        return Ok(false);
     };
     let roots_match = std::fs::canonicalize(expected_data_root)
         .ok()
         .zip(std::fs::canonicalize(installation_data_root).ok())
         .is_some_and(|(expected, selected)| expected == selected);
     if !roots_match {
-        return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+        return Ok(false);
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(
-            if active_native_trust_mode(&program_root)?
-                == NativeTrustMode::DeveloperIdSignedAndNotarized
-            {
-                InstalledSecretBackendPolicy::PlatformKeyring
-            } else {
-                InstalledSecretBackendPolicy::EncryptedFileOnly
-            },
-        );
+        return Ok(active_native_trust_mode(&program_root)?
+            == NativeTrustMode::DeveloperIdSignedAndNotarized);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(InstalledSecretBackendPolicy::PlatformKeyring)
+        Ok(true)
     }
 }
 

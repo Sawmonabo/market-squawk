@@ -1,79 +1,70 @@
 # Market Squawk Delivery Ledger
 
-## Active previous-close and startup delivery wave — 2026-09-30
+## Active startup, optional-lock and previous-close integration — 2026-09-30
 
-Owner security correction: application locking is opt-in, not a startup requirement. Configured
-connections must reuse saved credentials across ordinary launches/rebuilds without an app password;
-provider expiry/key replacement affects only that connection. If enabled, locking supports remembered
-OS-secured access, explicit Lock/Forget and optional reauthentication interval. No arbitrary default
-interval. This supersedes the earlier always-locked development fallback and any conflicting
-one-time-import-only wording for the owner's configured credential-file use. Never log credentials.
+Base: `a0e8b77b` pushed to origin on `feature/v1-installed-product-experience`.
+One primary worktree, three local branches and three origin branches; no linked worktrees.
+Original session and recovery backups remain protected. No CI or release gate has run for this wave.
 
-Security change DAG: inspect existing store/startup ownership → define one default-unlocked and
-optional-lock contract → integrate service/provider/Desktop consumers → verify restart and explicit
-lock behavior. Lead reserves shared service composition, manifests, contracts, Git and builds.
-Astra `startup_bootstrap_trace` owns read-only store/policy design; Sol `starter_market_ui` owns
-read-only Settings/startup consumer inventory. No implementation agents write security files until
-the shared contract is resolved. Existing Research verification continues independently.
+Owner correction (committed in `a0e8b77b`): locking is opt-in. Configured connections reuse saved
+credentials across normal launches/rebuilds without an application password. Provider expiry/key
+replacement affects its connection. Optional locking supports OS-remembered access, explicit
+Lock/Forget, and a user-selected reauthentication interval. Saved pages remain usable. This
+supersedes forced password storage in development and any conflicting import-only guidance.
 
-Current verification: the five-operation installed case fails at preparation options with typed
-Unavailable (`startup-research-preparation-critical.log`, 21.08s). Do not weaken the new assertion;
-trace the producer before accepting Research. Astra `research_options_failure` owns read-only
-failure diagnosis in dataset preparation/analytical reads; lead retains edits and build scheduling.
-Current security design owners are Astra `optional_lock_backend` and Sol `optional_lock_ui`;
-earlier session helpers are no longer running. Both are read-only until contract handoff.
+### Current outcomes and verification
 
-Native evidence after preparation worker change: Research 8/8 concurrent rounds pass; full route
-sweep is running. Live source retry still fails calendar replay: new diagnostic is exactly
-`calendar-native-replay-currentness: Stale`, not catalog selection or response freshness.
-Astra `calendar_currentness_failure` owns read-only trace of that synchronous authority check and
-source Retry lifetime. No relaxation of revocation/currentness. Lead owns resulting shared edits.
+Accepted startup checkpoint: automatic local access, optional connection Lock and concurrent Research loading. Native preserved runtime recovery succeeds; native/CLI builds pass, CLI provider recovery returns the structured Ready receipt, and the same installation restarts without any password submission. Both Desktop contexts are Ready and events reconnect; service status confirms provider `credentialAccess.access=ready`, `enabled=false`. Evidence: `automatic-access-native-recovery.json`, `automatic-access-native-restart.json`, `automatic-access-restart-service-status.json`, `automatic-access-client-build.log`. This is ordinary checkpoint evidence from the integrated working tree, not a clean unchanged release gate. Home/Markets queries still time out and previous-close history remains pending in preserved unstaged work.
 
-Opt-in lock implementation boundary: Astra `optional_lock_backend` owns platform secret access
-only (`secrets.rs`, `secrets/preferred.rs`, existing encrypted store, a cohesive secrets/access.rs
-if needed, existing platform secrets tests). Implement reusable automatic private-key retention
-for the existing encrypted vault plus policy-controlled optional lock/remember/Forget using existing
-OS keyring and crash-consistent vault rotation. No new cryptography/dependency/credential database.
-Lead owns service transport/provider composition, commands/status, provider drain/restoration and
-all Git/builds. Desktop follows the agreed redacted policy contract; no UI-only unlocking shortcut.
+Native retained runtime recovery succeeded; CLI provider recovery returns completed/ready with locking disabled. First 17-route sweep passes 15 routes but Home/Markets collection queries fail during restoration; lead owns exact query/restart diagnosis. Actual calendar retry now proves `activation-busy` at account synchronous currentness, mapped to Stale in calendar replay. Astra `calendar_currentness_failure` owns read-only trace and smallest fix proposal across account currentness/calendar ownership; no source edits until lead assigns exact files.
 
-Current continuation ownership (same branch/worktree):
-
-| Owner | Bounded outcome and exact files | Dependency / critical evidence |
+| Outcome | Implemented in working tree | Evidence / remaining acceptance |
 | --- | --- | --- |
-| Lead | Research concurrent initial reads: returned `research.rs`, `research/dataset_preparation.rs`, `research/macro_context/board.rs`; existing installed critical case; all builds, native actions and Git | Five concurrent operations in the existing service/restart case, then actual native route and repeated Research reads. Startup ownership checkpoint already pushed. |
-| Astra `macro_restart_digest`, returned | All three Research files released to lead | Existing owned I/O worker reused; no additional runtime or nested worker acquisition. Verification pending. |
-| Astra `stock_capture_trace`, diagnostics returned | `market_calendar/read.rs` and `market_calendar/alpaca/completed.rs` released; subsequent lock trace read-only | Closed diagnostics distinguish runtime lookup from native replay currentness failure. Caller catalog locks are released before native replay; await live evidence before changing authority behavior. |
+| Automatic local startup and optional credential protection | Existing encrypted vault gains private automatic-key retention, explicit policy and rotation; service/provider composition no longer selects forced password locking by build/signing type | Existing platform lifecycle case passes (71.28s), including reopen, wrong password, explicit Lock, expiry, recovery and disabling Lock. Native Keychain remembering remains unverified. |
+| Settings-only optional lock | Shared current V1 status/commands replace fallback-specific UI/transport; General Settings owns controls, connection import uses credential readiness | Desktop typecheck passes. Existing provider-boundary case passes (2.55s); no global provider-lock page gate. Real native automatic restart verified; optional Keychain remembering remains unverified. |
+| Stop credential activity when explicitly locked | Reversible OAuth, research/live runtime and private-paper drain reuse existing owners; saved choices/data retained; paper never auto-trades on unlock | Lead integrated producer/consumer contracts and timer into installed service lifetime. Existing installed service case now covers default Ready, Lock with saved reads still usable, unlock, disable and restart. The integrated case passes (102.28s): saved reads and status while locked, unlock, disable, in-process restart, automatic subprocess startup and crash/restart. Native automatic restart and preserved-vault recovery now pass. |
+| Reliable initial Research loading | Shared I/O owner for catalog/macro/preparation reads; complete cursor scan replaces expensive all-observation query in preparation options | Earlier five-operation case failed with exact `observation_read/query_memory`. The five concurrent startup assertions pass in the completed integrated critical run. Native Research previously passed 8/8 concurrent rounds but one Advanced profile-options load still failed. |
+| Real previous-close starter data | Prior history/identity/calendar/corporate-action batch remains intact | Live retry is applied, but history preparation still fails at `calendar-origin-read`. Newest calendar metadata was fresh/authorized. Added closed worker/currentness diagnostics; actual cause awaits next rebuilt live retry. No real-price/restart completion claim. |
 
-Settled native sweep: all 17 routes have Ready System/Product state; 16 have no active query
-errors. Research has one `Macro.GetContext` rejection, while the same CLI read succeeds. Real
-source Retry now succeeds but optional display history remains unavailable before per-instrument
-acquisition. No real-price or complete-screen claim is made. Evidence:
-`startup-resolved-settled-routes.json`, `startup-macro-context.json`, `history-resolved-retry.json`.
+Evidence under `.agents/tmp/v1-first-stock/`:
+`optional-access-platform-test.log`, `optional-access-desktop-typecheck.log`,
+`optional-access-desktop-critical.log`, `optional-access-installed-critical.log`,
+`optional-access-recovery-critical.log`,
+`research-preparation-diagnostic-test.log`, `research-concurrent-preparation.json`,
+`research-preparation-routes.json`, `advanced-concurrent-before.json`,
+`calendar-currentness-diagnostic-retry.json`, `credential-access-diagnostic-service.log`.
 
-Live Research reproduction: economic context succeeds 8/8 times alone, but fails 6/8 alongside
-its actual active screen queries (`research-concurrent-before.json`). The returned two-file fix
-queues dataset discovery and rolling interest-rate origin reads on the existing research I/O owner;
-lead extended the existing installed concurrent-read case with Macro/ListDatasets. One serialized
-critical build is active (`startup-research-history-critical.log`). Display-history diagnosis
-excludes the proposed timestamp/freshness cause: its v5 calendar is fresh and cutoff-admitted.
-Closed pre-acquisition stage diagnostics will identify the remaining failure; no timestamps,
-freshness or integrity rules were relaxed. Both Astra helpers released ownership.
+### Dependency and ownership
 
-The expanded installed critical case passes (70.20s). A fresh native sweep reaches Ready on all
-17 routes with zero active query errors (`startup-research-routes.json`), but the stronger
-concurrent screen check still fails Macro 3/8 times (`research-concurrent-after.json`). Therefore
-Research is not yet accepted. The remaining preparation-choices reads bypass the same worker.
-Astra `macro_restart_digest` exclusively owns `application/research/dataset_preparation.rs`:
-queue its catalog page and leaf observation query on that owner, using the existing captured
-runtime-handle pattern; no nested research-worker acquisition, new runtime or catalog mutex across
-await. Lead owns the existing critical check/dispatch integration and all builds. Its earlier two
-files are released. Astra `stock_capture_trace` owns closed diagnostic additions only in
-`application/market_calendar/read.rs` and `application/market_calendar/alpaca/completed.rs`:
-log suppressed runtime lookup/native replay unavailability and synchronous currentness failure;
-no authorization behavior changes. Calendar selection diagnosis: new live diagnostics prove selection returns None,
-after successful publication (`history-diagnostic-retry.json`, `startup-research-live-service.log`).
+Calendar correction authorized: Astra `calendar_currentness_failure` exclusively owns `market_calendar/alpaca/durable.rs` and `completed.rs`; acquire existing bounded account authority before queueing replay, validate under that guard, release before final async currentness check. Preserve all revocation/lease/cancellation checks and activation-before-worker lock order. Lead integrates and schedules the existing calendar critical check/native retry.
 
+Native query trace: Home/Markets fail with `request_interrupted` at the existing 15-second native request deadline. Astra `credential_runtime_lifecycle` owns a read-only bounded trace of `paper/market/durable_product.rs`, `research/market_history/previous_close.rs` and collection consumers for duplicated/blocking startup work; propose concrete fix, no edits while lead verifies restart.
+
+Current verification: the integrated installed-service case passes (102.28s), including optional Lock with saved reads, unlock/disable, five concurrent startup reads, automatic child startup and crash/restart without a password. Desktop typecheck and the existing provider-boundary case pass. Evidence: `automatic-startup-critical.log`, `optional-access-desktop-{typecheck,critical}.log`.
+
+Next bounded dependency: retained password-vault recovery has a 10-second transport deadline around a 30-second secret operation. Astra `optional_lock_backend` owns only `service/bootstrap.rs` and `service/bootstrap/windows.rs` to align authenticated unlock transactions while retaining bounded request admission. Lead owns existing recovery verification, native build and screen/restart proof. All other agents have released their files.
+
+Policy → platform store → shared app contracts/composition → reversible credential-runtime drain
+→ installed critical case → actual native fresh/restart journey → coherent commit/push.
+Research and history fixes proceed in independent files, then join the same native-screen proof.
+The first integrated check compiled but failed after 24.22s because the new test helper exceeded its client request lifetime; corrected without changing production limits. Both correction slices are returned and inspected: retained credential drain/resume steps, pending vault completion and source gate ordering; Advanced catalog pages on existing owned I/O plus closed stage diagnostics. Lead wired the existing configure deadline and corrected the test helper timeout. The serialized critical rerun passed. No competing compilers.
+
+| Owner | Exact bounded slice | State |
+| --- | --- | --- |
+| Sol `optional_access_docs` | Only operations/provider-account-setup.md and architecture/security-and-trust-boundaries.md, deployment.md; align current optional-access behavior with integrated source | Returned and inspected; three current docs aligned. Lead corrected discovered CLI access-status reader; native CLI proof pending. |
+| Lead | Shared schemas/contracts, service and LocalProduct composition, credential coordinator, native bridge/transport, critical installed case, Git/build/native actions | Startup commit/push; market-query integration and native verification owner. |
+| Astra `optional_lock_backend` | `platform/src/secrets.rs`, `secrets/access.rs`, `secrets/preferred.rs`, existing platform secrets case | Returned; inspected, critical case passes. |
+| Sol `optional_lock_ui` | Settings application-lock/settings-page; sources connection-setup/provider-credential-import/sources-page | Returned; inspected, typecheck and existing boundary case pass. |
+| Astra `credential_runtime_lifecycle` | Source lifecycle and credential_access child; provider activation; research provider_runtime; paper controller and shutdown owner | Returned; inspected; integrated critical verification passes. |
+| Astra `research_options_failure` | Research dataset_preparation cursor; subsequently cli_provider and schwab_oauth_runtime resumable access | Returned; inspected; read-only fixture-impact follow-up while compiler runs. |
+| Astra `calendar_currentness_failure` | market_calendar/read and alpaca/completed/durable diagnostics; earlier account diagnostics | Returned; read-only follow-up on calendar origin query/error mapping while native build runs. Actual retry pending; no edits or authority/freshness relaxation. |
+
+Remaining barriers: resolve Home/Markets query deadlines and the proven calendar activation-lock
+contention, then retry actual starter history and complete native screen/restart proof. Commit/push independently coherent slices
+without claiming the entire V1 contract or final release verification complete. RAM measurement
+remains deferred until all application workflows are ready.
+
+## Earlier pushed startup checkpoints and retained evidence
 
 Pushed checkpoint `d6162c6b` acquires the service instance before writing startup state/logs, retains its lock
 through final drain, restores authenticated crash predecessors using retained subject evidence,

@@ -926,7 +926,7 @@ async fn unlock_provider_credentials(
         &StagedUnlock {
             schema: "market-squawk.provider-setup.v1",
             request: UnlockRequest {
-                action: "unlockFallback",
+                action: "unlockAccess",
                 secret: unlock.expose_secret(),
             },
         },
@@ -958,7 +958,7 @@ async fn unlock_provider_credentials(
         != Some("completed")
         || result
             .value()
-            .pointer("/data/value")
+            .pointer("/data/value/access")
             .and_then(Value::as_str)
             != Some("ready")
     {

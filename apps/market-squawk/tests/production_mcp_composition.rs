@@ -18,8 +18,7 @@ use chrono::{Datelike as _, NaiveDate, SecondsFormat, Utc};
 use clap::{Parser as _, error::ErrorKind};
 use futures_util::FutureExt as _;
 use market_squawk::service::{
-    BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
-    InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
+    InstalledService, InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk::{
@@ -89,6 +88,10 @@ fn installed_service_real_alpaca_vertical_survives_restart() -> TestResult {
 }
 
 fn run_installed_service_test(real_alpaca_bundle_path: Option<PathBuf>) -> TestResult {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
     let scenario = std::thread::Builder::new()
         .name("market-squawk-installed-service-test".to_owned())
         .stack_size(INSTALLED_SERVICE_MAIN_STACK_BYTES)
@@ -200,6 +203,8 @@ async fn run_installed_service_authority_scenario(
             .await
             .context("fetch initial desktop bootstrap")?;
         assert_eq!(bootstrap["readiness"]["service"], true);
+        assert_eq!(bootstrap["sources"]["credentialAccess"]["enabled"], false);
+        assert_eq!(bootstrap["sources"]["credentialAccess"]["access"], "ready");
         assert!(bootstrap["runtime"]["workspaceId"].is_string());
         let provider = bootstrap["sources"]["profiles"][0]["id"]
             .as_str()
@@ -421,7 +426,14 @@ async fn run_installed_service_authority_scenario(
             connector.connect_mcp_relay(NamedClient::Codex),
             Err(InstalledServiceError::AdmissionRejected)
         ));
-        exercise_market_collection(&desktop, false).await?;
+        exercise_market_collection(&desktop, false)
+            .await
+            .context("exercise initial market collection and concurrent startup reads")?;
+        if real_alpaca_evidence.is_none() {
+            exercise_optional_credential_access(&desktop)
+                .await
+                .context("exercise optional credential access")?;
+        }
         cli.probe_ready(CancellationToken::new())
             .await
             .context("probe initial CLI client readiness")?;
@@ -488,6 +500,11 @@ async fn run_installed_service_authority_scenario(
         let restarted_cli = connector
             .connect(NamedClient::Cli, None)
             .context("admit CLI client after service restart")?;
+        let access = restarted_desktop
+            .bootstrap(CancellationToken::new())
+            .await?;
+        assert_eq!(access["sources"]["credentialAccess"]["access"], "ready");
+        assert_eq!(access["sources"]["credentialAccess"]["enabled"], false);
         exercise_market_collection(&restarted_desktop, true).await?;
         assert_owner_research_file_available(&restarted_desktop)
             .await
@@ -607,23 +624,9 @@ async fn run_installed_service_authority_scenario(
         installed_service_authority_root(&process_root),
     )
     .context("construct installed process-restart connector")?;
-    let process_paths = LocalPaths::prepare(installed_service_authority_root(&process_root))
-        .context("prepare installed process-restart authority root")?;
-    let process_secrets: Arc<dyn SecretStore> = Arc::new(
-        EncryptedFileSecretStore::try_open(
-            process_paths
-                .control_root()
-                .context("open installed process-restart control root")?
-                .root()
-                .join("secrets/installed-runtime"),
-            SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
-                .context("construct installed process-restart test unlock")?,
-        )
-        .context("open installed process-restart fallback store")?,
-    );
-    let seeded = InstalledService::start_with_secret_store(
+    let seeded = InstalledService::start_at_installation_root(
         process_config.clone(),
-        Arc::clone(&process_secrets),
+        installed_service_authority_root(&process_root),
     )
     .await
     .context("seed installed process-restart protected runtime authority")?;
@@ -636,7 +639,6 @@ async fn run_installed_service_authority_scenario(
             .context("stop installed process-restart authority seeder")?,
         InstalledServiceRunOutcome::Stopped
     );
-    drop(process_secrets);
     let mut service = start_installed_service_subprocess(&process_root)
         .context("start installed-service subprocess")?;
     let stale_cli = wait_until_ready(&process_connector)
@@ -1044,6 +1046,71 @@ fn real_alpaca_remaining_timeout(deadline: Instant) -> TestResult<Duration> {
     Ok(remaining.min(INSTALLED_MCP_SERVICE_TIMEOUT))
 }
 
+// Critical boundary: opting into a provider lock must not lock local Desktop/CLI authority or
+// saved reads. Disable the opt-in before the existing restart proves automatic retained access.
+async fn exercise_optional_credential_access(client: &LoopbackApplicationClient) -> TestResult {
+    let policy = |enabled| json!({"enabled":enabled,"rememberInKeychain":false,"reauthenticateAfterSeconds":null});
+    for (index, request, expected) in [
+        (
+            0,
+            json!({"action":"configureAccess","policy":policy(true),"secret":INSTALLED_SERVICE_TEST_UNLOCK}),
+            "ready",
+        ),
+        (1, json!({"action":"lockAccess"}), "locked"),
+        (
+            2,
+            json!({"action":"unlockAccess","secret":INSTALLED_SERVICE_TEST_UNLOCK}),
+            "ready",
+        ),
+        (
+            3,
+            json!({"action":"configureAccess","policy":policy(false)}),
+            "ready",
+        ),
+    ] {
+        let response = client
+            .invoke_operation(
+                RequestId::try_string(format!("optional-access-{index}"))?,
+                "Source.Onboarding.Apply",
+                json!({"request":request,"confirm":true}),
+                INSTALLED_MCP_SERVICE_TIMEOUT,
+                CancellationToken::new(),
+            )
+            .await
+            .with_context(|| format!("optional credential access step {index}"))?;
+        let result = response.result();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["value"]["data"]["outcome"], "completed", "{result}");
+        assert_eq!(
+            result["value"]["data"]["value"]["access"], expected,
+            "{result}"
+        );
+        client.probe_ready(CancellationToken::new()).await?;
+        if expected == "locked" {
+            // Settings must still read lifecycle status while Lock retains the mutation gate.
+            let status = client.invoke_operation(
+                RequestId::try_string("optional-access-locked-status")?,
+                "Source.GetStatus",
+                json!({"sourceCoverage":["coinbase.public-market-data"],"resultLimits":{"maximumItems":32,"maximumBytes":1_048_576}}),
+                INSTALLED_MCP_SERVICE_TIMEOUT,
+                CancellationToken::new(),
+            ).await.context("read connection status while optionally locked")?;
+            assert_eq!(status.result()["ok"], true, "{}", status.result());
+        }
+        let saved = client
+            .invoke_operation(
+                RequestId::try_string(format!("optional-access-saved-{index}"))?,
+                "Market.GetCollection",
+                json!({}),
+                INSTALLED_MCP_SERVICE_TIMEOUT,
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(saved.result()["ok"], true, "{}", saved.result());
+    }
+    Ok(())
+}
+
 // Critical persistence gap: removed defaults must not be silently reseeded on service restart.
 async fn exercise_market_collection(
     client: &LoopbackApplicationClient,
@@ -1067,7 +1134,7 @@ async fn exercise_market_collection(
         workflow.result()
     );
     // Ordinary first-load reads share the catalog worker instead of failing on mutex contention.
-    let (comparison, response) = tokio::try_join!(
+    let (comparison, response, datasets, macro_context, preparation) = tokio::try_join!(
         client.invoke_operation(
             RequestId::try_string(format!("comparison-startup-{restored}"))?,
             "Analysis.ReadWorkflow",
@@ -1081,8 +1148,37 @@ async fn exercise_market_collection(
             json!({}),
             INSTALLED_MCP_SERVICE_TIMEOUT,
             CancellationToken::new(),
+        ),
+        client.invoke_operation(
+            RequestId::try_string(format!("datasets-startup-{restored}"))?,
+            "Research.ListDatasets",
+            json!({"resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        ),
+        client.invoke_operation(
+            RequestId::try_string(format!("macro-startup-{restored}"))?,
+            "Macro.GetContext",
+            json!({"resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        ),
+        client.invoke_operation(
+            RequestId::try_string(format!("preparation-startup-{restored}"))?,
+            "Analysis.GetFeatureDatasetPreparationOptions",
+            json!({"resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
         )
     )?;
+    assert_eq!(preparation.result()["ok"], true, "{}", preparation.result());
+    assert_eq!(datasets.result()["ok"], true, "{}", datasets.result());
+    assert_eq!(
+        macro_context.result()["ok"],
+        true,
+        "{}",
+        macro_context.result()
+    );
     assert_eq!(comparison.result()["ok"], true, "{}", comparison.result());
     assert_eq!(
         comparison.result()["value"]["data"]["kind"],
@@ -3228,31 +3324,15 @@ fn installed_service_authority_root(root: &Path) -> PathBuf {
 async fn wait_until_ready(
     connector: &InstalledServiceConnector,
 ) -> TestResult<LoopbackApplicationClient> {
-    let mut unlock_submitted = false;
     let client = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             match connector.connect(NamedClient::Cli, None) {
                 Ok(client) => break Ok::<_, InstalledServiceError>(client),
                 Err(InstalledServiceError::ServiceUnavailable) => {
                     match connector.bootstrap_status().await {
-                        Ok(status) if !unlock_submitted => {
-                            assert_eq!(status.state(), InstalledServiceBootstrapState::Required);
-                            assert_eq!(
-                                status.requirement(),
-                                Some(BootstrapRequirement::EncryptedFallbackLocked)
-                            );
-                            let accepted = connector
-                                .bootstrap_unlock(
-                                    status,
-                                    SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
-                                        .map_err(|_error| InstalledServiceError::SecretStore)?,
-                                )
-                                .await?;
-                            assert_eq!(accepted.state(), InstalledServiceBootstrapState::Retrying);
-                            unlock_submitted = true;
-                        }
-                        Ok(_)
-                        | Err(
+                        // Current V1 defaults must reopen without interactive recovery.
+                        Ok(_) => return Err(InstalledServiceError::BootstrapRejected),
+                        Err(
                             InstalledServiceError::ServiceUnavailable
                             | InstalledServiceError::BootstrapUnavailable,
                         ) => {}
@@ -3266,15 +3346,11 @@ async fn wait_until_ready(
     })
     .await
     .context("time out waiting for installed-service readiness")?
-    .context("poll installed-service readiness")?;
+    .context("poll automatic installed-service readiness")?;
     client
         .probe_ready(CancellationToken::new())
         .await
         .context("probe newly ready installed-service client")?;
-    assert!(
-        unlock_submitted,
-        "service became ready without fallback unlock"
-    );
     Ok(client)
 }
 

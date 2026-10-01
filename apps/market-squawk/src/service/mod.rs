@@ -57,10 +57,10 @@ use market_squawk_mcp::{
     AuditSink, HttpMcpConfig, McpHandlerFactory, McpHttpService, McpLimitSpec, McpLimits,
 };
 use market_squawk_platform::{
-    EncryptedFileFallbackStatus, InstalledServiceSelectedWorkspaceGuard,
-    LocalAuthorityStateStoreError, LocalPaths, LocalSecretStoreError, PathError,
-    PreferredSecretStore, SecretCancellation, SecretInteractionPolicy, SecretOperationControl,
-    SecretStore, SecretValue,
+    AccessControlledSecretStore, EncryptedFileFallbackStatus,
+    InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStoreError, LocalPaths,
+    LocalSecretStoreError, PathError, SecretCancellation, SecretInteractionPolicy,
+    SecretOperationControl, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationClientError, ApplicationProtocolRange, ApplicationProtocolVersion,
@@ -153,15 +153,6 @@ const MCP_CLIENT_REQUESTS: usize = 4;
 const TAURI_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
 pub use runtime::SystemProcessIdentityVerifier;
-
-/// Fixed secret-backend selection established before installed-service composition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InstalledSecretBackendPolicy {
-    /// Admit the platform keyring, with encrypted-file fallback when the platform is unavailable.
-    PlatformKeyring,
-    /// Admit only the explicitly unlocked encrypted-file store.
-    EncryptedFileOnly,
-}
 
 /// One fresh, absolute, non-default installation root authorized for destructive verification
 /// credential cleanup.
@@ -354,7 +345,7 @@ pub async fn complete_foreground_keyring_bootstrap_at_installation_root(
     if installation_id != expected_installation_id {
         return Err(InstalledServiceError::BootstrapRejected);
     }
-    let secret_store = runtime_secret_store(&paths, InstalledSecretBackendPolicy::PlatformKeyring)?;
+    let secret_store = runtime_secret_store(&paths)?;
     let foreground = runtime::prepare_foreground_runtime_credential(
         &paths,
         secret_store.as_ref(),
@@ -470,13 +461,7 @@ impl InstalledService {
     ) -> Result<Self, InstalledServiceError> {
         let instance = InstalledServiceInstance::try_acquire(installation_root)?;
         let logs = logging::open_log_store(&instance.paths)?;
-        Self::start_with_logging_store(
-            config,
-            instance,
-            logs,
-            InstalledSecretBackendPolicy::EncryptedFileOnly,
-        )
-        .await
+        Self::start_with_logging_store(config, instance, logs).await
     }
 
     /// Composes the service with an already acquired instance and process-owned logging.
@@ -484,19 +469,10 @@ impl InstalledService {
         config: AppConfig,
         instance: InstalledServiceInstance,
         logs: Arc<crate::application::logs::StructuredLogStore>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let secret_store = runtime_secret_store(&instance.paths, secret_backend_policy)?;
-        Self::start_prepared(
-            config,
-            instance,
-            workspace_paths,
-            secret_store,
-            logs,
-            secret_backend_policy,
-        )
-        .await
+        let secret_store = runtime_secret_store(&instance.paths)?;
+        Self::start_prepared(config, instance, workspace_paths, secret_store, logs).await
     }
 
     /// Composes the installed service with an already-owned native secret capability.
@@ -508,18 +484,11 @@ impl InstalledService {
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let instance =
-            InstalledServiceInstance::try_acquire(deterministic_installation_root(&workspace_paths)?)?;
+        let instance = InstalledServiceInstance::try_acquire(deterministic_installation_root(
+            &workspace_paths,
+        )?)?;
         let logs = logging::open_log_store(&instance.paths)?;
-        Self::start_prepared(
-            config,
-            instance,
-            workspace_paths,
-            secret_store,
-            logs,
-            InstalledSecretBackendPolicy::EncryptedFileOnly,
-        )
-        .await
+        Self::start_prepared(config, instance, workspace_paths, secret_store, logs).await
     }
 
     /// Composes the installed service with one closed debug-only Board transport/rate fixture.
@@ -534,8 +503,9 @@ impl InstalledService {
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let instance =
-            InstalledServiceInstance::try_acquire(deterministic_installation_root(&workspace_paths)?)?;
+        let instance = InstalledServiceInstance::try_acquire(deterministic_installation_root(
+            &workspace_paths,
+        )?)?;
         let logs = logging::open_log_store(&instance.paths)?;
         Self::start_prepared_with_board_fixture(
             config,
@@ -543,7 +513,6 @@ impl InstalledService {
             workspace_paths,
             secret_store,
             logs,
-            InstalledSecretBackendPolicy::EncryptedFileOnly,
             board_fixture,
         )
         .await
@@ -555,7 +524,6 @@ impl InstalledService {
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         Self::start_prepared_inner(
             config,
@@ -563,7 +531,6 @@ impl InstalledService {
             legacy_workspace_paths,
             secret_store,
             logs,
-            secret_backend_policy,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -577,7 +544,6 @@ impl InstalledService {
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, InstalledServiceError> {
         Self::start_prepared_inner(
@@ -586,7 +552,6 @@ impl InstalledService {
             legacy_workspace_paths,
             secret_store,
             logs,
-            secret_backend_policy,
             Some(board_fixture),
         )
         .await
@@ -598,7 +563,6 @@ impl InstalledService {
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
@@ -694,7 +658,6 @@ impl InstalledService {
                     &selected_workspace_guard,
                     &installation_paths,
                     installation_id,
-                    secret_backend_policy,
                     fixture,
                 ).await?,
                 None => LocalProduct::try_new_at_selected_workspace(
@@ -702,7 +665,6 @@ impl InstalledService {
                     &selected_workspace_guard,
                     &installation_paths,
                     installation_id,
-                    secret_backend_policy,
                 ).await?,
             };
             #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
@@ -711,7 +673,6 @@ impl InstalledService {
                 &selected_workspace_guard,
                 &installation_paths,
                 installation_id,
-                secret_backend_policy,
             ).await?;
             let source_recovery_deadline = std::time::Instant::now()
                 .checked_add(CLIENT_TIMEOUT)
@@ -942,6 +903,9 @@ impl InstalledService {
                     InstalledServiceError::CompositionStage("analytical workflow startup")
                 })
             });
+        let credential_access = product.credential_access();
+        let mut credential_monitor =
+            Box::pin(credential_access.monitor(cancellation.child_token()));
         let transport_cancellation = CancellationToken::new();
         let mut serving = Box::pin(server.run_until(
             transport_cancellation.clone(),
@@ -970,8 +934,12 @@ impl InstalledService {
                 () = admission.failed() => {
                     (None, false, true, None)
                 }
+                () = &mut credential_monitor => {
+                    (None, false, false, None)
+                }
             }
         };
+        drop(credential_monitor);
         let admission_retired = admission.shutdown().await;
         transport_cancellation.cancel();
         let transport = match completed_transport {
@@ -1443,21 +1411,13 @@ async fn shutdown_application(application: Arc<crate::application::Application>)
     report.is_complete()
 }
 
-fn runtime_secret_store(
-    paths: &LocalPaths,
-    policy: InstalledSecretBackendPolicy,
-) -> Result<Arc<dyn SecretStore>, InstalledServiceError> {
+fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, InstalledServiceError> {
     let namespace = runtime_secret_namespace(paths)?;
     let root = paths.control_root()?.root().join(RUNTIME_SECRET_DIRECTORY);
-    let store = match policy {
-        InstalledSecretBackendPolicy::PlatformKeyring => {
-            PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(&namespace, root)
-        }
-        InstalledSecretBackendPolicy::EncryptedFileOnly => {
-            PreferredSecretStore::try_new_with_locked_encrypted_file(root)
-        }
-    }
-    .map_err(|_error| InstalledServiceError::SecretStore)?;
+    let control =
+        runtime::secret_control("installed-runtime-open", SecretInteractionPolicy::Forbid)?;
+    let store = AccessControlledSecretStore::try_open(root, &namespace, &control)
+        .map_err(|_| InstalledServiceError::SecretStore)?;
     Ok(Arc::new(store))
 }
 

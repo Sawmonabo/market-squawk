@@ -45,9 +45,9 @@ use market_squawk_data::{
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
-    SecretCancellation, SecretDeletionDisposition, SecretGeneration, SecretInteractionPolicy,
-    SecretKey, SecretMutationEffect, SecretOperationControl, SecretReconciliationObservation,
-    SecretStore, SecretValue,
+    SecretAccessPolicy, SecretAccessStatus, SecretCancellation, SecretDeletionDisposition,
+    SecretGeneration, SecretInteractionPolicy, SecretKey, SecretMutationEffect,
+    SecretOperationControl, SecretReconciliationObservation, SecretStore, SecretValue,
 };
 use market_squawk_sources::{
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput, AuthorizationMode,
@@ -1095,23 +1095,118 @@ impl ProviderOnboardingService {
         .await
     }
 
-    /// Drops the process-held fallback unlock through the single-flight secret executor.
-    pub async fn lock_encrypted_file_fallback(
+    /// Returns the explicit application-lock policy independently of application readiness.
+    pub fn credential_access_status(&self) -> Result<SecretAccessStatus, ProviderOnboardingError> {
+        self.secrets.access_status().map_err(Into::into)
+    }
+
+    /// Changes optional locking without replacing any saved provider credential.
+    pub async fn configure_credential_access(
+        &self,
+        policy: SecretAccessPolicy,
+        unlock: Option<SecretValue>,
+        cancellation: CancellationToken,
+    ) -> Result<SecretAccessStatus, ProviderOnboardingError> {
+        self.credential_access_operation(cancellation, move |secrets, control| {
+            secrets.configure_access(
+                policy,
+                unlock.map(EncryptedFileUnlockCapability::new),
+                control,
+            )
+        })
+        .await
+    }
+
+    /// Opens previously selected application protection, preserving saved provider sessions.
+    pub async fn unlock_credential_access(
+        &self,
+        unlock: SecretValue,
+        cancellation: CancellationToken,
+    ) -> Result<SecretAccessStatus, ProviderOnboardingError> {
+        self.credential_access_operation(cancellation, move |secrets, control| {
+            secrets.unlock_access(EncryptedFileUnlockCapability::new(unlock), control)
+        })
+        .await
+    }
+
+    /// Closes new credential admission. The lifecycle owner also drains retained runtime copies.
+    pub async fn lock_credential_access(
         &self,
         cancellation: CancellationToken,
-    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+    ) -> Result<SecretAccessStatus, ProviderOnboardingError> {
+        self.credential_access_operation(cancellation, |secrets, control| {
+            secrets.lock_access(control)
+        })
+        .await
+    }
+
+    /// Removes remembered OS access without deleting provider credentials or signed-in sessions.
+    pub async fn forget_credential_access(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<SecretAccessStatus, ProviderOnboardingError> {
+        self.credential_access_operation(cancellation, |secrets, control| {
+            secrets.forget_remembered_access(control)
+        })
+        .await
+    }
+
+    async fn credential_access_operation<F>(
+        &self,
+        cancellation: CancellationToken,
+        operation: F,
+    ) -> Result<SecretAccessStatus, ProviderOnboardingError>
+    where
+        F: FnOnce(
+                &dyn SecretStore,
+                &SecretOperationControl,
+            ) -> Result<SecretAccessStatus, LocalSecretStoreError>
+            + Send
+            + 'static,
+    {
         let secrets = Arc::clone(&self.secrets);
         await_blocking_secret_operation(
             Arc::clone(&self.secret_operations),
             cancellation,
-            move |operation| {
-                let control = secret_fallback_control("provider-fallback-lock", operation)?;
-                secrets
-                    .lock_encrypted_file_fallback(&control)
-                    .map_err(Into::into)
+            move |cancellation| {
+                let deadline = Instant::now()
+                    .checked_add(SECRET_OPERATION_DURATION)
+                    .ok_or(ProviderOnboardingError::Clock)?;
+                let control = SecretOperationControl::try_new(
+                    "provider-credential-access",
+                    deadline,
+                    0,
+                    SecretInteractionPolicy::AllowPlatformPrompt,
+                    cancellation,
+                )?;
+                operation(secrets.as_ref(), &control).map_err(Into::into)
             },
         )
         .await
+    }
+
+    /// Joins probes and secret reads admitted before the vault closed. New reads are denied by
+    /// the secret-store gate; this barrier never closes ordinary catalog or saved-result reads.
+    pub(crate) async fn drain_credential_operations(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProviderOnboardingError> {
+        let join = async {
+            let _activation = self.activation.lock().await;
+            let _secrets = self
+                .secret_operations
+                .acquire()
+                .await
+                .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?;
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ProviderOnboardingError::OperationCancelled),
+            () = tokio::time::sleep_until(deadline.into()) => Err(ProviderOnboardingError::ProbeDeadlineExceeded),
+            result = join => result,
+        }
     }
 
     /// Idempotently registers one exact code-owned capability without starting setup.

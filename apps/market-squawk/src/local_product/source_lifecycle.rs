@@ -1,5 +1,6 @@
 //! Production source lifecycle authority over live and research runtime owners.
 
+mod credential_access;
 mod reconnect;
 
 use std::{
@@ -95,6 +96,7 @@ impl LiveSourceRestoreFailure {
 
 /// Single lifecycle authority injected into the Source application domain.
 pub(crate) struct ProductionSourceLifecycleAuthority {
+    credential_access: credential_access::CredentialRuntimeAccess,
     paths: LocalPaths,
     onboarding: Arc<ProviderOnboardingService>,
     activation: Arc<ProviderAdapterActivation>,
@@ -118,6 +120,7 @@ impl ProductionSourceLifecycleAuthority {
         calendars: crate::application::market_calendar::CompletedMarketSessionReadCapability,
     ) -> Self {
         Self {
+            credential_access: credential_access::CredentialRuntimeAccess::default(),
             paths,
             onboarding,
             activation,
@@ -325,10 +328,12 @@ impl ProductionSourceLifecycleAuthority {
         command: &SourceLifecycleCommand,
     ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
         ensure_live(command)?;
+        self.credential_access.ensure_resumed()?;
         let provider = command.provider().as_str().to_owned();
         let _mutation = self
             .lifecycle_gate_before(&provider, command.deadline(), command.cancellation())
             .await?;
+        self.credential_access.ensure_resumed()?;
         let command_digest = command_digest(command)?;
         let operation_id = operation_id(command_digest)?;
         let current = self
@@ -528,6 +533,27 @@ impl ProductionSourceLifecycleAuthority {
             .map_err(map_durable_error)?;
         let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
         let surface = AccountMarketSurface::SchwabMarketData;
+        if matches!(
+            purpose,
+            crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialLock
+        ) {
+            if self
+                .durable
+                .source_lifecycle_record(surface.surface_id())
+                .map_err(map_durable_error)?
+                .account()
+                .is_some_and(|pending| !pending.finished)
+            {
+                return Err(SourceLifecycleError::ReconciliationRequired);
+            }
+            self.live
+                .prepare_schwab_oauth_stop(session, current_receipt, deadline, cancellation)
+                .await
+                .map_err(map_live_error)?;
+            return self
+                .suspend_live_credentials(surface.surface_id(), deadline, cancellation)
+                .await;
+        }
         let action = match purpose {
             crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::ProcessShutdown => {
                 AccountLifecycleAction::OAuthProcessShutdown
@@ -537,6 +563,9 @@ impl ProductionSourceLifecycleAuthority {
             }
             crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialReplacement => {
                 AccountLifecycleAction::OAuthCredentialReplacement
+            }
+            crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialLock => {
+                return Err(SourceLifecycleError::Internal);
             }
         };
         let prepared = self
@@ -577,6 +606,9 @@ impl ProductionSourceLifecycleAuthority {
                 crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::ProcessShutdown => 1,
                 crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::Unlink => 2,
                 crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialReplacement => 3,
+                crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialLock => {
+                    return Err(SourceLifecycleError::Internal);
+                }
             }]);
             let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into());
             let pending = PendingAccountLifecycle {
@@ -1320,9 +1352,20 @@ impl ProductionSourceLifecycleAuthority {
         deadline: Instant,
     ) -> Result<SourceLifecycleStatus, SourceLifecycleError> {
         ensure_status_live(cancellation, deadline)?;
-        let _read = self
-            .lifecycle_gate_before(provider.as_str(), deadline, cancellation)
+        // The lock owner already retains the durable gate while suspended. Serialize this read
+        // against suspension/resume, then use that held authority instead of awaiting it again.
+        let _operation = self
+            .credential_access
+            .operation_before(deadline, cancellation)
             .await?;
+        let _read = if self.credential_access.owns_mutation()? {
+            None
+        } else {
+            Some(
+                self.lifecycle_gate_before(provider.as_str(), deadline, cancellation)
+                    .await?,
+            )
+        };
         ensure_status_live(cancellation, deadline)?;
         let record = match self.durable.source_lifecycle_record(provider.as_str()) {
             Ok(record) => record,
@@ -2619,7 +2662,26 @@ impl std::fmt::Debug for ProductionSourceLifecycleAuthority {
 #[async_trait]
 impl SourceLifecycleAuthority for ProductionSourceLifecycleAuthority {
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), SourceLifecycleError> {
+        self.credential_access
+            .release_for_shutdown(deadline)
+            .await?;
         self.drain_pending_account_transitions(deadline).await
+    }
+
+    async fn suspend_credential_runtimes(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SourceLifecycleError> {
+        self.suspend_credentials_owned(deadline, cancellation).await
+    }
+
+    async fn resume_credential_runtimes(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SourceLifecycleError> {
+        self.resume_credentials_owned(deadline, cancellation).await
     }
 
     fn supports(&self, provider: &SourceIdentifier) -> bool {

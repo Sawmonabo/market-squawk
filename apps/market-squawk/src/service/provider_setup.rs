@@ -41,6 +41,7 @@ pub(super) struct InstalledProviderSetup {
     desktop_client: ClientId,
     cli_client: ClientId,
     inputs: Arc<InputStager>,
+    access: Arc<crate::local_product::credential_access::CredentialAccessCoordinator>,
     start_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -62,6 +63,7 @@ impl InstalledProviderSetup {
             cli_client,
             inputs,
             start_gate,
+            access: product.credential_access(),
         }
     }
 
@@ -99,7 +101,7 @@ impl InstalledProviderSetup {
                     "properties": {
                         "confirm": {"const": true},
                         "request": {"type": "object", "required": ["action"],
-                            "properties": {"action": {"enum": ["start", "resume", "unlockFallback", "lockFallback", "submitSecret", "activate", "verifySaved", "restoreSaved", "resumePublication", "schwabOAuth", "renew", "cleanup", "cancel"]}}
+                            "properties": {"action": {"enum": ["start", "resume", "configureAccess", "unlockAccess", "lockAccess", "forgetRememberedAccess", "submitSecret", "activate", "verifySaved", "restoreSaved", "resumePublication", "schwabOAuth", "renew", "cleanup", "cancel"]}}
                         }
                     }
                 })
@@ -205,7 +207,7 @@ impl InstalledProviderSetup {
                 .collect::<Result<Vec<_>, ServiceError>>()?;
             json!({
                 "profiles": profiles, "sessions": sessions, "setup": setup,
-                "encryptedFileFallback": self.onboarding.encrypted_file_fallback_status()
+                "credentialAccess": self.access.status()
                     .map_err(|_| ServiceError::Unavailable)?,
             })
         } else if operation == APPLY || operation == APPLY_STAGED {
@@ -240,7 +242,10 @@ impl InstalledProviderSetup {
                     || !matches!(
                         request.request,
                         ProviderOnboardingRequest::Start { .. }
-                            | ProviderOnboardingRequest::UnlockFallback { .. }
+                            | ProviderOnboardingRequest::UnlockAccess { .. }
+                            | ProviderOnboardingRequest::ConfigureAccess { .. }
+                            | ProviderOnboardingRequest::LockAccess
+                            | ProviderOnboardingRequest::ForgetRememberedAccess
                             | ProviderOnboardingRequest::Activate { .. }
                             | ProviderOnboardingRequest::VerifySaved { .. }
                             | ProviderOnboardingRequest::RestoreSaved { .. }
@@ -353,20 +358,30 @@ impl InstalledProviderSetup {
             ProviderOnboardingRequest::Resume { session_id } => {
                 serialize(self.onboarding.resume(session_id)?)
             }
-            ProviderOnboardingRequest::UnlockFallback { mut secret } => serialize(
-                self.onboarding
-                    .unlock_encrypted_file_fallback(
+            ProviderOnboardingRequest::ConfigureAccess { policy, mut secret } => {
+                let unlock = secret
+                    .as_mut()
+                    .map(|secret| SecretValue::new(std::mem::take(&mut **secret)))
+                    .transpose()
+                    .map_err(|_| SetupFailure::invalid())?;
+                serialize(self.access.configure(policy, unlock, deadline, cancellation).await?)
+            }
+            ProviderOnboardingRequest::UnlockAccess { mut secret } => serialize(
+                self.access
+                    .unlock(
                         SecretValue::new(std::mem::take(&mut *secret))
                             .map_err(|_| SetupFailure::invalid())?,
+                        deadline,
                         cancellation,
                     )
                     .await?,
             ),
-            ProviderOnboardingRequest::LockFallback => serialize(
-                self.onboarding
-                    .lock_encrypted_file_fallback(cancellation)
-                    .await?,
-            ),
+            ProviderOnboardingRequest::LockAccess => {
+                serialize(self.access.lock(deadline, cancellation).await?)
+            }
+            ProviderOnboardingRequest::ForgetRememberedAccess => {
+                serialize(self.access.forget(cancellation).await?)
+            }
             ProviderOnboardingRequest::SubmitSecret {
                 session_id,
                 mut secret,

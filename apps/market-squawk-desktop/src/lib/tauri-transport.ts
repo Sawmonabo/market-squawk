@@ -6,7 +6,7 @@ import {
   desktopEventSchema,
   desktopEventSubscriptionReceiptSchema,
   desktopSystemStartupSchema,
-  encryptedFileFallbackSchema,
+  secretAccessStatusSchema,
   installationControlResultSchema,
   inputTicketSchema,
   mcpClientsStatusSchema,
@@ -427,9 +427,11 @@ function parseProviderResult<Request extends ProviderOnboardingRequest>(
         return providerBootstrapSchema.parse(value)
       case "inspect":
         return providerSetupInspectionSchema.parse(value)
-      case "unlockFallback":
-      case "lockFallback":
-        return encryptedFileFallbackSchema.parse(value)
+      case "configureAccess":
+      case "unlockAccess":
+      case "lockAccess":
+      case "forgetRememberedAccess":
+        return secretAccessStatusSchema.parse(value)
       case "verifySaved":
       case "activate":
       case "resumePublication":

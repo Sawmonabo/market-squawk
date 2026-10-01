@@ -4,6 +4,7 @@
 use std::{
     fmt,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -55,19 +56,21 @@ const SERVING_LOOKBACK_NANOS: i64 = 10 * 366 * 24 * 60 * 60 * 1_000_000_000;
 /// Analytical implementation of the model-owned forecast evidence contract.
 #[derive(Clone)]
 pub(crate) struct AnalyticalForecastEvidenceReader {
+    research: Arc<crate::ResearchService>,
     analytical: AnalyticalReadCapability,
     macro_context: Option<MacroContextReadCapability>,
     calendar: Option<crate::application::market_calendar::CompletedMarketSessionReadCapability>,
 }
 
 impl AnalyticalForecastEvidenceReader {
-    pub(crate) const fn new(
-        analytical: AnalyticalReadCapability,
+    pub(crate) fn new(
+        research: Arc<crate::ResearchService>,
         macro_context: Option<MacroContextReadCapability>,
         calendar: Option<crate::application::market_calendar::CompletedMarketSessionReadCapability>,
     ) -> Self {
         Self {
-            analytical,
+            analytical: research.analytical_reader(),
+            research,
             macro_context,
             calendar,
         }
@@ -148,7 +151,7 @@ impl AnalyticalForecastEvidenceReader {
         }
     }
 
-    fn analysis_catalog(
+    async fn analysis_catalog(
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,
@@ -160,10 +163,22 @@ impl AnalyticalForecastEvidenceReader {
             let mut after: Option<DatasetId> = None;
             loop {
                 check_control(deadline, cancellation)?;
+                let analytical = self.analytical.clone();
+                let cursor = after.clone();
                 let page = self
-                    .analytical
-                    .feature_datasets(contract, after.as_ref(), limit, deadline, cancellation)
-                    .map_err(map_read_error)?;
+                    .research
+                    .run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
+                        analytical.feature_datasets(
+                            contract,
+                            cursor.as_ref(),
+                            limit,
+                            deadline,
+                            &worker_cancellation,
+                        )
+                    })
+                    .await
+                    .map_err(map_catalog_worker_error)?
+                    .map_err(map_catalog_read_error)?;
                 if page.datasets().is_empty() {
                     if page.has_more() {
                         return Err(ForecastEvidenceReadError::InvalidEvidence);
@@ -231,7 +246,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
         cancellation: CancellationToken,
     ) -> Result<ForecastEvidenceCatalogSnapshot, ForecastEvidenceReadError> {
         check_control(deadline, &cancellation)?;
-        let analysis_catalog = self.analysis_catalog(deadline, &cancellation)?;
+        let analysis_catalog = self.analysis_catalog(deadline, &cancellation).await?;
         let current_output = if let Some(input) = request.current_feature_input() {
             Some(
                 crate::application::model::forecast::reopen_current_price_input(
@@ -1979,6 +1994,46 @@ fn check_control(
     } else {
         Ok(())
     }
+}
+
+fn map_catalog_worker_error(error: crate::ResearchServiceError) -> ForecastEvidenceReadError {
+    let error = match error {
+        crate::ResearchServiceError::Ingest(market_squawk_data::IngestError::Cancelled) => {
+            ForecastEvidenceReadError::Cancelled
+        }
+        crate::ResearchServiceError::Ingest(market_squawk_data::IngestError::DeadlineExceeded) => {
+            ForecastEvidenceReadError::DeadlineExceeded
+        }
+        _ => ForecastEvidenceReadError::Unavailable,
+    };
+    tracing::warn!(
+        stage = "analysis_catalog_worker",
+        error = ?error,
+        "forecast evidence catalog unavailable"
+    );
+    error
+}
+
+fn map_catalog_read_error(error: market_squawk_data::AnalyticalReadError) -> ForecastEvidenceReadError {
+    let error_class = match &error {
+        market_squawk_data::AnalyticalReadError::Manifest(
+            market_squawk_data::ManifestCatalogError::CatalogAuthority(
+                market_squawk_data::CatalogError::AuthorityBusy,
+            ),
+        ) => "catalog_authority_busy",
+        market_squawk_data::AnalyticalReadError::Manifest(_) => "manifest",
+        market_squawk_data::AnalyticalReadError::PythonDataset(_) => "dataset",
+        market_squawk_data::AnalyticalReadError::InvalidLimit => "invalid_limit",
+        _ => "other",
+    };
+    let error = map_read_error(error);
+    tracing::warn!(
+        stage = "analysis_catalog_read",
+        error_class,
+        error = ?error,
+        "forecast evidence catalog unavailable"
+    );
+    error
 }
 
 fn map_read_error(error: market_squawk_data::AnalyticalReadError) -> ForecastEvidenceReadError {

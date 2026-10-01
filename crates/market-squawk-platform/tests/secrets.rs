@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use market_squawk_platform::{
-    EncryptedFileFallbackStatus, EncryptedFileSecretFallback, EncryptedFileSecretStore,
-    EncryptedFileUnlockCapability, LocalSecretStoreError, PreferredSecretStore, SecretBackend,
-    SecretCancellation, SecretGeneration, SecretInteractionPolicy, SecretKey,
+    AccessControlledSecretStore, EncryptedFileFallbackStatus, EncryptedFileSecretFallback,
+    EncryptedFileSecretStore, EncryptedFileUnlockCapability, LocalAuthorityStateStore,
+    LocalSecretStoreError, PreferredSecretStore, SecretAccessPolicy, SecretAccessState,
+    SecretBackend, SecretCancellation, SecretGeneration, SecretInteractionPolicy, SecretKey,
     SecretOperationControl, SecretStore, SecretValue,
 };
 use sha2::{Digest as _, Sha256};
@@ -115,7 +116,266 @@ fn managed_secret_lifecycle_is_generation_exact_and_fail_closed() -> TestResult 
         store.read(&reference_two, &expired),
         Err(LocalSecretStoreError::DeadlineExceeded)
     ));
+    optional_access_reuses_generations_and_preserves_explicit_lock()?;
     Ok(())
+}
+
+fn optional_access_reuses_generations_and_preserves_explicit_lock() -> TestResult {
+    let stage = std::cell::Cell::new("create automatic vault");
+    let outcome = (|| -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("managed-access");
+        let control = SecretOperationControl::try_new(
+            "optional-access-critical",
+            Instant::now() + Duration::from_secs(120),
+            0,
+            SecretInteractionPolicy::Forbid,
+            SecretCancellation::new(),
+        )?;
+        let key = SecretKey::try_new("provider", "retained-oauth-session")?;
+        let store =
+            AccessControlledSecretStore::try_open(&root, "market-squawk-access-test", &control)?;
+        assert_eq!(store.access_status()?.access, SecretAccessState::Ready);
+        assert_eq!(store.access_status()?.policy, SecretAccessPolicy::default());
+        let reference = store.create(
+            &key,
+            SecretGeneration::new(7)?,
+            SecretValue::new("fixture-retained-token".to_owned())?,
+            &control,
+        )?;
+        assert_eq!(reference.backend(), SecretBackend::EncryptedFile);
+        drop(store);
+
+        stage.set("read retained automatic authority");
+        let automatic_unlock = {
+            let authority = LocalAuthorityStateStore::try_open(root.join("access-policy"))?;
+            let bytes = zeroize::Zeroizing::new(authority.load()?.ok_or("missing access policy")?);
+            let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+            zeroize::Zeroizing::new(
+                document["active"]["automaticUnlock"]
+                    .as_str()
+                    .ok_or("missing automatic key")?
+                    .to_owned(),
+            )
+        };
+        stage.set("restart automatic vault and reuse credential");
+        let store =
+            AccessControlledSecretStore::try_open(&root, "market-squawk-access-test", &control)?;
+        assert_eq!(
+            store.read(&reference, &control)?.expose_secret(),
+            "fixture-retained-token"
+        );
+        let policy = SecretAccessPolicy {
+            enabled: true,
+            remember_in_keychain: false,
+            reauthenticate_after_seconds: Some(3_600),
+        };
+        let cancelled = SecretCancellation::new();
+        cancelled.cancel();
+        let cancelled_control = SecretOperationControl::try_new(
+            "cancelled-access-change",
+            Instant::now() + Duration::from_secs(30),
+            0,
+            SecretInteractionPolicy::Forbid,
+            cancelled,
+        )?;
+        assert!(matches!(
+            store.configure_access(
+                policy,
+                Some(EncryptedFileUnlockCapability::new(SecretValue::new(
+                    "fixture-password".to_owned()
+                )?)),
+                &cancelled_control
+            ),
+            Err(LocalSecretStoreError::OperationCancelled)
+        ));
+        assert_eq!(store.access_status()?.policy, SecretAccessPolicy::default());
+        stage.set("enable optional locking");
+        let enabled = store.configure_access(
+            policy,
+            Some(EncryptedFileUnlockCapability::new(SecretValue::new(
+                "fixture-password".to_owned(),
+            )?)),
+            &control,
+        )?;
+        assert_eq!(enabled.access, SecretAccessState::Ready);
+        assert!(enabled.reauthenticate_at_unix_seconds.is_some());
+        let receipt = serde_json::to_string(&enabled)?;
+        assert!(!receipt.contains("fixture-password"));
+        assert!(!format!("{store:?}").contains("fixture-password"));
+        for slot in [SLOT_A_FILE, SLOT_B_FILE] {
+            let bytes = fs::read(root.join("access-policy").join(slot))?;
+            assert!(
+                !bytes
+                    .windows(automatic_unlock.len())
+                    .any(|window| window == automatic_unlock.as_bytes()),
+                "automatic unlock remained in a live authority slot"
+            );
+            assert!(
+                !bytes
+                    .windows("fixture-password".len())
+                    .any(|window| window == b"fixture-password")
+            );
+        }
+        stage.set("cancel and persist explicit lock");
+        assert!(matches!(
+            store.lock_access(&cancelled_control),
+            Err(LocalSecretStoreError::OperationCancelled)
+        ));
+        assert_eq!(store.access_status()?.access, SecretAccessState::Ready);
+        assert_eq!(
+            store.lock_access(&control)?.access,
+            SecretAccessState::Locked
+        );
+        drop(store);
+
+        stage.set("restart explicitly locked vault");
+        let store =
+            AccessControlledSecretStore::try_open(&root, "market-squawk-access-test", &control)?;
+        assert_eq!(store.access_status()?.access, SecretAccessState::Locked);
+        assert!(matches!(
+            store.read(&reference, &control),
+            Err(LocalSecretStoreError::Locked)
+        ));
+        // The gate rejects an OS reference before it can touch the user's actual Keychain.
+        let os_reference = serde_json::from_value(
+            serde_json::json!({"version": 1, "backend": "apple_keychain", "locator": "a".repeat(64), "generation": 1}),
+        )?;
+        assert!(matches!(
+            store.read(&os_reference, &control),
+            Err(LocalSecretStoreError::Locked)
+        ));
+        assert!(matches!(
+            store.unlock_access(
+                EncryptedFileUnlockCapability::new(SecretValue::new(
+                    "incorrect-password".to_owned()
+                )?),
+                &control
+            ),
+            Err(LocalSecretStoreError::AuthenticationFailed)
+        ));
+        assert_eq!(store.access_status()?.access, SecretAccessState::Locked);
+        stage.set("unlock explicit lock and forget remembered access");
+        store.unlock_access(
+            EncryptedFileUnlockCapability::new(SecretValue::new("fixture-password".to_owned())?),
+            &control,
+        )?;
+        assert_eq!(
+            store.forget_remembered_access(&control)?.access,
+            SecretAccessState::Ready
+        );
+        assert_eq!(
+            store.read(&reference, &control)?.expose_secret(),
+            "fixture-retained-token"
+        );
+
+        // Only an explicitly selected interval expires access; ordinary access had none.
+        stage.set("select five-second reauthentication interval");
+        store.configure_access(
+            SecretAccessPolicy {
+                reauthenticate_after_seconds: Some(5),
+                ..policy
+            },
+            None,
+            &control,
+        )?;
+        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(store.access_status()?.access, SecretAccessState::Locked);
+        assert!(matches!(
+            store.read(&reference, &control),
+            Err(LocalSecretStoreError::Locked)
+        ));
+        stage.set("unlock after timed expiry");
+        let reauthenticated = store.unlock_access(
+            EncryptedFileUnlockCapability::new(SecretValue::new("fixture-password".to_owned())?),
+            &control,
+        )?;
+        assert_eq!(reauthenticated.access, SecretAccessState::Ready);
+        stage.set("restore interval after timed unlock");
+        store.configure_access(policy, None, &control)?;
+
+        // An authority publication failure cannot claim that a policy change completed.
+        stage.set("reject failed policy publication");
+        let interrupted = root.join("access-policy").join(TEMP_A_FILE);
+        fs::create_dir(&interrupted)?;
+        assert!(
+            store
+                .configure_access(SecretAccessPolicy::default(), None, &control)
+                .is_err()
+        );
+        assert_eq!(
+            store.access_status()?.access,
+            SecretAccessState::RecoveryRequired
+        );
+        fs::remove_dir(interrupted)?;
+        drop(store);
+        stage.set("reopen after failed policy publication");
+        let store =
+            AccessControlledSecretStore::try_open(&root, "market-squawk-access-test", &control)?;
+        store.unlock_access(
+            EncryptedFileUnlockCapability::new(SecretValue::new("fixture-password".to_owned())?),
+            &control,
+        )?;
+        stage.set("disable locking after publication recovery");
+        store.configure_access(SecretAccessPolicy::default(), None, &control)?;
+        drop(store);
+        stage.set("restart with locking disabled");
+        let store =
+            AccessControlledSecretStore::try_open(&root, "market-squawk-access-test", &control)?;
+        assert_eq!(store.access_status()?.access, SecretAccessState::Ready);
+        assert_eq!(
+            store.read(&reference, &control)?.expose_secret(),
+            "fixture-retained-token"
+        );
+        assert_eq!(reference.generation().get(), 7);
+        drop(store);
+
+        // An existing password vault is preserved, adopted once, and then reopens automatically.
+        stage.set("seed existing password vault");
+        let legacy_root = directory.path().join("existing-password-vault");
+        let legacy = EncryptedFileSecretStore::try_open(
+            &legacy_root,
+            SecretValue::new("existing-owner-unlock".to_owned())?,
+        )?;
+        let legacy_reference = legacy.create(
+            &key,
+            SecretGeneration::new(9)?,
+            SecretValue::new("retained-existing-token".to_owned())?,
+            &control,
+        )?;
+        drop(legacy);
+        stage.set("open existing password vault for recovery");
+        let legacy = AccessControlledSecretStore::try_open(
+            &legacy_root,
+            "market-squawk-access-test",
+            &control,
+        )?;
+        assert_eq!(
+            legacy.access_status()?.access,
+            SecretAccessState::RecoveryRequired
+        );
+        stage.set("adopt existing password vault once");
+        legacy.unlock_access(
+            EncryptedFileUnlockCapability::new(SecretValue::new(
+                "existing-owner-unlock".to_owned(),
+            )?),
+            &control,
+        )?;
+        drop(legacy);
+        stage.set("restart adopted vault automatically");
+        let legacy = AccessControlledSecretStore::try_open(
+            &legacy_root,
+            "market-squawk-access-test",
+            &control,
+        )?;
+        assert_eq!(legacy.access_status()?.access, SecretAccessState::Ready);
+        assert_eq!(
+            legacy.read(&legacy_reference, &control)?.expose_secret(),
+            "retained-existing-token"
+        );
+        Ok(())
+    })();
+    outcome.map_err(|error| format!("optional access [{}]: {error}", stage.get()).into())
 }
 
 #[test]

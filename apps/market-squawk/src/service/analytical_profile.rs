@@ -54,7 +54,14 @@ pub(super) async fn call(
             }
             let models = forecasts
                 .model_catalog_page(input.cursor, usize::from(limit), context)
-                .await?;
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        stage = "model_catalog",
+                        error = ?error,
+                        "analytical profile options unavailable"
+                    );
+                })?;
             let observed_at =
                 super::runtime::current_timestamp().map_err(|_| ServiceError::Internal)?;
             let benchmarks = benchmarks.clone();
@@ -72,7 +79,21 @@ pub(super) async fn call(
                         market_squawk_data::IngestError::DeadlineExceeded,
                     ) => ServiceError::DeadlineExceeded,
                     _ => ServiceError::Internal,
-                })??;
+                })
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        stage = "benchmark_worker",
+                        error = ?error,
+                        "analytical profile options unavailable"
+                    );
+                })?
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        stage = "benchmark_read",
+                        error = ?error,
+                        "analytical profile options unavailable"
+                    );
+                })?;
             (catalog(models.as_ref(), &choices)?, 10)
         }
         RESOLVE => {

@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Link } from "react-router-dom"
 import { AlertCircle, CheckCircle2, FileKey2, LoaderCircle } from "lucide-react"
 import { z } from "zod"
 
@@ -67,12 +68,12 @@ type ProviderCredentialImportResult = z.infer<
 
 export function ProviderCredentialImport({
   available,
-  fallback,
+  credentialAccess,
   transport,
   onAttempted,
 }: {
   available: boolean
-  fallback: ProviderBootstrap["encryptedFileFallback"]
+  credentialAccess: ProviderBootstrap["credentialAccess"]
   transport: SystemTransport
   onAttempted: () => void
 }) {
@@ -82,7 +83,7 @@ export function ProviderCredentialImport({
   const [error, setError] = React.useState<string | null>(null)
 
   const importBundle = async () => {
-    if (!available || fallback === "locked" || pending) return
+    if (!available || credentialAccess.access !== "ready" || pending) return
     let cancelled = false
     setPending(true)
     setResult(null)
@@ -128,14 +129,14 @@ export function ProviderCredentialImport({
           </div>
           <h2 className="mt-2 text-lg font-semibold">Use an existing credential file</h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Already have a Market Squawk provider-credentials .env file? Select it here once.
+            Already have a Market Squawk provider-credentials .env file? Select it here to add or update credentials.
             Saved credentials and data selections are reused. New credentials are stored securely;
             continue their verification above without signing up again or entering the keys by hand.
           </p>
         </div>
         <Button
           onClick={() => void importBundle()}
-          disabled={!available || fallback === "locked" || pending}
+          disabled={!available || credentialAccess.access !== "ready" || pending}
         >
           {pending ? (
             <LoaderCircle className="animate-spin" aria-hidden="true" />
@@ -160,12 +161,16 @@ export function ProviderCredentialImport({
           </AlertDescription>
         </Alert>
       ) : null}
-      {available && fallback === "locked" ? (
+      {available && credentialAccess.access !== "ready" ? (
         <Alert className="mt-4">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Unlock credential storage to import</AlertTitle>
+          <AlertTitle>{credentialAccess.access === "locked" ? "Unlock credential access to import" : "Credential access needs recovery"}</AlertTitle>
           <AlertDescription>
-            Enter the secure storage password above, then choose your credential file.
+            Manage credential access in General Settings before choosing your credential file.
+            Ordinary screens and saved results remain available.
+            <Link to="/system/settings" className="mt-2 inline-block text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary">
+              Open application lock settings
+            </Link>
           </AlertDescription>
         </Alert>
       ) : null}

@@ -207,7 +207,7 @@ struct ServiceBootstrapSnapshot {
     claude_code_credential_identity: String,
     codex_credential_identity: String,
     provider_profiles: Value,
-    encrypted_file_fallback: Value,
+    credential_access: Value,
     operations: Vec<ServiceOperation>,
     mcp_ready: bool,
     model_runtime_configured: bool,
@@ -271,8 +271,8 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
             .filter(|profiles| profiles.is_array())
             .cloned()
             .ok_or_else(DesktopCommandError::internal)?;
-        let encrypted_file_fallback = value
-            .pointer("/sources/encryptedFileFallback")
+        let credential_access = value
+            .pointer("/sources/credentialAccess")
             .cloned()
             .ok_or_else(DesktopCommandError::internal)?;
         let operations = value
@@ -333,7 +333,7 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
             claude_code_credential_identity,
             codex_credential_identity,
             provider_profiles,
-            encrypted_file_fallback,
+            credential_access,
             operations: parsed_operations,
             mcp_ready,
             model_runtime_configured,
@@ -2262,7 +2262,7 @@ async fn provider_bootstrap(
         "profiles": current.get("profiles").ok_or_else(DesktopCommandError::internal)?,
         "sessions": current.get("sessions").ok_or_else(DesktopCommandError::internal)?,
         "setup": current.get("setup").ok_or_else(DesktopCommandError::internal)?,
-        "encryptedFileFallback": current.get("encryptedFileFallback").ok_or_else(DesktopCommandError::internal)?,
+        "credentialAccess": current.get("credentialAccess").ok_or_else(DesktopCommandError::internal)?,
         "capabilities": {
             "credentialImport": supports("Source.ImportCredentialBundle"),
             "health": supports("Source.GetHealth"),

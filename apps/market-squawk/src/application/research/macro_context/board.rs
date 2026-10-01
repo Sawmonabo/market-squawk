@@ -153,38 +153,54 @@ impl MacroContextReadCapability {
             .map_err(|_| ServiceError::Unavailable)?;
         // Resolve the cutoff-admitted creating generation, whose append manifest retains earlier
         // captures, before selecting rows. A later refresh cannot change retained inputs.
-        let (mut origins, _has_older_origins) = self
-            .reader
-            .provider_capture_origin_candidates(
-                &dataset,
-                cutoffs.knowledge_cutoff,
-                None,
-                market_squawk_data::AnalyticalReadLimit::try_new(1).map_err(map_read_error)?,
-                deadline,
-                &cancellation,
-            )
-            .map_err(map_read_error)?;
-        let Some(manifest) = origins.pop() else {
+        let reader = self.reader.clone();
+        let select = move |worker: CancellationToken| {
+            let (mut origins, _has_older_origins) = reader
+                .provider_capture_origin_candidates(
+                    &dataset,
+                    cutoffs.knowledge_cutoff,
+                    None,
+                    market_squawk_data::AnalyticalReadLimit::try_new(1).map_err(map_read_error)?,
+                    deadline,
+                    &worker,
+                )
+                .map_err(map_read_error)?;
+            let Some(manifest) = origins.pop() else {
+                return Ok(None);
+            };
+            let generation = reader
+                .exact(&manifest, deadline, &worker)
+                .map_err(map_read_error)?;
+            let source_id =
+                SourceId::try_from(BOARD_DDP_SOURCE_ID).map_err(|_| ServiceError::Unavailable)?;
+            if generation.source_id() != &source_id
+                || generation.manifest().dataset_id() != &dataset
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            Ok(Some(generation.manifest().clone()))
+        };
+        let manifest = if let Some(research) = self.energy_store.as_ref() {
+            research
+                .run_owned_research_io(deadline, &cancellation, select)
+                .await
+                .map_err(map_board_worker_error)??
+        } else {
+            select(cancellation.clone())?
+        };
+        check_board_read(deadline, &cancellation)?;
+        let Some(manifest) = manifest else {
             return Ok(None);
         };
-        let generation = self
-            .reader
-            .exact(&manifest, deadline, &cancellation)
-            .map_err(map_read_error)?;
-        let source_id =
-            SourceId::try_from(BOARD_DDP_SOURCE_ID).map_err(|_| ServiceError::Unavailable)?;
-        if generation.source_id() != &source_id || generation.manifest().dataset_id() != &dataset {
-            return Err(ServiceError::InvalidResult);
-        }
 
-        let request = board_request(generation.manifest().clone(), cutoffs)?;
+        let request = board_request(manifest.clone(), cutoffs)?;
         let query_limits = macro_context_query_limits(&request, deadline)?;
         let output = self
             .reader
             .read_macro_latest_known_snapshot(request, query_limits, deadline, cancellation)
             .await
             .map_err(map_read_error)?;
-        if output.output().manifest() != generation.manifest() {
+        if output.output().manifest() != &manifest {
             return Err(ServiceError::InvalidResult);
         }
         Ok(Some(output))

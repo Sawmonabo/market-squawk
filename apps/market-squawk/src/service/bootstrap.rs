@@ -47,6 +47,10 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const TOTAL_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const TRAILING_DATA_TIMEOUT: Duration = Duration::from_millis(100);
 const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Retained-vault unlock includes authenticated key rotation within the secret-operation budget.
+// Its transport must also leave room for the existing bounded request/response I/O.
+const UNLOCK_TRANSACTION_TIMEOUT: Duration =
+    Duration::from_secs(SECRET_OPERATION_TIMEOUT.as_secs() + CONNECTION_TIMEOUT.as_secs());
 
 /// Non-secret credential condition that permits one bounded foreground action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -155,6 +159,15 @@ enum BootstrapCommand {
     UnlockEncryptedFallback(SecretValue),
 }
 
+impl BootstrapCommand {
+    const fn transaction_timeout(&self) -> Duration {
+        match self {
+            Self::UnlockEncryptedFallback(_) => UNLOCK_TRANSACTION_TIMEOUT,
+            Self::Status | Self::ProvideForegroundCredential { .. } => CONNECTION_TIMEOUT,
+        }
+    }
+}
+
 impl std::fmt::Debug for BootstrapCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -213,7 +226,7 @@ pub(super) async fn wait_for_action(
             .await
             .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)??;
         match tokio::time::timeout(
-            CONNECTION_TIMEOUT,
+            UNLOCK_TRANSACTION_TIMEOUT,
             serve_connection(stream, metadata, &admission, Arc::clone(&secret_store)),
         )
         .await
@@ -289,13 +302,17 @@ async fn request_exact_at_root(
     command: BootstrapCommand,
 ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
     let deadline = Instant::now()
-        .checked_add(CONNECTION_TIMEOUT)
+        .checked_add(command.transaction_timeout())
         .ok_or(InstalledServiceError::BootstrapUnavailable)?;
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or(InstalledServiceError::BootstrapDeadline)?;
     tokio::time::timeout(remaining, async move {
-        let mut stream = platform::connect(root).await?;
+        let mut stream = tokio::time::timeout(CONNECTION_TIMEOUT, platform::connect(root))
+            .await
+            .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)??;
+        #[cfg(windows)]
+        platform::set_transaction_deadline(&mut stream, deadline);
         stream.write_all(PREFACE).await?;
         let frame = encode_request(metadata, command)?;
         write_frame(&mut stream, &frame).await?;
@@ -320,19 +337,31 @@ async fn serve_connection(
     admission: &BootstrapAdmission,
     secret_store: Arc<dyn SecretStore>,
 ) -> Result<Option<BootstrapAction>, InstalledServiceError> {
-    platform::authenticate_preface(&mut stream).await?;
-    let frame = read_frame(&mut stream).await?;
-    let request = decode_request(&frame, metadata)?;
-    drop(frame);
-    let mut commit = [0_u8; REQUEST_COMMIT.len()];
-    stream.read_exact(&mut commit).await?;
-    if commit != *REQUEST_COMMIT {
-        return Err(InstalledServiceError::BootstrapProtocol);
-    }
-    require_no_trailing_data(&mut stream).await?;
+    let connection_deadline = Instant::now()
+        .checked_add(UNLOCK_TRANSACTION_TIMEOUT)
+        .ok_or(InstalledServiceError::BootstrapUnavailable)?;
+    // A slow or incomplete request never gains the longer authenticated-unlock allowance.
+    let mut request = tokio::time::timeout(CONNECTION_TIMEOUT, async {
+        platform::authenticate_preface(&mut stream).await?;
+        let frame = read_frame(&mut stream).await?;
+        let request = decode_request(&frame, metadata)?;
+        drop(frame);
+        let mut commit = [0_u8; REQUEST_COMMIT.len()];
+        stream.read_exact(&mut commit).await?;
+        if commit != *REQUEST_COMMIT {
+            return Err(InstalledServiceError::BootstrapProtocol);
+        }
+        require_no_trailing_data(&mut stream).await?;
+        Ok(request)
+    })
+    .await
+    .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)??;
+    request.deadline = request.deadline.min(connection_deadline);
     if Instant::now() >= request.deadline {
         return Err(InstalledServiceError::BootstrapDeadline);
     }
+    #[cfg(windows)]
+    platform::set_transaction_deadline(&mut stream, request.deadline);
     let (code, action) = match request.command {
         BootstrapCommand::Status => (ResponseCode::Required, None),
         BootstrapCommand::ProvideForegroundCredential {
@@ -355,7 +384,7 @@ async fn serve_connection(
             if metadata.requirement == BootstrapRequirement::EncryptedFallbackLocked
                 && admission.admits_fallback_unlock() =>
         {
-            let control = bootstrap_secret_control()?;
+            let control = bootstrap_secret_control(request.deadline)?;
             let status = secret_store
                 .unlock_encrypted_file_fallback(
                     EncryptedFileUnlockCapability::new(unlock),
@@ -375,8 +404,12 @@ async fn serve_connection(
         | BootstrapCommand::UnlockEncryptedFallback(_) => (ResponseCode::Rejected, None),
     };
     let response = encode_response(metadata, code);
-    write_frame(&mut stream, &response).await?;
-    platform::complete_response_write(&mut stream).await?;
+    tokio::time::timeout_at(request.deadline.into(), async {
+        write_frame(&mut stream, &response).await?;
+        platform::complete_response_write(&mut stream).await
+    })
+    .await
+    .map_err(|_elapsed| InstalledServiceError::BootstrapDeadline)??;
     // Returning immediately after the acknowledged frame keeps credential handoff and connection
     // close in the same poll; there is no cancellation point where the client can observe
     // acceptance after the server has dropped the accepted credential.
@@ -460,6 +493,7 @@ fn encode_request(
     metadata: BootstrapMetadata,
     command: BootstrapCommand,
 ) -> Result<Zeroizing<Vec<u8>>, InstalledServiceError> {
+    let transaction_timeout = command.transaction_timeout();
     let (command_code, payload) = match command {
         BootstrapCommand::Status => (1_u8, Zeroizing::new(Vec::new())),
         BootstrapCommand::ProvideForegroundCredential {
@@ -519,7 +553,7 @@ fn encode_request(
     encoded.extend_from_slice(&metadata.generation.to_be_bytes());
     encoded.push(command_code);
     encoded.extend_from_slice(
-        &u32::try_from(CONNECTION_TIMEOUT.as_millis())
+        &u32::try_from(transaction_timeout.as_millis())
             .map_err(|_error| InstalledServiceError::BootstrapProtocol)?
             .to_be_bytes(),
     );
@@ -556,7 +590,6 @@ fn decode_request(
         || installation_id != metadata.installation_id
         || generation != metadata.generation
         || deadline_millis == 0
-        || deadline_millis > u32::try_from(CONNECTION_TIMEOUT.as_millis()).unwrap_or(u32::MAX)
         || encoded.len() != 33 + payload_len
     {
         return Err(InstalledServiceError::BootstrapProtocol);
@@ -572,6 +605,9 @@ fn decode_request(
         ),
         _ => return Err(InstalledServiceError::BootstrapProtocol),
     };
+    if Duration::from_millis(u64::from(deadline_millis)) > command.transaction_timeout() {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
     Ok(BootstrapRequest { deadline, command })
 }
 
@@ -770,10 +806,13 @@ fn random_generation() -> Result<u64, InstalledServiceError> {
     Ok(generation)
 }
 
-fn bootstrap_secret_control() -> Result<SecretOperationControl, InstalledServiceError> {
+fn bootstrap_secret_control(
+    transaction_deadline: Instant,
+) -> Result<SecretOperationControl, InstalledServiceError> {
     let deadline = Instant::now()
         .checked_add(SECRET_OPERATION_TIMEOUT)
-        .ok_or(InstalledServiceError::BootstrapUnavailable)?;
+        .ok_or(InstalledServiceError::BootstrapUnavailable)?
+        .min(transaction_deadline);
     SecretOperationControl::try_new(
         "installed-service-bootstrap-unlock",
         deadline,

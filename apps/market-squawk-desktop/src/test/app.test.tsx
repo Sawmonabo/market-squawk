@@ -1646,7 +1646,7 @@ describe("Market Squawk desktop boundary", () => {
           ],
           sessions: [],
           setup: [],
-          encryptedFileFallback: "locked",
+          credentialAccess: { enabled: true, rememberInKeychain: false, reauthenticateAfterSeconds: null, access: "locked", rememberedAccessAvailable: false, reauthenticateAtUnixSeconds: null },
           capabilities: {
             credentialImport: false,
             health: false,

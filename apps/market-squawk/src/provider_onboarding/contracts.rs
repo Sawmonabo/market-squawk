@@ -986,11 +986,17 @@ pub enum ProviderOnboardingRequest {
     Resume {
         session_id: Uuid,
     },
-    UnlockFallback {
+    ConfigureAccess {
+        policy: market_squawk_platform::SecretAccessPolicy,
+        #[serde(default, with = "optional_onboarding_secret")]
+        secret: Option<Zeroizing<String>>,
+    },
+    UnlockAccess {
         #[serde(with = "onboarding_secret")]
         secret: Zeroizing<String>,
     },
-    LockFallback,
+    LockAccess,
+    ForgetRememberedAccess,
     SubmitSecret {
         session_id: Uuid,
         #[serde(with = "onboarding_secret")]
@@ -1037,8 +1043,10 @@ impl std::fmt::Debug for ProviderOnboardingRequest {
             Self::Inspect { .. } => "inspect",
             Self::Start { .. } => "start",
             Self::Resume { .. } => "resume",
-            Self::UnlockFallback { .. } => "unlock_fallback",
-            Self::LockFallback => "lock_fallback",
+            Self::ConfigureAccess { .. } => "configure_access",
+            Self::UnlockAccess { .. } => "unlock_access",
+            Self::LockAccess => "lock_access",
+            Self::ForgetRememberedAccess => "forget_remembered_access",
             Self::SubmitSecret { .. } => "submit_secret",
             Self::Activate { .. } => "activate",
             Self::VerifySaved { .. } => "verifySaved",
@@ -1073,5 +1081,31 @@ mod onboarding_secret {
         D: Deserializer<'de>,
     {
         String::deserialize(deserializer).map(Zeroizing::new)
+    }
+}
+
+mod optional_onboarding_secret {
+    use super::*;
+
+    pub(super) fn serialize<S>(
+        value: &Option<Zeroizing<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .as_ref()
+            .map(|secret| secret.as_str())
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<Zeroizing<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(|secret| secret.map(Zeroizing::new))
     }
 }

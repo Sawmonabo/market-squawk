@@ -84,6 +84,19 @@ pub trait ProviderPortalActivationAuthority: Send + Sync {
         Err(ProviderPortalActivationError::Unavailable)
     }
 
+    /// Suspends credential-bearing sign-in work without deleting saved provider authorization.
+    async fn suspend_credential_access(
+        &self,
+        _deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        Err(ProviderPortalActivationError::Unavailable)
+    }
+
+    /// Reopens credential work after the local access authority has admitted an unlock.
+    async fn resume_credential_access(&self) -> Result<(), ProviderPortalActivationError> {
+        Err(ProviderPortalActivationError::Unavailable)
+    }
+
     /// Closes admission to application-owned activation work before installed service teardown.
     fn begin_shutdown(&self) {}
 

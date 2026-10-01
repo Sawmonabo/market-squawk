@@ -6,6 +6,7 @@ mod cli_model;
 mod cli_portfolio;
 mod cli_provider;
 mod cli_transport;
+pub(crate) mod credential_access;
 mod executable;
 mod fair_value_producer;
 mod governance;
@@ -42,8 +43,8 @@ use market_squawk_domain::{
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{
-    InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore, LocalPaths,
-    PreferredSecretStore,
+    AccessControlledSecretStore, InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore,
+    LocalPaths, SecretCancellation, SecretInteractionPolicy, SecretOperationControl,
 };
 use market_squawk_runtime::InstallationId;
 use market_squawk_services::{
@@ -133,8 +134,8 @@ use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServi
 use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
-use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
 use crate::live_source::{ALPACA_IEX_LIVE_AUTHORITY_KEY, ALPACA_OPTIONS_LIVE_AUTHORITY_KEY};
+use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
 use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
 use crate::provider_activation::{
     FredPointInTimeReadCapability, publish_fred_latest_known, publish_treasury_latest_known,
@@ -147,7 +148,6 @@ use crate::provider_onboarding::{
     SchwabOAuthMarketDrainPurpose, SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
 };
 use crate::provider_rate::open_provider_rate_authority;
-use crate::service::InstalledSecretBackendPolicy;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
     PortfolioApplicationServiceError, ProviderAdapterActivation, ProviderOnboardingError,
@@ -347,6 +347,7 @@ pub struct LocalProduct {
     provider_activation: Arc<ProviderAdapterActivation>,
     provider_research_activation: Arc<cli_provider::ProviderResearchActivationService>,
     provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
+    credential_access: Arc<credential_access::CredentialAccessCoordinator>,
     provider_activation_state: DurableProviderActivationState,
     portfolio: Arc<PortfolioApplicationService>,
     decisions: Arc<DecisionApplication>,
@@ -535,7 +536,6 @@ impl LocalProduct {
         selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
         installation_paths: &LocalPaths,
         installation_id: InstallationId,
-        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
             config,
@@ -546,7 +546,6 @@ impl LocalProduct {
                 paths: installation_paths.clone(),
                 installation_id,
             }),
-            secret_backend_policy,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -559,7 +558,6 @@ impl LocalProduct {
         selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
         installation_paths: &LocalPaths,
         installation_id: InstallationId,
-        secret_backend_policy: InstalledSecretBackendPolicy,
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
@@ -571,7 +569,6 @@ impl LocalProduct {
                 paths: installation_paths.clone(),
                 installation_id,
             }),
-            secret_backend_policy,
             Some(board_fixture),
         )
         .await
@@ -600,7 +597,6 @@ impl LocalProduct {
             registrations,
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor,
             None,
-            InstalledSecretBackendPolicy::EncryptedFileOnly,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -613,7 +609,6 @@ impl LocalProduct {
         registrations: I,
         source_authority_startup_policy: SourceAuthorityStartupPolicy<'_>,
         schwab_oauth_installation: Option<SchwabOAuthInstallationContext>,
-        secret_backend_policy: InstalledSecretBackendPolicy,
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
@@ -694,7 +689,10 @@ impl LocalProduct {
             // Saved Alpaca profiles are restored after secure unlock; static configuration is
             // not proof that either retained authority is absent. Recover both under the same
             // exclusive installation capability before any account runtime can start.
-            for key in [ALPACA_IEX_LIVE_AUTHORITY_KEY, ALPACA_OPTIONS_LIVE_AUTHORITY_KEY] {
+            for key in [
+                ALPACA_IEX_LIVE_AUTHORITY_KEY,
+                ALPACA_OPTIONS_LIVE_AUTHORITY_KEY,
+            ] {
                 AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
                     selected_workspace,
                     key,
@@ -755,17 +753,18 @@ impl LocalProduct {
             )?;
 
         let provider_secret_root = paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY);
-        let secrets = Arc::new(match secret_backend_policy {
-            InstalledSecretBackendPolicy::PlatformKeyring => {
-                PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
-                    "market-squawk",
-                    provider_secret_root,
-                )?
-            }
-            InstalledSecretBackendPolicy::EncryptedFileOnly => {
-                PreferredSecretStore::try_new_with_locked_encrypted_file(provider_secret_root)?
-            }
-        });
+        let secret_control = SecretOperationControl::try_new(
+            "provider-credentials-open",
+            recovery_deadline,
+            1,
+            SecretInteractionPolicy::Forbid,
+            SecretCancellation::new(),
+        )?;
+        let secrets = Arc::new(AccessControlledSecretStore::try_open(
+            provider_secret_root,
+            "market-squawk",
+            &secret_control,
+        )?);
         let provider_activation_state =
             DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
         // Source-registry exclusive replacement above has succeeded. Only its real selected
@@ -1330,6 +1329,12 @@ impl LocalProduct {
             [fred_startup, fiscal_startup, daily_startup],
         );
         let application = Arc::new(application.with_startup_tasks(Arc::clone(&startup_tasks)));
+        let credential_access = Arc::new(credential_access::CredentialAccessCoordinator::new(
+            Arc::clone(&onboarding),
+            Arc::clone(&provider_portal_activation),
+            source_lifecycle.clone(),
+            paper.credential_runtime_control(),
+        ));
         Ok(Self {
             paths,
             artifacts,
@@ -1348,6 +1353,7 @@ impl LocalProduct {
             provider_activation,
             provider_research_activation: portal_activation,
             provider_portal_activation,
+            credential_access,
             provider_activation_state,
             portfolio,
             decisions,
@@ -1654,6 +1660,10 @@ impl LocalProduct {
         )
     }
 
+    pub(crate) fn credential_access(&self) -> Arc<credential_access::CredentialAccessCoordinator> {
+        Arc::clone(&self.credential_access)
+    }
+
     pub(crate) fn source_lifecycle_authority(&self) -> Arc<dyn SourceLifecycleAuthority> {
         self.source_lifecycle.clone()
     }
@@ -1666,6 +1676,9 @@ impl LocalProduct {
         source_lifecycle::LiveSourceRestoreReport,
         crate::application::source::SourceLifecycleError,
     > {
+        self.source_lifecycle
+            .restore_ready_research_sources(deadline, cancellation)
+            .await?;
         self.source_lifecycle
             .restore_active_live_sources(deadline, cancellation)
             .await

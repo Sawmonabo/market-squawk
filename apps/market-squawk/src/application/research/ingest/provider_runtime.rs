@@ -1448,6 +1448,61 @@ enum ResearchProviderRuntimeReplacementState {
 }
 
 impl ResearchProviderRuntimeMutationAuthority {
+    /// Includes revoked entries: revocation alone can still retain a credential-bearing adapter.
+    pub(crate) fn retained_credential_generations(
+        &self,
+    ) -> Result<Vec<ResearchProviderRuntimeGeneration>, ResearchIngestCompositionError> {
+        let authority = self.coordinator.authority.lock()
+            .map_err(|_| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if !authority.pending_replacements.is_empty() {
+            return Err(ResearchIngestCompositionError::ReplacementInProgress);
+        }
+        Ok(authority.sources.values().filter_map(|source| source.generation.as_ref())
+            .chain(authority.publication_sources.values().map(|source| &source.generation))
+            .filter(|generation| generation.secret_reference().is_some())
+            .cloned().collect())
+    }
+
+    /// Releases drained process adapters while retaining their durable catalog history.
+    pub(crate) fn release_suspended_provider_generation(
+        &self,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        let mut authority = self.coordinator.authority.lock()
+            .map_err(|_| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.pending_replacements.contains_key(expected.profile()) {
+            return Err(ResearchIngestCompositionError::ReplacementInProgress);
+        }
+        let super::CoordinatorAuthority { registry, sources, publication_sources, .. } = &mut *authority;
+        let registration = if let Some(current) = sources.get(expected.profile()) {
+            if current.generation.as_ref() != Some(expected) || !current.admission.revocation_drained() {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            let registry_owners = match &current.typed_capability {
+                super::RegisteredTypedSourceCapability::None => 1,
+                super::RegisteredTypedSourceCapability::BoardFullHistory(_)
+                | super::RegisteredTypedSourceCapability::TreasuryAllHistory(_)
+                | super::RegisteredTypedSourceCapability::BeaRegional(_) => 2,
+            };
+            if Arc::strong_count(&current.source) != registry_owners {
+                return Err(ResearchIngestCompositionError::AuthorityUnavailable);
+            }
+            current.registration.as_ref()
+        } else if let Some(current) = publication_sources.get(expected.profile()) {
+            if &current.generation != expected || !current.admission.revocation_drained() {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.registration.as_ref()
+        } else {
+            return Err(ResearchIngestCompositionError::RuntimeGenerationUnavailable);
+        };
+        registry.as_mut().ok_or(ResearchIngestCompositionError::ShuttingDown)?
+            .release_process_registration_exact(registration)?;
+        drop(sources.remove(expected.profile()));
+        drop(publication_sources.remove(expected.profile()));
+        Ok(())
+    }
+
     pub(super) fn new(coordinator: Arc<ProductionResearchIngestCoordinator>) -> Self {
         Self { coordinator }
     }

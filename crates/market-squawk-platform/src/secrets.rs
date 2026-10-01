@@ -1,5 +1,6 @@
 //! OS-backed credentials and a capability-confined encrypted local fallback.
 
+mod access;
 mod crypto;
 mod encrypted;
 mod keyring;
@@ -14,6 +15,9 @@ use thiserror::Error;
 use self::crypto::encode_hex;
 use crate::{LocalAuthorityStateStoreError, SecretValue};
 
+pub use self::access::{
+    AccessControlledSecretStore, SecretAccessPolicy, SecretAccessState, SecretAccessStatus,
+};
 pub use self::encrypted::EncryptedFileSecretStore;
 pub use self::keyring::OsKeyringSecretStore;
 pub use self::managed::{
@@ -89,6 +93,46 @@ impl fmt::Debug for SecretKey {
 
 /// Replaceable storage contract for local credential material.
 pub trait SecretStore: fmt::Debug + Send + Sync {
+    /// Returns the managed access policy and redacted current readiness.
+    fn access_status(&self) -> Result<SecretAccessStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
+    /// Changes optional locking. Enabling requires a new user-held unlock capability.
+    fn configure_access(
+        &self,
+        _policy: SecretAccessPolicy,
+        _new_unlock: Option<EncryptedFileUnlockCapability>,
+        _control: &SecretOperationControl,
+    ) -> Result<SecretAccessStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
+    /// Authenticates explicit access without changing provider credential generations.
+    fn unlock_access(
+        &self,
+        _unlock: EncryptedFileUnlockCapability,
+        _control: &SecretOperationControl,
+    ) -> Result<SecretAccessStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
+    /// Persists explicit locking after the caller has drained credential-bearing work.
+    fn lock_access(
+        &self,
+        _control: &SecretOperationControl,
+    ) -> Result<SecretAccessStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
+    /// Deletes only the remembered OS unlock, retaining provider credentials and policy.
+    fn forget_remembered_access(
+        &self,
+        _control: &SecretOperationControl,
+    ) -> Result<SecretAccessStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
     /// Returns the non-secret readiness of an optional encrypted-file fallback.
     fn encrypted_file_fallback_status(
         &self,
