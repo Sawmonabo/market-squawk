@@ -5004,3 +5004,50 @@ and existing adapter message contract use top-level `/success`. Lead independent
 source/schema contradiction. Checkpoint the verified Coinbase drain separately; next lead-owned
 change is the exact reference lookup correction and unchanged live recheck. No endpoint/deadline,
 identity, credential or financial evidence checks will be weakened.
+
+Coinbase drain checkpoint `618b62c8`. Lead changed the Kraken reference subscription success
+lookup in place to the official top-level field; all channel, snapshot, capture and selection
+validation remains. Reuse the same real lifecycle selector; no added harness. Build pending.
+
+Kraken acknowledgement build PASS4m45s, but live recheck FAIL208.27s at Coinbase restart
+(`kraken-reference-ack-live.log`): retained original reference capture unavailable, before Kraken.
+The prior full Coinbase journey is valid evidence for that run, not repeatable acceptance. Astra
+trace found two concrete capture hazards: immutable reopen treats recovery RwLock contention as
+unavailable, and AcceptedNativeReferenceCapture discards its live receipt pin before catalog
+publication. Committed native references are included in recovery membership; that index is not
+missing. Exact failed branch needs closed diagnostic evidence.
+
+Next finite ownership: Astra `research_options_failure` owns platform journal `sealed.rs` and
+`sealed_recovery.rs`, and data catalog `market_data_instruments/native_reference.rs`, to fix those
+two capture lifetime/contention defects with existing control/receipt ownership. No new queues,
+builds, Git or compatibility paths. Lead owns safe closed diagnostics in crypto reference callers,
+integration, existing critical verification, commits/pushes. Dependency: retain original through
+catalog commit and allow controlled immutable reopen before rerunning the same lifecycle.
+
+Capture corrections are frozen for focused verification. Lead reused the already pinned workspace
+parking_lot dependency for timed recovery read admission (manifest/lock edge only, no version
+change), and retained safe failure-only capture stage/control or filesystem ErrorKind diagnostics.
+Astra additionally owned the existing `data/tests/catalog.rs` native-reference custody case;
+its early producer-token drop and precommit recovery now exercise the previously uncovered pin
+gap. The existing platform sealed-reopen case now exercises actual recovery lock contention and
+original cancellation/deadline controls. No new harness or general review round. Platform/data
+checks are serialized before the application build/live journey; exact prior capture failure branch
+remains unproven pending diagnostic/live evidence.
+
+Capture critical checks PASS: existing platform sealed-reopen/recovery test 1/1 (0.14s,
+`reference-custody-platform-test.log`), existing native-reference custody/identity/restart case 1/1
+(0.97s, `reference-custody-data-test.log`). The latter explicitly runs recovery before catalog
+commit with only the accepted capture retaining the physical pin. Application rebuild and real
+lifecycle recheck remain pending. No full gate or whole-app performance claim.
+
+Capture application build PASS7m07s (`reference-custody-app-build.log`). Live combined check
+FAIL245.53s (`reference-custody-live.log`), after the full Coinbase publication/shutdown/restart/
+original-evidence/explicit-stop journey completes again. No reference capture error in this run.
+Kraken now passes reference preparation and opens its source pair, but trade generation1 requests
+DecoderStateDiscontinuity before subscription/first-data readiness. Therefore the Kraken ACK fix
+is live exercised; Kraken publication/restart remains unverified. Focused capture tests prove the
+two repaired hazards; this run does not retrospectively identify which caused the earlier failure.
+
+Checkpoint the reference-custody/protocol fixes. Next bounded Astra read-only lane traces Kraken
+trade continuity against the official schema and a small public WebSocket sample; no mutation or
+build assigned. Lead retains application/Git/verification ownership. No final lifecycle/V1 approval.

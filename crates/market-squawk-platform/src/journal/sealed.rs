@@ -12,13 +12,15 @@ use std::{
     fs::File,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak},
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
 };
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt as _;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{SeqAccess, Visitor},
@@ -54,6 +56,8 @@ const MAX_SEALED_FRAMES: usize = 4_096;
 const MAX_SEALED_BYTES: u64 = 512 * 1024 * 1024;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_CLAIM_REFERENCE_BYTES: usize = 128;
+// Cooperative cancellation/deadline observation granularity, not an operation timeout.
+const RECOVERY_READ_CONTROL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
@@ -636,10 +640,7 @@ impl SealedResearchJournalStore {
         &self,
         receipt: &SealedResearchJournalSegmentReceipt,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
-        let _read = self
-            .recovery_exclusion
-            .read()
-            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        let _read = self.recovery_exclusion.read();
         self.validate_owner()?;
         self.open_verified_claim_inner(receipt.claim())
     }
@@ -649,10 +650,7 @@ impl SealedResearchJournalStore {
         &self,
         claim: &SealedResearchJournalSegmentClaim,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
-        let _read = self
-            .recovery_exclusion
-            .read()
-            .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        let _read = self.recovery_exclusion.read();
         self.validate_owner()?;
         self.open_verified_claim_inner(claim)
     }
@@ -660,7 +658,7 @@ impl SealedResearchJournalStore {
     /// Reopens a persisted claim under caller-owned cooperative cancellation and deadline checks.
     ///
     /// Verification reuses the bounded streaming verifier used by recovery. The shared read guard
-    /// is acquired without waiting so recovery cannot outlive the caller's absolute deadline.
+    /// waits cooperatively for recovery under the caller's original cancellation and deadline.
     pub fn open_verified_claim_with_control(
         &self,
         claim: &SealedResearchJournalSegmentClaim,
@@ -694,19 +692,24 @@ impl SealedResearchJournalStore {
         &self,
         control: &dyn ResearchObjectControl,
     ) -> Result<RwLockReadGuard<'_, ()>, SealedResearchJournalStoreError> {
-        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
-        match self.recovery_exclusion.try_read() {
-            Ok(read) => Ok(read),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                Err(ResearchObjectControlError::Unavailable.into())
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                Err(SealedResearchJournalStoreError::OperationLockPoisoned)
+        loop {
+            control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+            let read = self
+                .recovery_exclusion
+                .try_read_for(RECOVERY_READ_CONTROL_INTERVAL);
+            control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+            if let Some(read) = read {
+                return Ok(read);
             }
         }
     }
 
     fn validate_owner(&self) -> Result<(), SealedResearchJournalStoreError> {
+        // Recovery releases its std mutation guard before the read barrier. A panic therefore
+        // poisons mutation before another reader can enter, preserving fail-closed reopen.
+        if self.operation.is_poisoned() {
+            return Err(SealedResearchJournalStoreError::OperationLockPoisoned);
+        }
         let named = self
             .root
             .symlink_metadata(OWNER_LOCK_FILE)
@@ -2076,10 +2079,7 @@ mod tests {
         // An in-progress seal and another immutable reader do not deny exact retained reads.
         {
             let _seal = store.operation.lock().map_err(|_| "seal lock poisoned")?;
-            let _reader = store
-                .recovery_exclusion
-                .read()
-                .map_err(|_| "read lock poisoned")?;
+            let _reader = store.recovery_exclusion.read();
             assert_eq!(
                 store
                     .open_verified_claim_with_control(receipt.claim(), &Allow)?
@@ -2090,6 +2090,69 @@ mod tests {
                 store.verify_claim_with_control(receipt.claim(), &Allow)?,
                 receipt
             );
+        }
+        struct WaitingRead {
+            checks: std::cell::Cell<usize>,
+            waiting: Option<std::sync::mpsc::Sender<()>>,
+            stop: Option<ResearchObjectControlError>,
+        }
+        impl ResearchObjectControl for WaitingRead {
+            fn checkpoint(
+                &self,
+                _: ResearchObjectControlPoint,
+            ) -> Result<(), ResearchObjectControlError> {
+                let checks = self.checks.get() + 1;
+                self.checks.set(checks);
+                if checks == 2 {
+                    if let Some(waiting) = &self.waiting {
+                        waiting
+                            .send(())
+                            .map_err(|_| ResearchObjectControlError::Unavailable)?;
+                    }
+                    if let Some(stop) = self.stop {
+                        return Err(stop);
+                    }
+                }
+                Ok(())
+            }
+        }
+        // A retained read waits for maintenance instead of reporting ordinary contention as
+        // unavailable, and rechecks the original control while waiting.
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let recovery = store.recovery_exclusion.write();
+            let (waiting, observed) = std::sync::mpsc::channel();
+            let read = scope.spawn(|| {
+                store.verify_claim_with_control(
+                    receipt.claim(),
+                    &WaitingRead {
+                        checks: std::cell::Cell::new(0),
+                        waiting: Some(waiting),
+                        stop: None,
+                    },
+                )
+            });
+            observed.recv_timeout(std::time::Duration::from_secs(2))?;
+            assert!(!read.is_finished());
+            drop(recovery);
+            assert_eq!(
+                read.join().map_err(|_| "controlled read panicked")??,
+                receipt
+            );
+            Ok(())
+        })?;
+        for stop in [
+            ResearchObjectControlError::Cancelled,
+            ResearchObjectControlError::DeadlineExceeded,
+        ] {
+            let _recovery = store.recovery_exclusion.write();
+            assert!(matches!(
+                store.verify_claim_with_control(receipt.claim(), &WaitingRead {
+                    checks: std::cell::Cell::new(0),
+                    waiting: None,
+                    stop: Some(stop),
+                }),
+                Err(super::SealedResearchJournalStoreError::ObjectControl(actual)) if actual == stop
+            ));
         }
         // A self-consistent physical claim still cannot change metadata in the raw envelope.
         let mut wrong_sequence = receipt.claim().clone();

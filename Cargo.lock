@@ -5417,6 +5417,7 @@ dependencies = [
  "memory-stats",
  "objc2",
  "objc2-foundation",
+ "parking_lot",
  "process-wrap",
  "proptest",
  "rust_decimal",

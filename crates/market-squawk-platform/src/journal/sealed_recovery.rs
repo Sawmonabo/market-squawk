@@ -131,7 +131,10 @@ impl SealedResearchRecoverySession {
         let _recovery = store
             .recovery_exclusion
             .try_write()
-            .map_err(|_| ResearchObjectControlError::Unavailable)?;
+            .ok_or(ResearchObjectControlError::Unavailable)?;
+        // Tuple fields drop in order: poison mutation on unwind before reopening the read
+        // barrier. Immutable readers validate that poison before issuing any authority.
+        let _exclusion = (_operation, _recovery);
         store.validate_owner()?;
         let mut report = SealedResearchJournalRecoveryReport {
             quarantined_staging: Vec::new(),

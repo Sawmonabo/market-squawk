@@ -2510,6 +2510,22 @@ async fn native_reference_custody_preserves_prior_identity_and_recovers_original
         &capture,
     )?;
     let original_coordinate = accepted.coordinate().clone();
+    drop(capture);
+    // The accepted reference alone must retain physical custody before its catalog commit.
+    // Maintenance has no membership edge yet and must not quarantine that live original.
+    let recovery = Arc::new(Mutex::new(
+        service.create_provider_capture_recovery(Arc::clone(&raw_store))?,
+    ));
+    loop {
+        let turn = service
+            .recover_provider_capture_store_turn(Arc::clone(&recovery), deadline(), &cancellation)
+            .await?;
+        assert!(turn.report().quarantined_objects().is_empty());
+        if turn.complete() {
+            break;
+        }
+    }
+    drop(recovery);
     let native = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
         instrument_id: instrument,
         source_id: namespace.clone(),
@@ -2715,7 +2731,6 @@ async fn native_reference_custody_preserves_prior_identity_and_recovers_original
     drop(reader);
     drop(publisher);
     drop(service);
-    drop(capture);
     drop(raw_store);
 
     let service = initialize()?;

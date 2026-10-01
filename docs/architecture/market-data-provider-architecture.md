@@ -573,6 +573,12 @@ explicit backups still verify their complete selected bytes; background completi
 authorization receipt. Accounting detects integer overflow rather than imposing a cumulative
 physical-object or stored-byte quota.
 
+Accepted native-reference material retains its physical receipt until the catalog synchronization
+transaction commits, including the interval after the producing transport has stopped. Its value-only
+claim does not replace that live pin. Controlled immutable reads wait for a running recovery turn
+under their original cancellation/deadline checks; ordinary contention is not missing evidence.
+The existing mutation poison check still prevents reads after an incomplete panicking recovery.
+
 Raw journal and capture-pipe serialization share an 8 KiB temporary buffer ahead of checksum/count
 writers. This coalesces JSON fragments without materializing an entire encoded record or changing
 its bytes. Each pass explicitly drains before checking its length/digest; failure discards pending

@@ -1,6 +1,9 @@
 //! Original native reference custody in the canonical instrument transaction.
 
-use market_squawk_platform::{ResearchObjectClaim, ResearchObjectReceipt, SealedResearchRawClaim};
+use market_squawk_platform::{
+    ResearchObjectClaim, ResearchObjectReceipt, SealedResearchJournalSegmentReceipt,
+    SealedResearchRawClaim,
+};
 use market_squawk_sources::{
     ProviderCaptureTerminalDisposition, SegmentedHttpResponseReceipt, ValidatedRawMarketFrame,
 };
@@ -242,6 +245,19 @@ pub struct AcceptedNativeReferenceCapture {
     native_id: ProviderInstrumentId,
     coordinate: NativeReferenceSourceCoordinate,
     raw: SealedResearchRawClaim,
+    // A value-only claim cannot exclude orphan recovery before the catalog transaction commits.
+    // Keep the original physical owner alive for the whole synchronization call.
+    _raw_owner: NativeReferenceRawOwner,
+}
+
+#[derive(Debug)]
+enum NativeReferenceRawOwner {
+    Logical {
+        _receipt: ResearchObjectReceipt,
+    },
+    Journal {
+        _receipt: SealedResearchJournalSegmentReceipt,
+    },
 }
 
 impl AcceptedNativeReferenceCapture {
@@ -279,6 +295,9 @@ impl AcceptedNativeReferenceCapture {
             native_id,
             coordinate,
             raw,
+            _raw_owner: NativeReferenceRawOwner::Journal {
+                _receipt: sealed.segment().clone(),
+            },
         })
     }
 
@@ -317,14 +336,15 @@ impl AcceptedNativeReferenceCapture {
                 response_coordinate_digest: capture.coordinate_digest(),
             },
         };
-        let raw = SealedResearchRawClaim::LogicalObject(raw.claim().clone());
-        coordinate.validate(&raw)?;
+        let claim = SealedResearchRawClaim::LogicalObject(raw.claim().clone());
+        coordinate.validate(&claim)?;
         Ok(Self {
             instrument_id,
             identity_source,
             native_id,
             coordinate,
-            raw,
+            raw: claim,
+            _raw_owner: NativeReferenceRawOwner::Logical { _receipt: raw },
         })
     }
 
@@ -350,14 +370,15 @@ impl AcceptedNativeReferenceCapture {
                 transport: frame.transport(),
             },
         };
-        let raw = SealedResearchRawClaim::LogicalObject(raw.claim().clone());
-        coordinate.validate(&raw)?;
+        let claim = SealedResearchRawClaim::LogicalObject(raw.claim().clone());
+        coordinate.validate(&claim)?;
         Ok(Self {
             instrument_id,
             identity_source,
             native_id,
             coordinate,
-            raw,
+            raw: claim,
+            _raw_owner: NativeReferenceRawOwner::Logical { _receipt: raw },
         })
     }
     /// Returns the canonical identity supplied by the source-specific normalization owner.

@@ -24,7 +24,7 @@ use market_squawk_domain::{
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalPaths, ResearchObjectAdmission, ResearchObjectClaim,
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
-    ResearchObjectReceipt, SealedResearchJournalStore,
+    ResearchObjectReceipt, SealedResearchJournalStore, SealedResearchJournalStoreError,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, BudgetDispatchDecision, BudgetPermit,
@@ -71,6 +71,26 @@ impl ResearchObjectControl for SealControl {
     }
 }
 
+// Public diagnostics retain the failed operation and closed cause, never filesystem paths or bytes.
+fn capture_store_failure(
+    stage: &'static str,
+    error: SealedResearchJournalStoreError,
+) -> CryptoReferenceError {
+    match error {
+        SealedResearchJournalStoreError::Io { context, source } => {
+            tracing::warn!(stage, context, kind = ?source.kind(), "public reference capture failed");
+        }
+        SealedResearchJournalStoreError::Journal(_) => {
+            tracing::warn!(stage, cause = "journal", "public reference capture failed");
+        }
+        error => {
+            // Remaining variants contain only static descriptions, closed controls or numeric bounds.
+            tracing::warn!(stage, %error, "public reference capture failed");
+        }
+    }
+    CryptoReferenceError::CaptureUnavailable
+}
+
 /// Physically seals the complete original response/frame and re-verifies its digest before any
 /// provider assertion is decoded or sent to the catalog.
 pub(crate) async fn seal_original(
@@ -98,13 +118,13 @@ pub(crate) async fn seal_original(
         .map_err(|_| CryptoReferenceError::CaptureUnavailable)?;
         let mut pending = store
             .begin_logical_object(admission)
-            .map_err(|_| CryptoReferenceError::CaptureUnavailable)?;
+            .map_err(|error| capture_store_failure("begin", error))?;
         pending
             .write_admitted(&bytes)
-            .map_err(|_| CryptoReferenceError::CaptureUnavailable)?;
+            .map_err(|error| capture_store_failure("write", error))?;
         let verified = store
             .finish_logical_object(pending, &control)
-            .map_err(|_| CryptoReferenceError::CaptureUnavailable)?;
+            .map_err(|error| capture_store_failure("seal", error))?;
         if verified.content_digest() != expected_digest
             || verified.size_bytes() != bytes.len() as u64
         {
@@ -112,7 +132,7 @@ pub(crate) async fn seal_original(
         }
         verified
             .reverify_for_commit(&control)
-            .map_err(|_| CryptoReferenceError::CaptureUnavailable)
+            .map_err(|error| capture_store_failure("reverify", error))
     });
     // Retain the blocking owner until it has a definite commit/refusal outcome; dropping its
     // JoinHandle on timeout would leave an unaccounted late raw object behind.
@@ -140,7 +160,7 @@ pub(super) async fn reopen_original(
     let task = tokio::task::spawn_blocking(move || {
         let mut object = store
             .open_verified_logical_object_claim(&claim, &control)
-            .map_err(|_| CryptoReferenceError::CaptureUnavailable)?;
+            .map_err(|error| capture_store_failure("reopen", error))?;
         let size = usize::try_from(object.size_bytes())
             .map_err(|_| CryptoReferenceError::CaptureUnavailable)?;
         if size == 0 || size > maximum_bytes {
@@ -601,7 +621,7 @@ async fn kraken_instrument_inner(
                 if value.get("method").and_then(Value::as_str) == Some("subscribe") {
                     if value.pointer("/result/channel").and_then(Value::as_str)
                         != Some("instrument")
-                        || value.pointer("/result/success").and_then(Value::as_bool) != Some(true)
+                        || value.get("success").and_then(Value::as_bool) != Some(true)
                     {
                         return Err(CryptoReferenceError::ProviderReferenceUnavailable);
                     }
