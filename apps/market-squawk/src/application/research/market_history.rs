@@ -7,6 +7,7 @@
 mod harmonic;
 mod native_sessions;
 pub(crate) use native_sessions::NativeSessionHistory;
+mod previous_close;
 mod viewport;
 pub(crate) use harmonic::HarmonicHistoryEvaluation;
 pub(crate) use viewport::MarketHistoryViewport;

@@ -24,6 +24,7 @@ pub(crate) trait AccountMarketRuntimeReconnect: Send + Sync {
     /// Revisit the original durable intent after interrupted cleanup or successor startup.
     async fn resume_pending(
         &self,
+        surface: AccountMarketSurface,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError>;
@@ -75,28 +76,37 @@ impl MarketRuntimeRegistry {
                 return;
             }
         };
-        // A blocked Schwab renewal must not repeatedly select the first entry and starve
-        // independent account cleanup. Every observed unrelated generation gets its own turn.
-        for snapshot in snapshots.iter().filter(|snapshot| {
-            snapshot.surface_id.as_str() != AccountMarketSurface::SchwabMarketData.surface_id()
-        }) {
+        // A blocked renewal must not starve independent account cleanup. Every observed
+        // unrelated generation and each retained recovery operation gets its own turn.
+        for snapshot in snapshots
+            .iter()
+            .filter(|snapshot| !supports_account_reconnect(&snapshot.surface_id))
+        {
             self.drain_unhealthy_account_snapshot(snapshot, cancellation)
                 .await;
         }
-        let Ok(deadline) = self.cleanup_deadline() else {
-            return;
-        };
-        if let Some(owner) = self.account_reconnect.get().and_then(Weak::upgrade)
-            && let Err(error) = owner
-                .resume_pending(deadline, cancellation.child_token())
-                .await
-            && !cancellation.is_cancelled()
-        {
-            tracing::warn!(%error, "pending Schwab lifecycle recovery remains incomplete");
+        if let Some(owner) = self.account_reconnect.get().and_then(Weak::upgrade) {
+            for surface in [
+                AccountMarketSurface::AlpacaBasic,
+                AccountMarketSurface::SchwabMarketData,
+            ] {
+                let Ok(deadline) = self.cleanup_deadline() else {
+                    return;
+                };
+                if let Err(error) = owner
+                    .resume_pending(surface, deadline, cancellation.child_token())
+                    .await
+                    && !cancellation.is_cancelled()
+                {
+                    tracing::warn!(%error, surface = surface.surface_id(),
+                        "pending account lifecycle recovery remains incomplete");
+                }
+            }
         }
-        for snapshot in snapshots.iter().filter(|snapshot| {
-            snapshot.surface_id.as_str() == AccountMarketSurface::SchwabMarketData.surface_id()
-        }) {
+        for snapshot in snapshots
+            .iter()
+            .filter(|snapshot| supports_account_reconnect(&snapshot.surface_id))
+        {
             let Ok(deadline) = self.cleanup_deadline() else {
                 return;
             };
@@ -113,7 +123,7 @@ impl MarketRuntimeRegistry {
                     // Recovery retains the original allocation; generic removal cannot
                     // replace its persisted predecessor or manufacture acknowledgement.
                     if !cancellation.is_cancelled() {
-                        tracing::warn!(%error, "Schwab generation recovery remains incomplete");
+                        tracing::warn!(%error, surface = %snapshot.surface_id, "account generation recovery remains incomplete");
                     }
                 }
             }
@@ -167,12 +177,32 @@ impl MarketRuntimeRegistry {
             let MarketRuntime::Account(group) = &entry.runtime else {
                 return Err(ServiceError::InvalidResult);
             };
-            if group.schwab_recovery_owner().is_none() {
-                return Ok(false);
+            let surface = AccountMarketSurface::parse(snapshot.surface_id.as_str())
+                .ok_or(ServiceError::InvalidResult)?;
+            match surface {
+                AccountMarketSurface::AlpacaBasic => {
+                    let lease = group.activation_lease();
+                    let Some(doctor) = lease
+                        .runtime_verification_evidence()
+                        .alpaca_paper_iex_receipt()
+                    else {
+                        return Ok(false);
+                    };
+                    if doctor.exclusive_expires_at() > market_runtime_timestamp()? {
+                        // Other transport, authorization, or publication failures do not
+                        // authorize an automatic doctor retry.
+                        return Ok(false);
+                    }
+                }
+                AccountMarketSurface::SchwabMarketData
+                    if group.schwab_recovery_owner().is_some() => {}
+                AccountMarketSurface::SchwabMarketData | AccountMarketSurface::KrakenLevel3 => {
+                    return Ok(false);
+                }
             }
             let evidence = group.evidence();
             PreparedMarketProviderConfigurationRequest::try_new(
-                AccountMarketSurface::SchwabMarketData,
+                surface,
                 evidence.onboarding_session_id(),
                 evidence.public_configuration_digest(),
                 evidence.runtime_verification_receipt_digest(),
@@ -274,4 +304,11 @@ impl MarketRuntimeRegistry {
             .await?;
         Ok(Some(delay))
     }
+}
+
+fn supports_account_reconnect(surface: &SourceIdentifier) -> bool {
+    matches!(
+        AccountMarketSurface::parse(surface.as_str()),
+        Some(AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData)
+    )
 }

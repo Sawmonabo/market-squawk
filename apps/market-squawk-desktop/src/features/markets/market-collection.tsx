@@ -143,6 +143,7 @@ function CollectionInvestment({ symbol, market, onSelect }: {
       : <div className="mt-2 text-[10px] text-muted-foreground">
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
         <p>{availabilityLabel(market)}{market.changePercent !== null ? ` · ${market.changePercent}%` : ""}</p>
+        {market.asOf ? <time dateTime={market.asOf}>{new Date(market.asOf).toLocaleString()}</time> : null}
       </div>}
   </>
 }

@@ -73,7 +73,8 @@ pub use fair_value::{
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub(crate) use market_runtime::{
     AccountGroupStopReceipt, AccountMarketRuntimeReconnect, AccountMarketSurface,
-    AlpacaOptionChainRuntime, AlpacaPublicationRuntime, EquityPaperRouteEvidence,
+    AlpacaHistoricalRuntimeCapability, AlpacaOptionChainRuntime, AlpacaPublicationRuntime,
+    EquityPaperRouteEvidence,
     EquityPaperSourceBinding, EquityPaperSourceRoute, MarketProviderGroupLifecycleEvidence,
     MarketRuntimeGroupGeneration, MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
     OptionChainDemand, OptionChainDemandError, OptionChainDemandResult, PreparedAccountStop,

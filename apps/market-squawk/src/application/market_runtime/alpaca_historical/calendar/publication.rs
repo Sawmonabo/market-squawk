@@ -16,7 +16,7 @@ impl AlpacaHistoricalRuntimeCapability {
     /// Retains one already-admitted account operation through the immutable calendar commit.
     ///
     /// The producer acquires this after authenticated fetching and normalization, before the
-    /// existing research ingest. It retains the account's existing activation mutation guard
+    /// existing research ingest. It retains the account's shared activation read guard
     /// until ingest completes, then drops this authority before ordinary runtime checks.
     /// Shutdown cancels its authority and drains the same historical operation counter.
     pub(crate) async fn acquire_calendar_publication_authority(

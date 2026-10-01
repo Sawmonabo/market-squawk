@@ -154,7 +154,34 @@ impl MarketDomainService {
                         .and_then(|id| id.parse::<InstrumentId>().ok())
                         == Some(instrument_id)
                 });
-                rows.push(selected.cloned().unwrap_or_else(|| json!({
+                let selected = selected.filter(|row| {
+                    row.get("currentPrice")
+                        .is_some_and(|price| !price.is_null())
+                        && !matches!(
+                            row.get("availability").and_then(Value::as_str),
+                            Some("stale" | "unavailable")
+                        )
+                });
+                let row = if let Some(selected) = selected {
+                    Some(selected.clone())
+                } else {
+                    let record = records
+                        .binary_search_by_key(&instrument_id, |record| {
+                            record.definition().instrument_id()
+                        })
+                        .ok()
+                        .and_then(|index| records.get(index))
+                        .ok_or(ServiceError::InvalidResult)?;
+                    match self
+                        .previous_close_product_row(record, reference_at, context)
+                        .await
+                    {
+                        Ok(row) => row,
+                        Err(ServiceError::Unavailable | ServiceError::Unauthorized) => None,
+                        Err(error) => return Err(error),
+                    }
+                };
+                rows.push(row.unwrap_or_else(|| json!({
                     "instrumentId": instrument_id.to_string(), "currentPrice": Value::Null, "availability": "unavailable",
                 })));
             }
@@ -254,6 +281,41 @@ impl MarketDomainService {
             "instrumentId": receipt.instrument_id().to_string(), "availability": availability,
             "currentPrice": {"value": mark.value().normalize().to_string(), "currency": mark.currency().as_str(),
                 "observedAt": timestamp_value(observation.timestamps().effective_at())},
+        })))
+    }
+
+    /// Completed daily closes are presentation evidence, never current mark authority.
+    async fn previous_close_product_row(
+        &self,
+        record: &MarketDataInstrumentRecord,
+        reference_at: Timestamp,
+        context: &RequestContext,
+    ) -> Result<Option<Value>, ServiceError> {
+        ensure_live(context)?;
+        let instrument_id = record.definition().instrument_id();
+        let Some(close) = self
+            .market_history
+            .read_latest_previous_close(
+                &self.product_research,
+                instrument_id,
+                reference_at,
+                context,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        ensure_live(context)?;
+        if close.instrument_id() != instrument_id
+            || close.currency() != record.definition().quote_currency()
+            || close.session_close() > reference_at
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(Some(json!({
+            "instrumentId": instrument_id.to_string(), "availability": "end_of_day",
+            "currentPrice": {"value": close.close().amount().normalize().to_string(),
+                "currency": close.currency().as_str(), "currentThrough": timestamp_value(close.session_close())},
         })))
     }
 

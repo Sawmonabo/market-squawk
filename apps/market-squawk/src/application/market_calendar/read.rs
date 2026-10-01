@@ -427,6 +427,7 @@ impl CompletedMarketSessionReadCapability {
                 deadline,
                 &cancellation,
             )
+            .inspect_err(|error| calendar_read_failure("calendar-origin-candidates", error))
             .map_err(|_| controlled_error(deadline, &cancellation))?;
         for manifest in candidates {
             check(deadline, &cancellation)?;
@@ -445,8 +446,21 @@ impl CompletedMarketSessionReadCapability {
             {
                 Ok(Some(read)) => return Ok(Some(read)),
                 Ok(None) => {}
-                Err(CompletedMarketSessionError::Unavailable) => return Ok(None),
-                Err(error) => return Err(error),
+                Err(CompletedMarketSessionError::Unavailable) => {
+                    tracing::warn!(
+                        stage = "calendar-origin-read",
+                        "completed market calendar selection unavailable"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        stage = "calendar-origin-selection",
+                        "completed market calendar selection unavailable"
+                    );
+                    return Err(error);
+                }
             }
         }
         Ok(None)
@@ -539,7 +553,12 @@ impl CompletedMarketSessionReadCapability {
             .await
         {
             Ok(runtime) => Ok(Some(runtime)),
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    stage = "calendar-runtime-lookup",
+                    "completed market calendar runtime unavailable"
+                );
                 check(deadline, cancellation)?;
                 Ok(None)
             }
@@ -573,7 +592,14 @@ impl CompletedMarketSessionReadCapability {
             cancellation,
             job,
         )
-        .await?
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                stage = "calendar-origin-canonical-read",
+                "completed market calendar selection unavailable"
+            );
+        })?
         else {
             return Ok(None);
         };
@@ -614,6 +640,13 @@ impl CompletedMarketSessionReadCapability {
                 > retained_metadata.freshness_policy().max_source_age_nanos()
         {
             // Latest applicable source evidence is stale; do not fall back behind it.
+            tracing::warn!(
+                stage = "calendar-origin-source-age",
+                source_age_nanos = source_age,
+                maximum_source_age_nanos =
+                    retained_metadata.freshness_policy().max_source_age_nanos(),
+                "completed market calendar selection unavailable"
+            );
             return Err(CompletedMarketSessionError::Unavailable);
         }
         let request = AlpacaAuthenticatedCalendarRequest::try_for_market(
@@ -638,7 +671,14 @@ impl CompletedMarketSessionReadCapability {
             cancellation,
             job,
         )
-        .await?;
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                stage = "calendar-origin-native-read",
+                "completed market calendar selection unavailable"
+            );
+        })?;
         let replay = source.native_session_replay().clone();
         let action_calendar = self
             .research
@@ -661,6 +701,7 @@ impl CompletedMarketSessionReadCapability {
                 },
             )
             .await
+            .inspect_err(|error| calendar_worker_failure("calendar-origin-action-rejoin", error))
             .map_err(|_| controlled_error(deadline, cancellation))?;
         let authority = Arc::new(CompletedMarketSessionAuthority::new(source.clone()));
         Ok(Some(CompletedMarketSessionRead {
@@ -733,6 +774,7 @@ async fn read_calendar_origin(
             },
         )
         .await
+        .inspect_err(|error| calendar_worker_failure("calendar-origin-coordinates", error))
         .map_err(|_| controlled_error(deadline, cancellation))?;
     let Some((binding, published_at, retained_metadata)) = coordinates else {
         return Ok(None);
@@ -766,6 +808,7 @@ async fn read_calendar_origin(
         .analytical_reader()
         .read_observations(request, limits, deadline, cancellation.clone())
         .await
+        .inspect_err(|error| calendar_read_failure("calendar-origin-observation-read", error))
         .map_err(|_| controlled_error(deadline, cancellation))?;
     let QueryResult::Inline { batches, .. } = output.output().result() else {
         return Err(CompletedMarketSessionError::ResourceBoundExceeded);
@@ -794,14 +837,14 @@ async fn read_calendar_origin(
                 remaining_read_bytes,
                 &control,
             )
-            .map_err(invalid)?;
+            .map_err(|_| calendar_invalid("calendar-origin-row-decode"))?;
         remaining_read_bytes = remaining_read_bytes
             .checked_sub(retained_bytes)
             .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?;
         for (ordinal, record) in records {
             check(deadline, cancellation)?;
             let ResearchObservation::MarketCalendar(calendar) = record else {
-                return Err(CompletedMarketSessionError::InvalidEvidence);
+                return Err(calendar_invalid("calendar-origin-row-type"));
             };
             let provenance = calendar.context().provenance();
             if provenance.received_at() > as_of
@@ -814,7 +857,7 @@ async fn read_calendar_origin(
                     .is_none_or(|available| available > as_of)
                 || rows.len() >= binding.record_count()
             {
-                return Err(CompletedMarketSessionError::InvalidEvidence);
+                return Err(calendar_invalid("calendar-origin-row-clock-or-count"));
             }
             rows.push((ordinal, calendar));
         }
@@ -826,7 +869,7 @@ async fn read_calendar_origin(
             .enumerate()
             .any(|(index, (ordinal, _))| usize::try_from(*ordinal).ok() != Some(index))
     {
-        return Err(CompletedMarketSessionError::InvalidEvidence);
+        return Err(calendar_invalid("calendar-origin-row-ordinals"));
     }
     let calendar_rows: Vec<MarketCalendarObservation> =
         rows.into_iter().map(|(_, row)| row).collect();
@@ -839,7 +882,7 @@ async fn read_calendar_origin(
         ..
     } = coverage.payload()
     else {
-        return Err(CompletedMarketSessionError::InvalidEvidence);
+        return Err(calendar_invalid("calendar-origin-coverage-type"));
     };
     if *completeness != MarketCalendarCompleteness::CompleteSessionEnumeration
         || calendar_rows.len()
@@ -848,7 +891,7 @@ async fn read_calendar_origin(
                 .checked_add(1)
                 .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?
     {
-        return Err(CompletedMarketSessionError::InvalidEvidence);
+        return Err(calendar_invalid("calendar-origin-coverage-count"));
     }
     Ok(Some(CalendarOriginRead {
         binding,
@@ -856,6 +899,54 @@ async fn read_calendar_origin(
         retained_metadata,
         calendar_rows,
     }))
+}
+
+fn calendar_invalid(stage: &'static str) -> CompletedMarketSessionError {
+    tracing::warn!(stage, "completed market calendar evidence invalid");
+    CompletedMarketSessionError::InvalidEvidence
+}
+
+fn calendar_read_failure(stage: &'static str, error: &market_squawk_data::AnalyticalReadError) {
+    use market_squawk_data::{AnalyticalReadError, ManifestCatalogError, QueryError};
+    let failure = match error {
+        AnalyticalReadError::Manifest(ManifestCatalogError::LockPoisoned) => "catalog-lock",
+        AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled) => "catalog-cancelled",
+        AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded) => "catalog-deadline",
+        AnalyticalReadError::Manifest(_) => "catalog-other",
+        AnalyticalReadError::Query(QueryError::MemoryLimitExceeded { .. }) => "query-memory",
+        AnalyticalReadError::Query(QueryError::ReaderMemoryBoundExceeded) => "query-reader-memory",
+        AnalyticalReadError::Query(QueryError::RowLimitExceeded { .. }) => "query-rows",
+        AnalyticalReadError::Query(QueryError::ByteLimitExceeded { .. }) => "query-bytes",
+        AnalyticalReadError::Query(QueryError::BlockingTaskLimitExceeded) => "query-workers",
+        AnalyticalReadError::Query(QueryError::Cancelled) => "query-cancelled",
+        AnalyticalReadError::Query(QueryError::DeadlineExceeded) => "query-deadline",
+        AnalyticalReadError::Query(QueryError::UnsupportedSourceSchema) => "query-schema",
+        AnalyticalReadError::Query(QueryError::DependencyAllocationContract) => "query-allocation",
+        AnalyticalReadError::Query(QueryError::DataFusion(_)) => "query-datafusion",
+        AnalyticalReadError::Query(_) => "query-other",
+        AnalyticalReadError::Parquet(_) => "parquet-read",
+        _ => "analytical-read",
+    };
+    tracing::warn!(stage, failure, "completed market calendar read failed");
+}
+
+fn calendar_worker_failure(stage: &'static str, error: &ResearchServiceError) {
+    use market_squawk_data::{CatalogError, IngestError};
+    let failure = match error {
+        ResearchServiceError::Ingest(IngestError::AuthorityBusy)
+        | ResearchServiceError::Ingest(IngestError::Catalog(CatalogError::AuthorityBusy))
+        | ResearchServiceError::Catalog(CatalogError::AuthorityBusy) => "catalog-busy",
+        ResearchServiceError::Ingest(IngestError::Cancelled) => "cancelled",
+        ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => "deadline-exceeded",
+        ResearchServiceError::IngestAuthorityMismatch => "ingest-authority-mismatch",
+        ResearchServiceError::ProviderCaptureSealWorkerUnavailable => "worker-unavailable",
+        ResearchServiceError::Manifest(_) => "manifest-error",
+        ResearchServiceError::Catalog(_) => "catalog-error",
+        ResearchServiceError::ProviderCaptureStore(_) => "capture-store-error",
+        ResearchServiceError::Ingest(_) => "ingest-error",
+        _ => "research-error",
+    };
+    tracing::warn!(stage, failure, "completed market calendar worker failed");
 }
 
 struct CalendarReadControl<'a> {

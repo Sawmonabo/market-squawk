@@ -83,7 +83,13 @@ impl SourceActionPreparationCapability {
                             selected_at,
                         ) == Some(*identity)
                 });
-        let native_id = native_ids.next().ok_or(ServiceError::Unavailable)?;
+        let native_id = native_ids.next().ok_or_else(|| {
+            tracing::warn!(
+                stage = "history-native-identity-missing",
+                "historical publication unavailable"
+            );
+            ServiceError::Unavailable
+        })?;
         if native_ids.next().is_some() {
             return Err(ServiceError::InvalidResult);
         }
@@ -108,8 +114,31 @@ impl SourceActionPreparationCapability {
                 identities.select_current(&native, deadline, &cancellation)
             })
             .await
-            .map_err(map_research_error)?
-            .map_err(|_| controlled(context, ServiceError::Unavailable))?;
+            .map_err(|error| {
+                tracing::warn!(
+                    stage = "history-native-identity-worker",
+                    "historical publication unavailable"
+                );
+                map_research_error(error)
+            })?
+            .map_err(|error| {
+                use market_squawk_sources::RegistryError;
+                let failure = match error {
+                    RegistryError::ProviderIdentityAuthorityBusy => "catalog-busy",
+                    RegistryError::ProviderIdentityAuthorityUnavailable => "catalog-authority",
+                    RegistryError::ProviderIdentitySelectionStale => "identity-stale",
+                    RegistryError::ProviderIdentityAuthorizationRejected => "identity-unauthorized",
+                    RegistryError::ProviderIdentitySelectionCancelled => "cancelled",
+                    RegistryError::ProviderIdentitySelectionDeadlineExceeded => "deadline-exceeded",
+                    _ => "identity-other",
+                };
+                tracing::warn!(
+                    stage = "history-native-identity-selection",
+                    failure,
+                    "historical publication unavailable"
+                );
+                controlled(context, ServiceError::Unavailable)
+            })?;
         let provider_instrument = ProviderInstrumentId::try_from(plan.mapping().symbol())
             .map_err(|_| ServiceError::InvalidResult)?;
         let interval = plan
@@ -159,9 +188,13 @@ impl SourceActionPreparationCapability {
         let provider_dataset = authorized.provider_dataset().clone();
         let analytical_dataset = authorized.analytical_dataset().clone();
         let semantics = authorized.series_semantics().clone();
-        authorized
-            .validate_current()
-            .map_err(|_| ServiceError::Unavailable)?;
+        authorized.validate_current().map_err(|_| {
+            tracing::warn!(
+                stage = "history-authorized-currentness",
+                "historical publication unavailable"
+            );
+            ServiceError::Unavailable
+        })?;
         // Discovery/extraction reacquire their own ordinary publication authority. Holding the
         // directory's exclusive barrier across those calls would deadlock its own source owner.
         drop(authorized);
@@ -176,7 +209,14 @@ impl SourceActionPreparationCapability {
                 NonZeroU16::MIN,
                 context,
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "history-registered-discovery",
+                    "historical publication unavailable"
+                );
+            })?;
         let rollback = DiscoveryRollback {
             owner: &self.ingest,
             discovery: &discovery,
@@ -210,7 +250,14 @@ impl SourceActionPreparationCapability {
         let publication = self
             .ingest
             .ingest(&admitted, context, context.limits())
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "history-registered-ingest",
+                    "historical publication unavailable"
+                );
+            })?;
         drop(rollback); // Receipt revocation is idempotent after the one-use ingest consumes it.
         let manifest: ManifestWire = serde_json::from_value(
             publication
@@ -227,7 +274,13 @@ impl SourceActionPreparationCapability {
         runtime
             .require_current(context.deadline(), context.cancellation())
             .await
-            .map_err(|_| controlled(context, ServiceError::Unavailable))?;
+            .map_err(|_| {
+                tracing::warn!(
+                    stage = "history-published-currentness",
+                    "historical publication unavailable"
+                );
+                controlled(context, ServiceError::Unavailable)
+            })?;
         Ok(PublishedAnchorHistory {
             manifest,
             instrument: instrument.definition().instrument_id(),

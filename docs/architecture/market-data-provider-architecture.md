@@ -565,6 +565,43 @@ compacts small objects later under a new manifest. A raw capture receipt is not 
 acknowledgement, and a physical file that is not admitted by the SQLite/manifest authority is not a
 published dataset.
 
+Market-event PIT reads use an independent, endpoint-bound read-only SQLite WAL transaction
+inside their existing supervised I/O worker. Selection, manifest membership, publication and
+native identity, metadata and reconstruction share that snapshot; ingestion retains its writer
+coordination. Reads preserve their original cutoffs, cancellation/deadline and bounded selected
+object verification without acquiring the writer or manifest connection mutex. The snapshot ends
+when that operation exits; it is not a cached connection or a second runtime. This follows SQLite's
+[WAL reader/writer concurrency](https://www.sqlite.org/wal.html) and
+[snapshot isolation](https://www.sqlite.org/isolation.html) (reviewed 2026-09-30). Actual SQLite
+lock conflicts remain possible; WAL does not justify treating every source as available.
+
+Live native-identity selection briefly coordinates the durable authority clock and revocation
+watch, then resolves and verifies identity through the same independent snapshot facility. It
+validates that watch after reading, so a concurrent identity publication cannot authorize an old
+snapshot. Contention at the short mutation boundary observes the original cancellation/deadline;
+an occupied writer mutex alone is not an invalid identity.
+
+Market-event point reads resolve the selected publication's original artifact set inside the
+requested immutable manifest and verify only those objects. Raw-capture, identity, cutoff and tie
+checks remain required; unrelated archived files are not reopened for each market card. Current
+market-event publications retain identity in per-object schema metadata; the research-observation
+compactor does not support combining them. Event compaction is not a verified capability.
+
+Alpaca stock history binds the current catalog-selected native asset UUID and listing to an
+explicit New York symbol-resolution date (`asof`). Capture and publication retain that selection's
+original knowledge/effective cutoffs and digests; reopening reproduces the same selection. A newly
+observed instrument can therefore acquire older bars without backdating its reference identity or
+claiming that today's reference was known historically. Daily acquisition ends before the current
+incomplete provider day, using the existing data-delay policy.
+
+Home and Markets share the persisted, editable starter collection. Source activation admits finite
+completed-history preparation to the existing service task owner and returns without awaiting it.
+Preparation uses the exact activated generation; replacement, revocation and shutdown cancel and
+drain it before successor work starts. Product reads use the
+existing history cursor and retained native calendar to select a genuine previous close and its
+session timestamp when a current display price is unavailable. This is display evidence, never
+fresh-price execution authority; reading a page does not initiate provider acquisition.
+
 The logical local layout is:
 
 ```text

@@ -15,7 +15,7 @@ use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalEquityConfig,
     AlpacaHistoricalEquityPreflightClient, AlpacaHistoricalEquityPreflightPlan,
     AlpacaHistoricalEquityPreflightReceipt, AlpacaHistoricalEquitySource,
-    AlpacaTradingApiEnvironment,
+    AlpacaHistoricalPendingExtractionSeal, AlpacaTradingApiEnvironment,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MarketDataInstrumentDefinition, SourceIdentifier,
@@ -23,10 +23,10 @@ use market_squawk_domain::{
 use market_squawk_platform::SecretGeneration;
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
-    CompleteMarketBarHistoryV1, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
-    ExtractionSourceError, HttpRequestBounds, ProviderCaptureMaterial, ProviderRateDeclaration,
-    SharedProviderBudget, SourceError, SourceMetadata,
+    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HttpRequestBounds,
+    ProviderCaptureSealRequest, ProviderRateDeclaration, SharedProviderBudget, SourceError,
+    SourceMetadata,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
@@ -50,48 +50,6 @@ pub(crate) use calendar::{
 type CurrentnessFuture = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
 type CurrentnessValidator = dyn Fn() -> CurrentnessFuture + Send + Sync + 'static;
 type SynchronousCurrentnessValidator = dyn Fn() -> bool + Send + Sync + 'static;
-
-/// Complete exact evidence returned by the rich Alpaca historical extraction boundary.
-///
-/// The application integration owner must durably seal both capture materials and bind both
-/// sealed receipts to publication before the batch can enter canonical storage.
-#[derive(Debug)]
-pub(crate) struct AlpacaHistoricalExtractionWithCapture {
-    batch: ExtractionBatch,
-    bar_capture: ProviderCaptureMaterial,
-    calendar_capture: ProviderCaptureMaterial,
-    history_capture_semantic: CompleteMarketBarHistoryV1,
-}
-
-impl AlpacaHistoricalExtractionWithCapture {
-    pub(crate) const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
-    }
-
-    pub(crate) const fn bar_capture(&self) -> &ProviderCaptureMaterial {
-        &self.bar_capture
-    }
-
-    pub(crate) const fn calendar_capture(&self) -> &ProviderCaptureMaterial {
-        &self.calendar_capture
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ExtractionBatch,
-        ProviderCaptureMaterial,
-        ProviderCaptureMaterial,
-        CompleteMarketBarHistoryV1,
-    ) {
-        (
-            self.batch,
-            self.bar_capture,
-            self.calendar_capture,
-            self.history_capture_semantic,
-        )
-    }
-}
 
 /// Exact fail-closed outcome of a registry lookup for the active Alpaca historical authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -189,6 +147,10 @@ impl AlpacaHistoricalRuntimeCapability {
 
     pub(crate) fn is_revoked(&self) -> bool {
         !self.inner.accepting.load(Ordering::Acquire) || self.inner.cancellation.is_cancelled()
+    }
+
+    pub(crate) async fn wait_until_revoked(&self) {
+        self.inner.cancellation.cancelled().await;
     }
 
     pub(crate) async fn require_current(
@@ -331,8 +293,8 @@ impl AlpacaHistoricalRuntimeCapability {
         Err(SourceError::InvalidProtocolState.into())
     }
 
-    /// Extracts one exact historical page and returns both required raw-capture lineages while
-    /// the account-generation operation and currentness checks remain held around the work.
+    /// Extracts one complete historical graph into an opaque adapter continuation and its seal
+    /// request while retaining account-generation and currentness checks around the work.
     #[allow(
         clippy::too_many_arguments,
         reason = "one exact plan, canonical identity, calendar capture, and extraction authority stay explicit"
@@ -348,14 +310,17 @@ impl AlpacaHistoricalRuntimeCapability {
         request: ExtractionRequest,
         cancellation: CancellationToken,
         identity: Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
-    ) -> Result<AlpacaHistoricalExtractionWithCapture, ExtractionSourceError> {
+    ) -> Result<
+        (
+            AlpacaHistoricalPendingExtractionSeal,
+            ProviderCaptureSealRequest,
+        ),
+        ExtractionSourceError,
+    > {
         let _operation = self.inner.admit().map_err(map_capability_error)?;
         self.validate_current(&cancellation)
             .await
             .map_err(map_capability_error)?;
-        let bar_capture = preflight
-            .provider_capture_material(&config)
-            .map_err(|_error| SourceError::InvalidProtocolState)?;
         let calendar_capture = bar_time_authority
             .provider_capture_material(&config, &preflight)
             .map_err(|_error| SourceError::InvalidProtocolState)?;
@@ -391,19 +356,16 @@ impl AlpacaHistoricalRuntimeCapability {
                 Err(SourceError::SessionNotCurrent.into())
             }
             () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled),
-            result = source.extract(authority, request, cancellation.clone()) => result,
+            result = source.extract_for_sealing(
+                authority, request, cancellation.clone(), calendar_capture, history_capture_semantic,
+            ) => result,
         };
         drop(source);
-        let batch = extracted?;
+        let pending = extracted?;
         self.validate_current(&cancellation)
             .await
             .map_err(map_capability_error)?;
-        Ok(AlpacaHistoricalExtractionWithCapture {
-            batch,
-            bar_capture,
-            calendar_capture,
-            history_capture_semantic,
-        })
+        Ok(pending)
     }
 
     /// Revalidates the revocable runtime around a pure, exact one-plan analytical mapping.

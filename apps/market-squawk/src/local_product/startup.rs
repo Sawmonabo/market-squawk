@@ -1,4 +1,4 @@
-//! Retained ownership of the three fixed source-startup publications.
+//! Retained ownership of source startup and finite market-history preparation.
 
 use std::{
     future::{Future, poll_fn},
@@ -35,7 +35,7 @@ impl ProductStartupTasks {
     pub(super) fn start(
         research: Arc<ResearchApplicationServices>,
         cancellation: CancellationToken,
-        futures: [Option<StartupFuture>; 3],
+        futures: [Option<StartupFuture>; 4],
     ) -> Arc<Self> {
         let owner = Arc::new(Self {
             research,

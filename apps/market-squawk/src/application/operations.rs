@@ -347,7 +347,10 @@ impl OperationsApplicationServices {
         let current = self
             .workspace_lifecycle
             .current()
-            .map_err(map_lifecycle_error)?;
+            .map_err(|error| {
+                tracing::warn!(?error, "operations workspace read unavailable");
+                map_lifecycle_error(error)
+            })?;
         if current.workspace_id().as_uuid() != origin.workspace_id() {
             return Err(ServiceError::Unauthorized);
         }
@@ -544,7 +547,10 @@ impl ApplicationDomainService for OperationsApplicationServices {
                 )
                 .map_err(|_| ServiceError::Internal)?
             }
-            GET_SETTINGS => serde_json::to_value(self.settings.snapshot()?)
+            GET_SETTINGS => serde_json::to_value(self.settings.snapshot().map_err(|error| {
+                tracing::warn!(?error, "settings snapshot read failed");
+                error
+            })?)
                 .map_err(|_| ServiceError::Internal)?,
             PREVIEW_SETTINGS_CHANGE => {
                 let input: SettingsChangeInput = decode(request.arguments())?;

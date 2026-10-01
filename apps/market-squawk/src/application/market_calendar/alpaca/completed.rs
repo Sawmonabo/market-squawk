@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Instant};
 use market_squawk_adapter_alpaca::{
     AlpacaAuthenticatedCalendarRequest, AlpacaCalendarMarket, AlpacaRetainedCalendarSessions,
 };
+use market_squawk_data::{IngestError, IngestPrecommitAuthority};
 use market_squawk_domain::{
     BarTimeSemantics, BarTimestampBasis, CalendarDate, DigestAlgorithm, EffectiveInterval,
     EvidenceDigest, ExactPayloadEvidence, MarketBarSessionEvidence, MarketBarSessionKind,
@@ -108,12 +109,15 @@ impl AlpacaCompletedSessionEvidence {
             segment,
             None,
             None,
+            None,
             deadline,
             cancellation,
         )
     }
 
     /// Reconstructs an independently published calendar under its original commit clock.
+    /// The caller acquires the existing account guard before scheduling this blocking replay;
+    /// construction borrows it without retaining it in the returned evidence.
     pub(crate) fn try_from_published_calendar_capture(
         runtime: AlpacaHistoricalRuntimeCapability,
         request: &AlpacaAuthenticatedCalendarRequest,
@@ -121,6 +125,7 @@ impl AlpacaCompletedSessionEvidence {
         segment: &SealedResearchJournalSegment,
         published_at: Timestamp,
         retained_metadata: market_squawk_sources::SourceMetadata,
+        currentness: &dyn IngestPrecommitAuthority,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Self, CompletedMarketSessionError> {
@@ -131,6 +136,7 @@ impl AlpacaCompletedSessionEvidence {
             segment,
             Some(published_at),
             Some(retained_metadata),
+            Some(currentness),
             deadline,
             cancellation,
         )
@@ -143,10 +149,11 @@ impl AlpacaCompletedSessionEvidence {
         segment: &SealedResearchJournalSegment,
         published_at: Option<Timestamp>,
         retained_metadata: Option<market_squawk_sources::SourceMetadata>,
+        currentness: Option<&dyn IngestPrecommitAuthority>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Self, CompletedMarketSessionError> {
-        ensure_current(&runtime, deadline, cancellation)?;
+        ensure_current(&runtime, currentness, deadline, cancellation)?;
         let active_metadata = if published_at.is_some() {
             runtime.calendar_metadata()
         } else {
@@ -229,7 +236,14 @@ impl AlpacaCompletedSessionEvidence {
         .flatten()
         .min()
         .filter(|expires_at| *expires_at > latest_received_at)
-        .ok_or(CompletedMarketSessionError::Unavailable)?;
+        .ok_or_else(|| {
+            tracing::warn!(
+                stage = "calendar-native-replay-expiry",
+                failure = "missing-or-not-after-capture",
+                "completed market calendar replay unavailable"
+            );
+            CompletedMarketSessionError::Unavailable
+        })?;
         let calendar_evidence = replay.completed_session_evidence_digest(
             metadata
                 .revision_evidence()
@@ -253,7 +267,7 @@ impl AlpacaCompletedSessionEvidence {
         days.try_reserve_exact(replay.sessions().len())
             .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?;
         for day in replay.sessions() {
-            ensure_current(&runtime, deadline, cancellation)?;
+            ensure_current(&runtime, currentness, deadline, cancellation)?;
             let period = match (
                 day.period_start(),
                 day.period_end_exclusive(),
@@ -283,7 +297,7 @@ impl AlpacaCompletedSessionEvidence {
                 },
             });
         }
-        let currentness = CompletedMarketSessionCurrentnessIdentity::try_new(
+        let currentness_identity = CompletedMarketSessionCurrentnessIdentity::try_new(
             metadata.source_id().clone(),
             metadata.revision().clone(),
             VenueId::try_from(request.market().venue())
@@ -308,7 +322,7 @@ impl AlpacaCompletedSessionEvidence {
             runtime.group_generation().digest(),
             runtime.runtime_evidence_digest(),
         )?;
-        ensure_current(&runtime, deadline, cancellation)?;
+        ensure_current(&runtime, currentness, deadline, cancellation)?;
         Ok(Self {
             runtime,
             market: request.market(),
@@ -316,7 +330,7 @@ impl AlpacaCompletedSessionEvidence {
             capture: sealed,
             native_replay: Arc::new(replay),
             calendar_revision,
-            currentness,
+            currentness: currentness_identity,
             complete_from,
             complete_until,
             available_at,
@@ -429,7 +443,10 @@ impl AlpacaCompletedSessionEvidence {
         completion_cutoff: Timestamp,
         evaluated_at: Timestamp,
     ) -> Result<
-        (Option<AlpacaCalendarSessionDateReceipt>, CompletedMarketSessionCurrentnessReceipt),
+        (
+            Option<AlpacaCalendarSessionDateReceipt>,
+            CompletedMarketSessionCurrentnessReceipt,
+        ),
         CompletedMarketSessionError,
     > {
         if completion_cutoff > evaluated_at {
@@ -444,7 +461,9 @@ impl AlpacaCompletedSessionEvidence {
         {
             return Err(CompletedMarketSessionError::Unavailable);
         }
-        let completed = self.days.iter()
+        let completed = self
+            .days
+            .iter()
             .filter(|day| day.session.closes_at_exclusive <= completion_cutoff)
             .max_by_key(|day| day.session.closes_at_exclusive)
             .map(|day| day.session.clone());
@@ -629,6 +648,7 @@ impl CompletedMarketSessionEvidenceAuthority for AlpacaCompletedSessionEvidence 
 
 fn ensure_current(
     runtime: &AlpacaHistoricalRuntimeCapability,
+    currentness: Option<&dyn IngestPrecommitAuthority>,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), CompletedMarketSessionError> {
@@ -638,8 +658,32 @@ fn ensure_current(
     if Instant::now() >= deadline {
         return Err(CompletedMarketSessionError::DeadlineExceeded);
     }
+    if let Some(currentness) = currentness {
+        // Reuse the exact held account guard: a queued writer can block a new read while
+        // this read remains valid. Waiting here would invert activation-before-worker ordering.
+        return currentness.validate_precommit().map_err(|error| {
+            let error = match error {
+                IngestError::Cancelled => CompletedMarketSessionError::Cancelled,
+                IngestError::DeadlineExceeded => CompletedMarketSessionError::DeadlineExceeded,
+                _ => CompletedMarketSessionError::Unavailable,
+            };
+            tracing::warn!(
+                ?error,
+                stage = "calendar-native-replay-held-currentness",
+                "completed market calendar replay unavailable"
+            );
+            error
+        });
+    }
     runtime
         .validate_current_now()
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                stage = "calendar-native-replay-currentness",
+                "completed market calendar replay unavailable"
+            );
+        })
         .map_err(|_| CompletedMarketSessionError::Unavailable)
 }
 

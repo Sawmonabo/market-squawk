@@ -82,27 +82,47 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<bool, ServiceError> {
-        let surface = AccountMarketSurface::SchwabMarketData;
-        let _gate = self
-            .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
-            .await
-            .map_err(reconnect_error)?;
-        let record = match self.durable.source_lifecycle_record(surface.surface_id()) {
-            Ok(record) => record,
-            Err(error) => {
-                tracing::warn!(surface = surface.surface_id(), %error, "account reconnect state is unavailable; source remains disabled");
-                return Ok(false);
+        if self.credential_access.ensure_resumed().is_err() {
+            return Ok(false);
+        }
+        for surface in [
+            AccountMarketSurface::AlpacaBasic,
+            AccountMarketSurface::SchwabMarketData,
+        ] {
+            let _gate = self
+                .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
+                .await
+                .map_err(reconnect_error)?;
+            let record = match self.durable.source_lifecycle_record(surface.surface_id()) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(surface = surface.surface_id(), %error, "account reconnect state is unavailable; source remains disabled");
+                    continue;
+                }
+            };
+            if is_pending_reconnect(&record) {
+                return Ok(true);
             }
-        };
-        Ok(is_pending_reconnect(&record))
+        }
+        Ok(false)
     }
 
     async fn resume_pending(
         &self,
+        surface: AccountMarketSurface,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError> {
-        let surface = AccountMarketSurface::SchwabMarketData;
+        if !matches!(
+            surface,
+            AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData
+        ) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if self.credential_access.ensure_resumed().is_err() {
+            // The pending record remains owned; unlock will reopen recovery admission.
+            return Ok(());
+        }
         let original = {
             let _gate = self
                 .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
@@ -121,8 +141,10 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
             .account()
             .and_then(|pending| pending.target_session_id)
             .ok_or(ServiceError::InvalidResult)?;
-        self.continue_schwab_reconnect_authority(session, deadline, &cancellation)
-            .await?;
+        if surface == AccountMarketSurface::SchwabMarketData {
+            self.continue_schwab_reconnect_authority(session, deadline, &cancellation)
+                .await?;
+        }
         let _gate = self
             .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
             .await
@@ -134,11 +156,22 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         if record != original {
             return Ok(());
         }
-        // Equality includes revision, action, original predecessor, target, partial successor,
-        // credential and verification receipt. Resume this exact record after renewal.
-        self.continue_account_transition(record, surface, deadline, &cancellation, true, false)
-            .await
+        self.credential_access
+            .ensure_resumed()
             .map_err(reconnect_error)?;
+        // Equality includes revision, action, original predecessor, target, partial successor,
+        // credential and verification receipt. Resume this exact record; Alpaca continuation
+        // reuses a current doctor or renews its expired proof after the predecessor is drained.
+        self.continue_account_transition(
+            record,
+            surface,
+            deadline,
+            &cancellation,
+            true,
+            surface == AccountMarketSurface::AlpacaBasic,
+        )
+        .await
+        .map_err(reconnect_error)?;
         Ok(())
     }
 
@@ -149,8 +182,16 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError> {
-        let surface = AccountMarketSurface::SchwabMarketData;
-        if request.surface() != surface {
+        self.credential_access
+            .ensure_resumed()
+            .map_err(reconnect_error)?;
+        let surface = request.surface();
+        if surface == AccountMarketSurface::AlpacaBasic {
+            return self
+                .reconnect_expired_alpaca(request, generation, deadline, cancellation)
+                .await;
+        }
+        if surface != AccountMarketSurface::SchwabMarketData {
             return Err(ServiceError::InvalidRequest);
         }
         let original = {
@@ -193,6 +234,9 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
             // A concurrent stop, removal or replacement wins; automatic recovery cannot undo it.
             return Ok(());
         }
+        self.credential_access
+            .ensure_resumed()
+            .map_err(reconnect_error)?;
         let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
             provider: SourceIdentifier::try_from(surface.surface_id())
                 .map_err(|_| ServiceError::Internal)?,
@@ -222,6 +266,73 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
 }
 
 impl ProductionSourceLifecycleAuthority {
+    async fn reconnect_expired_alpaca(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let surface = AccountMarketSurface::AlpacaBasic;
+        let original = {
+            let _gate = self
+                .lifecycle_gate_before(surface.surface_id(), deadline, &cancellation)
+                .await
+                .map_err(reconnect_error)?;
+            self.credential_access
+                .ensure_resumed()
+                .map_err(reconnect_error)?;
+            let record = self
+                .durable
+                .source_lifecycle_record(surface.surface_id())
+                .map_err(|error| reconnect_error(map_durable_error(error)))?;
+            if record.account().is_some_and(|pending| !pending.finished)
+                || record.phase() != DurableSourceLifecyclePhase::Active
+                || record.session_id() != Some(request.onboarding_session_id())
+                || record.public_configuration_digest()
+                    != Some(request.expected_public_configuration_digest())
+                || record.runtime_verification_receipt_digest()
+                    != Some(request.expected_runtime_verification_receipt_digest())
+                || record.credential_generation() != Some(request.expected_credential_generation())
+            {
+                return Ok(());
+            }
+            // The registry supplied only an exact expired-doctor allocation. Recheck the saved
+            // target before creating intent; a rejected/revoked credential cannot be renewed.
+            let _current_lease = self
+                .alpaca_retry_admission(
+                    &record,
+                    request.onboarding_session_id(),
+                    request.expected_public_configuration_digest(),
+                )
+                .map_err(reconnect_error)?;
+            record
+        };
+        let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+            provider: SourceIdentifier::try_from(surface.surface_id())
+                .map_err(|_| ServiceError::Internal)?,
+            action: SourceLifecycleAction::Retry,
+            expected_state_revision: original.revision(),
+            expected_generation: None,
+            expected_runtime_generation_digest: Some(generation.digest()),
+            onboarding_session_id: Some(request.onboarding_session_id()),
+            public_configuration_digest: Some(request.expected_public_configuration_digest()),
+            reason: Some(
+                SourceIdentifier::try_from("alpaca-doctor-proof-expired")
+                    .map_err(|_| ServiceError::Internal)?,
+            ),
+            cancellation,
+            deadline,
+        })
+        .map_err(reconnect_error)?;
+        // execute_owned reacquires admission and the lifecycle gate before its exact CAS. It
+        // persists the predecessor, drains and acknowledges it, then verifies the saved keys.
+        self.execute_owned(&command)
+            .await
+            .map_err(reconnect_error)?;
+        Ok(())
+    }
+
     async fn continue_schwab_reconnect_authority(
         &self,
         session: uuid::Uuid,

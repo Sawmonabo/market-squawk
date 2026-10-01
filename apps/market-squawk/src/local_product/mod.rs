@@ -968,6 +968,8 @@ impl LocalProduct {
                 research.market_data_instruments(),
                 product_mark_age_nanos,
             )?;
+        let (display_history_requests, display_history_receiver) =
+            ProductionSourceLifecycleAuthority::starter_history_channel();
         let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
             paths.clone(),
             Arc::clone(&onboarding),
@@ -977,6 +979,8 @@ impl LocalProduct {
             Arc::clone(&research),
             Arc::clone(&market_runtime),
             source_calendars.clone(),
+            source_action_preparation.clone(),
+            display_history_requests,
         ));
         schwab_market_drain.bind(&source_lifecycle)?;
         let reconnect_owner: Arc<dyn crate::application::AccountMarketRuntimeReconnect> =
@@ -1323,10 +1327,16 @@ impl LocalProduct {
                 startup_cancellation.child_token(),
             )) as startup::StartupFuture
         });
+        let display_history_startup = Some(Box::pin(
+            Arc::clone(&source_lifecycle).run_display_history_worker(
+                display_history_receiver,
+                startup_cancellation.child_token(),
+            ),
+        ) as startup::StartupFuture);
         let startup_tasks = startup::ProductStartupTasks::start(
             Arc::clone(&research_domains),
             startup_cancellation,
-            [fred_startup, fiscal_startup, daily_startup],
+            [fred_startup, fiscal_startup, daily_startup, display_history_startup],
         );
         let application = Arc::new(application.with_startup_tasks(Arc::clone(&startup_tasks)));
         let credential_access = Arc::new(credential_access::CredentialAccessCoordinator::new(

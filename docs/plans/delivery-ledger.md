@@ -23,7 +23,9 @@ Pushed lease-bound renewal: `f8f14c14` (PR #43 comment 5923796790), following in
 
 Live Retry now reaches historical extraction instead of rejecting renewed reference authority, but fails before canonical publication. Sequence 303 identifies registered ingest; source tracing found captured history remains a pending handoff that the publisher correctly refuses. Sequences 305/307 separately show native identity selection still contends with the writer. Both require corrections; no claim that all contention or live startup data is resolved.
 
-Automatic Alpaca proof renewal and finite generation-bound history work are integrated in the working tree through the existing lifecycle/health/startup owners. The first installed-service critical compilation found a private-module import in the new worker; lead corrected its crate-local re-export. That failed run is not verification (`automatic-renewal-startup-critical.log`). No new timer, runtime, expiry extension or branch. The next barrier is this critical result, then the captured-history handoff and remaining identity-read correction, followed by the native data/restart proof.
+Automatic Alpaca proof renewal and finite generation-bound history work are integrated through existing lifecycle/health/startup owners. The installed-service critical case now passes (101.53s; `automatic-renewal-startup-critical-rerun.log`), covering shared-client startup, optional Lock, saved reads and restart. The earlier private-import compile failure is superseded by this successful run, not acceptance evidence itself. Adapter capture and native identity critical cases above also pass. No new timer, runtime, expiry extension, migration or branch. Native price publication, active renewal and retained-price restart still require the rebuilt app.
+
+The same-root live recommendation setup reports one saved practice account but `no_default_account`, with no allocation profile. The owner has been asked for explicit development allocation settings; no arbitrary preferences were committed. This does not block native market/history verification.
 
 ### Prior integrated observations
 

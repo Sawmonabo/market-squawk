@@ -1,6 +1,7 @@
 //! Production source lifecycle authority over live and research runtime owners.
 
 mod credential_access;
+mod display_history;
 mod reconnect;
 
 use std::{
@@ -105,6 +106,8 @@ pub(crate) struct ProductionSourceLifecycleAuthority {
     research: Arc<ResearchService>,
     live: Arc<MarketRuntimeRegistry>,
     calendars: crate::application::market_calendar::CompletedMarketSessionReadCapability,
+    display_history: crate::application::SourceActionPreparationCapability,
+    display_history_requests: display_history::StarterHistorySender,
 }
 
 impl ProductionSourceLifecycleAuthority {
@@ -118,6 +121,8 @@ impl ProductionSourceLifecycleAuthority {
         research: Arc<ResearchService>,
         live: Arc<MarketRuntimeRegistry>,
         calendars: crate::application::market_calendar::CompletedMarketSessionReadCapability,
+        display_history: crate::application::SourceActionPreparationCapability,
+        display_history_requests: display_history::StarterHistorySender,
     ) -> Self {
         Self {
             credential_access: credential_access::CredentialRuntimeAccess::default(),
@@ -129,6 +134,8 @@ impl ProductionSourceLifecycleAuthority {
             research,
             live,
             calendars,
+            display_history,
+            display_history_requests,
         }
     }
 
@@ -182,7 +189,7 @@ impl ProductionSourceLifecycleAuthority {
                         deadline,
                         cancellation,
                         true,
-                        false,
+                        account_surface == AccountMarketSurface::AlpacaBasic,
                     )
                     .await
                 {
@@ -267,24 +274,42 @@ impl ProductionSourceLifecycleAuthority {
                     Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
                 }
             } else if let Some(surface) = AccountMarketSurface::parse(provider.as_str()) {
-                let request = match self.restored_account_group_request(surface, &provider, &record)
-                {
-                    Ok(request) => request,
-                    Err(error) => {
-                        failures.push(LiveSourceRestoreFailure { provider, error });
+                let (action, session, configuration) = if surface == AccountMarketSurface::AlpacaBasic {
+                    // Retry owns fresh doctor verification when a saved proof expired while
+                    // the application was stopped. Saved keys alone never authorize a runtime.
+                    let (Some(session), Some(configuration)) =
+                        (record.session_id(), record.public_configuration_digest())
+                    else {
+                        failures.push(LiveSourceRestoreFailure {
+                            provider,
+                            error: SourceLifecycleError::InvalidResult,
+                        });
                         continue;
-                    }
+                    };
+                    (SourceLifecycleAction::Retry, session, configuration)
+                } else {
+                    let request = match self.restored_account_group_request(surface, &provider, &record)
+                    {
+                        Ok(request) => request,
+                        Err(error) => {
+                            failures.push(LiveSourceRestoreFailure { provider, error });
+                            continue;
+                        }
+                    };
+                    (
+                        SourceLifecycleAction::Start,
+                        request.onboarding_session_id(),
+                        request.expected_public_configuration_digest(),
+                    )
                 };
                 let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
                     provider: provider.clone(),
-                    action: SourceLifecycleAction::Start,
+                    action,
                     expected_state_revision: record.revision(),
                     expected_generation: None,
                     expected_runtime_generation_digest: None,
-                    onboarding_session_id: Some(request.onboarding_session_id()),
-                    public_configuration_digest: Some(
-                        request.expected_public_configuration_digest(),
-                    ),
+                    onboarding_session_id: Some(session),
+                    public_configuration_digest: Some(configuration),
                     reason: None,
                     cancellation: cancellation.child_token(),
                     deadline,
@@ -1249,7 +1274,8 @@ impl ProductionSourceLifecycleAuthority {
             ensure_status_live(cancellation, deadline)?;
         }
         pending.finished = true;
-        self.durable
+        let active = self
+            .durable
             .update_account_lifecycle(
                 surface.surface_id(),
                 &record,
@@ -1257,7 +1283,36 @@ impl ProductionSourceLifecycleAuthority {
                 DurableSourceLifecyclePhase::Active,
                 Some(request),
             )
-            .map_err(map_durable_error)
+            .map_err(map_durable_error)?;
+        if surface == AccountMarketSurface::AlpacaBasic {
+            let admitted = match self.live
+                .current_alpaca_calendar_runtime(deadline, cancellation)
+                .await
+            {
+                Ok(runtime) => self.admit_display_history(runtime, deadline),
+                Err(_) if cancellation.is_cancelled() => {
+                    Err(market_squawk_services::ServiceError::Cancelled)
+                }
+                Err(_) if Instant::now() >= deadline => {
+                    Err(market_squawk_services::ServiceError::DeadlineExceeded)
+                }
+                Err(_) => Err(market_squawk_services::ServiceError::Unavailable),
+            };
+            if let Err(error) = admitted {
+                // History is a display prerequisite, not connection authority. Its failure
+                // must not undo the exact healthy source persisted above.
+                tracing::warn!(%error, provider = surface.surface_id(),
+                    "starter market history preparation is unavailable");
+                if matches!(
+                    error,
+                    market_squawk_services::ServiceError::Cancelled
+                        | market_squawk_services::ServiceError::DeadlineExceeded
+                ) {
+                    return Err(map_live_error(error));
+                }
+            }
+        }
+        Ok(active)
     }
 
     async fn drain_account_successor(

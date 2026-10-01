@@ -29,8 +29,8 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     AuthorizationMode, CurrentCatalogProviderIdentity, DiscoveryBatch, DiscoveryRequest,
     ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan,
-    ExtractionSource, ExtractionSourceError, HttpRequestBounds, ProviderCaptureMaterial,
-    ProviderCaptureSemanticBinding, SourceError, SourceMetadata, SourceMetadataProvider,
+    ExtractionSource, ExtractionSourceError, HttpRequestBounds, SourceError, SourceMetadata,
+    SourceMetadataProvider,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -38,9 +38,10 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use uuid::Uuid;
 
 use super::{
-    ManagedExtraction, ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
-    RegisteredExtractionSource, ResearchProviderAdmission, ResearchProviderPublicationLease,
-    ResearchRevisionPlanError, ResearchRightsAuthority, invalid_capture_protocol,
+    ManagedExtractionWithNative, ManagedProviderCaptureAuthority, ManagedResearchExtractionSource,
+    ProductionResearchIngestCoordinator, RegisteredExtractionSource, ResearchProviderAdmission,
+    ResearchProviderPublicationLease, ResearchRevisionPlanError, ResearchRightsAuthority,
+    invalid_capture_protocol,
 };
 use crate::{
     application::market_runtime::{
@@ -1849,12 +1850,13 @@ impl ExtractionSource for AlpacaHistoricalManagedSource {
 }
 
 impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
-    fn extract_managed(
+    fn extract_managed_with_native(
         &self,
+        capture: ManagedProviderCaptureAuthority,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+    ) -> BoxFuture<'_, Result<ManagedExtractionWithNative, ExtractionSourceError>> {
         let record = match self.inner.plan(request.object().dataset()) {
             Ok(record) => record,
             Err(error) => return Box::pin(async move { Err(error) }),
@@ -1863,7 +1865,7 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
         let bar_time_authority = Arc::clone(&record.bar_time_authority);
         let preflight = Arc::clone(&record.preflight);
         let extraction = Box::pin(async move {
-            let output = runtime
+            let (pending, seal_request) = runtime
                 .extract_plan_with_capture(
                     record.config.clone(),
                     record.canonical_instrument.clone(),
@@ -1872,19 +1874,21 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
                     preflight,
                     authority,
                     request,
-                    cancellation,
+                    cancellation.clone(),
                     Arc::clone(&record.identity),
                 )
                 .await?;
-            let (batch, bar_capture, calendar_capture, history_capture_semantic) =
-                output.into_parts();
-            bind_complete_market_history_capture_graph(
-                batch,
-                vec![bar_capture, calendar_capture],
-                ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(
-                    history_capture_semantic,
-                ),
-            )
+            runtime
+                .require_current(capture.deadline, &cancellation)
+                .await
+                .map_err(map_historical_currentness_error)?;
+            let sealed = capture.seal(seal_request, &cancellation).await?;
+            runtime
+                .require_current(capture.deadline, &cancellation)
+                .await
+                .map_err(map_historical_currentness_error)?;
+            let (binding, revisions) = pending.try_rejoin(sealed)?;
+            Ok(ManagedExtractionWithNative::provider(binding, revisions))
         });
         Box::pin(async move {
             // Extraction retains its original authorities but is polled independently of
@@ -1943,24 +1947,19 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
     }
 }
 
-fn bind_complete_market_history_capture_graph(
-    batch: ExtractionBatch,
-    components: Vec<ProviderCaptureMaterial>,
-    semantic_binding: ProviderCaptureSemanticBinding,
-) -> Result<ManagedExtraction, ExtractionSourceError> {
-    let dataset = batch.request().object().dataset().clone();
-    let capture_material = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
-        batch.request().object().source_id().clone(),
-        batch.request().object().metadata_revision().clone(),
-        dataset,
-        components,
-        semantic_binding,
-    )
-    .map_err(|_error| invalid_capture_protocol())?;
-    let batch = batch
-        .try_bind_provider_capture(capture_material.receipt())
-        .map_err(|_error| invalid_capture_protocol())?;
-    Ok(ManagedExtraction::new(batch, None, Some(capture_material)))
+fn map_historical_currentness_error(
+    error: crate::application::market_runtime::AlpacaHistoricalCapabilityError,
+) -> ExtractionSourceError {
+    use crate::application::market_runtime::AlpacaHistoricalCapabilityError;
+    match error {
+        AlpacaHistoricalCapabilityError::Cancelled => ExtractionSourceError::Cancelled,
+        AlpacaHistoricalCapabilityError::DeadlineExceeded => {
+            ExtractionSourceError::DeadlineExceeded
+        }
+        AlpacaHistoricalCapabilityError::Revoked | AlpacaHistoricalCapabilityError::Stale => {
+            SourceError::SessionNotCurrent.into()
+        }
+    }
 }
 
 impl AlpacaHistoricalPlanDirectoryInner {

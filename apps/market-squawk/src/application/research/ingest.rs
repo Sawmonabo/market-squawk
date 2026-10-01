@@ -2622,6 +2622,7 @@ impl ProductionResearchIngestCoordinator {
             deadline,
         )
         .await
+        .inspect_err(ProviderOperationDiagnostic::log_failure)
         .map_err(ProviderOperationDiagnostic::service_error)
     }
 
@@ -3022,7 +3023,13 @@ impl ProductionResearchIngestCoordinator {
             admission
                 .acquire_publication_lease()
                 .await
-                .map_err(|_error| ServiceError::Unavailable)?,
+                .map_err(|_error| {
+                    tracing::warn!(
+                        stage = "registered-ingest-publication-lease",
+                        "registered provider operation unavailable"
+                    );
+                    ServiceError::Unavailable
+                })?,
         );
         let precommit: Arc<dyn IngestPrecommitAuthority> = match &additional {
             Some(additional) => Arc::new(ChainedIngestPrecommitAuthority {
@@ -3193,6 +3200,11 @@ pub(crate) struct ProviderOperationDiagnostic {
 }
 
 impl ProviderOperationDiagnostic {
+    fn log_failure(&self) {
+        tracing::warn!(phase = ?self.phase, failure = ?self.failure,
+            "registered provider operation unavailable");
+    }
+
     const fn new(phase: ProviderOperationPhase, failure: ProviderOperationFailureClass) -> Self {
         Self {
             phase,
@@ -3323,6 +3335,7 @@ async fn await_extraction<T>(
         ProviderOperationPhase::Extraction,
     )
     .await
+    .inspect_err(ProviderOperationDiagnostic::log_failure)
     .map_err(ProviderOperationDiagnostic::service_error)
 }
 
@@ -3393,6 +3406,7 @@ async fn await_publication<T>(
         ProviderOperationPhase::RawSeal,
     )
     .await
+    .inspect_err(ProviderOperationDiagnostic::log_failure)
     .map_err(ProviderOperationDiagnostic::service_error)
 }
 

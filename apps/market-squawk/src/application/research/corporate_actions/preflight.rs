@@ -5,6 +5,7 @@
 
 mod current_inputs;
 mod current_paper;
+mod display_history;
 pub(crate) use current_paper::{PreparedCurrentPaperSources, PreparedFinancialShareSources};
 mod forecast_outcome;
 mod outcome_coordinates;

@@ -16,15 +16,19 @@ use market_squawk_domain::{
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
     AvailabilityEvidence, BudgetDecision, BudgetPermit, BudgetReservation,
-    CURRENT_RESEARCH_RECORD_SCHEMA, CurrentCatalogProviderIdentity, DiscoveryBatch,
-    DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
-    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HttpRequestBounds,
-    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SharedProviderBudget, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, apply_http_retry_after,
+    CURRENT_RESEARCH_RECORD_SCHEMA, CompleteMarketBarHistoryV1, CurrentCatalogProviderIdentity,
+    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord,
+    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    HttpRequestBounds, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+    ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderCaptureSemanticBinding,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+    SealedProviderCaptureBinding, SealedProviderCaptureMaterial, SharedProviderBudget, SourceError,
+    SourceMetadata, SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    apply_http_retry_after,
 };
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -193,6 +197,83 @@ pub struct AlpacaHistoricalEquitySource {
     bar_time_authority: Arc<dyn AlpacaHistoricalBarTimeAuthority>,
     preflight: Arc<AlpacaHistoricalEquityPreflightReceipt>,
     identities: Vec<Arc<dyn CurrentCatalogProviderIdentity>>,
+}
+
+/// One historical extraction awaiting the exact physical seal of its bar/calendar graph.
+/// Canonical rows and adapter-native semantics stay private until the consuming rejoin.
+pub struct AlpacaHistoricalPendingExtractionSeal {
+    parts: Box<AlpacaHistoricalPendingExtractionParts>,
+}
+
+struct AlpacaHistoricalPendingExtractionParts {
+    batch: ExtractionBatch,
+    native_lineage: ProviderNativeLineageBatch,
+    row_capture_page_ordinals: Vec<u16>,
+    revisions: ExtractionRevisionPlan,
+    expectation: ProviderCaptureSealExpectation,
+    deadline: Timestamp,
+    cancellation: CancellationToken,
+    identities: Vec<Arc<dyn CurrentCatalogProviderIdentity>>,
+    bar_time_authority: Arc<dyn AlpacaHistoricalBarTimeAuthority>,
+}
+
+impl std::fmt::Debug for AlpacaHistoricalPendingExtractionSeal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaHistoricalPendingExtractionSeal")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AlpacaHistoricalPendingExtractionSeal {
+    /// Consumes only the matching sealed graph and retains honest local-content revision policy.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<(SealedProviderCaptureBinding, ExtractionRevisionPlan), ExtractionSourceError> {
+        if self.parts.cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        ensure_wall_deadline(self.parts.deadline).map_err(map_adapter_error)?;
+        let at = system_timestamp().map_err(map_adapter_error)?;
+        for identity in &self.parts.identities {
+            identity
+                .validate_at(at)
+                .map_err(|_| SourceError::SessionNotCurrent)?;
+        }
+        self.parts
+            .bar_time_authority
+            .validate_current()
+            .map_err(map_adapter_error)?;
+        let token = self
+            .parts
+            .expectation
+            .try_rejoin(sealed)
+            .and_then(|capture| capture.try_into_whole())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let binding = SealedProviderCaptureBinding::try_whole(
+            token,
+            self.parts.batch,
+            self.parts.native_lineage,
+            self.parts.row_capture_page_ordinals,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        self.parts
+            .bar_time_authority
+            .validate_current()
+            .map_err(map_adapter_error)?;
+        if self.parts.cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        ensure_wall_deadline(self.parts.deadline).map_err(map_adapter_error)?;
+        let at = system_timestamp().map_err(map_adapter_error)?;
+        for identity in &self.parts.identities {
+            identity
+                .validate_at(at)
+                .map_err(|_| SourceError::SessionNotCurrent)?;
+        }
+        Ok((binding, self.parts.revisions))
+    }
 }
 
 /// Exact bounded input to the provider-specific historical bar-time authority.
@@ -752,6 +833,127 @@ impl AlpacaHistoricalEquitySource {
         DiscoveryBatch::try_new(&request, vec![object]).map_err(Into::into)
     }
 
+    /// Extracts native rows and splits the complete bar/calendar graph for owned physical sealing.
+    /// The calendar material and semantic receipt are checked by the shared complete-history graph
+    /// constructor. Raw bar bytes and the row-to-page mapping come only from this adapter's preflight.
+    pub async fn extract_for_sealing(
+        &self,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+        calendar_capture: ProviderCaptureMaterial,
+        history_semantic: CompleteMarketBarHistoryV1,
+    ) -> Result<
+        (
+            AlpacaHistoricalPendingExtractionSeal,
+            ProviderCaptureSealRequest,
+        ),
+        ExtractionSourceError,
+    > {
+        let batch = self
+            .extract_impl(authority, request, cancellation.clone())
+            .await?;
+        let bars = self
+            .provider_capture_material()
+            .map_err(map_adapter_error)?;
+        let capture = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
+            batch.request().object().source_id().clone(),
+            batch.request().object().metadata_revision().clone(),
+            batch.request().object().dataset().clone(),
+            vec![bars, calendar_capture],
+            ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(history_semantic),
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let batch = batch
+            .try_bind_provider_capture(capture.receipt())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let (native_lineage, row_capture_page_ordinals) =
+            self.historical_native_lineage(&batch, &cancellation)?;
+        let revisions =
+            ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())
+                .map_err(|_| SourceError::InvalidProtocolState)?;
+        let deadline = batch.request().deadline();
+        let (expectation, request) = capture.into_whole_seal_parts();
+        self.validate_current_identities()
+            .map_err(map_adapter_error)?;
+        self.bar_time_authority
+            .validate_current()
+            .map_err(map_adapter_error)?;
+        Ok((
+            AlpacaHistoricalPendingExtractionSeal {
+                parts: Box::new(AlpacaHistoricalPendingExtractionParts {
+                    batch,
+                    native_lineage,
+                    row_capture_page_ordinals,
+                    revisions,
+                    expectation,
+                    deadline,
+                    cancellation,
+                    identities: self.identities.clone(),
+                    bar_time_authority: Arc::clone(&self.bar_time_authority),
+                }),
+            },
+            request,
+        ))
+    }
+
+    fn historical_native_lineage(
+        &self,
+        batch: &ExtractionBatch,
+        cancellation: &CancellationToken,
+    ) -> Result<(ProviderNativeLineageBatch, Vec<u16>), ExtractionSourceError> {
+        let dataset = exactly_one_dataset(&self.config).map_err(map_adapter_error)?;
+        let mut native = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::AlpacaHistoricalBarV1,
+            batch,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let mut ordinals = Vec::new();
+        let timeframe = dataset.timeframe().provider_value();
+        ordinals
+            .try_reserve_exact(batch.records().len())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        for (page_index, page) in self.preflight.pages.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(ExtractionSourceError::Cancelled);
+            }
+            ensure_wall_deadline(batch.request().deadline()).map_err(map_adapter_error)?;
+            let parsed: BarPage = serde_json::from_slice(&page.body)
+                .map_err(|_| SourceError::GenerationResynchronizationRequired)?;
+            validate_page(dataset, &parsed).map_err(map_adapter_error)?;
+            for bar in &parsed.bars {
+                if cancellation.is_cancelled() {
+                    return Err(ExtractionSourceError::Cancelled);
+                }
+                ensure_wall_deadline(batch.request().deadline()).map_err(map_adapter_error)?;
+                if ordinals.len() >= batch.records().len() {
+                    return Err(SourceError::GenerationResynchronizationRequired.into());
+                }
+                // Keep provider timestamp text and numeric semantics, including optional fields;
+                // page receive times remain in canonical/raw evidence, never provider revisions.
+                native
+                    .try_push(&HistoricalNativeBar {
+                        symbol: &parsed.symbol,
+                        feed: "iex",
+                        timeframe: &timeframe,
+                        adjustment: market_bar_adjustment(dataset.adjustment()),
+                        bar,
+                    })
+                    .map_err(|_| SourceError::InvalidProtocolState)?;
+                ordinals.push(
+                    u16::try_from(page_index).map_err(|_| SourceError::InvalidProtocolState)?,
+                );
+            }
+        }
+        if ordinals.len() != batch.records().len() {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
+        }
+        let native = native
+            .finish()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        Ok((native, ordinals))
+    }
+
     async fn extract_impl(
         &self,
         authority: ExtractionAuthority,
@@ -1095,7 +1297,7 @@ struct BarPage {
     next_page_token: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct BarWire {
     #[serde(rename = "t")]
     timestamp: String,
@@ -1113,6 +1315,15 @@ struct BarWire {
     trade_count: Option<Number>,
     #[serde(rename = "vw", default)]
     vwap: Option<Number>,
+}
+
+#[derive(Serialize)]
+struct HistoricalNativeBar<'a> {
+    symbol: &'a str,
+    feed: &'static str,
+    timeframe: &'a str,
+    adjustment: MarketBarAdjustment,
+    bar: &'a BarWire,
 }
 
 fn validate_analytical_batch(
@@ -2035,11 +2246,10 @@ mod capture_tests {
         }
     }
 
-    #[test]
-    fn retrospective_history_uses_current_native_identity_without_backdating()
-    -> Result<(), Box<dyn Error>> {
-        let at = system_timestamp()?.checked_sub_nanos(1_000_000_000)?;
-        let native = native_request(at)?;
+    fn current_identity_fixture(
+        native: &ProviderNativeIdentityRequest,
+    ) -> Result<(MarketDataInstrumentDefinition, TestCurrentIdentity), Box<dyn Error>> {
+        let at = native.knowledge_at;
         let validity = EffectiveInterval::new(at, None)?;
         let revision =
             MetadataRevision::new(SourceIdentifier::try_from("current-asset-fixture-v1")?);
@@ -2095,6 +2305,15 @@ mod capture_tests {
             },
             revoked: AtomicBool::new(false),
         };
+        Ok((definition, identity))
+    }
+
+    #[test]
+    fn retrospective_history_uses_current_native_identity_without_backdating()
+    -> Result<(), Box<dyn Error>> {
+        let at = system_timestamp()?.checked_sub_nanos(1_000_000_000)?;
+        let native = native_request(at)?;
+        let (definition, identity) = current_identity_fixture(&native)?;
         let mapping = crate::AlpacaInstrumentMapping::try_new(
             "AAPL".to_owned(),
             native.instrument,
@@ -2533,8 +2752,9 @@ mod capture_tests {
         Ok(())
     }
 
-    #[test]
-    fn historical_capture_preserves_terminal_pages_and_refuses_broken_token_chain() {
+    #[tokio::test]
+    async fn historical_capture_preserves_terminal_pages_and_refuses_broken_token_chain()
+    -> Result<(), Box<dyn Error>> {
         let mapping = crate::AlpacaInstrumentMapping::try_new(
             "AAPL".to_owned(),
             "00000001-0002-0003-0004-000000000001"
@@ -2664,5 +2884,317 @@ mod capture_tests {
             build_historical_capture_material(&source_id, &revision, &dataset, &preflight),
             Err(AlpacaError::CaptureMaterial)
         ));
+        preflight.pages[1].request_page_token = Some("page-two".into());
+        preflight.digest = preflight_receipt_digest(
+            &preflight.plan,
+            &preflight.pages,
+            &preflight.returned_bar_times,
+            preflight.pagination,
+            preflight.total_response_bytes,
+        )?;
+        assert_historical_sealing(preflight).await?;
+        Ok(())
+    }
+
+    async fn assert_historical_sealing(
+        preflight: AlpacaHistoricalEquityPreflightReceipt,
+    ) -> Result<(), Box<dyn Error>> {
+        use market_squawk_domain::{
+            AuthorizationBasis, BarTimestampBasis, MarketBarSessionEvidence, MarketBarSessionKind,
+        };
+        use market_squawk_sources::{
+            AuthoritativeSourceRegistry, AuthorizationGrant, FreshnessPolicy,
+        };
+        let native = preflight
+            .plan
+            .mapping()
+            .native_identity()
+            .ok_or("native identity")?
+            .clone();
+        let (definition, identity) = current_identity_fixture(&native)?;
+        let identity_evidence = identity.evidence.clone();
+        let identity = Arc::new(identity);
+        let session = MarketBarSessionEvidence::try_new(
+            MarketBarSessionKind::Regular,
+            SourceIdentifier::try_from("iex-history-test-session-v1")?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [51; 32]),
+        )?;
+        struct TimeAuthority(MarketBarSessionEvidence);
+        impl AlpacaHistoricalBarTimeAuthority for TimeAuthority {
+            fn validate_current(&self) -> Result<(), AlpacaError> {
+                Ok(())
+            }
+            fn resolve(
+                &self,
+                request: &AlpacaHistoricalBarTimeRequest,
+            ) -> Result<BarTimeSemantics, AlpacaError> {
+                BarTimeSemantics::try_new(
+                    request.provider_timestamp(),
+                    request
+                        .provider_timestamp()
+                        .checked_add_nanos(86_400_000_000_000)
+                        .map_err(|_| AlpacaError::Protocol)?,
+                    BarTimestampBasis::PeriodStart,
+                    self.0.clone(),
+                )
+                .map_err(|_| AlpacaError::Protocol)
+            }
+        }
+        let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let evidence = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [52; 32],
+        ));
+        let authorization = AuthorizationGrant::new(
+            AuthorizationMode::UserAuthorized,
+            AuthorizationBasis::new(SourceIdentifier::try_from("alpaca-historical-seal-test")?),
+            evidence.clone(),
+            effective,
+        );
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::for_authorization(
+                SourceIdentifier::try_from(crate::config::ALPACA_PROVIDER)?,
+                &authorization,
+            )?,
+            NonZeroU32::new(crate::ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE)
+                .ok_or("request count")?,
+            NonZeroU64::new(60_000_000_000).ok_or("request window")?,
+            NonZeroU16::new(2).ok_or("concurrency")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::MIN,
+                NonZeroU64::new(60_000_000_000).ok_or("backoff")?,
+                0,
+            )?,
+        )?;
+        let config = AlpacaHistoricalEquityConfig::try_new(
+            SourceId::try_from("alpaca-history-native-handoff-test")?,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from(
+                    "alpaca-history-native-handoff-test-v1",
+                )?),
+                evidence.clone(),
+            ),
+            authorization,
+            evidence.clone(),
+            effective,
+            vec![crate::AlpacaHistoricalEquityDatasetPlan::bind_preflight(
+                preflight.plan.clone(),
+                crate::AlpacaHistoricalSeriesSemantics::new(
+                    BarTimestampBasis::PeriodStart,
+                    session.clone(),
+                ),
+            )],
+            FreshnessPolicy::try_new(
+                30_000_000_000,
+                5_000_000_000,
+                5_000_000_000,
+                5_000_000_000,
+                1_000_000_000,
+            )?,
+            policy,
+            HttpRequestBounds::default(),
+        )?;
+        let dataset = exactly_one_dataset(&config)?.dataset().clone();
+        let semantic = CompleteMarketBarHistoryV1::try_new(
+            preflight.plan.start(),
+            preflight.plan.end(),
+            native.instrument,
+            identity_evidence.definition_digest,
+            preflight.digest(),
+            identity_evidence,
+            preflight.plan.symbol_asof_date()?,
+            ProviderInstrumentId::try_from("AAPL")?,
+            native.venue.clone(),
+            SourceIdentifier::try_from("iex")?,
+            SourceIdentifier::try_from("1Day")?,
+            market_bar_adjustment(preflight.plan.adjustment()),
+            BarTimestampBasis::PeriodStart,
+            session.kind(),
+            session.ruleset().clone(),
+            SourceIdentifier::try_from("alpaca-complete-history-test-v1")?,
+            0,
+            1,
+            preflight
+                .returned_bar_times
+                .iter()
+                .map(|value| value.provider_timestamp())
+                .collect(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [53; 32]),
+        )?;
+        let original_bodies: Vec<_> = preflight
+            .pages
+            .iter()
+            .map(|page| page.body.clone())
+            .collect();
+        let calendar_body = Bytes::from(serde_json::to_vec(&preflight.returned_bar_times.iter().map(|value| {
+            serde_json::json!({"date": value.calendar_date().to_string(), "open": "09:30", "close": "16:00"})
+        }).collect::<Vec<_>>())?);
+        let source = AlpacaHistoricalEquitySource::try_from_preflight(
+            config.clone(),
+            vec![definition],
+            Arc::new(TimeAuthority(session)),
+            Arc::new(preflight),
+            vec![identity.clone()],
+        )?;
+        #[derive(Debug)]
+        struct FixtureSubjectResolver {
+            evidence: EvidenceDigest,
+            subject: SourceIdentifier,
+        }
+        impl market_squawk_sources::AuthorizationSubjectResolver for FixtureSubjectResolver {
+            fn resolve_subject_record(
+                &self,
+                mode: AuthorizationMode,
+                evidence: EvidenceDigest,
+            ) -> Result<SourceIdentifier, market_squawk_sources::AuthorizationSubjectResolutionError>
+            {
+                if mode != AuthorizationMode::UserAuthorized || evidence != self.evidence {
+                    return Err(
+                        market_squawk_sources::AuthorizationSubjectResolutionError::EvidenceUnresolved,
+                    );
+                }
+                Ok(self.subject.clone())
+            }
+        }
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+            Arc::new(FixtureSubjectResolver {
+                evidence: config.metadata().authorization().evidence().content_digest(),
+                subject: SourceIdentifier::try_from("alpaca-historical-seal-test-subject")?,
+            }),
+        )?;
+        let registered = registry.register(config.metadata().clone(), system_timestamp()?)?;
+        let authority = registry.extraction_authority(&registered, &source)?;
+        let deadline = system_timestamp()?.checked_add_nanos(60_000_000_000)?;
+        let discovery = source
+            .discover(
+                authority.clone(),
+                DiscoveryRequest::try_new(dataset.clone(), None, NonZeroU16::MIN, deadline)?,
+                CancellationToken::new(),
+            )
+            .await?;
+        let request = ExtractionRequest::try_new(
+            discovery.objects().first().ok_or("history object")?.clone(),
+            NonZeroU32::new(2).ok_or("record limit")?,
+            NonZeroU64::new(1024 * 1024).ok_or("byte limit")?,
+            deadline,
+        )?;
+        let calendar_source = SourceId::try_from("alpaca-calendar-native-handoff-test")?;
+        let received_at = system_timestamp()?;
+        let calendar_receipt = ProviderCaptureSetReceipt::try_new(
+            calendar_source.clone(),
+            config.metadata().revision().clone(),
+            dataset,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [54; 32]),
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![ProviderCapturePageReceipt::try_new(
+                0,
+                EvidenceDigest::new(DigestAlgorithm::Sha256, [55; 32]),
+                None,
+                None,
+                200,
+                u64::try_from(calendar_body.len())?,
+                exact_evidence(&calendar_body).content_digest(),
+                received_at,
+            )?],
+        )?;
+        let calendar = || -> Result<ProviderCaptureMaterial, Box<dyn Error>> {
+            Ok(ProviderCaptureMaterial::try_new(
+                calendar_receipt.clone(),
+                vec![RawCaptureRecord::try_new_live(
+                    Uuid::new_v4(),
+                    Arc::from(calendar_source.as_str()),
+                    Uuid::new_v4(),
+                    Some(0),
+                    None,
+                    DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+                    calendar_body.clone(),
+                )?],
+            )?)
+        };
+        let (pending, seal_request) = source
+            .extract_for_sealing(
+                authority.clone(),
+                request.clone(),
+                CancellationToken::new(),
+                calendar()?,
+                semantic.clone(),
+            )
+            .await?;
+        struct TemporaryRoot(std::path::PathBuf);
+        impl Drop for TemporaryRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = TemporaryRoot(
+            std::env::temp_dir().join(format!("alpaca-history-seal-{}", Uuid::new_v4())),
+        );
+        let paths = market_squawk_platform::LocalPaths::prepare(&root.0)?;
+        let store = paths.sealed_research_journal_store()?;
+        let (binding, revisions) = pending.try_rejoin(seal_request.seal(&store)?)?;
+        binding.validate()?;
+        assert!(revisions.native_lineage_required());
+        assert_eq!(binding.record_count(), 2);
+        assert_eq!(
+            binding.native_lineage().schema().implementation(),
+            ProviderNativeLineageImplementation::AlpacaHistoricalBarV1
+        );
+        assert_eq!(
+            binding
+                .row_frames()
+                .iter()
+                .map(|row| row.capture_page_ordinal())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            binding.capture_evidence().semantic_binding(),
+            Some(&ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(
+                semantic.clone()
+            ))
+        );
+        for (index, row) in binding.native_lineage().rows().iter().enumerate() {
+            let payload: serde_json::Value = serde_json::from_slice(row.semantic_payload())?;
+            let original: serde_json::Value = serde_json::from_slice(&original_bodies[index])?;
+            assert_eq!(payload["bar"]["t"], original["bars"][0]["t"]);
+            assert_eq!(payload["bar"]["c"], original["bars"][0]["c"]);
+            assert_eq!(
+                binding.row_frames()[index].page_body_digest(),
+                exact_evidence(&original_bodies[index]).content_digest()
+            );
+        }
+        // Same logical graph sealed by a different request cannot satisfy this continuation.
+        let (first, _first_request) = source
+            .extract_for_sealing(
+                authority.clone(),
+                request.clone(),
+                CancellationToken::new(),
+                calendar()?,
+                semantic.clone(),
+            )
+            .await?;
+        let (_second, second_request) = source
+            .extract_for_sealing(
+                authority.clone(),
+                request.clone(),
+                CancellationToken::new(),
+                calendar()?,
+                semantic.clone(),
+            )
+            .await?;
+        assert!(first.try_rejoin(second_request.seal(&store)?).is_err());
+        let (stale, stale_request) = source
+            .extract_for_sealing(
+                authority,
+                request,
+                CancellationToken::new(),
+                calendar()?,
+                semantic,
+            )
+            .await?;
+        let sealed = stale_request.seal(&store)?;
+        identity.revoked.store(true, AtomicOrdering::SeqCst);
+        assert!(stale.try_rejoin(sealed).is_err());
+        Ok(())
     }
 }

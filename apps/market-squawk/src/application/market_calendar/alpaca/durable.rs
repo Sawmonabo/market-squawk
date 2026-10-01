@@ -214,7 +214,22 @@ pub(crate) async fn read_alpaca_completed_calendar_with_job_context(
     runtime
         .require_current(deadline, cancellation)
         .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                stage = "calendar-native-read-currentness-before",
+                "completed market calendar replay unavailable"
+            );
+        })
         .map_err(map_capability_error)?;
+    // Match publication's activation-before-worker ordering. The same account guard validates
+    // replay without treating concurrent monitor reads as a stale lease. It stays local to this
+    // operation and is released before the ordinary final currentness check.
+    let replay_currentness = runtime
+        .acquire_calendar_publication_authority(deadline, cancellation)
+        .await
+        .map_err(map_capability_error)?;
+    let worker_currentness = Arc::clone(&replay_currentness);
     let operation_cancellation = cancellation.child_token();
     let _cancel_on_drop = operation_cancellation.clone().drop_guard();
     let read_runtime = runtime.clone();
@@ -285,6 +300,7 @@ pub(crate) async fn read_alpaca_completed_calendar_with_job_context(
                         &segment,
                         generation.published_at(),
                         metadata,
+                        worker_currentness.as_ref(),
                         deadline,
                         read_cancellation,
                     ),
@@ -292,10 +308,57 @@ pub(crate) async fn read_alpaca_completed_calendar_with_job_context(
             },
         )
         .await
+        .inspect_err(|error| {
+            use market_squawk_data::{CatalogError, IngestError};
+            use market_squawk_platform::SealedResearchJournalStoreError as StoreError;
+            let failure = match error {
+                ResearchServiceError::Ingest(IngestError::AuthorityBusy)
+                | ResearchServiceError::Ingest(IngestError::Catalog(CatalogError::AuthorityBusy))
+                | ResearchServiceError::Catalog(CatalogError::AuthorityBusy) => "catalog-busy",
+                ResearchServiceError::Ingest(IngestError::AuthorityLockPoisoned) => {
+                    "catalog-lock-poisoned"
+                }
+                ResearchServiceError::Ingest(IngestError::Cancelled) => "cancelled",
+                ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => "deadline-exceeded",
+                ResearchServiceError::Ingest(IngestError::ProviderCaptureRequired) => {
+                    "capture-evidence-mismatch"
+                }
+                ResearchServiceError::Ingest(IngestError::Manifest(_))
+                | ResearchServiceError::Manifest(_) => "manifest-error",
+                ResearchServiceError::Ingest(IngestError::Catalog(_))
+                | ResearchServiceError::Catalog(_) => "catalog-error",
+                ResearchServiceError::Ingest(IngestError::SealedProviderCapture(
+                    StoreError::Io { .. },
+                ))
+                | ResearchServiceError::ProviderCaptureStore(StoreError::Io { .. }) => {
+                    "capture-store-io"
+                }
+                ResearchServiceError::Ingest(IngestError::SealedProviderCapture(_))
+                | ResearchServiceError::ProviderCaptureStore(_) => "capture-store-error",
+                ResearchServiceError::Ingest(_) => "ingest-error",
+                ResearchServiceError::IngestAuthorityMismatch => "ingest-authority-mismatch",
+                ResearchServiceError::ProviderCaptureSealWorkerUnavailable => "worker-unavailable",
+                ResearchServiceError::Path(_) => "path-unavailable",
+                _ => "research-error",
+            };
+            tracing::warn!(
+                stage = "calendar-native-read-worker",
+                failure,
+                "completed market calendar replay unavailable"
+            );
+        })
         .map_err(map_research_error)??;
+    drop(replay_currentness);
     runtime
         .require_current(deadline, cancellation)
         .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                stage = "calendar-native-read-currentness-after",
+                "completed market calendar replay unavailable"
+            );
+        })
         .map_err(map_capability_error)?;
     Ok(Arc::new(evidence))
 }
