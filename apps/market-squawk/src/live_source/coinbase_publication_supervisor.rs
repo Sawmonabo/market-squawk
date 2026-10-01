@@ -662,7 +662,11 @@ fn trace_publication_worker_failure(
             CryptoMarketPublicationError::RendezvousUnavailable => {
                 "publication_rendezvous_unavailable"
             }
-            CryptoMarketPublicationError::Coinbase(_) => "publication_coinbase",
+            CryptoMarketPublicationError::Coinbase(error) => {
+                // This closed adapter/common error contains only variants and numeric bounds.
+                tracing::warn!(?error, "Coinbase canonical publication rejected evidence");
+                "publication_coinbase"
+            }
             CryptoMarketPublicationError::Kraken(_) => "publication_kraken",
             CryptoMarketPublicationError::Research(_) => "publication_research",
             CryptoMarketPublicationError::Ingest(_) => "publication_ingest",

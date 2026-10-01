@@ -48,6 +48,11 @@ use crate::{
     CoinbaseMarketContinuity, CoinbaseMarketFeed, CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 
+#[path = "../../tests/common/catalog.rs"]
+mod catalog_fixture;
+
+use catalog_fixture::CatalogFixture;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const PRODUCT_BODY: &[u8] = br#"{"id":"BTC-USD","base_currency":"BTC","quote_currency":"USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#;
@@ -756,7 +761,8 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .rule_for(LiveEventClass::BookDelta, Some(MarketDepth::OrderLevel))
             .is_some()
     );
-    let (mut registry, session, generation) = live_generation(&config, "direct-transport-happy")?;
+    let (_catalog, mut registry, session, generation) =
+        live_generation(&config, "direct-transport-happy")?;
     let budget = session
         .budget()
         .ok_or("fixture session lacks its shared provider budget")?
@@ -1071,7 +1077,7 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
 #[tokio::test]
 async fn raw_sink_rejection_precedes_every_decoded_state_mutation() -> TestResult {
     let config = config()?;
-    let (_registry, _session, generation) =
+    let (_catalog, _registry, _session, generation) =
         live_generation(&config, "direct-transport-raw-rejection")?;
     let (_product_capture, product, selected, freshness) = sealed_product_reference(&config)?;
     let (http, controls) = scripted_http(&config);
@@ -1132,6 +1138,7 @@ fn live_generation(
     config: &CoinbaseDirectConfig,
     session_id: &str,
 ) -> TestResult<(
+    CatalogFixture,
     AuthoritativeSourceRegistry,
     market_squawk_sources::CurrentSourceSession,
     LiveSourceGeneration,
@@ -1139,11 +1146,15 @@ fn live_generation(
     let resolver = FixtureAuthorizationSubjectResolver {
         subject: identifier(&format!("{session_id}-credential"))?,
     };
-    let mut registry =
+    let registry =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
             Arc::new(resolver),
         )?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let catalog = CatalogFixture::new(
+        config.instrument(),
+        SourceId::try_from("coinbase-exchange-direct")?,
+    )?;
+    let (mut registry, registered) = catalog.register_selected(registry, config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier(session_id)?),
@@ -1154,7 +1165,7 @@ fn live_generation(
     let (mut initialization, _admission, _degradation) = capture.into_parts();
     initialization.mark_healthy()?;
     let generation = registry.take_live_source_generation(&session)?;
-    Ok((registry, session, generation))
+    Ok((catalog, registry, session, generation))
 }
 
 fn config() -> TestResult<CoinbaseDirectConfig> {

@@ -6,7 +6,7 @@ mod catalog;
 use market_squawk_adapter_coinbase::{
     CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseProductMapping,
 };
-use market_squawk_domain::ProviderProduct;
+use market_squawk_domain::{ProviderProduct, SourceId};
 
 use crate::common::{TestResult, config, config_with_channels_and_mapping, identifier};
 use catalog::CatalogFixture;
@@ -23,7 +23,7 @@ pub(crate) fn selected_fixture() -> TestResult<SelectedFixture> {
         .first()
         .ok_or("Coinbase product mapping missing")?
         .instrument();
-    let catalog = CatalogFixture::new(instrument)?;
+    let catalog = CatalogFixture::new(instrument, SourceId::try_from("coinbase-advanced-trade")?)?;
     let config = config_with_channels_and_mapping(
         vec![
             CoinbaseChannel::Level2,

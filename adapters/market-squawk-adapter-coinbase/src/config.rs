@@ -23,7 +23,7 @@ pub const COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT: &str =
     "wss://advanced-trade-ws.coinbase.com";
 const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
-const CONFIGURED_PRODUCTS: &str = "coinbase-advanced-trade-configured-products-v1";
+pub(crate) const CONFIGURED_PRODUCTS: &str = "coinbase-advanced-trade-configured-products-v1";
 const CONFIGURED_CHANNELS: &str = "level2+market_trades+heartbeats";
 // Coinbase recommends distributing high-volume products across connections. The live application
 // also owns one deterministic route per source generation, so this public profile is deliberately

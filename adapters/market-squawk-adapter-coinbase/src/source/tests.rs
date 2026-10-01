@@ -296,7 +296,7 @@ fn selected_fixture() -> TestResult<SelectedFixture> {
         .first()
         .ok_or("Coinbase product mapping missing")?
         .instrument();
-    let catalog = CatalogFixture::new(instrument)?;
+    let catalog = CatalogFixture::new(instrument, SourceId::try_from("coinbase-advanced-trade")?)?;
     let config = config_with_mapping(CoinbaseProductMapping::try_new_selected_public(
         ProviderProduct::new(identifier("BTC-USD")?),
         instrument,

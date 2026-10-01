@@ -43,11 +43,11 @@ Its focused evidence is recorded below. Independent terminal-batch WIP remains p
 
 ### Current dependency and ownership wave
 
-The storage wave is pushed through `ee77ff55`; its focused platform, data and shared-service
-checks pass. The live feed still fails before publication. Terminal-batch changes and the bounded
-serialization correction below are frozen with the lead for integrated verification; no other
-implementation owner is active. The single-job application build passed in 6m55s; live verification failed in 132.26s as recorded below. No current evidence
-establishes completed live ingestion or installed Desktop workflows.
+The database/archive/recovery work is pushed through `ee77ff55`, capture batching/buffering
+through `8404085c`, and committed-row clock correction through `5a763d8d`. Focused storage and
+shared-service checks pass. Live ingestion is still blocked by the feed-product mismatch below.
+Astra has handed off its three-file correction; the lead owns integration and serialized verification.
+No current evidence establishes completed live ingestion or installed Desktop workflows.
 
 ### Raw capture serialization correction — base `ee77ff55`
 
@@ -114,6 +114,31 @@ publication error during canonical evidence binding; the source stops and no sel
 available. Kraken is not reached. The clock correction is implemented/compiled, with unchanged
 source authority critical coverage passing, but complete live ingestion remains unverified.
 Next: identify the closed adapter validation failure rather than relaxing evidence checks.
+
+### Adapter canonical-binding trace — base `5a763d8d`
+
+Astra research_options_failure owns read-only tracing of Coinbase `publication.rs` and its existing
+critical fixtures for the newly reached canonical-binding failure. No contradictory predicate is proved. Owner now has bounded implementation ownership of
+`adapters/market-squawk-adapter-coinbase/src/publication.rs` only: preserve all comparisons and emit
+failure-only closed stage/field names, without provider values, for committed-row and common-binding
+validation. Reuse a cohesive local helper where it eliminates duplicate checks/logging. Lead owns
+supervisor typed-error logging and integrated compilation/live check. No independent builds/Git or
+weakened validation. This follows the pushed clock correction;
+no other implementation lane is active.
+
+The diagnostic files are frozen and lead-inspected; all comparison predicates are preserved.
+The single-job integrated build passes in4m34s (`coinbase-binding-diagnostic-build.log`);
+the unchanged live check fails in132.41s (`coinbase-binding-diagnostic-live.log`). The expanded
+field-level diagnostics are investigative; reduce them to useful maintained failure context after
+the cause is identified, rather than retaining unnecessary debugging bulk.
+
+Live diagnostics identify exactly one mismatched common-row field: `provider_product`; all other
+identity/provenance/clock/quality comparisons pass. Astra research_options_failure now owns the
+bounded semantic trace and in-place correction in Coinbase `publication.rs`, `market_handoff.rs`
+and `config.rs`; report any additional producer/shared application caller needs to lead before edits. Preserve exact
+instrument/native identity and provider feed-product binding; do not remove the check. Lead owns
+application/shared metadata integration and removing unnecessary diagnostic bulk after the cause
+is resolved. No new harness or independent build. Existing live test remains the completion check.
 
 ### Bounded storage implementation wave — base `d9f91902`
 
@@ -4656,3 +4681,51 @@ release build, package matrix, or release-branch merge ran. This is an exact pro
 not complete V1 or release approval. The active barrier remains complete Alpaca daily-history and
 calendar publication, manifest-pinned `Market.GetHistory`, Desktop charts, and then the separately
 sealed forward live-event archive needed before genuine PIT analytics can become available.
+
+### Feed-product correction — base `5a763d8d`
+
+The live field diagnostic proves only `provider_product` differs: public metadata declares
+`coinbase-advanced-trade-configured-products-v1`, while handoff `product()` denotes the native
+trading pair. The three-file adapter correction separates those meanings using the existing feed
+constant; Direct keeps its exact-pair feed product. Sidecar evidence retains both canonical feed
+product and native pair. All instrument/native selection, clocks and payload checks remain intact.
+
+Astra's files are frozen and lead-inspected. Lead removed the temporary field/stage diagnostic
+implementation, preserving its patch in ignored local evidence. A small closed typed-error log
+remains in the application supervisor. Existing decoder and Direct-session checks, then the
+unchanged live publication/restart journey, are the verification sequence; one compiler job.
+
+Decoder evidence passes1/1 (0.99s). Existing Direct-session check fails before publication with
+`LiveScopeNotCovered` (0.01s). Astra research_options_failure owns read-only tracing of that existing
+fixture and coverage setup to distinguish a real regression from stale fixture metadata; no edits,
+builds or Git. Lead retains implementation ownership and proceeds with the public live integration
+build. Logs: `coinbase-product-{decode,direct}-critical.log`.
+
+Direct failure is the existing fixture's identity-less session: `begin_session` rejects live market
+coverage before network or publication code. Astra may update exactly
+`tests/common/{catalog.rs,selected.rs}` and `src/direct_transport/tests.rs` in the Coinbase adapter,
+reusing the genuine catalog fixture with an explicit namespace, attaching its authority and selected
+identity before session creation, and retaining its owner for the session. No production guard
+changes, new harness, builds or Git. Public semantic files remain frozen during the current build.
+
+Lead aligned the additional public `src/source/tests.rs` fixture caller to the same explicit namespace.
+
+Final production compilation passes4m35s (`coinbase-product-app-build.log`). Corrected existing
+Direct fixture passes replay/handoff1/1 (0.39s; build5.30s) and rejection-before-mutation1/1.
+Logs: `coinbase-product-direct-catalog-critical.log`,
+`coinbase-product-direct-rejection-critical.log`. Genuine registry selection is checked at trusted
+current time; the separate original HTTP product receipt keeps its own exact historical receipt
+time. This fixture proves transport/replay behavior, not historical end-to-end selection.
+
+The corrected public run now crosses adapter canonical binding and reaches ingestion, then reports
+`publication_ingest`; the Markets read concurrently reports composition authority busy. No exact
+IngestError variant is yet identified. Astra research_options_failure owns a read-only trace of
+this failure through crypto publication and event ingest; no edits/builds/Git. Identify the exact
+likely rejecting boundary and smallest safe diagnostic/correction, without weakening authority or
+increasing timeouts. Lead retains changes and runtime scheduling.
+
+Final decoder rerun with the shared fixture passes1/1 (0.99s). Live check fails132.32s
+(`coinbase-product-live.log`), now at `publication_ingest` after successful adapter binding and
+100/100 committed terminal rows. Kraken/restart are not reached. This checkpoint fixes the proven
+feed/native-product comparison and restores two existing Direct critical checks; it does not claim
+completed live ingestion or resolved Desktop startup. No timeouts/limits were increased.

@@ -1481,6 +1481,7 @@ impl CoinbaseMarketSealRejoin {
             channel: &'static str,
             publication_kind: &'static str,
             provider_product: &'a str,
+            native_product: &'a str,
             venue: &'a str,
             instrument: String,
             native_input_depth: Option<&'static str>,
@@ -1537,7 +1538,8 @@ impl CoinbaseMarketSealRejoin {
             feed: feed_name(self.evidence.feed()),
             channel: channel_name(self.evidence.channel()),
             publication_kind: publication_kind_name(kind),
-            provider_product: self.evidence.product().as_source_identifier().as_str(),
+            provider_product: self.evidence.provider_product_identifier(),
+            native_product: self.evidence.product().as_source_identifier().as_str(),
             venue: self.evidence.venue().as_str(),
             instrument: self.evidence.configured_instrument().to_string(),
             native_input_depth: self.evidence.native_input_depth().map(depth_name),
@@ -1882,7 +1884,12 @@ fn validate_direct_replay_event(
                 .binding()
                 .session_id()
                 .as_source_identifier()
-        || provenance.binding().provider_product() != handoff.evidence.product()
+        || provenance
+            .binding()
+            .provider_product()
+            .as_source_identifier()
+            .as_str()
+            != handoff.evidence.provider_product_identifier()
         || provenance.binding().provider_channel() != &handoff.expected_channel
         || provenance.binding().venue_id() != handoff.evidence.venue()
         || provenance.binding().instrument_id() != Some(handoff.evidence.configured_instrument())
@@ -1928,7 +1935,12 @@ fn validate_common_event(
         || provenance.binding().metadata_revision() != binding.metadata_revision()
         || provenance.binding().session_id() != binding.session_id().as_source_identifier()
         || provenance.binding().connection_generation() != binding.connection_generation()
-        || provenance.binding().provider_product() != handoff.evidence.product()
+        || provenance
+            .binding()
+            .provider_product()
+            .as_source_identifier()
+            .as_str()
+            != handoff.evidence.provider_product_identifier()
         || provenance.binding().provider_channel() != &handoff.expected_channel
         || provenance.binding().venue_id() != handoff.evidence.venue()
         || provenance.binding().instrument_id() != Some(handoff.evidence.configured_instrument())

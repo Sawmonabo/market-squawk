@@ -1,4 +1,4 @@
-//! Real catalog-selected Coinbase public identity for adapter tests.
+//! Real catalog-selected Coinbase identity for adapter tests.
 
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,7 @@ pub(crate) struct CatalogFixture {
 }
 
 impl CatalogFixture {
-    pub(crate) fn new(instrument: InstrumentId) -> TestResult<Self> {
+    pub(crate) fn new(instrument: InstrumentId, namespace: SourceId) -> TestResult<Self> {
         let directory = TempDir::new()?;
         let paths = LocalPaths::prepare(directory.path().join("catalog"))?;
         let catalog = CatalogConfig::try_new(
@@ -51,7 +51,6 @@ impl CatalogFixture {
         )?;
         let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?;
         let observed_at = system_timestamp()?;
-        let namespace = SourceId::try_from("coinbase-advanced-trade")?;
         let native_id = ProviderInstrumentId::try_from("BTC-USD")?;
         let venue = VenueId::try_from("coinbase-exchange")?;
         let symbol = VenueSymbol::try_from("BTC-USD")?;
@@ -133,8 +132,19 @@ impl CatalogFixture {
         &self,
         metadata: &SourceMetadata,
     ) -> TestResult<(AuthoritativeSourceRegistry, RegisteredSource)> {
-        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
-            .with_provider_identity_authority(Arc::new(self.reader.clone()))?;
+        self.register_selected(
+            AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?,
+            metadata,
+        )
+    }
+
+    pub(crate) fn register_selected(
+        &self,
+        registry: AuthoritativeSourceRegistry,
+        metadata: &SourceMetadata,
+    ) -> TestResult<(AuthoritativeSourceRegistry, RegisteredSource)> {
+        let mut registry =
+            registry.with_provider_identity_authority(Arc::new(self.reader.clone()))?;
         let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
         registry.record_provider_identities(
             &registered,

@@ -391,9 +391,18 @@ impl CoinbaseMarketHandoffEvidence {
         self.output_depth
     }
 
-    /// Returns Coinbase's native product identity.
+    /// Returns Coinbase's native trading-pair identity, independently of the feed coverage product.
     pub const fn product(&self) -> &ProviderProduct {
         &self.product
+    }
+
+    /// Returns the product identifier declared by this feed's source coverage.
+    /// Advanced Trade covers its configured product set; Direct declares the exact trading pair.
+    pub(crate) fn provider_product_identifier(&self) -> &str {
+        match self.feed {
+            CoinbaseMarketFeed::AdvancedTradePublic => crate::config::CONFIGURED_PRODUCTS,
+            CoinbaseMarketFeed::ExchangeDirectFull => self.product.as_source_identifier().as_str(),
+        }
     }
 
     /// Returns the externally configured instrument binding; the adapter never mints it.
