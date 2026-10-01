@@ -80,7 +80,12 @@ impl SourceActionPreparationCapability {
                 let latest_session = latest_session.ok_or(ServiceError::Unavailable)?;
                 stage = "retained-close-read";
                 if let Some(retained) = history
-                    .read_latest_previous_close(&self.research, instrument_id, analysis_at, context)
+                    .prepare_latest_previous_close(
+                        &self.research,
+                        instrument_id,
+                        analysis_at,
+                        context,
+                    )
                     .await?
                 {
                     if retained.instrument_id() != instrument_id
@@ -99,7 +104,7 @@ impl SourceActionPreparationCapability {
                     .await?;
                 stage = "published-close-read";
                 let retained = history
-                    .read_latest_previous_close(&self.research, instrument_id, now()?, context)
+                    .prepare_latest_previous_close(&self.research, instrument_id, now()?, context)
                     .await?
                     .ok_or(ServiceError::Unavailable)?;
                 if retained.instrument_id() != instrument_id

@@ -24,7 +24,8 @@ use serde_json::{Value, json};
 use super::results::bounded_result;
 use super::serialization::{QualitySummary, timestamp_value, with_availability};
 use super::{
-    DurableMarketEvidenceSet, DurableMarketRouteEvidence, MarketFilters, StreamView, ensure_live,
+    DurableMarketEvidenceSet, DurableMarketRouteEvidence, MarketFilters, StreamView,
+    durable_candidate_effective_at, ensure_live,
 };
 use crate::application::domain_support::encode_hex;
 use crate::application::market_runtime::{
@@ -922,12 +923,26 @@ fn build_candidate_set(
             route.instrument_id == definition.instrument_id()
                 && !durable_route_is_shadowed(route, streams, reference_at)
         }) {
-            let executable = definition.executable.ok_or(ServiceError::Unavailable)?;
+            if definition.executable.is_none()
+                && !durable
+                    .selections
+                    .iter()
+                    .flat_map(|receipt| receipt.selection().sources())
+                    .flat_map(|source| source.tied_candidates())
+                    .any(|candidate| {
+                        matches!(
+                            candidate.event(),
+                            MarketEvent::MarketDataQuote(_) | MarketEvent::MarketDataTrade(_)
+                        )
+                    })
+            {
+                continue;
+            }
             let policy =
                 exact_durable_surface_policy(surface_policies, durable, definition.asset_class())?;
             candidates.push(durable_source_candidate(
                 durable,
-                executable,
+                definition,
                 policy,
                 reference_at,
                 definition.definition_revision_digest(),
@@ -1233,7 +1248,7 @@ fn source_candidate(
 
 fn durable_source_candidate(
     evidence: &DurableMarketRouteEvidence,
-    definition: &InstrumentDefinition,
+    definition: UnifiedInstrumentDefinition<'_>,
     policy: &MarketSurfaceSelectionPolicy,
     reference_at: Timestamp,
     definition_revision_digest: Option<EvidenceDigest>,
@@ -2204,82 +2219,156 @@ fn product_quote(
 fn durable_product_quote(
     evidence: &DurableMarketRouteEvidence,
     definition: UnifiedInstrumentDefinition<'_>,
-    _selected_at: Timestamp,
+    selected_at: Timestamp,
 ) -> Result<ProductQuote, ServiceError> {
-    let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+    let mut result = empty_product_quote();
     let quote_candidate = evidence.best_quote_candidate();
-    let quote = match quote_candidate.map(|candidate| candidate.event()) {
-        Some(MarketEvent::Quote(quote)) => Some(quote),
-        Some(MarketEvent::BookSnapshot(_)) => None,
-        Some(_) => return Err(ServiceError::InvalidResult),
-        None => None,
-    };
-    let snapshot_candidate = quote_candidate
-        .filter(|candidate| matches!(candidate.event(), MarketEvent::BookSnapshot(_)));
-    let snapshot = match snapshot_candidate.map(|candidate| candidate.event()) {
-        Some(MarketEvent::BookSnapshot(snapshot)) => Some(snapshot),
-        Some(_) => return Err(ServiceError::InvalidResult),
-        None => None,
-    };
-    let (bid, ask, quote_evidence) = if let Some(quote) = quote {
-        (quote.bid(), quote.ask(), quote_candidate)
-    } else if let Some(snapshot) = snapshot {
-        (
-            snapshot.bids().first().copied(),
-            snapshot.asks().first().copied(),
-            snapshot_candidate,
-        )
+    let mut bid_price = None;
+    let mut ask_price = None;
+    if let Some(candidate) = quote_candidate {
+        match candidate.event() {
+            MarketEvent::MarketDataQuote(quote) => {
+                if quote.reference().currency() != definition.quote_currency() {
+                    return Err(ServiceError::InvalidResult);
+                }
+                bid_price = quote
+                    .bid()
+                    .map(|side| native_money_price(side.price(), definition.quote_currency()))
+                    .transpose()?;
+                ask_price = quote
+                    .ask()
+                    .map(|side| native_money_price(side.price(), definition.quote_currency()))
+                    .transpose()?;
+                // Native quote size remains explicitly unresolved; never claim shares/lots.
+            }
+            MarketEvent::Quote(quote) => {
+                if let Some(executable) = definition.executable {
+                    bid_price = quote
+                        .bid()
+                        .map(|side| decimal_price(side.price(), executable))
+                        .transpose()?;
+                    ask_price = quote
+                        .ask()
+                        .map(|side| decimal_price(side.price(), executable))
+                        .transpose()?;
+                    result.bid_size = quote
+                        .bid()
+                        .map(|side| decimal_quantity(side.quantity(), executable))
+                        .transpose()?;
+                    result.ask_size = quote
+                        .ask()
+                        .map(|side| decimal_quantity(side.quantity(), executable))
+                        .transpose()?;
+                }
+            }
+            MarketEvent::BookSnapshot(snapshot) => {
+                if let Some(executable) = definition.executable {
+                    let bid = snapshot.bids().first();
+                    let ask = snapshot.asks().first();
+                    bid_price = bid
+                        .map(|side| decimal_price(side.price(), executable))
+                        .transpose()?;
+                    ask_price = ask
+                        .map(|side| decimal_price(side.price(), executable))
+                        .transpose()?;
+                    result.bid_size = bid
+                        .map(|side| decimal_quantity(side.quantity(), executable))
+                        .transpose()?;
+                    result.ask_size = ask
+                        .map(|side| decimal_quantity(side.quantity(), executable))
+                        .transpose()?;
+                }
+            }
+            _ => return Err(ServiceError::InvalidResult),
+        }
+        result.quote_observed_at = Some(durable_candidate_effective_at(candidate));
+        result.quote_current_through = evidence.display_fresh_until(candidate);
+        result.quote_fresh = result
+            .quote_current_through
+            .is_some_and(|until| selected_at <= until);
+    }
+    result.bid_price = bid_price.map(|price| price.normalize().to_string());
+    result.ask_price = ask_price.map(|price| price.normalize().to_string());
+    result.midpoint = if bid_price
+        .zip(ask_price)
+        .is_some_and(|(bid, ask)| bid > Decimal::ZERO && bid <= ask)
+    {
+        checked_midpoint(bid_price, ask_price)?
     } else {
-        (None, None, None)
+        None
     };
-    let trade_candidate = evidence.candidate(LiveEventClass::Trade);
-    let trade = match evidence.event(LiveEventClass::Trade) {
-        Some(MarketEvent::Trade(trade)) => Some(trade),
-        Some(_) => return Err(ServiceError::InvalidResult),
-        None => None,
-    };
-    let bid_price = bid
-        .map(|level| decimal_price(level.price(), executable))
-        .transpose()?;
-    let ask_price = ask
-        .map(|level| decimal_price(level.price(), executable))
-        .transpose()?;
-    let quote_observed_at = quote_evidence.map(|candidate| {
-        candidate
-            .coordinate()
-            .source_timestamp()
-            .unwrap_or(candidate.coordinate().received_at())
-    });
-    let last_observed_at = trade_candidate.map(|candidate| {
-        candidate
-            .coordinate()
-            .source_timestamp()
-            .unwrap_or(candidate.coordinate().received_at())
-    });
-    Ok(ProductQuote {
-        bid_price: bid_price.map(|value| value.normalize().to_string()),
-        bid_size: bid
-            .map(|level| decimal_quantity(level.quantity(), executable))
-            .transpose()?,
-        ask_price: ask_price.map(|value| value.normalize().to_string()),
-        ask_size: ask
-            .map(|level| decimal_quantity(level.quantity(), executable))
-            .transpose()?,
-        midpoint: checked_midpoint(bid_price, ask_price)?,
-        last_price: trade
-            .map(|value| decimal_price(value.price(), executable))
-            .transpose()?
-            .map(|value| value.normalize().to_string()),
-        last_size: trade
-            .map(|value| decimal_quantity(value.quantity(), executable))
-            .transpose()?,
-        quote_observed_at,
-        last_observed_at,
-        quote_current_through: None,
-        last_current_through: None,
-        quote_fresh: false,
-        last_fresh: false,
-    })
+    if let Some(candidate) = evidence.candidate(LiveEventClass::Trade) {
+        match candidate.event() {
+            MarketEvent::MarketDataTrade(trade) => {
+                let price = native_money_price(trade.price(), definition.quote_currency())?;
+                if price > Decimal::ZERO {
+                    result.last_price = Some(price.normalize().to_string());
+                    result.last_size = Some(trade.quantity().normalize().to_string());
+                }
+            }
+            MarketEvent::Trade(trade) => {
+                if let Some(executable) = definition.executable {
+                    let price = decimal_price(trade.price(), executable)?;
+                    if price > Decimal::ZERO {
+                        result.last_price = Some(price.normalize().to_string());
+                    }
+                    result.last_size = Some(decimal_quantity(trade.quantity(), executable)?);
+                }
+            }
+            _ => return Err(ServiceError::InvalidResult),
+        }
+        result.last_observed_at = Some(durable_candidate_effective_at(candidate));
+        result.last_current_through = evidence.display_fresh_until(candidate);
+        result.last_fresh = result
+            .last_current_through
+            .is_some_and(|until| selected_at <= until);
+    }
+    Ok(result)
+}
+
+fn native_money_price(
+    price: market_squawk_domain::Money,
+    currency: Currency,
+) -> Result<Decimal, ServiceError> {
+    if price.currency() != currency {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(price.amount())
+}
+
+#[cfg(test)]
+mod product_quote_tests {
+    use super::*;
+
+    #[test]
+    fn native_money_display_preserves_precision_currency_and_component_freshness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let usd = Currency::try_from("USD")?;
+        let eur = Currency::try_from("EUR")?;
+        let value = "123.4567890123456789".parse::<Decimal>()?;
+        let money = market_squawk_domain::Money::new(value, usd);
+        assert_eq!(native_money_price(money, usd)?, value);
+        assert_eq!(
+            native_money_price(money, eur),
+            Err(ServiceError::InvalidResult)
+        );
+        let mut quote = empty_product_quote();
+        quote.midpoint = Some(value.normalize().to_string());
+        quote.last_price = Some("125".to_owned());
+        quote.quote_fresh = true;
+        assert_eq!(quote.current_price(usd)["basis"], "bid_ask_midpoint");
+        assert_eq!(
+            quote.current_price(usd)["value"],
+            value.normalize().to_string()
+        );
+        quote.last_fresh = true;
+        assert_eq!(quote.current_price(usd)["basis"], "last_trade");
+        quote.quote_fresh = false;
+        quote.last_fresh = false;
+        assert!(quote.current_price(usd).is_null());
+        assert_eq!(quote.value()["lastPrice"], "125");
+        Ok(())
+    }
 }
 
 fn product_market_state(
@@ -2293,8 +2382,17 @@ fn product_market_state(
     let current_through = product_current_through(view);
     let is_fresh = product_view_is_fresh(view, selected_at);
     let freshness = if is_fresh { "fresh" } else { "stale" };
-    let availability = if matches!(view, UnifiedSelectedView::Durable(_)) {
-        "stored"
+    let availability = if let UnifiedSelectedView::Durable(evidence) = view {
+        if is_fresh {
+            match evidence.metadata.coverage().delay() {
+                CoverageDelay::RealTime => "live",
+                CoverageDelay::Delayed(_) => "delayed",
+                CoverageDelay::NotApplicable => "stored",
+                CoverageDelay::Unknown => "unavailable",
+            }
+        } else {
+            "stored"
+        }
     } else {
         match (is_fresh, capabilities.quality()) {
             (false, _) | (_, DataQuality::Stale) => "stale",
@@ -2322,7 +2420,9 @@ fn product_market_state(
 fn product_view_is_fresh(view: UnifiedSelectedView<'_>, selected_at: Timestamp) -> bool {
     match view {
         UnifiedSelectedView::Live(view) => selected_at <= view.stream.source_valid_until(),
-        UnifiedSelectedView::Durable(_) => false,
+        UnifiedSelectedView::Durable(evidence) => evidence
+            .display_current_through()
+            .is_some_and(|until| selected_at <= until),
         UnifiedSelectedView::Display(snapshot) => display_selection_observation(snapshot.lease())
             .is_some_and(|value| {
                 matches!(
@@ -2342,7 +2442,7 @@ fn product_view_is_fresh(view: UnifiedSelectedView<'_>, selected_at: Timestamp) 
 fn product_current_through(view: UnifiedSelectedView<'_>) -> Option<Timestamp> {
     match view {
         UnifiedSelectedView::Live(view) => Some(view.stream.source_valid_until()),
-        UnifiedSelectedView::Durable(_) => None,
+        UnifiedSelectedView::Durable(evidence) => evidence.display_current_through(),
         UnifiedSelectedView::Display(snapshot) => display_selection_observation(snapshot.lease())
             .and_then(|value| display_expires_at(value.availability())),
         UnifiedSelectedView::Kraken(_) => None,
@@ -2410,7 +2510,6 @@ fn product_depth(
             )
         }
         UnifiedSelectedView::Durable(evidence) => {
-            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
             let snapshot = match evidence
                 .safe_book_snapshot_candidate()
                 .map(|candidate| candidate.event())
@@ -2420,11 +2519,21 @@ fn product_depth(
                 None => None,
             };
             let bids = snapshot
-                .map(|snapshot| product_durable_levels(snapshot.bids(), executable))
+                .map(|snapshot| {
+                    product_durable_levels(
+                        snapshot.bids(),
+                        definition.executable.ok_or(ServiceError::InvalidResult)?,
+                    )
+                })
                 .transpose()?
                 .unwrap_or_default();
             let asks = snapshot
-                .map(|snapshot| product_durable_levels(snapshot.asks(), executable))
+                .map(|snapshot| {
+                    product_durable_levels(
+                        snapshot.asks(),
+                        definition.executable.ok_or(ServiceError::InvalidResult)?,
+                    )
+                })
                 .transpose()?
                 .unwrap_or_default();
             let levels_truncated = snapshot.is_some_and(|snapshot| {

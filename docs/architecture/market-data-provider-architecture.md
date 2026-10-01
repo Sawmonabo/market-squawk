@@ -711,10 +711,24 @@ incomplete provider day, using the existing data-delay policy.
 Home and Markets share the persisted, editable starter collection. Source activation admits finite
 completed-history preparation to the existing service task owner and returns without awaiting it.
 Preparation uses the exact activated generation; replacement, revocation and shutdown cancel and
-drain it before successor work starts. Product reads use the
-existing history cursor and retained native calendar to select a genuine previous close and its
-session timestamp when a current display price is unavailable. This is display evidence, never
-fresh-price execution authority; reading a page does not initiate provider acquisition.
+drain it before successor work starts. Preparation validates the complete original history cursor
+and retained native calendar, then persists one completed-close row in the existing immutable
+SQLite projection store. Its identity binds the original history publication and selection policy;
+request cutoffs and descendant generations do not duplicate that evidence. Product reads select
+the authoritative publication, verify its stored close and clocks, and renew Display rights for
+the current selected generation and original parent. They do not reconstruct history per card.
+Projection reads use endpoint-bound WAL snapshots; only publication uses the catalog writer.
+This is display evidence, never fresh-price execution authority; reading a page does not initiate
+provider acquisition. Automatic preparation/update acceptance remains tracked in the ledger.
+
+Current-price presentation uses one selected page of live display snapshots. Only instruments
+without an eligible snapshot price query retained market routes, using the page's existing canonical
+definitions and fresh Display authorization. Financial analysis keeps its separate analytical
+receipt path; ordinary price cards do not create those receipts. Native monetary events retain
+their original currency and precision without requiring executable tick/lot definitions. Tick-based
+events still require their actual conversion terms. Component freshness is checked before a price
+is returned, and the card's observation time is distinct from its freshness expiry. A completed
+close may supply the card price without replacing retained quote or market-state evidence.
 
 The logical local layout is:
 

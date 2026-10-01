@@ -3,7 +3,8 @@
 //! The financial owner supplies original values and evidence. This module only commits them
 //! atomically and performs indexed, ordered reads; it never recalculates financial values.
 
-use super::CatalogAuthority;
+use super::{CatalogAuthority, CatalogError, CatalogResultLimits};
+use crate::AnalyticalManifestCatalog;
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -105,10 +106,12 @@ pub struct ChartProjectionRow {
     pub point: serde_json::Value,
 }
 
-/// The existing sole catalog session, with no separate database or writer.
+/// The existing sole catalog writer and endpoint-bound immutable read owner.
 #[derive(Clone)]
 pub struct ChartProjectionCatalogCapability {
     authority: Arc<Mutex<CatalogAuthority>>,
+    manifests: Arc<AnalyticalManifestCatalog>,
+    result_limits: CatalogResultLimits,
 }
 impl std::fmt::Debug for ChartProjectionCatalogCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,8 +120,28 @@ impl std::fmt::Debug for ChartProjectionCatalogCapability {
 }
 
 impl ChartProjectionCatalogCapability {
-    pub(crate) const fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
-        Self { authority }
+    pub(crate) const fn new(
+        authority: Arc<Mutex<CatalogAuthority>>,
+        manifests: Arc<AnalyticalManifestCatalog>,
+        result_limits: CatalogResultLimits,
+    ) -> Self {
+        Self {
+            authority,
+            manifests,
+            result_limits,
+        }
+    }
+
+    fn read<T>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(&rusqlite::Connection) -> Result<T, ChartProjectionError>,
+    ) -> Result<T, ChartProjectionError> {
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.result_limits, deadline, cancellation)?;
+        snapshot.read(|snapshot| operation(snapshot.connection()))
     }
 
     /// Consumes one row at a time; failure/cancellation rolls back the complete projection.
@@ -216,15 +239,9 @@ impl ChartProjectionCatalogCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ChartProjectionReference>, ChartProjectionError> {
-        check(deadline, cancellation)?;
-        let authority = self
-            .authority
-            .lock()
-            .map_err(|_| ChartProjectionError::Unavailable)?;
-        let result =
-            header(&authority.catalog().connection, &source)?.map(|(reference, _)| reference);
-        check(deadline, cancellation)?;
-        Ok(result)
+        self.read(deadline, cancellation, |connection| {
+            Ok(header(connection, &source)?.map(|(reference, _)| reference))
+        })
     }
 
     /// Reads only compact projection metadata and checks the decision-bound complete identity.
@@ -234,18 +251,9 @@ impl ChartProjectionCatalogCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>, ChartProjectionError> {
-        check(deadline, cancellation)?;
-        let authority = self
-            .authority
-            .lock()
-            .map_err(|_| ChartProjectionError::Unavailable)?;
-        let (actual, metadata) = header(&authority.catalog().connection, &reference.source_sha256)?
-            .ok_or(ChartProjectionError::NotFound)?;
-        if &actual != reference {
-            return Err(ChartProjectionError::Invalid);
-        }
-        check(deadline, cancellation)?;
-        Ok(metadata)
+        self.read(deadline, cancellation, |connection| {
+            projection_metadata(connection, reference)
+        })
     }
 
     /// Verifies the complete retained projection with one decoded row in memory.
@@ -255,56 +263,59 @@ impl ChartProjectionCatalogCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ChartProjectionError> {
-        let metadata = self.metadata(reference, deadline, cancellation)?;
-        if reference.source_sha256 == [0; 32]
-            || metadata.is_empty()
-            || metadata.len() > 64 * 1024
-            || !(1..=3).contains(&reference.series_count)
-        {
-            return Err(ChartProjectionError::Invalid);
-        }
-        let mut hash = Sha256::new();
-        hash.update(b"market-squawk/chart-projection/v1\0");
-        hash.update(reference.source_sha256);
-        hash.update((reference.series_count as u64).to_be_bytes());
-        hash.update((metadata.len() as u64).to_be_bytes());
-        hash.update(&metadata);
-        let mut count = 0_u64;
-        let mut first = None;
-        let mut last = None;
-        self.scan_rows(
-            reference,
-            i64::MIN,
-            i64::MAX,
-            deadline,
-            cancellation,
-            |ordinal, row, bytes| {
-                if ordinal != count {
-                    return Err(ChartProjectionError::Invalid);
-                }
-                hash.update(ordinal.to_be_bytes());
-                hash.update((bytes.len() as u64).to_be_bytes());
-                hash.update(bytes);
-                first.get_or_insert(row.time_nanos);
-                last = Some(row.time_nanos);
-                count = count.checked_add(1).ok_or(ChartProjectionError::Invalid)?;
-                Ok(())
-            },
-        )?;
-        hash.update(count.to_be_bytes());
-        let digest: [u8; 32] = hash.finalize().into();
-        if count != reference.row_count
-            || first != reference.first_time
-            || last != reference.last_time
-            || digest != reference.projection_sha256
-        {
-            return Err(ChartProjectionError::Invalid);
-        }
-        check(deadline, cancellation)
+        self.read(deadline, cancellation, |connection| {
+            let metadata = projection_metadata(connection, reference)?;
+            if reference.source_sha256 == [0; 32]
+                || metadata.is_empty()
+                || metadata.len() > 64 * 1024
+                || !(1..=3).contains(&reference.series_count)
+            {
+                return Err(ChartProjectionError::Invalid);
+            }
+            let mut hash = Sha256::new();
+            hash.update(b"market-squawk/chart-projection/v1\0");
+            hash.update(reference.source_sha256);
+            hash.update((reference.series_count as u64).to_be_bytes());
+            hash.update((metadata.len() as u64).to_be_bytes());
+            hash.update(&metadata);
+            let mut count = 0_u64;
+            let mut first = None;
+            let mut last = None;
+            scan_projection_rows(
+                connection,
+                reference,
+                i64::MIN,
+                i64::MAX,
+                deadline,
+                cancellation,
+                |ordinal, row, bytes| {
+                    if ordinal != count {
+                        return Err(ChartProjectionError::Invalid);
+                    }
+                    hash.update(ordinal.to_be_bytes());
+                    hash.update((bytes.len() as u64).to_be_bytes());
+                    hash.update(bytes);
+                    first.get_or_insert(row.time_nanos);
+                    last = Some(row.time_nanos);
+                    count = count.checked_add(1).ok_or(ChartProjectionError::Invalid)?;
+                    Ok(())
+                },
+            )?;
+            hash.update(count.to_be_bytes());
+            let digest: [u8; 32] = hash.finalize().into();
+            if count != reference.row_count
+                || first != reference.first_time
+                || last != reference.last_time
+                || digest != reference.projection_sha256
+            {
+                return Err(ChartProjectionError::Invalid);
+            }
+            check(deadline, cancellation)
+        })
     }
 
     /// Visits an indexed inclusive range in original order, holding only one decoded row.
-    /// The callback must not call another operation on this catalog session.
+    /// Each call uses one independent read transaction over the original catalog endpoint.
     pub fn scan(
         &self,
         reference: &ChartProjectionReference,
@@ -331,54 +342,83 @@ impl ChartProjectionCatalogCapability {
         end: i64,
         deadline: Instant,
         cancellation: &CancellationToken,
-        mut visit: impl FnMut(u64, ChartProjectionRow, &[u8]) -> Result<(), ChartProjectionError>,
+        visit: impl FnMut(u64, ChartProjectionRow, &[u8]) -> Result<(), ChartProjectionError>,
     ) -> Result<u64, ChartProjectionError> {
         check(deadline, cancellation)?;
         if start > end {
             return Err(ChartProjectionError::Invalid);
         }
-        let authority = self
-            .authority
-            .lock()
-            .map_err(|_| ChartProjectionError::Unavailable)?;
-        let connection = &authority.catalog().connection;
-        let (actual, _) =
-            header(connection, &reference.source_sha256)?.ok_or(ChartProjectionError::NotFound)?;
-        if &actual != reference {
+        self.read(deadline, cancellation, |connection| {
+            scan_projection_rows(
+                connection,
+                reference,
+                start,
+                end,
+                deadline,
+                cancellation,
+                visit,
+            )
+        })
+    }
+}
+
+fn projection_metadata(
+    connection: &rusqlite::Connection,
+    reference: &ChartProjectionReference,
+) -> Result<Vec<u8>, ChartProjectionError> {
+    let (actual, metadata) =
+        header(connection, &reference.source_sha256)?.ok_or(ChartProjectionError::NotFound)?;
+    if &actual != reference {
+        return Err(ChartProjectionError::Invalid);
+    }
+    Ok(metadata)
+}
+
+fn scan_projection_rows(
+    connection: &rusqlite::Connection,
+    reference: &ChartProjectionReference,
+    start: i64,
+    end: i64,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    mut visit: impl FnMut(u64, ChartProjectionRow, &[u8]) -> Result<(), ChartProjectionError>,
+) -> Result<u64, ChartProjectionError> {
+    let (actual, _) =
+        header(connection, &reference.source_sha256)?.ok_or(ChartProjectionError::NotFound)?;
+    if &actual != reference {
+        return Err(ChartProjectionError::Invalid);
+    }
+    let mut statement = connection.prepare("SELECT ordinal,time_nanos,payload,payload_sha256 FROM chart_projection_rows WHERE source_sha256=?1 AND time_nanos>=?2 AND time_nanos<=?3 ORDER BY time_nanos,ordinal")?;
+    let mut rows = statement.query(params![reference.source_sha256.as_slice(), start, end])?;
+    let mut previous = None;
+    let mut count = 0_u64;
+    while let Some(row) = rows.next()? {
+        check(deadline, cancellation)?;
+        let ordinal =
+            u64::try_from(row.get::<_, i64>(0)?).map_err(|_| ChartProjectionError::Invalid)?;
+        let at: i64 = row.get(1)?;
+        let bytes: Vec<u8> = row.get(2)?;
+        let digest: Vec<u8> = row.get(3)?;
+        if bytes.len() > 16 * 1024
+            || Sha256::digest(&bytes).as_slice() != digest
+            || ordinal >= reference.row_count
+            || previous.is_some_and(|(prior_ordinal, prior_at)| {
+                prior_ordinal + 1 != ordinal || prior_at >= at
+            })
+        {
             return Err(ChartProjectionError::Invalid);
         }
-        let mut statement = connection.prepare("SELECT ordinal,time_nanos,payload,payload_sha256 FROM chart_projection_rows WHERE source_sha256=?1 AND time_nanos>=?2 AND time_nanos<=?3 ORDER BY time_nanos,ordinal")?;
-        let mut rows = statement.query(params![reference.source_sha256.as_slice(), start, end])?;
-        let mut previous = None;
-        let mut count = 0_u64;
-        while let Some(row) = rows.next()? {
-            check(deadline, cancellation)?;
-            let ordinal =
-                u64::try_from(row.get::<_, i64>(0)?).map_err(|_| ChartProjectionError::Invalid)?;
-            let at: i64 = row.get(1)?;
-            let bytes: Vec<u8> = row.get(2)?;
-            let digest: Vec<u8> = row.get(3)?;
-            if bytes.len() > 16 * 1024
-                || Sha256::digest(&bytes).as_slice() != digest
-                || ordinal >= reference.row_count
-                || previous.is_some_and(|(prior_ordinal, prior_at)| {
-                    prior_ordinal + 1 != ordinal || prior_at >= at
-                })
-            {
-                return Err(ChartProjectionError::Invalid);
-            }
-            let point: ChartProjectionRow =
-                serde_json::from_slice(&bytes).map_err(|_| ChartProjectionError::Invalid)?;
-            if point.time_nanos != at || point.values.len() != reference.series_count {
-                return Err(ChartProjectionError::Invalid);
-            }
-            visit(ordinal, point, &bytes)?;
-            previous = Some((ordinal, at));
-            count += 1;
+        let point: ChartProjectionRow =
+            serde_json::from_slice(&bytes).map_err(|_| ChartProjectionError::Invalid)?;
+        if point.time_nanos != at || point.values.len() != reference.series_count {
+            return Err(ChartProjectionError::Invalid);
         }
-        check(deadline, cancellation)?;
-        Ok(count)
+        visit(ordinal, point, &bytes)?;
+        previous = Some((ordinal, at));
+        count += 1;
     }
+    check(deadline, cancellation)?;
+    Ok(count)
 }
 
 fn header(
@@ -427,10 +467,21 @@ pub enum ChartProjectionError {
     Storage(#[from] rusqlite::Error),
 }
 
+impl From<CatalogError> for ChartProjectionError {
+    fn from(error: CatalogError) -> Self {
+        match error {
+            CatalogError::MarketRecoveryReadCancelled => Self::Cancelled,
+            CatalogError::MarketRecoveryReadDeadlineExceeded => Self::DeadlineExceeded,
+            CatalogError::Sqlite(error) => Self::Storage(error),
+            _ => Self::Unavailable,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CatalogConfig, CatalogLimit, CatalogResultLimits};
+    use crate::{CatalogConfig, CatalogLimit};
     use market_squawk_platform::LocalPaths;
     use std::time::Duration;
 
@@ -456,17 +507,21 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("chart"))?;
+        let result_limits = CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?;
         let config = || -> Result<CatalogConfig, Box<dyn std::error::Error>> {
             Ok(CatalogConfig::try_new(
                 paths.catalog()?.clone(),
                 Duration::from_millis(750),
                 CatalogLimit::new(32)?,
-                CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+                result_limits,
             )?)
         };
-        let capability = ChartProjectionCatalogCapability::new(Arc::new(Mutex::new(
-            CatalogAuthority::open(config()?)?,
-        )));
+        let authority = Arc::new(Mutex::new(CatalogAuthority::open(config()?)?));
+        let capability = ChartProjectionCatalogCapability::new(
+            authority,
+            Arc::new(AnalyticalManifestCatalog::open(paths.catalog()?, 8)?),
+            result_limits,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         let cancellation = CancellationToken::new();
         let rows = || {
@@ -514,9 +569,27 @@ mod tests {
         );
         assert!(matches!(failed, Err(ChartProjectionError::Cancelled)));
         drop(capability);
-        let capability = ChartProjectionCatalogCapability::new(Arc::new(Mutex::new(
-            CatalogAuthority::open(config()?)?,
-        )));
+        let authority = Arc::new(Mutex::new(CatalogAuthority::open(config()?)?));
+        let capability = ChartProjectionCatalogCapability::new(
+            authority,
+            Arc::new(AnalyticalManifestCatalog::open(paths.catalog()?, 8)?),
+            result_limits,
+        );
+        // Reopening original values must remain available during an unrelated publication.
+        // Hold both the capability's exact writer mutex and a real SQLite write transaction.
+        let authority = capability.authority.lock().map_err(|_| "catalog lock")?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &authority.catalog().connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        assert_eq!(
+            capability.reference(reference.source_sha256, deadline, &cancellation)?,
+            Some(reference.clone())
+        );
+        assert_eq!(
+            capability.metadata(&reference, deadline, &cancellation)?,
+            b"{\"baseline\":100}"
+        );
         let mut selected = Vec::new();
         assert_eq!(
             capability.scan(
@@ -541,6 +614,18 @@ mod tests {
         );
         assert!(selected[1].2.is_none());
         capability.verify(&reference, deadline, &cancellation)?;
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            capability.reference(reference.source_sha256, deadline, &cancelled),
+            Err(ChartProjectionError::Cancelled)
+        ));
+        assert!(matches!(
+            capability.metadata(&reference, Instant::now(), &cancellation),
+            Err(ChartProjectionError::DeadlineExceeded)
+        ));
+        transaction.rollback()?;
+        drop(authority);
         let last_reference =
             capability.publish([3; 32], b"{}", 1, rows(), deadline, &cancellation)?;
         capability.verify(&last_reference, deadline, &cancellation)?;

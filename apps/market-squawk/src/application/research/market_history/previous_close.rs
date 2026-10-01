@@ -1,21 +1,26 @@
-//! Read-only completed-session close projection over original canonical history and calendar.
+//! Persisted completed-session display evidence over original canonical history and calendar.
 
 use super::{MarketHistoryReadCapability, MarketHistoryUnavailableReason, unavailable_reason};
 use crate::{
     ResearchService,
     application::{
-        model::forecast::authorize_projection_parents,
+        model::forecast::{authorize_projection_parents, chart_storage_error},
         research::corporate_actions::map_research_error,
     },
 };
 use market_squawk_data::{
-    AnalyticalReadError, LatestCanonicalMarketBarHistoryWindowRequest, MarketHistorySelectionPolicy,
+    AnalyticalReadError, ChartProjectionError, ChartProjectionRow,
+    CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
+    LatestCanonicalMarketBarHistoryWindowSelection, MarketHistorySelectionPolicy,
 };
 use market_squawk_domain::{
     CalendarDate, Currency, DataQuality, InstrumentId, MarketBarAdjustment, Money, Timestamp,
 };
+use market_squawk_modeling::ForecastArtifactManifestRecord;
 use market_squawk_services::{RequestContext, ServiceError};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Display evidence only; it carries no current-price or execution authority.
@@ -24,6 +29,86 @@ pub(crate) struct PreviousClose {
     close: Money,
     native_date: CalendarDate,
     session_close: Timestamp,
+}
+
+/// One bounded lookup stage; Drop also attributes errors and abandoned request futures.
+struct CloseReadStage<'a> {
+    context: &'a RequestContext,
+    instrument_id: InstrumentId,
+    stage: &'static str,
+    started: Instant,
+    completed: bool,
+}
+
+impl<'a> CloseReadStage<'a> {
+    fn new(context: &'a RequestContext, instrument_id: InstrumentId, stage: &'static str) -> Self {
+        Self {
+            context,
+            instrument_id,
+            stage,
+            started: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CloseReadStage<'_> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            request_id = ?self.context.request_id(),
+            instrument_id = %self.instrument_id,
+            stage = self.stage,
+            completed = self.completed,
+            elapsed_ms = %self.started.elapsed().as_millis(),
+            remaining_at_stage_entry_ms = %self.context.deadline().saturating_duration_since(self.started).as_millis(),
+            "previous close read stage finished"
+        );
+    }
+}
+
+/// Stable original evidence only: request cutoffs, descendant selections and rights expire
+/// independently and must never change an immutable publication's projection.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloseMetadata {
+    publication: [u8; 32],
+    origin: ForecastArtifactManifestRecord,
+    artifact: String,
+    object_ordinal: u16,
+    object_content: [u8; 32],
+    object_lineage: [u8; 32],
+    object_rows: u64,
+    object_bytes: u64,
+    history_content: [u8; 32],
+    bar_count: usize,
+    native_mapping: [u8; 32],
+    calendar_replay: [u8; 32],
+    calendar_capture: [u8; 32],
+    calendar_component: Option<[u8; 32]>,
+    calendar_origin: [u8; 32],
+    calendar_binding: [u8; 32],
+    calendar_published_at: Timestamp,
+    calendar_received_at: Timestamp,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClosePoint {
+    instrument_id: InstrumentId,
+    close: Money,
+    native_date: CalendarDate,
+    session_open: Timestamp,
+    session_close: Timestamp,
+    provider_timestamp: Option<Timestamp>,
+    provider_period: Option<(Timestamp, Timestamp)>,
+    available_at: Timestamp,
+    received_at: Timestamp,
+    ingested_at: Timestamp,
+    quality: DataQuality,
 }
 
 impl PreviousClose {
@@ -49,6 +134,8 @@ impl PreviousClose {
 }
 
 impl MarketHistoryReadCapability {
+    /// Screen reads never reconstruct history or replay raw captures. A miss belongs to the
+    /// existing generation-owned preparation worker.
     pub(crate) async fn read_latest_previous_close(
         &self,
         research: &ResearchService,
@@ -56,6 +143,22 @@ impl MarketHistoryReadCapability {
         knowledge_cutoff: Timestamp,
         context: &RequestContext,
     ) -> Result<Option<PreviousClose>, ServiceError> {
+        let Some(selection) = self
+            .select_previous_close(research, instrument_id, knowledge_cutoff, context)
+            .await?
+        else {
+            return Ok(None);
+        };
+        read_projection(research, selection.selection(), knowledge_cutoff, context).await
+    }
+
+    async fn select_previous_close(
+        &self,
+        research: &ResearchService,
+        instrument_id: InstrumentId,
+        knowledge_cutoff: Timestamp,
+        context: &RequestContext,
+    ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ServiceError> {
         check(context)?;
         let request = LatestCanonicalMarketBarHistoryWindowRequest::try_new(
             instrument_id,
@@ -65,6 +168,7 @@ impl MarketHistoryReadCapability {
         .map_err(|_| ServiceError::InvalidRequest)?;
         let reader = self.reader.clone();
         let deadline = context.deadline();
+        let timing = CloseReadStage::new(context, instrument_id, "selection");
         let selection = research
             .run_owned_research_read(deadline, context.cancellation(), move |cancellation| {
                 reader.select_latest_canonical_market_bar_history_window(
@@ -79,10 +183,31 @@ impl MarketHistoryReadCapability {
             .inspect_err(|error| {
                 trace_close_read_failure(instrument_id, "latest-window-selection", error)
             })?;
+        timing.complete();
         check(context)?;
+        Ok(selection)
+    }
+
+    /// Validates the entire original history and calendar once, then commits its terminal close.
+    pub(crate) async fn prepare_latest_previous_close(
+        &self,
+        research: &ResearchService,
+        instrument_id: InstrumentId,
+        knowledge_cutoff: Timestamp,
+        context: &RequestContext,
+    ) -> Result<Option<PreviousClose>, ServiceError> {
+        let selection = self
+            .select_previous_close(research, instrument_id, knowledge_cutoff, context)
+            .await?;
         let Some(selection) = selection else {
             return Ok(None);
         };
+        if let Some(close) =
+            read_projection(research, selection.selection(), knowledge_cutoff, context).await?
+        {
+            return Ok(Some(close));
+        }
+        let selected = selection.selection().clone();
         let Some(history) = self
             .reader
             .read_canonical_market_bar_history_cursor(
@@ -116,6 +241,7 @@ impl MarketHistoryReadCapability {
         };
         let publication = history.selection().receipt();
         if publication.instrument_id() != instrument_id
+            || publication.receipt_digest() != selected.receipt().receipt_digest()
             || publication.adjustment() != MarketBarAdjustment::Raw
             || !publication.current_research_eligible()
             || publication.published_at() > knowledge_cutoff
@@ -212,11 +338,18 @@ impl MarketHistoryReadCapability {
                     .provider_period()
                     .is_none_or(|(_, end)| end <= knowledge_cutoff)
             {
-                latest = Some(PreviousClose {
+                latest = Some(ClosePoint {
                     instrument_id,
                     close: bar.close(),
                     native_date: session.native_date(),
+                    session_open: session.opens_at(),
                     session_close,
+                    provider_timestamp: session.provider_timestamp(),
+                    provider_period: session.provider_period(),
+                    available_at: available,
+                    received_at: provenance.received_at(),
+                    ingested_at: provenance.ingested_at(),
+                    quality: provenance.quality(),
                 });
             }
         }
@@ -226,17 +359,255 @@ impl MarketHistoryReadCapability {
             return Err(invalid_close_read(instrument_id, "terminal-bar-count"));
         }
         check(context)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
-            .map(Timestamp::from_unix_nanos)
-            .ok_or(ServiceError::Internal)?;
-        if now >= permit.expires_at() {
+        if wall_now()? >= permit.expires_at() {
             return Err(ServiceError::Unauthorized);
         }
-        Ok(latest)
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        let read = history.read_receipt();
+        let (content, lineage, rows, bytes) = read.object_evidence();
+        let metadata = CloseMetadata {
+            publication: publication.receipt_digest().bytes(),
+            origin: ForecastArtifactManifestRecord::from_manifest(read.origin_manifest()),
+            artifact: read.origin_object().0.to_string(),
+            object_ordinal: read.origin_object().1,
+            object_content: content.bytes(),
+            object_lineage: lineage.bytes(),
+            object_rows: rows,
+            object_bytes: bytes,
+            history_content: read.history_content_digest().bytes(),
+            bar_count,
+            native_mapping: native.mapping_digest().bytes(),
+            calendar_replay: native.source_replay_digest().bytes(),
+            calendar_capture: native.capture_receipt_digest().bytes(),
+            calendar_component: native
+                .calendar_component_digest()
+                .map(|digest| digest.bytes()),
+            calendar_origin: native.calendar_origin_content_digest().bytes(),
+            calendar_binding: native.calendar_capture_binding_digest().bytes(),
+            calendar_published_at: native.published_at(),
+            calendar_received_at: native.received_at(),
+        };
+        validate_projection(&selected, &metadata, &latest, knowledge_cutoff)?;
+        let metadata = serde_json::to_vec(&metadata).map_err(|_| ServiceError::InvalidResult)?;
+        let row = ChartProjectionRow {
+            time_nanos: latest.session_close.unix_nanos(),
+            values: vec![Some(latest.close.amount().into())],
+            point: serde_json::to_value(&latest).map_err(|_| ServiceError::InvalidResult)?,
+        };
+        let source = projection_source(&selected);
+        let projections = research.chart_projections();
+        let deadline = context.deadline();
+        research
+            .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+                projections.publish(source, &metadata, 1, [Ok(row)], deadline, &cancellation)
+            })
+            .await
+            .map_err(map_research_error)?
+            .map_err(chart_storage_error)?;
+        check(context)?;
+        if wall_now()? >= permit.expires_at() {
+            return Err(ServiceError::Unauthorized);
+        }
+        read_projection(research, &selected, knowledge_cutoff, context).await
     }
+}
+
+fn projection_source(selection: &CompleteMarketBarHistorySelection) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/completed-session-close/v1\0");
+    digest.update(selection.policy_digest().bytes());
+    digest.update(selection.receipt().receipt_digest().bytes());
+    digest.finalize().into()
+}
+
+async fn read_projection(
+    research: &ResearchService,
+    selection: &CompleteMarketBarHistorySelection,
+    cutoff: Timestamp,
+    context: &RequestContext,
+) -> Result<Option<PreviousClose>, ServiceError> {
+    check(context)?;
+    let projections = research.chart_projections();
+    let source = projection_source(selection);
+    let deadline = context.deadline();
+    let timing = CloseReadStage::new(
+        context,
+        selection.receipt().instrument_id(),
+        "stored_projection",
+    );
+    let stored = research
+        .run_owned_research_read(deadline, context.cancellation(), move |cancellation| {
+            let Some(reference) = projections.reference(source, deadline, &cancellation)? else {
+                return Ok(None);
+            };
+            if reference.row_count != 1 || reference.series_count != 1 {
+                return Err(ChartProjectionError::Invalid);
+            }
+            projections.verify(&reference, deadline, &cancellation)?;
+            let metadata: CloseMetadata = serde_json::from_slice(&projections.metadata(
+                &reference,
+                deadline,
+                &cancellation,
+            )?)
+            .map_err(|_| ChartProjectionError::Invalid)?;
+            let mut point = None;
+            let count = projections.scan(
+                &reference,
+                i64::MIN,
+                i64::MAX,
+                deadline,
+                &cancellation,
+                |ordinal, row| {
+                    let close: ClosePoint = serde_json::from_value(row.point)
+                        .map_err(|_| ChartProjectionError::Invalid)?;
+                    if ordinal != 0
+                        || point.is_some()
+                        || row.time_nanos != close.session_close.unix_nanos()
+                        || row.values != vec![Some(close.close.amount().into())]
+                    {
+                        return Err(ChartProjectionError::Invalid);
+                    }
+                    point = Some(close);
+                    Ok(())
+                },
+            )?;
+            if count != 1 {
+                return Err(ChartProjectionError::Invalid);
+            }
+            Ok(Some((
+                metadata,
+                point.ok_or(ChartProjectionError::Invalid)?,
+            )))
+        })
+        .await
+        .map_err(map_research_error)?
+        .map_err(chart_storage_error)?;
+    timing.complete();
+    let Some((metadata, close)) = stored else {
+        return Ok(None);
+    };
+    validate_projection(selection, &metadata, &close, cutoff)?;
+    let mut parents = vec![selection.pinned().manifest().clone()];
+    if !parents.contains(selection.receipt().origin_manifest()) {
+        parents.push(selection.receipt().origin_manifest().clone());
+    }
+    let timing = CloseReadStage::new(
+        context,
+        selection.receipt().instrument_id(),
+        "rights_authorization",
+    );
+    let permit = authorize_projection_parents(research, &parents, cutoff, context).await?;
+    timing.complete();
+    check(context)?;
+    if wall_now()? >= permit.expires_at() {
+        return Err(ServiceError::Unauthorized);
+    }
+    Ok(Some(PreviousClose {
+        instrument_id: close.instrument_id,
+        close: close.close,
+        native_date: close.native_date,
+        session_close: close.session_close,
+    }))
+}
+
+fn validate_projection(
+    selection: &CompleteMarketBarHistorySelection,
+    metadata: &CloseMetadata,
+    close: &ClosePoint,
+    cutoff: Timestamp,
+) -> Result<(), ServiceError> {
+    let receipt = selection.receipt();
+    let origin = metadata
+        .origin
+        .typed()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let (available, received, ingested) = receipt.knowledge_clocks();
+    let coordinate_matches = match (close.provider_timestamp, close.provider_period) {
+        (Some(timestamp), Some((start, end))) => {
+            start <= timestamp
+                && timestamp < end
+                && start <= close.session_open
+                && close.session_close <= end
+                && end <= close.available_at
+                && end <= cutoff
+                && receipt
+                    .coverage()
+                    .is_some_and(|(_, last, complete)| timestamp == last && end == complete)
+        }
+        (None, None) => {
+            receipt.requested_dates().is_some() && close.session_close <= close.available_at
+        }
+        _ => false,
+    };
+    if metadata.publication != receipt.receipt_digest().bytes()
+        || origin != *receipt.origin_manifest()
+        || metadata.artifact != receipt.origin_artifact_id().to_string()
+        || metadata.object_ordinal != receipt.origin_object_ordinal()
+        || metadata.bar_count != receipt.bar_count()
+        || metadata.object_rows < metadata.bar_count as u64
+        || metadata.object_bytes == 0
+        || [
+            metadata.object_content,
+            metadata.object_lineage,
+            metadata.history_content,
+            metadata.native_mapping,
+            metadata.calendar_replay,
+        ]
+        .contains(&[0; 32])
+        || metadata.calendar_capture != receipt.capture_receipt_digest().bytes()
+        || metadata.calendar_component
+            != receipt
+                .session_calendar_component()
+                .map(|(_, digest, _)| digest.bytes())
+        || metadata.calendar_origin != receipt.origin_manifest().content_hash().bytes()
+        || metadata.calendar_binding != receipt.binding_digest().bytes()
+        || close.instrument_id != receipt.instrument_id()
+        || close.close.currency() != receipt.currency()
+        || close.close.amount() <= Decimal::ZERO
+        || receipt.adjustment() != MarketBarAdjustment::Raw
+        || !receipt.current_research_eligible()
+        || close.session_open >= close.session_close
+        || !coordinate_matches
+        || [
+            receipt.published_at(),
+            receipt.capture_recorded_at(),
+            available,
+            received,
+            ingested,
+            metadata.calendar_published_at,
+            metadata.calendar_received_at,
+            close.session_close,
+            close.available_at,
+            close.received_at,
+            close.ingested_at,
+        ]
+        .into_iter()
+        .any(|at| at > cutoff)
+        || matches!(
+            close.quality,
+            DataQuality::Modeled
+                | DataQuality::Estimated
+                | DataQuality::Stale
+                | DataQuality::Quarantined
+        )
+    {
+        return Err(invalid_close_read(
+            receipt.instrument_id(),
+            "stored-projection-evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn wall_now() -> Result<Timestamp, ServiceError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(ServiceError::Internal)
 }
 
 fn check(context: &RequestContext) -> Result<(), ServiceError> {

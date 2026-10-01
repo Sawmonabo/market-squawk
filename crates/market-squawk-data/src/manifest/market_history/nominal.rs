@@ -793,5 +793,6 @@ pub(super) fn latest_nominal_window(
     Ok(Some(LatestCanonicalMarketBarHistoryWindowSelection {
         exact_request,
         lookup_digest: nonzero_sha256(hash.finalize().into())?,
+        selection: selected,
     }))
 }

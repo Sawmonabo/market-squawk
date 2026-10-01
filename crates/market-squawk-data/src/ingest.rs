@@ -3381,7 +3381,11 @@ impl AnalyticalDataService {
 
     /// Returns the existing catalog's bounded chart-projection authority.
     pub fn chart_projections(&self) -> crate::ChartProjectionCatalogCapability {
-        crate::ChartProjectionCatalogCapability::new(Arc::clone(&self.authority))
+        crate::ChartProjectionCatalogCapability::new(
+            Arc::clone(&self.authority),
+            Arc::clone(&self.manifests),
+            self.catalog_read_limits,
+        )
     }
 
     /// Creates private, restart-reclaimable temporary storage for one owned analytical operation.

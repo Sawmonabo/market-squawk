@@ -2,9 +2,10 @@
 
 ## Current execution — 2026-10-01
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. This checkpoint
-isolates retained reads and adds failed-request stage attribution; native initial collection loading
-remains unresolved. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
+Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed `5b25ac44` (PR #43 comment5941104580)
+isolates retained reads and adds failed-request stage attribution. The current completed-close/display
+batch below has one successful native initial load after earlier deadline failures; full screen/data
+acceptance remains open. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
 `ff788610` fixes verified service-owner joining at Desktop startup (PR #43 comment5940019410).
 `9eac1d57` fixes actor-time current presentation; `4239a7d6` preserves Alpaca publication custody;
 `96abecae` preserves retained evidence access and analytical/I/O admission order.
@@ -12,12 +13,24 @@ One worktree, three local and three origin branches; protected backup refs remai
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — isolate retained-screen reads | Owns research_service.rs/retained_use.rs, worker lifecycle, market_selection/product.rs and previous_close.rs caller routing; analytical_read.rs/history_cursor.rs and ingest.rs configured-limit plumbing; Git/builds/checks/docs. Reuse ResearchIoWorker with separate retained-read ownership; preserve actual catalog write authority for authorization. | Existing nine-price warm CLI read passes in12.69s. Prove capture work cannot monopolize read admission, original workers drain, and native startup collection loads. |
-| GPT-6.1 Sol history_snapshot — frozen independent history selectors | Owns only crates/market-squawk-data/src/manifest/catalog.rs and its existing private catalog regression case. The complete-history recovery fixture remains unchanged. Start from existing endpoint-bound snapshot reader; no new connection framework, cap/deadline changes or authority bypass. | Implementation frozen; direct held-writer and unchanged full-history integrity/restart cases PASS1/1 each. Application worker custody/progress case PASS1/1; service build and native initial-load proof follow. |
-| Lead — request-stage attribution verified | Diagnostic build PASS5m35s. Initial collection completes nine current reads, then fails third previous-close fallback at native-session-rejoin. elapsed17069ms, remaining1935ms at stage entry, stage4007ms, fallback_completed2. | Exact live evidence retained-read-stage-live.log; correct repeated history reconstruction, not the request timeout. |
-| Astra collection_read — completed-close projection design | Read-only current previous_close.rs/native_sessions.rs, history publication/selection and catalog schema; no edits/builds/Git. | Find smallest reusable persisted/indexed completed-close projection with exact history/calendar/rights lineage; no whole-history reconstruction per card, no authority bypass or new arbitrary limits. Return bounded file/API plan. |
-| Astra collection_read — crypto diagnosis complete | No active edits. Report `.agents/tmp/v1-first-stock/crypto-publication-followup.md` traces local capacity charged as socket idle and accepted-publication custody dropped on recoverable transport exit. | Correct admission/receive accounting and drain-before-teardown together after the current read checkpoint. HealthNotQualified predicate remains unattributed; preserve existing expiry/revocation checks. |
-| Public crypto reference diagnosis — completed | Existing references are present. Catalog capability pin still takes writer authority; contention is collapsed into unavailable. No edits. | Reuse independent read snapshots while preserving pinned histories; latest run additionally reports HealthNotQualified. |
+| Lead — completed-close and display integration | Frozen current batch: original-receipt completed-close projection; independent SQLite projection reads; page-level display authority; retained native Money conversion; actual observation timestamp. Shared plumbing, Git, builds and runtime remain lead-owned. | Four critical checks pass. Fresh native initial Home now loads all nine saved closes in6.9s without Refresh. Earlier15s failures remain part of the evidence; no general latency or streaming acceptance claim. Commit/push this coherent slice before next implementation. |
+| Astra collection_read — macro startup failure diagnosis | Read-only application/research/macro_context.rs and children, actual data/worker callees. No edits/builds/runtime/Git. |17-route native sweep finds Macro.GetContext rejected on Advanced Research. Trace exact error boundary and repeated work; propose the smallest correction preserving other independent values, original evidence, cancellation and cutoffs. |
+| Lead — remaining product/data update contract | Required data-to-screen closure below remains authoritative. Existing rich quote and committed-domain event designs are source-traced, not implemented. | Next: reduce retained display lookup cost where measured, close macro error, wire committed-domain invalidation and rich quote fields together; then remaining family details and saved Investment Brief. |
+
+Current integrated evidence (2026-10-01): service build PASS5m21s, current source with timing
+verbosity reduced from INFO to DEBUG after capture (no behavior change). The actual first native
+Home request completed in6899ms: population94ms, actor display2ms, retained routes/events5825ms,
+and all nine close selection/projection/rights reads together under1s. Each close authorization took
+4–16ms in this request. This excludes close authorization as the dominant cost in this successful
+run; it does not attribute the earlier failed requests. No deadline or data limit was increased.
+Evidence: `display-stage-{service-build,live,native}.log`, `display-stage-native-home.json`.
+The prior late native read returned all nine closes in5345ms; single MSFT detail819ms.
+No live current quotes qualified in these after-hours checks; saved closes are explicitly labeled.
+The17-route native sweep recorded16 routes without query errors and one concrete failure:
+Advanced Research Macro.GetContext operation_failed. This is screen-read evidence, not proof of
+all model/provider/data-family workflows. See `display-stage-all-routes.{json,log}`.
+Actual remote heads verified again: feature/main/release only; one primary worktree and three
+local branches. No refs or protected recovery artifacts were removed.
 
 
 Latest-display build PASS7m22s. Real CLI IWM changes279.34→279.32; native Home shows QQQ742.43,
@@ -90,9 +103,40 @@ lineage instead of reconstructing selected history for each card. The source log
 apportion the earlier elapsed time among successful stages. The owned WebDriver session and
 service/native processes were stopped after evidence. No CI, RAM measurement or final gate ran.
 
+Lead additionally owns paper/market/product.rs: compact-card asOf must use original observedAt,
+not the display quote's future freshness expiry. Saved-close producer supplies its session-close
+observation time; no compatibility fallback is added.
+Display-purpose slice is frozen under lead integration. Native-money precision/currency/component
+freshness critical PASS1/1; existing source-selection/downgrade/execution-rejection critical
+PASS1/1. Logs: `display-purpose-{money,selection}-critical.log`; serialized service build is next.
+The new conversion case does not establish retained runtime-absent lineage or whole-screen closure.
+Native quote sizes with unresolved units remain null; exposing their original value plus unit
+requires the remaining shared rich-quote contract and renderer work, not fabricated share counts.
+
+Completed-close projection live evidence: service84323 prepared nine persisted rows, independently
+matched to their original publication receipts (`close-projection-original-bindings.json`). A fresh
+service86304 reverified all nine without publishing replacement history. Both owned services exited
+cleanly after SIGINT; the hidden native84392 and its WebDriver session were also closed. Initial
+Home still failed after seven current-price reads at its15s request deadline, before any saved-close
+fallback. Diagnostic manual Refresh also failed after five current reads; it is not startup acceptance.
+Evidence: `close-projection-{first,restart}-live.log`, `close-projection-first-native-home.json`.
+No timeout was increased, no CI or whole-app RAM gate ran. Current fix replaces analytical investment
+reads in product display with the existing SnapshotDisplay authority and exact retained Display reads.
+
 Next dependency order: correct initial collection-read failure; integrate existing rich quote projection and
 committed-domain screen invalidation; continue missing family detail and
 first saved Investment Brief. Screen route presence is not complete workflow acceptance.
+
+Next update-edge design is source-traced, not implemented: reuse ServiceDomain and a fixed atomic
+dirty-domain mask shared before startup. EventHub.read_after drains it under the existing journal
+mutex into one sequenced domain-union event; failed append restores with fetch_or. Native strictly
+maps it to existing invalidations. This needs no additional worker/timer. Mark actual committed or
+actor-applied results, including publication completion after caller cancellation; ingest return
+alone misses direct market/macro commits. Job/paper output hooks remain separate required edges.
+New raw daily-history commits must also wake the existing starter owner for a retained-only
+same-generation pass; preserve active preparation, coalesce revisions, and rely on receipt-keyed
+projections for deduplication. No per-screen acquisition queue. Existing generation-only suppression
+and outer publication callbacks do not close this dependency. Notify Market after projection commit.
 
 ### Required data-to-screen closure
 

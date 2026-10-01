@@ -150,6 +150,7 @@ struct DurableMarketRouteEvidence {
     instrument_id: InstrumentId,
     venue_id: VenueId,
     selections: Vec<MarketEventPointInTimeReceipt>,
+    display_authorizations: Vec<market_squawk_data::AuthorizedMarketEventUse>,
 }
 
 impl DurableMarketRouteEvidence {
@@ -291,6 +292,7 @@ impl DurableMarketRouteEvidence {
             instrument_id,
             venue_id,
             selections,
+            display_authorizations: Vec::new(),
         };
         if route.presentation_candidate().is_some() {
             Ok(Some(route))
@@ -351,6 +353,59 @@ impl DurableMarketRouteEvidence {
             .into_iter()
             .chain(self.safe_book_snapshot_candidate())
             .max_by_key(|candidate| durable_candidate_effective_at(candidate))
+    }
+
+    fn display_fresh_until(
+        &self,
+        candidate: &ProviderMarketEventSelectedCandidate,
+    ) -> Option<Timestamp> {
+        if self.display_authorizations.is_empty() {
+            return None;
+        }
+        let provenance = market_event_provenance(candidate.event());
+        if matches!(
+            provenance.recorded_quality(),
+            DataQuality::Modeled
+                | DataQuality::Estimated
+                | DataQuality::Stale
+                | DataQuality::Quarantined
+        ) {
+            return None;
+        }
+        let policy = self.metadata.freshness_policy();
+        let mut until = provenance
+            .source_timestamp()?
+            .checked_add_nanos(i64::try_from(policy.max_source_age_nanos()).ok()?)
+            .ok()?
+            .min(
+                provenance
+                    .received_at()
+                    .checked_add_nanos(i64::try_from(policy.max_market_age_nanos()).ok()?)
+                    .ok()?,
+            );
+        for deadline in [
+            self.metadata
+                .authorization()
+                .inclusive_authorization_deadline(),
+            self.metadata.coverage().inclusive_coverage_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            until = until.min(deadline);
+        }
+        for authorization in &self.display_authorizations {
+            until = until.min(authorization.expires_at().checked_sub_nanos(1).ok()?);
+        }
+        (candidate.coordinate().origin_committed_at() <= until).then_some(until)
+    }
+
+    fn display_current_through(&self) -> Option<Timestamp> {
+        self.candidate(LiveEventClass::Trade)
+            .into_iter()
+            .chain(self.best_quote_candidate())
+            .filter_map(|candidate| self.display_fresh_until(candidate))
+            .max()
     }
 }
 
@@ -553,7 +608,6 @@ pub(super) struct MarketDomainService {
     market_history: MarketHistoryReadCapability,
     market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
     product_research: Arc<crate::ResearchService>,
-    product_markets: crate::application::market_selection::MarketInvestmentReadCapability,
 }
 
 impl MarketDomainService {
@@ -565,7 +619,6 @@ impl MarketDomainService {
         market_history: MarketHistoryReadCapability,
         market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
         product_research: Arc<crate::ResearchService>,
-        product_markets: crate::application::market_selection::MarketInvestmentReadCapability,
     ) -> Self {
         Self {
             registry,
@@ -575,7 +628,6 @@ impl MarketDomainService {
             market_history,
             market_collection,
             product_research,
-            product_markets,
         }
     }
 }
@@ -1014,6 +1066,234 @@ async fn load_durable_market_evidence(
         }
     }
     DurableMarketEvidenceSet::try_new(bound_sources, routes, bindings.len())
+}
+
+/// Product fallback discovers original publications even when their source runtime is absent.
+/// It reuses the page's canonical definitions and grants Display use only.
+async fn load_retained_display_evidence(
+    research: &Arc<crate::ResearchService>,
+    records: &[MarketDataInstrumentRecord],
+    instruments: &[InstrumentId],
+    reference_at: Timestamp,
+    context: &RequestContext,
+) -> Result<DurableMarketEvidenceSet, ServiceError> {
+    use crate::application::research::{
+        MarketEventPointInTimeSelector, map_durable_market_ingest_error,
+    };
+    use market_squawk_data::{MarketEventUseRequest, ResearchUse, ResearchUseLimits};
+    let mut routes = Vec::new();
+    let mut sources = Vec::new();
+    let mut expected = 0usize;
+    for instrument in instruments {
+        ensure_live(context)?;
+        let record = records
+            .binary_search_by_key(instrument, |record| record.definition().instrument_id())
+            .ok()
+            .and_then(|index| records.get(index))
+            .ok_or(ServiceError::InvalidResult)?;
+        let kinds: &[LiveEventClass] = if record.definition().asset_class() == AssetClass::Crypto {
+            &DURABLE_CURRENT_EVENT_KINDS
+        } else {
+            &[LiveEventClass::Quote, LiveEventClass::Trade]
+        };
+        let mut after = None;
+        loop {
+            let page = research
+                .analytical()
+                .provider_market_event_durable_routes(
+                    *instrument,
+                    kinds,
+                    reference_at,
+                    reference_at,
+                    after.as_ref(),
+                    MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .map_err(map_durable_market_ingest_error)?;
+            let exhausted = page.len() < MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT;
+            after = page.last().cloned();
+            for route in page {
+                expected = expected
+                    .checked_add(1)
+                    .ok_or(ServiceError::ResourceExhausted)?;
+                sources.push(route.source_surface().clone());
+                let selector = MarketEventPointInTimeSelector::new(
+                    Arc::clone(research),
+                    route.dataset().clone(),
+                    route.source_surface().clone(),
+                );
+                let mut selections = Vec::new();
+                for kind in kinds {
+                    ensure_live(context)?;
+                    match selector
+                        .select_current(
+                            *instrument,
+                            route.venue_id().clone(),
+                            *kind,
+                            reference_at,
+                            reference_at,
+                            MAXIMUM_DURABLE_EVENT_CANDIDATES,
+                            context.deadline(),
+                            context.cancellation().clone(),
+                        )
+                        .await
+                    {
+                        Ok(Some(selection)) => selections.push(selection),
+                        Ok(None) => {}
+                        Err(error) => {
+                            match crate::application::market_selection::map_market_event_read_error(
+                                error,
+                            ) {
+                                ServiceError::Unavailable | ServiceError::Unauthorized => {
+                                    selections.clear();
+                                    break;
+                                }
+                                error => return Err(error),
+                            }
+                        }
+                    }
+                }
+                let Some(latest) = selections
+                    .iter()
+                    .flat_map(|receipt| receipt.selection().sources())
+                    .flat_map(|source| source.tied_candidates())
+                    .max_by_key(|candidate| durable_cohort_recency_key(candidate))
+                else {
+                    continue;
+                };
+                let provenance = market_event_provenance(latest.event());
+                let Some(metadata) = research
+                    .analytical()
+                    .retained_source_metadata(
+                        provenance.binding().source_id(),
+                        provenance.binding().metadata_revision(),
+                        reference_at,
+                        context.deadline(),
+                        context.cancellation(),
+                    )
+                    .map_err(map_durable_market_ingest_error)?
+                else {
+                    continue;
+                };
+                if !metadata.is_effective_at(reference_at) {
+                    continue;
+                }
+                let surface = SourceIdentifier::try_from(route.source_surface().as_str())
+                    .map_err(|_| ServiceError::InvalidResult)?;
+                let Some(mut evidence) = DurableMarketRouteEvidence::try_new(
+                    surface,
+                    metadata,
+                    route.source_surface().clone(),
+                    *instrument,
+                    route.venue_id().clone(),
+                    selections,
+                )?
+                else {
+                    continue;
+                };
+                let mut denied = false;
+                for receipt in &evidence.selections {
+                    let candidate = &receipt.selection().sources()[0].tied_candidates()[0];
+                    let provenance = market_event_provenance(candidate.event());
+                    if !evidence.metadata.is_effective_at(
+                        provenance
+                            .source_timestamp()
+                            .unwrap_or(provenance.received_at()),
+                    ) {
+                        denied = true;
+                        break;
+                    }
+                    let native_reference = match candidate.event() {
+                        MarketEvent::MarketDataQuote(quote) => Some(quote.reference()),
+                        MarketEvent::MarketDataTrade(trade) => Some(trade.reference()),
+                        _ => None,
+                    };
+                    if native_reference.is_some_and(|reference| {
+                        reference.definition_digest() != record.revision_digest()
+                    }) {
+                        denied = true;
+                        break;
+                    }
+                    match candidate.event() {
+                        MarketEvent::MarketDataQuote(quote) => {
+                            crate::application::market_selection::validate_native_reference(
+                                quote.reference(),
+                                record,
+                                provenance,
+                                reference_at,
+                            )?
+                        }
+                        MarketEvent::MarketDataTrade(trade) => {
+                            crate::application::market_selection::validate_native_reference(
+                                trade.reference(),
+                                record,
+                                provenance,
+                                reference_at,
+                            )?
+                        }
+                        _ => {}
+                    }
+                    let remaining = context.deadline().saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ServiceError::DeadlineExceeded);
+                    }
+                    let use_limits = ResearchUseLimits::try_new(
+                        1,
+                        market_squawk_data::MAX_RESEARCH_USE_GRAPH_NODES,
+                        market_squawk_data::MAX_RESEARCH_USE_EDGES,
+                        market_squawk_data::MAX_RESEARCH_USE_SOURCES,
+                        market_squawk_data::MAX_RESEARCH_USE_RETAINED_BYTES,
+                        remaining.min(std::time::Duration::from_secs(
+                            market_squawk_data::MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS,
+                        )),
+                        std::time::Duration::from_secs(
+                            market_squawk_data::MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
+                        ),
+                    )
+                    .map_err(|_| ServiceError::InvalidResult)?;
+                    let authorization = research
+                        .authorize_market_event_use(
+                            MarketEventUseRequest::try_new(
+                                receipt.selection().commit().clone(),
+                                vec![candidate.coordinate().clone()],
+                                ResearchUse::Display,
+                                use_limits,
+                            )
+                            .map_err(|_| ServiceError::InvalidResult)?,
+                            context.deadline(),
+                            context.cancellation(),
+                        )
+                        .await
+                        .map_err(
+                            crate::application::research::corporate_actions::map_research_error,
+                        )?
+                        .map_err(crate::application::research::map_research_use_error);
+                    match authorization {
+                        Ok(authorization)
+                            if authorization.research_use() == ResearchUse::Display
+                                && authorization.commit() == receipt.selection().commit()
+                                && system_timestamp()? < authorization.expires_at() =>
+                        {
+                            evidence.display_authorizations.push(authorization)
+                        }
+                        Ok(_) | Err(ServiceError::Unauthorized) => {
+                            denied = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !denied {
+                    routes.push(evidence);
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+    }
+    DurableMarketEvidenceSet::try_new(sources, routes, expected)
 }
 
 async fn load_durable_route_evidence(

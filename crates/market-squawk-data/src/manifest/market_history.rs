@@ -658,6 +658,7 @@ impl CanonicalMarketBarHistoryRequest {
 pub struct LatestCanonicalMarketBarHistoryWindowSelection {
     exact_request: CanonicalMarketBarHistoryRequest,
     lookup_digest: Sha256Digest,
+    selection: CompleteMarketBarHistorySelection,
 }
 
 impl LatestCanonicalMarketBarHistoryWindowSelection {
@@ -692,6 +693,11 @@ impl LatestCanonicalMarketBarHistoryWindowSelection {
     /// Returns the exact internally manifest-pinned request for the existing durable reader.
     pub const fn exact_request(&self) -> &CanonicalMarketBarHistoryRequest {
         &self.exact_request
+    }
+
+    /// Returns the already validated original publication and selected generation.
+    pub const fn selection(&self) -> &CompleteMarketBarHistorySelection {
+        &self.selection
     }
 
     /// Transfers the exact internally manifest-pinned request to the existing durable reader.
@@ -1372,7 +1378,7 @@ impl MarketBarHistoryPublicationReceipt {
 }
 
 /// Restart-safe selection of one complete window under an immutable descendant generation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompleteMarketBarHistorySelection {
     surface_requirement: MarketHistoryPriceSurfaceRequirement,
     knowledge_cutoff: Timestamp,
@@ -3112,6 +3118,7 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
     Ok(Some(LatestCanonicalMarketBarHistoryWindowSelection {
         exact_request,
         lookup_digest,
+        selection: validated,
     }))
 }
 

@@ -235,12 +235,7 @@ pub(super) fn product_row(
         })
         .transpose()?;
     let as_of = current_price
-        .and_then(|price| {
-            price
-                .get("currentThrough")
-                .filter(|value| !value.is_null())
-                .or_else(|| price.get("observedAt").filter(|value| !value.is_null()))
-        })
+        .and_then(|price| price.get("observedAt").filter(|value| !value.is_null()))
         .map(|value| canonical_time(value).map(Value::String))
         .transpose()?;
     if price.is_some() != as_of.is_some() {

@@ -1334,7 +1334,7 @@ fn market_provenance(event: &MarketEvent) -> &LiveProvenance {
     }
 }
 
-fn validate_native_reference(
+pub(crate) fn validate_native_reference(
     reference: &market_squawk_domain::MarketDataReference,
     definition: &market_squawk_data::MarketDataInstrumentRecord,
     provenance: &LiveProvenance,

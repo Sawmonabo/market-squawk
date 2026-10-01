@@ -1199,7 +1199,7 @@ impl LocalProduct {
                     Arc::clone(&research),
                 ),
             ),
-            market: product_markets.clone(),
+            market: product_markets,
             forecasts: model.clone(),
             valuations: fair_value.automatic_read_capability(),
             valuation_sources: forecast_sources.clone(),
@@ -1245,7 +1245,6 @@ impl LocalProduct {
             portfolio.paper_publisher(),
             Arc::clone(&market_collection),
             Arc::clone(&research),
-            product_markets,
         );
         let portfolio_candidate_resolution =
             paper.candidate_resolution_factory(Arc::clone(&research))?;

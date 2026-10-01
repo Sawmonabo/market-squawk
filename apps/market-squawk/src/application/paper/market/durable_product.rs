@@ -1,10 +1,8 @@
 //! Catalog-backed product discovery, durable marks and qualified SnapshotDisplay fallback.
 
 use super::*;
-use crate::application::market_selection::{
-    MarketInvestmentReadReceipt, product::MarketProductSelectionReadCapability,
-};
-use crate::application::research::{map_catalog_error, map_durable_market_ingest_error};
+use crate::application::market_selection::product::MarketProductSelectionReadCapability;
+use crate::application::research::map_catalog_error;
 use market_squawk_services::ServiceLimits;
 use serde_json::json;
 
@@ -31,7 +29,10 @@ impl<'a> ProductReadProgress<'a> {
             started: now,
             stage_started: now,
             stage: "collection_snapshot",
-            remaining_at_stage_entry_ms: context.deadline().saturating_duration_since(now).as_millis(),
+            remaining_at_stage_entry_ms: context
+                .deadline()
+                .saturating_duration_since(now)
+                .as_millis(),
             instrument_id: None,
             current_completed: 0,
             fallback_completed: 0,
@@ -40,6 +41,7 @@ impl<'a> ProductReadProgress<'a> {
     }
 
     fn enter(&mut self, stage: &'static str, instrument_id: Option<InstrumentId>) {
+        self.trace_completed_stage();
         self.stage = stage;
         self.instrument_id = instrument_id;
         self.stage_started = Instant::now();
@@ -52,7 +54,36 @@ impl<'a> ProductReadProgress<'a> {
 
     fn finish<T>(&mut self, result: Result<T, ServiceError>) -> Result<T, ServiceError> {
         self.completed = result.is_ok();
+        if self.completed {
+            self.trace_completed_stage();
+        }
         result
+    }
+
+    fn trace_completed_stage(&self) {
+        if !matches!(
+            self.stage,
+            "population"
+                | "display_read"
+                | "retained_display_read"
+                | "previous_close"
+                | "retained_routes_and_events"
+                | "retained_execution_terms"
+                | "retained_projection"
+        ) {
+            return;
+        }
+        let now = Instant::now();
+        tracing::debug!(
+            request_id = ?self.context.request_id(),
+            operation = self.operation,
+            stage = self.stage,
+            elapsed_ms = %now.duration_since(self.started).as_millis(),
+            stage_elapsed_ms = %now.duration_since(self.stage_started).as_millis(),
+            remaining_at_stage_entry_ms = %self.remaining_at_stage_entry_ms,
+            instrument_id = ?self.instrument_id,
+            "product market read stage completed"
+        );
     }
 }
 
@@ -61,6 +92,7 @@ impl Drop for ProductReadProgress<'_> {
         if !self.completed {
             let now = Instant::now();
             tracing::warn!(
+                request_id = ?self.context.request_id(),
                 operation = self.operation,
                 stage = self.stage,
                 elapsed_ms = %now.duration_since(self.started).as_millis(),
@@ -111,13 +143,15 @@ impl MarketDomainService {
                 })
                 .collect();
             ensure_live(context)?;
-            return progress.finish(TypedToolResult::try_new(
-                json!({"revision": collection.revision.to_string(), "entries": entries}),
-                entries.len(),
-                ToolResultMetadata::complete_not_applicable(),
-                limits,
-            )
-            .map_err(|_| ServiceError::ResourceExhausted));
+            return progress.finish(
+                TypedToolResult::try_new(
+                    json!({"revision": collection.revision.to_string(), "entries": entries}),
+                    entries.len(),
+                    ToolResultMetadata::complete_not_applicable(),
+                    limits,
+                )
+                .map_err(|_| ServiceError::ResourceExhausted),
+            );
         }
         let selections = MarketProductSelectionReadCapability::new(
             Arc::clone(&self.product_research),
@@ -160,7 +194,9 @@ impl MarketDomainService {
                 argument("pageToken"),
             )?;
             ensure_live(context)?;
-            return progress.finish(product::product_result(content, available, has_more, limits));
+            return progress.finish(product::product_result(
+                content, available, has_more, limits,
+            ));
         }
         if request.name() == MARKET_GET_HISTORY {
             let token = argument("historyToken").ok_or(ServiceError::InvalidRequest)?;
@@ -197,79 +233,57 @@ impl MarketDomainService {
                 argument("pageToken"),
             )?
         };
-        let mut rows = Vec::new();
-        let mut missing = Vec::new();
-        rows.try_reserve_exact(page.instrument_ids().len())
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        missing
-            .try_reserve_exact(page.instrument_ids().len())
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        for instrument_id in page.instrument_ids() {
-            progress.enter("current_market_read", Some(*instrument_id));
-            ensure_live(context)?;
-            let record = records
-                .binary_search_by_key(instrument_id, |record| record.definition().instrument_id())
-                .ok()
-                .and_then(|index| records.get(index))
-                .ok_or(ServiceError::InvalidResult)?;
-            let receipt = match self
-                .product_markets
-                .read(
-                    *instrument_id,
-                    reference_at,
-                    context.deadline(),
-                    context.cancellation().clone(),
-                )
-                .await
-            {
-                Ok(receipt) => receipt,
-                Err(ServiceError::Unavailable | ServiceError::Unauthorized) => None,
-                Err(error) => return Err(error),
-            };
-            progress.enter("durable_row_projection", Some(*instrument_id));
-            let row = receipt
-                .as_ref()
-                .map(|receipt| self.durable_product_row(receipt, record, reference_at, context))
-                .transpose()?
-                .flatten();
-            if let Some(row) = row {
-                rows.push(row);
-            } else {
-                missing.push(*instrument_id);
-            }
-            progress.current_completed += 1;
-        }
-        // SnapshotDisplay never issues an analytical receipt or sizing authority.
+        let mut instrument_ids = page.instrument_ids().to_vec();
+        instrument_ids.sort_unstable();
+        progress.enter("display_read", None);
+        let mut rows = self
+            .product_display_rows(&records, &instrument_ids, reference_at, limits, context)
+            .await?;
+        let missing = instrument_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                !rows
+                    .iter()
+                    .any(|row| row_instrument(row) == Some(*id) && has_current_price(row))
+            })
+            .collect::<Vec<_>>();
+        progress.current_completed = instrument_ids.len() - missing.len();
         if !missing.is_empty() {
-            missing.sort_unstable();
-            progress.enter("display_fallback", None);
-            let display = match self
-                .product_display_rows(&records, &missing, reference_at, limits, context)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ServiceError::Unavailable | ServiceError::Unauthorized) => Vec::new(),
-                Err(error) => return Err(error),
-            };
+            progress.enter("retained_display_read", None);
+            let retained = self
+                .product_retained_rows(&records, &missing, reference_at, limits, context)
+                .await?;
             for instrument_id in missing {
-                progress.enter("fallback_selection", Some(instrument_id));
-                let selected = display.iter().find(|row| {
-                    row.get("instrumentId")
-                        .and_then(Value::as_str)
-                        .and_then(|id| id.parse::<InstrumentId>().ok())
-                        == Some(instrument_id)
-                });
-                let selected = selected.filter(|row| {
-                    row.get("currentPrice")
-                        .is_some_and(|price| !price.is_null())
-                        && !matches!(
-                            row.get("availability").and_then(Value::as_str),
-                            Some("stale" | "unavailable")
-                        )
-                });
-                let row = if let Some(selected) = selected {
-                    Some(selected.clone())
-                } else {
+                let retained_row = retained
+                    .iter()
+                    .find(|row| row_instrument(row) == Some(instrument_id));
+                let row_index = rows
+                    .iter()
+                    .position(|row| row_instrument(row) == Some(instrument_id));
+                let mut row =
+                    if let Some(retained) = retained_row.filter(|row| has_current_price(row)) {
+                        retained.clone()
+                    } else {
+                        row_index
+                            .map(|index| rows[index].clone())
+                            .or_else(|| retained_row.cloned())
+                            .unwrap_or_else(|| {
+                                json!({"instrumentId": instrument_id.to_string(),
+                            "currentPrice": Value::Null, "availability": "unavailable"})
+                            })
+                    };
+                if !has_current_price(&row) {
+                    // Keep the original quote, depth and market clocks when a completed close
+                    // supplies the compact card's price. A close never becomes a live quote.
+                    if let Some(retained) = retained_row {
+                        if row.get("quote").is_none_or(|quote| quote.is_null())
+                            || row.get("availability").and_then(Value::as_str)
+                                == Some("unavailable")
+                        {
+                            row = retained.clone();
+                        }
+                    }
                     let record = records
                         .binary_search_by_key(&instrument_id, |record| {
                             record.definition().instrument_id()
@@ -278,19 +292,40 @@ impl MarketDomainService {
                         .and_then(|index| records.get(index))
                         .ok_or(ServiceError::InvalidResult)?;
                     progress.enter("previous_close", Some(instrument_id));
-                    match self
+                    let close = match self
                         .previous_close_product_row(record, reference_at, context)
                         .await
                     {
-                        Ok(row) => row,
+                        Ok(close) => close,
                         Err(ServiceError::Unavailable | ServiceError::Unauthorized) => None,
                         Err(error) => return Err(error),
+                    };
+                    if let Some(close) = close {
+                        row["currentPrice"] = close["currentPrice"].clone();
+                        row["availability"] = close["availability"].clone();
                     }
-                };
-                rows.push(row.unwrap_or_else(|| json!({
-                    "instrumentId": instrument_id.to_string(), "currentPrice": Value::Null, "availability": "unavailable",
-                })));
+                }
+                if let Some(index) = row_index {
+                    rows[index] = row;
+                } else {
+                    rows.push(row);
+                }
                 progress.fallback_completed += 1;
+            }
+        }
+        // Other instruments may have required retained reads after the actor snapshot.
+        // Keep its observation details, but never return an expired observation as current.
+        let projected_at = system_timestamp()?;
+        for row in &mut rows {
+            if row.get("availability").and_then(Value::as_str) != Some("end_of_day")
+                && row["currentPrice"]["currentThrough"]
+                    .as_str()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .and_then(|value| value.timestamp_nanos_opt())
+                    .is_some_and(|until| projected_at.unix_nanos() > until)
+            {
+                row["currentPrice"] = Value::Null;
+                row["availability"] = json!("stale");
             }
         }
         progress.enter("page_projection", None);
@@ -325,72 +360,19 @@ impl MarketDomainService {
                     json!({"symbol": choice.symbol, "kept": choice.kept, "market": market})
                 })
                 .collect();
-            return progress.finish(TypedToolResult::try_new(
-                json!({"revision": collection.revision.to_string(), "entries": entries}),
-                entries.len(),
-                ToolResultMetadata::complete_not_applicable(),
-                limits,
-            )
-            .map_err(|_| ServiceError::ResourceExhausted));
+            return progress.finish(
+                TypedToolResult::try_new(
+                    json!({"revision": collection.revision.to_string(), "entries": entries}),
+                    entries.len(),
+                    ToolResultMetadata::complete_not_applicable(),
+                    limits,
+                )
+                .map_err(|_| ServiceError::ResourceExhausted),
+            );
         }
-        progress.finish(product::product_result(content, available, has_more, limits))
-    }
-
-    fn durable_product_row(
-        &self,
-        receipt: &MarketInvestmentReadReceipt,
-        record: &MarketDataInstrumentRecord,
-        reference_at: Timestamp,
-        context: &RequestContext,
-    ) -> Result<Option<Value>, ServiceError> {
-        let [selected_definition] = receipt.market_definitions().records() else {
-            return Err(ServiceError::InvalidResult);
-        };
-        if selected_definition.revision_digest() != record.revision_digest()
-            || receipt.instrument_id() != record.definition().instrument_id()
-            || receipt.currency() != record.definition().quote_currency()
-        {
-            return Err(ServiceError::InvalidResult);
-        }
-        let observation = receipt
-            .observation()
-            .map_err(|_| ServiceError::InvalidResult)?;
-        let mark = observation.mark();
-        let now = system_timestamp()?;
-        if mark.fresh_until().is_none_or(|until| until < now) {
-            return Ok(None);
-        }
-        let event = receipt.event().map_err(|_| ServiceError::InvalidResult)?;
-        let binding = market_event_provenance(event).binding();
-        let metadata = self
-            .product_research
-            .analytical()
-            .retained_source_metadata(
-                binding.source_id(),
-                binding.metadata_revision(),
-                reference_at,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .map_err(map_durable_market_ingest_error)?
-            .ok_or(ServiceError::InvalidResult)?;
-        if metadata.source_id() != binding.source_id()
-            || metadata.revision() != binding.metadata_revision()
-            || !metadata.is_effective_at(reference_at)
-        {
-            return Err(ServiceError::InvalidResult);
-        }
-        let availability = match metadata.coverage().delay() {
-            CoverageDelay::RealTime => "live",
-            CoverageDelay::Delayed(_) => "delayed",
-            CoverageDelay::NotApplicable => "stored",
-            CoverageDelay::Unknown => "unavailable",
-        };
-        Ok(Some(json!({
-            "instrumentId": receipt.instrument_id().to_string(), "availability": availability,
-            "currentPrice": {"value": mark.value().normalize().to_string(), "currency": mark.currency().as_str(),
-                "observedAt": timestamp_value(observation.timestamps().effective_at())},
-        })))
+        progress.finish(product::product_result(
+            content, available, has_more, limits,
+        ))
     }
 
     /// Completed daily closes are presentation evidence, never current mark authority.
@@ -424,7 +406,9 @@ impl MarketDomainService {
         Ok(Some(json!({
             "instrumentId": instrument_id.to_string(), "availability": "end_of_day",
             "currentPrice": {"value": close.close().amount().normalize().to_string(),
-                "currency": close.currency().as_str(), "currentThrough": timestamp_value(close.session_close())},
+                "currency": close.currency().as_str(),
+                "observedAt": timestamp_value(close.session_close()),
+                "currentThrough": timestamp_value(close.session_close())},
         })))
     }
 
@@ -432,7 +416,7 @@ impl MarketDomainService {
         &self,
         records: &[MarketDataInstrumentRecord],
         instrument_ids: &[InstrumentId],
-        reference_at: Timestamp,
+        _reference_at: Timestamp,
         limits: ServiceLimits,
         context: &RequestContext,
     ) -> Result<Vec<Value>, ServiceError> {
@@ -450,10 +434,7 @@ impl MarketDomainService {
             .await?;
         progress.enter("stream_collection", None);
         let mut streams = collect_streams(&snapshots, &filters, context)?;
-        progress.enter("durable_market_evidence", None);
-        let mut durable =
-            load_durable_market_evidence(self.registry.as_ref(), &filters, reference_at, context)
-                .await?;
+        let durable = DurableMarketEvidenceSet::default();
         progress.enter("display_instrument_ids", None);
         let display_ids =
             load_display_instrument_ids(self.registry.as_ref(), &filters, context).await?;
@@ -466,16 +447,25 @@ impl MarketDomainService {
         )
         .await?;
         progress.enter("instrument_definitions", None);
-        let definitions = self
-            .instrument_definitions
-            .latest(
-                instrument_ids,
-                product::MAXIMUM_PRODUCT_MARKET_ROWS,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .map_err(map_catalog_error)?;
-        progress.enter("display_route_filtering", None);
+        let mut tick_ids = streams
+            .iter()
+            .map(|view| view.route.route().instrument())
+            .chain(kraken.iter().map(|view| view.key().instrument_id()))
+            .collect::<Vec<_>>();
+        tick_ids.sort_unstable();
+        tick_ids.dedup();
+        let definitions = if tick_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.instrument_definitions
+                .latest(
+                    &tick_ids,
+                    product::MAXIMUM_PRODUCT_MARKET_ROWS,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .map_err(map_catalog_error)?
+        };
         let executable = |id| {
             definitions
                 .iter()
@@ -483,24 +473,6 @@ impl MarketDomainService {
         };
         streams.retain(|view| executable(view.route.route().instrument()));
         kraken.retain(|view| executable(view.key().instrument_id()));
-        // Native Money is handled by its exact neutral receipt above. Only legacy tick events
-        // enter the original presentation conversion with their genuine execution definition.
-        durable.routes.retain(|route| {
-            executable(route.instrument_id)
-                && route.selections.iter().all(|receipt| {
-                    receipt
-                        .selection()
-                        .sources()
-                        .iter()
-                        .flat_map(|source| source.tied_candidates())
-                        .all(|candidate| {
-                            !matches!(
-                                candidate.event(),
-                                MarketEvent::MarketDataQuote(_) | MarketEvent::MarketDataTrade(_)
-                            )
-                        })
-                })
-        });
         let kraken_refs = kraken_projection_refs(&kraken)?;
         progress.enter("order_level_snapshots", None);
         let order_level =
@@ -508,15 +480,37 @@ impl MarketDomainService {
         // Current presentation is selected when the actor handles the read, after slower
         // catalog preparation. Historical queries above retain the original request cutoff.
         progress.enter("display_snapshots", None);
-        let display_batches = load_display_snapshots(
-            self.registry.as_ref(),
-            &display_ids,
-            DisplayMarketReadTime::LatestDisplay,
-            context,
-        )
-        .await?;
+        let mut display_batches = Vec::new();
+        let maximum_sources = NonZeroUsize::new(MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT)
+            .ok_or(ServiceError::Internal)?;
+        for instrument in &display_ids {
+            match self
+                .registry
+                .display_snapshots_for_instrument(
+                    *instrument,
+                    maximum_sources,
+                    DisplayMarketReadTime::LatestDisplay,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await
+            {
+                Ok(batch) => display_batches.push(batch),
+                Err(ServiceError::Unavailable | ServiceError::Unauthorized) => {}
+                Err(error) => return Err(error),
+            }
+        }
         progress.enter("display_projection", None);
-        let display = display_snapshot_refs(&display_batches, &filters)?;
+        let mut display = display_snapshot_refs(&display_batches, &filters)?;
+        display.retain(|snapshot| {
+            records
+                .binary_search_by_key(&snapshot.lease().key().instrument_id(), |record| {
+                    record.definition().instrument_id()
+                })
+                .ok()
+                .and_then(|index| records.get(index))
+                .is_some_and(|record| snapshot.matches_definition_record(record))
+        });
         let display_selected_at = system_timestamp()?;
         let policies = build_surface_policies(
             &snapshots,
@@ -557,4 +551,141 @@ impl MarketDomainService {
             .ok_or(ServiceError::InvalidResult);
         progress.finish(rows)
     }
+
+    async fn product_retained_rows(
+        &self,
+        records: &[MarketDataInstrumentRecord],
+        instruments: &[InstrumentId],
+        reference_at: Timestamp,
+        limits: ServiceLimits,
+        context: &RequestContext,
+    ) -> Result<Vec<Value>, ServiceError> {
+        let mut progress = ProductReadProgress::new("retained_market_display", context);
+        progress.enter("retained_routes_and_events", None);
+        let durable = load_retained_display_evidence(
+            &self.product_research,
+            records,
+            instruments,
+            reference_at,
+            context,
+        )
+        .await?;
+        let mut tick_ids = durable
+            .routes
+            .iter()
+            .filter(|route| {
+                route
+                    .selections
+                    .iter()
+                    .flat_map(|receipt| receipt.selection().sources())
+                    .flat_map(|source| source.tied_candidates())
+                    .any(|candidate| {
+                        matches!(
+                            candidate.event(),
+                            MarketEvent::Quote(_)
+                                | MarketEvent::Trade(_)
+                                | MarketEvent::BookSnapshot(_)
+                                | MarketEvent::BookDelta(_)
+                        )
+                    })
+            })
+            .map(|route| route.instrument_id)
+            .collect::<Vec<_>>();
+        tick_ids.sort_unstable();
+        tick_ids.dedup();
+        progress.enter("retained_execution_terms", None);
+        let definitions = if tick_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.instrument_definitions
+                .latest(
+                    &tick_ids,
+                    product::MAXIMUM_PRODUCT_MARKET_ROWS,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .map_err(map_catalog_error)?
+        };
+        let mut policies = Vec::new();
+        let selected_at = system_timestamp()?;
+        let operations = presentation_surface_operations()?;
+        for route in &durable.routes {
+            for asset_class in route.metadata.coverage().asset_classes() {
+                push_surface_policy(
+                    &mut policies,
+                    &route.surface_id,
+                    &route.metadata,
+                    *asset_class,
+                    operations,
+                    surface_rights(&route.metadata, operations, selected_at)?,
+                )?;
+            }
+            if route
+                .display_authorizations
+                .iter()
+                .any(|authorization| selected_at >= authorization.expires_at())
+            {
+                return Err(ServiceError::Unauthorized);
+            }
+        }
+        let page_records = records
+            .iter()
+            .filter(|record| {
+                instruments
+                    .binary_search(&record.definition().instrument_id())
+                    .is_ok()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        progress.enter("retained_projection", None);
+        let result = build_market_overview_result(
+            &[],
+            &MarketFilters {
+                instruments: instruments.to_vec(),
+                sources: Vec::new(),
+                time_range: None,
+            },
+            &definitions,
+            &page_records,
+            &[],
+            &[],
+            &policies,
+            &[],
+            &durable,
+            selected_at,
+            durable.complete_for(&[]),
+            limits,
+            context,
+        )?;
+        let now = system_timestamp()?;
+        if durable
+            .routes
+            .iter()
+            .flat_map(|route| &route.display_authorizations)
+            .any(|authorization| now >= authorization.expires_at())
+        {
+            return Err(ServiceError::Unauthorized);
+        }
+        progress.finish(
+            result
+                .structured_content()
+                .as_array()
+                .cloned()
+                .ok_or(ServiceError::InvalidResult),
+        )
+    }
+}
+
+fn row_instrument(row: &Value) -> Option<InstrumentId> {
+    row.get("instrumentId")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+fn has_current_price(row: &Value) -> bool {
+    row.get("currentPrice")
+        .is_some_and(|price| !price.is_null())
+        && !matches!(
+            row.get("availability").and_then(Value::as_str),
+            Some("stale" | "unavailable")
+        )
 }

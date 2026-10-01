@@ -103,7 +103,6 @@ pub struct PaperApplicationServices {
     market_history: MarketHistoryReadCapability,
     market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
     product_research: Arc<crate::ResearchService>,
-    product_markets: super::market_selection::MarketInvestmentReadCapability,
 }
 
 /// Market-only candidate factory retained until durable workspace setup is available.
@@ -279,7 +278,6 @@ impl PaperApplicationServices {
         portfolio_publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
         market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
         product_research: Arc<crate::ResearchService>,
-        product_markets: super::market_selection::MarketInvestmentReadCapability,
     ) -> Self {
         Self {
             controller: Arc::new(PaperController::new(
@@ -298,7 +296,6 @@ impl PaperApplicationServices {
             market_history,
             market_collection,
             product_research,
-            product_markets,
         }
     }
 
@@ -326,7 +323,6 @@ impl PaperApplicationServices {
             self.market_history.clone(),
             Arc::clone(&self.market_collection),
             Arc::clone(&self.product_research),
-            self.product_markets.clone(),
         ))
     }
 
