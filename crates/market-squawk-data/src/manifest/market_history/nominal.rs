@@ -332,6 +332,8 @@ impl MarketBarHistoryPublicationCandidate {
             instrument_id: graph.instrument_id(),
             instrument_revision_digest: sha256_evidence(graph.instrument_revision_digest())?,
             admitted_plan_digest: sha256_evidence(graph.admitted_plan_digest())?,
+            identity_selection: None,
+            symbol_asof: None,
             provider_instrument_id: graph.provider_instrument_id().clone(),
             venue_id: graph.venue_id().clone(),
             feed: SourceIdentifier::try_from(if adjustment == MarketBarAdjustment::Raw {

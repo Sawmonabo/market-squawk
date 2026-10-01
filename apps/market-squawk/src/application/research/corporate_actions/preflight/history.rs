@@ -11,8 +11,9 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     BarTimestampBasis, MarketBarAdjustment, MarketBarObservation, MarketBarSessionKind,
-    ProviderInstrumentId, SchemaVersion, SourceIdentifier,
+    ProviderInstrumentId, SchemaVersion, SourceId, SourceIdentifier, VenueSymbol,
 };
+use market_squawk_sources::{CatalogProviderIdentityAuthority as _, ProviderNativeIdentityRequest};
 use serde::Deserialize;
 
 pub(super) struct PublishedAnchorHistory {
@@ -38,27 +39,83 @@ impl SourceActionPreparationCapability {
         original: &MarketBarObservation,
         context: &RequestContext,
     ) -> Result<PublishedAnchorHistory, ServiceError> {
-        let exact = original.time_semantics().timestamped_period().ok_or(ServiceError::Unavailable)?;
-        let published = self.publish_canonical_history(runtime, plan, instrument, context).await?;
+        let exact = original
+            .time_semantics()
+            .timestamped_period()
+            .ok_or(ServiceError::Unavailable)?;
+        let published = self
+            .publish_canonical_history(runtime, plan, instrument, context)
+            .await?;
         if published.provider_instrument != *original.provider_instrument_id()
             || original.context().provenance().venue_id() != Some(&published.venue)
-            || published.feed != *original.feed() || published.interval != *original.interval()
+            || published.feed != *original.feed()
+            || published.interval != *original.interval()
             || published.timestamp_basis != exact.timestamp_basis()
             || published.session_kind != exact.session().kind()
-            || published.session_ruleset != *exact.session().ruleset() {
+            || published.session_ruleset != *exact.session().ruleset()
+        {
             return Err(ServiceError::Unavailable);
         }
         Ok(published)
     }
 
     pub(super) async fn publish_canonical_history(
-        &self, runtime: &AlpacaHistoricalRuntimeCapability,
-        plan: AlpacaHistoricalEquityPreflightPlan, instrument: &MarketDataInstrumentRecord,
+        &self,
+        runtime: &AlpacaHistoricalRuntimeCapability,
+        plan: AlpacaHistoricalEquityPreflightPlan,
+        instrument: &MarketDataInstrumentRecord,
         context: &RequestContext,
     ) -> Result<PublishedAnchorHistory, ServiceError> {
         check(context)?;
-        let provider_instrument = ProviderInstrumentId::try_from(plan.mapping().symbol()).map_err(|_| ServiceError::InvalidResult)?;
-        let interval = plan.timeframe().provider_identifier().map_err(|_| ServiceError::InvalidResult)?;
+        let selected_at = now()?;
+        let namespace = SourceId::try_from("alpaca-basic-asset-reference-v1")
+            .map_err(|_| ServiceError::Internal)?;
+        let mut native_ids =
+            instrument
+                .definition()
+                .provider_identities()
+                .iter()
+                .filter(|identity| {
+                    identity.source_id() == &namespace
+                        && instrument.definition().provider_identity_at(
+                            identity.source_id(),
+                            identity.provider_instrument_id(),
+                            selected_at,
+                        ) == Some(*identity)
+                });
+        let native_id = native_ids.next().ok_or(ServiceError::Unavailable)?;
+        if native_ids.next().is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let native = ProviderNativeIdentityRequest {
+            namespace,
+            provider_instrument_id: native_id.provider_instrument_id().clone(),
+            instrument: instrument.definition().instrument_id(),
+            venue: VenueId::try_from("iex").map_err(|_| ServiceError::Internal)?,
+            venue_symbol: VenueSymbol::try_from(plan.mapping().symbol())
+                .map_err(|_| ServiceError::InvalidResult)?,
+            knowledge_at: selected_at,
+            effective_at: selected_at,
+        };
+        let plan = plan
+            .try_with_native_identity(native.clone())
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let identities = self.research.market_data_instruments().clone();
+        let deadline = context.deadline();
+        let identity = self
+            .research
+            .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+                identities.select_current(&native, deadline, &cancellation)
+            })
+            .await
+            .map_err(map_research_error)?
+            .map_err(|_| controlled(context, ServiceError::Unavailable))?;
+        let provider_instrument = ProviderInstrumentId::try_from(plan.mapping().symbol())
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let interval = plan
+            .timeframe()
+            .provider_identifier()
+            .map_err(|_| ServiceError::InvalidResult)?;
         let range = (plan.start(), plan.end());
         let adjustment = match plan.adjustment() {
             AlpacaAdjustment::Raw => MarketBarAdjustment::Raw,
@@ -80,9 +137,13 @@ impl SourceActionPreparationCapability {
                 instrument.definition().clone(),
                 context.deadline(),
                 context.cancellation(),
+                identity,
             )
             .await
-            .map_err(|_| controlled(context, ServiceError::Unavailable))?;
+            .map_err(|error| {
+                tracing::warn!(?error, "historical plan admission failed");
+                controlled(context, ServiceError::Unavailable)
+            })?;
         let authorized = self
             .runtime
             .authorize_alpaca_historical_plan_receipt(
@@ -91,7 +152,10 @@ impl SourceActionPreparationCapability {
                 context.cancellation(),
             )
             .await
-            .map_err(|_| controlled(context, ServiceError::Unavailable))?;
+            .map_err(|error| {
+                tracing::warn!(?error, "historical plan receipt authorization failed");
+                controlled(context, ServiceError::Unavailable)
+            })?;
         let provider_dataset = authorized.provider_dataset().clone();
         let analytical_dataset = authorized.analytical_dataset().clone();
         let semantics = authorized.series_semantics().clone();
@@ -180,9 +244,13 @@ impl SourceActionPreparationCapability {
     }
 
     pub(super) async fn reopen_published_history(
-        &self, original: PublishedAnchorHistory, cutoff: Timestamp, context: &RequestContext,
+        &self,
+        original: PublishedAnchorHistory,
+        cutoff: Timestamp,
+        context: &RequestContext,
     ) -> Result<CompleteMarketBarHistoryOutput, ServiceError> {
-        self.reopen_published_history_ref(&original, cutoff, context).await
+        self.reopen_published_history_ref(&original, cutoff, context)
+            .await
     }
 
     pub(super) async fn reopen_published_history_ref(

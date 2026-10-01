@@ -264,6 +264,7 @@ impl AlpacaHistoricalRuntimeCapability {
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
+        identity: Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
     ) -> Result<DiscoveryBatch, ExtractionSourceError> {
         let _operation = self.inner.admit().map_err(map_capability_error)?;
         self.validate_current(&cancellation)
@@ -274,6 +275,7 @@ impl AlpacaHistoricalRuntimeCapability {
             vec![canonical_instrument],
             bar_time_authority,
             preflight,
+            vec![identity],
         )
         .map_err(|_error| SourceError::InvalidProtocolState)?;
         let extracted = tokio::select! {
@@ -311,6 +313,7 @@ impl AlpacaHistoricalRuntimeCapability {
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
+        identity: Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
     ) -> Result<ExtractionBatch, ExtractionSourceError> {
         let _operation = self.inner.admit().map_err(map_capability_error)?;
         self.validate_current(&cancellation)
@@ -323,6 +326,7 @@ impl AlpacaHistoricalRuntimeCapability {
             preflight,
             authority,
             request,
+            identity,
         ));
         Err(SourceError::InvalidProtocolState.into())
     }
@@ -343,6 +347,7 @@ impl AlpacaHistoricalRuntimeCapability {
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
+        identity: Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
     ) -> Result<AlpacaHistoricalExtractionWithCapture, ExtractionSourceError> {
         let _operation = self.inner.admit().map_err(map_capability_error)?;
         self.validate_current(&cancellation)
@@ -361,7 +366,12 @@ impl AlpacaHistoricalRuntimeCapability {
             Sha256::digest(&canonical_instrument_json).into(),
         );
         let history_capture_semantic = bar_time_authority
-            .history_capture_semantic(instrument_revision_digest, admitted_plan_digest)
+            .history_capture_semantic(
+                instrument_revision_digest,
+                admitted_plan_digest,
+                identity.as_ref(),
+                &preflight,
+            )
             .map_err(|_error| SourceError::InvalidProtocolState)?;
         self.validate_current(&cancellation)
             .await
@@ -372,6 +382,7 @@ impl AlpacaHistoricalRuntimeCapability {
             vec![canonical_instrument],
             time_authority,
             preflight,
+            vec![identity],
         )
         .map_err(|_error| SourceError::InvalidProtocolState)?;
         let extracted = tokio::select! {
@@ -401,6 +412,7 @@ impl AlpacaHistoricalRuntimeCapability {
         config: &AlpacaHistoricalEquityConfig,
         canonical_instrument: &MarketDataInstrumentDefinition,
         batch: &ExtractionBatch,
+        identity: &dyn market_squawk_sources::CurrentCatalogProviderIdentity,
     ) -> Result<SourceIdentifier, AlpacaHistoricalPlanOperationError> {
         let _operation = self.inner.admit()?;
         self.validate_current_now()?;
@@ -409,6 +421,7 @@ impl AlpacaHistoricalRuntimeCapability {
                 config,
                 canonical_instrument,
                 batch,
+                identity,
             )?;
         self.validate_current_now()?;
         Ok(identifier)

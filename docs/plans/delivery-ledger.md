@@ -2,7 +2,7 @@
 
 ## Active startup, optional-lock and previous-close integration — 2026-09-30
 
-Current pushed Desktop reconnect checkpoint: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
+Current pushed request-admission checkpoint: `e092a17b` (PR #43 comment 5923423225); Desktop reconnect: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
 History integration audit base: `a0e8b77b`; both preserved on `feature/v1-installed-product-experience`.
 One primary worktree, three local branches and three origin branches; no linked worktrees.
 Original session and recovery backups remain protected. No CI or release gate has run for this wave.
@@ -14,6 +14,10 @@ Lock/Forget, and a user-selected reauthentication interval. Saved pages remain u
 supersedes forced password storage in development and any conflicting import-only guidance.
 
 ### Current outcomes and verification
+
+Coherent retained-history checkpoint: adapter request identity/asof, shared capture contract, catalog publication/reopen validation and all application producers/consumers are integrated together. The complete-history critical case now also verifies actual native calendar rejoin at the inclusive daily boundary before/after restart (1.37s). Heap-owned extraction payloads preserve serialization and avoid the observed stack crash. Existing V1 schema/checksum updated in place, no migration path; original local catalog recovery backup retained. This checkpoint is critically verified, not live price completion: native source retry succeeds but separate calendar preparation currently rejects before history publication. Display warming/previous-close UI remains in pending working-tree integration.
+
+Request admission is pushed in `e092a17b` (PR #43 comment 5923423225). Its native build passes (6m); all 17 routes load without query errors again. Real Alpaca retry now succeeds with applied/available receipt and does not terminate on concurrency exhaustion. Starter history still reports InvalidResult with zero history publications in the preserved catalog; lead is tracing the remaining preparation edge. This does not establish live-price completion. The real native-session boundary/restart regression passes (1.37s; `native-history-rejoin-critical.log`). Home remains Ready/connected with zero active-query errors after the successful live retry; prices remain unavailable (`request-admission-after-live-retry.json`).
 
 Request-slot waiting passes the focused overlap/cancellation/uncharged-expiry case (0.03s). One serialized native build is running (`request-admission-native-build.log`); live price availability remains unproven. Lead owns build/native actions and integration. Astra `calendar_currentness_failure` has a read-only integration trace of the retained history identity/publication/previous-close changes; no file edits, builds or additional review round. This trace identifies concrete consumer gaps before the coherent history checkpoint.
 
@@ -46,6 +50,12 @@ Evidence under `.agents/tmp/v1-first-stock/`:
 `calendar-currentness-diagnostic-retry.json`, `credential-access-diagnostic-service.log`.
 
 ### Dependency and ownership
+
+Confirmed presentation defect: an absent event kind yields a valid complete empty selection, but durable route assembly treats it as InvalidResult. Astra `research_options_failure` exclusively owns `application/paper/market.rs` and its existing inline critical case (if needed) to preserve receipt identity/completeness validation and omit only genuinely empty selections. Separately, investigate independent existing catalog read ownership for PIT reads; do not serialize all reads behind the global ingest gate without establishing necessity. No data-layer edits yet.
+
+Parallel read-only contention trace: Astra `research_options_failure` inspects the proven live `analytical catalog authority is busy` current-market read (sequence 280) and resulting InvalidResult route errors. Scope is existing analytical catalog/read ownership and durable market route error mapping; no edits, builds, runtime actions or wider audit. Return the exact mutex/transaction lifetime and smallest correction if confirmed. Calendar preparation diagnostics stay with the other agent.
+
+Next concrete history failure: live source retry returns applied/available, but preparation reports InvalidResult before any history publication or per-instrument failure. Astra `calendar_currentness_failure` owns a bounded trace and minimal categorical stage diagnostics in `application/market_calendar/read.rs` and `research/corporate_actions/preflight/display_history.rs` only if existing source/log evidence cannot locate it. Lead owns native actions; no speculative behavior changes or builds by agent. Native-session inclusive-end regression passes (1.37s).
 
 Native-session read correction: Astra `calendar_currentness_failure` exclusively owns `crates/market-squawk-data/src/analytical_read/history_sessions.rs` to align final period-end inclusion with the existing inclusive request-end contract (period_end - 1ns). Publication and replay currently disagree for completed daily requests ending at midnight minus 1ns. Astra also owns a narrowly scoped extension inside the existing `publication_recovery.rs` complete-history case and its calendar capture builder: one real sealed calendar replay across publication/restart at the inclusive final daily boundary. Existing synthetic cases stay intact; no new harness or test matrix. Lead owns compilation and real read/restart verification. No other agent edits these files.
 

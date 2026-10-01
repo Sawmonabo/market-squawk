@@ -81,13 +81,13 @@ use market_squawk_sources::{
     LiveProtocolProfile, NetworkAccessPolicy, ObservedProviderOrder, PathScope,
     ProviderBudgetPolicy, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSemanticBinding, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderEventMicrobatchMaterial, ProviderMarketEventBatch,
-    ProviderMarketEventNativeLineageBatch, ProviderNativeLineageBatchBuilder,
-    ProviderNativeLineageImplementation, ProviderNumericPolicy, SealedProviderCaptureBinding,
-    SealedProviderEventMicrobatchBinding, SealedProviderPublicationBinding,
-    SemanticInterpretationProfile, SequenceValidationProfile, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceObject, SourceObjectCaptureIdentity,
-    SourceProtocolProfile,
+    ProviderEventMicrobatchMaterial, ProviderIdentitySelectionEvidence, ProviderMarketEventBatch,
+    ProviderMarketEventNativeLineageBatch, ProviderNativeIdentityRequest,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation, ProviderNumericPolicy,
+    SealedProviderCaptureBinding, SealedProviderEventMicrobatchBinding,
+    SealedProviderPublicationBinding, SemanticInterpretationProfile, SequenceValidationProfile,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
 };
 use rusqlite::params;
 use rust_decimal::Decimal;
@@ -3565,20 +3565,6 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         DigestAlgorithm::Sha256,
         Sha256::digest(definition_json.as_bytes()).into(),
     );
-    assert!(
-        complete_history_semantic(
-            Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
-            Timestamp::from_unix_nanos(COMPLETE_HISTORY_REQUEST_END_NS),
-            instrument_id,
-            definition_digest,
-            vec![
-                Timestamp::from_unix_nanos(COMPLETE_HISTORY_SECOND_BAR_NS),
-                Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
-            ],
-        )
-        .is_err(),
-        "unordered calendar expectations must fail before a capture graph can be minted"
-    );
 
     let authority = CatalogAuthority::open(catalog_config.clone())?;
     let source = complete_history_source(instrument_id)?;
@@ -3599,14 +3585,130 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     )?;
     assert_eq!((synchronized.inserted(), synchronized.replayed()), (1, 0));
     drop(definition_synchronizer);
+    let identity_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let native = ProviderNativeIdentityRequest {
+        namespace: SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+        provider_instrument_id: ProviderInstrumentId::try_from(
+            "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+        )?,
+        instrument: instrument_id,
+        venue: VenueId::try_from("iex")?,
+        venue_symbol: VenueSymbol::try_from("AAPL")?,
+        knowledge_at: identity_at,
+        effective_at: identity_at,
+    };
+    let instrument_reader = service.market_data_instruments();
+    let selected_identity = instrument_reader
+        .select_provider_identity_as_of(
+            market_squawk_data::MarketDataProviderIdentityQuery::try_new(
+                native.namespace.clone(),
+                native.provider_instrument_id.clone(),
+                native.knowledge_at,
+                native.effective_at,
+            )?,
+            Instant::now() + Duration::from_secs(10),
+            &CancellationToken::new(),
+        )?
+        .ok_or("missing fresh native identity")?;
+    let identity_selection = instrument_reader.selected_provider_identity_evidence(
+        &selected_identity,
+        &native,
+        Instant::now() + Duration::from_secs(10),
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(identity_selection.definition_digest, definition_digest);
+    assert!(
+        identity_selection
+            .definition_validity
+            .starts_at()
+            .unix_nanos()
+            > COMPLETE_HISTORY_REQUEST_END_NS
+    );
+    drop(instrument_reader);
+    assert!(
+        complete_history_semantic(
+            Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
+            Timestamp::from_unix_nanos(COMPLETE_HISTORY_REQUEST_END_NS),
+            instrument_id,
+            &identity_selection,
+            vec![
+                Timestamp::from_unix_nanos(COMPLETE_HISTORY_SECOND_BAR_NS),
+                Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
+            ],
+        )
+        .is_err(),
+        "unordered calendar expectations must fail before a capture graph can be minted"
+    );
+
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
+    // A well-shaped capture is still untrusted until publication reproduces its
+    // exact native catalog selection and symbol interpretation date.
+    let symbol_asof = market_squawk_adapter_alpaca::alpaca_history_symbol_asof(identity_at)?;
+    let mut wrong_uuid = identity_selection.clone();
+    wrong_uuid.native.provider_instrument_id =
+        ProviderInstrumentId::try_from("b0b6dd9d-8b9b-48a9-ba46-b9d54906e416")?;
+    let mut wrong_revision = identity_selection.clone();
+    wrong_revision.definition_digest = digest(110);
+    let mut wrong_selection = identity_selection.clone();
+    wrong_selection.selection_digest = digest(109);
+    for (ordinal, (retained, asof)) in [
+        (wrong_uuid, symbol_asof),
+        (wrong_revision, symbol_asof),
+        (wrong_selection, symbol_asof),
+        (
+            identity_selection.clone(),
+            Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS).utc_calendar_date()?,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dataset = format!("alpaca-aapl-rejected-history-{ordinal}-v1");
+        // Failed publication still retains its independently assigned native revisions.
+        // Use disjoint families so every case reaches the manifest identity boundary.
+        let window_shift = (50 + i64::try_from(ordinal)? * 2) * COMPLETE_HISTORY_DAY_NS;
+        let rejected = publish_complete_history_fixture(
+            &service,
+            &source,
+            &capture_store,
+            complete_history_capture_fixture_with_adjustment(
+                instrument_id,
+                &retained,
+                &dataset,
+                COMPLETE_HISTORY_FIRST_BAR_NS + window_shift,
+                COMPLETE_HISTORY_REQUEST_END_NS + window_shift,
+                &[
+                    COMPLETE_HISTORY_FIRST_BAR_NS + window_shift,
+                    COMPLETE_HISTORY_SECOND_BAR_NS + window_shift,
+                ],
+                COMPLETE_HISTORY_RECEIVED_AT_NS,
+                7 + u8::try_from(ordinal)?,
+                MarketBarAdjustment::All,
+                asof,
+            )?,
+            &format!("alpaca:rejected-history:{ordinal}:v1"),
+        )
+        .await;
+        let error = rejected.expect_err("mismatched native identity/asof must not publish");
+        assert!(
+            matches!(
+                error.downcast_ref::<IngestError>(),
+                Some(IngestError::Manifest(
+                    ManifestCatalogError::MarketBarHistoryMismatch
+                ))
+            ),
+            "unexpected publication rejection for case {ordinal}: {error:?}"
+        );
+    }
     let older_wide = publish_complete_history_fixture(
         &service,
         &source,
         &capture_store,
         complete_history_capture_fixture(
             instrument_id,
-            definition_digest,
+            &identity_selection,
             "alpaca-aapl-iex-daily-adjusted-history-older-wide-v1",
             COMPLETE_HISTORY_FIRST_BAR_NS,
             COMPLETE_HISTORY_REQUEST_END_NS,
@@ -3623,20 +3725,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
 
     let cutoff = Timestamp::from_unix_nanos(i64::MAX - 1);
     let reader = service.analytical_reader();
-    let older_current = reader
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_FIRST_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("missing complete history after publication")?;
+    let older_current = read_complete_history_fixture(
+        &reader,
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("missing complete history after publication")?;
     assert_eq!(older_current.selection().policy_version(), 1);
     assert_eq!(
         older_current.selection().policy_digest().bytes(),
@@ -3670,6 +3772,16 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(
         older_origin_receipt.origin_manifest(),
         older_wide.manifest()
+    );
+    assert_eq!(
+        older_origin_receipt.identity_selection(),
+        Some(&identity_selection)
+    );
+    assert_eq!(
+        older_origin_receipt.symbol_asof(),
+        Some(market_squawk_adapter_alpaca::alpaca_history_symbol_asof(
+            identity_at
+        )?)
     );
     assert!(older_origin_receipt.current_research_eligible());
     assert!(!older_origin_receipt.realized_outcome_eligible());
@@ -3738,36 +3850,36 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             .ok_or("publication cutoff underflow")?,
     );
     assert!(
-        reader
-            .read_canonical_market_bar_history(
-                complete_history_request(
-                    instrument_id,
-                    COMPLETE_HISTORY_FIRST_BAR_NS,
-                    COMPLETE_HISTORY_REQUEST_END_NS,
-                    premature_cutoff,
-                    None,
-                )?,
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await?
-            .is_none(),
-        "a complete local-first-observed window is unknowable before publication"
-    );
-    let exact_origin = reader
-        .read_canonical_market_bar_history(
+        read_complete_history_fixture(
+            &reader,
             complete_history_request(
                 instrument_id,
                 COMPLETE_HISTORY_FIRST_BAR_NS,
                 COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                Some(older_wide.manifest()),
+                premature_cutoff,
+                None,
             )?,
             Instant::now() + Duration::from_secs(30),
             CancellationToken::new(),
         )
         .await?
-        .ok_or("exact origin history pin did not resolve")?;
+        .is_none(),
+        "a complete local-first-observed window is unknowable before publication"
+    );
+    let exact_origin = read_complete_history_fixture(
+        &reader,
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            Some(older_wide.manifest()),
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("exact origin history pin did not resolve")?;
     assert_eq!(
         exact_origin.selection().receipt().receipt_digest(),
         older_origin_receipt_digest
@@ -3783,7 +3895,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         &capture_store,
         complete_history_capture_fixture(
             instrument_id,
-            definition_digest,
+            &identity_selection,
             "alpaca-aapl-iex-daily-adjusted-history-short-v1",
             COMPLETE_HISTORY_SECOND_BAR_NS,
             COMPLETE_HISTORY_REQUEST_END_NS,
@@ -3794,21 +3906,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         "alpaca:paper-iex:complete-daily-history:aapl:short:v1",
     )
     .await?;
-    let short_result = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_SECOND_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("exact short history window did not resolve")?;
+    let short_result = read_complete_history_fixture(
+        &service.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_SECOND_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("exact short history window did not resolve")?;
     assert_eq!(
         short_result.selection().pinned().manifest(),
         short.manifest()
@@ -3831,7 +3942,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         &capture_store,
         complete_history_capture_fixture(
             instrument_id,
-            definition_digest,
+            &identity_selection,
             "alpaca-aapl-iex-daily-adjusted-history-newer-wide-v1",
             COMPLETE_HISTORY_FIRST_BAR_NS,
             COMPLETE_HISTORY_REQUEST_END_NS,
@@ -3845,21 +3956,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         "alpaca:paper-iex:complete-daily-history:aapl:newer-wide:v1",
     )
     .await?;
-    let newer_wide_result = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_FIRST_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("newer exact wide history window did not resolve")?;
+    let newer_wide_result = read_complete_history_fixture(
+        &service.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("newer exact wide history window did not resolve")?;
     assert_eq!(
         newer_wide_result.selection().pinned().manifest(),
         newer_wide.manifest()
@@ -3897,21 +4007,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     let compacted_older_manifest = compacted_older.manifest().clone();
     drop(compacted_older);
 
-    let inherited_older = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_FIRST_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                Some(&compacted_older_manifest),
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("older compacted generation did not inherit complete-history lineage")?;
+    let inherited_older = read_complete_history_fixture(
+        &service.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            Some(&compacted_older_manifest),
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("older compacted generation did not inherit complete-history lineage")?;
     assert_eq!(
         inherited_older.selection().pinned().manifest(),
         &compacted_older_manifest
@@ -3927,21 +4036,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(inherited_older.bars(), older_expected_bars);
     drop(inherited_older);
 
-    let selected = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_FIRST_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("newer exact origin was shadowed by an older origin descendant")?;
+    let selected = read_complete_history_fixture(
+        &service.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("newer exact origin was shadowed by an older origin descendant")?;
     assert_eq!(
         selected.selection().pinned().manifest(),
         &compacted_newer_manifest
@@ -3960,21 +4068,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     let selected_history_content_digest = selected.read_receipt().history_content_digest();
     drop(selected);
 
-    let short_after_compaction = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_SECOND_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("short request substituted a different history window")?;
+    let short_after_compaction = read_complete_history_fixture(
+        &service.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_SECOND_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("short request substituted a different history window")?;
     assert_eq!(
         short_after_compaction.selection().pinned().manifest(),
         short.manifest()
@@ -3997,7 +4104,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         &capture_store,
         complete_history_capture_fixture(
             instrument_id,
-            definition_digest,
+            &identity_selection,
             "alpaca-aapl-iex-daily-adjusted-history-short-v1",
             COMPLETE_HISTORY_REQUEST_END_NS,
             COMPLETE_HISTORY_REQUEST_END_NS + 2 * COMPLETE_HISTORY_DAY_NS,
@@ -4049,21 +4156,20 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     drop(short_append);
 
     assert!(
-        service
-            .analytical_reader()
-            .read_canonical_market_bar_history(
-                complete_history_request(
-                    instrument_id,
-                    COMPLETE_HISTORY_FIRST_BAR_NS - COMPLETE_HISTORY_DAY_NS,
-                    COMPLETE_HISTORY_REQUEST_END_NS,
-                    cutoff,
-                    None,
-                )?,
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await?
-            .is_none(),
+        read_complete_history_fixture(
+            &service.analytical_reader(),
+            complete_history_request(
+                instrument_id,
+                COMPLETE_HISTORY_FIRST_BAR_NS - COMPLETE_HISTORY_DAY_NS,
+                COMPLETE_HISTORY_REQUEST_END_NS,
+                cutoff,
+                None,
+            )?,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .is_none(),
         "an unserved fixed window must remain unavailable"
     );
     // The exact provider-label bound excludes the next daily label while retaining the
@@ -4079,15 +4185,14 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         cutoff,
     )?;
     assert!(
-        service
-            .analytical_reader()
-            .read_canonical_market_bar_history(
-                raw_request.clone(),
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await?
-            .is_none(),
+        read_complete_history_fixture(
+            &service.analytical_reader(),
+            raw_request.clone(),
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .is_none(),
         "adjusted history cannot satisfy a raw outcome request"
     );
     let raw_request = CanonicalMarketBarHistoryRequest::try_latest(
@@ -4103,7 +4208,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         &capture_store,
         complete_history_capture_fixture_with_adjustment(
             instrument_id,
-            definition_digest,
+            &identity_selection,
             "alpaca-aapl-iex-daily-raw-history-v1",
             COMPLETE_HISTORY_FIRST_BAR_NS,
             inclusive_history_end_ns,
@@ -4114,19 +4219,19 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 2 * COMPLETE_HISTORY_DAY_NS,
             5,
             MarketBarAdjustment::Raw,
+            market_squawk_adapter_alpaca::alpaca_history_symbol_asof(identity_at)?,
         )?,
         "alpaca:paper-iex:complete-daily-history:aapl:raw:v1",
     )
     .await?;
-    let raw_selected = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            raw_request,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("missing authentic raw outcome history")?;
+    let raw_selected = read_complete_history_fixture(
+        &service.analytical_reader(),
+        raw_request,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("missing authentic raw outcome history")?;
     let raw_receipt = raw_selected.selection().receipt();
     assert_eq!(raw_receipt.adjustment(), MarketBarAdjustment::Raw);
     assert!(raw_receipt.realized_outcome_eligible());
@@ -4138,7 +4243,9 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(
         raw_receipt.knowledge_clocks().1,
         Timestamp::from_unix_nanos(
-            COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 2 * COMPLETE_HISTORY_DAY_NS
+            identity_selection.native.knowledge_at.unix_nanos()
+                + (COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 2 * COMPLETE_HISTORY_DAY_NS)
+                    / COMPLETE_HISTORY_DAY_NS
         )
     );
     let raw_content_digest = raw_selected.read_receipt().history_content_digest();
@@ -4173,15 +4280,14 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         Timestamp::from_unix_nanos(raw_receipt.published_at().unix_nanos() - 1),
     )?;
     assert!(
-        service
-            .analytical_reader()
-            .read_canonical_market_bar_history(
-                raw_premature,
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await?
-            .is_none()
+        read_complete_history_fixture(
+            &service.analytical_reader(),
+            raw_premature,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .is_none()
     );
     let split = publish_complete_history_fixture(
         &service,
@@ -4189,7 +4295,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         &capture_store,
         complete_history_capture_fixture_with_adjustment(
             instrument_id,
-            definition_digest,
+            &identity_selection,
             "alpaca-aapl-iex-daily-split-boundary-v1",
             COMPLETE_HISTORY_FIRST_BAR_NS,
             inclusive_history_end_ns,
@@ -4200,6 +4306,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 3 * COMPLETE_HISTORY_DAY_NS,
             6,
             MarketBarAdjustment::Split,
+            market_squawk_adapter_alpaca::alpaca_history_symbol_asof(identity_at)?,
         )?,
         "alpaca:paper-iex:complete-daily-history:aapl:split-boundary:v1",
     )
@@ -4225,15 +4332,14 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         )?
         .ok_or("missing canonical split-only latest window")?;
     assert_eq!(split_latest_window.exact_request(), &split_request);
-    let split_selected = service
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            split_request.clone(),
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("missing exact source Split boundary history")?;
+    let split_selected = read_complete_history_fixture(
+        &service.analytical_reader(),
+        split_request.clone(),
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("missing exact source Split boundary history")?;
     assert_eq!(split_selected.bars().len(), 2);
     assert_eq!(
         split_selected.selection().receipt().adjustment(),
@@ -4275,38 +4381,103 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         ),
     )?;
     assert!(
-        service
-            .analytical_reader()
-            .read_canonical_market_bar_history(
-                split_premature,
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await?
-            .is_none(),
+        read_complete_history_fixture(
+            &service.analytical_reader(),
+            split_premature,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .is_none(),
         "raw or all-adjusted history cannot replace an unavailable split-only publication"
     );
     let split_read_receipt = split_selected.read_receipt().clone();
     let split_bars = split_selected.bars().to_vec();
     assert!(
-        service
-            .analytical_reader()
-            .read_canonical_market_bar_history(
-                CanonicalMarketBarHistoryRequest::try_exact(
-                    instrument_id,
-                    Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
-                    Timestamp::from_unix_nanos(inclusive_history_end_ns),
-                    MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
-                    cutoff,
-                    split.manifest().clone(),
-                )?,
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await?
-            .is_none(),
+        read_complete_history_fixture(
+            &service.analytical_reader(),
+            CanonicalMarketBarHistoryRequest::try_exact(
+                instrument_id,
+                Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
+                Timestamp::from_unix_nanos(inclusive_history_end_ns),
+                MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+                cutoff,
+                split.manifest().clone(),
+            )?,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .is_none(),
         "Split history cannot satisfy a raw outcome request"
     );
+    // Actual sealed calendar replay must retain the last daily period when the provider's
+    // inclusive request ends one nanosecond before the canonical exclusive boundary.
+    let native_start = DateTime::parse_from_rfc3339("2024-11-25T05:00:00Z")?
+        .timestamp_nanos_opt()
+        .ok_or("native fixture start")?;
+    let native_second = native_start
+        .checked_add(COMPLETE_HISTORY_DAY_NS)
+        .ok_or("native fixture second")?;
+    let native_end = native_second
+        .checked_add(COMPLETE_HISTORY_DAY_NS)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or("native fixture end")?;
+    let native_request = market_squawk_adapter_alpaca::AlpacaAuthenticatedCalendarRequest::try_new(
+        market_squawk_adapter_alpaca::AlpacaTradingApiEnvironment::Paper,
+        Timestamp::from_unix_nanos(native_start).utc_calendar_date()?,
+        Timestamp::from_unix_nanos(native_end).utc_calendar_date()?,
+    )?;
+    let native_calendar_body = Bytes::from_static(br#"{
+        "market":{"acronym":"IEX","name":"IEX","timezone":"America/New_York"},
+        "calendar":[
+            {"date":"2024-11-25","core_start":"2024-11-25T14:30:00Z","core_end":"2024-11-25T21:00:00Z"},
+            {"date":"2024-11-26","core_start":"2024-11-26T14:30:00Z","core_end":"2024-11-26T21:00:00Z"}
+        ]
+    }"#);
+    let native_history = publish_complete_history_fixture(
+        &service,
+        &source,
+        &capture_store,
+        complete_history_capture_fixture_with_calendar(
+            instrument_id,
+            &identity_selection,
+            "alpaca-aapl-native-rejoin-v1",
+            native_start,
+            native_end,
+            &[native_start, native_second],
+            COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 4 * COMPLETE_HISTORY_DAY_NS,
+            11,
+            MarketBarAdjustment::Raw,
+            symbol_asof,
+            Some((&native_request, native_calendar_body)),
+        )?,
+        "alpaca:paper-iex:complete-daily-history:aapl:native-rejoin:v1",
+    )
+    .await?;
+    let native_exact = CanonicalMarketBarHistoryRequest::try_exact(
+        instrument_id,
+        Timestamp::from_unix_nanos(native_start),
+        Timestamp::from_unix_nanos(native_end),
+        MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+        cutoff,
+        native_history.manifest().clone(),
+    )?;
+    let native_output = read_complete_history_fixture(
+        &service.analytical_reader(),
+        native_exact.clone(),
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("native history before restart")?;
+    assert_complete_history_native_rejoin(
+        &service,
+        &capture_store,
+        native_output,
+        &native_request,
+    )?;
+    drop(native_history);
     drop(split_selected);
     drop(split);
     drop(raw_selected);
@@ -4325,22 +4496,35 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     restarted
         .recover_provider_capture_store(Arc::clone(&capture_store), &CancellationToken::new())
         .await?;
+    let native_output = read_complete_history_fixture(
+        &restarted.analytical_reader(),
+        native_exact,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("native history after restart")?;
+    assert_complete_history_native_rejoin(
+        &restarted,
+        &capture_store,
+        native_output,
+        &native_request,
+    )?;
     let restart_cutoff = Timestamp::from_unix_nanos(i64::MAX);
-    let replayed = restarted
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_FIRST_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                restart_cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("restart did not recover latest complete history")?;
+    let replayed = read_complete_history_fixture(
+        &restarted.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            restart_cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("restart did not recover latest complete history")?;
     assert_eq!(
         replayed.selection().pinned().manifest(),
         &compacted_newer_manifest
@@ -4362,6 +4546,16 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         selected_history_content_digest
     );
     assert_eq!(replayed.bars(), newer_expected_bars);
+    assert_eq!(
+        replayed.selection().receipt().identity_selection(),
+        Some(&identity_selection)
+    );
+    assert_eq!(
+        replayed.selection().receipt().symbol_asof(),
+        Some(market_squawk_adapter_alpaca::alpaca_history_symbol_asof(
+            identity_at
+        )?)
+    );
     drop(replayed);
     assert_eq!(
         restarted
@@ -4369,15 +4563,14 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         expected_short_owned
     );
 
-    let raw_replay = restarted
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            raw_exact_request,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("raw exact history did not survive restart")?;
+    let raw_replay = read_complete_history_fixture(
+        &restarted.analytical_reader(),
+        raw_exact_request,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("raw exact history did not survive restart")?;
     assert_eq!(raw_replay.selection().pinned().manifest(), &raw_manifest);
     assert_eq!(
         raw_replay.read_receipt().history_content_digest(),
@@ -4387,15 +4580,14 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert!(raw_replay.selection().receipt().realized_outcome_eligible());
     drop(raw_replay);
 
-    let split_replay = restarted
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            split_request,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?
-        .ok_or("exact Split boundary history did not survive restart")?;
+    let split_replay = read_complete_history_fixture(
+        &restarted.analytical_reader(),
+        split_request,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await?
+    .ok_or("exact Split boundary history did not survive restart")?;
     assert_eq!(split_replay.read_receipt(), &split_read_receipt);
     assert_eq!(split_replay.bars(), split_bars);
     assert_eq!(
@@ -4417,20 +4609,19 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         1
     );
     drop(ambiguity);
-    let ambiguous = restarted
-        .analytical_reader()
-        .read_canonical_market_bar_history(
-            complete_history_request(
-                instrument_id,
-                COMPLETE_HISTORY_FIRST_BAR_NS,
-                COMPLETE_HISTORY_REQUEST_END_NS,
-                restart_cutoff,
-                None,
-            )?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await;
+    let ambiguous = read_complete_history_fixture(
+        &restarted.analytical_reader(),
+        complete_history_request(
+            instrument_id,
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            restart_cutoff,
+            None,
+        )?,
+        Instant::now() + Duration::from_secs(30),
+        CancellationToken::new(),
+    )
+    .await;
     // Selecting the changed row would reach the receipt/row comparison and return CorruptCatalog;
     // this earlier mismatch proves the canonical exact-one-series gate rejected both coordinates.
     assert!(matches!(
@@ -5528,6 +5719,89 @@ fn sec_filing_observation(
     )?))
 }
 
+fn assert_complete_history_native_rejoin(
+    service: &AnalyticalDataService,
+    store: &SealedResearchJournalStore,
+    output: market_squawk_data::CompleteMarketBarHistoryOutput,
+    request: &market_squawk_adapter_alpaca::AlpacaAuthenticatedCalendarRequest,
+) -> TestResult {
+    struct Control;
+    impl ResearchObjectControl for Control {
+        fn checkpoint(
+            &self,
+            _: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            Ok(())
+        }
+    }
+    let owned = service.generation_owned_provider_capture_evidence(
+        output.selection().receipt().origin_manifest(),
+        store,
+    )?;
+    let binding = owned
+        .objects()
+        .first()
+        .ok_or("native history object")?
+        .inputs()
+        .first()
+        .ok_or("native history input")?
+        .binding();
+    let segment = store.open_verified_claim_with_control(
+        binding
+            .physical_claims()
+            .first()
+            .ok_or("native history capture")?
+            .claim(),
+        &Control,
+    )?;
+    let sealed = market_squawk_sources::SealedProviderCaptureSetReceipt::try_bind(
+        binding.capture().clone(),
+        segment.receipt().clone(),
+    )?;
+    let replay = market_squawk_adapter_alpaca::AlpacaRetainedCalendarSessions::try_replay(
+        request, &sealed, &segment, &Control,
+    )?;
+    let output = output.try_with_native_sessions(replay, &Control)?;
+    let native = output.native_sessions().ok_or("rejoined native sessions")?;
+    let sessions = native.sessions().iter().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(sessions.len(), 2);
+    let final_session = sessions.last().ok_or("final native session")?;
+    assert!(final_session.bar_present());
+    assert_eq!(
+        final_session.native_date(),
+        market_squawk_domain::CalendarDate::new(2024, 11, 26)?
+    );
+    assert_eq!(
+        final_session.closes_at_exclusive().unix_nanos(),
+        DateTime::parse_from_rfc3339("2024-11-26T21:00:00Z")?
+            .timestamp_nanos_opt()
+            .ok_or("native close")?
+    );
+    assert_eq!(
+        final_session
+            .provider_period()
+            .ok_or("native period")?
+            .1
+            .checked_sub_nanos(1)?,
+        output
+            .selection()
+            .receipt()
+            .requested_range()
+            .ok_or("native request range")?
+            .1
+    );
+    assert_eq!(
+        output
+            .bars()
+            .last()
+            .ok_or("final native bar")?
+            .time_semantics()
+            .provider_timestamp(),
+        final_session.provider_timestamp()
+    );
+    Ok(())
+}
+
 struct CompleteHistoryCaptureFixture {
     batch: ExtractionBatch,
     capture_material: ProviderCaptureMaterial,
@@ -5569,111 +5843,135 @@ fn complete_history_request(
     }
 }
 
-async fn publish_complete_history_fixture(
-    service: &AnalyticalDataService,
-    source: &SourceMetadata,
-    capture_store: &market_squawk_platform::SealedResearchJournalStore,
-    fixture: CompleteHistoryCaptureFixture,
-    ingest_key: &str,
-) -> Result<CommittedDataset, Box<dyn Error>> {
-    let CompleteHistoryCaptureFixture {
-        batch,
-        capture_material,
-        revision_plan,
-        native_rows,
-        received_at,
-    } = fixture;
-    let payload_digest = extraction_provider_payload_digest(&batch);
-    let identity = IngestIdentity::try_new(
-        source.source_id().clone(),
-        payload_digest,
-        SourceOperation::Persist,
-        ingest_key,
-    )?;
-    let cancellation = CancellationToken::new();
-    let reservation = service
-        .reserve_source_ingest(
-            source,
-            Timestamp::from_unix_nanos(10),
-            RightsDecisionInput {
-                source_id: source.source_id().clone(),
-                payload_digest,
-                retrieved_at: received_at,
-                basis: RightsBasis::reviewed_terms(
-                    "https://example.test/alpaca-paper-iex-history-terms/v1",
-                    digest(111),
-                )?,
-                authorization_evidence: digest(112),
-                authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-                permitted_operations: vec![SourceOperation::Persist],
-            },
-            &identity,
-            &cancellation,
-        )
-        .await?;
-    let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
-    let (expectation, request) = capture_material.into_whole_seal_parts();
-    let sealed = request.seal(capture_store)?;
-    let token = expectation.try_rejoin(sealed)?.try_into_whole()?;
-    let mut native = ProviderNativeLineageBatchBuilder::try_new(
-        ProviderNativeLineageImplementation::AlpacaHistoricalBarV1,
-        &batch,
-    )?;
-    for row in &native_rows {
-        native.try_push(row)?;
-    }
-    let native = native.finish()?;
-    let binding =
-        SealedProviderCaptureBinding::try_whole(token, batch, native, vec![0; native_rows.len()])?;
-    Ok(service
-        .ingest_provider_publication(
-            reservation,
-            analytical_dataset,
-            ProviderPublicationInput::try_new(binding, revision_plan)?,
-            cancellation,
-        )
-        .await?)
+// Box construction at the fixture boundary keeps the long restart journey's poll
+// frame from embedding every complete-read future on the ordinary test-thread stack.
+fn read_complete_history_fixture<'a>(
+    reader: &'a market_squawk_data::AnalyticalReadCapability,
+    request: CanonicalMarketBarHistoryRequest,
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> impl std::future::Future<
+    Output = Result<
+        Option<market_squawk_data::CompleteMarketBarHistoryOutput>,
+        AnalyticalReadError,
+    >,
+> + 'a {
+    Box::pin(reader.read_canonical_market_bar_history(request, deadline, cancellation))
 }
 
-async fn compact_complete_history_fixture(
-    service: &AnalyticalDataService,
-    source: &SourceMetadata,
-    manifest: &DatasetManifestRef,
-    ingest_key: &str,
+fn publish_complete_history_fixture<'a>(
+    service: &'a AnalyticalDataService,
+    source: &'a SourceMetadata,
+    capture_store: &'a market_squawk_platform::SealedResearchJournalStore,
+    fixture: CompleteHistoryCaptureFixture,
+    ingest_key: &'a str,
+) -> impl std::future::Future<Output = Result<CommittedDataset, Box<dyn Error>>> + 'a {
+    Box::pin(async move {
+        let CompleteHistoryCaptureFixture {
+            batch,
+            capture_material,
+            revision_plan,
+            native_rows,
+            received_at,
+        } = fixture;
+        let payload_digest = extraction_provider_payload_digest(&batch);
+        let identity = IngestIdentity::try_new(
+            source.source_id().clone(),
+            payload_digest,
+            SourceOperation::Persist,
+            ingest_key,
+        )?;
+        let cancellation = CancellationToken::new();
+        let reservation = service
+            .reserve_source_ingest(
+                source,
+                Timestamp::from_unix_nanos(10),
+                RightsDecisionInput {
+                    source_id: source.source_id().clone(),
+                    payload_digest,
+                    retrieved_at: received_at,
+                    basis: RightsBasis::reviewed_terms(
+                        "https://example.test/alpaca-paper-iex-history-terms/v1",
+                        digest(111),
+                    )?,
+                    authorization_evidence: digest(112),
+                    authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                    permitted_operations: vec![SourceOperation::Persist],
+                },
+                &identity,
+                &cancellation,
+            )
+            .await?;
+        let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
+        let (expectation, request) = capture_material.into_whole_seal_parts();
+        let sealed = request.seal(capture_store)?;
+        let token = expectation.try_rejoin(sealed)?.try_into_whole()?;
+        let mut native = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::AlpacaHistoricalBarV1,
+            &batch,
+        )?;
+        for row in &native_rows {
+            native.try_push(row)?;
+        }
+        let native = native.finish()?;
+        let binding = SealedProviderCaptureBinding::try_whole(
+            token,
+            batch,
+            native,
+            vec![0; native_rows.len()],
+        )?;
+        Ok(service
+            .ingest_provider_publication(
+                reservation,
+                analytical_dataset,
+                ProviderPublicationInput::try_new(binding, revision_plan)?,
+                cancellation,
+            )
+            .await?)
+    })
+}
+
+fn compact_complete_history_fixture<'a>(
+    service: &'a AnalyticalDataService,
+    source: &'a SourceMetadata,
+    manifest: &'a DatasetManifestRef,
+    ingest_key: &'a str,
     retrieved_at: Timestamp,
-) -> Result<CommittedDataset, Box<dyn Error>> {
-    let compaction = CompactionRequest::new(manifest.clone());
-    let payload_digest = compaction.payload_digest();
-    let identity = IngestIdentity::try_new(
-        source.source_id().clone(),
-        payload_digest,
-        SourceOperation::Persist,
-        ingest_key,
-    )?;
-    let cancellation = CancellationToken::new();
-    let reservation = service
-        .reserve_source_ingest(
-            source,
-            Timestamp::from_unix_nanos(10),
-            RightsDecisionInput {
-                source_id: source.source_id().clone(),
-                payload_digest,
-                retrieved_at,
-                basis: RightsBasis::reviewed_terms(
-                    "https://example.test/alpaca-paper-iex-history-terms/v1",
-                    digest(111),
-                )?,
-                authorization_evidence: digest(112),
-                authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-                permitted_operations: vec![SourceOperation::Persist],
-            },
-            &identity,
-            &cancellation,
-        )
-        .await?;
-    Ok(service
-        .compact(reservation, compaction, cancellation)
-        .await?)
+) -> impl std::future::Future<Output = Result<CommittedDataset, Box<dyn Error>>> + 'a {
+    Box::pin(async move {
+        let compaction = CompactionRequest::new(manifest.clone());
+        let payload_digest = compaction.payload_digest();
+        let identity = IngestIdentity::try_new(
+            source.source_id().clone(),
+            payload_digest,
+            SourceOperation::Persist,
+            ingest_key,
+        )?;
+        let cancellation = CancellationToken::new();
+        let reservation = service
+            .reserve_source_ingest(
+                source,
+                Timestamp::from_unix_nanos(10),
+                RightsDecisionInput {
+                    source_id: source.source_id().clone(),
+                    payload_digest,
+                    retrieved_at,
+                    basis: RightsBasis::reviewed_terms(
+                        "https://example.test/alpaca-paper-iex-history-terms/v1",
+                        digest(111),
+                    )?,
+                    authorization_evidence: digest(112),
+                    authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                    permitted_operations: vec![SourceOperation::Persist],
+                },
+                &identity,
+                &cancellation,
+            )
+            .await?;
+        Ok(service
+            .compact(reservation, compaction, cancellation)
+            .await?)
+    })
 }
 
 #[allow(
@@ -5682,7 +5980,7 @@ async fn compact_complete_history_fixture(
 )]
 fn complete_history_capture_fixture(
     instrument_id: InstrumentId,
-    instrument_revision_digest: EvidenceDigest,
+    identity_selection: &ProviderIdentitySelectionEvidence,
     dataset: &str,
     requested_start_ns: i64,
     requested_end_ns: i64,
@@ -5692,7 +5990,7 @@ fn complete_history_capture_fixture(
 ) -> Result<CompleteHistoryCaptureFixture, Box<dyn Error>> {
     complete_history_capture_fixture_with_adjustment(
         instrument_id,
-        instrument_revision_digest,
+        identity_selection,
         dataset,
         requested_start_ns,
         requested_end_ns,
@@ -5700,6 +5998,9 @@ fn complete_history_capture_fixture(
         received_at_ns,
         variant,
         MarketBarAdjustment::All,
+        market_squawk_adapter_alpaca::alpaca_history_symbol_asof(
+            identity_selection.native.effective_at,
+        )?,
     )
 }
 
@@ -5709,7 +6010,7 @@ fn complete_history_capture_fixture(
 )]
 fn complete_history_capture_fixture_with_adjustment(
     instrument_id: InstrumentId,
-    instrument_revision_digest: EvidenceDigest,
+    identity_selection: &ProviderIdentitySelectionEvidence,
     dataset: &str,
     requested_start_ns: i64,
     requested_end_ns: i64,
@@ -5717,10 +6018,52 @@ fn complete_history_capture_fixture_with_adjustment(
     received_at_ns: i64,
     variant: u8,
     adjustment: MarketBarAdjustment,
+    symbol_asof: market_squawk_domain::CalendarDate,
+) -> Result<CompleteHistoryCaptureFixture, Box<dyn Error>> {
+    complete_history_capture_fixture_with_calendar(
+        instrument_id,
+        identity_selection,
+        dataset,
+        requested_start_ns,
+        requested_end_ns,
+        expected_provider_timestamps_ns,
+        received_at_ns,
+        variant,
+        adjustment,
+        symbol_asof,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one native replay case retains the existing exact capture coordinates"
+)]
+fn complete_history_capture_fixture_with_calendar(
+    instrument_id: InstrumentId,
+    identity_selection: &ProviderIdentitySelectionEvidence,
+    dataset: &str,
+    requested_start_ns: i64,
+    requested_end_ns: i64,
+    expected_provider_timestamps_ns: &[i64],
+    received_at_ns: i64,
+    variant: u8,
+    adjustment: MarketBarAdjustment,
+    symbol_asof: market_squawk_domain::CalendarDate,
+    calendar: Option<(
+        &market_squawk_adapter_alpaca::AlpacaAuthenticatedCalendarRequest,
+        Bytes,
+    )>,
 ) -> Result<CompleteHistoryCaptureFixture, Box<dyn Error>> {
     if expected_provider_timestamps_ns.is_empty() || variant == 0 {
         return Err("complete-history fixture requires timestamps and a nonzero variant".into());
     }
+    let received_at_ns = identity_selection
+        .native
+        .knowledge_at
+        .unix_nanos()
+        .checked_add(received_at_ns / COMPLETE_HISTORY_DAY_NS)
+        .ok_or("complete-history acquisition timestamp overflow")?;
     let source_id = SourceId::try_from("alpaca-basic-iex-market-data")?;
     let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from(
         "alpaca-history-source-revision-v1",
@@ -5780,29 +6123,42 @@ fn complete_history_capture_fixture_with_adjustment(
             .checked_add(1)
             .ok_or("calendar receive timestamp overflow")?,
     );
-    let calendar_body = Bytes::from(
+    let native_calendar = calendar.is_some();
+    let calendar_request_identity = calendar
+        .as_ref()
+        .map(|(request, _)| request.capture_request_identity())
+        .transpose()?;
+    let calendar_body = calendar.map(|(_, body)| body).unwrap_or_else(|| Bytes::from(
         format!(
             "{{\"variant\":{variant},\"expected_provider_timestamps_ns\":{expected_provider_timestamps_ns:?}}}"
         )
         .into_bytes(),
-    );
+    ));
     let calendar_body_digest = EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         Sha256::digest(&calendar_body).into(),
     );
-    let calendar_source_id = SourceId::try_from("alpaca-iex-calendar-reference")?;
-    let calendar_metadata_revision = MetadataRevision::new(SourceIdentifier::try_from(
-        "alpaca-iex-calendar-reference-revision-v1",
-    )?);
+    let calendar_source_id = if native_calendar {
+        source_id.clone()
+    } else {
+        SourceId::try_from("alpaca-iex-calendar-reference")?
+    };
+    let calendar_metadata_revision = if native_calendar {
+        metadata_revision.clone()
+    } else {
+        MetadataRevision::new(SourceIdentifier::try_from(
+            "alpaca-iex-calendar-reference-revision-v1",
+        )?)
+    };
     let calendar_capture = ProviderCaptureSetReceipt::try_new(
         calendar_source_id.clone(),
         calendar_metadata_revision,
         dataset.clone(),
-        digest(digest_base + 2),
+        calendar_request_identity.unwrap_or_else(|| digest(digest_base + 2)),
         ProviderCaptureTerminalDisposition::StandaloneResponse,
         vec![ProviderCapturePageReceipt::try_new(
             0,
-            digest(digest_base + 3),
+            calendar_request_identity.unwrap_or_else(|| digest(digest_base + 3)),
             None,
             None,
             200,
@@ -5925,13 +6281,14 @@ fn complete_history_capture_fixture_with_adjustment(
         Timestamp::from_unix_nanos(requested_start_ns),
         Timestamp::from_unix_nanos(requested_end_ns),
         instrument_id,
-        instrument_revision_digest,
+        identity_selection,
         expected_provider_timestamps_ns
             .iter()
             .copied()
             .map(Timestamp::from_unix_nanos)
             .collect(),
         adjustment,
+        symbol_asof,
     )?;
     let capture_material = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
         batch.request().object().source_id().clone(),
@@ -5954,16 +6311,19 @@ fn complete_history_semantic(
     requested_start: Timestamp,
     requested_end: Timestamp,
     instrument_id: InstrumentId,
-    instrument_revision_digest: EvidenceDigest,
+    identity_selection: &ProviderIdentitySelectionEvidence,
     expected_provider_timestamps: Vec<Timestamp>,
 ) -> Result<CompleteMarketBarHistoryV1, Box<dyn Error>> {
     complete_history_semantic_with_adjustment(
         requested_start,
         requested_end,
         instrument_id,
-        instrument_revision_digest,
+        identity_selection,
         expected_provider_timestamps,
         MarketBarAdjustment::All,
+        market_squawk_adapter_alpaca::alpaca_history_symbol_asof(
+            identity_selection.native.effective_at,
+        )?,
     )
 }
 
@@ -5971,16 +6331,19 @@ fn complete_history_semantic_with_adjustment(
     requested_start: Timestamp,
     requested_end: Timestamp,
     instrument_id: InstrumentId,
-    instrument_revision_digest: EvidenceDigest,
+    identity_selection: &ProviderIdentitySelectionEvidence,
     expected_provider_timestamps: Vec<Timestamp>,
     adjustment: MarketBarAdjustment,
+    symbol_asof: market_squawk_domain::CalendarDate,
 ) -> Result<CompleteMarketBarHistoryV1, Box<dyn Error>> {
     Ok(CompleteMarketBarHistoryV1::try_new(
         requested_start,
         requested_end,
         instrument_id,
-        instrument_revision_digest,
+        identity_selection.definition_digest,
         digest(125),
+        identity_selection.clone(),
+        symbol_asof,
         ProviderInstrumentId::try_from("AAPL")?,
         VenueId::try_from("iex")?,
         SourceIdentifier::try_from("iex")?,
@@ -6076,14 +6439,10 @@ fn complete_history_market_bar_observation(
 fn complete_history_market_data_definition(
     instrument_id: InstrumentId,
 ) -> Result<MarketDataInstrumentDefinition, Box<dyn Error>> {
-    let effective = EffectiveInterval::new(
-        Timestamp::from_unix_nanos(
-            COMPLETE_HISTORY_FIRST_BAR_NS
-                .checked_sub(COMPLETE_HISTORY_DAY_NS)
-                .ok_or("complete-history definition start underflow")?,
-        ),
-        None,
-    )?;
+    let observed_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let effective = EffectiveInterval::new(observed_at, None)?;
     let exact = |byte| ExactPayloadEvidence::from_content_digest(digest(byte));
     Ok(MarketDataInstrumentDefinition::try_new(
         MarketDataInstrumentDefinitionInput {
@@ -6105,15 +6464,13 @@ fn complete_history_market_data_definition(
             )],
             provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
                 instrument_id,
-                source_id: SourceId::try_from("alpaca-basic-iex-market-data")?,
-                provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+                source_id: SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+                provider_instrument_id: ProviderInstrumentId::try_from(
+                    "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+                )?,
                 evidence: ProviderIdentityEvidence::from_content_digest(digest(129)),
-                source_timestamp: Some(Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS)),
-                observed_at: Timestamp::from_unix_nanos(
-                    COMPLETE_HISTORY_FIRST_BAR_NS
-                        .checked_add(1)
-                        .ok_or("complete-history provider observation overflow")?,
-                ),
+                source_timestamp: Some(observed_at),
+                observed_at,
                 metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
                     "alpaca-aapl-provider-identity-v1",
                 )?),

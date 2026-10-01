@@ -1,9 +1,12 @@
 //! One generation-bound Alpaca historical source with bounded immutable click-plan admission.
 
 mod market;
-pub(crate) use market::{AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
-    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput, AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
-    AlpacaOptionMarketPointInTimeSelector};
+pub(crate) use market::{
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
+    AlpacaOptionMarketPointInTimeSelector, AlpacaOptionMarketPublicationReceipt,
+    AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
+    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
+};
 
 use std::{
     fmt,
@@ -24,14 +27,14 @@ use market_squawk_domain::{
     SourceIdentifier,
 };
 use market_squawk_sources::{
-    AuthorizationMode, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch,
-    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    HttpRequestBounds, ProviderCaptureMaterial, ProviderCaptureSemanticBinding, SourceError,
-    SourceMetadata, SourceMetadataProvider,
+    AuthorizationMode, CurrentCatalogProviderIdentity, DiscoveryBatch, DiscoveryRequest,
+    ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan,
+    ExtractionSource, ExtractionSourceError, HttpRequestBounds, ProviderCaptureMaterial,
+    ProviderCaptureSemanticBinding, SourceError, SourceMetadata, SourceMetadataProvider,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use uuid::Uuid;
 
 use super::{
@@ -132,6 +135,7 @@ pub(crate) trait AlpacaHistoricalPlanAdmissionDirectory:
         canonical_instrument: MarketDataInstrumentDefinition,
         deadline: Instant,
         cancellation: &'a CancellationToken,
+        identity: Arc<dyn CurrentCatalogProviderIdentity>,
     ) -> BoxFuture<'a, Result<AlpacaHistoricalAdmittedPlan, AlpacaHistoricalPlanAdmissionError>>;
 
     fn validate_parent<'a>(
@@ -179,6 +183,7 @@ impl AlpacaHistoricalPlanDirectoryLease {
         canonical_instrument: MarketDataInstrumentDefinition,
         deadline: Instant,
         cancellation: &CancellationToken,
+        identity: Arc<dyn CurrentCatalogProviderIdentity>,
     ) -> Result<AlpacaHistoricalPlanReceipt, AlpacaHistoricalPlanAdmissionError> {
         self.validate_exact_parent(self.parent)
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
@@ -213,6 +218,7 @@ impl AlpacaHistoricalPlanDirectoryLease {
                 canonical_instrument,
                 deadline,
                 cancellation,
+                identity,
             ) => result?,
         };
         if plan.parent_digest != self.parent.binding_digest()
@@ -792,6 +798,7 @@ impl AlpacaHistoricalSourceMutationAuthority {
         let validated = AlpacaHistoricalValidatedPlan {
             plan: &receipt.plan,
             admission: receipt.admission.clone(),
+            directory: Arc::clone(&stable.directory),
         };
         drop(authority);
         Ok(validated)
@@ -1288,6 +1295,7 @@ struct AlpacaHistoricalPlanRecord {
     plan_digest: EvidenceDigest,
     config: AlpacaHistoricalEquityConfig,
     canonical_instrument: MarketDataInstrumentDefinition,
+    identity: Arc<dyn CurrentCatalogProviderIdentity>,
     preflight: Arc<AlpacaHistoricalEquityPreflightReceipt>,
     bar_time_authority: Arc<AlpacaHistoricalCompositeCalendarAuthority>,
     retained_response_bytes: usize,
@@ -1301,6 +1309,7 @@ impl AlpacaHistoricalPlanRecord {
             && self.plan_digest == other.plan_digest
             && self.config == other.config
             && self.canonical_instrument == other.canonical_instrument
+            && self.identity.evidence() == other.identity.evidence()
             && self.preflight.digest() == other.preflight.digest()
             && self.preflight.as_ref() == other.preflight.as_ref()
             && self.bar_time_authority.preflight_digest()
@@ -1345,6 +1354,7 @@ impl AlpacaHistoricalPlanReceipt {
 pub(crate) struct AlpacaHistoricalValidatedPlan<'receipt> {
     plan: &'receipt AlpacaHistoricalAdmittedPlan,
     admission: ResearchProviderAdmission,
+    directory: Arc<dyn AlpacaHistoricalPlanAdmissionDirectory>,
 }
 
 impl<'receipt> AlpacaHistoricalValidatedPlan<'receipt> {
@@ -1355,7 +1365,11 @@ impl<'receipt> AlpacaHistoricalValidatedPlan<'receipt> {
         cancellation: &CancellationToken,
     ) -> Result<AlpacaHistoricalAuthorizedPlan<'receipt>, AlpacaHistoricalSourceSlotError> {
         ensure_plan_receipt_wait_current(deadline, cancellation)?;
-        let Self { plan, admission } = self;
+        let Self {
+            plan,
+            admission,
+            directory,
+        } = self;
         let publication = tokio::select! {
             biased;
             () = admission.cancellation().cancelled() => {
@@ -1377,8 +1391,13 @@ impl<'receipt> AlpacaHistoricalValidatedPlan<'receipt> {
         admission
             .ensure_live()
             .map_err(|_error| AlpacaHistoricalSourceSlotError::StaleLease)?;
+        directory.validate_plan_now(plan)?;
         ensure_plan_receipt_wait_current(deadline, cancellation)?;
-        Ok(AlpacaHistoricalAuthorizedPlan { plan, publication })
+        Ok(AlpacaHistoricalAuthorizedPlan {
+            plan,
+            publication,
+            directory,
+        })
     }
 }
 
@@ -1390,11 +1409,14 @@ impl<'receipt> AlpacaHistoricalValidatedPlan<'receipt> {
 pub(crate) struct AlpacaHistoricalAuthorizedPlan<'receipt> {
     plan: &'receipt AlpacaHistoricalAdmittedPlan,
     publication: ResearchProviderPublicationLease,
+    directory: Arc<dyn AlpacaHistoricalPlanAdmissionDirectory>,
 }
 
 impl AlpacaHistoricalAuthorizedPlan<'_> {
     /// Original composite calendar semantics, exposed only under exact current plan authority.
-    pub(crate) const fn series_semantics(&self) -> &market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics {
+    pub(crate) const fn series_semantics(
+        &self,
+    ) -> &market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics {
         &self.plan.series_semantics
     }
     pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
@@ -1407,6 +1429,7 @@ impl AlpacaHistoricalAuthorizedPlan<'_> {
 
     /// Revalidates the retained publication authority immediately before downstream commit.
     pub(crate) fn validate_current(&self) -> Result<(), AlpacaHistoricalSourceSlotError> {
+        self.directory.validate_plan_now(self.plan)?;
         self.publication
             .validate_precommit()
             .map_err(|_error| AlpacaHistoricalSourceSlotError::StaleLease)
@@ -1471,6 +1494,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
         canonical_instrument: MarketDataInstrumentDefinition,
         deadline: Instant,
         cancellation: &CancellationToken,
+        identity: Arc<dyn CurrentCatalogProviderIdentity>,
     ) -> Result<AlpacaHistoricalAdmittedPlan, AlpacaHistoricalPlanAdmissionError> {
         // A single generation owns this directory's mutation authority. Serializing the bounded
         // network preflight with publication prevents concurrent identical clicks from minting
@@ -1501,6 +1525,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             &self.inner.metadata,
             &preflight_plan,
             &canonical_instrument,
+            identity.as_ref(),
         )
         .map_err(|_error| AlpacaHistoricalPlanAdmissionError::InvalidInstrumentAuthority)?;
         {
@@ -1513,7 +1538,9 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
                 .iter()
                 .find(|record| record.preflight.plan() == &preflight_plan)
             {
-                if existing.canonical_instrument == canonical_instrument {
+                if existing.canonical_instrument == canonical_instrument
+                    && existing.identity.evidence() == identity.evidence()
+                {
                     return Ok(admitted_plan(existing));
                 }
                 return Err(AlpacaHistoricalPlanAdmissionError::IdentityCollision);
@@ -1564,6 +1591,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             AlpacaHistoricalEquitySource::one_plan_analytical_dataset_identifier(
                 &config,
                 &canonical_instrument,
+                identity.as_ref(),
             )
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::InvalidInstrumentAuthority)?;
         let analytical_dataset = DatasetId::try_from(analytical_identifier.as_str())
@@ -1576,6 +1604,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             &analytical_dataset,
             preflight.digest(),
             bar_time_authority.preflight_digest(),
+            identity.evidence(),
         )?;
         let retained_response_bytes = preflight
             .total_response_bytes()
@@ -1589,6 +1618,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             plan_digest,
             config,
             canonical_instrument,
+            identity,
             preflight,
             bar_time_authority,
             retained_response_bytes,
@@ -1660,6 +1690,7 @@ impl AlpacaHistoricalPlanAdmissionDirectory for AlpacaHistoricalPlanDirectoryAut
         canonical_instrument: MarketDataInstrumentDefinition,
         deadline: Instant,
         cancellation: &'a CancellationToken,
+        identity: Arc<dyn CurrentCatalogProviderIdentity>,
     ) -> BoxFuture<'a, Result<AlpacaHistoricalAdmittedPlan, AlpacaHistoricalPlanAdmissionError>>
     {
         Box::pin(AlpacaHistoricalPlanDirectoryAuthority::admit_plan(
@@ -1668,6 +1699,7 @@ impl AlpacaHistoricalPlanAdmissionDirectory for AlpacaHistoricalPlanDirectoryAut
             canonical_instrument,
             deadline,
             cancellation,
+            identity,
         ))
     }
 
@@ -1724,6 +1756,13 @@ impl AlpacaHistoricalPlanAdmissionDirectory for AlpacaHistoricalPlanDirectoryAut
                 && record.parent_digest == plan.parent_digest
                 && record.plan_digest == plan.plan_digest
                 && record.bar_time_authority.series_semantics() == &plan.series_semantics
+                && AlpacaHistoricalEquitySource::validate_one_preflight_instrument(
+                    &self.inner.metadata,
+                    record.preflight.plan(),
+                    &record.canonical_instrument,
+                    record.identity.as_ref(),
+                )
+                .is_ok()
         }) {
             Ok(())
         } else {
@@ -1772,6 +1811,7 @@ impl ExtractionSource for AlpacaHistoricalManagedSource {
                     authority,
                     request,
                     cancellation,
+                    Arc::clone(&record.identity),
                 )
                 .await
         })
@@ -1801,6 +1841,7 @@ impl ExtractionSource for AlpacaHistoricalManagedSource {
                     authority,
                     request,
                     cancellation,
+                    Arc::clone(&record.identity),
                 )
                 .await
         })
@@ -1821,7 +1862,7 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
         let runtime = self.inner.runtime.clone();
         let bar_time_authority = Arc::clone(&record.bar_time_authority);
         let preflight = Arc::clone(&record.preflight);
-        Box::pin(async move {
+        let extraction = Box::pin(async move {
             let output = runtime
                 .extract_plan_with_capture(
                     record.config.clone(),
@@ -1832,6 +1873,7 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
                     authority,
                     request,
                     cancellation,
+                    Arc::clone(&record.identity),
                 )
                 .await?;
             let (batch, bar_capture, calendar_capture, history_capture_semantic) =
@@ -1843,6 +1885,19 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
                     history_capture_semantic,
                 ),
             )
+        });
+        Box::pin(async move {
+            // Extraction retains its original authorities but is polled independently of
+            // the lifecycle/ingest caller chain. Boxing alone does not separate poll stacks.
+            // Dropping the caller aborts this owned task instead of detaching extraction.
+            let task = AbortOnDropHandle::new(tokio::spawn(extraction));
+            task.await.map_err(|error| {
+                if error.is_cancelled() {
+                    ExtractionSourceError::Cancelled
+                } else {
+                    invalid_capture_protocol()
+                }
+            })?
         })
     }
 
@@ -1857,7 +1912,12 @@ impl ManagedResearchExtractionSource for AlpacaHistoricalManagedSource {
         let identifier = self
             .inner
             .runtime
-            .analytical_dataset_for_plan(&record.config, &record.canonical_instrument, batch)
+            .analytical_dataset_for_plan(
+                &record.config,
+                &record.canonical_instrument,
+                batch,
+                record.identity.as_ref(),
+            )
             .map_err(|_error| ResearchRevisionPlanError)?;
         let dataset =
             DatasetId::try_from(identifier.as_str()).map_err(|_error| ResearchRevisionPlanError)?;
@@ -1900,11 +1960,7 @@ fn bind_complete_market_history_capture_graph(
     let batch = batch
         .try_bind_provider_capture(capture_material.receipt())
         .map_err(|_error| invalid_capture_protocol())?;
-    Ok(ManagedExtraction {
-        batch,
-        company_identity: None,
-        capture_material: Some(capture_material),
-    })
+    Ok(ManagedExtraction::new(batch, None, Some(capture_material)))
 }
 
 impl AlpacaHistoricalPlanDirectoryInner {
@@ -1922,6 +1978,14 @@ impl AlpacaHistoricalPlanDirectoryInner {
         let index = plans
             .binary_search_by(|record| record.provider_dataset.as_str().cmp(dataset.as_str()))
             .map_err(|_error| SourceError::InvalidProtocolState)?;
+        let record = &plans[index];
+        AlpacaHistoricalEquitySource::validate_one_preflight_instrument(
+            &self.metadata,
+            record.preflight.plan(),
+            &record.canonical_instrument,
+            record.identity.as_ref(),
+        )
+        .map_err(|_| SourceError::SessionNotCurrent)?;
         Ok(Arc::clone(&plans[index]))
     }
 }
@@ -2138,6 +2202,10 @@ const fn source_operation_tag(operation: SourceOperation) -> u8 {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the admitted plan binds its exact source, native identity and capture coordinates"
+)]
 fn plan_binding_digest(
     parent_digest: EvidenceDigest,
     config: &AlpacaHistoricalEquityConfig,
@@ -2146,6 +2214,7 @@ fn plan_binding_digest(
     analytical_dataset: &DatasetId,
     preflight_digest: EvidenceDigest,
     authority_preflight_digest: EvidenceDigest,
+    identity: &market_squawk_sources::ProviderIdentitySelectionEvidence,
 ) -> Result<EvidenceDigest, AlpacaHistoricalPlanAdmissionError> {
     if preflight_digest != authority_preflight_digest {
         return Err(AlpacaHistoricalPlanAdmissionError::IdentityCollision);
@@ -2153,6 +2222,8 @@ fn plan_binding_digest(
     let metadata = serde_json::to_vec(config.metadata())
         .map_err(|_error| AlpacaHistoricalPlanAdmissionError::Serialization)?;
     let canonical_instrument = serde_json::to_vec(canonical_instrument)
+        .map_err(|_error| AlpacaHistoricalPlanAdmissionError::Serialization)?;
+    let identity = serde_json::to_vec(identity)
         .map_err(|_error| AlpacaHistoricalPlanAdmissionError::Serialization)?;
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/alpaca-historical-admitted-plan/v1\0");
@@ -2162,6 +2233,7 @@ fn plan_binding_digest(
     digest.update(preflight_digest.bytes());
     hash_bytes(&mut digest, &metadata);
     hash_bytes(&mut digest, &canonical_instrument);
+    hash_bytes(&mut digest, &identity);
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
@@ -2244,8 +2316,8 @@ mod tests {
         assert_eq!(
             first_parent.binding_digest().bytes(),
             [
-                192, 2, 149, 25, 219, 73, 42, 129, 14, 40, 213, 103, 83, 186, 136, 1, 169, 233,
-                109, 183, 15, 147, 125, 148, 35, 203, 178, 37, 82, 143, 154, 94,
+                145, 46, 212, 199, 82, 143, 198, 180, 18, 208, 73, 91, 16, 157, 251, 96, 110, 81,
+                183, 200, 91, 239, 88, 117, 213, 138, 250, 23, 32, 235, 47, 22,
             ]
         );
         assert_ne!(
@@ -2357,13 +2429,14 @@ mod tests {
         assert_eq!(install_count.load(Ordering::SeqCst), 1);
         first_lease.validate_exact_parent(first_parent)?;
         let first_source = active_entry_snapshot(&coordinator, &first_lease)?;
-        let (preflight_plan, canonical_instrument) = fixture_plan()?;
+        let (preflight_plan, canonical_instrument, identity) = fixture_plan()?;
         let first_receipt = first_lease
             .admit_plan(
                 preflight_plan.clone(),
                 canonical_instrument.clone(),
                 Instant::now() + Duration::from_secs(2),
                 &CancellationToken::new(),
+                Arc::clone(&identity),
             )
             .await?;
         assert!(first_receipt.admission.matches(&first_lease.admission));
@@ -2474,6 +2547,7 @@ mod tests {
                 canonical_instrument,
                 Instant::now() + Duration::from_secs(2),
                 &CancellationToken::new(),
+                identity,
             )
             .await?;
         assert!(successor_receipt.matches_group_generation(successor_parent.group_generation()));
@@ -2767,14 +2841,18 @@ mod tests {
             Ok(Self {
                 parent,
                 plan: AlpacaHistoricalAdmittedPlan {
-                    series_semantics: market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics::new(
-                        market_squawk_domain::BarTimestampBasis::PeriodStart,
-                        market_squawk_domain::MarketBarSessionEvidence::try_new(
-                            market_squawk_domain::MarketBarSessionKind::Regular,
-                            SourceIdentifier::try_from("fixture-original-session").map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
-                            EvidenceDigest::new(DigestAlgorithm::Sha256, [17;32]),
-                        ).map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
-                    ),
+                    series_semantics:
+                        market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics::new(
+                            market_squawk_domain::BarTimestampBasis::PeriodStart,
+                            market_squawk_domain::MarketBarSessionEvidence::try_new(
+                                market_squawk_domain::MarketBarSessionKind::Regular,
+                                SourceIdentifier::try_from("fixture-original-session").map_err(
+                                    |_| AlpacaHistoricalSourceSlotError::InvalidCandidate,
+                                )?,
+                                EvidenceDigest::new(DigestAlgorithm::Sha256, [17; 32]),
+                            )
+                            .map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
+                        ),
                     provider_dataset: SourceIdentifier::try_from("alpaca:test-history")
                         .map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
                     analytical_dataset: DatasetId::try_from("alpaca.test-history")
@@ -2797,12 +2875,15 @@ mod tests {
             canonical_instrument: MarketDataInstrumentDefinition,
             deadline: Instant,
             cancellation: &'a CancellationToken,
+            identity: Arc<dyn CurrentCatalogProviderIdentity>,
         ) -> BoxFuture<'a, Result<AlpacaHistoricalAdmittedPlan, AlpacaHistoricalPlanAdmissionError>>
         {
             Box::pin(async move {
                 if cancellation.is_cancelled()
                     || Instant::now() >= deadline
                     || preflight_plan.mapping().instrument() != canonical_instrument.instrument_id()
+                    || preflight_plan.mapping().native_identity()
+                        != Some(&identity.evidence().native)
                 {
                     return Err(AlpacaHistoricalPlanAdmissionError::InvalidPlan);
                 }
@@ -2861,15 +2942,42 @@ mod tests {
         )?)
     }
 
+    #[derive(Debug)]
+    struct TestIdentity(market_squawk_sources::ProviderIdentitySelectionEvidence);
+
+    impl CurrentCatalogProviderIdentity for TestIdentity {
+        fn evidence(&self) -> &market_squawk_sources::ProviderIdentitySelectionEvidence {
+            &self.0
+        }
+        fn validate_at(&self, at: Timestamp) -> Result<(), market_squawk_sources::RegistryError> {
+            if at < self.0.definition_published_at {
+                Err(market_squawk_sources::RegistryError::StaleHandle)
+            } else {
+                Ok(())
+            }
+        }
+        fn retained_bytes(&self) -> Result<usize, market_squawk_sources::RegistryError> {
+            std::mem::size_of::<Self>()
+                .checked_add(
+                    self.0
+                        .dynamic_retained_bytes()
+                        .ok_or(market_squawk_sources::RegistryError::RetainedSizeOverflow)?,
+                )
+                .ok_or(market_squawk_sources::RegistryError::RetainedSizeOverflow)
+        }
+    }
+
     fn fixture_plan() -> Result<
         (
             AlpacaHistoricalEquityPreflightPlan,
             MarketDataInstrumentDefinition,
+            Arc<dyn CurrentCatalogProviderIdentity>,
         ),
         Box<dyn std::error::Error>,
     > {
         let instrument_id = fixture_instrument_id()?;
         let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let observed_at = Timestamp::from_unix_nanos(1_735_776_900_000_000_000);
         let mapping =
             AlpacaInstrumentMapping::try_new("AAPL".to_owned(), instrument_id, AssetClass::Equity)?;
         let plan = AlpacaHistoricalEquityPreflightPlan::try_new(
@@ -2897,10 +3005,66 @@ mod tests {
                     VenueId::try_from("iex")?,
                     VenueSymbol::try_from("AAPL")?,
                 )],
-                provider_identities: Vec::new(),
+                provider_identities: vec![market_squawk_domain::ProviderIdentityRecord::new(
+                    market_squawk_domain::ProviderIdentityRecordInput {
+                        instrument_id,
+                        source_id: SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+                        provider_instrument_id: ProviderInstrumentId::try_from(
+                            "00000001-0002-0003-0004-000000000099",
+                        )?,
+                        evidence:
+                            market_squawk_domain::ProviderIdentityEvidence::from_content_digest(
+                                exact_evidence(53).content_digest(),
+                            ),
+                        source_timestamp: None,
+                        observed_at,
+                        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                            "fixture-alpaca-asset-v1",
+                        )?),
+                        validity: effective,
+                        supersedes: None,
+                    },
+                )],
                 identifiers: Vec::new(),
             })?;
-        Ok((plan, definition))
+        let native = market_squawk_sources::ProviderNativeIdentityRequest {
+            namespace: SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+            provider_instrument_id: ProviderInstrumentId::try_from(
+                "00000001-0002-0003-0004-000000000099",
+            )?,
+            instrument: instrument_id,
+            venue: VenueId::try_from("iex")?,
+            venue_symbol: VenueSymbol::try_from("AAPL")?,
+            knowledge_at: observed_at,
+            effective_at: observed_at,
+        };
+        let evidence = market_squawk_sources::ProviderIdentitySelectionEvidence {
+            native: native.clone(),
+            definition_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(serde_json::to_vec(&definition)?).into(),
+            ),
+            definition_sequence: 1,
+            reference_revision: definition.reference_evidence().metadata_revision().clone(),
+            reference_payload_digest: definition
+                .reference_evidence()
+                .payload_evidence()
+                .content_digest(),
+            definition_published_at: observed_at,
+            definition_validity: effective,
+            provider_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                "fixture-alpaca-asset-v1",
+            )?),
+            provider_payload_digest: exact_evidence(53).content_digest(),
+            provider_validity: effective,
+            resolution_digest: exact_evidence(54).content_digest(),
+            selection_digest: exact_evidence(55).content_digest(),
+        };
+        Ok((
+            plan.try_with_native_identity(native)?,
+            definition,
+            Arc::new(TestIdentity(evidence)),
+        ))
     }
 
     async fn wait_for_slot_draining(

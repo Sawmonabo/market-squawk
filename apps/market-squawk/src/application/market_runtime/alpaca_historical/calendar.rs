@@ -114,7 +114,21 @@ impl AlpacaHistoricalCompositeCalendarAuthority {
         &self,
         instrument_revision_digest: EvidenceDigest,
         admitted_plan_digest: EvidenceDigest,
+        identity: &dyn market_squawk_sources::CurrentCatalogProviderIdentity,
+        preflight: &AlpacaHistoricalEquityPreflightReceipt,
     ) -> Result<CompleteMarketBarHistoryV1, AlpacaHistoricalCalendarError> {
+        self.validate_current()?;
+        identity
+            .validate_at(SystemMarketCalendarClock.now()?)
+            .map_err(|_| AlpacaHistoricalCalendarError::Identity)?;
+        let symbol_asof = preflight.plan().symbol_asof_date()?;
+        if preflight.digest() != self.preflight_digest
+            || preflight.plan().mapping().native_identity() != Some(&identity.evidence().native)
+            || identity.evidence().definition_digest != instrument_revision_digest
+            || identity.evidence().native.instrument != self.instrument_id
+        {
+            return Err(AlpacaHistoricalCalendarError::RequestMismatch);
+        }
         let mut expected_provider_timestamps = Vec::new();
         expected_provider_timestamps
             .try_reserve_exact(self.expected_provider_timestamps.len())
@@ -126,6 +140,8 @@ impl AlpacaHistoricalCompositeCalendarAuthority {
             self.instrument_id,
             instrument_revision_digest,
             admitted_plan_digest,
+            identity.evidence().clone(),
+            symbol_asof,
             self.provider_instrument_id.clone(),
             self.venue_id.clone(),
             self.feed.clone(),

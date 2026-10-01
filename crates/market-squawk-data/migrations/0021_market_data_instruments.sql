@@ -2840,8 +2840,19 @@ WHEN NOT EXISTS (
       AND instrument_revision.published_at_ns <= run.requested_at_ns
       AND (
           (NEW.requested_start_ns IS NOT NULL
-           AND instrument_revision.effective_start_ns <= NEW.requested_start_ns
-           AND (instrument_revision.effective_end_ns IS NULL OR NEW.requested_end_ns < instrument_revision.effective_end_ns))
+           AND json_type(NEW.receipt_json, '$.identity_selection') = 'object'
+           AND json_type(NEW.receipt_json, '$.symbol_asof') = 'object'
+           AND json_extract(NEW.receipt_json, '$.identity_selection.native.namespace') = 'alpaca-basic-asset-reference-v1'
+           AND json_extract(NEW.receipt_json, '$.identity_selection.native.instrument') = NEW.instrument_id
+           AND json_extract(NEW.receipt_json, '$.identity_selection.native.venue') = NEW.venue_id
+           AND json_extract(NEW.receipt_json, '$.identity_selection.native.venue_symbol') = NEW.provider_instrument_id
+           AND json_extract(NEW.receipt_json, '$.identity_selection.definition_published_at') = instrument_revision.published_at_ns
+           AND instrument_revision.published_at_ns <= json_extract(NEW.receipt_json, '$.identity_selection.native.knowledge_at')
+           AND json_extract(NEW.receipt_json, '$.identity_selection.native.knowledge_at') <= run.requested_at_ns
+           AND json_extract(NEW.receipt_json, '$.identity_selection.native.effective_at') <= json_extract(NEW.receipt_json, '$.identity_selection.native.knowledge_at')
+           AND instrument_revision.effective_start_ns <= json_extract(NEW.receipt_json, '$.identity_selection.native.effective_at')
+           AND (instrument_revision.effective_end_ns IS NULL
+                OR json_extract(NEW.receipt_json, '$.identity_selection.native.effective_at') < instrument_revision.effective_end_ns))
           OR
           (NEW.requested_start_date IS NOT NULL
            AND instrument_revision.effective_start_ns <= json_extract(NEW.receipt_json, '$.date_windows.normalization.resolved_at')

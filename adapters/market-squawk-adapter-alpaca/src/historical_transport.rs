@@ -596,6 +596,7 @@ fn validate_bar_request(url: &Url) -> Result<(), AlpacaError> {
     let end = exact_query_value(&mut query, "end")?;
     let limit = exact_query_value(&mut query, "limit")?;
     let adjustment = exact_query_value(&mut query, "adjustment")?;
+    let asof = exact_query_value(&mut query, "asof")?;
     let feed = exact_query_value(&mut query, "feed")?;
     let sort = exact_query_value(&mut query, "sort")?;
     let page_token = query.next();
@@ -603,6 +604,8 @@ fn validate_bar_request(url: &Url) -> Result<(), AlpacaError> {
         || !valid_timeframe(&timeframe)
         || !valid_utc_timestamp(&start)
         || !valid_utc_timestamp(&end)
+        || asof.len() != 10
+        || parse_calendar_date(&asof).is_none()
         || limit
             .parse::<u16>()
             .ok()

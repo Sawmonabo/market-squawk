@@ -1112,6 +1112,154 @@ impl CatalogAuthority {
     }
 }
 
+/// Replays retained selection evidence inside the caller's catalog transaction. This
+/// preserves its progress handler and original cutoffs rather than requiring today's revision.
+pub(crate) fn verify_provider_identity_evidence(
+    connection: &rusqlite::Connection,
+    evidence: &ProviderIdentitySelectionEvidence,
+) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+    // Retain the connection's record ceiling and the resolver's three-row bound.
+    let record_limit =
+        usize::try_from(connection.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)?)
+            .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?
+            .min(super::types::MAX_SQLITE_RECORD_BYTES);
+    let limits = super::CatalogResultLimits::try_new(record_limit, record_limit.saturating_mul(4))?;
+    let request = &evidence.native;
+    let query = MarketDataProviderIdentityQuery::try_new(
+        request.namespace.clone(),
+        request.provider_instrument_id.clone(),
+        request.knowledge_at,
+        request.effective_at,
+    )?;
+    let selection = MarketDataProviderIdentitySelection::from_resolution(
+        resolve_provider_identity_in_connection(connection, limits, query, || Ok(()))?,
+    )
+    .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
+    let exact = selection.exact_receipt()?;
+    let row = connection.query_row(
+        &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_revisions AS revisions WHERE revisions.revision_digest=?1"),
+        [exact.definition_revision_digest().bytes()], decode_stored_row,
+    )?;
+    charge_row(&row, &mut ResultBudget::new(limits))?;
+    let record = rebuild_record(row)?;
+    if record.definition().instrument_id() != exact.instrument_id()
+        || record.revision_sequence() != exact.definition_revision_sequence()
+        || record.published_at() != exact.definition_published_at()
+        || native_identity_evidence(&selection, &record, request)? != *evidence
+    {
+        return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+    }
+    Ok(record)
+}
+
+fn resolve_provider_identity_in_connection(
+    connection: &rusqlite::Connection,
+    result_bytes: super::CatalogResultLimits,
+    query: MarketDataProviderIdentityQuery,
+    check: impl Fn() -> Result<(), MarketDataInstrumentCatalogError>,
+) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
+    const MAX_RETAINED_EXACT_MATCHES: usize = 2;
+    check()?;
+    let retrieval_limit = i64::try_from(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
+        .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?;
+    let mut statement = connection.prepare(PROVIDER_IDENTITY_AS_OF_SQL)?;
+    let rows = statement.query_map(
+        params![
+            query.source_id().as_str(),
+            query.provider_instrument_id().as_str(),
+            query.knowledge_at().unix_nanos(),
+            query.effective_at().unix_nanos(),
+            retrieval_limit,
+        ],
+        |row| {
+            Ok((
+                decode_stored_row(row)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+            ))
+        },
+    )?;
+    let mut budget = ResultBudget::new(result_bytes);
+    let mut receipts = Vec::new();
+    receipts
+        .try_reserve_exact(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
+        .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+    for row in rows {
+        check()?;
+        let (stored, term_start_ns, term_end_ns) = row?;
+        charge_row(&stored, &mut budget)?;
+        let record = rebuild_record(stored)?;
+        let definition = record.definition();
+        if record.published_at() > query.knowledge_at()
+            || !interval_contains(definition.effective_interval(), query.effective_at())
+        {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        let provider_identity = definition
+            .provider_identity_at(
+                query.source_id(),
+                query.provider_instrument_id(),
+                query.effective_at(),
+            )
+            .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
+        if provider_identity.instrument_id() != definition.instrument_id()
+            || provider_identity.source_id() != query.source_id()
+            || provider_identity.provider_instrument_id() != query.provider_instrument_id()
+            || provider_identity.validity().starts_at().unix_nanos() != term_start_ns
+            || provider_identity
+                .validity()
+                .ends_at()
+                .map(Timestamp::unix_nanos)
+                != term_end_ns
+        {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        let mut matching_venues = Vec::new();
+        matching_venues
+            .try_reserve_exact(definition.venue_mappings().len())
+            .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+        for mapping in definition.venue_mappings() {
+            if mapping.venue_symbol().as_str() == query.provider_instrument_id().as_str() {
+                budget
+                    .charge([size_of::<VenueId>(), mapping.venue_id().as_str().len()])
+                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                matching_venues.push(mapping.venue_id().clone());
+            }
+        }
+        budget
+            .charge([size_of::<MarketDataProviderIdentityExactReceipt>()])
+            .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+        receipts.push(MarketDataProviderIdentityExactReceipt {
+            instrument_id: definition.instrument_id(),
+            definition_revision_digest: record.revision_digest(),
+            definition_revision_sequence: record.revision_sequence(),
+            definition_reference_revision: definition.reference_revision().clone(),
+            definition_reference_payload_digest: definition
+                .reference_payload_evidence()
+                .content_digest(),
+            definition_published_at: record.published_at(),
+            provider_identity_revision: provider_identity.metadata_revision().clone(),
+            provider_identity_payload_digest: provider_identity.evidence().content_digest(),
+            provider_identity_validity: provider_identity.validity(),
+            matching_venues: matching_venues.into_boxed_slice(),
+        });
+    }
+    let has_more = receipts.len() > MAX_RETAINED_EXACT_MATCHES;
+    receipts.truncate(MAX_RETAINED_EXACT_MATCHES);
+    let outcome = match receipts.as_slice() {
+        [] => MarketDataProviderIdentityResolutionOutcome::Missing,
+        [exact] if !has_more => MarketDataProviderIdentityResolutionOutcome::Exact(exact.clone()),
+        _ => MarketDataProviderIdentityResolutionOutcome::Ambiguous,
+    };
+    let receipt_digest =
+        provider_identity_resolution_digest(query.query_digest(), &outcome, &receipts, has_more);
+    Ok(MarketDataProviderIdentityResolution {
+        query,
+        outcome,
+        receipt_digest,
+    })
+}
+
 fn native_identity_evidence(
     selection: &MarketDataProviderIdentitySelection,
     record: &MarketDataInstrumentRecord,
@@ -2507,117 +2655,12 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
-        const MAX_RETAINED_EXACT_MATCHES: usize = 2;
-        check_operation(deadline, cancellation)?;
-        let connection = &self.catalog().connection;
-        let result = (|| {
-            let retrieval_limit = i64::try_from(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
-                .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?;
-            let mut statement = connection.prepare(PROVIDER_IDENTITY_AS_OF_SQL)?;
-            let rows = statement.query_map(
-                params![
-                    query.source_id().as_str(),
-                    query.provider_instrument_id().as_str(),
-                    query.knowledge_at().unix_nanos(),
-                    query.effective_at().unix_nanos(),
-                    retrieval_limit,
-                ],
-                |row| {
-                    Ok((
-                        decode_stored_row(row)?,
-                        row.get::<_, i64>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
-                    ))
-                },
-            )?;
-            let mut budget = ResultBudget::new(self.catalog().result_bytes);
-            let mut receipts = Vec::new();
-            receipts
-                .try_reserve_exact(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
-                .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
-            for row in rows {
-                check_operation(deadline, cancellation)?;
-                let (stored, term_start_ns, term_end_ns) = row?;
-                charge_row(&stored, &mut budget)?;
-                let record = rebuild_record(stored)?;
-                let definition = record.definition();
-                if record.published_at() > query.knowledge_at()
-                    || !interval_contains(definition.effective_interval(), query.effective_at())
-                {
-                    return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
-                }
-                let provider_identity = definition
-                    .provider_identity_at(
-                        query.source_id(),
-                        query.provider_instrument_id(),
-                        query.effective_at(),
-                    )
-                    .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
-                if provider_identity.instrument_id() != definition.instrument_id()
-                    || provider_identity.source_id() != query.source_id()
-                    || provider_identity.provider_instrument_id() != query.provider_instrument_id()
-                    || provider_identity.validity().starts_at().unix_nanos() != term_start_ns
-                    || provider_identity
-                        .validity()
-                        .ends_at()
-                        .map(Timestamp::unix_nanos)
-                        != term_end_ns
-                {
-                    return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
-                }
-                let mut matching_venues = Vec::new();
-                matching_venues
-                    .try_reserve_exact(definition.venue_mappings().len())
-                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
-                for mapping in definition.venue_mappings() {
-                    if mapping.venue_symbol().as_str() == query.provider_instrument_id().as_str() {
-                        budget
-                            .charge([size_of::<VenueId>(), mapping.venue_id().as_str().len()])
-                            .map_err(|_| {
-                                MarketDataInstrumentCatalogError::ResultByteLimitExceeded
-                            })?;
-                        matching_venues.push(mapping.venue_id().clone());
-                    }
-                }
-                budget
-                    .charge([size_of::<MarketDataProviderIdentityExactReceipt>()])
-                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
-                receipts.push(MarketDataProviderIdentityExactReceipt {
-                    instrument_id: definition.instrument_id(),
-                    definition_revision_digest: record.revision_digest(),
-                    definition_revision_sequence: record.revision_sequence(),
-                    definition_reference_revision: definition.reference_revision().clone(),
-                    definition_reference_payload_digest: definition
-                        .reference_payload_evidence()
-                        .content_digest(),
-                    definition_published_at: record.published_at(),
-                    provider_identity_revision: provider_identity.metadata_revision().clone(),
-                    provider_identity_payload_digest: provider_identity.evidence().content_digest(),
-                    provider_identity_validity: provider_identity.validity(),
-                    matching_venues: matching_venues.into_boxed_slice(),
-                });
-            }
-            let has_more = receipts.len() > MAX_RETAINED_EXACT_MATCHES;
-            receipts.truncate(MAX_RETAINED_EXACT_MATCHES);
-            let outcome = match receipts.as_slice() {
-                [] => MarketDataProviderIdentityResolutionOutcome::Missing,
-                [exact] if !has_more => {
-                    MarketDataProviderIdentityResolutionOutcome::Exact(exact.clone())
-                }
-                _ => MarketDataProviderIdentityResolutionOutcome::Ambiguous,
-            };
-            let receipt_digest = provider_identity_resolution_digest(
-                query.query_digest(),
-                &outcome,
-                &receipts,
-                has_more,
-            );
-            Ok(MarketDataProviderIdentityResolution {
-                query,
-                outcome,
-                receipt_digest,
-            })
-        })();
+        let result = resolve_provider_identity_in_connection(
+            &self.catalog().connection,
+            self.catalog().result_bytes,
+            query,
+            || check_operation(deadline, cancellation),
+        );
         classify_operation(result, deadline, cancellation)
     }
 

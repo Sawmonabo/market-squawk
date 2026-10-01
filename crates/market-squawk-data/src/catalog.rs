@@ -14,11 +14,11 @@ mod market_data_instruments;
 mod market_recovery;
 mod migration_preflight;
 mod model_inventory;
-mod portfolio_planning;
 mod observed_revisions;
 mod official_options_reference;
 mod official_options_reference_stage;
 mod onboarding;
+mod portfolio_planning;
 mod provider_capture;
 mod provider_event;
 mod provider_logical;
@@ -99,6 +99,7 @@ pub use self::listing_reference::{
     MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MAX_LISTING_REFERENCE_RECORDS,
     MAX_LISTING_REFERENCE_SEARCH_ROWS,
 };
+pub(crate) use self::market_data_instruments::verify_provider_identity_evidence;
 pub use self::market_data_instruments::{
     AcceptedNativeReferenceCapture, AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission,
     CurrentListedPopulation, CurrentListedPopulationAdmission, CurrentListedPopulationMember,

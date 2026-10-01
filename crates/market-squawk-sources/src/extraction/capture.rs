@@ -33,9 +33,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    BarTimestampBasis, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarAdjustment,
-    MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, SourceId, SourceIdentifier,
-    Timestamp, VenueId,
+    BarTimestampBasis, CalendarDate, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    MarketBarAdjustment, MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{
     RawCaptureRecord, SealedResearchJournalSegmentClaim, SealedResearchJournalSegmentReceipt,
@@ -50,6 +50,7 @@ use super::contracts::MAX_EXTRACTION_RECORDS;
 use super::native_lineage::{
     ProviderNativeLineageBatch, ProviderNativeLineageImplementation, ProviderNativeLineageSchema,
 };
+use crate::ProviderIdentitySelectionEvidence;
 use crate::bounded::BoundedVec;
 
 /// Maximum exact response pages admitted to one provider capture set.
@@ -107,6 +108,8 @@ pub struct CompleteMarketBarHistoryV1 {
     instrument_id: InstrumentId,
     instrument_revision_digest: EvidenceDigest,
     admitted_plan_digest: EvidenceDigest,
+    identity_selection: ProviderIdentitySelectionEvidence,
+    symbol_asof: CalendarDate,
     provider_instrument_id: ProviderInstrumentId,
     venue_id: VenueId,
     feed: SourceIdentifier,
@@ -134,6 +137,8 @@ impl CompleteMarketBarHistoryV1 {
         instrument_id: InstrumentId,
         instrument_revision_digest: EvidenceDigest,
         admitted_plan_digest: EvidenceDigest,
+        identity_selection: ProviderIdentitySelectionEvidence,
+        symbol_asof: CalendarDate,
         provider_instrument_id: ProviderInstrumentId,
         venue_id: VenueId,
         feed: SourceIdentifier,
@@ -161,6 +166,10 @@ impl CompleteMarketBarHistoryV1 {
             || instrument_revision_digest.bytes() == [0; 32]
             || admitted_plan_digest.algorithm() != DigestAlgorithm::Sha256
             || admitted_plan_digest.bytes() == [0; 32]
+            || identity_selection.native.instrument != instrument_id
+            || identity_selection.definition_digest != instrument_revision_digest
+            || identity_selection.native.venue != venue_id
+            || identity_selection.native.venue_symbol.as_str() != provider_instrument_id.as_str()
             || market_bar_component_ordinal != 0
             || session_calendar_component_ordinal != 1
         {
@@ -182,6 +191,8 @@ impl CompleteMarketBarHistoryV1 {
             instrument_id,
             instrument_revision_digest,
             admitted_plan_digest,
+            identity_selection,
+            symbol_asof,
             provider_instrument_id,
             venue_id,
             feed,
@@ -221,6 +232,16 @@ impl CompleteMarketBarHistoryV1 {
     /// Returns the exact immutable application plan that admitted this capture.
     pub const fn admitted_plan_digest(&self) -> EvidenceDigest {
         self.admitted_plan_digest
+    }
+
+    /// Returns the retained catalog selection for the requested symbol.
+    pub const fn identity_selection(&self) -> &ProviderIdentitySelectionEvidence {
+        &self.identity_selection
+    }
+
+    /// Returns the explicit provider symbol-resolution date.
+    pub const fn symbol_asof(&self) -> CalendarDate {
+        self.symbol_asof
     }
 
     /// Returns the exact provider-native instrument identity.
@@ -297,6 +318,8 @@ struct CompleteMarketBarHistoryV1Wire {
     instrument_id: InstrumentId,
     instrument_revision_digest: EvidenceDigest,
     admitted_plan_digest: EvidenceDigest,
+    identity_selection: ProviderIdentitySelectionEvidence,
+    symbol_asof: CalendarDate,
     provider_instrument_id: ProviderInstrumentId,
     venue_id: VenueId,
     feed: SourceIdentifier,
@@ -324,6 +347,8 @@ impl<'de> Deserialize<'de> for CompleteMarketBarHistoryV1 {
             wire.instrument_id,
             wire.instrument_revision_digest,
             wire.admitted_plan_digest,
+            wire.identity_selection,
+            wire.symbol_asof,
             wire.provider_instrument_id,
             wire.venue_id,
             wire.feed,
@@ -592,7 +617,7 @@ pub struct ProviderCaptureSetReceipt {
     total_body_bytes: u64,
     pages: Box<[ProviderCapturePageReceipt]>,
     request_graph_components: Box<[ProviderCaptureRequestGraphComponent]>,
-    semantic_binding: Option<ProviderCaptureSemanticBinding>,
+    semantic_binding: Option<Box<ProviderCaptureSemanticBinding>>,
     content_digest: EvidenceDigest,
     observation_digest: EvidenceDigest,
 }
@@ -786,7 +811,7 @@ impl ProviderCaptureSetReceipt {
             total_body_bytes,
             pages: pages.into_boxed_slice(),
             request_graph_components: request_graph_components.into_boxed_slice(),
-            semantic_binding,
+            semantic_binding: semantic_binding.map(Box::new),
             content_digest,
             observation_digest,
         })
@@ -834,7 +859,10 @@ impl ProviderCaptureSetReceipt {
 
     /// Returns the typed complete-request semantic proof, when this graph carries one.
     pub const fn semantic_binding(&self) -> Option<&ProviderCaptureSemanticBinding> {
-        self.semantic_binding.as_ref()
+        match &self.semantic_binding {
+            Some(binding) => Some(binding),
+            None => None,
+        }
     }
 
     /// Returns the stable provider-content identity, excluding receive/storage facts.
@@ -4305,6 +4333,9 @@ fn hash_semantic_binding(hash: &mut Sha256, semantic_binding: &ProviderCaptureSe
     hash.update(binding.instrument_id.as_uuid().as_bytes());
     hash_digest(hash, binding.instrument_revision_digest);
     hash_digest(hash, binding.admitted_plan_digest);
+    hash_identity_selection(hash, &binding.identity_selection);
+    hash.update(binding.symbol_asof.year().to_be_bytes());
+    hash.update([binding.symbol_asof.month(), binding.symbol_asof.day()]);
     hash_field(hash, binding.provider_instrument_id.as_str().as_bytes());
     hash_field(hash, binding.venue_id.as_str().as_bytes());
     hash_field(hash, binding.feed.as_str().as_bytes());
@@ -4339,6 +4370,50 @@ fn hash_semantic_binding(hash: &mut Sha256, semantic_binding: &ProviderCaptureSe
         hash.update(timestamp.unix_nanos().to_be_bytes());
     }
     hash_digest(hash, binding.completeness_evidence);
+}
+
+fn hash_identity_selection(hash: &mut Sha256, evidence: &ProviderIdentitySelectionEvidence) {
+    let native = &evidence.native;
+    hash_field(hash, native.namespace.as_str().as_bytes());
+    hash_field(hash, native.provider_instrument_id.as_str().as_bytes());
+    hash.update(native.instrument.as_uuid().as_bytes());
+    hash_field(hash, native.venue.as_str().as_bytes());
+    hash_field(hash, native.venue_symbol.as_str().as_bytes());
+    hash.update(native.knowledge_at.unix_nanos().to_be_bytes());
+    hash.update(native.effective_at.unix_nanos().to_be_bytes());
+    hash_digest(hash, evidence.definition_digest);
+    hash.update(evidence.definition_sequence.to_be_bytes());
+    hash_field(
+        hash,
+        evidence
+            .reference_revision
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    );
+    hash_digest(hash, evidence.reference_payload_digest);
+    hash.update(evidence.definition_published_at.unix_nanos().to_be_bytes());
+    hash_field(
+        hash,
+        evidence
+            .provider_revision
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    );
+    hash_digest(hash, evidence.provider_payload_digest);
+    for validity in [evidence.definition_validity, evidence.provider_validity] {
+        hash.update(validity.starts_at().unix_nanos().to_be_bytes());
+        match validity.ends_at() {
+            Some(end) => {
+                hash.update([1]);
+                hash.update(end.unix_nanos().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    hash_digest(hash, evidence.resolution_digest);
+    hash_digest(hash, evidence.selection_digest);
 }
 
 fn capture_observation_digest(

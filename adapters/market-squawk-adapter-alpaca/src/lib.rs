@@ -79,6 +79,7 @@ pub use doctor::{
 };
 pub use error::AlpacaError;
 pub use historical::{
+    alpaca_history_symbol_asof,
     AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest,
     AlpacaHistoricalEquityPreflightClient, AlpacaHistoricalEquityPreflightReceipt,
     AlpacaHistoricalEquitySource, AlpacaHistoricalPaginationDisposition,

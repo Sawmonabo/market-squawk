@@ -14,6 +14,7 @@ use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, CanonicalObservationPayload,
     ExtractionBatch, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, ProviderCaptureSemanticBinding,
     ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderIdentitySelectionEvidence,
 };
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,8 @@ pub(crate) struct MarketBarHistoryPublicationCandidate {
     instrument_id: InstrumentId,
     instrument_revision_digest: Sha256Digest,
     admitted_plan_digest: Sha256Digest,
+    identity_selection: Option<ProviderIdentitySelectionEvidence>,
+    symbol_asof: Option<CalendarDate>,
     provider_instrument_id: ProviderInstrumentId,
     venue_id: VenueId,
     feed: SourceIdentifier,
@@ -427,6 +430,8 @@ impl MarketBarHistoryPublicationCandidate {
             instrument_id: binding.instrument_id(),
             instrument_revision_digest: sha256_evidence(binding.instrument_revision_digest())?,
             admitted_plan_digest: sha256_evidence(binding.admitted_plan_digest())?,
+            identity_selection: Some(binding.identity_selection().clone()),
+            symbol_asof: Some(binding.symbol_asof()),
             provider_instrument_id: binding.provider_instrument_id().clone(),
             venue_id: binding.venue_id().clone(),
             feed: binding.feed().clone(),
@@ -951,6 +956,8 @@ pub struct MarketBarHistoryPublicationReceipt {
     asset_class: AssetClass,
     instrument_revision_digest: Sha256Digest,
     admitted_plan_digest: Sha256Digest,
+    identity_selection: Option<ProviderIdentitySelectionEvidence>,
+    symbol_asof: Option<CalendarDate>,
     provider_instrument_id: ProviderInstrumentId,
     venue_id: VenueId,
     feed: SourceIdentifier,
@@ -1063,6 +1070,16 @@ impl MarketBarHistoryPublicationReceipt {
     /// Returns the exact admitted plan identity bound into the provider request graph.
     pub const fn admitted_plan_digest(&self) -> Sha256Digest {
         self.admitted_plan_digest
+    }
+
+    /// Returns the original native identity selection for timestamped Alpaca history.
+    pub const fn identity_selection(&self) -> Option<&ProviderIdentitySelectionEvidence> {
+        self.identity_selection.as_ref()
+    }
+
+    /// Returns the explicit Alpaca symbol interpretation date.
+    pub const fn symbol_asof(&self) -> Option<CalendarDate> {
+        self.symbol_asof
     }
 
     /// Returns the provider-native instrument.
@@ -1417,6 +1434,8 @@ struct MarketBarHistoryReceiptWire {
     asset_class: AssetClass,
     instrument_revision_digest: [u8; 32],
     admitted_plan_digest: [u8; 32],
+    identity_selection: Option<ProviderIdentitySelectionEvidence>,
+    symbol_asof: Option<CalendarDate>,
     provider_instrument_id: ProviderInstrumentId,
     venue_id: VenueId,
     feed: SourceIdentifier,
@@ -1495,6 +1514,62 @@ fn require_canonical_history_schema(schema: &DatasetSchemaRef) -> Result<(), Man
     } else {
         Err(ManifestCatalogError::MarketBarHistoryMismatch)
     }
+}
+
+/// Replays the exact current-reference selection used for retrospective acquisition.
+/// The original knowledge/effective cutoffs are retained; historical bar dates do not
+/// backdate either the native UUID assertion or its symbol mapping.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retained selection must match every canonical and native series coordinate"
+)]
+fn validate_alpaca_identity_selection(
+    connection: &Connection,
+    revision_digest: Sha256Digest,
+    instrument_id: InstrumentId,
+    source_id: &SourceId,
+    provider_instrument_id: &ProviderInstrumentId,
+    currency: Currency,
+    venue_id: &VenueId,
+    identity: &ProviderIdentitySelectionEvidence,
+    symbol_asof: CalendarDate,
+    admitted_at: Timestamp,
+) -> Result<AssetClass, ManifestCatalogError> {
+    let native = &identity.native;
+    if source_id.as_str() != ALPACA_HISTORY_SOURCE
+        || native.namespace.as_str() != "alpaca-basic-asset-reference-v1"
+        || native.instrument != instrument_id
+        || native.venue != *venue_id
+        || venue_id.as_str() != ALPACA_HISTORY_VENUE
+        || native.venue_symbol.as_str() != provider_instrument_id.as_str()
+        || Uuid::parse_str(native.provider_instrument_id.as_str())
+            .ok()
+            .is_none_or(|uuid| {
+                uuid.is_nil() || uuid.to_string() != native.provider_instrument_id.as_str()
+            })
+        || sha256_evidence(identity.definition_digest)? != revision_digest
+        || native.knowledge_at > admitted_at
+        || native.effective_at > admitted_at
+        || market_squawk_adapter_alpaca::alpaca_history_symbol_asof(native.effective_at)
+            .map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?
+            != symbol_asof
+    {
+        return Err(ManifestCatalogError::MarketBarHistoryMismatch);
+    }
+    let record = crate::catalog::verify_provider_identity_evidence(connection, identity)
+        .map_err(|_| ManifestCatalogError::MarketBarHistoryMismatch)?;
+    let definition = record.definition();
+    if definition.instrument_id() != instrument_id
+        || !matches!(
+            definition.asset_class(),
+            AssetClass::Equity | AssetClass::Fund
+        )
+        || definition.quote_currency() != currency
+        || currency.as_str() != ALPACA_HISTORY_CURRENCY
+    {
+        return Err(ManifestCatalogError::MarketBarHistoryMismatch);
+    }
+    Ok(definition.asset_class())
 }
 
 fn validate_exact_instrument_revision(
@@ -1744,6 +1819,8 @@ pub(super) fn insert_generation_market_bar_history_inputs(
     if let Some(candidate) = candidate {
         let source_input = source_input.ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?;
         if candidate.max_ingested_at > anchor.created_at()
+            || (candidate.date_windows.is_some()
+                && (candidate.identity_selection.is_some() || candidate.symbol_asof.is_some()))
             || candidate.source_id != *source_input.source_id()
         {
             return Err(ManifestCatalogError::MarketBarHistoryMismatch);
@@ -1756,18 +1833,20 @@ pub(super) fn insert_generation_market_bar_history_inputs(
                 source_input.requested_at(),
             )?
         } else {
-            validate_exact_instrument_revision(
+            validate_alpaca_identity_selection(
                 transaction,
                 candidate.instrument_revision_digest,
                 candidate.instrument_id,
                 &candidate.source_id,
                 &candidate.provider_instrument_id,
                 candidate.currency,
+                &candidate.venue_id,
                 candidate
-                    .requested_start
+                    .identity_selection
+                    .as_ref()
                     .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?,
                 candidate
-                    .requested_end
+                    .symbol_asof
                     .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?,
                 source_input.requested_at(),
             )?
@@ -2027,6 +2106,8 @@ fn insert_market_bar_history_publication(
         asset_class,
         instrument_revision_digest: candidate.instrument_revision_digest.bytes(),
         admitted_plan_digest: candidate.admitted_plan_digest.bytes(),
+        identity_selection: candidate.identity_selection.clone(),
+        symbol_asof: candidate.symbol_asof,
         provider_instrument_id: candidate.provider_instrument_id.clone(),
         venue_id: candidate.venue_id.clone(),
         feed: candidate.feed.clone(),
@@ -2430,7 +2511,19 @@ pub(super) fn generation_market_bar_history_candidate_matches(
         ],
         |row| row.get(0),
     )?;
-    Ok(matches)
+    if !matches {
+        return Ok(false);
+    }
+    let receipt_json: String = connection.query_row(
+        "SELECT receipt_json FROM market_bar_history_publications
+         WHERE origin_generation_sequence=?1",
+        [generation_sequence],
+        |row| row.get(0),
+    )?;
+    let wire: MarketBarHistoryReceiptWire =
+        serde_json::from_str(&receipt_json).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    Ok(wire.identity_selection == candidate.identity_selection
+        && wire.symbol_asof == candidate.symbol_asof)
 }
 
 struct StoredCanonicalMarketBarHistorySeries {
@@ -3633,18 +3726,18 @@ fn load_market_bar_history_receipt(
             Timestamp::from_unix_nanos(origin_requested_at_ns),
         )?
     } else {
-        validate_exact_instrument_revision(
+        validate_alpaca_identity_selection(
             connection,
             nonzero_sha256(wire.instrument_revision_digest)?,
             wire.instrument_id,
             &wire.source_id,
             &wire.provider_instrument_id,
             wire.currency,
-            wire.requested_start_ns
-                .map(Timestamp::from_unix_nanos)
+            &wire.venue_id,
+            wire.identity_selection
+                .as_ref()
                 .ok_or(ManifestCatalogError::CorruptCatalog)?,
-            wire.requested_end_ns
-                .map(Timestamp::from_unix_nanos)
+            wire.symbol_asof
                 .ok_or(ManifestCatalogError::CorruptCatalog)?,
             Timestamp::from_unix_nanos(origin_requested_at_ns),
         )?
@@ -3863,6 +3956,8 @@ fn validate_capture_against_wire(
         || binding.instrument_id() != wire.instrument_id
         || binding.instrument_revision_digest().bytes() != wire.instrument_revision_digest
         || binding.admitted_plan_digest().bytes() != wire.admitted_plan_digest
+        || Some(binding.identity_selection()) != wire.identity_selection.as_ref()
+        || Some(binding.symbol_asof()) != wire.symbol_asof
         || binding.provider_instrument_id() != &wire.provider_instrument_id
         || binding.venue_id() != &wire.venue_id
         || binding.feed() != &wire.feed
@@ -3966,7 +4061,12 @@ fn receipt_from_wire(
                 || wire.session_ruleset.as_str() != ALPACA_HISTORY_SESSION_RULESET
                 || wire.graph_purpose.as_str() != ALPACA_HISTORY_GRAPH_PURPOSE
                 || wire.currency.as_str() != ALPACA_HISTORY_CURRENCY))
-        || (wire.date_windows.is_some() && !nominal::nominal_wire_valid(&wire))
+        || (wire.date_windows.is_none()
+            && (wire.identity_selection.is_none() || wire.symbol_asof.is_none()))
+        || (wire.date_windows.is_some()
+            && (wire.identity_selection.is_some()
+                || wire.symbol_asof.is_some()
+                || !nominal::nominal_wire_valid(&wire)))
         || wire.origin_record_count < wire.returned_bar_count
         || wire.expected_bar_count == 0
         || wire.expected_bar_count != wire.returned_bar_count
@@ -4027,6 +4127,8 @@ fn receipt_from_wire(
         asset_class: wire.asset_class,
         instrument_revision_digest: nonzero_sha256(wire.instrument_revision_digest)?,
         admitted_plan_digest: nonzero_sha256(wire.admitted_plan_digest)?,
+        identity_selection: wire.identity_selection,
+        symbol_asof: wire.symbol_asof,
         provider_instrument_id: wire.provider_instrument_id,
         venue_id: wire.venue_id,
         feed: wire.feed,

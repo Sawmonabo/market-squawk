@@ -521,6 +521,13 @@ pub struct ResearchRevisionPlanError;
 /// One source-agnostic analytical batch plus optional adapter-owned reference metadata.
 #[derive(Debug)]
 pub struct ManagedExtraction {
+    // Keep both the future output and its enclosing Tokio task result small. The original
+    // non-cloneable capture authority remains owned by this one extraction.
+    parts: Box<ManagedExtractionParts>,
+}
+
+#[derive(Debug)]
+struct ManagedExtractionParts {
     batch: ExtractionBatch,
     company_identity: Option<CompanyIdentityObservation>,
     capture_material: Option<ProviderCaptureMaterial>,
@@ -534,7 +541,7 @@ struct ManagedProviderNativePublication {
 
 #[derive(Debug)]
 pub struct ManagedExtractionWithNative {
-    handoff: ManagedExtractionHandoff,
+    handoff: Box<ManagedExtractionHandoff>,
 }
 
 #[derive(Debug)]
@@ -550,12 +557,22 @@ enum ManagedExtractionHandoff {
 }
 
 impl ManagedExtraction {
-    fn analytical_only(batch: ExtractionBatch) -> Self {
+    fn new(
+        batch: ExtractionBatch,
+        company_identity: Option<CompanyIdentityObservation>,
+        capture_material: Option<ProviderCaptureMaterial>,
+    ) -> Self {
         Self {
-            batch,
-            company_identity: None,
-            capture_material: None,
+            parts: Box::new(ManagedExtractionParts {
+                batch,
+                company_identity,
+                capture_material,
+            }),
         }
+    }
+
+    fn analytical_only(batch: ExtractionBatch) -> Self {
+        Self::new(batch, None, None)
     }
 }
 
@@ -565,10 +582,10 @@ impl ManagedExtractionWithNative {
         provider_native: Option<ManagedProviderNativePublication>,
     ) -> Self {
         Self {
-            handoff: ManagedExtractionHandoff::Pending {
+            handoff: Box::new(ManagedExtractionHandoff::Pending {
                 extraction,
                 provider_native,
-            },
+            }),
         }
     }
 
@@ -577,10 +594,10 @@ impl ManagedExtractionWithNative {
         revisions: ExtractionRevisionPlan,
     ) -> Self {
         Self {
-            handoff: ManagedExtractionHandoff::Provider {
+            handoff: Box::new(ManagedExtractionHandoff::Provider {
                 sealed_capture,
                 revisions,
-            },
+            }),
         }
     }
 }
@@ -820,11 +837,7 @@ fn bind_managed_provider_native_capture(
         return Err(invalid_capture_protocol());
     }
     Ok(ManagedExtractionWithNative::pending(
-        ManagedExtraction {
-            batch,
-            company_identity: None,
-            capture_material: Some(capture_material),
-        },
+        ManagedExtraction::new(batch, None, Some(capture_material)),
         Some(ManagedProviderNativePublication {
             native_lineage,
             row_capture_page_ordinals,
@@ -2678,16 +2691,16 @@ impl ProductionResearchIngestCoordinator {
             prepared.metadata.source_class(),
             SourceClass::LocalFile | SourceClass::PortfolioExport
         );
-        let (publication, company_identity, revisions) = match managed.handoff {
+        let (publication, company_identity, revisions) = match *managed.handoff {
             ManagedExtractionHandoff::Pending {
-                extraction:
-                    ManagedExtraction {
-                        batch,
-                        company_identity,
-                        capture_material: extraction_capture,
-                    },
+                extraction,
                 provider_native,
             } => {
+                let ManagedExtractionParts {
+                    batch,
+                    company_identity,
+                    capture_material: extraction_capture,
+                } = *extraction.parts;
                 let (batch, capture_material) = match (discovery_capture, extraction_capture) {
                     (Some(_), Some(_)) => return Err(invalid_result()),
                     (Some(capture_material), None) => {

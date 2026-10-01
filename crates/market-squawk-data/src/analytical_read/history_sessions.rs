@@ -550,7 +550,11 @@ fn join_provider(
         .iter()
         .filter(|session| {
             session.provider_timestamp().is_some_and(|at| at >= start)
-                && session.period_end_exclusive().is_some_and(|at| at <= end)
+                // The provider request includes its end; canonical periods exclude theirs.
+                && session.period_end_exclusive().is_some_and(|at| {
+                    at.checked_sub_nanos(1)
+                        .is_ok_and(|last_included| last_included <= end)
+                })
         })
         .count()
         != sink.count

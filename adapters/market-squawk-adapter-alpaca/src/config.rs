@@ -4,8 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64};
 use std::time::Duration;
 
+use chrono::{DateTime, Datelike as _, Utc};
+use chrono_tz::America::New_York;
+
 use market_squawk_domain::{
-    AssetClass, BarTimestampBasis, ChecksumCapability, CoverageDelay, DataQuality,
+    AssetClass, BarTimestampBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     InstrumentId, IntegrityRule, LiveEventClass, MarketBarSessionEvidence, ProviderChannel,
     ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
@@ -808,7 +811,24 @@ pub struct AlpacaHistoricalEquityPreflightPlan {
 }
 
 impl AlpacaHistoricalEquityPreflightPlan {
+    /// Binds current native coordinates for Alpaca's retrospective symbol mapping. The
+    /// coordinates are not authority; source admission separately requires the catalog capability.
+    pub fn try_with_native_identity(
+        mut self,
+        native: ProviderNativeIdentityRequest,
+    ) -> Result<Self, AlpacaError> {
+        self.mapping = self.mapping.try_with_native_identity(native)?;
+        Ok(self)
+    }
+
+    /// Explicit New York symbol-identity date sent to Alpaca, independent of the bar window.
+    pub fn symbol_asof_date(&self) -> Result<CalendarDate, AlpacaError> {
+        historical_symbol_asof(&self.mapping)
+    }
+
     /// Anchors a contiguous bounded lookback at the delayed-data boundary for `analysis_at`.
+    /// Daily requests end before the New York provider day containing that delayed cutoff,
+    /// excluding an intraday daily aggregate without asserting calendar/session completeness.
     ///
     /// Callers cannot provide independent start/end coordinates. Runtime extraction separately
     /// verifies the derived end against the current trusted historical-exclusion boundary.
@@ -821,9 +841,14 @@ impl AlpacaHistoricalEquityPreflightPlan {
     ) -> Result<Self, AlpacaError> {
         let exclusion = i64::try_from(ALPACA_HISTORICAL_EXCLUSION_NANOS)
             .map_err(|_| AlpacaError::InvalidHistoricalPlan)?;
-        let end = analysis_at
+        let cutoff = analysis_at
             .checked_sub_nanos(exclusion)
             .map_err(|_| AlpacaError::InvalidHistoricalPlan)?;
+        let end = if timeframe == AlpacaTimeframe::day() {
+            completed_daily_request_end(cutoff)?
+        } else {
+            cutoff
+        };
         let lookback_nanos = u64::from(lookback.days())
             .checked_mul(NANOS_PER_DAY)
             .and_then(|nanos| i64::try_from(nanos).ok())
@@ -873,6 +898,21 @@ impl AlpacaHistoricalEquityPreflightPlan {
     pub const fn page_limit(&self) -> u16 {
         self.page_limit.get()
     }
+}
+
+fn completed_daily_request_end(cutoff: Timestamp) -> Result<Timestamp, AlpacaError> {
+    let date = DateTime::<Utc>::from_timestamp_nanos(cutoff.unix_nanos())
+        .with_timezone(&New_York)
+        .date_naive();
+    let boundary = date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| midnight.and_local_timezone(New_York).single())
+        .and_then(|midnight| midnight.timestamp_nanos_opt())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(AlpacaError::InvalidHistoricalPlan)?;
+    boundary
+        .checked_sub_nanos(1)
+        .map_err(|_| AlpacaError::InvalidHistoricalPlan)
 }
 
 /// Final unregistered historical plan whose identities include exact composite calendar evidence.
@@ -1220,6 +1260,10 @@ fn validate_historical_parent_metadata(
     validate_historical_parent_surface(metadata, request_bounds)?;
     let coverage = metadata.coverage();
     let membership = coverage.instruments().membership(plan.mapping.instrument());
+    let native = plan
+        .mapping
+        .native_identity()
+        .ok_or(AlpacaError::InvalidCoverage)?;
     if !coverage
         .asset_classes()
         .contains(&plan.mapping.asset_class())
@@ -1228,8 +1272,9 @@ fn validate_historical_parent_metadata(
             InstrumentCoverageMembership::Enumerated
                 | InstrumentCoverageMembership::EvidenceBackedUniverse
         )
-        || !coverage.is_effective_at(plan.start)
-        || !coverage.is_effective_at(plan.end)
+        // Coverage authorizes this current acquisition, not knowledge at the old bar dates.
+        || !coverage.is_effective_at(native.effective_at)
+        || !coverage.is_effective_at(native.knowledge_at)
     {
         return Err(AlpacaError::InvalidCoverage);
     }
@@ -1381,6 +1426,7 @@ fn provider_dataset_identifier_from_parts(
     hash_source_generation(&mut digest, metadata);
     digest.update(mapping.instrument().as_uuid().as_bytes());
     hash_str(&mut digest, mapping.symbol());
+    hash_historical_native_identity(&mut digest, mapping)?;
     hash_str(&mut digest, IEX_VENUE);
     hash_str(&mut digest, "iex");
     hash_str(&mut digest, &timeframe.provider_value());
@@ -1394,6 +1440,44 @@ fn provider_dataset_identifier_from_parts(
         encode_lower_hex(digest.finalize().into())
     ))
     .map_err(Into::into)
+}
+
+pub(crate) fn historical_symbol_asof(
+    mapping: &AlpacaInstrumentMapping,
+) -> Result<CalendarDate, AlpacaError> {
+    let native = mapping
+        .native_identity()
+        .ok_or(AlpacaError::InvalidCoverage)?;
+    validate_native_identity(native, mapping.instrument(), mapping.symbol(), IEX_VENUE)?;
+    historical_symbol_asof_at(native.effective_at)
+}
+
+pub(crate) fn historical_symbol_asof_at(at: Timestamp) -> Result<CalendarDate, AlpacaError> {
+    let date = DateTime::<Utc>::from_timestamp_nanos(at.unix_nanos())
+        .with_timezone(&New_York)
+        .date_naive();
+    CalendarDate::new(
+        u16::try_from(date.year()).map_err(|_| AlpacaError::InvalidCoverage)?,
+        u8::try_from(date.month()).map_err(|_| AlpacaError::InvalidCoverage)?,
+        u8::try_from(date.day()).map_err(|_| AlpacaError::InvalidCoverage)?,
+    )
+    .map_err(|_| AlpacaError::InvalidCoverage)
+}
+
+pub(crate) fn hash_historical_native_identity(
+    digest: &mut Sha256,
+    mapping: &AlpacaInstrumentMapping,
+) -> Result<(), AlpacaError> {
+    let date = historical_symbol_asof(mapping)?;
+    let native = mapping
+        .native_identity()
+        .ok_or(AlpacaError::InvalidCoverage)?;
+    let bytes = serde_json::to_vec(native).map_err(|_| AlpacaError::Serialization)?;
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.update(date.year().to_be_bytes());
+    digest.update([date.month(), date.day()]);
+    Ok(())
 }
 
 fn has_strict_provider_dataset_grammar(dataset: &SourceIdentifier) -> bool {
@@ -1935,6 +2019,7 @@ fn historical_endpoint_policy(
         public("end", 40)?,
         public("limit", 5)?,
         public("adjustment", 16)?,
+        public("asof", 10)?,
         QueryParameterRule::try_new_exact_public(
             SourceIdentifier::try_from("feed")?,
             SourceIdentifier::try_from("iex")?,
@@ -1949,7 +2034,7 @@ fn historical_endpoint_policy(
         ALPACA_STOCKS_BASE_ENDPOINT,
         PathScope::Descendants,
         rules,
-        8,
+        9,
         1_024,
     )?;
     Ok(market_squawk_sources::EndpointPolicy::try_from_api_rules(

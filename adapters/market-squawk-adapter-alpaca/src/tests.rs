@@ -44,7 +44,8 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
         effective,
     );
     let mapping =
-        AlpacaInstrumentMapping::try_new("AAPL".to_owned(), instrument(1)?, AssetClass::Equity)?;
+        AlpacaInstrumentMapping::try_new("AAPL".to_owned(), instrument(1)?, AssetClass::Equity)?
+            .try_with_native_identity(historical_native_identity(instrument(1)?)?)?;
     let limits = AlpacaTransportLimits::try_new(
         1024 * 1024,
         Duration::from_secs(5),
@@ -98,8 +99,14 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
         .is_err()
     );
 
+    let mut option_native = historical_native_identity(instrument(100)?)?;
+    option_native.namespace = SourceId::try_from("alpaca-basic-options-test")?;
+    option_native.venue = VenueId::try_from("alpaca-indicative-options")?;
+    option_native.venue_symbol =
+        market_squawk_domain::VenueSymbol::try_from("AAPL260116C00250000")?;
     let option_mapping =
-        AlpacaOptionMapping::try_new("AAPL260116C00250000".to_owned(), instrument(100)?)?;
+        AlpacaOptionMapping::try_new("AAPL260116C00250000".to_owned(), instrument(100)?)?
+            .try_with_native_identity(option_native)?;
     let options = AlpacaOptionsLiveConfig::try_new(
         SourceId::try_from("alpaca-basic-options-test")?,
         revision("alpaca-basic-options-test-v1", 6)?,
@@ -221,7 +228,8 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
                     "AAPL".to_owned(),
                     instrument(1)?,
                     AssetClass::Equity,
-                )?,
+                )?
+                .try_with_native_identity(historical_native_identity(instrument(1)?)?)?,
                 AlpacaTimeframe::day(),
                 Timestamp::from_unix_nanos(1_735_690_500_000_000_000),
                 AlpacaHistoricalLookback::try_from_days(366)?,
@@ -344,4 +352,21 @@ fn budget(authorization: &AuthorizationGrant) -> TestResult<ProviderBudgetPolicy
             1_000,
         )?,
     )?)
+}
+
+fn historical_native_identity(
+    instrument: InstrumentId,
+) -> TestResult<market_squawk_sources::ProviderNativeIdentityRequest> {
+    let at = Timestamp::from_unix_nanos(1_735_690_500_000_000_000);
+    Ok(market_squawk_sources::ProviderNativeIdentityRequest {
+        namespace: SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+        provider_instrument_id: ProviderInstrumentId::try_from(
+            "00000001-0002-0003-0004-000000000099",
+        )?,
+        instrument,
+        venue: VenueId::try_from("iex")?,
+        venue_symbol: market_squawk_domain::VenueSymbol::try_from("AAPL")?,
+        knowledge_at: at,
+        effective_at: at,
+    })
 }

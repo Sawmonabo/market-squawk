@@ -1366,6 +1366,7 @@ impl MarketRuntimeRegistry {
         canonical_instrument: MarketDataInstrumentDefinition,
         deadline: Instant,
         cancellation: &CancellationToken,
+        identity: Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
     ) -> Result<AlpacaHistoricalPlanReceipt, AlpacaHistoricalPlanAdmissionError> {
         if request.surface() != AccountMarketSurface::AlpacaBasic {
             return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
@@ -1408,7 +1409,13 @@ impl MarketRuntimeRegistry {
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
         let receipt = lease
-            .admit_plan(preflight_plan, canonical_instrument, deadline, cancellation)
+            .admit_plan(
+                preflight_plan,
+                canonical_instrument,
+                deadline,
+                cancellation,
+                identity,
+            )
             .await?;
         drop(lease);
         let mutation = bounded_lock(&self.mutation, deadline, cancellation)
