@@ -1505,6 +1505,9 @@ describe("Market Squawk desktop boundary", () => {
 
   it("admits secure startup and reconnects the workspace without accepting an old session", async () => {
     const user = userEvent.setup()
+    let rejectInitialStartup: ((error: Error) => void) | undefined
+    const initialStartup = new Promise<never>((_resolve, reject) => { rejectInitialStartup = reject })
+    let startupAttempts = 0
     let ready = false
     let submittedUnlock: string | null = null
     const subscriptions: {
@@ -1527,13 +1530,15 @@ describe("Market Squawk desktop boundary", () => {
       product: baseTransport.product,
       system: {
         ...baseTransport.system,
-        bootstrap: async () =>
-          ready
+        bootstrap: async () => {
+          if (++startupAttempts === 1) return initialStartup
+          return ready
             ? blockedBootstrap
             : {
                 status: "bootstrap_required" as const,
                 requirement: "encrypted_fallback_locked" as const,
-              },
+              }
+        },
         bootstrapService: async (request) => {
           if (request.action !== "unlock_encrypted_fallback") {
             throw new Error("Expected the encrypted fallback unlock request.")
@@ -1574,6 +1579,11 @@ describe("Market Squawk desktop boundary", () => {
       </MemoryRouter>,
     )
 
+    expect(await screen.findByText("Loading workspace…")).toBeTruthy()
+    expect(subscriptions).toHaveLength(0)
+    expect(startupAttempts).toBe(1)
+    await act(async () => { rejectInitialStartup!(new Error("Service startup failed")) })
+    await user.click(await screen.findByRole("button", { name: "Try again" }))
     const field = await screen.findByLabelText("Local security password")
     expect(screen.queryByText("Investment workspace unavailable")).toBeNull()
     expect(subscriptions).toHaveLength(0)
@@ -1674,7 +1684,7 @@ describe("Market Squawk desktop boundary", () => {
         fireEvent.click(screen.getByRole("button", { name: "Try again" }))
       })
       expect(reconnectService).toHaveBeenNthCalledWith(3, replacementBootstrap.productSessionToken)
-      expect(screen.getByText("Investment workspace unavailable")).toBeTruthy()
+      expect(screen.getByText("Workspace could not open")).toBeTruthy()
       expect(summary.getByText("Unavailable")).toBeTruthy()
       await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
       expect(reconnectService).toHaveBeenCalledTimes(3)

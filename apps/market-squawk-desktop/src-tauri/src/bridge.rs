@@ -27,7 +27,7 @@ use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, R
 use market_squawk_services::{JsonStructureLimits, RequestId, validate_json_contract};
 use serde_json::{Map, Value, json};
 use tauri::{Manager as _, State};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use url::Url;
 use uuid::Uuid;
 
@@ -99,27 +99,87 @@ enum PendingDesktopBootstrap {
 pub(crate) struct DesktopBootstrapState {
     pending: tokio::sync::Mutex<Option<PendingDesktopBootstrap>>,
     reconnect_gate: tokio::sync::Mutex<()>,
+    startup_tasks: TaskTracker,
+    initial_args: crate::DesktopArgs,
+    installation_data_root: PathBuf,
+    cancellation: CancellationToken,
 }
 
 impl DesktopBootstrapState {
-    pub(crate) fn compose(
-        app: &tauri::AppHandle,
-        startup: DesktopServiceStartup,
-        context: DesktopCompositionContext,
-    ) -> Result<Self, DesktopCommandError> {
-        let pending = match startup {
-            DesktopServiceStartup::Ready(connection) => {
-                manage_ready_desktop(app, *connection, &context)?;
-                None
-            }
-            DesktopServiceStartup::BootstrapRequired(service) => {
-                Some(PendingDesktopBootstrap::Initial { service, context })
-            }
-        };
-        Ok(Self {
-            pending: tokio::sync::Mutex::new(pending),
+    pub(crate) fn new(initial_args: crate::DesktopArgs, installation_data_root: PathBuf) -> Self {
+        Self {
+            pending: tokio::sync::Mutex::new(None),
             reconnect_gate: tokio::sync::Mutex::new(()),
-        })
+            startup_tasks: TaskTracker::new(),
+            initial_args,
+            installation_data_root,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.cancellation.cancel();
+        self.startup_tasks.close();
+    }
+
+    pub(crate) async fn finish_shutdown(&self) {
+        self.begin_shutdown();
+        self.startup_tasks.wait().await;
+    }
+
+    // The caller holds reconnect_gate. Retries share the same startup owner and cannot
+    // race an initial composition or a subsequent authenticated reconnect.
+    async fn initialize(&self, app: &tauri::AppHandle) -> Result<(), DesktopCommandError> {
+        if self.cancellation.is_cancelled() {
+            return Err(service_generation_changed());
+        }
+        if app.try_state::<DesktopState>().is_some() || self.pending.lock().await.is_some() {
+            return Ok(());
+        }
+        let app = app.clone();
+        let args = self.initial_args.clone();
+        let root = self.installation_data_root.clone();
+        let cancellation = self.cancellation.clone();
+        let pending = self
+            .startup_tasks
+            .spawn_blocking(move || {
+                if cancellation.is_cancelled() {
+                    return Err(crate::DesktopStartupError::StartupCancelled);
+                }
+                let (startup, context) = crate::prepare_desktop(&app, args, root, &cancellation)?;
+                if cancellation.is_cancelled() {
+                    return Err(crate::DesktopStartupError::StartupCancelled);
+                }
+                match startup {
+                    DesktopServiceStartup::Ready(connection) => {
+                        manage_ready_desktop(&app, *connection, &context).map_err(|source| {
+                            crate::DesktopStartupError::InvalidServiceBootstrap { source }
+                        })?;
+                        // Exit may begin while composition prepares its generation.
+                        if cancellation.is_cancelled() {
+                            if let Some(state) = app.try_state::<DesktopState>() {
+                                state.begin_shutdown();
+                            }
+                            return Err(crate::DesktopStartupError::StartupCancelled);
+                        }
+                        Ok(None)
+                    }
+                    DesktopServiceStartup::BootstrapRequired(service) => {
+                        Ok(Some(PendingDesktopBootstrap::Initial { service, context }))
+                    }
+                }
+            })
+            .await
+            .map_err(|_| DesktopCommandError::internal())?
+            .map_err(|error| {
+                eprintln!("market-squawk-desktop: workspace startup failed: {error}");
+                DesktopCommandError::new(
+                    "desktop_startup_failed",
+                    "Market Squawk could not open this workspace. Try again.",
+                )
+            })?;
+        *self.pending.lock().await = pending;
+        Ok(())
     }
 
     async fn status(&self) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
@@ -1347,6 +1407,7 @@ pub(crate) async fn desktop_bootstrap(
     bootstrap_state: State<'_, DesktopBootstrapState>,
 ) -> Result<DesktopStartup, DesktopCommandError> {
     let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
+    bootstrap_state.initialize(&app).await?;
     if let Some(status) = bootstrap_state.pending_status().await? {
         return Ok(DesktopStartup::BootstrapRequired(status));
     }
@@ -1484,14 +1545,17 @@ pub(crate) async fn desktop_service_reconnect(
         ));
     }
     let expected_runtime = generation.runtime();
-    let startup = service::reconnect_or_start(&state.service_authority())
-        .await
-        .map_err(|_error| {
-            DesktopCommandError::new(
-                "service_reconnect_failed",
-                "The installed service could not reconnect or restart within the local deadline.",
-            )
-        })?;
+    let startup = service::reconnect_or_start(
+        &state.service_authority(),
+        bootstrap_state.cancellation.clone(),
+    )
+    .await
+    .map_err(|_error| {
+        DesktopCommandError::new(
+            "service_reconnect_failed",
+            "The installed service could not reconnect or restart within the local deadline.",
+        )
+    })?;
     match startup {
         DesktopServiceStartup::Ready(connection) => {
             let bootstrap = commit_reconnected_generation(

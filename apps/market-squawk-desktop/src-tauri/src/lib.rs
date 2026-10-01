@@ -59,7 +59,7 @@ const CLI_EXECUTABLE_BASENAME: &str = "market-squawk";
 #[cfg(debug_assertions)]
 const DEVELOPMENT_MCP_RELAY_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM";
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "market-squawk-desktop")]
 #[command(about = "Market Squawk Obsidian Signal desktop application")]
 #[command(version)]
@@ -143,8 +143,8 @@ enum DesktopStartupError {
     Tauri(#[from] tauri::Error),
     #[error("desktop main window is unavailable")]
     MainWindowUnavailable,
-    #[error("desktop state was already installed")]
-    DuplicateState,
+    #[error("desktop startup was cancelled")]
+    StartupCancelled,
     #[error("installed MCP client authority is unavailable")]
     McpClientAuthority,
     #[error("native package cleanup failed")]
@@ -288,6 +288,10 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let app = builder
         .plugin(tauri_plugin_dialog::init())
         .manage(DesktopEventSubscriptions::default())
+        .manage(DesktopBootstrapState::new(
+            args.clone(),
+            installation_data_root.clone(),
+        ))
         .invoke_handler(tauri::generate_handler![
             analytical_controller,
             analytical_product,
@@ -333,53 +337,6 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         app.handle()
             .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
     }
-    let installation = installation::prepare(app.handle(), installation_data_root.join("program"))?;
-    if let Some(program) = installation.handoff_program.as_ref() {
-        return handoff_to_selected_release(program);
-    }
-    let desktop_data_directory = app.path().app_local_data_dir()?;
-    let environment = ConfigSources::process_product_environment();
-    let config_path = args
-        .config
-        .as_deref()
-        .map(std::fs::canonicalize)
-        .transpose()
-        .map_err(|source| DesktopStartupError::ConfigurationPath { source })?;
-    let config = AppConfig::load(
-        ConfigSources::new(
-            config_path.as_deref(),
-            &environment,
-            ConfigOverrides {
-                data_dir: args.data_dir,
-                training_release_root: args
-                    .training_release_root
-                    .or(installation.active_release_root),
-                ..ConfigOverrides::default()
-            },
-        )
-        .with_data_directory_default(desktop_data_directory),
-    )?;
-    let service = tauri::async_runtime::block_on(service::connect_or_start(
-        &config,
-        config_path.as_deref(),
-        Some(&installation_data_root),
-    ))?;
-    let relay_program = mcp_relay_program(&installation.root)?;
-    let bootstrap_state = DesktopBootstrapState::compose(
-        app.handle(),
-        service,
-        DesktopCompositionContext::new(
-            config.data_dir().to_path_buf(),
-            installation_data_root,
-            installation.root,
-            installation.status,
-            relay_program,
-        ),
-    )
-    .map_err(|source| DesktopStartupError::InvalidServiceBootstrap { source })?;
-    if !app.manage(bootstrap_state) {
-        return Err(DesktopStartupError::DuplicateState);
-    }
     let runtime_startup_error = Rc::new(RefCell::new(None));
     let runtime_startup_error_for_event = Rc::clone(&runtime_startup_error);
     let exit_code = app.run_return(move |handle, event| match event {
@@ -404,12 +361,24 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
                 handle.exit(1);
             }
         }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } if !background_automation => {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
         tauri::RunEvent::ExitRequested { .. } => {
+            handle.state::<DesktopBootstrapState>().begin_shutdown();
             if let Some(state) = handle.try_state::<DesktopState>() {
                 state.begin_shutdown();
             }
         }
         tauri::RunEvent::Exit => {
+            tauri::async_runtime::block_on(
+                handle.state::<DesktopBootstrapState>().finish_shutdown(),
+            );
             if let Some(state) = handle.try_state::<DesktopState>() {
                 let restart_program = state.scheduled_restart_program();
                 tauri::async_runtime::block_on(state.finish_shutdown());
@@ -429,6 +398,63 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         return Err(error);
     }
     Ok(exit_code)
+}
+
+// Runs only on the blocking pool after the main event loop and WebView are available.
+fn prepare_desktop(
+    app: &tauri::AppHandle,
+    args: DesktopArgs,
+    installation_data_root: PathBuf,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<(service::DesktopServiceStartup, DesktopCompositionContext), DesktopStartupError> {
+    let installation = installation::prepare(app, installation_data_root.join("program"))?;
+    if let Some(program) = installation.handoff_program.as_ref() {
+        let exit_code = handoff_to_selected_release(program)?;
+        app.exit(exit_code);
+        return Err(DesktopStartupError::StartupCancelled);
+    }
+    let desktop_data_directory = app.path().app_local_data_dir()?;
+    let environment = ConfigSources::process_product_environment();
+    let config_path = args
+        .config
+        .as_deref()
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|source| DesktopStartupError::ConfigurationPath { source })?;
+    let config = AppConfig::load(
+        ConfigSources::new(
+            config_path.as_deref(),
+            &environment,
+            ConfigOverrides {
+                data_dir: args.data_dir,
+                training_release_root: args
+                    .training_release_root
+                    .or(installation.active_release_root),
+                ..ConfigOverrides::default()
+            },
+        )
+        .with_data_directory_default(desktop_data_directory),
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(DesktopStartupError::StartupCancelled);
+    }
+    let service = tauri::async_runtime::block_on(service::connect_or_start(
+        &config,
+        config_path.as_deref(),
+        Some(&installation_data_root),
+        cancellation.clone(),
+    ))?;
+    let relay_program = mcp_relay_program(&installation.root)?;
+    Ok((
+        service,
+        DesktopCompositionContext::new(
+            config.data_dir().to_path_buf(),
+            installation_data_root,
+            installation.root,
+            installation.status,
+            relay_program,
+        ),
+    ))
 }
 
 fn mcp_relay_program(installation_root: &Path) -> Result<PathBuf, DesktopStartupError> {

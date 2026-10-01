@@ -5248,3 +5248,110 @@ exhaustion was observed in this short run; that is not sustained ingestion/perfo
 PR #43 implementation evidence: comment5936024993. Next barrier is recoverable live connection
 renewal and freshness-only resynchronization, then genuine stock/fiscal workflow wiring. Keep
 current root, saved account/config and original protected backups intact.
+
+### Live connection recovery and fiscal dispatch — base `4a0465ad`
+
+Owner authorizes the researched design and implementation in the current worktree. Storage is
+already integrated; this wave closes demonstrated consumer failures rather than restarting storage
+research. Current tree is clean at the audit base; no service/build is running.
+
+| Owner | Exact ownership and dependency | Smallest completion evidence |
+| --- | --- | --- |
+| Lead | Shared `service/tool_services.rs`, lifecycle integration, ledger/Git/runtime and all builds; reserves manifests/contracts | Existing critical dispatch/recovery checks, then current workspace connection renewal and real market reads. |
+| Astra calendar_currentness_failure | `service/forecast_preparation.rs` and `service/forecast_preparation/fiscal.rs` only; existing fiscal request/result contracts | Implement the three missing current fiscal operations through existing dataset/forecast owners; report exact shared dispatch needed. No builds/Git. |
+| Astra research_options_failure | Read-only trace of retained Alpaca reconciliation blocking Verify in `local_product/source_lifecycle*`, `application/market_runtime*`, onboarding/account lifecycle | Identify first failed authority and smallest recovery fix; no edits or runtime actions. |
+
+DAG: disjoint fiscal implementation + retained connection recovery trace → lead shared dispatch/
+recovery integration → serialized critical checks → commit/push → real saved workspace retry.
+No lifetime/freshness limit increases, new storage stack, branch/worktree, full gate or RAM check.
+The separately confirmed Kraken freshness-only resynchronization remains open for its next coherent
+checkpoint; this wave does not claim sustained combined ingestion or complete investment analysis.
+
+Alpaca normal Retry reproduced Unavailable in the retained workspace; diagnostic service stopped
+cleanly (PID80861, exit0). Read-only trace narrows failure to publication-generation registration;
+null projected doctor does not prove missing verification. Lead additionally owns failure-only
+stage logging in `provider_activation/alpaca.rs`, preserving underlying closed registration errors.
+Fiscal dispatch now uses existing dataset/forecast job runners. Extend existing installed service
+startup/restart case to assert a complete fiscal unavailable plan for missing input population;
+this closes the missing-handler recovery gap, not successful fiscal forecast acceptance. Real
+fiscal success remains dependent on SEC canonical issuer relation and admitted model runtime.
+
+### Immediate Desktop window — base `4a0465ad`, alongside fiscal dispatch
+
+Acceptance 5/7: observed roughly 50 seconds without a window because installation/configuration
+and service connection execute before the native event loop. Replace that ordering in place: show
+the existing main window immediately, initialize through the existing asynchronous bootstrap
+command, and keep failure/retry inside the window. Preserve hidden automation and shutdown.
+
+| Owner | Files / dependency | Critical evidence |
+| --- | --- | --- |
+| Lead | Desktop `src-tauri/src/lib.rs`, `bridge.rs`, `service.rs`, startup composition, ledger/Git/builds | Native window appears while bootstrap is pending; startup failure can retry; no duplicate initialization. |
+| Sol frontend lane | Desktop `src/app/routes.tsx` only; existing product/system status contract | Shared startup loading/retry screen; no individual page unavailable errors during startup. |
+| Astra fiscal lane | Existing fiscal files only; diagnose rejected new critical call | Identify contract mismatch; no builds or shared dispatch edits. |
+
+DAG: native asynchronous startup and disjoint startup presentation → integrated native check.
+Fiscal critical run compiled but rejected `Analysis.GetFiscalPreparationPlan`; diagnose before
+committing that separate checkpoint. One compiler remains the lead-owned resource. No new worktrees.
+
+Fiscal failure traced to shared `application/research/instrument_context/find.rs`: incomplete
+population was handed to a complete-cohort constructor and mislabeled invalid request. Lead
+corrects unavailable evidence before construction; no invalid-request catch-all or authority bypass.
+
+Owner reports all Overview prices unavailable. Current live status confirms saved credentials and
+available quote/snapshot/history/calendar/stream probes, but lifecycle is blocked with no current
+generation. Later logs show activation did eventually reach generation5, then failed durable
+publication ingress and stale-generation cleanup deadlines; the earlier registration error alone
+is not the complete current cause. Lead restarts the existing service with the rebuilt diagnostic
+binary while preserving the visible Desktop and retained root. Astra research_options_failure
+owns a read-only trace of ingress failure/cleanup and published-close-read InvalidResult, with
+no source edits or runtime actions until the exact failure is established.
+
+Fiscal installed startup/restart check PASS1/1 (83.23s; single-job compile5m22s). Extended existing
+Desktop startup/reconnect check PASS1/1 (3.78s total), including delayed initial opening, initial
+failure and retry, optional credential recovery and stale-session rejection. Native startup
+compile/live visibility still pending.
+
+Before fiscal checkpoint acceptance, Astra calendar_currentness_failure additionally owns
+`service/tool_services/training_preparation.rs` with `forecast_preparation/fiscal.rs` to reuse the
+existing selected-export verifier and owned I/O worker. This removes a duplicated verification
+policy in the new fiscal caller; no new runtime, limit increase or broad redesign. Lead next
+compiles the coherent dependency set once those files are frozen.
+
+Native/fiscal sources frozen for one serialized Desktop build (with development automation).
+The fiscal lane released its shared verifier change; both callers retain exact export identities
+and use the existing owned Research I/O worker. Current native build includes that dependency.
+During compilation Astra calendar_currentness_failure is read-only on stale Alpaca reference
+generation registration in `provider_runtime.rs` / `market_provider_configuration.rs`; Astra
+research_options_failure remains read-only on the separate live ingress byte/slot backpressure.
+The updated failure-only diagnostic confirms coordinator StaleRuntimeGeneration, distinct from
+the subsequent observed live queue-full failure. No authority weakening or capacity increase.
+
+Native build passes but the normal launch visibility check found zero accessible windows after
+15 seconds; no immediate-window completion claim. Lead retains Desktop startup ownership.
+
+### Restore Overview prices — current uncommitted integration on `4a0465ad`
+
+| Owner | Exact ownership | Dependency and critical proof |
+| --- | --- | --- |
+| Astra calendar_currentness_failure | `provider_activation/market_config.rs` only | Remove transient lease issuance from durable metadata identity; same-authority rereads stable, changed authority remains distinct. No builds/Git. |
+| Astra research_options_failure | `adapters/market-squawk-adapter-alpaca/src/live.rs`, `apps/market-squawk/src/live_source/alpaca_publication.rs`, `live_source/sink.rs`, `application/market_runtime/alpaca_publication.rs` only | Await both frame and byte admission through existing sink lifecycle; preserve custody/order/cancellation/drain. Existing critical case extension only for uncovered queue-full failure. No builds/Git. |
+| Lead | Shared integration, Desktop startup, ledger/Git/builds/runtime | Inspect both changes, serialize critical checks, then verify actual saved Overview prices. |
+
+DAG: stable generation identity + independent Alpaca backpressure + Desktop visibility correction
+→ lead integration/critical checks → live retained-workspace prices and native launch → commit/push.
+No authority relaxation, capacity increase, discarded evidence or new worktree.
+
+Alpaca lane ownership also includes `adapters/market-squawk-adapter-alpaca/src/boot_snapshot.rs`: the initial snapshot must reserve publication capacity under its existing cancellation/deadline before emitting its first frame.
+
+Native timing recheck uses CoreGraphics window metadata because AX alone returned zero while a
+native window existed. Fresh normal launch reports a visible on-screen Market Squawk window at
+0.422 seconds (receipt `immediate-window-visible-cg.json`). Concurrent second Desktop hit its
+exclusive MCP receipt store; retry is being checked after closing the first instance. No claim
+of simultaneous multi-Desktop workspace support or complete market prices.
+
+Immediate-window slice verified: native build PASS; normal on-screen window at0.422s; native
+initial composition failure followed by Try again reaches Ready after releasing the other
+Desktop's exclusive local receipt owner. Existing startup/reconnect renderer test and typecheck
+PASS. The Home saved collection renders all nine starters; its includeMarket request remains
+rejected and is part of the separate active price-remediation wave. No complete market-data or
+installed-release acceptance is claimed.

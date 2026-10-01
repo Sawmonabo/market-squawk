@@ -1,8 +1,12 @@
 import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from "react"
+import { useIsFetching } from "@tanstack/react-query"
+import { CircleAlert, LoaderCircle, RefreshCw } from "lucide-react"
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom"
 
 import { useProduct, useSystem } from "@/app/product-context"
+import { productKeys } from "@/app/query-client"
 import { McpPage } from "@/components/mcp-page"
+import { Button } from "@/components/ui/button"
 
 const OverviewPage = lazy(() =>
   import("@/components/overview-page").then((module) => ({
@@ -64,6 +68,9 @@ export function AppRoutes() {
   const system = useSystem()
 
   if (product.status === "loading") return <RouteLoading />
+  if (product.status === "error" && system.status !== "recovery_required") {
+    return <WorkspaceRecovery detail={product.error} onRetry={product.refresh} />
+  }
 
   return (
     <RouteErrorBoundary key={location.pathname}>
@@ -142,8 +149,39 @@ class RouteErrorBoundary extends Component<
 
 function RouteLoading() {
   return (
-    <main className="grid min-h-[55vh] place-items-center" aria-live="polite">
-      <p className="text-sm text-muted-foreground">Loading workspace…</p>
+    <main className="grid min-h-[55vh] place-items-center px-6" aria-live="polite">
+      <section className="w-full max-w-lg rounded-xl border border-border bg-card p-6" role="status">
+        <LoaderCircle className="size-5 text-primary motion-safe:animate-spin" aria-hidden="true" />
+        <h1 className="mt-4 text-xl font-semibold">Loading workspace…</h1>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">
+          Opening your saved workspace. This can take a moment.
+        </p>
+      </section>
+    </main>
+  )
+}
+
+function WorkspaceRecovery({ detail, onRetry }: { detail: string; onRetry: () => void }) {
+  const retrying = useIsFetching({ queryKey: productKeys.bootstrap }) > 0
+
+  return (
+    <main className="grid min-h-[55vh] place-items-center px-6">
+      <section className="w-full max-w-lg rounded-xl border border-border bg-card p-6">
+        <div role="alert">
+          <CircleAlert className="size-5 text-muted-foreground" aria-hidden="true" />
+          <h1 className="mt-4 text-xl font-semibold">Workspace could not open</h1>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">{detail}</p>
+        </div>
+        <Button className="mt-5" onClick={onRetry} disabled={retrying}>
+          {retrying ? (
+            <LoaderCircle className="motion-safe:animate-spin" aria-hidden="true" />
+          ) : (
+            <RefreshCw aria-hidden="true" />
+          )}
+          {retrying ? "Trying again…" : "Try again"}
+        </Button>
+        <p className="sr-only" role="status">{retrying ? "Opening workspace again…" : ""}</p>
+      </section>
     </main>
   )
 }

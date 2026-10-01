@@ -97,6 +97,19 @@ still be sensitive.
 
 ## Configuration and startup
 
+Desktop shows its main window before installation checks and service connection. Those tasks run
+from its asynchronous bootstrap command on Tauri's blocking pool, leaving the shell responsive.
+While opening the workspace, pages share a loading state; startup failure offers **Try again** in
+that same window. Concurrent bootstrap calls serialize through the existing startup/reconnect
+owner. Quitting cancels pending service startup; a ready shared service remains independently owned.
+On macOS, clicking the Dock icon restores the existing window. Explicit background automation
+continues to keep its window hidden.
+
+This follows Tauri's [asynchronous command guidance](https://v2.tauri.app/develop/calling-rust/)
+and [asynchronous setup example](https://v2.tauri.app/learn/splashscreen/) (reviewed 2026-10-01),
+using the existing main window instead of introducing another startup window. Window visibility
+and workspace readiness are separate; a visible window does not establish successful data loading.
+
 | Symptom | Likely boundary | Action |
 | --- | --- | --- |
 | Clap exits `2` | Command spelling, enum, required flag, or option placement | Use `market-squawk --help` and the command-specific `--help`; correct syntax before domain diagnosis |

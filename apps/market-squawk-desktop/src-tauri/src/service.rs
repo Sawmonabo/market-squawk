@@ -101,6 +101,8 @@ pub(crate) enum DesktopBootstrapAction {
 
 #[derive(Debug, Error)]
 pub(crate) enum DesktopServiceError {
+    #[error("desktop service startup was cancelled")]
+    StartupCancelled,
     #[error("installed service discovery is unavailable")]
     Discovery,
     #[error("Schwab OAuth callback trust is unavailable")]
@@ -125,6 +127,7 @@ pub(crate) async fn connect_or_start(
     config: &AppConfig,
     config_path: Option<&Path>,
     installation_data_root: Option<&Path>,
+    cancellation: CancellationToken,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
     let installation_data_root = installation_data_root
         .map(Path::to_path_buf)
@@ -144,11 +147,12 @@ pub(crate) async fn connect_or_start(
             installation_data_root,
         },
     });
-    reconnect_or_start(&authority).await
+    reconnect_or_start(&authority, cancellation).await
 }
 
 pub(crate) async fn reconnect_or_start(
     authority: &Arc<DesktopServiceAuthority>,
+    cancellation: CancellationToken,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
     match connect(authority).await {
         Ok(connection) => return Ok(DesktopServiceStartup::Ready(Box::new(connection))),
@@ -183,8 +187,18 @@ pub(crate) async fn reconnect_or_start(
     command
         .arg("--installation-data-root")
         .arg(&authority.launch.installation_data_root);
+    if cancellation.is_cancelled() {
+        return Err(DesktopServiceError::StartupCancelled);
+    }
     let mut child = command.spawn().map_err(DesktopServiceError::Launch)?;
-    wait_for_started_service(authority, &mut child).await
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            stop_failed_start(&mut child);
+            Err(DesktopServiceError::StartupCancelled)
+        }
+        result = wait_for_started_service(authority, &mut child) => result,
+    }
 }
 
 fn selected_service_program() -> Result<PathBuf, DesktopServiceError> {
