@@ -3,16 +3,16 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Latest pushed
-checkpoint `9eac1d57` separates actor-time current presentation from financial cutoffs;
-`4239a7d6` preserves Alpaca publication custody under backpressure; `96abecae` preserves retained
-evidence access and analytical/I/O admission order. PR #43 comments5939484067 and5939704383.
-One worktree, three local and three origin branches verified; protected backup refs are retained.
+checkpoint `ff788610` fixes verified service-owner joining at Desktop startup (PR #43 comment5940019410).
+`9eac1d57` fixes actor-time current presentation; `4239a7d6` preserves Alpaca publication custody;
+`96abecae` preserves retained evidence access and analytical/I/O admission order.
+One worktree, three local and three origin branches; protected backup refs remain untouched.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — native competing-start integration | Shared process-bound startup evidence and Desktop owner joining implemented in place. Critical identity check, service/Desktop builds and reproduced native startup pass. | Commit/push frozen checkpoint, then rich quote/update delivery and starter-history operation lifetime. |
-| Astra live_stack_failure — startup frozen; history diagnosis | Native service.rs handed to lead and frozen for build. History diagnosis complete: one30s deadline covers all nine starters, and expiry abandons later instruments. No further active edits. | Return exact bottleneck, smallest existing-path correction and critical check. Lead owns native competing-start verification in parallel. |
-| GPT-6.1 Sol screen_contract_coverage — released | Source audit and committed-domain update proposal complete; no active edits. | Reuse accepted actor/durable commit hooks and existing EventHub in next price-to-screen checkpoint. |
+| Lead — starter-history checkpoint and screen-read integration | Owns Git/builds/checks/docs and shared contracts. Per-instrument history operation is implemented; nine completed closes verified in the real workspace. | Finish native refresh evidence and push history checkpoint. Collection read deadline remains a separate open defect. |
+| Astra collection_read — identify failing collection read | Read-only: trace Market.GetCollection through market/product and previous-close reads; inspect starter-history-operation-live.log. No edits, builds, runtime commands or Git. | Exact deadline/coordination cause and smallest shared-path correction preserving selected evidence; lead integrates after history checkpoint. |
+| Public crypto reference diagnosis — completed | Existing references are present. Catalog capability pin still takes writer authority; contention is collapsed into unavailable. No edits. | Reuse existing independent read snapshots while preserving full pinned histories; latest run also reports publication HealthNotQualified, so reference contention alone is not the full crypto failure. |
 
 Latest-display build PASS7m22s. Real CLI IWM changes279.34→279.32; native Home shows QQQ742.43,
 IWM279.31 and five previous closes. Evidence: `latest-display-{service-build,live}.log`,
@@ -39,14 +39,28 @@ Evidence: `competing-start-verified-{live,native,native-restart}.log` and matchi
 the reproduced race and ready-owner rejoin, not all startup failures or full data contracts.
 Owned processes are stopped after evidence collection; no foreground automation or RAM gate.
 
-Starter-history diagnosis: source_lifecycle/display_history.rs applies one30s recovery deadline
-to all nine instruments; corporate_actions/preflight/display_history.rs aborts the remainder on
-expiry. Next correction keeps the finite generation-owned worker and canonical pipeline, with
-per-instrument operation deadlines, stage attribution and cancellation/drain. Five stored closes
-are not proof of publication during this run; extraction cost still needs direct evidence.
+Starter-history checkpoint in this commit: shared definition resolution retains its existing
+30s deadline, and each sequential instrument operation starts its own existing 30s window. The
+finite generation-owned worker ignores duplicates and cancels/drains on source replacement or
+shutdown; a single failed instrument no longer abandons later instruments. Canonical publication,
+identity/currency/session validation and original evidence remain unchanged. No timeout value or
+history-size limit was increased.
 
-Next dependency order: close reproduced native startup race; integrate existing rich quote
-projection and committed-domain screen invalidation; continue missing starter/family detail and
+Critical capture-integrity check PASS1/1 (`historical_capture_preserves_terminal_pages_and_refuses_broken_token_chain`);
+service build PASS6m31s. Real service5335/native5346 verified nine completed closes: seven retained
+and two newly published. Native Home initially failed Market.GetCollection at its request deadline.
+After an explicit Refresh collection, all nine starters rendered: QQQ742.175/IWM279.28 Current;
+SPY762.34, DIA508.37, VTI374.305, AAPL333.21, MSFT512.91, NVDA228.29 and TSLA354.89 Previous close.
+This proves populated native display after refresh, not automatic update or initial-load closure.
+Evidence: `starter-history-operation-{build,live,native}.log`,
+`starter-history-operation-native-{settled,refreshed-settled}.json` and
+`starter-history-capture-critical.log` under ignored `.agents/tmp/v1-first-stock/`.
+Latest live run also reports crypto HealthNotQualified and raw-publication interruption; the
+previous reference diagnosis does not establish that these separate failures are resolved.
+No CI, release gate or whole-app RAM measurement ran.
+
+Next dependency order: correct initial collection-read failure; integrate existing rich quote projection and
+committed-domain screen invalidation; continue missing family detail and
 first saved Investment Brief. Screen route presence is not complete workflow acceptance.
 
 ### Required data-to-screen closure
@@ -62,6 +76,11 @@ require every family on every screen or streaming fundamentally scheduled data. 
    Desktop query-client uses infinite staleTime. Connect coalesced committed-domain changes through
    existing generation/sequence recovery, align macro/research keys and dependent portfolio/result
    invalidations; prove actual display updates without user commands. Preserve immutable saved results.
+   Product-context currently uses invalidateQueries with default cancellation. Before admitting
+   frequent async events, coalesce domain refresh work without cancelling an ongoing successful
+   read; retain dirtiness arriving during that read for one follow-up refresh. Simply setting
+   cancelRefetch=false can skip an update during an in-flight read. Primary API reference checked
+   2026-10-01: [TanStack InvalidateOptions](https://tanstack.com/query/latest/docs/framework/react/reference/interfaces/InvalidateOptions).
 2. **Current Markets:** `paper/market/product.rs`, output contract and Desktop market-product.ts
    discard independent quote/trade fields, basis and component freshness; changePercent is always
    null. Complete exact quote sides/sizes, last-trade versus midpoint meaning and available change
@@ -84,7 +103,7 @@ require every family on every screen or streaming fundamentally scheduled data. 
    paper accounting and shared-client/installed restart still need actual end-to-end evidence.
 
 Retained-data/admission and actor-time current selection checkpoints are pushed. Next integration
-order: native competing-start closure, rich quote projection with background update delivery, then
+order: initial collection-read closure, rich quote projection with background update delivery, then
 remaining family detail checkpoints alongside the first saved Investment Brief. Full scope in the
 owner-test goal remains.
 

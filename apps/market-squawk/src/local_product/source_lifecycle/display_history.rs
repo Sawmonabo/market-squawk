@@ -6,7 +6,7 @@ use crate::application::{map_market_definition_read_error, map_source_research_e
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
 };
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +49,7 @@ impl ProductionSourceLifecycleAuthority {
         shutdown: CancellationToken,
     ) {
         let mut pending = None;
+        let mut attempted_generation = None;
         loop {
             let request = if let Some(request) = pending.take() {
                 request
@@ -73,9 +74,13 @@ impl ProductionSourceLifecycleAuthority {
             if request.runtime.is_revoked() {
                 continue;
             }
-            // Source activation admitted this work; its request has already completed. Start
-            // this owned recovery operation's lifetime here, once, without renewing it on
-            // duplicate notifications or while processing instruments.
+            let generation = request.runtime.group_generation();
+            if attempted_generation == Some(generation) {
+                continue;
+            }
+            attempted_generation = Some(generation);
+            // Shared setup is bounded separately. Each instrument receives its own ordinary
+            // recovery window when admitted; this generation is never retried by a duplicate.
             let Some(deadline) = Instant::now().checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
             else {
                 record_history_outcome(Err(ServiceError::Internal));
@@ -179,15 +184,52 @@ impl ProductionSourceLifecycleAuthority {
             .map_err(|_| ServiceError::Internal)?;
         let limits = ServiceLimits::try_new(256 * 1024, 1_000, 1024 * 1024, 1_000, structure)
             .map_err(|_| ServiceError::Internal)?;
-        let context = RequestContext::new(
-            RequestId::String(Arc::from("source.starter-market-history")),
-            cancellation.child_token(),
-            deadline,
-            limits,
-        );
-        self.display_history
-            .prepare_market_display_histories(runtime, &records, &context)
-            .await
+        let mut unique = BTreeSet::new();
+        for record in &records {
+            if !unique.insert(record.definition().instrument_id()) {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let mut first_failure = None;
+        for record in &records {
+            if cancellation.is_cancelled() {
+                return Err(ServiceError::Cancelled);
+            }
+            if runtime.is_revoked() {
+                return Err(ServiceError::Unavailable);
+            }
+            let deadline = Instant::now()
+                .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+                .ok_or(ServiceError::Internal)?;
+            let context = RequestContext::new(
+                RequestId::String(Arc::from("source.starter-market-history")),
+                cancellation.child_token(),
+                deadline,
+                limits,
+            );
+            let result = self
+                .display_history
+                .prepare_market_display_history(runtime, record, &context)
+                .await;
+            if cancellation.is_cancelled() || result == Err(ServiceError::Cancelled) {
+                return Err(ServiceError::Cancelled);
+            }
+            if runtime.is_revoked() {
+                return Err(ServiceError::Unavailable);
+            }
+            if let Err(error) = result {
+                // An instrument's exhausted window does not consume the next one's budget.
+                // The existing operation has returned and drained before another is admitted.
+                first_failure.get_or_insert(error);
+            }
+        }
+        first_failure.map_or(Ok(()), Err)
     }
 }
 

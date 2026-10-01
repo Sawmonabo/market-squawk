@@ -8,78 +8,42 @@ use market_squawk_adapter_alpaca::{
 };
 
 impl SourceActionPreparationCapability {
-    /// Warms display evidence only. Each missing instrument gets one ordinary raw daily
+    /// Warms display evidence only. A missing instrument gets one ordinary raw daily
     /// acquisition through the existing canonical publisher; successful publications survive a
     /// later failure. The lifecycle caller retains ownership of the healthy source connection.
-    pub(crate) async fn prepare_market_display_histories(
+    pub(crate) async fn prepare_market_display_history(
         &self,
         runtime: &AlpacaHistoricalRuntimeCapability,
-        instruments: &[MarketDataInstrumentRecord],
+        instrument: &MarketDataInstrumentRecord,
         context: &RequestContext,
     ) -> Result<(), ServiceError> {
-        check(context)?;
-        if instruments.is_empty() {
-            return Ok(());
-        }
-        let mut unique = BTreeSet::new();
-        for instrument in instruments {
-            if !unique.insert(instrument.definition().instrument_id()) {
-                return Err(ServiceError::InvalidRequest);
-            }
-        }
-        runtime
-            .require_current(context.deadline(), context.cancellation())
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    ?error,
-                    stage = "active-calendar-runtime",
-                    "market display history preparation unavailable"
-                );
-                controlled(context, ServiceError::Unavailable)
-            })?;
-        let analysis_at = now()?;
-        let calendar = self
-            .calendars
-            .select(
-                analysis_at,
-                context.deadline(),
-                context.cancellation().clone(),
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    ?error,
-                    stage = "current-calendar-selection-error",
-                    "market display history preparation unavailable"
-                );
-                map_calendar_error(error)
-            })?
-            .ok_or_else(|| {
-                tracing::warn!(
-                    stage = "current-calendar-selection",
-                    "market display history preparation unavailable"
-                );
-                ServiceError::Unavailable
-            })?;
-        if calendar.venue_id().as_str() != "iex" {
-            tracing::warn!(
-                stage = "current-calendar-venue",
-                "market display history preparation unavailable"
-            );
-            return Err(ServiceError::InvalidResult);
-        }
-        let history = MarketHistoryReadCapability::new(self.research.analytical_reader());
-        let mut first_failure = None;
-        for instrument in instruments {
+        let started = Instant::now();
+        let instrument_id = instrument.definition().instrument_id();
+        let mut stage = "active-calendar-runtime";
+        let result = async {
             check(context)?;
             runtime
                 .require_current(context.deadline(), context.cancellation())
                 .await
                 .map_err(map_capability_error)?;
-            let instrument_id = instrument.definition().instrument_id();
-            let mut stage = "configured-iex-mapping";
-            let result = async {
+            stage = "current-calendar-selection";
+            let analysis_at = now()?;
+            let calendar = self
+                .calendars
+                .select(
+                    analysis_at,
+                    context.deadline(),
+                    context.cancellation().clone(),
+                )
+                .await
+                .map_err(map_calendar_error)?
+                .ok_or(ServiceError::Unavailable)?;
+            stage = "current-calendar-venue";
+            if calendar.venue_id().as_str() != "iex" {
+                return Err(ServiceError::InvalidResult);
+            }
+            let history = MarketHistoryReadCapability::new(self.research.analytical_reader());
+            let published = async {
                 stage = "configured-iex-mapping";
                 let mut listings = instrument
                     .definition()
@@ -127,7 +91,7 @@ impl SourceActionPreparationCapability {
                     if retained.native_date() >= latest_session.date()
                         && retained.session_close() >= latest_session.closes_at_exclusive()
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 stage = "canonical-publication";
@@ -145,30 +109,39 @@ impl SourceActionPreparationCapability {
                 }
                 // A provider may not have published its newest daily bar yet. Preserve an
                 // older genuine completed close without looping or rejecting its evidence.
+                Ok(true)
+            }
+            .await?;
+            stage = "final-runtime-validation";
+            runtime
+                .require_current(context.deadline(), context.cancellation())
+                .await
+                .map_err(map_capability_error)?;
+            check(context)?;
+            Ok(published)
+        }
+        .await;
+        match result {
+            Ok(published) => {
+                tracing::info!(
+                    %instrument_id,
+                    published,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "market display history completed close verified"
+                );
                 Ok(())
             }
-            .await;
-            if let Err(error) = result {
-                if matches!(
-                    error,
-                    ServiceError::Cancelled | ServiceError::DeadlineExceeded
-                ) {
-                    return Err(error);
-                }
+            Err(ServiceError::Cancelled) => Err(ServiceError::Cancelled),
+            Err(error) => {
                 tracing::warn!(
                     %instrument_id,
                     ?error,
                     stage,
+                    elapsed_ms = started.elapsed().as_millis(),
                     "market display history preparation unavailable"
                 );
-                first_failure.get_or_insert(error);
+                Err(error)
             }
         }
-        runtime
-            .require_current(context.deadline(), context.cancellation())
-            .await
-            .map_err(map_capability_error)?;
-        check(context)?;
-        first_failure.map_or(Ok(()), Err)
     }
 }
