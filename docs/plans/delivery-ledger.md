@@ -44,9 +44,12 @@ Its focused evidence is recorded below. Independent terminal-batch WIP remains p
 ### Current dependency and ownership wave
 
 The database/archive/recovery work is pushed through `ee77ff55`, capture batching/buffering
-through `8404085c`, and committed-row clock correction through `5a763d8d`. Focused storage and
-shared-service checks pass. Live ingestion is still blocked by the feed-product mismatch below.
-Astra has handed off its three-file correction; the lead owns integration and serialized verification.
+through `8404085c`, committed-row clock correction through `5a763d8d`, and feed/native-product
+identity correction through `042fd569`. Live publication now reaches SQLite, where stale 64-row
+schema constraints reject validated 100-row batches. The current in-place integration aligns the
+schema with admitted parent counts, preserves uniqueness-only retries, and moves Markets latest
+instrument-definition reads to an independent WAL snapshot. Astra's implementation is frozen;
+the lead owns remaining critical checks, the combined live run, integration and push.
 No current evidence establishes completed live ingestion or installed Desktop workflows.
 
 ### Raw capture serialization correction — base `ee77ff55`
@@ -4729,3 +4732,78 @@ Final decoder rerun with the shared fixture passes1/1 (0.99s). Live check fails1
 100/100 committed terminal rows. Kraken/restart are not reached. This checkpoint fixes the proven
 feed/native-product comparison and restores two existing Direct critical checks; it does not claim
 completed live ingestion or resolved Desktop startup. No timeouts/limits were increased.
+
+Feed-product checkpoint `042fd569` is pushed; PR #43 comment5931459183. Astra traced the suspected
+self-lock and ruled it out: retained row identity checks use atomic generations, while catalog
+precommit receives the existing borrowed authority. Lead owns a bounded supervisor diagnostic
+using closed IngestError/Arrow/Catalog Display messages (no recursive raw error material), followed
+by the same single-job build/live check. The concurrent Markets busy message alone does not prove
+the cause of ingestion failure.
+
+While that diagnostic build runs, Astra research_options_failure owns a read-only trace of the
+Markets instrument-definition `AuthorityBusy` path and its available WAL snapshot read capability.
+Return the exact remaining read/write coupling and smallest in-place fix; no edits/builds/Git. This
+addresses the observed screen failure independently and does not assume it caused ingestion failure.
+
+Confirmed read coupling: Markets `load_instrument_definitions` ->
+`InstrumentDefinitionReadCapability::latest` takes the sole writer's `try_lock`, mapping normal
+contention to unavailable. Approved dependency: capability retains the existing manifest read
+owner/result limits; latest uses one independent WAL snapshot for all selected IDs and shared
+verified instrument-history SQL. Astra owns `catalog_capabilities.rs`, `catalog/records.rs`, and
+`catalog/read_snapshot.rs`; lead owns constructor wiring in `ingest.rs`, existing critical-test
+integration, builds and Git. Pin/pin_optional authority semantics stay intact. No new gate/worker,
+compatibility path, separate harness or competing build. Current diagnostic binary excludes this
+new data edit; rebuild only after the lane freezes.
+
+Snapshot-read lane is frozen and lead-inspected. Lead aligned the only capability constructor and
+extended the existing writer-held event restart test: a nonempty ID lookup must execute and return
+the fixture's genuine absence while publication owns the writer. This covers the otherwise
+uncovered normal-contention regression without a new fixture/harness. Pinning/search remain
+unchanged; this is not a claim that every catalog read is independent. Diagnostic app build
+passes4m31s and its live run excludes the new snapshot source changes.
+
+Latest diagnostic narrows ingestion rejection to CatalogError::Sqlite; exact SQLite code/message is
+not yet captured. Astra research_options_failure owns read-only tracing of event publication SQL
+constraints against real 100-row public microbatches and existing multi-row fixtures. No edits or
+builds. Snapshot-read files remain frozen with lead.
+
+Diagnostic live run fails132.24s (`crypto-ingest-error-live.log`) with a SQLite engine rejection,
+not a proved nested-lock failure. Lead adds engine/constraint context for parameterized ingestion
+writes (no SQL parameter values) to the existing error log for the next combined build. The
+snapshot read change is now under the existing held-writer critical check.
+
+SQL contradiction is confirmed: validated 100-row Coinbase batches meet the Rust per-operation
+contract but event SQL accepts at most64 rows; broad INSERT OR IGNORE suppresses the parent CHECK
+failure before child FK failure. Lead owns in-place SQL0021 structural counts/parent ordinal
+validation, schema digest, existing 100-row restart check and integration. Astra owns only
+`catalog/provider_event.rs`: replace stale128 publication and64 journal-frame checks with the
+existing source-contract bounds, and make affected idempotent SQL inserts ignore uniqueness
+conflicts only so CHECK/NOT NULL failures stay visible. No new budgets, lifetime limits, migration,
+backward compatibility, builds or Git. HTTP page64 remains its distinct source contract.
+
+The expanded 100-row critical fixture compiles but returns Catalog(CorruptCatalog) in3.73s
+(`market-event-batch-contract-critical.log`), whereas its prior33-row snapshot version passed.
+Astra research_options_failure owns read-only diagnosis of remaining canonical replay/backup
+count assumptions against this exact fixture; lead owns narrow temporary phase diagnostics in
+the existing test and all builds. No authority weakening, new budgets or other-file edits.
+
+Phase evidence:100-row ingestion, current/historical reads and101-row archival pass; backup
+creation rejects the journal's100 physical frames through evidence.rs's duplicated64 bound.
+Lead owns that one reader alignment to existing MAX_PROVIDER_EVENT_MICROBATCH_FRAMES; temporary
+test phase prints removed. Existing complete catalog-control/history check runs separately.
+
+Final100-row event critical passes1/1 in7.40s (build41.02s), including concurrent definition read,
+archival, duplicate retry, corruption detection, mixed backup/restore and exact original reopen:
+`market-event-batch-backup-critical.log`. The populated catalog-control/history critical passes1/1
+in0.57s (`instrument-history-catalog-critical.log`). Astra's completed read-only audit found no
+additional event count mismatch in reached backup paths; remaining64/63 values are distinct
+logical-object or HTTP-page contracts. Combined application build now runs single-job; all runtime
+source is frozen. These focused checks are not live or installed acceptance.
+
+Combined app compilation passes5m26s (`market-event-batch-app-build.log`). Live run fails132.40s
+(`market-event-batch-live.log`): no SQLite batch rejection or Markets definition-lock failure is
+reported, but the unified-feed helper receives a non-array and later Coinbase health authority
+is unqualified. Kraken/restart are not reached. Storage critical checks pass; live/installed
+acceptance remains open. Astra research_options_failure owns read-only analysis of the current
+unified-feed result envelope and health-invalidating path; lead owns any next integration, builds
+and Git. No source edits during this handoff.

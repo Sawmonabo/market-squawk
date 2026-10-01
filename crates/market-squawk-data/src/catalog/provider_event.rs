@@ -6,14 +6,15 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchRawClaim};
 use market_squawk_sources::{
-    MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS, MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
-    PROVIDER_MARKET_EVENT_SCHEMA_VERSION, ProviderCaptureSetReceipt,
-    ProviderCompositeResponseEventBindingDigest, ProviderEventMicrobatchBindingDigest,
-    ProviderEventMicrobatchReceipt, ProviderEventMicrobatchRowFrameEvidence,
-    ProviderMarketEventNativeLineageRowEvidenceRef, ProviderNativeLineageBatchSidecarEvidenceRef,
-    ProviderResponseMarketEventBindingDigest, ProviderResponseMarketEventRowFrameEvidence,
-    SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
-    SealedProviderPublicationBinding, SealedProviderResponseMarketEventBinding, SourceMetadata,
+    MAX_PROVIDER_EVENT_MICROBATCH_FRAMES, MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS,
+    MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, PROVIDER_MARKET_EVENT_SCHEMA_VERSION,
+    ProviderCaptureSetReceipt, ProviderCompositeResponseEventBindingDigest,
+    ProviderEventMicrobatchBindingDigest, ProviderEventMicrobatchReceipt,
+    ProviderEventMicrobatchRowFrameEvidence, ProviderMarketEventNativeLineageRowEvidenceRef,
+    ProviderNativeLineageBatchSidecarEvidenceRef, ProviderResponseMarketEventBindingDigest,
+    ProviderResponseMarketEventRowFrameEvidence, SealedProviderCompositeResponseEventBinding,
+    SealedProviderEventMicrobatchBinding, SealedProviderPublicationBinding,
+    SealedProviderResponseMarketEventBinding, SourceMetadata,
     verify_provider_market_event_native_lineage_batch_evidence,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, params};
@@ -213,7 +214,9 @@ impl ProviderMarketEventSelectionCandidate {
             || self
                 .cohort_key()
                 .is_some_and(|key| key != self.provider_event_id.as_ref())
-            || self.publication_row_ordinal >= 128
+            || self.publication_row_ordinal
+                >= u32::try_from(MAX_PROVIDER_MARKET_EVENT_PUBLICATION_ROWS)
+                    .map_err(|_| CatalogError::InvalidRecord)?
             || self.component_row_ordinal
                 >= u32::try_from(MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS)
                     .map_err(|_| CatalogError::InvalidRecord)?
@@ -1800,10 +1803,10 @@ pub(crate) fn retain_prepared_provider_publication_binding(
             retain_event_binding_evidence(connection, run_id, event, recorded_at)?;
             let event_count = event.evidence.canonical_event_count;
             let inserted = connection.execute(
-                "INSERT OR IGNORE INTO provider_composite_response_event_bindings
+                "INSERT INTO provider_composite_response_event_bindings
                  (composite_binding_digest, response_binding_digest, event_binding_digest,
                   response_row_count, event_row_count, recorded_at_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
                 params![
                     digest_bytes(*composite_binding_digest),
                     digest_bytes(response.evidence.binding_digest),
@@ -1968,7 +1971,7 @@ fn retain_provider_market_event_selection_rows(
             publication_row_ordinal,
         )?;
         let inserted = connection.execute(
-            "INSERT OR IGNORE INTO provider_market_event_selection_index
+            "INSERT INTO provider_market_event_selection_index
              (publication_digest, publication_kind, publication_row_ordinal,
               component_kind, component_binding_digest, component_row_ordinal,
               canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
@@ -1977,7 +1980,7 @@ fn retain_provider_market_event_selection_rows(
               coordinate_digest, cohort_key, provider_product, provider_channel,
               dataset_id, commit_sequence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) ON CONFLICT DO NOTHING",
             params![
                 digest_bytes(candidate.publication_digest),
                 candidate.publication_kind.as_ref(),
@@ -2151,12 +2154,12 @@ pub(super) fn insert_response_capture(
         |row| row.get(0),
     )?;
     connection.execute(
-        "INSERT OR IGNORE INTO provider_raw_observations
+        "INSERT INTO provider_raw_observations
          (capture_observation_digest, capture_content_digest, source_id,
           source_revision_digest, metadata_revision, provider_dataset,
           request_set_identity, terminal_disposition, page_count, total_body_bytes,
           capture_json, recorded_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(capture.observation_digest()),
             digest_bytes(capture.content_digest()),
@@ -2174,11 +2177,11 @@ pub(super) fn insert_response_capture(
     )?;
     for page in capture.pages() {
         connection.execute(
-            "INSERT OR IGNORE INTO provider_raw_observation_pages
+            "INSERT INTO provider_raw_observation_pages
              (capture_observation_digest, page_ordinal, request_identity,
               request_page_token_digest, response_next_page_token_digest, http_status,
               body_bytes, body_digest, received_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT DO NOTHING",
             params![
                 digest_bytes(capture.observation_digest()),
                 i64::from(page.ordinal()),
@@ -2194,11 +2197,11 @@ pub(super) fn insert_response_capture(
     }
     insert_journal_claim(connection, retained_raw_claim_digest, claim, recorded_at)?;
     connection.execute(
-        "INSERT OR IGNORE INTO provider_raw_observation_objects
+        "INSERT INTO provider_raw_observation_objects
          (capture_observation_digest, input_ordinal, raw_claim_digest,
           physical_receipt_digest, object_capture_content_digest,
           object_capture_observation_digest, capture_receipt_digest)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(capture.observation_digest()),
             digest_bytes(retained_raw_claim_digest),
@@ -2210,12 +2213,12 @@ pub(super) fn insert_response_capture(
     )?;
     for frame in claim.frames() {
         connection.execute(
-            "INSERT OR IGNORE INTO provider_raw_observation_frames
+            "INSERT INTO provider_raw_observation_frames
              (capture_observation_digest, observation_unit_ordinal,
               raw_object_input_ordinal, raw_claim_digest, physical_receipt_digest,
               raw_unit_ordinal, frame_offset, framed_bytes, provider_payload_bytes,
               provider_payload_digest, received_at_ns, source_sequence)
-             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING",
             params![
                 digest_bytes(capture.observation_digest()),
                 i64::from(frame.ordinal()),
@@ -2240,12 +2243,12 @@ fn insert_response_event_binding(
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     connection.execute(
-        "INSERT OR IGNORE INTO provider_response_market_event_bindings
+        "INSERT INTO provider_response_market_event_bindings
          (response_event_binding_digest, binding_format_version,
           capture_observation_digest, sealed_capture_receipt_digest,
           canonical_schema_fingerprint, canonical_content_digest,
           canonical_event_count, row_mapping_digest, recorded_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(evidence.binding_digest),
             EVENT_BINDING_FORMAT_VERSION,
@@ -2260,10 +2263,10 @@ fn insert_response_event_binding(
     )?;
     let native = &evidence.native_lineage;
     connection.execute(
-        "INSERT OR IGNORE INTO provider_response_market_event_binding_native_lineage
+        "INSERT INTO provider_response_market_event_binding_native_lineage
          (response_event_binding_digest, schema_version, implementation, row_count,
           batch_digest, batch_sidecar_payload, batch_sidecar_digest)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(evidence.binding_digest),
             i64::from(native.schema_version),
@@ -2276,12 +2279,12 @@ fn insert_response_event_binding(
     )?;
     for row in &evidence.rows {
         connection.execute(
-            "INSERT OR IGNORE INTO provider_response_market_event_binding_rows
+            "INSERT INTO provider_response_market_event_binding_rows
              (response_event_binding_digest, capture_observation_digest,
               canonical_row_ordinal, canonical_event_digest, native_semantic_payload,
               native_semantic_digest, capture_page_ordinal, physical_frame_ordinal,
               payload_digest, received_at_ns, source_sequence, identity_selection)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT DO NOTHING",
             params![
                 digest_bytes(evidence.binding_digest),
                 digest_bytes(evidence.capture.observation_digest()),
@@ -2334,17 +2337,17 @@ pub(super) fn insert_journal_claim(
     if claim_json.is_empty()
         || claim_json.len() > MAX_EVENT_CLAIM_JSON_BYTES
         || claim.frames().is_empty()
-        || claim.frames().len() > 64
+        || claim.frames().len() > MAX_PROVIDER_EVENT_MICROBATCH_FRAMES
         || raw_claim_digest(claim_json.as_bytes()) != claim_digest
     {
         return Err(CatalogError::ProviderEventMismatch);
     }
     connection.execute(
-        "INSERT OR IGNORE INTO sealed_raw_objects
+        "INSERT INTO sealed_raw_objects
          (raw_claim_digest, raw_claim_kind, physical_receipt_digest, relative_reference,
           content_digest, size_bytes, integrity_chunk_bytes, unit_count, raw_claim_json,
           recorded_at_ns)
-         VALUES (?1, 'journal_segment', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+         VALUES (?1, 'journal_segment', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(claim_digest),
             digest_bytes(claim.physical_receipt_digest()),
@@ -2399,10 +2402,10 @@ fn insert_event_capture(
         |row| row.get(0),
     )?;
     connection.execute(
-        "INSERT OR IGNORE INTO provider_event_microbatches
+        "INSERT INTO provider_event_microbatches
          (event_observation_digest, event_content_digest, source_id, source_revision_digest,
           dataset, stream_identity, frame_count, total_payload_bytes, capture_json, recorded_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(capture.observation_digest()),
             digest_bytes(capture.content_digest()),
@@ -2418,10 +2421,10 @@ fn insert_event_capture(
     )?;
     for frame in capture.frames() {
         connection.execute(
-            "INSERT OR IGNORE INTO provider_event_microbatch_frames
+            "INSERT INTO provider_event_microbatch_frames
              (event_observation_digest, event_frame_ordinal, event_id, connection_id,
               source_sequence, exchange_at_ns, received_at_ns, payload_bytes, payload_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT DO NOTHING",
             params![
                 digest_bytes(capture.observation_digest()),
                 i64::from(frame.ordinal()),
@@ -2438,9 +2441,9 @@ fn insert_event_capture(
     let claim = &evidence.physical_claim;
     insert_journal_claim(connection, evidence.raw_claim_digest, claim, recorded_at)?;
     connection.execute(
-        "INSERT OR IGNORE INTO provider_event_microbatch_objects
+        "INSERT INTO provider_event_microbatch_objects
          (event_observation_digest, raw_claim_digest, physical_receipt_digest,
-          sealed_event_receipt_digest) VALUES (?1, ?2, ?3, ?4)",
+          sealed_event_receipt_digest) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(capture.observation_digest()),
             digest_bytes(evidence.raw_claim_digest),
@@ -2457,11 +2460,11 @@ fn insert_event_binding(
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     connection.execute(
-        "INSERT OR IGNORE INTO provider_event_bindings
+        "INSERT INTO provider_event_bindings
          (event_binding_digest, binding_format_version, event_observation_digest,
           sealed_event_receipt_digest, canonical_schema_fingerprint,
           canonical_content_digest, canonical_event_count, row_mapping_digest, recorded_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(evidence.binding_digest),
             EVENT_BINDING_FORMAT_VERSION,
@@ -2476,10 +2479,10 @@ fn insert_event_binding(
     )?;
     let native = &evidence.native_lineage;
     connection.execute(
-        "INSERT OR IGNORE INTO provider_event_binding_native_lineage
+        "INSERT INTO provider_event_binding_native_lineage
          (event_binding_digest, schema_version, implementation, row_count, batch_digest,
           batch_sidecar_payload, batch_sidecar_digest)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT DO NOTHING",
         params![
             digest_bytes(evidence.binding_digest),
             i64::from(native.schema_version),
@@ -2492,12 +2495,12 @@ fn insert_event_binding(
     )?;
     for row in &evidence.rows {
         connection.execute(
-            "INSERT OR IGNORE INTO provider_event_binding_rows
+            "INSERT INTO provider_event_binding_rows
              (event_binding_digest, event_observation_digest, canonical_row_ordinal,
               canonical_event_digest, native_semantic_payload, native_semantic_digest,
               event_frame_ordinal, physical_frame_ordinal, event_id, connection_id,
               payload_digest, exchange_at_ns, received_at_ns, source_sequence, identity_selection)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT DO NOTHING",
             params![
                 digest_bytes(evidence.binding_digest),
                 digest_bytes(evidence.capture.observation_digest()),
@@ -3322,7 +3325,7 @@ fn parse_stored_journal_claim(
     if raw_claim_kind != "journal_segment"
         || integrity_chunk_bytes.is_some()
         || claim.frames().is_empty()
-        || claim.frames().len() > 64
+        || claim.frames().len() > MAX_PROVIDER_EVENT_MICROBATCH_FRAMES
         || usize::try_from(unit_count).ok() != Some(claim.frames().len())
         || u64::try_from(size_bytes).ok() != Some(claim.size_bytes())
         || relative_reference != claim.relative_reference()

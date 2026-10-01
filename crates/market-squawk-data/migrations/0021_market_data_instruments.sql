@@ -532,8 +532,7 @@ CREATE TABLE sealed_raw_objects (
     CHECK (
         (raw_claim_kind = 'journal_segment'
             AND size_bytes <= 536870912
-            AND integrity_chunk_bytes IS NULL
-            AND unit_count <= 64)
+            AND integrity_chunk_bytes IS NULL)
         OR (raw_claim_kind = 'logical_object'
             AND integrity_chunk_bytes IS NOT NULL
             AND size_bytes <= unit_count * integrity_chunk_bytes
@@ -904,7 +903,7 @@ CREATE TABLE provider_response_market_event_bindings (
         length(canonical_content_digest) = 32
         AND canonical_content_digest <> zeroblob(32)
     ),
-    canonical_event_count INTEGER NOT NULL CHECK (canonical_event_count BETWEEN 1 AND 64),
+    canonical_event_count INTEGER NOT NULL CHECK (canonical_event_count > 0),
     row_mapping_digest BLOB NOT NULL CHECK (
         length(row_mapping_digest) = 32 AND row_mapping_digest <> zeroblob(32)
     ),
@@ -919,7 +918,7 @@ CREATE TABLE provider_response_market_event_binding_native_lineage (
     implementation TEXT NOT NULL CHECK (
         length(CAST(implementation AS BLOB)) BETWEEN 1 AND 128
     ),
-    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 64),
+    row_count INTEGER NOT NULL CHECK (row_count > 0),
     batch_digest BLOB NOT NULL CHECK (
         length(batch_digest) = 32 AND batch_digest <> zeroblob(32)
     ),
@@ -943,7 +942,7 @@ CREATE TABLE provider_response_market_event_binding_native_lineage (
 CREATE TABLE provider_response_market_event_binding_rows (
     response_event_binding_digest BLOB NOT NULL,
     capture_observation_digest BLOB NOT NULL,
-    canonical_row_ordinal INTEGER NOT NULL CHECK (canonical_row_ordinal BETWEEN 0 AND 63),
+    canonical_row_ordinal INTEGER NOT NULL CHECK (canonical_row_ordinal >= 0),
     canonical_event_digest BLOB NOT NULL CHECK (
         length(canonical_event_digest) = 32
         AND canonical_event_digest <> zeroblob(32)
@@ -1003,7 +1002,7 @@ CREATE TABLE provider_event_microbatches (
     stream_identity TEXT NOT NULL CHECK (
         length(CAST(stream_identity AS BLOB)) BETWEEN 1 AND 256
     ),
-    frame_count INTEGER NOT NULL CHECK (frame_count BETWEEN 1 AND 64),
+    frame_count INTEGER NOT NULL CHECK (frame_count > 0),
     total_payload_bytes INTEGER NOT NULL CHECK (
         total_payload_bytes BETWEEN 1 AND 67108864
     ),
@@ -1020,7 +1019,7 @@ CREATE TABLE provider_event_microbatches (
 CREATE TABLE provider_event_microbatch_frames (
     event_observation_digest BLOB NOT NULL
         REFERENCES provider_event_microbatches(event_observation_digest),
-    event_frame_ordinal INTEGER NOT NULL CHECK (event_frame_ordinal BETWEEN 0 AND 63),
+    event_frame_ordinal INTEGER NOT NULL CHECK (event_frame_ordinal >= 0),
     event_id BLOB NOT NULL CHECK (length(event_id) = 16 AND event_id <> zeroblob(16)),
     connection_id BLOB NOT NULL CHECK (
         length(connection_id) = 16 AND connection_id <> zeroblob(16)
@@ -1075,7 +1074,7 @@ CREATE TABLE provider_event_bindings (
         length(canonical_content_digest) = 32
         AND canonical_content_digest <> zeroblob(32)
     ),
-    canonical_event_count INTEGER NOT NULL CHECK (canonical_event_count BETWEEN 1 AND 64),
+    canonical_event_count INTEGER NOT NULL CHECK (canonical_event_count > 0),
     row_mapping_digest BLOB NOT NULL CHECK (
         length(row_mapping_digest) = 32 AND row_mapping_digest <> zeroblob(32)
     ),
@@ -1095,7 +1094,7 @@ CREATE TABLE provider_event_binding_native_lineage (
     implementation TEXT NOT NULL CHECK (
         length(CAST(implementation AS BLOB)) BETWEEN 1 AND 128
     ),
-    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 64),
+    row_count INTEGER NOT NULL CHECK (row_count > 0),
     batch_digest BLOB NOT NULL CHECK (
         length(batch_digest) = 32 AND batch_digest <> zeroblob(32)
     ),
@@ -1119,7 +1118,7 @@ CREATE TABLE provider_event_binding_native_lineage (
 CREATE TABLE provider_event_binding_rows (
     event_binding_digest BLOB NOT NULL,
     event_observation_digest BLOB NOT NULL,
-    canonical_row_ordinal INTEGER NOT NULL CHECK (canonical_row_ordinal BETWEEN 0 AND 63),
+    canonical_row_ordinal INTEGER NOT NULL CHECK (canonical_row_ordinal >= 0),
     canonical_event_digest BLOB NOT NULL CHECK (
         length(canonical_event_digest) = 32
         AND canonical_event_digest <> zeroblob(32)
@@ -1134,9 +1133,9 @@ CREATE TABLE provider_event_binding_rows (
         length(native_semantic_digest) = 32
         AND native_semantic_digest <> zeroblob(32)
     ),
-    event_frame_ordinal INTEGER NOT NULL CHECK (event_frame_ordinal BETWEEN 0 AND 63),
+    event_frame_ordinal INTEGER NOT NULL CHECK (event_frame_ordinal >= 0),
     physical_frame_ordinal INTEGER NOT NULL CHECK (
-        physical_frame_ordinal BETWEEN 0 AND 63
+        physical_frame_ordinal >= 0
     ),
     event_id BLOB NOT NULL CHECK (length(event_id) = 16 AND event_id <> zeroblob(16)),
     connection_id BLOB NOT NULL CHECK (
@@ -1160,6 +1159,58 @@ CREATE TABLE provider_event_binding_rows (
         )
 ) STRICT, WITHOUT ROWID;
 
+-- Counts describe the admitted publication, not an independent batch-size policy. Rust
+-- controls per-operation bytes/rows; SQL checks coordinates against their immutable parents.
+CREATE TRIGGER provider_response_market_event_native_count_guard
+BEFORE INSERT ON provider_response_market_event_binding_native_lineage
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_response_market_event_bindings AS parent
+    WHERE parent.response_event_binding_digest=NEW.response_event_binding_digest
+      AND parent.canonical_event_count=NEW.row_count
+) BEGIN
+    SELECT RAISE(ABORT, 'response native count differs from canonical count');
+END;
+CREATE TRIGGER provider_response_market_event_row_guard
+BEFORE INSERT ON provider_response_market_event_binding_rows
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_response_market_event_bindings AS parent
+    WHERE parent.response_event_binding_digest=NEW.response_event_binding_digest
+      AND NEW.canonical_row_ordinal<parent.canonical_event_count
+) BEGIN
+    SELECT RAISE(ABORT, 'response canonical ordinal exceeds parent count');
+END;
+CREATE TRIGGER provider_event_microbatch_frame_guard
+BEFORE INSERT ON provider_event_microbatch_frames
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_event_microbatches AS parent
+    WHERE parent.event_observation_digest=NEW.event_observation_digest
+      AND NEW.event_frame_ordinal<parent.frame_count
+) BEGIN
+    SELECT RAISE(ABORT, 'event frame ordinal exceeds parent count');
+END;
+CREATE TRIGGER provider_event_native_count_guard
+BEFORE INSERT ON provider_event_binding_native_lineage
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_event_bindings AS parent
+    WHERE parent.event_binding_digest=NEW.event_binding_digest
+      AND parent.canonical_event_count=NEW.row_count
+) BEGIN
+    SELECT RAISE(ABORT, 'event native count differs from canonical count');
+END;
+CREATE TRIGGER provider_event_binding_row_guard
+BEFORE INSERT ON provider_event_binding_rows
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_event_bindings AS parent
+    JOIN provider_event_microbatch_objects AS object
+      ON object.event_observation_digest=parent.event_observation_digest
+    JOIN sealed_raw_objects AS raw ON raw.raw_claim_digest=object.raw_claim_digest
+    WHERE parent.event_binding_digest=NEW.event_binding_digest
+      AND NEW.canonical_row_ordinal<parent.canonical_event_count
+      AND NEW.physical_frame_ordinal<raw.unit_count
+) BEGIN
+    SELECT RAISE(ABORT, 'event row coordinates exceed parent counts');
+END;
+
 CREATE TABLE provider_composite_response_event_bindings (
     composite_binding_digest BLOB PRIMARY KEY CHECK (
         length(composite_binding_digest) = 32
@@ -1169,8 +1220,8 @@ CREATE TABLE provider_composite_response_event_bindings (
         REFERENCES provider_response_market_event_bindings(response_event_binding_digest),
     event_binding_digest BLOB NOT NULL UNIQUE
         REFERENCES provider_event_bindings(event_binding_digest),
-    response_row_count INTEGER NOT NULL CHECK (response_row_count BETWEEN 1 AND 64),
-    event_row_count INTEGER NOT NULL CHECK (event_row_count BETWEEN 1 AND 64),
+    response_row_count INTEGER NOT NULL CHECK (response_row_count > 0),
+    event_row_count INTEGER NOT NULL CHECK (event_row_count > 0),
     recorded_at_ns INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 
@@ -1908,7 +1959,7 @@ CREATE TABLE provider_market_event_selection_index (
         )
     ),
     publication_row_ordinal INTEGER NOT NULL CHECK (
-        publication_row_ordinal BETWEEN 0 AND 127
+        publication_row_ordinal >= 0
     ),
     component_kind TEXT NOT NULL CHECK (component_kind IN ('response', 'stream')),
     component_binding_digest BLOB NOT NULL CHECK (
@@ -1916,7 +1967,7 @@ CREATE TABLE provider_market_event_selection_index (
         AND component_binding_digest <> zeroblob(32)
     ),
     component_row_ordinal INTEGER NOT NULL CHECK (
-        component_row_ordinal BETWEEN 0 AND 63
+        component_row_ordinal >= 0
     ),
     canonical_event_digest BLOB NOT NULL CHECK (
         length(canonical_event_digest) = 32

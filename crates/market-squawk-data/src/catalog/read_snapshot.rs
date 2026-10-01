@@ -157,6 +157,23 @@ impl CatalogReadSnapshot {
         &self.connection
     }
 
+    /// Reads newest-first verified executable definitions on this transaction's connection.
+    pub(crate) fn instrument_history(
+        &self,
+        instrument: market_squawk_domain::InstrumentId,
+        limit: super::CatalogLimit,
+    ) -> Result<Vec<market_squawk_domain::InstrumentDefinition>, CatalogError> {
+        self.check_control()?;
+        let result = super::records::instrument_history(
+            &self.connection,
+            self.result_limits,
+            instrument,
+            limit,
+        );
+        self.check_control()?;
+        result
+    }
+
     pub(crate) fn authoritative_provider_raw_claim_page(
         &self,
         after: Option<EvidenceDigest>,

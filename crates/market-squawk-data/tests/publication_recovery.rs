@@ -3552,10 +3552,10 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     for (batch_number, observations, expected_ties) in [
         (
             2,
-            (501..=533).map(|time| (time, 10_150)).collect::<Vec<_>>(),
+            (501..=600).map(|time| (time, 10_150)).collect::<Vec<_>>(),
             1,
         ),
-        (3, vec![(533, 10_151)], 2),
+        (3, vec![(600, 10_151)], 2),
     ] {
         let (publication, _, _) =
             sealed_market_event_microbatch(&capture_store, batch_number, &observations)?;
@@ -3568,7 +3568,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 RightsDecisionInput {
                     source_id: source.source_id().clone(),
                     payload_digest: publication_digest,
-                    retrieved_at: Timestamp::from_unix_nanos(533),
+                    retrieved_at: Timestamp::from_unix_nanos(600),
                     basis: RightsBasis::reviewed_terms(
                         "https://example.test/alpaca-terms/v1",
                         digest(41),
@@ -3639,6 +3639,13 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 Instant::now() + Duration::from_secs(5),
                 &cancellation,
             );
+            // Even an absent definition must be queried without competing with the writer.
+            let definitions_during_write = restarted.instrument_definitions().latest(
+                &[instrument],
+                1,
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            );
             // Release before propagating a read failure, so the writer cannot outlive this check.
             let released = release_tx.send(());
             let publication = publication_task.await;
@@ -3650,6 +3657,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             assert_eq!(during_write, selected);
             assert_eq!(routes_during_write, retained_routes);
             assert_eq!(metadata_during_write, Some(source.clone()));
+            assert!(definitions_during_write?.is_empty());
             committed
         } else {
             restarted
@@ -3710,9 +3718,9 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 .tied_candidates()
                 .iter()
                 .all(|candidate| candidate.coordinate().received_at()
-                    == Timestamp::from_unix_nanos(533))
+                    == Timestamp::from_unix_nanos(600))
         );
-        assert_eq!(current.exclusions().superseded_received_observation(), 33);
+        assert_eq!(current.exclusions().superseded_received_observation(), 100);
         assert_eq!(
             current.exact_restart_request()?.tie_policy(),
             current_request.tie_policy()
@@ -3735,7 +3743,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 Timestamp::from_unix_nanos(490),
                 Timestamp::from_unix_nanos(i64::MAX),
                 market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
-                64,
+                128,
                 committed.clone(),
                 Some(source.source_id().clone()),
             )?;
@@ -3750,7 +3758,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             .ok_or("missing historical source-time ties")?;
         assert_eq!(
             historical.sources()[0].tied_candidates().len(),
-            33 + expected_ties
+            100 + expected_ties
         );
         assert_eq!(historical.exclusions().superseded_received_observation(), 0);
         assert_eq!(u128::from(committed.sequence()), batch_number);
@@ -3814,7 +3822,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 before.query_row("SELECT COUNT(*) FROM market_event_active_rows", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(before_rows, 34);
+            assert_eq!(before_rows, 101);
             let turn = restarted
                 .maintain_market_event_archive(
                     None,
@@ -3831,12 +3839,12 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             assert_eq!(turn.next_dataset(), Some(first_commit.dataset_id()));
             assert_eq!(
                 (turn.archived_publications(), turn.archived_rows()),
-                (2, 34)
+                (2, 101)
             );
             let old_snapshot: (i64,i64) = before.query_row(
                 "SELECT (SELECT COUNT(*) FROM market_event_active_rows),(SELECT COUNT(*) FROM market_event_archive_memberships)",
                 [], |row|Ok((row.get(0)?,row.get(1)?)))?;
-            assert_eq!(old_snapshot, (34, 0));
+            assert_eq!(old_snapshot, (101, 0));
             let after = rusqlite::Connection::open(location.path())?;
             let new_snapshot: (i64, i64, i64) = after.query_row(
                 "SELECT (SELECT COUNT(*) FROM market_event_active_rows),
@@ -3845,7 +3853,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            assert_eq!(new_snapshot, (0, 2, 34));
+            assert_eq!(new_snapshot, (0, 2, 101));
             before.execute_batch("COMMIT")?;
             restarted
                 .verify_provider_market_event_point_in_time_restart(

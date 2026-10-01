@@ -3140,7 +3140,11 @@ impl AnalyticalDataService {
 
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.
     pub fn instrument_definitions(&self) -> crate::InstrumentDefinitionReadCapability {
-        crate::InstrumentDefinitionReadCapability::new(Arc::clone(&self.authority))
+        crate::InstrumentDefinitionReadCapability::new(
+            Arc::clone(&self.authority),
+            Arc::clone(&self.manifests),
+            self.catalog_read_limits,
+        )
     }
 
     /// Returns bounded current reads over repository-owned, non-execution market-data definitions.

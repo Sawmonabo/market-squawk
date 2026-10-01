@@ -802,7 +802,8 @@ fn read_sealed_raw_object_evidence(
                 claim_kind == "journal_segment"
                     && integrity_chunk_bytes.is_none()
                     && size_bytes <= 536_870_912
-                    && unit_count <= 64
+                    && unit_count
+                        <= market_squawk_sources::MAX_PROVIDER_EVENT_MICROBATCH_FRAMES as u64
                     && claim.relative_reference() == relative_reference
                     && claim.content_digest().bytes() == content_digest.bytes()
                     && claim.size_bytes() == size_bytes

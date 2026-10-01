@@ -669,7 +669,30 @@ fn trace_publication_worker_failure(
             }
             CryptoMarketPublicationError::Kraken(_) => "publication_kraken",
             CryptoMarketPublicationError::Research(_) => "publication_research",
-            CryptoMarketPublicationError::Ingest(_) => "publication_ingest",
+            CryptoMarketPublicationError::Ingest(error) => {
+                // Display is closed domain context; never recursively log raw I/O/SQL/provider errors.
+                let detail: &dyn std::fmt::Display = match error {
+                    market_squawk_data::IngestError::Arrow(inner) => inner,
+                    market_squawk_data::IngestError::Catalog(inner) => inner,
+                    _ => error,
+                };
+                if let market_squawk_data::IngestError::Catalog(
+                    market_squawk_data::CatalogError::Sqlite(rusqlite::Error::SqliteFailure(
+                        code,
+                        message,
+                    )),
+                ) = error
+                {
+                    // These parameterized writes report engine/constraint context, never bound values.
+                    tracing::warn!(
+                        ?code,
+                        sqlite_message = message.as_deref(),
+                        "Coinbase catalog write rejected"
+                    );
+                }
+                tracing::warn!(%error, %detail, "Coinbase canonical ingestion failed");
+                "publication_ingest"
+            }
             CryptoMarketPublicationError::Capture(_) => "publication_capture",
             CryptoMarketPublicationError::RawCapture(_) => "publication_raw_capture",
             CryptoMarketPublicationError::Rights(_) => "publication_rights",

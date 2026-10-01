@@ -499,25 +499,7 @@ impl Catalog {
         limit: CatalogLimit,
     ) -> Result<Vec<InstrumentDefinition>, CatalogError> {
         self.enforce_limit(limit)?;
-        let mut budget = ResultBudget::new(self.result_bytes);
-        let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT definition_json, revision_digest FROM instrument_revisions
-             WHERE instrument_id=?1
-             ORDER BY observed_at_ns DESC, revision_digest DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![instrument_id.to_string(), row_limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut history = Vec::new();
-        history
-            .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
-            .map_err(|_| CatalogError::Allocation)?;
-        for row in rows {
-            let (value, digest) = row?;
-            history.push(deserialize_verified(&value, &digest, &mut budget)?);
-        }
-        Ok(history)
+        instrument_history(&self.connection, self.result_bytes, instrument_id, limit)
     }
 
     /// Pins complete, verified instrument-definition histories at one catalog knowledge bound.
@@ -903,6 +885,34 @@ fn put_instrument_revision(
         catalog_now,
     )?;
     Ok(())
+}
+
+/// Shared digest-verified history query for writer-owned and independent snapshot reads.
+pub(super) fn instrument_history(
+    connection: &rusqlite::Connection,
+    result_limits: CatalogResultLimits,
+    instrument_id: InstrumentId,
+    limit: CatalogLimit,
+) -> Result<Vec<InstrumentDefinition>, CatalogError> {
+    let mut budget = ResultBudget::new(result_limits);
+    let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
+    let mut statement = connection.prepare(
+        "SELECT definition_json, revision_digest FROM instrument_revisions
+         WHERE instrument_id=?1
+         ORDER BY observed_at_ns DESC, revision_digest DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![instrument_id.to_string(), row_limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut history = Vec::new();
+    history
+        .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
+        .map_err(|_| CatalogError::Allocation)?;
+    for row in rows {
+        let (value, digest) = row?;
+        history.push(deserialize_verified(&value, &digest, &mut budget)?);
+    }
+    Ok(history)
 }
 
 fn check_instrument_definition_read(

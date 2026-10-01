@@ -169,6 +169,8 @@ impl InstrumentCatalogCapability {
 #[derive(Clone)]
 pub struct InstrumentDefinitionReadCapability {
     authority: Arc<Mutex<CatalogAuthority>>,
+    manifests: Arc<crate::AnalyticalManifestCatalog>,
+    result_limits: crate::CatalogResultLimits,
 }
 
 impl fmt::Debug for InstrumentDefinitionReadCapability {
@@ -184,8 +186,16 @@ impl fmt::Debug for InstrumentDefinitionReadCapability {
 }
 
 impl InstrumentDefinitionReadCapability {
-    pub(crate) fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
-        Self { authority }
+    pub(crate) fn new(
+        authority: Arc<Mutex<CatalogAuthority>>,
+        manifests: Arc<crate::AnalyticalManifestCatalog>,
+        result_limits: crate::CatalogResultLimits,
+    ) -> Self {
+        Self {
+            authority,
+            manifests,
+            result_limits,
+        }
     }
 
     /// Mints one exact bounded receipt from the sole catalog session.
@@ -231,8 +241,9 @@ impl InstrumentDefinitionReadCapability {
 
     /// Returns the newest verified definition for each requested stable identity.
     ///
-    /// The operation is bounded by `maximum_instruments`, checks cancellation and deadline around
-    /// every catalog read, and never substitutes a definition for a missing identity.
+    /// One independent WAL snapshot covers the complete request without taking the catalog writer
+    /// lock. The operation is bounded by `maximum_instruments`, checks cancellation and deadline
+    /// around every catalog read, and never substitutes a definition for a missing identity.
     pub fn latest(
         &self,
         instrument_ids: &[InstrumentId],
@@ -251,24 +262,35 @@ impl InstrumentDefinitionReadCapability {
         {
             return Err(CatalogError::InvalidLimit);
         }
-        let authority = self.lock(deadline, cancellation)?;
-        let one = CatalogLimit::new(1)?;
-        let mut definitions = Vec::new();
-        definitions
-            .try_reserve_exact(instrument_ids.len())
-            .map_err(|_| CatalogError::Allocation)?;
-        for instrument_id in instrument_ids {
-            check_read(deadline, cancellation)?;
-            if let Some(definition) = authority
-                .instrument_history(*instrument_id, one)?
-                .into_iter()
-                .next()
-            {
-                definitions.push(definition);
-            }
-        }
         check_read(deadline, cancellation)?;
-        Ok(definitions)
+        let result = (|| {
+            let snapshot =
+                self.manifests
+                    .read_snapshot(self.result_limits, deadline, cancellation)?;
+            snapshot.read(|snapshot| {
+                let one = CatalogLimit::new(1)?;
+                let mut definitions = Vec::new();
+                definitions
+                    .try_reserve_exact(instrument_ids.len())
+                    .map_err(|_| CatalogError::Allocation)?;
+                for instrument_id in instrument_ids {
+                    check_read(deadline, cancellation)?;
+                    if let Some(definition) = snapshot
+                        .instrument_history(*instrument_id, one)?
+                        .into_iter()
+                        .next()
+                    {
+                        definitions.push(definition);
+                    }
+                }
+                check_read(deadline, cancellation)?;
+                Ok(definitions)
+            })
+        })();
+        // Preserve this capability's control-error family even when SQLite's progress handler
+        // or the shared snapshot boundary observes cancellation/deadline first.
+        check_read(deadline, cancellation)?;
+        result
     }
 
     /// Searches the canonical reference master without exposing general catalog authority.
