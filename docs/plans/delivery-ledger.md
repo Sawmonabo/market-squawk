@@ -5234,3 +5234,17 @@ remains selectable with honest label and no invented symbol. Shared product proj
 to its admitted unambiguous symbol, otherwise explicitly unavailable name. No rows/evidence are
 dropped, no financial identity or rights checks changed. Native live recheck requires service
 rebuild; baseline Home/Markets failures are not yet declared closed.
+
+Native integration at `0d09e0f3`: service build PASS9m43s. Previous process65221 handled SIGTERM
+and exited0. Hidden Desktop eventually launched/reconnected to current service69249 with no app
+password; initial restart trace includes transient Starting and one exited child67247. Settled
+recheck (`market-startup-settled-native-routes.json`) has17/17 Ready routes, zero query errors.
+Home/Markets now show9named starters and CLI MSFT search returns its real canonical selection.
+This closes the reproduced population-wide optional-name error, not complete live pricing.
+Prices remain unavailable: Alpaca recovery is Blocked/reconciliation with null doctor and verify
+returns Unavailable; automatic recovery reports expired/invalid publication authority. Separate
+Kraken failure is now confirmed freshness-only via closed cause4112. No further clock retry
+exhaustion was observed in this short run; that is not sustained ingestion/performance proof.
+PR #43 implementation evidence: comment5936024993. Next barrier is recoverable live connection
+renewal and freshness-only resynchronization, then genuine stock/fiscal workflow wiring. Keep
+current root, saved account/config and original protected backups intact.
