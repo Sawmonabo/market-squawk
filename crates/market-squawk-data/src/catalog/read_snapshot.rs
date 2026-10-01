@@ -190,6 +190,78 @@ impl CatalogReadSnapshot {
         )
     }
 
+    pub(crate) fn capture_binding_evidence(
+        &self,
+        digest: EvidenceDigest,
+    ) -> Result<
+        Option<super::provider_capture::PersistedProviderCaptureBindingEvidence>,
+        CatalogError,
+    > {
+        self.check_control()?;
+        super::provider_capture::load_provider_capture_binding_evidence(&self.connection, digest)
+    }
+
+    pub(crate) fn metadata_capture(
+        &self,
+        digest: EvidenceDigest,
+    ) -> Result<super::provider_capture::ProviderMetadataCaptureEvidence, CatalogError> {
+        self.check_control()?;
+        super::provider_capture::metadata::load(&self.connection, digest)?
+            .ok_or(CatalogError::ProviderCaptureMismatch)
+    }
+
+    pub(crate) fn selected_capture_rows(
+        &self,
+        selection: crate::analytical_read::SelectedProviderCaptureRows,
+        maximum_bytes: usize,
+    ) -> Result<crate::ingest::SelectedProviderCaptureEvidence, CatalogError> {
+        super::provider_capture::load_selected_provider_capture_rows(
+            &self.connection,
+            selection,
+            maximum_bytes,
+            self.deadline,
+            &self.cancellation,
+        )
+    }
+
+    pub(crate) fn durable_market_routes(
+        &self,
+        instrument: market_squawk_domain::InstrumentId,
+        kinds: &[market_squawk_domain::LiveEventClass],
+        as_of: market_squawk_domain::Timestamp,
+        knowledge_cutoff: market_squawk_domain::Timestamp,
+        maximum_routes: usize,
+    ) -> Result<Vec<super::market_recovery::ProviderMarketEventDurableRoute>, CatalogError> {
+        super::market_recovery::load_provider_market_event_durable_routes(
+            &self.connection,
+            self.result_limits,
+            instrument,
+            kinds,
+            as_of,
+            knowledge_cutoff,
+            maximum_routes,
+            self.deadline,
+            &self.cancellation,
+        )
+    }
+
+    pub(crate) fn retained_source_metadata(
+        &self,
+        source: &market_squawk_domain::SourceId,
+        revision: &market_squawk_domain::MetadataRevision,
+        knowledge_cutoff: market_squawk_domain::Timestamp,
+    ) -> Result<Option<market_squawk_sources::SourceMetadata>, CatalogError> {
+        super::market_recovery::load_retained_source_metadata(
+            &self.connection,
+            self.result_limits,
+            source,
+            revision,
+            knowledge_cutoff,
+            self.deadline,
+            &self.cancellation,
+        )
+    }
+
     fn check_control(&self) -> Result<(), CatalogError> {
         check_control(self.deadline, &self.cancellation)
     }

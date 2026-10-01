@@ -3466,7 +3466,14 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     )
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(5), entered_rx).await??;
+            let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx).await;
+            if !matches!(entered, Ok(Ok(()))) {
+                let _ = release_tx.send(());
+                let publication = publication_task.await;
+                publication??;
+                entered??;
+                return Err("publication never entered the writer seam".into());
+            }
             let during_write = restarted
                 .read_provider_market_event_point_in_time(
                     &selection_request,
@@ -3475,11 +3482,33 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     cancellation.clone(),
                 )
                 .await;
+            let routes_during_write = restarted.provider_market_event_durable_routes(
+                instrument,
+                &[LiveEventClass::Trade],
+                Timestamp::from_unix_nanos(490),
+                Timestamp::from_unix_nanos(i64::MAX),
+                32,
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            );
+            let metadata_during_write = restarted.retained_source_metadata(
+                source.source_id(),
+                source.revision(),
+                Timestamp::from_unix_nanos(i64::MAX),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            );
             // Release before propagating a read failure, so the writer cannot outlive this check.
-            release_tx.send(())?;
-            let committed = publication_task.await??;
+            let released = release_tx.send(());
+            let publication = publication_task.await;
             let during_write = during_write?.ok_or("writer hid existing market evidence")?;
+            let routes_during_write = routes_during_write?;
+            let metadata_during_write = metadata_during_write?;
+            let committed = publication??;
+            released?;
             assert_eq!(during_write, selected);
+            assert_eq!(routes_during_write, retained_routes);
+            assert_eq!(metadata_during_write, Some(source.clone()));
             committed
         } else {
             restarted
@@ -3621,7 +3650,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("complete-alpaca-history"))?;
@@ -3640,12 +3669,12 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     let calendar_source = complete_history_calendar_source(instrument_id)?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     authority.register_source(&calendar_source, Timestamp::from_unix_nanos(10))?;
-    let service = AnalyticalDataService::initialize(
+    let service = Arc::new(AnalyticalDataService::initialize(
         authority,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 64, Duration::from_secs(60))?,
-    )?;
+    )?);
     let definition_synchronizer = service.market_data_instrument_synchronization();
     let synchronized = definition_synchronizer.synchronize(
         MarketDataInstrumentSynchronization::try_new(vec![definition], 1)?,
@@ -4540,12 +4569,90 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     )
     .await?
     .ok_or("native history before restart")?;
-    assert_complete_history_native_rejoin(
+    // The actual calendar capture + retained metadata reopen must remain available while
+    // another publication owns the catalog writer. The existing precommit seam holds it.
+    let event_source = market_event_source()?;
+    let (publication, _, _) = sealed_market_event_microbatch(&capture_store, 1, &[(500, 10_150)])?;
+    let publication_digest = provider_market_event_publication_digest(&publication)?;
+    let reservation = service
+        .reserve_source_ingest(
+            &event_source,
+            Timestamp::from_unix_nanos(10),
+            RightsDecisionInput {
+                source_id: event_source.source_id().clone(),
+                payload_digest: publication_digest,
+                retrieved_at: Timestamp::from_unix_nanos(500),
+                basis: RightsBasis::reviewed_terms(
+                    "https://example.test/alpaca-terms/v1",
+                    digest(41),
+                )?,
+                authorization_evidence: digest(43),
+                authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                permitted_operations: vec![SourceOperation::Persist],
+            },
+            &IngestIdentity::try_new(
+                event_source.source_id().clone(),
+                publication_digest,
+                SourceOperation::Persist,
+                "alpaca:iex:events:calendar-concurrent-read:v1",
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = Arc::clone(&service);
+    let event_dataset = DatasetId::try_from("alpaca-calendar-concurrent-event-fixture")?;
+    let publication_task = tokio::spawn(async move {
+        writer
+            .ingest_provider_market_events(
+                reservation,
+                event_dataset,
+                publication,
+                CancellationToken::new(),
+                Arc::new(HoldProviderEventPublication {
+                    entered: std::sync::Mutex::new(Some(entered_tx)),
+                    release: std::sync::Mutex::new(release_rx),
+                }),
+            )
+            .await
+    });
+    let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx).await;
+    if !matches!(entered, Ok(Ok(()))) {
+        let _ = release_tx.send(());
+        let publication = publication_task.await;
+        publication??;
+        entered??;
+        return Err("publication never entered the writer seam".into());
+    }
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let cancelled_read = service.generation_owned_provider_capture_evidence_bounded(
+        native_history.manifest(),
+        &capture_store,
+        Instant::now() + Duration::from_secs(5),
+        &cancelled,
+    );
+    let expired_read = service.generation_owned_provider_capture_evidence_bounded(
+        native_history.manifest(),
+        &capture_store,
+        Instant::now(),
+        &CancellationToken::new(),
+    );
+    let replay_during_write = assert_complete_history_native_rejoin(
         &service,
         &capture_store,
         native_output,
         &native_request,
-    )?;
+    );
+    // Always release and join the genuine writer before propagating the read outcome.
+    let released = release_tx.send(());
+    let publication = publication_task.await;
+    replay_during_write?;
+    publication??;
+    released?;
+    assert!(matches!(cancelled_read, Err(IngestError::Cancelled)));
+    assert!(matches!(expired_read, Err(IngestError::DeadlineExceeded)));
     drop(native_history);
     drop(split_selected);
     drop(split);
@@ -5803,9 +5910,13 @@ fn assert_complete_history_native_rejoin(
             Ok(())
         }
     }
-    let owned = service.generation_owned_provider_capture_evidence(
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let cancellation = CancellationToken::new();
+    let owned = service.generation_owned_provider_capture_evidence_bounded(
         output.selection().receipt().origin_manifest(),
         store,
+        deadline,
+        &cancellation,
     )?;
     let binding = owned
         .objects()
@@ -5815,6 +5926,17 @@ fn assert_complete_history_native_rejoin(
         .first()
         .ok_or("native history input")?
         .binding();
+    let metadata = service
+        .retained_source_metadata(
+            binding.capture().source_id(),
+            binding.capture().metadata_revision(),
+            Timestamp::from_unix_nanos(i64::MAX),
+            deadline,
+            &cancellation,
+        )?
+        .ok_or("native calendar retained metadata")?;
+    assert_eq!(metadata.source_id(), binding.capture().source_id());
+    assert_eq!(metadata.revision(), binding.capture().metadata_revision());
     let segment = store.open_verified_claim_with_control(
         binding
             .physical_claims()

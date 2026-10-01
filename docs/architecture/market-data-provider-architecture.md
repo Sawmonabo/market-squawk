@@ -575,6 +575,12 @@ when that operation exits; it is not a cached connection or a second runtime. Th
 [snapshot isolation](https://www.sqlite.org/isolation.html) (reviewed 2026-09-30). Actual SQLite
 lock conflicts remain possible; WAL does not justify treating every source as available.
 
+Bounded retained-capture and calendar reads use that same snapshot owner for generation membership,
+capture bindings and original metadata. Durable market-route and retained-source metadata reads also
+use independent snapshots. Physical capture verification runs after the catalog transaction closes;
+publication and macro reobservation reconciliation retain writer authority. These reads do not
+acquire a publication mutex merely to inspect already committed evidence.
+
 Live native-identity selection briefly coordinates the durable authority clock and revocation
 watch, then resolves and verifies identity through the same independent snapshot facility. It
 validates that watch after reading, so a concurrent identity publication cannot authorize an old

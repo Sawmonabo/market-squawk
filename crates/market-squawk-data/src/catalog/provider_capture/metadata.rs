@@ -1,8 +1,6 @@
 //! Original metadata capture dependencies of canonical macro publication inputs.
 use super::*;
 use market_squawk_sources::SealedProviderCaptureSetReceipt;
-use std::time::Instant;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderMetadataCaptureEvidence {
@@ -248,16 +246,5 @@ impl Catalog {
         digest: EvidenceDigest,
     ) -> Result<ProviderMetadataCaptureEvidence, CatalogError> {
         load(&self.connection, digest)?.ok_or(CatalogError::ProviderCaptureMismatch)
-    }
-
-    pub(crate) fn provider_metadata_capture(
-        &self,
-        digest: EvidenceDigest,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<ProviderMetadataCaptureEvidence, CatalogError> {
-        self.market_recovery_read(deadline, cancellation, || {
-            load(&self.connection, digest)?.ok_or(CatalogError::ProviderCaptureMismatch)
-        })
     }
 }

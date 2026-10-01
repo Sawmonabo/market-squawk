@@ -3244,10 +3244,12 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<SelectedProviderCaptureEvidence, IngestError> {
-        let evidence = self
-            .market_recovery_authority(deadline, cancellation)?
-            .catalog()
-            .selected_provider_capture_rows(selection, maximum_bytes, deadline, cancellation)
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        let evidence = snapshot
+            .read(|snapshot| snapshot.selected_capture_rows(selection, maximum_bytes))
             .map_err(map_market_recovery_catalog_error)?;
         let control = MarketEventReadControl {
             deadline,
@@ -3312,92 +3314,111 @@ impl AnalyticalDataService {
         store: &market_squawk_platform::SealedResearchJournalStore,
         control: Option<&MarketEventReadControl<'_>>,
     ) -> Result<GenerationOwnedProviderCaptureEvidence, IngestError> {
-        let owned = match control {
-            Some(control) => self.manifests.generation_owned_provider_captures_bounded(
-                manifest,
-                control.deadline,
-                control.cancellation,
-            ),
-            None => self.manifests.generation_owned_provider_captures(manifest),
-        }
-        .map_err(map_recovery_manifest_error)?;
-        let object_count = owned
-            .pinned
-            .objects()
-            .len()
-            .checked_sub(owned.suffix_start)
-            .filter(|count| (1..=1024).contains(count))
-            .ok_or(IngestError::ProviderCaptureRequired)?;
-        let mut grouped_inputs = Vec::new();
-        grouped_inputs
-            .try_reserve_exact(object_count)
-            .map_err(|_| IngestError::ProviderCaptureRequired)?;
-        for _ in 0..object_count {
-            grouped_inputs.push(Vec::new());
-        }
-        let mut metadata_retained_bytes = 0_u64;
-        {
-            let authority = match control {
-                Some(control) => {
-                    self.market_recovery_authority(control.deadline, control.cancellation)?
+        let read_catalog = |snapshot: Option<&crate::catalog::CatalogReadSnapshot>| {
+            let owned = match snapshot {
+                Some(snapshot) => self
+                    .manifests
+                    .generation_owned_provider_captures_in_snapshot(manifest, snapshot),
+                None => self.manifests.generation_owned_provider_captures(manifest),
+            }
+            .map_err(map_recovery_manifest_error)?;
+            let object_count = owned
+                .pinned
+                .objects()
+                .len()
+                .checked_sub(owned.suffix_start)
+                .filter(|count| (1..=1024).contains(count))
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            let mut grouped_inputs = Vec::new();
+            grouped_inputs
+                .try_reserve_exact(object_count)
+                .map_err(|_| IngestError::ProviderCaptureRequired)?;
+            for _ in 0..object_count {
+                grouped_inputs.push(Vec::new());
+            }
+            let mut metadata_retained_bytes = 0_u64;
+            {
+                let authority = if snapshot.is_none() {
+                    Some(self.lock_authority()?)
+                } else {
+                    None
+                };
+                for input in &owned.inputs {
+                    let evidence = match (snapshot, authority.as_ref()) {
+                        (Some(snapshot), _) => {
+                            snapshot.capture_binding_evidence(input.binding_digest)
+                        }
+                        (None, Some(authority)) => {
+                            authority.provider_capture_binding_evidence(input.binding_digest)
+                        }
+                        (None, None) => return Err(IngestError::ProviderCaptureRequired),
+                    }
+                    .map_err(map_market_recovery_catalog_error)?
+                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                    if evidence.binding_digest() != input.binding_digest
+                        || evidence.capture().source_id() != &owned.source_id
+                        || evidence.record_count() != input.record_count
+                    {
+                        return Err(IngestError::ProviderCaptureRequired);
+                    }
+                    let output = grouped_inputs
+                        .get_mut(input.output_artifact_ordinal)
+                        .ok_or(IngestError::ProviderCaptureRequired)?;
+                    if input.object_input_ordinal != output.len() {
+                        return Err(IngestError::ProviderCaptureRequired);
+                    }
+                    output.push(GenerationOwnedProviderCaptureInputEvidence {
+                        input_ordinal: input.input_ordinal,
+                        object_input_ordinal: input.object_input_ordinal,
+                        metadata: input
+                            .metadata_dependency_digest
+                            .map(|digest| {
+                                let metadata = match (snapshot, authority.as_ref()) {
+                                    (Some(snapshot), _) => snapshot.metadata_capture(digest),
+                                    (None, Some(authority)) => authority
+                                        .catalog()
+                                        .provider_metadata_capture_unbounded(digest),
+                                    (None, None) => {
+                                        return Err(IngestError::ProviderCaptureRequired);
+                                    }
+                                }
+                                .map_err(map_market_recovery_catalog_error)?;
+                                metadata.validate_data(evidence.capture())?;
+                                metadata_retained_bytes = metadata_retained_bytes
+                                    .checked_add(
+                                        u64::try_from(metadata.retained_bytes()?)
+                                            .map_err(|_| IngestError::ProviderCaptureRequired)?,
+                                    )
+                                    .filter(|bytes| *bytes <= MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+                                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                                Ok::<_, IngestError>(metadata)
+                            })
+                            .transpose()?,
+                        binding: evidence,
+                    });
                 }
-                None => self.lock_authority()?,
-            };
-            for input in &owned.inputs {
-                let evidence = match control {
-                    Some(control) => authority.provider_capture_binding_evidence_bounded(
-                        input.binding_digest,
+            }
+            Ok::<_, IngestError>((owned, grouped_inputs, object_count))
+        };
+        let (owned, grouped_inputs, object_count) = match control {
+            Some(control) => {
+                let snapshot = self
+                    .manifests
+                    .read_snapshot(
+                        self.catalog_read_limits,
                         control.deadline,
                         control.cancellation,
-                    ),
-                    None => authority.provider_capture_binding_evidence(input.binding_digest),
-                }
-                .map_err(map_market_recovery_catalog_error)?
-                .ok_or(IngestError::ProviderCaptureRequired)?;
-                if evidence.binding_digest() != input.binding_digest
-                    || evidence.capture().source_id() != &owned.source_id
-                    || evidence.record_count() != input.record_count
-                {
-                    return Err(IngestError::ProviderCaptureRequired);
-                }
-                let output = grouped_inputs
-                    .get_mut(input.output_artifact_ordinal)
-                    .ok_or(IngestError::ProviderCaptureRequired)?;
-                if input.object_input_ordinal != output.len() {
-                    return Err(IngestError::ProviderCaptureRequired);
-                }
-                output.push(GenerationOwnedProviderCaptureInputEvidence {
-                    input_ordinal: input.input_ordinal,
-                    object_input_ordinal: input.object_input_ordinal,
-                    metadata: input
-                        .metadata_dependency_digest
-                        .map(|digest| {
-                            let metadata = match control {
-                                Some(control) => authority.catalog().provider_metadata_capture(
-                                    digest,
-                                    control.deadline,
-                                    control.cancellation,
-                                ),
-                                None => authority
-                                    .catalog()
-                                    .provider_metadata_capture_unbounded(digest),
-                            }
-                            .map_err(map_market_recovery_catalog_error)?;
-                            metadata.validate_data(evidence.capture())?;
-                            metadata_retained_bytes = metadata_retained_bytes
-                                .checked_add(
-                                    u64::try_from(metadata.retained_bytes()?)
-                                        .map_err(|_| IngestError::ProviderCaptureRequired)?,
-                                )
-                                .filter(|bytes| *bytes <= MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
-                                .ok_or(IngestError::ProviderCaptureRequired)?;
-                            Ok::<_, IngestError>(metadata)
-                        })
-                        .transpose()?,
-                    binding: evidence,
-                });
+                    )
+                    .map_err(map_market_recovery_catalog_error)?;
+                snapshot
+                    .read(|snapshot| read_catalog(Some(snapshot)))
+                    .map_err(|error| match error {
+                        IngestError::Catalog(error) => map_market_recovery_catalog_error(error),
+                        error => error,
+                    })?
             }
-        }
+            None => read_catalog(None)?,
+        };
         // The catalog authority is no longer held during physical integrity verification.
         for input in grouped_inputs.iter().flatten() {
             verify_persisted_provider_capture_binding_inner(&input.binding, store, control)?;
@@ -3475,17 +3496,20 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Vec<crate::ProviderMarketEventDurableRoute>, IngestError> {
-        self.market_recovery_authority(deadline, cancellation)?
-            .catalog()
-            .provider_market_event_durable_routes(
-                instrument_id,
-                event_kinds,
-                as_of_cutoff,
-                knowledge_cutoff,
-                maximum_routes,
-                deadline,
-                cancellation,
-            )
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| {
+                snapshot.durable_market_routes(
+                    instrument_id,
+                    event_kinds,
+                    as_of_cutoff,
+                    knowledge_cutoff,
+                    maximum_routes,
+                )
+            })
             .map_err(map_market_recovery_catalog_error)
     }
 
@@ -3498,15 +3522,14 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<SourceMetadata>, IngestError> {
-        self.market_recovery_authority(deadline, cancellation)?
-            .catalog()
-            .retained_source_metadata(
-                source_id,
-                metadata_revision,
-                knowledge_cutoff,
-                deadline,
-                cancellation,
-            )
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| {
+                snapshot.retained_source_metadata(source_id, metadata_revision, knowledge_cutoff)
+            })
             .map_err(map_market_recovery_catalog_error)
     }
 
@@ -3627,22 +3650,29 @@ impl AnalyticalDataService {
         store: &market_squawk_platform::SealedResearchJournalStore,
         control: Option<&MarketEventReadControl<'_>>,
     ) -> Result<crate::PersistedProviderPublicationEvidence, IngestError> {
-        if !self
-            .provider_market_event_publications_inner(manifest, control)?
-            .contains(&selector)
-        {
-            return Err(IngestError::ProviderCaptureRequired);
-        }
-        let evidence = {
-            let authority = match control {
-                Some(control) => {
-                    self.market_recovery_authority(control.deadline, control.cancellation)?
-                }
-                None => self.lock_authority()?,
+        let read_catalog = |snapshot: Option<&crate::catalog::CatalogReadSnapshot>| {
+            let retained = match snapshot {
+                Some(snapshot) => self
+                    .manifests
+                    .provider_publication_bindings_in_snapshot(manifest, snapshot)?,
+                None => self.manifests.provider_publication_bindings(manifest)?,
             };
-            let evidence = authority
-                .provider_publication_evidence(selector.publication_digest)?
-                .ok_or(IngestError::ProviderCaptureRequired)?;
+            if !Self::provider_market_event_publication_selectors(retained)?.contains(&selector) {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            let authority = if snapshot.is_none() {
+                Some(self.lock_authority()?)
+            } else {
+                None
+            };
+            let evidence = match (snapshot, authority.as_ref()) {
+                (Some(snapshot), _) => snapshot.publication_evidence(selector.publication_digest),
+                (None, Some(authority)) => {
+                    authority.provider_publication_evidence(selector.publication_digest)
+                }
+                (None, None) => return Err(IngestError::ProviderCaptureRequired),
+            }?
+            .ok_or(IngestError::ProviderCaptureRequired)?;
             evidence.verify_integrity()?;
             let fallback_cancellation = CancellationToken::new();
             let deadline = control.map_or_else(
@@ -3654,15 +3684,41 @@ impl AnalyticalDataService {
             for payload in evidence.identity_selections().flatten() {
                 let selection = serde_json::from_slice(payload)
                     .map_err(|_| IngestError::ProviderCaptureRequired)?;
-                authority
-                    .verify_provider_identity_evidence_in_catalog(
-                        &selection,
-                        deadline,
-                        cancellation,
-                    )
-                    .map_err(map_native_identity_catalog_error)?;
+                match (snapshot, authority.as_ref()) {
+                    (Some(snapshot), _) => {
+                        snapshot.verify_identity_evidence(&selection).map(|_| ())
+                    }
+                    (None, Some(authority)) => authority
+                        .verify_provider_identity_evidence_in_catalog(
+                            &selection,
+                            deadline,
+                            cancellation,
+                        )
+                        .map(|_| ()),
+                    (None, None) => return Err(IngestError::ProviderCaptureRequired),
+                }
+                .map_err(map_native_identity_catalog_error)?;
             }
-            evidence
+            Ok::<_, IngestError>(evidence)
+        };
+        let evidence = match control {
+            Some(control) => {
+                let snapshot = self
+                    .manifests
+                    .read_snapshot(
+                        self.catalog_read_limits,
+                        control.deadline,
+                        control.cancellation,
+                    )
+                    .map_err(map_market_recovery_catalog_error)?;
+                snapshot
+                    .read(|snapshot| read_catalog(Some(snapshot)))
+                    .map_err(|error| match error {
+                        IngestError::Catalog(error) => map_market_recovery_catalog_error(error),
+                        error => error,
+                    })?
+            }
+            None => read_catalog(None)?,
         };
         Self::verify_provider_market_event_publication_raw_evidence(
             &evidence, selector, store, control,

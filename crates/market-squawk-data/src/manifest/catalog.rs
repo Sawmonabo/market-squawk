@@ -748,6 +748,18 @@ impl AnalyticalManifestCatalog {
         })
     }
 
+    pub(crate) fn generation_owned_provider_captures_in_snapshot(
+        &self,
+        manifest: &DatasetManifestRef,
+        snapshot: &CatalogReadSnapshot,
+    ) -> Result<CatalogGenerationOwnedProviderCaptures, ManifestCatalogError> {
+        load_generation_owned_provider_captures(
+            snapshot.connection(),
+            manifest,
+            self.max_objects_per_generation,
+        )
+    }
+
     /// Lists direct creating generations, never inherited capture membership.
     pub(crate) fn provider_capture_origin_candidates(
         &self,
