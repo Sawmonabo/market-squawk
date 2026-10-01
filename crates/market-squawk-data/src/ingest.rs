@@ -3840,7 +3840,6 @@ impl AnalyticalDataService {
         let pinned = self
             .manifests
             .pinned_bounded(&plan.manifest, deadline, cancellation)?;
-        let batches = self.objects.read_pinned(&pinned, cancellation)?;
         check_market_event_read(deadline, cancellation)?;
 
         let mut reopened: Vec<(
@@ -3872,6 +3871,22 @@ impl AnalyticalDataService {
                     cancellation,
                 }),
             )?);
+            let original_objects = self.manifests.provider_publication_objects_bounded(
+                &pinned,
+                &planned.publication,
+                deadline,
+                cancellation,
+            )?;
+            let maximum_bytes = MAX_EVENT_PUBLICATION_READ_BYTES
+                .checked_mul(original_objects.len())
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            let batches = self.objects.read_pinned_objects_bounded(
+                &pinned,
+                &original_objects,
+                maximum_bytes,
+                cancellation,
+            )?;
+            check_market_event_read(deadline, cancellation)?;
             let batch =
                 Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)?;
             self.market_recovery_authority(deadline, cancellation)?

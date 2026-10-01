@@ -484,7 +484,8 @@ impl AnalyticalManifestCatalog {
                 request
                     .exact_channel()
                     .map(|value| value.as_source_identifier().as_str()),
-                request.tie_policy() == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
+                request.tie_policy()
+                    == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
             ])?;
             let mut candidates = Vec::new();
             candidates
@@ -552,6 +553,115 @@ impl AnalyticalManifestCatalog {
     ) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
         self.read_bounded(deadline, cancellation, |connection| {
             load_provider_publication_bindings(connection, manifest)
+        })
+    }
+
+    /// Resolves every original output of a retained publication's creating run inside this pin.
+    /// Market-event publication identity lives in object metadata, so every original object
+    /// must remain in the pin. Missing or inconsistent metadata is an integrity failure.
+    pub(crate) fn provider_publication_objects_bounded(
+        &self,
+        pinned: &PinnedDataset,
+        publication: &ProviderMarketEventExactPublication,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(Uuid, usize)>, ManifestCatalogError> {
+        self.read_bounded(deadline, cancellation, |connection| {
+            let manifest = pinned.manifest();
+            let run_id: String = connection
+                .query_row(
+                    "SELECT publication.run_id
+                 FROM analytical_available_generations AS generation
+                 JOIN analytical_generation_provider_publication_bindings AS publication
+                   ON publication.generation_sequence=generation.generation_sequence
+                 JOIN ingest_run_provider_publication_bindings AS original
+                   ON original.run_id=publication.run_id
+                  AND original.publication_digest=publication.publication_digest
+                  AND original.publication_kind=publication.publication_kind
+                  AND original.source_id=publication.source_id
+                 WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+                   AND generation.schema_name=?3 AND generation.schema_version=?4
+                   AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
+                   AND publication.publication_digest=?7 AND publication.publication_kind=?8",
+                    params![
+                        manifest.dataset_id().as_str(),
+                        to_i64(manifest.manifest_version())?,
+                        manifest.schema().name(),
+                        i64::from(manifest.schema().version().get()),
+                        manifest.schema().fingerprint().as_slice(),
+                        manifest.content_hash().bytes(),
+                        publication.digest().bytes(),
+                        publication.kind().as_str()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(ManifestCatalogError::GenerationConflict)?;
+            let run_id =
+                Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+            let mut statement = connection.prepare(
+                "SELECT output.publication_ordinal, output.artifact_id,
+                        output.content_algorithm, output.content_digest, output.size_bytes,
+                        output.relative_reference, object.ordinal,
+                        object.content_hash, object.row_count, object.size_bytes
+                 FROM artifacts AS output
+                 LEFT JOIN analytical_generation_objects AS object
+                   ON object.dataset_id=?1 AND object.manifest_version=?2
+                  AND object.artifact_id=output.artifact_id
+                 WHERE output.run_id=?3
+                 ORDER BY output.publication_ordinal LIMIT 1025",
+            )?;
+            let mut rows = statement.query(params![
+                manifest.dataset_id().as_str(),
+                to_i64(manifest.manifest_version())?,
+                run_id.to_string()
+            ])?;
+            let mut outputs = Vec::new();
+            let mut count = 0usize;
+            while let Some(row) = rows.next()? {
+                let output_ordinal: i64 = row.get(0)?;
+                let artifact_id = Uuid::parse_str(&row.get::<_, String>(1)?)
+                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+                let algorithm: i64 = row.get(2)?;
+                let digest = parse_digest(&row.get::<_, Vec<u8>>(3)?)?;
+                let bytes = u64::try_from(row.get::<_, i64>(4)?)
+                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+                let reference: String = row.get(5)?;
+                if count >= 1024
+                    || usize::try_from(output_ordinal).ok() != Some(count)
+                    || algorithm != 1
+                    || bytes == 0
+                {
+                    return Err(ManifestCatalogError::CorruptCatalog);
+                }
+                count += 1;
+                let ordinal = row
+                    .get::<_, Option<i64>>(6)?
+                    .ok_or(ManifestCatalogError::CorruptCatalog)?;
+                let ordinal =
+                    usize::try_from(ordinal).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+                let object = pinned
+                    .objects()
+                    .get(ordinal)
+                    .ok_or(ManifestCatalogError::CorruptCatalog)?;
+                if object.artifact_id() != artifact_id
+                    || object.relative_reference() != reference
+                    || object.object().content_hash() != digest
+                    || object.object().size_bytes() != bytes
+                    || parse_digest(&row.get::<_, Vec<u8>>(7)?)? != digest
+                    || u64::try_from(row.get::<_, i64>(8)?).ok()
+                        != Some(object.object().row_count())
+                    || u64::try_from(row.get::<_, i64>(9)?).ok() != Some(bytes)
+                    || outputs.iter().any(|(_, prior)| *prior == ordinal)
+                {
+                    return Err(ManifestCatalogError::CorruptCatalog);
+                }
+                outputs.push((artifact_id, ordinal));
+            }
+            if count == 0 || outputs.len() != count {
+                return Err(ManifestCatalogError::CorruptCatalog);
+            }
+            Ok(outputs)
         })
     }
 

@@ -3514,6 +3514,40 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             33 + expected_ties
         );
         assert_eq!(historical.exclusions().superseded_received_observation(), 0);
+        if batch_number == 2 {
+            // Current selection must inspect its own publication, not reopen every inherited
+            // file. The selected file still has to pass the existing exact integrity checks.
+            for (ordinal, selected) in [(0, false), (1, true)] {
+                let path = paths
+                    .artifacts()?
+                    .root()
+                    .join(committed.pinned().objects()[ordinal].relative_reference());
+                let original = std::fs::read(&path)?;
+                let mut corrupt = original.clone();
+                corrupt[0] ^= 1;
+                std::fs::write(&path, corrupt)?;
+                let result = restarted
+                    .read_provider_market_event_point_in_time(
+                        &current_request,
+                        Arc::clone(&capture_store),
+                        deadline,
+                        cancellation.clone(),
+                    )
+                    .await;
+                std::fs::write(&path, original)?;
+                if selected {
+                    assert!(matches!(
+                        result,
+                        Err(IngestError::Parquet(
+                            ParquetStoreError::ObjectMetadataMismatch
+                        ))
+                    ));
+                } else {
+                    let selected = result?.ok_or("unrelated file blocked current selection")?;
+                    assert_eq!(selected.sources()[0].tied_candidates().len(), 1);
+                }
+            }
+        }
     }
     Ok(())
 }

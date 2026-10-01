@@ -1362,6 +1362,48 @@ impl ParquetObjectStore {
         Ok(batches)
     }
 
+    /// Reads an exact subset on an already admitted blocking worker. Artifact and ordinal must
+    /// both match this immutable pin; every selected object's hash, bytes and rows are verified.
+    /// This helper never reacquires blocking admission from its caller.
+    pub(crate) fn read_pinned_objects_bounded(
+        &self,
+        dataset: &PinnedDataset,
+        objects: &[(Uuid, usize)],
+        max_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>, ParquetStoreError> {
+        if objects.is_empty() || objects.len() > dataset.objects().len() || max_retained_bytes == 0
+        {
+            return Err(ParquetStoreError::ReadLimitExceeded);
+        }
+        let mut batches = Vec::new();
+        let mut retained_bytes = 0usize;
+        for (index, (artifact_id, ordinal)) in objects.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(ParquetStoreError::Cancelled);
+            }
+            let pinned = dataset
+                .objects()
+                .get(*ordinal)
+                .filter(|pinned| pinned.artifact_id() == *artifact_id)
+                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+            if objects[..index].iter().any(|(_, prior)| prior == ordinal) {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            self.read_one_pinned_object_with_limits(
+                pinned,
+                max_retained_bytes,
+                &mut retained_bytes,
+                &mut batches,
+                cancellation,
+            )?;
+        }
+        if batches.is_empty() {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        Ok(batches)
+    }
+
     fn read_one_pinned_object_with_limits(
         &self,
         pinned: &PinnedManifestObject,
