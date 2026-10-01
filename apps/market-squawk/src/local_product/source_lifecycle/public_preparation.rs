@@ -231,7 +231,29 @@ impl ProductionSourceLifecycleAuthority {
         Ok(())
     }
 
-    pub(super) async fn prepare_public_command(
+    // Keep public preparation's full runtime state out of account-command dispatch.
+    #[inline(never)]
+    pub(super) fn prepare_public_command<'a>(
+        &'a self,
+        command: &'a SourceLifecycleCommand,
+    ) -> Pin<
+        Box<
+            impl Future<
+                Output = Result<
+                    (
+                        Option<DurableSourceLifecycleRecord>,
+                        Option<Box<PreparedPublicMarketStart>>,
+                    ),
+                    SourceLifecycleError,
+                >,
+            > + Send
+            + 'a,
+        >,
+    > {
+        Box::pin(self.prepare_public_command_inner(command))
+    }
+
+    async fn prepare_public_command_inner(
         &self,
         command: &SourceLifecycleCommand,
     ) -> Result<

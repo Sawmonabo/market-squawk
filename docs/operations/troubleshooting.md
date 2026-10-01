@@ -110,6 +110,16 @@ and [asynchronous setup example](https://v2.tauri.app/learn/splashscreen/) (revi
 using the existing main window instead of introducing another startup window. Window visibility
 and workspace readiness are separate; a visible window does not establish successful data loading.
 
+After a workspace has opened, a matching-session event disconnect leaves its screens and cached
+results visible with an explicit reconnect notice. In-flight reads are cancelled back to their
+previous query state; successful reconnection refreshes active queries. Home and Markets preserve
+matching saved prices and original timestamps when refresh fails, marking freshness as unverified.
+A replacement workspace/session or invalid event receipt still requires fresh admission. Cached
+display values do not authorize analysis or simulated execution. This uses the existing TanStack
+Query [cache](https://tanstack.com/query/latest/docs/framework/react/guides/caching) and
+[cancellation](https://tanstack.com/query/latest/docs/framework/react/guides/query-cancellation)
+behavior (reviewed 2026-10-01); no second client-side data store is introduced.
+
 | Symptom | Likely boundary | Action |
 | --- | --- | --- |
 | Clap exits `2` | Command spelling, enum, required flag, or option placement | Use `market-squawk --help` and the command-specific `--help`; correct syntax before domain diagnosis |

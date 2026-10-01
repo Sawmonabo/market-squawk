@@ -5557,3 +5557,20 @@ and successful reconnect refreshes active queries. New sessions and invalid rece
 require admission. Native combined-workflow verification remains pending. Backend compilation caught
 a shared helper removed despite child-module callers; lead restored that still-used helper unchanged.
 Reobservation retains its new owned-worker path; one service build is running.
+
+Rebuild PASS (9m35s), binary UUID 58523BD6-E9B8-3874-A9A0-3D9761536541. Generated restoration
+frames shrink; real service survives restoration and native Home admits. CLI collection returns
+DIA/IWM/VTI/TSLA previous closes; five symbols remain unavailable. No full live completion claim.
+Live log restoration-fixed-live.log shows research I/O gate waits interrupting crypto publication
+and the whole starter-history batch reaching its shared 30-second deadline. Existing history
+critical test is compiling. Astra calendar_currentness_failure owns read-only dependency/lock-order
+diagnosis of ResearchIoWorker, calendar ingest and provider raw publication; propose smallest
+correct scheduling fix before editing. Lead retains all edits/builds/integration and native checks.
+
+Native Markets confirms all nine names and the four actual saved prices with original timestamps;
+Home/Markets remain admitted and service PID13956 survives beyond three minutes of restoration.
+Exact binary frame examples: execute_owned 76,240B; restore_live_sources 115,552B;
+restore_active_live_sources_independently 64,576B; startup restoration 121,600B. No stack-size
+increase. Existing complete history/calendar reobservation/restart case PASS1/1 (1.96s).
+Stack boundaries are an independent checkpoint; retained-policy/backpressure/calendar-worker
+changes remain pending their final checks and I/O scheduling diagnosis. PR43 includes c3c8edba.

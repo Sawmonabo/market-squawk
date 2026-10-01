@@ -316,21 +316,37 @@ impl ProductionSourceLifecycleAuthority {
                     }
                 };
                 match self
-                    .live
-                    .start(&provider, session_id, deadline, cancellation)
+                    .start_restored_scalar_live_source(&provider, session_id, deadline, cancellation)
                     .await
-                    .map_err(map_live_error)
                 {
-                    Ok(evidence) if evidence.provider == provider => restored.push(provider),
-                    Ok(_evidence) => failures.push(LiveSourceRestoreFailure {
-                        provider,
-                        error: SourceLifecycleError::InvalidResult,
-                    }),
+                    Ok(()) => restored.push(provider),
                     Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
                 }
             }
         }
         Ok(LiveSourceRestoreReport { restored, failures })
+    }
+
+    // The scalar start branch must not set the retained size of account restoration.
+    #[inline(never)]
+    fn start_restored_scalar_live_source<'a>(
+        &'a self,
+        provider: &'a SourceIdentifier,
+        session_id: Option<uuid::Uuid>,
+        deadline: Instant,
+        cancellation: &'a CancellationToken,
+    ) -> Pin<Box<impl Future<Output = Result<(), SourceLifecycleError>> + Send + 'a>> {
+        Box::pin(async move {
+            let evidence = self
+                .live
+                .start(provider, session_id, deadline, cancellation)
+                .await
+                .map_err(map_live_error)?;
+            if evidence.provider != *provider {
+                return Err(SourceLifecycleError::InvalidResult);
+            }
+            Ok(())
+        })
     }
 
     async fn execute_owned(
@@ -381,7 +397,21 @@ impl ProductionSourceLifecycleAuthority {
         result
     }
 
-    async fn execute_prepared_commit(
+    // Construct the commit future outside its callers' poll frames so restoration
+    // does not carry the complete transition state through every dispatch layer.
+    #[inline(never)]
+    fn execute_prepared_commit<'a>(
+        &'a self,
+        command: &'a SourceLifecycleCommand,
+        expected: Option<&'a DurableSourceLifecycleRecord>,
+        prepared: &'a mut Option<Box<PreparedPublicMarketStart>>,
+    ) -> Pin<
+        Box<impl Future<Output = Result<SourceLifecycleReceipt, SourceLifecycleError>> + Send + 'a>,
+    > {
+        Box::pin(self.execute_prepared_commit_inner(command, expected, prepared))
+    }
+
+    async fn execute_prepared_commit_inner(
         &self,
         command: &SourceLifecycleCommand,
         expected: Option<&DurableSourceLifecycleRecord>,
