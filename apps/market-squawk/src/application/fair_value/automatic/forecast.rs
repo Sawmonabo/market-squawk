@@ -206,11 +206,13 @@ impl FairValueDomainService {
             .await
             .map_err(|error| map_research_use_worker_error(error, context))?
             .map_err(|error| map_research_use_error(error, context))?;
-        let (event_authorization, _) = market_reader.authorize_local_analysis(
-            market_selection.publication(),
-            context.deadline(),
-            context.cancellation(),
-        )?;
+        let (event_authorization, _) = market_reader
+            .authorize_local_analysis(
+                market_selection.publication(),
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?;
         let rights = ValuationRightsReceipt::try_from_authorization(
             authorization,
             vec![event_authorization],

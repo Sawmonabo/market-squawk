@@ -529,9 +529,26 @@ WHEN NOT EXISTS (
         NEW.selection_outcome = 'selected' AND NOT EXISTS (
             SELECT 1
             FROM source_research_use_grants AS grant
+            JOIN source_rights AS current ON current.rights_id = grant.rights_id
+            JOIN source_rights AS original ON original.rights_id = NEW.rights_id
             WHERE grant.research_grant_id = NEW.selected_research_grant_id
-              AND grant.rights_id = NEW.rights_id
               AND grant.source_id = NEW.source_id
+              AND current.source_id = original.source_id
+              AND current.payload_algorithm = original.payload_algorithm
+              AND current.payload_digest = original.payload_digest
+              AND current.basis_kind = original.basis_kind
+              AND current.basis_reference = original.basis_reference
+              AND current.basis_algorithm = original.basis_algorithm
+              AND current.basis_digest = original.basis_digest
+              AND current.basis_root_algorithm IS original.basis_root_algorithm
+              AND current.basis_root_digest IS original.basis_root_digest
+              AND current.authorization_algorithm = original.authorization_algorithm
+              AND current.authorization_digest = original.authorization_digest
+              AND (original.operation_mask & current.operation_mask & CASE NEW.requested_use
+                      WHEN 'display' THEN 2
+                      WHEN 'local_analysis' THEN 4
+                      WHEN 'train' THEN 32
+                  END) <> 0
               AND (grant.use_mask & CASE NEW.requested_use
                       WHEN 'display' THEN 1
                       WHEN 'local_analysis' THEN 2
@@ -715,12 +732,14 @@ WHEN NOT (
         FROM research_use_decision_sources AS source
         JOIN source_research_use_grants AS grant
           ON grant.research_grant_id = source.selected_research_grant_id
-        JOIN source_rights AS rights ON rights.rights_id = source.rights_id
+        JOIN source_rights AS rights ON rights.rights_id = grant.rights_id
+        JOIN source_rights AS original ON original.rights_id = source.rights_id
         WHERE source.decision_id = NEW.decision_id
           AND source.selection_outcome = 'selected'
           AND (
               grant.admitted_at_ns > NEW.decided_at_ns
               OR rights.admitted_at_ns > NEW.decided_at_ns
+              OR original.admitted_at_ns > NEW.decided_at_ns
           )
     )
     AND (
@@ -736,7 +755,7 @@ WHEN NOT (
                 FROM research_use_decision_sources AS source
                 JOIN source_research_use_grants AS grant
                   ON grant.research_grant_id = source.selected_research_grant_id
-                JOIN source_rights AS rights ON rights.rights_id = source.rights_id
+                JOIN source_rights AS rights ON rights.rights_id = grant.rights_id
                 WHERE source.decision_id = NEW.decision_id
                   AND (
                       grant.admitted_at_ns > NEW.decided_at_ns
@@ -751,7 +770,21 @@ WHEN NOT (
                       )
                       OR EXISTS (
                           SELECT 1 FROM source_research_use_revocations AS revocation
-                          WHERE revocation.research_grant_id = grant.research_grant_id
+                          JOIN source_research_use_grants AS revoked_grant
+                            ON revoked_grant.research_grant_id = revocation.research_grant_id
+                          JOIN source_rights AS revoked_rights
+                            ON revoked_rights.rights_id = revoked_grant.rights_id
+                          WHERE revoked_rights.source_id = rights.source_id
+                            AND revoked_rights.payload_algorithm = rights.payload_algorithm
+                            AND revoked_rights.payload_digest = rights.payload_digest
+                            AND revoked_rights.basis_kind = rights.basis_kind
+                            AND revoked_rights.basis_reference = rights.basis_reference
+                            AND revoked_rights.basis_algorithm = rights.basis_algorithm
+                            AND revoked_rights.basis_digest = rights.basis_digest
+                            AND revoked_rights.basis_root_algorithm IS rights.basis_root_algorithm
+                            AND revoked_rights.basis_root_digest IS rights.basis_root_digest
+                            AND revoked_rights.authorization_algorithm = rights.authorization_algorithm
+                            AND revoked_rights.authorization_digest = rights.authorization_digest
                             AND revocation.revocation_sequence
                                 <= source.observed_revocation_sequence
                             AND revocation.effective_at_ns <= NEW.decided_at_ns
@@ -1117,3 +1150,7 @@ CREATE VIEW analytical_available_generations AS
 SELECT generation.*, availability.effective_available_at_ns AS available_at_ns
 FROM analytical_generations AS generation
 JOIN analytical_generation_source_availability_proofs AS availability USING (generation_sequence);
+
+-- Exact retained payload authorization must not scan unrelated source rights.
+CREATE INDEX source_rights_by_source_payload
+ON source_rights(source_id, payload_algorithm, payload_digest);

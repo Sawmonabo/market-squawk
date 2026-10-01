@@ -1172,7 +1172,6 @@ impl ProviderAdapterActivation {
         let digest = metadata_digest_for_bindings(
             b"market-squawk/alpaca-native-asset-reference/v1\0",
             lease,
-            lease.authority_effective_at(),
             account,
             &budget,
             &evidence,
@@ -1226,8 +1225,9 @@ impl ProviderAdapterActivation {
     /// This method performs no network access or credential acquisition. Alpaca retains the
     /// account owner supplied after native reference preparation. It validates the exact active lease before and after construction while the onboarding
     /// mutation guard is held. Every metadata revision is a deterministic SHA-256 commitment to
-    /// the lease, qualified account budget, logical source evidence, provider profile, transport
-    /// bounds, caller-supplied configuration instant, and sorted canonical instrument bindings.
+    /// durable lease authority, qualified account budget, logical source evidence, provider
+    /// profile, transport bounds, and sorted canonical instrument bindings. Lease issuance and
+    /// configuration instants remain validation inputs, not durable metadata identity.
     ///
     /// # Errors
     ///
@@ -1352,7 +1352,6 @@ fn prepare_alpaca(
     let boot_snapshot = AlpacaIexBootSnapshotPolicy::from_transport_limits(input.transport_limits);
     let iex_digest = display_metadata_digest(
         lease,
-        input.configured_at,
         &account,
         &budget,
         &input.iex_evidence,
@@ -1395,7 +1394,6 @@ fn prepare_alpaca(
     let historical_digest = metadata_digest_for_bindings(
         HISTORICAL_METADATA_EVIDENCE_DOMAIN,
         lease,
-        input.configured_at,
         &account,
         &budget,
         &input.iex_evidence,
@@ -1435,7 +1433,6 @@ fn prepare_alpaca(
     let calendar_digest = metadata_digest_for_bindings(
         b"market-squawk/authenticated-calendar-source-metadata/v1\0",
         lease,
-        input.configured_at,
         &account,
         &budget,
         &input.calendar_evidence,
@@ -1468,7 +1465,6 @@ fn prepare_alpaca(
             let digest = metadata_digest_for_bindings(
                 HISTORICAL_METADATA_EVIDENCE_DOMAIN,
                 lease,
-                input.configured_at,
                 &account,
                 &budget,
                 evidence,
@@ -1497,7 +1493,6 @@ fn prepare_alpaca(
         (Some(evidence), Some(instruments)) => {
             let digest = display_metadata_digest(
                 lease,
-                input.configured_at,
                 &account,
                 &budget,
                 &evidence,
@@ -1583,7 +1578,6 @@ fn prepare_kraken_l3(
     let authorization = authorization(lease, &account)?;
     let digest = metadata_digest(
         lease,
-        input.configured_at,
         &account,
         &budget,
         &input.evidence,
@@ -2099,7 +2093,8 @@ fn alpaca_historical_research_rights(
         source_id.clone(),
         basis,
         lease.rights_decision_digest(),
-        lease.verification_expires_at(),
+        // Reviewed retained-use policy has no expiry. Live verification is checked separately.
+        None,
         vec![
             SourceOperation::Retrieve,
             SourceOperation::Display,
@@ -2197,7 +2192,6 @@ impl From<KrakenL3ClientTier> for KrakenL3ClientTierWire {
 #[derive(Serialize)]
 struct MetadataEvidenceWire<'a, L, B> {
     schema_version: u8,
-    configured_at: Timestamp,
     lease: LeaseEvidenceWire<'a>,
     account_subject: &'a SourceIdentifier,
     budget: &'a ProviderBudgetPolicy,
@@ -2221,7 +2215,6 @@ struct LeaseEvidenceWire<'a> {
     generation: u64,
     authority_effective_at: Timestamp,
     verification_expires_at: Timestamp,
-    issued_at: Timestamp,
 }
 
 #[derive(Serialize)]
@@ -2426,7 +2419,6 @@ fn duration_nanos_saturating(duration: std::time::Duration) -> u64 {
 
 fn metadata_digest<L: Serialize>(
     lease: &ProviderActivationLease,
-    configured_at: Timestamp,
     account: &ProviderAccountBinding,
     budget: &ProviderBudgetPolicy,
     source: &MarketSourceEvidence,
@@ -2437,7 +2429,6 @@ fn metadata_digest<L: Serialize>(
     metadata_digest_for_bindings(
         METADATA_EVIDENCE_DOMAIN,
         lease,
-        configured_at,
         account,
         budget,
         source,
@@ -2452,7 +2443,6 @@ fn metadata_digest<L: Serialize>(
 
 fn display_metadata_digest<L: Serialize>(
     lease: &ProviderActivationLease,
-    configured_at: Timestamp,
     account: &ProviderAccountBinding,
     budget: &ProviderBudgetPolicy,
     source: &MarketSourceEvidence,
@@ -2463,7 +2453,6 @@ fn display_metadata_digest<L: Serialize>(
     metadata_digest_for_bindings(
         DISPLAY_METADATA_EVIDENCE_DOMAIN,
         lease,
-        configured_at,
         account,
         budget,
         source,
@@ -2483,7 +2472,6 @@ fn display_metadata_digest<L: Serialize>(
 fn metadata_digest_for_bindings<L: Serialize, B: Serialize>(
     evidence_domain: &[u8],
     lease: &ProviderActivationLease,
-    configured_at: Timestamp,
     account: &ProviderAccountBinding,
     budget: &ProviderBudgetPolicy,
     source: &MarketSourceEvidence,
@@ -2505,7 +2493,6 @@ fn metadata_digest_for_bindings<L: Serialize, B: Serialize>(
         .ok_or(MarketProviderConfigurationError::LeaseBinding)?;
     let wire = MetadataEvidenceWire {
         schema_version: 2,
-        configured_at,
         lease: LeaseEvidenceWire {
             session_id: *lease.session_id().as_bytes(),
             surface_id: lease.surface_id(),
@@ -2519,7 +2506,6 @@ fn metadata_digest_for_bindings<L: Serialize, B: Serialize>(
             generation: generation.get(),
             authority_effective_at: lease.authority_effective_at(),
             verification_expires_at: expires_at,
-            issued_at: lease.issued_at(),
         },
         account_subject: account.subject(),
         budget,
@@ -2528,20 +2514,29 @@ fn metadata_digest_for_bindings<L: Serialize, B: Serialize>(
         limits,
         bindings,
     };
-    let canonical = serde_json::to_vec(&wire)
-        .map_err(|_error| MarketProviderConfigurationError::EvidenceEncoding)?;
-    let mut hasher = Sha256::new();
-    hasher.update(evidence_domain);
-    hasher.update(
-        u64::try_from(canonical.len())
-            .map_err(|_error| MarketProviderConfigurationError::EvidenceEncoding)?
-            .to_be_bytes(),
-    );
-    hasher.update(canonical);
-    Ok(EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        hasher.finalize().into(),
-    ))
+    wire.digest(evidence_domain)
+}
+
+impl<L: Serialize, B: Serialize> MetadataEvidenceWire<'_, L, B> {
+    fn digest(
+        &self,
+        evidence_domain: &[u8],
+    ) -> Result<EvidenceDigest, MarketProviderConfigurationError> {
+        let canonical = serde_json::to_vec(self)
+            .map_err(|_error| MarketProviderConfigurationError::EvidenceEncoding)?;
+        let mut hasher = Sha256::new();
+        hasher.update(evidence_domain);
+        hasher.update(
+            u64::try_from(canonical.len())
+                .map_err(|_error| MarketProviderConfigurationError::EvidenceEncoding)?
+                .to_be_bytes(),
+        );
+        hasher.update(canonical);
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            hasher.finalize().into(),
+        ))
+    }
 }
 
 fn revision_evidence(
@@ -2677,6 +2672,83 @@ mod tests {
     use super::*;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn metadata_identity_retains_durable_authority_without_observation_clocks() -> TestResult {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        use market_squawk_sources::{BackoffPolicy, BudgetScope};
+
+        let digest = |byte| EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
+        let surface = SourceIdentifier::try_from("alpaca.basic-market-data")?;
+        let account = SourceIdentifier::try_from("metadata-regression-account")?;
+        let budget = ProviderBudgetPolicy::try_new(
+            BudgetScope::new(SourceIdentifier::try_from("alpaca-market-data")?),
+            NonZeroU32::new(200).ok_or("request budget")?,
+            NonZeroU64::new(60_000_000_000).ok_or("budget window")?,
+            NonZeroU16::new(1).ok_or("concurrent budget")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000_000).ok_or("backoff")?,
+                NonZeroU64::new(60_000_000_000).ok_or("backoff maximum")?,
+                1_000,
+            )?,
+        )?;
+        let source = MarketSourceEvidence::new(
+            SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+            ExactPayloadEvidence::from_content_digest(digest(1)),
+            EffectiveInterval::new(
+                Timestamp::from_unix_nanos(10),
+                Some(Timestamp::from_unix_nanos(100)),
+            )?,
+            FreshnessPolicy::try_new(60, 60, 60, 60, 1)?,
+        );
+        let limits = HttpRequestBounds::default();
+        let mut evidence = MetadataEvidenceWire {
+            schema_version: 2,
+            lease: LeaseEvidenceWire {
+                session_id: [1; 16],
+                surface_id: &surface,
+                capability_revision: 1,
+                capability_digest: digest(2),
+                rights_decision_digest: digest(3),
+                public_configuration_digest: digest(4),
+                account_digest: digest(5),
+                verification_evidence_digest: digest(6),
+                runtime_evidence_digest: digest(7),
+                generation: 1,
+                authority_effective_at: Timestamp::from_unix_nanos(10),
+                verification_expires_at: Timestamp::from_unix_nanos(100),
+            },
+            account_subject: &account,
+            budget: &budget,
+            source: &source,
+            profile: MetadataProfile::AlpacaAssetReference {
+                endpoint: market_squawk_adapter_alpaca::ALPACA_ASSET_REFERENCE_ENDPOINT,
+            },
+            limits: &limits,
+            bindings: (),
+        };
+        // Exercise the production commitment, without manufacturing an onboarding lease.
+        // Transient read/configuration clocks have no field in its canonical evidence.
+        let encoded = serde_json::to_value(&evidence)?;
+        assert!(encoded.get("configured_at").is_none());
+        assert!(encoded["lease"].get("issued_at").is_none());
+        let original = evidence.digest(DISPLAY_METADATA_EVIDENCE_DOMAIN)?;
+        assert_eq!(original, evidence.digest(DISPLAY_METADATA_EVIDENCE_DOMAIN)?);
+
+        evidence.lease.runtime_evidence_digest = digest(8);
+        assert_ne!(original, evidence.digest(DISPLAY_METADATA_EVIDENCE_DOMAIN)?);
+        evidence.lease.runtime_evidence_digest = digest(7);
+        evidence.lease.verification_evidence_digest = digest(9);
+        assert_ne!(original, evidence.digest(DISPLAY_METADATA_EVIDENCE_DOMAIN)?);
+        evidence.lease.verification_evidence_digest = digest(6);
+        evidence.lease.generation = 2;
+        assert_ne!(original, evidence.digest(DISPLAY_METADATA_EVIDENCE_DOMAIN)?);
+        evidence.lease.generation = 1;
+        evidence.lease.verification_expires_at = Timestamp::from_unix_nanos(101);
+        assert_ne!(original, evidence.digest(DISPLAY_METADATA_EVIDENCE_DOMAIN)?);
+        Ok(())
+    }
 
     #[test]
     fn alpaca_native_rebind_accepts_later_catalog_publication_and_rejects_changed_authority()

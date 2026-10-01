@@ -181,6 +181,7 @@ pub(crate) struct CatalogGenerationPage {
 #[derive(Debug)]
 pub(crate) struct CatalogGenerationOwnedProviderCaptures {
     pub(crate) pinned: PinnedDataset,
+    pub(crate) origin_created_at: Timestamp,
     pub(crate) published_at: Timestamp,
     pub(crate) source_id: SourceId,
     pub(crate) suffix_start: usize,
@@ -2648,11 +2649,16 @@ fn load_generation_owned_provider_captures(
     if pinned.generation_kind() != GenerationKind::Ingest {
         return Err(ManifestCatalogError::GenerationConflict);
     }
-    let (generation_sequence, run_id, source_id, published_at_ns): (i64, String, String, i64) =
-        connection
-            .query_row(
-                "SELECT generation.generation_sequence, source_input.run_id,
-                    source_input.source_id, generation.available_at_ns
+    let (generation_sequence, run_id, source_id, published_at_ns, origin_created_at_ns): (
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT generation.generation_sequence, source_input.run_id,
+                    source_input.source_id, generation.available_at_ns, generation.created_at_ns
              FROM analytical_available_generations AS generation
              JOIN analytical_generation_source_inputs AS source_input
                ON source_input.generation_sequence=generation.generation_sequence
@@ -2660,19 +2666,27 @@ fn load_generation_owned_provider_captures(
                AND generation.schema_name=?3 AND generation.schema_version=?4
                AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
                AND generation.generation_kind='ingest'",
-                params![
-                    manifest.dataset_id().as_str(),
-                    to_i64(manifest.manifest_version())?,
-                    manifest.schema().name(),
-                    i64::from(manifest.schema().version().get()),
-                    manifest.schema().fingerprint().as_slice(),
-                    manifest.content_hash().bytes(),
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?
-            .ok_or(ManifestCatalogError::GenerationConflict)?;
-    if generation_sequence <= 0 {
+            params![
+                manifest.dataset_id().as_str(),
+                to_i64(manifest.manifest_version())?,
+                manifest.schema().name(),
+                i64::from(manifest.schema().version().get()),
+                manifest.schema().fingerprint().as_slice(),
+                manifest.content_hash().bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+    if generation_sequence <= 0 || origin_created_at_ns > published_at_ns {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     let run_id = Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
@@ -2830,6 +2844,7 @@ fn load_generation_owned_provider_captures(
     )?;
     Ok(CatalogGenerationOwnedProviderCaptures {
         pinned,
+        origin_created_at: Timestamp::from_unix_nanos(origin_created_at_ns),
         published_at: Timestamp::from_unix_nanos(published_at_ns),
         source_id,
         suffix_start,

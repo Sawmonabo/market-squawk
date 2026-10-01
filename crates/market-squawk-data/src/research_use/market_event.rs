@@ -435,6 +435,21 @@ pub(crate) fn recheck_market_event_use_in_snapshot(
     Ok(())
 }
 
+pub(super) fn original_rights_for_request(
+    connection: &Connection,
+    request: &MarketEventUseRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Vec<[u8; 32]>, ResearchUseCatalogError> {
+    validate_horizon(connection, &request.commit)?;
+    let mut rights = std::collections::BTreeSet::new();
+    for input in &request.inputs {
+        check_control(cancellation, deadline)?;
+        rights.insert(validate_input(connection, &request.commit, input)?.1);
+    }
+    Ok(rights.into_iter().collect())
+}
+
 fn validate_horizon(
     connection: &Connection,
     commit: &MarketEventCommitRef,
@@ -602,6 +617,7 @@ fn decision_digest(
     for selected in grants {
         hash.update(selected.run.as_bytes());
         hash.update(selected.rights);
+        hash.update(selected.grant.selected_rights_id);
         hash.update(selected.grant.rights_basis_digest);
         hash_evidence(&mut hash, selected.grant.authorization_evidence);
         hash.update(selected.grant.research_grant_id);

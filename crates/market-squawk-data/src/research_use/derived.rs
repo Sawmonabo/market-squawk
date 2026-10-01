@@ -8,7 +8,7 @@ use super::catalog::{
     DerivedOutputObjectInput, PublishedDerivedGeneration, ResearchUseCatalogError,
     retention_operation_name,
 };
-use super::identity::{output_reservation_digest_parts, research_use_mask, to_i64, to_i64_usize};
+use super::identity::{output_reservation_digest_parts, to_i64, to_i64_usize};
 use super::{DerivedPublicationInput, DerivedRetentionOperation};
 use crate::manifest::{
     ManifestCatalogError, finalize_generation_availability,
@@ -251,52 +251,53 @@ fn validate_permit(
     if !decision_matches {
         return Err(ResearchUseCatalogError::Expired);
     }
-    let expired: bool = transaction.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM research_use_decision_sources AS source
-            LEFT JOIN source_research_use_grants AS grant
-              ON grant.research_grant_id=source.selected_research_grant_id
-            LEFT JOIN source_rights AS rights ON rights.rights_id=source.rights_id
-            WHERE source.decision_id=?1
-              AND (
-                  source.selection_outcome<>'selected'
-                  OR grant.research_grant_id IS NULL
-                  OR rights.rights_id IS NULL
-                  OR (grant.authorization_expires_at_ns IS NOT NULL
-                      AND grant.authorization_expires_at_ns<=?2)
-                  OR (rights.authorization_expires_at_ns IS NOT NULL
-                      AND rights.authorization_expires_at_ns<=?2)
-              )
-         )",
-        params![input.decision_digest().bytes(), now.unix_nanos()],
-        |row| row.get(0),
+    let frontier = super::persistence::source_use_frontier(transaction, now)?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(super::MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS);
+    let mut statement = transaction.prepare(
+        "SELECT rights_id,source_id,selected_research_grant_id,selection_outcome
+         FROM research_use_decision_sources WHERE decision_id=?1 ORDER BY ordinal",
     )?;
-    if expired {
-        return Err(ResearchUseCatalogError::Expired);
+    let mut rows = statement.query([input.decision_digest().bytes()])?;
+    while let Some(row) = rows.next()? {
+        let original = super::identity::parse_digest(row.get(0)?)?;
+        let source = market_squawk_domain::SourceId::try_from(row.get::<_, String>(1)?)
+            .map_err(|_| ResearchUseCatalogError::CorruptCatalog)?;
+        let grant = row
+            .get::<_, Option<Vec<u8>>>(2)?
+            .ok_or(ResearchUseCatalogError::CorruptCatalog)?;
+        if row.get::<_, String>(3)? != "selected" {
+            return Err(ResearchUseCatalogError::CorruptCatalog);
+        }
+        match super::persistence::select_source_use_grant(
+            transaction,
+            original,
+            &source,
+            input.requested_use(),
+            now,
+            frontier,
+            Some(super::identity::parse_digest(grant)?),
+            &cancellation,
+            deadline,
+        )? {
+            super::persistence::SourceGrantSelection::Selected(_) => {}
+            super::persistence::SourceGrantSelection::Denied(
+                super::ResearchUseDenialReason::Revoked,
+            ) => {
+                return Err(ResearchUseCatalogError::Revoked);
+            }
+            super::persistence::SourceGrantSelection::Denied(
+                super::ResearchUseDenialReason::Expired,
+            ) => {
+                return Err(ResearchUseCatalogError::Expired);
+            }
+            super::persistence::SourceGrantSelection::Denied(_) => {
+                return Err(ResearchUseCatalogError::InvalidGrant);
+            }
+        }
     }
-    let revoked: bool = transaction.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM research_use_decision_sources AS source
-            JOIN source_research_use_revocations AS revocation
-              ON revocation.research_grant_id=source.selected_research_grant_id
-            WHERE source.decision_id=?1
-              AND revocation.effective_at_ns<=?2 AND revocation.recorded_at_ns<=?2
-              AND (revocation.use_mask & ?3)<>0
-         )",
-        params![
-            input.decision_digest().bytes(),
-            now.unix_nanos(),
-            research_use_mask(input.requested_use()),
-        ],
-        |row| row.get(0),
-    )?;
-    if revoked {
-        Err(ResearchUseCatalogError::Revoked)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 fn validate_outputs(

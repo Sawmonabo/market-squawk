@@ -1,5 +1,58 @@
 # Market Squawk Delivery Ledger
 
+## Current execution — 2026-10-01
+
+Working branch `feature/v1-installed-product-experience`, primary worktree only. Latest pushed
+checkpoint `05a30951` fixes measured restoration stack frames. One worktree and three local/origin
+branches verified; protected bundle-backup refs and original recovery evidence are retained.
+The dated records below are history, not additional active assignments.
+
+| Active owner / outcome | State and exact scope | Next dependency / evidence |
+| --- | --- | --- |
+| Lead — retained history and independent I/O admission | Frozen backend WIP listed below; all Git/shared contracts/build scheduling. Three selected data checks pass: history/reobservation/restart1.88s, PIT authorization4.36s, market-event restart13.25s. | Application build PASS6m20s; genuine gate/worker regression PASS1/1,0.42s; identity and publication-custody cases PASS1/1 each. Commit/push coherent retained-data and feed-backpressure checkpoints. |
+| Astra live_stack_failure — current display selection | Read-only proposal complete; actor clock patch frozen in display_market.rs but not accepted as complete latest-display fix. | Explicit latest-display selection at actor read time; financial/paper callers retain original cutoff. Lead reserves shared caller changes. |
+| GPT-6.1 Sol screen_contract_coverage — full screen/data mapping | Completed read-only audit of17 screens and required family subflows; lead checked principal projection/event gaps. No implementation ownership. | Lead integrates missing edges below in producer-to-consumer checkpoints. |
+
+Native17-route navigation and four saved previous closes are verified on the preceding binary;
+streaming current quote display and complete screen contracts are **not verified**. No whole-app
+RAM measurement, CI or final gate has run. Empty screens are not completed product workflows.
+
+### Required data-to-screen closure
+
+The owner requires every agreed family at its intended consumer, including update semantics,
+component timestamps/units, freshness/coverage, selected detail and saved restart. This does not
+require every family on every screen or streaming fundamentally scheduled data. Audit anchor:
+`05a30951` plus backend WIP; detailed source map is in ignored
+`.agents/tmp/v1-first-stock/screen-contract-coverage.md`. The actionable findings are retained here:
+
+1. **Background updates:** `crates/market-squawk-runtime/src/router.rs` emits application.changed only after mutation
+   responses; `service/mod.rs` does not connect async publication/job/fill producers to EventHub.
+   Desktop query-client uses infinite staleTime. Connect coalesced committed-domain changes through
+   existing generation/sequence recovery, align macro/research keys and dependent portfolio/result
+   invalidations; prove actual display updates without user commands. Preserve immutable saved results.
+2. **Current Markets:** `paper/market/product.rs`, output contract and Desktop market-product.ts
+   discard independent quote/trade fields, basis and component freshness; changePercent is always
+   null. Complete exact quote sides/sizes, last-trade versus midpoint meaning and available change
+   evidence together. Native source-reported size units may be unresolved; never invent shares/lots.
+3. **Rich instrument details:** Desktop ProductQuery/Markets lacks option terms/chains/Greeks,
+   fund NAV/holdings/overlap, company filings/statements/ratios, crypto trades/books/comparisons and
+   supported bond terms/yield detail. Reuse existing typed company/fund/options/market projections,
+   with demand loading and exact identity; preserve unsupported external coverage honestly.
+4. **Research values:** native research_page_arguments forces summary; observation_page and Desktop
+   retain only chronology/quality. Add intended typed economic detail (value/missing state, units,
+   context, identity and original evidence) through existing family projections, not raw provider JSON.
+5. **Causal patterns:** saved Desktop price-pattern union has no forming status; complete required
+   producer/codec/chart status and geometry together with the financial lane.
+6. **Proof:** current Valuation, Portfolio and Advanced pages have connected consumers; historical
+   unconditional-placeholder findings are superseded. Available-data, all model/provider families,
+   paper accounting and shared-client/installed restart still need actual end-to-end evidence.
+
+Next integration order: finish frozen retained-data/admission checkpoint; complete current market
+selection plus rich quote projection and background update delivery; then remaining family detail
+checkpoints alongside the first saved Investment Brief. Full scope in the owner-test goal remains.
+
+## Historical integration records
+
 ## Active startup, optional-lock and previous-close integration — 2026-09-30
 
 Independent-read checkpoint: `1e82c1e5` (PR #43 comment 5923702152). History checkpoint: `0206d13a` (PR #43 comment 5923592639). Request-admission checkpoint: `e092a17b` (PR #43 comment 5923423225); Desktop reconnect: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
@@ -5574,3 +5627,63 @@ restore_active_live_sources_independently 64,576B; startup restoration 121,600B.
 increase. Existing complete history/calendar reobservation/restart case PASS1/1 (1.96s).
 Stack boundaries are an independent checkpoint; retained-policy/backpressure/calendar-worker
 changes remain pending their final checks and I/O scheduling diagnosis. PR43 includes c3c8edba.
+
+Scheduling diagnosis confirms an inverse lock order in source (not proved as this runtime stall):
+calendar/retained rights acquire ResearchIoWorker then analytical.operation_gate, while option
+originals, Tiingo recovery and Board staging acquire the gate before ResearchIoWorker.
+Astra calendar_currentness_failure now owns data ingest.rs/lib.rs and app research_service.rs plus
+research_service/retained_use.rs for one root-bound operation lease admitted before worker dispatch
+and reused through reserve/publication/reobservation/authorization. Reuse shared bodies; no second
+runtime, arbitrary workers, timeout extension, compatibility path or weakened checks. Existing
+identity unit build is already compiling its pre-correction snapshot; new integration will require
+a fresh serialized build/check after agent freeze. Lead owns remaining files and native evidence.
+
+Native navigation check opened all17 top-level routes without global startup/render failure;
+Operations and Logs were rechecked after their initial lazy loading state settled. Artifacts
+restoration-fixed-native-{home,markets,routes,advanced,remaining-routes,jobs,logs}.json. Empty
+research/model/analysis/backtest states are not completed workflows. Service survived over10min,
+then explicit background Desktop shutdown and service SIGTERM completed (service exit0).
+Metadata-identity regression PASS1/1, publication-custody cleanup regression PASS1/1 on the
+pre-admission-correction test binary. Calendar agent owns the four admission files as above.
+Astra live_stack_failure now owns read-only live-price diagnosis from restoration-fixed-live.log,
+registry/current_batch, sink and product-market selection: distinguish queue-age expiry from an
+incorrect clock/metadata comparison; no edits, runtime changes, builds or Git. Lead integrates.
+
+### Complete data-to-screen coverage — owner clarification, 2026-10-01
+
+Verification must cover every agreed data family and intended screen, not only a displayed price.
+Distinguish streaming observations, scheduled/on-demand updates and immutable saved results;
+preserve independent timestamps, freshness, coverage, provenance and unavailable states. Existing
+17-route navigation evidence proves admission only, not complete screen contracts.
+
+| Owner | Exact scope / ownership | Dependency and evidence |
+| --- | --- | --- |
+| GPT-6.1 Sol High screen_contract_coverage | Read-only approved plan/provider contracts, Desktop schemas/pages and corresponding backend projections; write only `.agents/tmp/v1-first-stock/screen-contract-coverage.md` | Map all17 screens and required subflows to real fields/update triggers; identify dropped/disconnected required fields and existing critical checks. No code edits, builds, Git or invented requirements. |
+| Astra live_stack_failure | Existing read-only live quote/freshness diagnosis | Independent native quote/trade receipts exist; product drops quote fields and price basis. Return exact canonical producer/consumer correction, keeping financial cutoffs separate from actual authorization clocks. |
+| Lead | Shared data-to-product contracts, integration, ledger, Git/builds | Admission-order four-file patch frozen; inspect and run existing critical checks before accepting. Then integrate complete current quote/trade display and verify feed updates in native screens. |
+
+Current confirmed gap: Markets exposes one price/time without bid/ask/sizes or mark basis. A newer
+trade must not erase an independently valid quote. Full data/screen completion remains unproven.
+One primary worktree and only main/release/feature local and origin branches freshly confirmed;
+protected bundle-backup refs remain intact. No branches/worktrees created.
+
+Astra live_stack_failure now owns `live_source/display_market.rs` only for the confirmed
+latest-observation/request-cutoff clock mismatch. Validate live authority at actual read time,
+retain the requested financial cutoff and exact provenance, and extend the closest existing critical
+clock case if needed. Preserve genuine stale/expired rejection; no timeout changes or new runtime.
+Lead reserves paper/market.rs for closed durable-route rejection diagnostics and shared projection.
+Data history check is compiling serially against frozen admission-order files; no agent builds.
+
+Admission-order integrity check PASS1/1 (complete history/reobservation/restart,1.88s; compile48.97s).
+Astra calendar_currentness_failure owns only the existing alpaca_historical.rs test module for one
+critical scheduling regression using its existing real ResearchService fixture: held original lease
+must not prevent an unrelated owned-I/O marker while authorization awaits admission. This gap is
+not covered by data integrity tests. No new harness or production visibility seam.
+
+Frozen integration checks: single-job app unit compilation PASS6m20s. Initial short exact filter
+selected zero tests and is compilation evidence only; fully qualified direct execution on the
+resulting test binary PASS1/1,0.42s for the genuine original-lease/worker scheduling regression.
+Current metadata identity and publication-custody checks also PASS1/1 each. Logs:
+`admitted-{application-critical,application-scheduling-critical,identity-critical,custody-critical}.log`.
+The clock patch and durable failure diagnostics remain pending the complete latest-display read
+semantics and native check. No full current-price/streaming/screen-completion claim.

@@ -11,8 +11,7 @@ use market_squawk_data::{
     MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
     MarketDataInstrumentReadCapability, MarketEventUseRequest, PinnedInstrumentDefinitions,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
-    ProviderMarketEventSelectionCompleteness, ResearchUse, ResearchUseCatalogError,
-    ResearchUseLimits,
+    ProviderMarketEventSelectionCompleteness, ResearchUse, ResearchUseLimits,
 };
 
 use market_squawk_domain::{
@@ -965,11 +964,10 @@ impl MarketInvestmentReadCapability {
                 if !native_price && execution_terms.is_none() {
                     continue;
                 }
-                let (authorization, authorized_at) = match self.authorize_local_analysis(
-                    receipt.selection(),
-                    deadline,
-                    &cancellation,
-                ) {
+                let (authorization, authorized_at) = match self
+                    .authorize_local_analysis(receipt.selection(), deadline, &cancellation)
+                    .await
+                {
                     Ok(admitted) => admitted,
                     Err(ServiceError::Unauthorized) => continue,
                     Err(error) => return Err(error),
@@ -1070,8 +1068,9 @@ impl MarketInvestmentReadCapability {
             .position(|source| &source.observation_id == selected_id)
             .ok_or(ServiceError::InvalidResult)?;
         let source = sources.swap_remove(index);
-        let (authorization, authorized_at) =
-            self.authorize_local_analysis(source.receipt.selection(), deadline, &cancellation)?;
+        let (authorization, authorized_at) = self
+            .authorize_local_analysis(source.receipt.selection(), deadline, &cancellation)
+            .await?;
         if authorization.rights_input_digest() != source.rights_input_digest {
             return Err(ServiceError::InvalidResult);
         }
@@ -1124,7 +1123,7 @@ impl MarketInvestmentReadCapability {
         Ok(Some(receipt))
     }
 
-    pub(crate) fn authorize_local_analysis(
+    pub(crate) async fn authorize_local_analysis(
         &self,
         selection: &ProviderMarketEventPointInTimeSelection,
         deadline: Instant,
@@ -1150,7 +1149,6 @@ impl MarketInvestmentReadCapability {
         let candidate = single_candidate(selection).map_err(|_| ServiceError::InvalidResult)?;
         let authorization = self
             .research
-            .analytical()
             .authorize_market_event_use(
                 MarketEventUseRequest::try_new(
                     selection.commit().clone(),
@@ -1159,19 +1157,12 @@ impl MarketInvestmentReadCapability {
                     limits,
                 )
                 .map_err(|_| ServiceError::InvalidRequest)?,
+                deadline,
                 cancellation,
             )
-            .map_err(|error| match error {
-                ResearchUseCatalogError::Cancelled => ServiceError::Cancelled,
-                ResearchUseCatalogError::DeadlineExceeded => ServiceError::DeadlineExceeded,
-                ResearchUseCatalogError::LimitExceeded => ServiceError::ResourceExhausted,
-                ResearchUseCatalogError::Denied { .. }
-                | ResearchUseCatalogError::Expired
-                | ResearchUseCatalogError::Revoked => ServiceError::Unauthorized,
-                ResearchUseCatalogError::Catalog(error) => map_catalog_error(error),
-                ResearchUseCatalogError::CorruptCatalog => ServiceError::InvalidResult,
-                _ => ServiceError::Unavailable,
-            })?;
+            .await
+            .map_err(crate::application::research::corporate_actions::map_research_error)?
+            .map_err(crate::application::research::map_research_use_error)?;
         let admitted_at = current_market_time()?;
         check_market_read(admitted_at, deadline, cancellation)?;
         if authorization.research_use() != ResearchUse::LocalAnalysis

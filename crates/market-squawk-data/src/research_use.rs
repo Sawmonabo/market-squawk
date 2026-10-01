@@ -24,6 +24,7 @@ pub use self::catalog::{
     AuthorizedResearchUse, DerivedOutputObjectInput, PublishedDerivedGeneration,
     RegisteredResearchUseGrant, ResearchUseCatalogError, ResearchUseGrantInput, ResearchUseRequest,
     ResearchUseRevocationInput, ResearchUseRevocationReason, ResearchUseRevocationReceipt,
+    RetainedResearchUsePolicy,
 };
 pub use self::decision::{
     ResearchUseAuthorityEvidence, ResearchUseDecisionInput, ResearchUseDecisionOutcome,

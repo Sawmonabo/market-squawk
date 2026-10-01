@@ -391,11 +391,13 @@ impl FairValueDomainService {
                     context.cancellation().clone(),
                 )
                 .await?;
-            let (authorization, _) = market_reader.authorize_local_analysis(
-                selected.market_selection.receipt().publication(),
-                context.deadline(),
-                context.cancellation(),
-            )?;
+            let (authorization, _) = market_reader
+                .authorize_local_analysis(
+                    selected.market_selection.receipt().publication(),
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?;
             event_authorizations.push(authorization);
             expires_at = expires_at.min(
                 selected
@@ -731,15 +733,8 @@ impl FairValueDomainService {
                 limits,
             )
             .map_err(|error| map_research_use_error(error, context))?;
-            let analytical = research.analytical_service();
             let event_authorization = research
-                .run_owned_research_io(
-                    context.deadline(),
-                    context.cancellation(),
-                    move |cancellation| {
-                        analytical.authorize_market_event_use(request, &cancellation)
-                    },
-                )
+                .authorize_market_event_use(request, context.deadline(), context.cancellation())
                 .await
                 .map_err(|error| map_research_use_worker_error(error, context))?
                 .map_err(|error| map_research_use_error(error, context))?;

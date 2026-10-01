@@ -1,6 +1,9 @@
 //! Catalog-backed ResearchUse authority and publication service.
 
 use std::fmt;
+use std::time::Instant;
+
+use rusqlite::{OptionalExtension as _, params};
 
 use market_squawk_domain::{EvidenceDigest, Timestamp};
 use thiserror::Error;
@@ -17,6 +20,66 @@ use crate::{
     CatalogAuthority, CatalogError, DatasetBuildSpecDigest, DatasetManifestRef, DatasetSchemaRef,
     IngestReservation, ManifestPlan, Sha256Digest,
 };
+
+/// Current policy evidence supplied by the existing local policy owner, without invented
+/// source or payload coordinates. Those coordinates come only from exact retained lineage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedResearchUsePolicy {
+    basis: crate::RightsBasis,
+    authorization_evidence: EvidenceDigest,
+    authorization_expires_at: Option<Timestamp>,
+    permitted_operations: Vec<crate::SourceOperation>,
+}
+
+impl RetainedResearchUsePolicy {
+    /// Binds explicit current operations to an exact reviewed or local evidence identity.
+    pub fn try_new(
+        basis: crate::RightsBasis,
+        authorization_evidence: EvidenceDigest,
+        authorization_expires_at: Option<Timestamp>,
+        mut permitted_operations: Vec<crate::SourceOperation>,
+    ) -> Result<Self, ResearchUseCatalogError> {
+        permitted_operations.sort_unstable();
+        if authorization_evidence.bytes() == [0; 32]
+            || permitted_operations.is_empty()
+            || permitted_operations
+                .windows(2)
+                .any(|pair| pair[0] == pair[1])
+        {
+            return Err(ResearchUseCatalogError::InvalidGrant);
+        }
+        Ok(Self {
+            basis,
+            authorization_evidence,
+            authorization_expires_at,
+            permitted_operations,
+        })
+    }
+}
+
+fn downstream_uses(
+    operations: &[crate::SourceOperation],
+) -> Result<Option<ResearchUseSet>, ResearchUseCatalogError> {
+    let mask = operations
+        .iter()
+        .fold(0u8, |mask, operation| mask | operation.mask());
+    let mut uses = Vec::new();
+    for requested in [
+        ResearchUse::Display,
+        ResearchUse::LocalAnalysis,
+        ResearchUse::Train,
+    ] {
+        let required = ResearchUseSet::try_new(vec![requested])?.required_source_operation_mask();
+        if mask & required == required {
+            uses.push(requested);
+        }
+    }
+    if uses.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ResearchUseSet::try_new(uses)?))
+    }
+}
 
 /// One bounded, exact request to evaluate transitive source authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -411,6 +474,195 @@ pub enum ResearchUseCatalogError {
 }
 
 impl CatalogAuthority {
+    pub(crate) fn admit_source_rights_with_research_uses(
+        &self,
+        rights: crate::RightsDecisionInput,
+    ) -> Result<crate::RegisteredRightsGrant, ResearchUseCatalogError> {
+        let uses = downstream_uses(&rights.permitted_operations)?;
+        let evidence = rights.authorization_evidence;
+        let expiry = rights.authorization_expires_at;
+        let grant = self.admit_source_rights(rights)?;
+        if let Some(uses) = uses {
+            self.admit_research_use_grant(ResearchUseGrantInput::try_new(
+                grant.rights_id(),
+                uses,
+                evidence,
+                expiry,
+            )?)?;
+        }
+        Ok(grant)
+    }
+
+    pub(crate) fn authorize_research_use_with_retained_policy(
+        &self,
+        request: ResearchUseRequest,
+        policies: &[RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AuthorizedResearchUse, ResearchUseCatalogError> {
+        let graph = self.with_research_use_transaction(|transaction, _, _| {
+            super::traversal::load_graph(transaction, &request, cancellation, deadline)
+        })?;
+        let rights: std::collections::BTreeSet<_> = graph
+            .sources()
+            .iter()
+            .map(|source| source.rights_id())
+            .collect();
+        self.admit_retained_rights(
+            rights,
+            request.requested_use,
+            policies,
+            deadline,
+            cancellation,
+        )?;
+        let outcome = self.with_research_use_transaction(|transaction, session, now| {
+            persistence::authorize_resolved(
+                transaction,
+                session,
+                now,
+                request,
+                graph,
+                cancellation,
+                deadline,
+            )
+        })?;
+        match outcome {
+            AuthorizationTransactionOutcome::Allowed(authorization) => Ok(*authorization),
+            AuthorizationTransactionOutcome::Denied {
+                decision_digest,
+                reason,
+            } => Err(ResearchUseCatalogError::Denied {
+                decision_digest,
+                reason,
+            }),
+        }
+    }
+
+    pub(crate) fn admit_retained_market_event_policy(
+        &self,
+        request: &super::market_event::MarketEventUseRequest,
+        policies: &[RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ResearchUseCatalogError> {
+        let rights = self.with_research_use_transaction(|transaction, _, _| {
+            super::market_event::original_rights_for_request(
+                transaction,
+                request,
+                deadline,
+                cancellation,
+            )
+        })?;
+        self.admit_retained_rights(
+            rights,
+            request.requested_use(),
+            policies,
+            deadline,
+            cancellation,
+        )
+    }
+
+    fn admit_retained_rights(
+        &self,
+        original_rights: impl IntoIterator<Item = [u8; 32]>,
+        requested_use: ResearchUse,
+        policies: &[RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ResearchUseCatalogError> {
+        let uses = ResearchUseSet::try_new(vec![requested_use])?;
+        let required = uses.required_source_operation_mask();
+        for original in original_rights {
+            super::traversal::check_control(cancellation, deadline)?;
+            let replacement = self.with_research_use_transaction(|transaction, _, now| {
+                let frontier = persistence::source_use_frontier(transaction, now)?;
+                if persistence::source_use_revoked(transaction, original, requested_use, now, frontier)? {
+                    return Err(ResearchUseCatalogError::Revoked);
+                }
+                let stored = transaction.query_row(
+                    "SELECT source_id,payload_algorithm,payload_digest,retrieved_at_ns,operation_mask,
+                            basis_kind,basis_reference,basis_algorithm,basis_digest,basis_root_algorithm,
+                            basis_root_digest,authorization_algorithm,authorization_digest
+                     FROM source_rights WHERE rights_id=?1 AND admitted_at_ns<=?2",
+                    params![original,now.unix_nanos()],
+                    |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Vec<u8>>(2)?,
+                        row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,
+                        row.get::<_,i64>(7)?,row.get::<_,Vec<u8>>(8)?,row.get::<_,Option<i64>>(9)?,
+                        row.get::<_,Option<Vec<u8>>>(10)?,row.get::<_,i64>(11)?,row.get::<_,Vec<u8>>(12)?)),
+                ).optional()?.ok_or(ResearchUseCatalogError::CorruptCatalog)?;
+                let (source, payload_algorithm, payload, retrieved_at, original_mask,
+                    basis_kind, basis_reference, basis_algorithm, basis_digest, root_algorithm,
+                    root_digest, authorization_algorithm, authorization_digest) = stored;
+                if original_mask & i64::from(required) != i64::from(required) { return Ok(None); }
+                let source = market_squawk_domain::SourceId::try_from(source)
+                    .map_err(|_| ResearchUseCatalogError::CorruptCatalog)?;
+                let payload = super::identity::parse_evidence(payload_algorithm,payload)?;
+                let basis = super::identity::parse_evidence(basis_algorithm,basis_digest)?;
+                let root = match (root_algorithm,root_digest) {
+                    (None,None) => None,
+                    (Some(algorithm),Some(digest)) => Some(super::identity::parse_evidence(algorithm,digest)?),
+                    _ => return Err(ResearchUseCatalogError::CorruptCatalog),
+                };
+                let authorization = super::identity::parse_evidence(authorization_algorithm,authorization_digest)?;
+                let mut selected: Option<crate::RightsDecisionInput> = None;
+                for policy in policies {
+                    super::traversal::check_control(cancellation, deadline)?;
+                    let mask = policy.permitted_operations.iter().fold(0u8, |mask, op| mask | op.mask());
+                    if mask & required != required || policy.authorization_expires_at.is_some_and(|expiry| expiry <= now)
+                        || policy.basis.kind().database_name() != basis_kind
+                        || policy.basis.reference() != basis_reference
+                        || policy.basis.digest() != basis || policy.basis.root_identity_digest() != root
+                        || policy.authorization_evidence != authorization {
+                        continue;
+                    }
+                    let input = crate::RightsDecisionInput {
+                        source_id: source.clone(),
+                        payload_digest: payload,
+                        retrieved_at: Timestamp::from_unix_nanos(retrieved_at),
+                        basis: policy.basis.clone(),
+                        authorization_evidence: policy.authorization_evidence,
+                        authorization_expires_at: policy.authorization_expires_at,
+                        permitted_operations: policy.permitted_operations.iter().copied()
+                            .filter(|op| original_mask & i64::from(op.mask()) != 0).collect(),
+                    };
+                    // Conflicting current declarations must not be resolved by list order.
+                    if let Some(previous) = &selected {
+                        if previous.authorization_expires_at != input.authorization_expires_at
+                            || previous.permitted_operations != input.permitted_operations {
+                            return Err(ResearchUseCatalogError::InvalidGrant);
+                        }
+                    }
+                    selected = Some(input);
+                }
+                if let Some(input) = &selected {
+                    let rights_id = crate::rights::SourceRightsDecision::try_new(input.clone())
+                        .map_err(|_| ResearchUseCatalogError::InvalidGrant)?.fingerprint();
+                    let grant = ResearchUseGrantInput::try_new(rights_id, uses,
+                        input.authorization_evidence, input.authorization_expires_at)?;
+                    let exists: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM source_research_use_grants WHERE research_grant_id=?1)",
+                        [super::identity::grant_digest(&grant)], |row| row.get(0),
+                    )?;
+                    if exists { return Ok(None); }
+                }
+                Ok(selected)
+            })?;
+            if let Some(input) = replacement {
+                super::traversal::check_control(cancellation, deadline)?;
+                let evidence = input.authorization_evidence;
+                let expiry = input.authorization_expires_at;
+                let rights = self.admit_source_rights(input)?;
+                self.admit_research_use_grant(ResearchUseGrantInput::try_new(
+                    rights.rights_id(),
+                    uses,
+                    evidence,
+                    expiry,
+                )?)?;
+            }
+        }
+        super::traversal::check_control(cancellation, deadline)
+    }
+
     /// Admits one immutable downstream-use grant under existing source-rights evidence.
     pub fn admit_research_use_grant(
         &self,

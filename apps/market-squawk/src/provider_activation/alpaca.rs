@@ -630,13 +630,28 @@ impl ProviderAdapterActivation {
         &self,
         activation: &AlpacaBasicAccountActivation,
         metadata: &SourceMetadata,
-    ) -> Result<crate::application::ResearchProviderRuntimeGeneration, crate::application::AlpacaMarketPublicationError> {
+    ) -> Result<
+        crate::application::ResearchProviderRuntimeGeneration,
+        crate::application::AlpacaMarketPublicationError,
+    > {
         use crate::application::AlpacaMarketPublicationError as E;
-        if !activation.account_binding().validates_metadata(metadata) { return Err(E::AuthorityInvalid); }
+        if !activation.account_binding().validates_metadata(metadata) {
+            tracing::warn!(
+                stage = "account_metadata",
+                "Alpaca publication registration failed"
+            );
+            return Err(E::AuthorityInvalid);
+        }
         let (generation, rights) = super::public_live_runtime_generation(activation.lease(), metadata)
-            .map_err(|_| E::AuthorityInvalid)?;
+            .map_err(|error| {
+                tracing::warn!(stage = "generation_construction", %error, "Alpaca publication registration failed");
+                E::AuthorityInvalid
+            })?;
         self.research_mutation.register_provider_publication_generation(generation.clone(), rights)
-            .map_err(|_| E::AuthorityInvalid)?;
+            .map_err(|error| {
+                tracing::warn!(stage = "coordinator_registration", %error, "Alpaca publication registration failed");
+                E::AuthorityInvalid
+            })?;
         Ok(generation)
     }
 

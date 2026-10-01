@@ -1997,8 +1997,19 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     let location = paths.catalog()?.clone();
     let catalog_config = test_catalog_config(location.clone())?;
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (service, publisher, source, market_bars) =
-        initialized_service_with_universe(&paths, catalog_config.clone(), store_config).await?;
+    let original_rights_expiry = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
+    .checked_add_nanos(60_000_000_000)?;
+    let (service, publisher, source, market_bars) = initialized_service_with_universe_fixture(
+        &paths,
+        catalog_config.clone(),
+        store_config,
+        closed_price_return_market_bar_fixture()?,
+        false,
+        Some(original_rights_expiry),
+    )
+    .await?;
     let instrument = dataset_membership_instrument()?;
     let research_limits = ResearchUseLimits::try_new(
         8,
@@ -2022,6 +2033,59 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     assert_ne!(preflight.decision_digest().bytes(), [0; 32]);
     assert_ne!(preflight.graph_digest().bytes(), [0; 32]);
     assert!(preflight.expires_at() > Timestamp::from_unix_nanos(0));
+    let current_policy = market_squawk_data::RetainedResearchUsePolicy::try_new(
+        RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+        digest(32),
+        None,
+        vec![SourceOperation::Persist],
+    )?;
+    let retained_limits = ResearchUseLimits::try_new(
+        8,
+        32,
+        32,
+        8,
+        1024 * 1024,
+        Duration::from_secs(2),
+        Duration::from_secs(300),
+    )?;
+    let retained_request = ResearchUseRequest::try_new(
+        vec![source.manifest().clone()],
+        ResearchUse::LocalAnalysis,
+        retained_limits,
+    )?;
+    let current_authorization = service
+        .authorize_research_use_with_retained_policy(
+            retained_request.clone(),
+            std::slice::from_ref(&current_policy),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
+    // A current retention policy is not capped by the original connection's expiry.
+    assert!(current_authorization.expires_at() > original_rights_expiry);
+    let proof = rusqlite::Connection::open(location.path())?;
+    let (original_rights, selected_rights, original_payload): (Vec<u8>, Vec<u8>, Vec<u8>) = proof.query_row(
+        "SELECT source.rights_id,grant.rights_id,original.payload_digest
+         FROM research_use_decision_sources AS source
+         JOIN source_research_use_grants AS grant ON grant.research_grant_id=source.selected_research_grant_id
+         JOIN source_rights AS original ON original.rights_id=source.rights_id
+         WHERE source.decision_id=?1",
+        [current_authorization.decision_digest().bytes()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    )?;
+    assert_ne!(original_rights, selected_rights);
+    assert_eq!(
+        current_authorization.graph().sources()[0]
+            .rights_id()
+            .as_slice(),
+        original_rights.as_slice()
+    );
+    let origin_unchanged: bool = proof.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_rights WHERE rights_id=?1 AND authorization_expires_at_ns=?2)",
+        params![original_rights, original_rights_expiry.unix_nanos()], |row| row.get(0),
+    )?;
+    assert!(origin_unchanged);
+    drop(proof);
     let feature = FeatureLabelComponentSpec::try_new(
         ComponentKind::Feature,
         ComponentScope::Global,
@@ -2708,7 +2772,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
 
     let (reopened_composition, _onboarding_catalog) =
         AnalyticalDataService::open_with_provider_onboarding(
-            CatalogAuthority::open(catalog_config)?,
+            CatalogAuthority::open(catalog_config.clone())?,
             AnalyticalManifestCatalog::open(&location, 8)?,
             paths.artifacts()?.clone(),
             store_config,
@@ -2986,6 +3050,86 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             .map(market_squawk_data::DatasetStudyPolicy::purpose),
         Some(market_squawk_data::DatasetBuildPurpose::StudyInputs)
     );
+    let after_restart = reopened
+        .authorize_research_use_with_retained_policy(
+            retained_request.clone(),
+            std::slice::from_ref(&current_policy),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        after_restart.graph().digest(),
+        current_authorization.graph().digest()
+    );
+    // The disk-backed historical row index owns operation scratch and its root authority.
+    // Release that read before reopening the same artifact root for the revocation check.
+    drop(historical_v1);
+    drop(reopened_reader);
+    drop(reopened_publisher);
+    drop(_onboarding_catalog);
+    drop(reopened);
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    let current_rights = authority.admit_source_rights(RightsDecisionInput {
+        source_id: SourceId::try_from("fred-local-fixture")?,
+        payload_digest: EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            original_payload
+                .try_into()
+                .map_err(|_| "invalid original payload")?,
+        ),
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+        authorization_evidence: digest(32),
+        authorization_expires_at: None,
+        permitted_operations: vec![SourceOperation::Persist],
+    })?;
+    assert_eq!(
+        current_rights.rights_id().as_slice(),
+        selected_rights.as_slice()
+    );
+    assert!(matches!(
+        authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+            current_rights.rights_id(),
+            ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+            digest(32),
+            Some(Timestamp::from_unix_nanos(16)),
+        )?),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidGrant)
+    ));
+    let current_grant = authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        current_rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(32),
+        None,
+    )?)?;
+    authority.revoke_research_use(market_squawk_data::ResearchUseRevocationInput::try_new(
+        &current_grant,
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        market_squawk_data::ResearchUseRevocationReason::AuthorizationWithdrawn,
+        digest(97),
+        Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?),
+    )?)?;
+    drop(authority);
+    let denied = AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    assert!(matches!(
+        denied
+            .authorize_research_use_with_retained_policy(
+                retained_request,
+                std::slice::from_ref(&current_policy),
+                Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await,
+        Err(market_squawk_data::ResearchUseCatalogError::Revoked)
+    ));
     Ok(())
 }
 
@@ -3468,6 +3612,86 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         reauthorized.rights_input_digest(),
         authorized.rights_input_digest()
     );
+    // Current policy is matched to the original exact payload and policy evidence. It
+    // preserves the publication/row identity while retaining independently selected rights.
+    let retained_policy = market_squawk_data::RetainedResearchUsePolicy::try_new(
+        RightsBasis::reviewed_terms("https://example.test/alpaca-terms/v1", digest(41))?,
+        digest(43),
+        None,
+        vec![SourceOperation::Persist, SourceOperation::Train],
+    )?;
+    let policy_request = market_squawk_data::MarketEventUseRequest::try_from_retained(
+        authorized.commit().clone(),
+        authorized.inputs().to_vec(),
+        ResearchUse::LocalAnalysis,
+        research_limits,
+    )?;
+    let current = restarted
+        .authorize_market_event_use_with_retained_policy(
+            policy_request.clone(),
+            std::slice::from_ref(&retained_policy),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )
+        .await?;
+    assert_eq!(current.inputs(), authorized.inputs());
+    assert_eq!(current.commit(), authorized.commit());
+    restarted.recheck_market_event_use(&authorized, deadline, &cancellation)?;
+    restarted.recheck_market_event_use(&current, deadline, &cancellation)?;
+    let inspect = rusqlite::Connection::open(location.path())?;
+    let current_rights: Vec<u8> = inspect.query_row(
+        "SELECT rights_id FROM source_rights WHERE source_id=?1 AND payload_digest=?2
+         AND authorization_expires_at_ns IS NULL",
+        params![source.source_id().as_str(), publication_digest.bytes()],
+        |row| row.get(0),
+    )?;
+    assert_ne!(current_rights, rights.rights_id());
+    let original_run_rights: Vec<u8> = inspect.query_row(
+        "SELECT rights_id FROM ingest_runs WHERE run_id=?1",
+        [retry_reservation.run_id().to_string()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(original_run_rights, rights.rights_id());
+    let counts = || -> Result<(i64, i64), rusqlite::Error> {
+        inspect.query_row(
+            "SELECT (SELECT COUNT(*) FROM source_rights),
+            (SELECT COUNT(*) FROM source_research_use_grants)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    };
+    let admitted_counts = counts()?;
+    let repeated = restarted
+        .authorize_market_event_use_with_retained_policy(
+            policy_request.clone(),
+            std::slice::from_ref(&retained_policy),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )
+        .await?;
+    assert_eq!(
+        repeated.rights_input_digest(),
+        current.rights_input_digest()
+    );
+    assert_eq!(counts()?, admitted_counts);
+    assert!(matches!(
+        restarted
+            .authorize_market_event_use_with_retained_policy(
+                market_squawk_data::MarketEventUseRequest::try_from_retained(
+                    authorized.commit().clone(),
+                    authorized.inputs().to_vec(),
+                    ResearchUse::Train,
+                    research_limits,
+                )?,
+                std::slice::from_ref(&retained_policy),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )
+            .await,
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidGrant)
+    ));
+    assert_eq!(counts()?, admitted_counts);
+    drop(inspect);
     let retained = &authorized.inputs()[0];
     let mut altered_digest = retained.canonical_event_digest().bytes();
     altered_digest[0] ^= 1;
@@ -4134,6 +4358,54 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             CancellationToken::new(),
         )
         .await?;
+    let cancellation = CancellationToken::new();
+    let reopened_authorization = reopened_service
+        .authorize_market_event_use_with_retained_policy(
+            policy_request.clone(),
+            std::slice::from_ref(&retained_policy),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )
+        .await?;
+    assert_eq!(
+        reopened_authorization.rights_input_digest(),
+        current.rights_input_digest()
+    );
+    drop(reopened_service);
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    let original_grant = authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(44),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    authority.revoke_research_use(market_squawk_data::ResearchUseRevocationInput::try_new(
+        &original_grant,
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        market_squawk_data::ResearchUseRevocationReason::AuthorizationWithdrawn,
+        digest(96),
+        Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?),
+    )?)?;
+    drop(authority);
+    let revoked_service = AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 2)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+    )?;
+    assert!(matches!(
+        revoked_service
+            .authorize_market_event_use_with_retained_policy(
+                policy_request,
+                std::slice::from_ref(&retained_policy),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )
+            .await,
+        Err(market_squawk_data::ResearchUseCatalogError::Revoked)
+    ));
     Ok(())
 }
 
@@ -5684,6 +5956,7 @@ async fn initialized_service_with_universe(
         store_config,
         closed_price_return_market_bar_fixture()?,
         false,
+        None,
     )
     .await
 }
@@ -5694,6 +5967,7 @@ async fn initialized_service_with_universe_fixture(
     store_config: ObjectStoreConfig,
     market_fixture: ClosedPriceReturnMarketBarFixture,
     training: bool,
+    membership_rights_expiry: Option<Timestamp>,
 ) -> Result<
     (
         AnalyticalDataService,
@@ -5728,7 +6002,9 @@ async fn initialized_service_with_universe_fixture(
         retrieved_at: Timestamp::from_unix_nanos(15),
         basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
-        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        authorization_expires_at: Some(
+            membership_rights_expiry.unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
+        ),
         permitted_operations: if training {
             vec![SourceOperation::Persist, SourceOperation::Train]
         } else {
@@ -5743,7 +6019,7 @@ async fn initialized_service_with_universe_fixture(
             vec![ResearchUse::LocalAnalysis]
         })?,
         digest(33),
-        Some(Timestamp::from_unix_nanos(i64::MAX)),
+        Some(membership_rights_expiry.unwrap_or(Timestamp::from_unix_nanos(i64::MAX))),
     )?)?;
     let membership_reservation = authority.reserve_ingest(
         &IngestIdentity::try_new(
@@ -6852,6 +7128,12 @@ fn assert_complete_history_native_rejoin(
         deadline,
         &cancellation,
     )?;
+    assert_eq!(
+        owned.origin_created_at(),
+        output.selection().receipt().published_at()
+    );
+    assert!(owned.origin_created_at() <= owned.published_at());
+    assert!(owned.published_at() <= output.read_receipt().knowledge_cutoff());
     let binding = owned
         .objects()
         .first()

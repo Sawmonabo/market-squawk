@@ -259,12 +259,13 @@ pub use fund_holdings::{
     MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
 };
 pub use ingest::{
-    AnalyticalDataService, CommittedDataset, CompactionRequest, CompletedProviderMacroPlanReceipt,
-    GenerationOwnedProviderCaptureEvidence, GenerationOwnedProviderCaptureInputEvidence,
-    GenerationOwnedProviderCaptureObjectEvidence, IngestError, IngestPrecommitAuthority,
-    ListingReferenceAdmissionCapability, MarketEventArchiveLimits, MarketEventArchiveTurn,
-    PendingProviderMacroPlanPublication, PinnedArtifactQueryRequest, ProviderCaptureRecovery,
-    ProviderMacroMetadataCapture, ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
+    AdmittedAnalyticalOperation, AnalyticalDataService, CommittedDataset, CompactionRequest,
+    CompletedProviderMacroPlanReceipt, GenerationOwnedProviderCaptureEvidence,
+    GenerationOwnedProviderCaptureInputEvidence, GenerationOwnedProviderCaptureObjectEvidence,
+    IngestError, IngestPrecommitAuthority, ListingReferenceAdmissionCapability,
+    MarketEventArchiveLimits, MarketEventArchiveTurn, PendingProviderMacroPlanPublication,
+    PinnedArtifactQueryRequest, ProviderCaptureRecovery, ProviderMacroMetadataCapture,
+    ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
     ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
     ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, ProviderMacroPlanSessionInput,
     ProviderMacroPlanSessionReceipt, ProviderMacroPlanStagedPage, ProviderMacroPlanTerminal,
@@ -348,7 +349,7 @@ pub use research_use::{
     ResearchUseError, ResearchUseGeneration, ResearchUseGrantInput, ResearchUseGraph,
     ResearchUseGraphDigest, ResearchUseGraphEdge, ResearchUseLimits, ResearchUsePermit,
     ResearchUseRequest, ResearchUseRevocationInput, ResearchUseRevocationReason,
-    ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput,
+    ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput, RetainedResearchUsePolicy,
 };
 pub use rights::{
     ImportedUserInputBasis, ImportedUserInputEvidence, IngestIdentity, RegisteredRightsGrant,

@@ -1,6 +1,8 @@
 //! Application-owned composition for research ingestion and immutable analytical generations.
 
+mod retained_use;
 mod worker;
+pub(crate) use retained_use::research_source_operations;
 
 use worker::ResearchIoWorker;
 
@@ -16,8 +18,8 @@ use market_squawk_data::{
     IngestError, IngestIdentity, IngestPrecommitAuthority, InstrumentDefinitionReadCapability,
     ManifestCatalogError, MarketDataInstrumentReadCapability,
     MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingCatalogCapability,
-    PersistedProviderCaptureBindingEvidence, ProviderPublicationInput, ResearchIngestService,
-    RightsDecisionInput, RightsError, SourceOperation, extraction_provider_payload_digest,
+    PersistedProviderCaptureBindingEvidence, ProviderPublicationInput, RightsDecisionInput,
+    RightsError, SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition,
@@ -396,6 +398,7 @@ pub struct ResearchService {
     analytical: Arc<AnalyticalDataService>,
     provider_captures: Arc<SealedResearchJournalStore>,
     provider_capture_worker: ResearchIoWorker,
+    retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
 }
 
 impl ResearchService {
@@ -590,6 +593,7 @@ impl ResearchService {
             analytical,
             provider_captures: Arc::new(paths.sealed_research_journal_store()?),
             provider_capture_worker: ResearchIoWorker::new(),
+            retained_use_policies: retained_use::current_policies()?.into(),
         })
     }
 
@@ -727,35 +731,6 @@ impl ResearchService {
         self.provider_capture_worker
             .run_with_job_context(Some(cancellation), deadline, cancellation, operation)
             .await
-    }
-
-    /// Admits exact lineage on the original retained synchronous I/O lane.
-    /// The worker owns only the existing analytical service, never this worker's owner.
-    pub(crate) async fn authorize_research_use(
-        &self,
-        request: market_squawk_data::ResearchUseRequest,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<
-        Result<
-            market_squawk_data::AuthorizedResearchUse,
-            market_squawk_data::ResearchUseCatalogError,
-        >,
-        ResearchServiceError,
-    > {
-        let analytical = Arc::clone(&self.analytical);
-        let result = self
-            .run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
-                analytical.authorize_research_use(request, &worker_cancellation)
-            })
-            .await?;
-        if cancellation.is_cancelled() {
-            return Err(market_squawk_data::IngestError::Cancelled.into());
-        }
-        if Instant::now() >= deadline {
-            return Err(market_squawk_data::IngestError::DeadlineExceeded.into());
-        }
-        Ok(result)
     }
 
     /// Closes admission and cancels original reads without discarding their blocking handles.
@@ -896,28 +871,45 @@ impl ResearchService {
         request: ResearchIngestRequest,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, ResearchServiceError> {
-        Self::ingest_on(&self.analytical, request, cancellation).await
+        let admission = self
+            .analytical
+            .acquire_research_operation(&cancellation)
+            .await?;
+        Self::ingest_on(&admission, request, cancellation).await
     }
 
-    /// Publishes an intermediate source generation, never the job's terminal result.
+    /// Publishes a bounded source generation with optional job input controls.
+    /// This never claims a job's terminal result.
     ///
     /// The existing I/O slot owns the original future through runner cancellation or abort. Its
     /// blocking worker uses the originating executor handle; no runtime, detached task, or service
     /// ownership cycle is created. Only the analytical owner and original request cross the lane.
-    pub(crate) async fn ingest_for_job(
+    pub(crate) async fn ingest_with_job_context(
         &self,
-        job: &market_squawk_jobs::JobRunContext,
+        job: Option<&market_squawk_jobs::JobRunContext>,
         mut request: ResearchIngestRequest,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<CommittedDataset, ResearchServiceError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?;
-        let analytical = Arc::clone(&self.analytical);
-        let job_cancellation = job.cancellation().clone();
+        let job_control = job.map(market_squawk_jobs::JobRunContext::cancellation);
+        let job_cancellation = job_control.unwrap_or(&cancellation).clone();
         let caller_cancellation = cancellation.clone();
+        // Original-capture owners take analytical admission before this I/O lane. Follow that
+        // same order and carry the exact lease into the retained worker; never reacquire it.
+        let admission = tokio::select! {
+            biased;
+            () = job_cancellation.cancelled() => return Err(IngestError::Cancelled.into()),
+            () = cancellation.cancelled() => return Err(IngestError::Cancelled.into()),
+            () = tokio::time::sleep_until(deadline.into()) => return Err(IngestError::DeadlineExceeded.into()),
+            admission = self.analytical.acquire_research_operation(&cancellation) => admission?,
+        };
+        // The request retains its publication guard inside the original worker. A non-job
+        // caller may return on interruption while this owned slot finishes cancellation;
+        // job callers preserve the existing drain-before-return contract.
         self.provider_capture_worker.run_with_job_context(
-            Some(job.cancellation()), deadline, &cancellation, move |operation_cancellation| {
+            job_control, deadline, &cancellation, move |operation_cancellation| {
                 let authority = Arc::new(JobInputPrecommit {
                     original: request.precommit_authority.take(),
                     job_cancellation,
@@ -928,7 +920,7 @@ impl ResearchService {
                 if let Err(error) = authority.validate_precommit() { return Err(error.into()); }
                 request.precommit_authority = Some(authority.clone());
                 runtime.block_on(async move {
-                    let operation = Self::ingest_on(&analytical, request, operation_cancellation.clone());
+                    let operation = Self::ingest_on(&admission, request, operation_cancellation.clone());
                     tokio::pin!(operation);
                     // The owning lane's original deadline cancels operation_cancellation.
                     // No timer/IO driver is needed by this retained storage continuation.
@@ -953,7 +945,7 @@ impl ResearchService {
     }
 
     async fn ingest_on(
-        analytical: &AnalyticalDataService,
+        admission: &market_squawk_data::AdmittedAnalyticalOperation,
         request: ResearchIngestRequest,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, ResearchServiceError> {
@@ -967,15 +959,13 @@ impl ResearchService {
             company_identity,
             precommit_authority,
         } = request;
-        let reservation = analytical
-            .reserve_source_ingest(
-                &source,
-                registered_at,
-                rights.clone(),
-                &identity,
-                &cancellation,
-            )
-            .await?;
+        let reservation = admission.reserve_source_ingest(
+            &source,
+            registered_at,
+            rights.clone(),
+            &identity,
+            &cancellation,
+        )?;
         match payload {
             ResearchIngestPayload::Provider {
                 sealed_capture,
@@ -994,7 +984,7 @@ impl ResearchService {
                 if let Some(precommit_authority) = precommit_authority {
                     publication = publication.with_precommit_authority(precommit_authority);
                 }
-                analytical
+                admission
                     .ingest_provider_publication(
                         reservation,
                         analytical_dataset,
@@ -1004,9 +994,12 @@ impl ResearchService {
                     .await
                     .map_err(Into::into)
             }
-            ResearchIngestPayload::Local(batch) => match (company_identity, precommit_authority) {
-                (None, Some(precommit_authority)) => analytical
-                    .ingest_with_precommit_authority(
+            ResearchIngestPayload::Local(batch) => {
+                if company_identity.is_some() {
+                    return Err(ResearchServiceError::IngestAuthorityMismatch);
+                }
+                admission
+                    .ingest_local(
                         reservation,
                         analytical_dataset,
                         batch,
@@ -1014,13 +1007,8 @@ impl ResearchService {
                         precommit_authority,
                     )
                     .await
-                    .map_err(Into::into),
-                (None, None) => analytical
-                    .ingest(reservation, analytical_dataset, batch, cancellation)
-                    .await
-                    .map_err(Into::into),
-                (Some(_), _) => Err(ResearchServiceError::IngestAuthorityMismatch),
-            },
+                    .map_err(Into::into)
+            }
         }
     }
 

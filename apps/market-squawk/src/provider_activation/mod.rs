@@ -2839,32 +2839,15 @@ fn provider_research_rights(
         source_id.clone(),
         basis,
         lease.rights_decision_digest(),
-        lease.verification_expires_at(),
+        // Reviewed retained-use policy has no expiry. Live verification is checked separately.
+        None,
         lease_research_operations(lease),
     )
     .map_err(Into::into)
 }
 
 fn lease_research_operations(lease: &ProviderActivationLease) -> Vec<SourceOperation> {
-    let mut operations = Vec::new();
-    for (provider_operation, research_operation) in [
-        (DataUseOperation::Retrieve, SourceOperation::Retrieve),
-        (DataUseOperation::Display, SourceOperation::Display),
-        (DataUseOperation::Persist, SourceOperation::Persist),
-        (DataUseOperation::ModelTraining, SourceOperation::Train),
-        (
-            DataUseOperation::Redistribute,
-            SourceOperation::Redistribute,
-        ),
-    ] {
-        if lease.admits(provider_operation) {
-            operations.push(research_operation);
-        }
-    }
-    if lease.admits(DataUseOperation::Persist) {
-        operations.push(SourceOperation::Cache);
-    }
-    operations
+    crate::research_service::research_source_operations(|operation| lease.admits(operation))
 }
 
 fn fred_research_rights(

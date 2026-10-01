@@ -54,7 +54,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::analytical_backup::AnalyticalOperationGate;
+use crate::analytical_backup::{AnalyticalOperationGate, AnalyticalOperationLease};
 use crate::authority_transition::{AuthorityTransitionError, AuthorityTransitionService};
 use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
 use crate::catalog::CatalogObservedRevisionAuthority;
@@ -1762,12 +1762,134 @@ pub struct AnalyticalDataService {
     operation_gate: AnalyticalOperationGate,
 }
 
+/// Admission to this exact service's existing analytical gate. Acquire before scheduling owned
+/// synchronous I/O, then retain this capability in that worker until its actual completion.
+/// The owner and lease are inseparable; callers cannot transplant admission to another catalog.
+pub struct AdmittedAnalyticalOperation {
+    data: Arc<AnalyticalDataService>,
+    operation: AnalyticalOperationLease,
+}
+
+impl fmt::Debug for AdmittedAnalyticalOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdmittedAnalyticalOperation([EXACT ANALYTICAL OWNER])")
+    }
+}
+
+impl AdmittedAnalyticalOperation {
+    /// Reserves through the existing source/rights authority without reacquiring its gate.
+    pub fn reserve_source_ingest(
+        &self,
+        source: &SourceMetadata,
+        registered_at: Timestamp,
+        rights: RightsDecisionInput,
+        identity: &IngestIdentity,
+        cancellation: &CancellationToken,
+    ) -> Result<IngestReservation, IngestError> {
+        self.data.reserve_source_ingest_admitted(
+            source,
+            registered_at,
+            rights,
+            identity,
+            cancellation,
+            &self.operation,
+        )
+    }
+
+    /// Publishes exact sealed evidence while retaining the same original admission.
+    pub fn ingest_provider_publication(
+        &self,
+        reservation: IngestReservation,
+        dataset: DatasetId,
+        input: ProviderPublicationInput,
+        cancellation: CancellationToken,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CommittedDataset, IngestError>> + Send + '_>,
+    > {
+        self.data.ingest_provider_publication_admitted(
+            reservation,
+            dataset,
+            input,
+            cancellation,
+            Some(&self.operation),
+        )
+    }
+
+    /// Uses the existing local extraction path under the same original admission.
+    pub async fn ingest_local(
+        &self,
+        reservation: IngestReservation,
+        dataset: DatasetId,
+        batch: ExtractionBatch,
+        cancellation: CancellationToken,
+        precommit: Option<Arc<dyn IngestPrecommitAuthority>>,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.data
+            .ingest_batch(
+                reservation,
+                dataset,
+                &batch,
+                None,
+                None,
+                None,
+                None,
+                cancellation,
+                precommit,
+                Some(&self.operation),
+            )
+            .await
+    }
+
+    /// Admits and authorizes physical lineage on the already admitted synchronous I/O owner.
+    pub fn authorize_research_use_with_retained_policy(
+        self,
+        request: crate::ResearchUseRequest,
+        policies: &[crate::RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedResearchUse, crate::ResearchUseCatalogError> {
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(request.limits().traversal_deadline())
+                .ok_or(crate::ResearchUseCatalogError::DeadlineExceeded)?,
+        );
+        self.data
+            .authorize_research_use_with_retained_policy_admitted(
+                request,
+                policies,
+                deadline,
+                cancellation,
+            )
+    }
+
+    /// Releases mutation admission before the independent exact-row authorization snapshot.
+    pub fn authorize_market_event_use_with_retained_policy(
+        self,
+        request: crate::MarketEventUseRequest,
+        policies: &[crate::RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedMarketEventUse, crate::ResearchUseCatalogError> {
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(request.limits().traversal_deadline())
+                .ok_or(crate::ResearchUseCatalogError::DeadlineExceeded)?,
+        );
+        self.data
+            .admit_retained_market_event_policy(&request, policies, deadline, cancellation)?;
+        let Self { data, operation } = self;
+        drop(operation);
+        data.authorize_market_event_use_snapshot(request, deadline, cancellation)
+    }
+}
+
 /// Exact provider evidence owned by the ingest run that created one immutable generation.
 ///
 /// The bindings retain the run's exact output grouping and exclude inherited provider lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationOwnedProviderCaptureEvidence {
     pinned: PinnedDataset,
+    origin_created_at: Timestamp,
     published_at: Timestamp,
     source_id: SourceId,
     objects: Box<[GenerationOwnedProviderCaptureObjectEvidence]>,
@@ -1793,6 +1915,11 @@ pub struct GenerationOwnedProviderCaptureInputEvidence {
 }
 
 impl GenerationOwnedProviderCaptureEvidence {
+    /// Original creating-generation publication coordinate, before catalog availability admission.
+    pub const fn origin_created_at(&self) -> Timestamp {
+        self.origin_created_at
+    }
+
     /// Actual creating generation catalog publication time, independent of source clocks.
     pub const fn published_at(&self) -> Timestamp {
         self.published_at
@@ -2773,6 +2900,156 @@ impl AnalyticalDataService {
         crate::AnalyticalReadCapability::new(Arc::clone(&self.manifests), Arc::clone(&self.objects))
     }
 
+    /// Acquires the existing operation gate before dispatch to an owned synchronous worker.
+    /// The caller keeps its original deadline while awaiting admission. Dropping this wait has
+    /// no worker to drain; after dispatch the worker must retain the returned exact-owner lease.
+    pub async fn acquire_research_operation(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+    ) -> Result<AdmittedAnalyticalOperation, IngestError> {
+        let operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        Ok(AdmittedAnalyticalOperation {
+            data: Arc::clone(self),
+            operation,
+        })
+    }
+
+    /// Reauthorizes exact retained inputs under explicit current policy, then commits the
+    /// research decision under the same catalog authority admission. Synchronous catalog
+    /// work must run on the caller's existing owned I/O worker.
+    pub async fn authorize_research_use_with_retained_policy(
+        &self,
+        request: crate::ResearchUseRequest,
+        policies: &[crate::RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedResearchUse, crate::ResearchUseCatalogError> {
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(request.limits().traversal_deadline())
+                .ok_or(crate::ResearchUseCatalogError::DeadlineExceeded)?,
+        );
+        let _operation = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.operation_gate.acquire(cancellation),
+        )
+        .await
+        .map_err(|_| crate::ResearchUseCatalogError::DeadlineExceeded)?
+        .ok_or(crate::ResearchUseCatalogError::Cancelled)?;
+        self.authorize_research_use_with_retained_policy_admitted(
+            request,
+            policies,
+            deadline,
+            cancellation,
+        )
+    }
+
+    fn authorize_research_use_with_retained_policy_admitted(
+        &self,
+        request: crate::ResearchUseRequest,
+        policies: &[crate::RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedResearchUse, crate::ResearchUseCatalogError> {
+        let authority = self.retained_policy_authority(deadline, cancellation)?;
+        authority.authorize_research_use_with_retained_policy(
+            request,
+            policies,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Admits current exact-payload policy and authorizes selected logical rows through the
+    /// existing snapshot engine. The snapshot rechecks current grants after writer release.
+    pub async fn authorize_market_event_use_with_retained_policy(
+        &self,
+        request: crate::MarketEventUseRequest,
+        policies: &[crate::RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedMarketEventUse, crate::ResearchUseCatalogError> {
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(request.limits().traversal_deadline())
+                .ok_or(crate::ResearchUseCatalogError::DeadlineExceeded)?,
+        );
+        {
+            let _operation = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.operation_gate.acquire(cancellation),
+            )
+            .await
+            .map_err(|_| crate::ResearchUseCatalogError::DeadlineExceeded)?
+            .ok_or(crate::ResearchUseCatalogError::Cancelled)?;
+            self.admit_retained_market_event_policy(&request, policies, deadline, cancellation)?;
+        }
+        self.authorize_market_event_use_snapshot(request, deadline, cancellation)
+    }
+
+    fn admit_retained_market_event_policy(
+        &self,
+        request: &crate::MarketEventUseRequest,
+        policies: &[crate::RetainedResearchUsePolicy],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), crate::ResearchUseCatalogError> {
+        let authority = self.retained_policy_authority(deadline, cancellation)?;
+        authority.admit_retained_market_event_policy(request, policies, deadline, cancellation)
+    }
+
+    fn authorize_market_event_use_snapshot(
+        &self,
+        request: crate::MarketEventUseRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedMarketEventUse, crate::ResearchUseCatalogError> {
+        let snapshot =
+            self.manifests
+                .read_snapshot(self.catalog_read_limits, deadline, cancellation)?;
+        snapshot.read(|snapshot| {
+            crate::research_use::authorize_market_event_use_in_snapshot(
+                snapshot,
+                self.catalog_id,
+                request,
+                deadline,
+                cancellation,
+            )
+        })
+    }
+
+    fn retained_policy_authority(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MutexGuard<'_, CatalogAuthority>, crate::ResearchUseCatalogError> {
+        let check = || {
+            if cancellation.is_cancelled() {
+                Err(crate::ResearchUseCatalogError::Cancelled)
+            } else if Instant::now() >= deadline {
+                Err(crate::ResearchUseCatalogError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        // The existing async operation gate owns admission. The caller's owned I/O worker
+        // waits for any remaining short catalog operation; no Tokio worker is blocked.
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)?;
+        check()?;
+        Ok(authority)
+    }
+
     /// Authorizes exact manifest lineage through this service's existing rights authority.
     pub fn authorize_research_use(
         &self,
@@ -3220,6 +3497,33 @@ impl AnalyticalDataService {
         identity: &IngestIdentity,
         cancellation: &CancellationToken,
     ) -> Result<IngestReservation, IngestError> {
+        let operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        self.reserve_source_ingest_admitted(
+            source,
+            registered_at,
+            rights,
+            identity,
+            cancellation,
+            &operation,
+        )
+    }
+
+    fn reserve_source_ingest_admitted(
+        &self,
+        source: &SourceMetadata,
+        registered_at: Timestamp,
+        rights: RightsDecisionInput,
+        identity: &IngestIdentity,
+        cancellation: &CancellationToken,
+        _operation: &AnalyticalOperationLease,
+    ) -> Result<IngestReservation, IngestError> {
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
         if source.source_id() != identity.source_id()
             || rights.source_id != *identity.source_id()
             || rights.payload_digest != identity.payload_digest()
@@ -3227,12 +3531,10 @@ impl AnalyticalDataService {
         {
             return Err(IngestError::ReservationPayloadMismatch);
         }
-        let _operation = self
-            .operation_gate
-            .acquire(cancellation)
-            .await
-            .ok_or(IngestError::Cancelled)?;
         let authority = self.lock_authority()?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
         if authority
             .source(source.source_id())?
             .as_ref()
@@ -3240,7 +3542,9 @@ impl AnalyticalDataService {
         {
             authority.register_source(source, registered_at)?;
         }
-        let grant = authority.admit_source_rights(rights)?;
+        let grant = authority
+            .admit_source_rights_with_research_uses(rights)
+            .map_err(|error| IngestError::ResearchUse(Box::new(error)))?;
         authority
             .reserve_ingest(identity, &grant)
             .map_err(Into::into)
@@ -3548,6 +3852,7 @@ impl AnalyticalDataService {
         }
         Ok(GenerationOwnedProviderCaptureEvidence {
             pinned: owned.pinned,
+            origin_created_at: owned.origin_created_at,
             published_at: owned.published_at,
             source_id: owned.source_id,
             objects: objects.into_boxed_slice(),
@@ -4213,6 +4518,7 @@ impl AnalyticalDataService {
         company_identity: Option<CompanyIdentityObservation>,
         cancellation: CancellationToken,
         precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
+        admitted_operation: Option<&AnalyticalOperationLease>,
     ) -> Result<CommittedDataset, IngestError> {
         let payload_digest = extraction_provider_payload_digest(batch);
         let source_id = batch.request().object().source_id().clone();
@@ -4344,11 +4650,15 @@ impl AnalyticalDataService {
         let converted = DatasetArrowBatch::from(converted);
         self.manifests
             .validate_append_schema(&analytical_dataset, &schema)?;
-        let _operation = self
-            .operation_gate
-            .acquire(&cancellation)
-            .await
-            .ok_or(IngestError::Cancelled)?;
+        let _operation = match admitted_operation {
+            Some(_) => None,
+            None => Some(
+                self.operation_gate
+                    .acquire(&cancellation)
+                    .await
+                    .ok_or(IngestError::Cancelled)?,
+            ),
+        };
         {
             let authority = self.lock_authority()?;
             let run =
@@ -4431,6 +4741,26 @@ impl AnalyticalDataService {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CommittedDataset, IngestError>> + Send + '_>,
     > {
+        self.ingest_provider_publication_admitted(
+            reservation,
+            analytical_dataset,
+            input,
+            cancellation,
+            None,
+        )
+    }
+
+    #[inline(never)]
+    fn ingest_provider_publication_admitted<'a>(
+        &'a self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        input: ProviderPublicationInput,
+        cancellation: CancellationToken,
+        admitted_operation: Option<&'a AnalyticalOperationLease>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CommittedDataset, IngestError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let ProviderPublicationInput {
                 sealed_capture,
@@ -4454,12 +4784,25 @@ impl AnalyticalDataService {
                     let retained = authority
                         .provider_capture_for_run(reservation.run_id())?
                         .ok_or(IngestError::IncompleteSuccessfulRun)?;
-                    (retained != prepared.evidence).then_some(retained)
+                    if retained != prepared.evidence {
+                        // Reuse this already-held writer view for the exact original-run
+                        // reconciliation; reobservation must not reacquire it with try_lock.
+                        let committed = self.reconcile_succeeded_provider_run(
+                            &authority,
+                            &reservation,
+                            &analytical_dataset,
+                            &retained,
+                            None,
+                        )?;
+                        Some((retained, committed))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             };
-            if let Some(retained) = reobserved {
+            if let Some((retained, committed)) = reobserved {
                 if company_identity.is_some()
                     || !revisions.is_locally_observed()
                     || !revisions.native_lineage_required()
@@ -4469,7 +4812,7 @@ impl AnalyticalDataService {
                 return self
                     .reconcile_provider_reobservation(
                         &reservation,
-                        &analytical_dataset,
+                        committed,
                         &prepared,
                         &retained,
                         sealed_capture.batch(),
@@ -4479,6 +4822,7 @@ impl AnalyticalDataService {
                             .as_deref()
                             .ok_or(IngestError::ReplayConflict)?,
                         &cancellation,
+                        admitted_operation,
                     )
                     .await;
             }
@@ -4492,6 +4836,7 @@ impl AnalyticalDataService {
                 company_identity,
                 cancellation,
                 precommit_authority,
+                admitted_operation,
             )
             .await
         })
@@ -5622,6 +5967,7 @@ impl AnalyticalDataService {
             None,
             cancellation,
             Some(precommit_authority),
+            None,
         )
         .await
     }
@@ -5648,6 +5994,7 @@ impl AnalyticalDataService {
             None,
             cancellation,
             Some(precommit_authority),
+            None,
         )
         .await
     }
@@ -5671,6 +6018,7 @@ impl AnalyticalDataService {
             None,
             Some(company_identity),
             cancellation,
+            None,
             None,
         )
         .await
@@ -5701,6 +6049,7 @@ impl AnalyticalDataService {
             Some(company_identity),
             cancellation,
             Some(precommit_authority),
+            None,
         )
         .await
     }
@@ -5892,7 +6241,7 @@ impl AnalyticalDataService {
     async fn reconcile_provider_reobservation(
         &self,
         reservation: &IngestReservation,
-        dataset: &DatasetId,
+        mut committed: CommittedDataset,
         input: &PreparedProviderCaptureBinding,
         retained: &crate::PersistedProviderCaptureBindingEvidence,
         batch: &ExtractionBatch,
@@ -5900,6 +6249,7 @@ impl AnalyticalDataService {
         rights: RightsDecisionInput,
         precommit: &dyn IngestPrecommitAuthority,
         cancellation: &CancellationToken,
+        admitted_operation: Option<&AnalyticalOperationLease>,
     ) -> Result<CommittedDataset, IngestError> {
         let deadline = Instant::now()
             .checked_add(REVISION_ASSIGNMENT_DEADLINE)
@@ -5961,10 +6311,6 @@ impl AnalyticalDataService {
             None => {}
         }
         check_market_event_read(deadline, cancellation)?;
-        let mut committed = {
-            let authority = self.market_recovery_authority(deadline, cancellation)?;
-            self.reconcile_succeeded_provider_run(&authority, reservation, dataset, retained, None)?
-        };
         let owned = self
             .manifests
             .generation_owned_provider_captures_bounded(
@@ -6026,16 +6372,25 @@ impl AnalyticalDataService {
         if seen.len() != fresh_rows.len() {
             return Err(IngestError::ReplayConflict);
         }
-        let _operation = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.operation_gate.acquire(cancellation),
-        )
-        .await
-        .map_err(|_| IngestError::DeadlineExceeded)?
-        .ok_or(IngestError::Cancelled)?;
+        let _operation = match admitted_operation {
+            Some(_) => None,
+            None => Some(
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.operation_gate.acquire(cancellation),
+                )
+                .await
+                .map_err(|_| IngestError::DeadlineExceeded)?
+                .ok_or(IngestError::Cancelled)?,
+            ),
+        };
         check_market_event_read(deadline, cancellation)?;
         precommit.validate_precommit()?;
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
+        // The existing operation gate admits mutation; production calendar ingest runs on
+        // its owned I/O worker. A competing short catalog operation is not lost authority.
+        // Mutex acquisition itself cannot be cancelled, so check again before any mutation.
+        let authority = self.lock_authority()?;
+        check_market_event_read(deadline, cancellation)?;
         let run = self.validate_run(
             &authority,
             reservation,
@@ -6046,7 +6401,9 @@ impl AnalyticalDataService {
             return Err(IngestError::ReplayConflict);
         }
         precommit.validate_catalog_precommit(&authority)?;
-        let grant = authority.admit_source_rights(rights)?;
+        let grant = authority
+            .admit_source_rights_with_research_uses(rights)
+            .map_err(|error| IngestError::ResearchUse(Box::new(error)))?;
         authority
             .catalog()
             .retain_provider_reobservation(
@@ -6431,6 +6788,7 @@ impl ResearchIngestService for AnalyticalDataService {
             None,
             cancellation,
             None,
+            None,
         )
         .await
     }
@@ -6452,6 +6810,7 @@ impl ResearchIngestService for AnalyticalDataService {
             None,
             None,
             cancellation,
+            None,
             None,
         )
         .await

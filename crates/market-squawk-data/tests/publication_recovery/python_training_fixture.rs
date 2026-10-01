@@ -43,6 +43,7 @@ pub(super) async fn publish(root: &Path) -> TestResult {
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
         market,
         true,
+        None,
     )
     .await?;
     let research_limits = ResearchUseLimits::try_new(

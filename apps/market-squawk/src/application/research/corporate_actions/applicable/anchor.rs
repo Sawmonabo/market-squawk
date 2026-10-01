@@ -218,6 +218,7 @@ impl SourceAppliedCorporateActionReadCapability {
         job: Option<&market_squawk_jobs::JobRunContext>,
     ) -> Result<Box<[Timestamp]>, ApplicableActionPlanError> {
         let receipt = history.selection().receipt().clone();
+        let knowledge_cutoff = history.read_receipt().knowledge_cutoff();
         self.research
             .read_provider_capture_generation_with_job_context(
                 job,
@@ -228,7 +229,9 @@ impl SourceAppliedCorporateActionReadCapability {
                     let invalid = || crate::ResearchServiceError::IngestAuthorityMismatch;
                     if generation.pinned().manifest() != receipt.origin_manifest()
                         || generation.source_id() != receipt.source_id()
-                        || generation.published_at() != receipt.published_at()
+                        || generation.origin_created_at() != receipt.published_at()
+                        || generation.published_at() < receipt.published_at()
+                        || generation.published_at() > knowledge_cutoff
                     {
                         return Err(invalid());
                     }

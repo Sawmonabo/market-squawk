@@ -2295,6 +2295,84 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn retained_authorization_waits_outside_original_capture_io_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use market_squawk_data::{
+            DatasetManifestRef, DatasetSchemaRegistry, ResearchUse, ResearchUseCatalogError,
+            ResearchUseLimits, ResearchUseRequest, Sha256Digest,
+        };
+        use std::task::Poll;
+
+        let (coordinator, _mutation) = test_coordinator()?;
+        let research = &coordinator.research;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // This checked request is intentionally unresolved: while original custody owns the
+        // gate, authorization must wait before catalog validation and must not occupy raw I/O.
+        let request = ResearchUseRequest::try_new(
+            vec![DatasetManifestRef::try_new_with_schema(
+                DatasetId::try_from("pending-original-authorization")?,
+                1,
+                DatasetSchemaRegistry::local().canonical_research_observations()?,
+                Sha256Digest::new([71; 32]),
+            )?],
+            ResearchUse::LocalAnalysis,
+            ResearchUseLimits::try_new(
+                1,
+                8,
+                8,
+                8,
+                1024 * 1024,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )?,
+        )?;
+        let original = research
+            .analytical()
+            .acquire_provider_capture_original_lease(deadline, &cancellation)
+            .await?;
+        let authorization = research.authorize_research_use(request, deadline, &cancellation);
+        tokio::pin!(authorization);
+        // A single explicit poll deterministically enters admission. No spawned-task timing
+        // or sleep is used to guess that authorization has reached the held gate.
+        let first_poll = futures_util::poll!(authorization.as_mut());
+        let pending = first_poll.is_pending();
+        let marker_cancellation = CancellationToken::new();
+        let marker = research
+            .run_owned_research_io(
+                Instant::now() + Duration::from_secs(1),
+                &marker_cancellation,
+                |_| 37_u8,
+            )
+            .await;
+
+        // Record all results and release/drain actual ownership before any assertion can panic.
+        cancellation.cancel();
+        let authorization_result = match first_poll {
+            Poll::Pending => authorization.await,
+            Poll::Ready(result) => result,
+        };
+        drop(original);
+        let drained = research
+            .finish_owned_io_shutdown(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(
+            pending,
+            "authorization must wait on the actual original-capture lease"
+        );
+        assert_eq!(
+            marker?, 37,
+            "original-capture I/O must remain usable during admission"
+        );
+        assert!(matches!(
+            authorization_result,
+            Ok(Err(ResearchUseCatalogError::Cancelled))
+        ));
+        drained?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exact_parent_install_coalesces_and_successor_replaces_only_fresh_admission()
     -> Result<(), Box<dyn std::error::Error>> {
         let (coordinator, mutation) = test_coordinator()?;

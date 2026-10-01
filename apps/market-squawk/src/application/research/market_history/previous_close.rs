@@ -75,7 +75,10 @@ impl MarketHistoryReadCapability {
             })
             .await
             .map_err(map_research_error)?
-            .map_err(read_error)?;
+            .map_err(read_error)
+            .inspect_err(|error| {
+                trace_close_read_failure(instrument_id, "latest-window-selection", error)
+            })?;
         check(context)?;
         let Some(selection) = selection else {
             return Ok(None);
@@ -88,7 +91,10 @@ impl MarketHistoryReadCapability {
                 context.cancellation().clone(),
             )
             .await
-            .map_err(read_error)?
+            .map_err(read_error)
+            .inspect_err(|error| {
+                trace_close_read_failure(instrument_id, "canonical-cursor-read", error)
+            })?
         else {
             return Ok(None);
         };
@@ -99,7 +105,10 @@ impl MarketHistoryReadCapability {
                 context.cancellation(),
             )
             .await
-            .map_err(map_research_error)?;
+            .map_err(map_research_error)
+            .inspect_err(|error| {
+                trace_close_read_failure(instrument_id, "native-session-rejoin", error)
+            })?;
         check(context)?;
         let Some(native) = history.native_sessions() else {
             // A date or aggregation boundary alone cannot establish a session close.
@@ -115,29 +124,34 @@ impl MarketHistoryReadCapability {
             || native.published_at() > knowledge_cutoff
             || native.received_at() > knowledge_cutoff
         {
-            return Err(ServiceError::InvalidResult);
+            return Err(invalid_close_read(instrument_id, "publication-receipt"));
         }
         let currency = publication.currency();
         let mut parents = vec![history.selection().pinned().manifest().clone()];
         if !parents.contains(history.read_receipt().origin_manifest()) {
             parents.push(history.read_receipt().origin_manifest().clone());
         }
-        let permit =
-            authorize_projection_parents(research, &parents, knowledge_cutoff, context).await?;
+        let permit = authorize_projection_parents(research, &parents, knowledge_cutoff, context)
+            .await
+            .inspect_err(|error| {
+                trace_close_read_failure(instrument_id, "projection-rights", error)
+            })?;
         let mut bars = history.bars();
         let mut bar_count = 0usize;
         let mut previous = None;
         let mut latest = None;
         for session in native.sessions().iter() {
             check(context)?;
-            let session = session.map_err(read_error)?;
+            let session = session.map_err(read_error).inspect_err(|error| {
+                trace_close_read_failure(instrument_id, "native-session-read", error)
+            })?;
             let session_close = session.closes_at_exclusive();
             if session.opens_at() >= session_close
                 || previous.is_some_and(|(date, close)| {
                     date >= session.native_date() || close >= session_close
                 })
             {
-                return Err(ServiceError::InvalidResult);
+                return Err(invalid_close_read(instrument_id, "native-session-order"));
             }
             previous = Some((session.native_date(), session_close));
             if !session.bar_present() {
@@ -147,7 +161,7 @@ impl MarketHistoryReadCapability {
                 .next()
                 .transpose()
                 .map_err(read_error)?
-                .ok_or(ServiceError::InvalidResult)?;
+                .ok_or_else(|| invalid_close_read(instrument_id, "missing-bar"))?;
             bar_count = bar_count
                 .checked_add(1)
                 .ok_or(ServiceError::ResourceExhausted)?;
@@ -155,7 +169,7 @@ impl MarketHistoryReadCapability {
             let available = provenance
                 .availability()
                 .conservative_available_at()
-                .ok_or(ServiceError::InvalidResult)?;
+                .ok_or_else(|| invalid_close_read(instrument_id, "missing-availability"))?;
             let coordinate_matches = if let Some(date) = bar.time_semantics().nominal_daily_date() {
                 session.provider_timestamp().is_none()
                     && session.provider_period().is_none()
@@ -188,7 +202,10 @@ impl MarketHistoryReadCapability {
                         | DataQuality::Quarantined
                 )
             {
-                return Err(ServiceError::InvalidResult);
+                return Err(invalid_close_read(
+                    instrument_id,
+                    "bar-coordinate-or-provenance",
+                ));
             }
             if session_close <= knowledge_cutoff
                 && session
@@ -206,7 +223,7 @@ impl MarketHistoryReadCapability {
         if bars.next().transpose().map_err(read_error)?.is_some()
             || bar_count != history.bar_count()
         {
-            return Err(ServiceError::InvalidResult);
+            return Err(invalid_close_read(instrument_id, "terminal-bar-count"));
         }
         check(context)?;
         let now = SystemTime::now()
@@ -240,4 +257,14 @@ fn read_error(error: AnalyticalReadError) -> ServiceError {
         MarketHistoryUnavailableReason::StorageUnavailable => ServiceError::Unavailable,
         MarketHistoryUnavailableReason::IntegrityUnproven => ServiceError::InvalidResult,
     }
+}
+
+fn invalid_close_read(instrument: InstrumentId, stage: &'static str) -> ServiceError {
+    let error = ServiceError::InvalidResult;
+    trace_close_read_failure(instrument, stage, &error);
+    error
+}
+
+fn trace_close_read_failure(instrument: InstrumentId, stage: &'static str, error: &ServiceError) {
+    tracing::warn!(%instrument, stage, ?error, "Previous close evidence could not be read");
 }

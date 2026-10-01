@@ -132,6 +132,13 @@ pub(crate) async fn publish_alpaca_market_calendar_with_job_context(
     let rights = runtime
         .calendar_rights()
         .decision(extraction_provider_payload_digest(binding.batch()), now)
+        .inspect_err(|error| {
+            tracing::warn!(
+                stage = "calendar_rights",
+                ?error,
+                "calendar publication unavailable"
+            );
+        })
         .map_err(|_| operation_error(deadline, cancellation))?;
     let request = ResearchIngestRequest::with_provider_publication(
         metadata.clone(),
@@ -141,23 +148,34 @@ pub(crate) async fn publish_alpaca_market_calendar_with_job_context(
         revisions,
     )
     .map_err(invalid)?;
-    // No network or ordinary runtime callback runs while this existing account mutation guard
+    // No network or ordinary runtime callback runs while this existing account read guard
     // is retained. The borrowed catalog hook validates the same authority at durable commit.
     let guard = runtime
         .acquire_calendar_publication_authority(deadline, cancellation)
         .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                stage = "calendar_publication_authority",
+                ?error,
+                "calendar publication unavailable"
+            );
+        })
         .map_err(map_capability_error)?;
     let request = request.with_precommit_authority(Arc::clone(&guard));
-    let committed = match job {
-        Some(job) => {
-            service
-                .ingest_for_job(job, request, cancellation.clone(), deadline)
-                .await
-        }
-        None => service.ingest(request, cancellation.clone()).await,
-    };
+    let committed = service
+        .ingest_with_job_context(job, request, cancellation.clone(), deadline)
+        .await;
     drop(guard);
-    let committed = committed.map_err(map_research_error)?;
+    let committed = committed
+        .inspect_err(|error| {
+            tracing::warn!(stage = "calendar_ingest", kind = ?std::mem::discriminant(error),
+            "calendar publication unavailable");
+            if let ResearchServiceError::Ingest(error) = error {
+                tracing::warn!(stage = "calendar_ingest", kind = ?std::mem::discriminant(error),
+                "calendar ingest rejected");
+            }
+        })
+        .map_err(map_research_error)?;
     // Reobservation retains the fresh raw receipt separately; the canonical generation still
     // owns its original binding and first-observed calendar facts.
     let binding_digest = committed
@@ -166,6 +184,13 @@ pub(crate) async fn publish_alpaca_market_calendar_with_job_context(
     runtime
         .require_current(deadline, cancellation)
         .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                stage = "calendar_final_currentness",
+                ?error,
+                "calendar publication unavailable"
+            );
+        })
         .map_err(map_capability_error)?;
     Ok(PublishedAlpacaCalendar {
         manifest: committed.manifest().clone(),

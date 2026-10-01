@@ -436,13 +436,30 @@ impl ResearchService {
             deadline,
             cancellation,
             move |owned, store, control, _, _| {
-                let invalid = || ResearchServiceError::IngestAuthorityMismatch;
+                let invalid = |stage: &'static str| {
+                    tracing::warn!(stage, "retained history native-session rejoin rejected");
+                    ResearchServiceError::IngestAuthorityMismatch
+                };
                 let receipt = output.selection().receipt();
                 if owned.pinned().manifest() != receipt.origin_manifest()
                     || owned.source_id() != receipt.source_id()
-                    || owned.published_at() != receipt.published_at()
+                    || owned.origin_created_at() != receipt.published_at()
+                    || owned.published_at() < receipt.published_at()
+                    || owned.published_at() > output.read_receipt().knowledge_cutoff()
                 {
-                    return Err(invalid());
+                    tracing::warn!(
+                        stage = "origin",
+                        manifest_mismatch = owned.pinned().manifest() != receipt.origin_manifest(),
+                        source_mismatch = owned.source_id() != receipt.source_id(),
+                        publication_clock_mismatch =
+                            owned.origin_created_at() != receipt.published_at(),
+                        availability_before_publication =
+                            owned.published_at() < receipt.published_at(),
+                        availability_after_cutoff =
+                            owned.published_at() > output.read_receipt().knowledge_cutoff(),
+                        "retained history native-session coordinates differ"
+                    );
+                    return Err(ResearchServiceError::IngestAuthorityMismatch);
                 }
                 let object = owned
                     .objects()
@@ -451,20 +468,28 @@ impl ResearchService {
                         object.generation_object_ordinal()
                             == usize::from(receipt.origin_object_ordinal())
                     })
-                    .ok_or_else(invalid)?;
+                    .ok_or_else(|| invalid("object_missing"))?;
                 if object.object().artifact_id() != receipt.origin_artifact_id()
                     || object.inputs().len() != 1
                 {
-                    return Err(invalid());
+                    tracing::warn!(
+                        stage = "object",
+                        artifact_mismatch =
+                            object.object().artifact_id() != receipt.origin_artifact_id(),
+                        input_count_mismatch = object.inputs().len() != 1,
+                        "retained history native-session coordinates differ"
+                    );
+                    return Err(invalid("object"));
                 }
                 let binding = object.inputs()[0].binding();
-                let (component_ordinal, digest, page_count) =
-                    receipt.session_calendar_component().ok_or_else(invalid)?;
+                let (component_ordinal, digest, page_count) = receipt
+                    .session_calendar_component()
+                    .ok_or_else(|| invalid("calendar_coordinate_missing"))?;
                 let component = binding
                     .capture()
                     .request_graph_components()
                     .get(usize::from(component_ordinal))
-                    .ok_or_else(invalid)?;
+                    .ok_or_else(|| invalid("calendar_component_missing"))?;
                 if binding.binding_digest().bytes() != receipt.binding_digest().bytes()
                     || binding.sealed_capture_receipt_digest().bytes()
                         != receipt.capture_receipt_digest().bytes()
@@ -477,10 +502,39 @@ impl ResearchService {
                     || binding.layout() != "whole_single_segment"
                     || binding.physical_claims().len() != 1
                 {
-                    return Err(invalid());
+                    tracing::warn!(
+                        stage = "graph",
+                        binding_mismatch =
+                            binding.binding_digest().bytes() != receipt.binding_digest().bytes(),
+                        capture_receipt_mismatch = binding.sealed_capture_receipt_digest().bytes()
+                            != receipt.capture_receipt_digest().bytes(),
+                        content_mismatch = binding.capture().content_digest().bytes()
+                            != receipt.capture_graph_digests().0.bytes(),
+                        observation_mismatch = binding.capture().observation_digest().bytes()
+                            != receipt.capture_graph_digests().1.bytes(),
+                        component_mismatch = component.content_digest().bytes() != digest.bytes(),
+                        page_count_mismatch = component.page_count().get() != page_count,
+                        layout_mismatch = binding.layout() != "whole_single_segment",
+                        claim_count_mismatch = binding.physical_claims().len() != 1,
+                        "retained history native-session coordinates differ"
+                    );
+                    return Err(invalid("graph"));
                 }
-                let (start, end) = receipt.requested_range().ok_or_else(invalid)?;
-                let (start_date, end_date) = (utc_date(start)?, utc_date(end)?);
+                let (start, end) = receipt
+                    .requested_range()
+                    .ok_or_else(|| invalid("requested_range_missing"))?;
+                let start_date = utc_date(start).inspect_err(|_| {
+                    tracing::warn!(
+                        stage = "request_start_date",
+                        "retained history native-session rejoin rejected"
+                    );
+                })?;
+                let end_date = utc_date(end).inspect_err(|_| {
+                    tracing::warn!(
+                        stage = "request_end_date",
+                        "retained history native-session rejoin rejected"
+                    );
+                })?;
                 let mut request = None;
                 for environment in [
                     AlpacaTradingApiEnvironment::Live,
@@ -491,34 +545,36 @@ impl ResearchService {
                         start_date,
                         end_date,
                     )
-                    .map_err(|_| invalid())?;
+                    .map_err(|_| invalid("request_construction"))?;
                     if candidate
                         .capture_request_identity()
-                        .map_err(|_| invalid())?
+                        .map_err(|_| invalid("request_identity"))?
                         == component.request_set_identity()
                     {
                         if request.replace(candidate).is_some() {
-                            return Err(invalid());
+                            return Err(invalid("request_ambiguous"));
                         }
                     }
                 }
-                let request = request.ok_or_else(invalid)?;
-                let segment = store.open_verified_claim_with_control(
-                    binding.physical_claims()[0].claim(),
-                    control,
-                )?;
+                let request = request.ok_or_else(|| invalid("request_unmatched"))?;
+                let segment = store
+                    .open_verified_claim_with_control(binding.physical_claims()[0].claim(), control)
+                    .inspect_err(|error| {
+                        tracing::warn!(stage = "raw_reopen", kind = ?std::mem::discriminant(error),
+                        "retained history native-session rejoin rejected");
+                    })?;
                 let sealed = SealedProviderCaptureSetReceipt::try_bind(
                     binding.capture().clone(),
                     segment.receipt().clone(),
                 )
-                .map_err(|_| invalid())?;
+                .map_err(|_| invalid("sealed_binding"))?;
                 if sealed.receipt_digest()
                     != EvidenceDigest::new(
                         DigestAlgorithm::Sha256,
                         receipt.capture_receipt_digest().bytes(),
                     )
                 {
-                    return Err(invalid());
+                    return Err(invalid("sealed_receipt"));
                 }
                 let replay = AlpacaRetainedCalendarSessions::try_replay(
                     &request, &sealed, &segment, control,
@@ -530,6 +586,10 @@ impl ResearchService {
             },
         )
         .await
+        .inspect_err(|error| {
+            tracing::warn!(stage = "capture_generation_read", kind = ?std::mem::discriminant(error),
+                "retained history native-session rejoin unavailable");
+        })
     }
 }
 
@@ -546,6 +606,11 @@ fn utc_date(timestamp: Timestamp) -> Result<CalendarDate, ResearchServiceError> 
 fn map_calendar_replay_error(
     error: market_squawk_adapter_alpaca::AlpacaCalendarDecodeError,
 ) -> ResearchServiceError {
+    tracing::warn!(
+        stage = "calendar_replay",
+        ?error,
+        "retained history native-session rejoin rejected"
+    );
     match error {
         market_squawk_adapter_alpaca::AlpacaCalendarDecodeError::Control(control) => {
             market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(control).into()
@@ -556,6 +621,8 @@ fn map_calendar_replay_error(
 fn map_native_history_error(
     error: market_squawk_data::AnalyticalReadError,
 ) -> ResearchServiceError {
+    tracing::warn!(stage = "native_period_join", kind = ?std::mem::discriminant(&error),
+        "retained history native-session rejoin rejected");
     match error {
         market_squawk_data::AnalyticalReadError::NativeSessionControl(control) => {
             market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(control).into()

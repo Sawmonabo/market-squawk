@@ -256,25 +256,16 @@ pub(crate) async fn authorize_projection_parents(
         std::time::Duration::from_secs(market_squawk_data::MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS),
     )
     .map_err(|_| ServiceError::InvalidResult)?;
-    let request = ResearchUseRequest::try_new(parents.to_vec(), ResearchUse::LocalAnalysis, limits)
+    let request = ResearchUseRequest::try_new(parents.to_vec(), ResearchUse::Display, limits)
         .map_err(|_| ServiceError::InvalidResult)?;
     let authorized = research
         .authorize_research_use(request, context.deadline(), context.cancellation())
         .await
         .map_err(crate::application::research::corporate_actions::map_research_error)?
-        .map_err(|error| match error {
-            market_squawk_data::ResearchUseCatalogError::Cancelled => ServiceError::Cancelled,
-            market_squawk_data::ResearchUseCatalogError::DeadlineExceeded => {
-                ServiceError::DeadlineExceeded
-            }
-            market_squawk_data::ResearchUseCatalogError::LimitExceeded => {
-                ServiceError::ResourceExhausted
-            }
-            _ => ServiceError::InvalidResult,
-        })?;
+        .map_err(crate::application::research::map_research_use_error)?;
     check(context)?;
     let now = wall_now()?;
-    if authorized.research_use() != ResearchUse::LocalAnalysis
+    if authorized.research_use() != ResearchUse::Display
         || now < source_cutoff
         || now >= authorized.expires_at()
         || authorized.graph().roots().len() != parents.len()

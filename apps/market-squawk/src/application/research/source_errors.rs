@@ -3,7 +3,7 @@
 use market_squawk_data::{
     CurrentPopulationError, IngestError, ListingReferenceError, MarketDataInstrumentCatalogError,
     ParquetStoreError, ProviderMarketEventSelectionError, PythonDatasetCatalogError,
-    ResearchUseCatalogError, ResearchUseError,
+    ResearchUseCatalogError, ResearchUseDenialReason, ResearchUseError,
 };
 use market_squawk_services::ServiceError;
 
@@ -126,8 +126,16 @@ pub(crate) fn map_research_use_error(error: ResearchUseCatalogError) -> ServiceE
         | ResearchUseCatalogError::Contract(
             ResearchUseError::AllocationFailed | ResearchUseError::CanonicalEncodingOverflow,
         ) => ServiceError::ResourceExhausted,
-        ResearchUseCatalogError::Denied { .. }
-        | ResearchUseCatalogError::Expired
+        ResearchUseCatalogError::Denied { reason, .. } => match reason {
+            ResearchUseDenialReason::MissingGrant
+            | ResearchUseDenialReason::Expired
+            | ResearchUseDenialReason::Revoked => ServiceError::Unauthorized,
+            ResearchUseDenialReason::CorruptAuthority => ServiceError::InvalidResult,
+            ResearchUseDenialReason::LimitExceeded => ServiceError::ResourceExhausted,
+            ResearchUseDenialReason::Cancelled => ServiceError::Cancelled,
+            ResearchUseDenialReason::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        },
+        ResearchUseCatalogError::Expired
         | ResearchUseCatalogError::Revoked
         | ResearchUseCatalogError::InvalidPermitSession => ServiceError::Unauthorized,
         ResearchUseCatalogError::InvalidGrant
