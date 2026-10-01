@@ -4123,9 +4123,13 @@ async fn installed_public_crypto_exact_journey(input: ExactPublicCryptoInput) ->
             Duration::from_secs(120),
         )?;
         desktop.bootstrap(CancellationToken::new()).await?;
-        tokio::time::timeout(Duration::from_secs(30), probe.reopen(&restarted_reader))
-            .await
-            .context("exact crypto reopen after installed restart timed out")?
+        let read_deadline = Instant::now() + Duration::from_secs(30);
+        tokio::time::timeout_at(
+            read_deadline.into(),
+            probe.reopen(&restarted_reader, read_deadline),
+        )
+        .await
+        .context("exact crypto reopen after installed restart timed out")?
     }
     .await;
     restarted_shutdown.cancel();
@@ -4226,9 +4230,13 @@ async fn wait_for_exact_public_crypto_publication(
                 )
                 .await?
                 .context("selected crypto source has not committed a publication")?;
-            let read = tokio::time::timeout(Duration::from_secs(30), probe.reopen(reader))
-                .await
-                .context("exact crypto pre-restart read timed out")??;
+            let read_deadline = deadline.min(Instant::now() + Duration::from_secs(30));
+            let read = tokio::time::timeout_at(
+                read_deadline.into(),
+                probe.reopen(reader, read_deadline),
+            )
+            .await
+            .context("exact crypto pre-restart read timed out")??;
             Ok::<_, anyhow::Error>((probe, read))
         }
         .await;

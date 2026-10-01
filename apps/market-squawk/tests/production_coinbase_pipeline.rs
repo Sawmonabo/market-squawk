@@ -40,15 +40,14 @@ fn production_contract_is_exactly_allowlisted_typed_and_non_executable() -> Test
     let production = ProductionLiveSourceComposition::try_new(config, vec![route])?;
 
     assert_eq!(
-        production.endpoint(),
+        production.endpoint()?,
         "wss://advanced-trade-ws.coinbase.com"
     );
-    assert_eq!(
-        production.metadata().quality_ceiling(),
-        DataQuality::DirectUnverified
-    );
+    let metadata = production.source_metadata()?;
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].quality_ceiling(), DataQuality::DirectUnverified);
     assert_eq!(production.routes().len(), 1);
-    assert!(production.metadata().coverage().live().is_some());
+    assert!(metadata[0].coverage().live().is_some());
     Ok(())
 }
 

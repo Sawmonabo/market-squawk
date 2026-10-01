@@ -888,6 +888,7 @@ impl YahooMarketEventRestartSelector {
     pub(crate) async fn reopen(
         &self,
         research: &ResearchService,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<YahooMarketEventRestartReceipt, YahooEnrichmentPublicationError> {
         let selector = research
@@ -918,7 +919,8 @@ impl YahooMarketEventRestartSelector {
             .read_provider_market_event_publication(
                 &self.manifest,
                 selector,
-                store.as_ref(),
+                store,
+                deadline,
                 cancellation,
             )
             .await?;
@@ -1247,7 +1249,7 @@ impl ProductionResearchIngestCoordinator {
                     source_id,
                     expected_event_count,
                 },
-                YahooRestartRequest::Quotes,
+                YahooRestartRequest::Quotes { deadline },
             ) => {
                 let receipt = YahooMarketEventRestartSelector {
                     manifest,
@@ -1255,7 +1257,7 @@ impl ProductionResearchIngestCoordinator {
                     source_id,
                     expected_event_count,
                 }
-                .reopen(self.research.as_ref(), cancellation)
+                .reopen(self.research.as_ref(), deadline, cancellation)
                 .await
                 .map_err(|_error| YahooProductError::Application)?;
                 Ok(YahooRestartOutcome::Quotes {

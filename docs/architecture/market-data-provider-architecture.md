@@ -594,11 +594,16 @@ validates that watch after reading, so a concurrent identity publication cannot 
 snapshot. Contention at the short mutation boundary observes the original cancellation/deadline;
 an occupied writer mutex alone is not an invalid identity.
 
-Market-event point reads resolve the selected publication's original artifact set inside the
-requested immutable manifest and verify only those objects. Raw-capture, identity, cutoff and tie
-checks remain required; unrelated archived files are not reopened for each market card. Current
-market-event publications retain identity in per-object schema metadata; the research-observation
-compactor does not support combining them. Event compaction is not a verified capability.
+Market-event point reads resolve the selected publication's original artifact set through its
+verified creating ancestor and verify only those objects. The requested manifest remains the
+selection identity. Raw-capture, identity, cutoff and tie checks remain required; unrelated archived
+files are not reopened for each market card. Market compaction streams canonical rows through the
+existing bounded cursor/writer, preserving row order and lineage while retaining original objects
+and their per-publication metadata for exact evidence reads. Alpaca publication requests compaction
+before exceeding the configured object count. The existing restart critical verifies compaction,
+subsequent append and original-evidence reopening. Continuous ingestion remains incomplete while
+cumulative publication/source-run lineage retains a lifetime ceiling; the delivery ledger tracks
+the required direct-edge/ancestry correction and live verification.
 
 Alpaca stock history binds the current catalog-selected native asset UUID and listing to an
 explicit New York symbol-resolution date (`asof`). Capture and publication retain that selection's

@@ -159,6 +159,7 @@ impl CryptoInstalledPublicationProbe {
     pub async fn reopen(
         &self,
         reader: &CryptoInstalledPublicationReader,
+        deadline: Instant,
     ) -> anyhow::Result<CryptoInstalledTypedRead> {
         let research = reader
             .research
@@ -166,7 +167,7 @@ impl CryptoInstalledPublicationProbe {
             .context("installed research owner has stopped")?;
         let reopened = self
             .selector
-            .reopen(research.as_ref(), CancellationToken::new())
+            .reopen(research.as_ref(), deadline, CancellationToken::new())
             .await
             .context(
                 "reopen exact installed crypto raw/native evidence and typed Parquet events",

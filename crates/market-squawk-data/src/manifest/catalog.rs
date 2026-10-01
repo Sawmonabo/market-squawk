@@ -553,15 +553,15 @@ impl AnalyticalManifestCatalog {
         })
     }
 
-    /// Resolves every original output of a retained publication's creating run inside this pin.
-    /// Market-event publication identity lives in object metadata, so every original object
-    /// must remain in the pin. Missing or inconsistent metadata is an integrity failure.
+    /// Resolves a retained publication's original objects in its verified creating ancestor.
+    /// Compaction preserves the publication binding but replaces the current generation's objects;
+    /// exact publication reads retain and verify the original immutable object metadata.
     pub(crate) fn provider_publication_objects_bounded(
         &self,
         pinned: &PinnedDataset,
         publication: &ProviderMarketEventExactPublication,
         snapshot: &CatalogReadSnapshot,
-    ) -> Result<Vec<(Uuid, usize)>, ManifestCatalogError> {
+    ) -> Result<(PinnedDataset, Vec<(Uuid, usize)>), ManifestCatalogError> {
         let connection = snapshot.connection();
         let manifest = pinned.manifest();
         let run_id: String = connection
@@ -594,6 +594,63 @@ impl AnalyticalManifestCatalog {
             .optional()?
             .ok_or(ManifestCatalogError::GenerationConflict)?;
         let run_id = Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+        // Follow only exact retained parent edges. Inherited bindings alone cannot establish
+        // that a publication belongs to this requested generation.
+        let (version, schema_name, schema_version, fingerprint, digest) = connection
+            .query_row(
+                "WITH RECURSIVE ancestry(generation_sequence, dataset_id, manifest_version) AS (
+                 SELECT generation_sequence, dataset_id, manifest_version
+                 FROM analytical_available_generations WHERE dataset_id=?1 AND manifest_version=?2
+                 UNION
+                 SELECT parent.generation_sequence, parent.dataset_id, parent.manifest_version
+                 FROM ancestry AS child
+                 JOIN analytical_generation_parents AS edge
+                   ON edge.child_dataset_id=child.dataset_id
+                  AND edge.child_manifest_version=child.manifest_version
+                 JOIN analytical_available_generations AS parent
+                   ON parent.generation_sequence=edge.parent_generation_sequence
+                  AND parent.dataset_id=edge.parent_dataset_id
+                  AND parent.manifest_version=edge.parent_manifest_version
+                  AND parent.schema_name=edge.parent_schema_name
+                  AND parent.schema_version=edge.parent_schema_version
+                  AND parent.schema_fingerprint=edge.parent_schema_fingerprint
+                  AND parent.content_hash=edge.parent_content_hash
+                 WHERE parent.dataset_id=?1
+             )
+             SELECT origin.manifest_version, origin.schema_name, origin.schema_version,
+                    origin.schema_fingerprint, origin.content_hash
+             FROM ancestry
+             JOIN analytical_available_generations AS origin USING(generation_sequence)
+             JOIN analytical_generation_source_inputs AS input USING(generation_sequence)
+             WHERE input.run_id=?3 AND origin.generation_kind='ingest'",
+                params![
+                    manifest.dataset_id().as_str(),
+                    to_i64(manifest.manifest_version())?,
+                    run_id.to_string()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+        let origin_manifest = DatasetManifestRef::try_new_with_schema(
+            manifest.dataset_id().clone(),
+            from_i64(version)?,
+            parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
+            parse_digest(&digest)?,
+        )?;
+        if origin_manifest.schema() != manifest.schema() {
+            return Err(ManifestCatalogError::SchemaMismatch);
+        }
+        let origin = self.pinned_in_snapshot(&origin_manifest, snapshot)?;
+        let manifest = origin.manifest();
         let mut statement = connection.prepare(
             "SELECT output.publication_ordinal, output.artifact_id,
                     output.content_algorithm, output.content_digest, output.size_bytes,
@@ -635,7 +692,7 @@ impl AnalyticalManifestCatalog {
                 .ok_or(ManifestCatalogError::CorruptCatalog)?;
             let ordinal =
                 usize::try_from(ordinal).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let object = pinned
+            let object = origin
                 .objects()
                 .get(ordinal)
                 .ok_or(ManifestCatalogError::CorruptCatalog)?;
@@ -655,7 +712,7 @@ impl AnalyticalManifestCatalog {
         if count == 0 || outputs.len() != count {
             return Err(ManifestCatalogError::CorruptCatalog);
         }
-        Ok(outputs)
+        Ok((origin, outputs))
     }
 
     /// Lists the generation's complete cumulative provider lineage in canonical digest order.
@@ -1018,6 +1075,27 @@ impl AnalyticalManifestCatalog {
 
     pub(crate) const fn catalog_binding(&self) -> [u8; 32] {
         self.catalog_binding
+    }
+
+    /// Returns the exact market-event head requiring compaction before an append.
+    pub(crate) fn market_event_compaction_source(
+        &self,
+        dataset: &DatasetId,
+        additional_objects: usize,
+    ) -> Result<Option<DatasetManifestRef>, ManifestCatalogError> {
+        let connection = self.lock()?;
+        let Some(head) = load_latest(&connection, dataset, self.max_objects_per_generation)? else {
+            return Ok(None);
+        };
+        if head.manifest().schema() != &DatasetSchemaRegistry::local().canonical_market_events()? {
+            return Err(ManifestCatalogError::SchemaMismatch);
+        }
+        let needed = head
+            .objects()
+            .len()
+            .checked_add(additional_objects)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        Ok((needed > self.max_objects_per_generation).then(|| head.manifest().clone()))
     }
 
     /// Builds the exact next ingest plan while the process-owned catalog writer is serialized.

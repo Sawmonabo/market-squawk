@@ -397,16 +397,26 @@ pub(crate) fn research_schema(
     )))
 }
 
+pub(crate) fn market_event_compaction_schema(
+    dataset: &SourceIdentifier,
+) -> Result<SchemaRef, DatasetSchemaError> {
+    let registry = DatasetSchemaRegistry::local();
+    let schema = registry.resolve(&registry.canonical_market_events()?)?;
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(DATASET_KEY.to_owned(), dataset.as_str().to_owned());
+    Ok(Arc::new(Schema::new_with_metadata(
+        schema.fields().clone(),
+        metadata,
+    )))
+}
+
 pub(crate) fn market_event_schema(
     dataset: &SourceIdentifier,
     publication_digest: EvidenceDigest,
     publication_kind: &str,
 ) -> Result<SchemaRef, DatasetSchemaError> {
-    let registry = DatasetSchemaRegistry::local();
-    let schema_ref = registry.canonical_market_events()?;
-    let schema = registry.resolve(&schema_ref)?;
+    let schema = market_event_compaction_schema(dataset)?;
     let mut metadata = schema.metadata().clone();
-    metadata.insert(DATASET_KEY.to_owned(), dataset.as_str().to_owned());
     metadata.insert(
         PROVIDER_PUBLICATION_DIGEST_KEY.to_owned(),
         encode_hex(publication_digest.bytes()),

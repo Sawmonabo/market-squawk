@@ -1199,6 +1199,7 @@ impl SchwabMarketEventRestartSelector {
     pub(crate) async fn reopen(
         &self,
         research: &ResearchService,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<SchwabMarketEventRestartReceipt, SchwabMarketPublicationError> {
         let selector = research
@@ -1220,7 +1221,8 @@ impl SchwabMarketEventRestartSelector {
             .read_provider_market_event_publication(
                 &self.manifest,
                 selector,
-                store.as_ref(),
+                store,
+                deadline,
                 cancellation,
             )
             .await?;

@@ -3217,7 +3217,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     )?;
     let service = AnalyticalDataService::initialize(
         authority,
-        AnalyticalManifestCatalog::open(&location, 8)?,
+        AnalyticalManifestCatalog::open(&location, 2)?,
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
@@ -3243,8 +3243,8 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     drop(capture_store);
 
     let restarted = Arc::new(AnalyticalDataService::open(
-        CatalogAuthority::open(catalog_config)?,
-        AnalyticalManifestCatalog::open(&location, 8)?,
+        CatalogAuthority::open(catalog_config.clone())?,
+        AnalyticalManifestCatalog::open(&location, 2)?,
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?);
@@ -3255,7 +3255,8 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         .read_provider_market_event_publication(
             &manifest,
             restarted_selectors[0],
-            &capture_store,
+            Arc::clone(&capture_store),
+            Instant::now() + Duration::from_secs(5),
             CancellationToken::new(),
         )
         .await?;
@@ -3409,6 +3410,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     // Repeated observations of one provider event must not exhaust a current mark's tie
     // budget. A conflict at the newest exact receive time remains an explicit two-row tie.
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
+    let mut compacted_manifest = None;
     for (batch_number, observations, expected_ties) in [
         (
             2,
@@ -3645,8 +3647,93 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     assert_eq!(selected.sources()[0].tied_candidates().len(), 1);
                 }
             }
+            // The third append crosses the configured two-object generation threshold.
+            // Compact with real source rights, then prove exact old publication reads survive.
+            let compaction = restarted
+                .market_event_compaction_request(manifest.dataset_id(), 1)?
+                .ok_or("full event generation did not request compaction")?;
+            let payload_digest = compaction.payload_digest();
+            let reservation = restarted
+                .reserve_source_ingest(
+                    &source,
+                    Timestamp::from_unix_nanos(10),
+                    RightsDecisionInput {
+                        source_id: source.source_id().clone(),
+                        payload_digest,
+                        retrieved_at: Timestamp::from_unix_nanos(533),
+                        basis: RightsBasis::reviewed_terms(
+                            "https://example.test/alpaca-terms/v1",
+                            digest(41),
+                        )?,
+                        authorization_evidence: digest(43),
+                        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                        permitted_operations: vec![SourceOperation::Persist],
+                    },
+                    &IngestIdentity::try_new(
+                        source.source_id().clone(),
+                        payload_digest,
+                        SourceOperation::Persist,
+                        "alpaca-events-streaming-compaction",
+                    )?,
+                    &cancellation,
+                )
+                .await?;
+            let compacted = restarted
+                .compact_provider_market_events(
+                    reservation,
+                    compaction,
+                    deadline,
+                    cancellation.clone(),
+                    Arc::new(AllowProviderEventPublication),
+                )
+                .await?;
+            assert_eq!(compacted.pinned().objects().len(), 1);
+            assert_eq!(
+                compacted.pinned().plan().row_count(),
+                committed.pinned().plan().row_count()
+            );
+            assert_eq!(
+                compacted.pinned().plan().lineage_digest(),
+                committed.pinned().plan().lineage_digest()
+            );
+            assert!(
+                restarted
+                    .market_event_compaction_request(manifest.dataset_id(), 1)?
+                    .is_none()
+            );
+            compacted_manifest = Some(compacted.manifest().clone());
         }
     }
+    drop(restarted);
+    let reopened_service = AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config.clone())?,
+        AnalyticalManifestCatalog::open(&location, 2)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+    )?;
+    let compacted_manifest = compacted_manifest.ok_or("missing compacted market generation")?;
+    let original = reopened_service
+        .read_provider_market_event_publication(
+            &compacted_manifest,
+            selectors[0],
+            Arc::clone(&capture_store),
+            Instant::now() + Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(original.events(), expected_event.as_slice());
+    let original_evidence = reopened_service.provider_market_event_publication_evidence(
+        &compacted_manifest,
+        selectors[0],
+        &capture_store,
+    )?;
+    assert_eq!(
+        original_evidence
+            .event()
+            .ok_or("missing compacted raw evidence")?
+            .physical_claim(),
+        &expected_claim
+    );
     Ok(())
 }
 

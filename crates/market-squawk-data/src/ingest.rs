@@ -5,6 +5,7 @@ pub(crate) use provider_logical_original::LogicalOriginalSourceRevisionKind;
 pub(crate) mod provider_logical_stream;
 pub use provider_logical_stream::ProviderLogicalStreamStaging;
 mod board_full_history;
+mod market_compaction;
 pub use board_full_history::{
     BoardFullHistoryAnnualRead, BoardFullHistoryArrowPartition, BoardFullHistoryAssignedPartition,
     BoardFullHistoryMacroRead, BoardFullHistoryNativePartition, BoardFullHistoryPublication,
@@ -3783,21 +3784,111 @@ impl AnalyticalDataService {
         &self,
         manifest: &DatasetManifestRef,
         selector: ProviderMarketEventPublicationSelector,
-        store: &market_squawk_platform::SealedResearchJournalStore,
+        store: Arc<market_squawk_platform::SealedResearchJournalStore>,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ProviderMarketEventArrowBatch, IngestError> {
-        let evidence =
-            self.provider_market_event_publication_evidence(manifest, selector, store)?;
-        let pinned = self.manifests.pinned(manifest)?;
-        let batches = self
-            .objects
-            .read_pinned_async(&pinned, &cancellation)
-            .await?;
-        let batch = Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)?;
-        self.lock_authority()?
-            .catalog()
-            .validate_provider_market_event_metadata(batch.events(), &evidence)?;
-        Ok(batch)
+        check_market_event_read(deadline, &cancellation)?;
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(IngestError::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => return Err(IngestError::DeadlineExceeded),
+            permit = self.objects.acquire_blocking_permit(&cancellation) => permit?,
+        };
+        let reader = Self {
+            authority: Arc::clone(&self.authority),
+            catalog_id: self.catalog_id,
+            catalog_read_limits: self.catalog_read_limits,
+            market_data_instrument_reader: self.market_data_instrument_reader.clone(),
+            manifests: Arc::clone(&self.manifests),
+            objects: Arc::clone(&self.objects),
+            operation_gate: self.operation_gate.clone(),
+        };
+        let manifest = manifest.clone();
+        let operation_cancellation = cancellation.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
+        let worker_cancellation = operation_cancellation.clone();
+        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                let snapshot = reader
+                    .manifests
+                    .read_snapshot(reader.catalog_read_limits, deadline, &worker_cancellation)
+                    .map_err(map_market_recovery_catalog_error)?;
+                snapshot
+                    .read(|snapshot| {
+                        let pinned = reader.manifests.pinned_in_snapshot(&manifest, snapshot)?;
+                        let publication = crate::ProviderMarketEventExactPublication::from_catalog(
+                            selector.publication_digest,
+                            selector.publication_kind,
+                        );
+                        let (origin, objects) =
+                            reader.manifests.provider_publication_objects_bounded(
+                                &pinned,
+                                &publication,
+                                snapshot,
+                            )?;
+                        let evidence = snapshot
+                            .publication_evidence(selector.publication_digest)?
+                            .ok_or(IngestError::ProviderCaptureRequired)?;
+                        evidence.verify_integrity()?;
+                        for payload in evidence.identity_selections().flatten() {
+                            check_market_event_read(deadline, &worker_cancellation)?;
+                            let selection = serde_json::from_slice(payload)
+                                .map_err(|_| IngestError::ProviderCaptureRequired)?;
+                            snapshot
+                                .verify_identity_evidence(&selection)
+                                .map_err(map_native_identity_catalog_error)?;
+                        }
+                        Self::verify_provider_market_event_publication_raw_evidence(
+                            &evidence,
+                            selector,
+                            &store,
+                            Some(&MarketEventReadControl {
+                                deadline,
+                                cancellation: &worker_cancellation,
+                            }),
+                        )?;
+                        let maximum_bytes = MAX_EVENT_PUBLICATION_READ_BYTES
+                            .checked_mul(objects.len())
+                            .ok_or(IngestError::ProviderCaptureRequired)?;
+                        let batches = reader.objects.read_pinned_objects_bounded(
+                            &origin,
+                            &objects,
+                            maximum_bytes,
+                            &worker_cancellation,
+                        )?;
+                        check_market_event_read(deadline, &worker_cancellation)?;
+                        let batch = Self::provider_market_event_batch_from_pinned(
+                            &batches, selector, &evidence,
+                        )?;
+                        snapshot.validate_event_metadata(batch.events(), &evidence)?;
+                        Ok(batch)
+                    })
+                    .map_err(|error| match error {
+                        IngestError::Catalog(error) => map_market_recovery_catalog_error(error),
+                        error => error,
+                    })
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => IngestError::Cancelled,
+                BlockingIoAdmissionError::Saturated => {
+                    IngestError::Parquet(ParquetStoreError::BlockingTaskLimitExceeded)
+                }
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    IngestError::Parquet(ParquetStoreError::BlockingTaskFailed)
+                }
+            })?;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(IngestError::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(IngestError::DeadlineExceeded),
+            result = &mut worker => {
+                check_market_event_read(deadline, &cancellation)?;
+                result.map_err(|_| IngestError::Parquet(ParquetStoreError::BlockingTaskFailed))?
+            }
+        }
     }
 
     fn provider_market_event_batch_from_pinned(
@@ -4010,7 +4101,7 @@ impl AnalyticalDataService {
                 }),
             )?;
             let evidence = Arc::new(evidence);
-            let original_objects = self.manifests.provider_publication_objects_bounded(
+            let (origin, original_objects) = self.manifests.provider_publication_objects_bounded(
                 &pinned,
                 &planned.publication,
                 snapshot,
@@ -4019,7 +4110,7 @@ impl AnalyticalDataService {
                 .checked_mul(original_objects.len())
                 .ok_or(IngestError::ProviderCaptureRequired)?;
             let batches = self.objects.read_pinned_objects_bounded(
-                &pinned,
+                &origin,
                 &original_objects,
                 maximum_bytes,
                 cancellation,

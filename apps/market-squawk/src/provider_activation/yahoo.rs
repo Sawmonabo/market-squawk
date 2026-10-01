@@ -433,7 +433,9 @@ pub(crate) enum YahooRestartRequest {
         limits: QueryLimits,
         deadline: Instant,
     },
-    Quotes,
+    Quotes {
+        deadline: Instant,
+    },
     Options,
 }
 
