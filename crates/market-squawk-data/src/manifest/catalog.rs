@@ -4270,6 +4270,9 @@ fn append_reference_membership(
                 SELECT 1 FROM analytical_generation_objects AS objects
                 WHERE objects.content_hash=candidates.content_hash
             ) OR EXISTS(
+                SELECT 1 FROM market_event_archive_objects AS objects
+                WHERE objects.content_digest=candidates.content_hash
+            ) OR EXISTS(
                 SELECT 1
                 FROM query_artifact_results AS results
                 JOIN query_artifact_reservations AS reservations USING (reservation_id)

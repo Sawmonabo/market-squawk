@@ -1874,7 +1874,20 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
             .all(|row| row.knowledge().generation_completed_after_cutoff())
     );
 
-    let expected = selected.clone();
+    // Retain evidence values, not the disk-backed row index that owns the old root.
+    let expected_request = selected.request().clone();
+    let expected_origin = selected.origin().clone();
+    let expected_company = selected.company_identity().clone();
+    let expected_rows = selected
+        .decoded_rows()
+        .iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_disposition = selected.disposition();
+    let expected_selected = selected.selected().to_vec();
+    let expected_exclusions = selected.exclusions().to_vec();
+    let expected_conflicts = selected.conflicts().to_vec();
+    let expected_receipt = selected.receipt();
+    assert!(selected.filing_xbrl().is_none());
     drop(generation_pending);
     drop(selected);
     drop(committed);
@@ -1889,14 +1902,29 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     let reopened_raw_store = paths.sealed_research_journal_store()?;
     let replay = restarted
         .sec_research_reader()
-        .verify_restart(
-            &expected,
+        .select(
+            expected_request.clone(),
             &reopened_raw_store,
             Instant::now() + Duration::from_secs(30),
             CancellationToken::new(),
         )
         .await?;
-    assert_eq!(replay, expected);
+    assert_eq!(replay.request(), &expected_request);
+    assert_eq!(replay.origin(), &expected_origin);
+    assert_eq!(replay.company_identity(), &expected_company);
+    assert_eq!(
+        replay
+            .decoded_rows()
+            .iter()
+            .collect::<Result<Vec<_>, _>>()?,
+        expected_rows
+    );
+    assert!(replay.filing_xbrl().is_none());
+    assert_eq!(replay.disposition(), expected_disposition);
+    assert_eq!(replay.selected(), expected_selected.as_slice());
+    assert_eq!(replay.exclusions(), expected_exclusions.as_slice());
+    assert_eq!(replay.conflicts(), expected_conflicts.as_slice());
+    assert_eq!(replay.receipt(), expected_receipt);
     Ok(())
 }
 
@@ -3256,7 +3284,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     );
     let retried = service
         .ingest_provider_market_events(
-            retry_reservation,
+            retry_reservation.clone(),
             first_commit.dataset_id().clone(),
             retry_publication,
             CancellationToken::new(),
@@ -3777,6 +3805,108 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 }
             }
         }
+        if batch_number == 2 {
+            // One independent WAL reader retains its hot snapshot while archival atomically
+            // publishes both whole publications and deletes only the equivalent active bytes.
+            let before = rusqlite::Connection::open(location.path())?;
+            before.execute_batch("BEGIN DEFERRED")?;
+            let before_rows: i64 =
+                before.query_row("SELECT COUNT(*) FROM market_event_active_rows", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(before_rows, 34);
+            let turn = restarted
+                .maintain_market_event_archive(
+                    None,
+                    market_squawk_data::MarketEventArchiveLimits::try_new(
+                        1024 * 1024,
+                        2,
+                        128 * 1024 * 1024,
+                    )?,
+                    Instant::now() + Duration::from_secs(10),
+                    CancellationToken::new(),
+                )
+                .await?;
+            assert!(turn.worked());
+            assert_eq!(turn.next_dataset(), Some(first_commit.dataset_id()));
+            assert_eq!(
+                (turn.archived_publications(), turn.archived_rows()),
+                (2, 34)
+            );
+            let old_snapshot: (i64,i64) = before.query_row(
+                "SELECT (SELECT COUNT(*) FROM market_event_active_rows),(SELECT COUNT(*) FROM market_event_archive_memberships)",
+                [], |row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(old_snapshot, (34, 0));
+            let after = rusqlite::Connection::open(location.path())?;
+            let new_snapshot: (i64, i64, i64) = after.query_row(
+                "SELECT (SELECT COUNT(*) FROM market_event_active_rows),
+                    (SELECT COUNT(*) FROM market_event_archive_memberships),
+                    (SELECT SUM(row_count) FROM market_event_archive_memberships)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(new_snapshot, (0, 2, 34));
+            before.execute_batch("COMMIT")?;
+            restarted
+                .verify_provider_market_event_point_in_time_restart(
+                    &current,
+                    Arc::clone(&capture_store),
+                    Instant::now() + Duration::from_secs(10),
+                    CancellationToken::new(),
+                )
+                .await?;
+            restarted
+                .verify_provider_market_event_point_in_time_restart(
+                    &selected,
+                    Arc::clone(&capture_store),
+                    Instant::now() + Duration::from_secs(10),
+                    CancellationToken::new(),
+                )
+                .await?;
+            let (retry_publication, _, _) =
+                sealed_market_event_microbatch(&capture_store, 1, &[(500, 10_150)])?;
+            // Reservations belong to one catalog incarnation. Reopen the same durable run
+            // through the restarted authority before retrying its now-archived publication.
+            let retry_digest = provider_market_event_publication_digest(&retry_publication)?;
+            assert_eq!(retry_digest, first_commit.publication_digest());
+            let archived_retry_reservation = restarted
+                .reserve_source_ingest(
+                    &source,
+                    Timestamp::from_unix_nanos(10),
+                    RightsDecisionInput {
+                        source_id: source.source_id().clone(),
+                        payload_digest: retry_digest,
+                        retrieved_at: Timestamp::from_unix_nanos(500),
+                        basis: RightsBasis::reviewed_terms(
+                            "https://example.test/alpaca-terms/v1",
+                            digest(41),
+                        )?,
+                        authorization_evidence: digest(43),
+                        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                        permitted_operations: vec![SourceOperation::Persist],
+                    },
+                    &IngestIdentity::try_new(
+                        source.source_id().clone(),
+                        retry_digest,
+                        SourceOperation::Persist,
+                        "alpaca:iex:events:fixture:v1",
+                    )?,
+                    &CancellationToken::new(),
+                )
+                .await?;
+            let retried = restarted
+                .ingest_provider_market_events(
+                    archived_retry_reservation,
+                    first_commit.dataset_id().clone(),
+                    retry_publication,
+                    CancellationToken::new(),
+                    Arc::new(AllowProviderEventPublication),
+                )
+                .await?;
+            assert_eq!(retried, first_commit);
+            // The following batch has the same original effective time and a later commit:
+            // the existing tie/current/historical assertions now cross hot and cold storage.
+        }
         latest_commit = Some(committed);
     }
     let connection = rusqlite::Connection::open(location.path())?;
@@ -3788,7 +3918,117 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         [first_commit.dataset_id().as_str()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    assert_eq!((commits, rows, artifacts, manifests), (3, 35, 0, 0));
+    assert_eq!((commits, rows, artifacts, manifests), (3, 1, 0, 0));
+    // The backup must retain a mixed hot/cold horizon without creating physical event manifests.
+    let backup_paths = LocalPaths::prepare(directory.path().join("market-event-backup"))?;
+    let backup_location = AnalyticalBackupLocation::try_new(
+        backup_paths.catalog()?.clone(),
+        backup_paths.artifacts()?.clone(),
+    )?;
+    let backup_limits =
+        AnalyticalBackupLimits::try_new(64, 256, 64 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
+    let backup_cutoff = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let latest_at_backup = latest_commit.as_ref().ok_or("missing backup horizon")?;
+    // Backup admission validates every retained hot payload, including earlier publications.
+    let trigger: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='market_event_active_rows_immutable_update'",
+        [], |row| row.get(0),
+    )?;
+    let active_payload: Vec<u8> = connection.query_row(
+        "SELECT event_json FROM market_event_active_rows WHERE publication_digest=?1 AND publication_row_ordinal=0",
+        [latest_at_backup.publication_digest().bytes().as_slice()], |row| row.get(0),
+    )?;
+    let mut corrupt = active_payload.clone();
+    corrupt[0] ^= 1;
+    connection.execute_batch("DROP TRIGGER market_event_active_rows_immutable_update")?;
+    connection.execute(
+        "UPDATE market_event_active_rows SET event_json=?1 WHERE publication_digest=?2 AND publication_row_ordinal=0",
+        params![corrupt, latest_at_backup.publication_digest().bytes().as_slice()],
+    )?;
+    let invalid_backup = restarted
+        .backup_service()
+        .create(
+            backup_location.clone(),
+            backup_cutoff,
+            backup_limits,
+            &CancellationToken::new(),
+        )
+        .await;
+    connection.execute(
+        "UPDATE market_event_active_rows SET event_json=?1 WHERE publication_digest=?2 AND publication_row_ordinal=0",
+        params![active_payload, latest_at_backup.publication_digest().bytes().as_slice()],
+    )?;
+    connection.execute_batch(&trigger)?;
+    assert!(matches!(
+        invalid_backup,
+        Err(market_squawk_data::AnalyticalBackupError::Catalog(
+            CatalogError::CorruptCatalog
+        ))
+    ));
+    let verified_backup = restarted
+        .backup_service()
+        .create(
+            backup_location.clone(),
+            backup_cutoff,
+            backup_limits,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let backup_receipt = verified_backup.receipt();
+    assert_eq!(backup_receipt.artifact_count(), 1);
+    assert!(backup_receipt.artifact_bytes() > 0);
+    drop(verified_backup);
+    let archive_reference: String = connection.query_row(
+        "SELECT relative_reference FROM market_event_archive_objects",
+        [],
+        |row| row.get(0),
+    )?;
+    let backup_directory = backup_paths.artifacts()?.try_clone_directory()?;
+    let archive_bytes = backup_directory.read(&archive_reference)?;
+    let mut corrupt_archive = archive_bytes.clone();
+    corrupt_archive[0] ^= 1;
+    backup_directory.write(&archive_reference, corrupt_archive)?;
+    let invalid_inventory = market_squawk_data::AnalyticalBackupService::open_verified(
+        backup_location.clone(),
+        backup_receipt,
+        backup_limits,
+        &CancellationToken::new(),
+    );
+    backup_directory.write(&archive_reference, archive_bytes)?;
+    assert!(invalid_inventory.is_err());
+    let verified_backup = market_squawk_data::AnalyticalBackupService::open_verified(
+        backup_location,
+        backup_receipt,
+        backup_limits,
+        &CancellationToken::new(),
+    )?;
+    let final_turn = restarted
+        .maintain_market_event_archive(
+            None,
+            market_squawk_data::MarketEventArchiveLimits::try_new(1, 2, 128 * 1024 * 1024)?,
+            Instant::now() + Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        (
+            final_turn.archived_publications(),
+            final_turn.archived_rows()
+        ),
+        (1, 1)
+    );
+    let exhausted = restarted
+        .maintain_market_event_archive(
+            None,
+            market_squawk_data::MarketEventArchiveLimits::default(),
+            Instant::now() + Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(!exhausted.worked());
+    assert!(exhausted.next_dataset().is_none());
     drop(connection);
     drop(restarted);
     let reopened_service = AnalyticalDataService::open(
@@ -3820,6 +4060,72 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             .physical_claim(),
         &expected_claim
     );
+    let restored_paths = LocalPaths::prepare(directory.path().join("market-event-restored"))?;
+    let restored = verified_backup.restore(
+        AnalyticalRestoreTarget::try_new(
+            test_catalog_config(restored_paths.catalog()?.clone())?,
+            restored_paths.artifacts()?.clone(),
+            2,
+            ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+            AnalyticalRestoreMode::Fresh,
+        )?,
+        &CancellationToken::new(),
+    )?;
+    let restored_connection = rusqlite::Connection::open(restored_paths.catalog()?.path())?;
+    let restored_shape: (i64, i64, i64, i64, i64, i64, i64) = restored_connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM market_event_commits),
+                (SELECT COUNT(*) FROM market_event_active_rows),
+                (SELECT COUNT(*) FROM artifacts),(SELECT COUNT(*) FROM dataset_manifests),
+                (SELECT COUNT(*) FROM market_event_archive_objects),
+                (SELECT COUNT(*) FROM market_event_archive_memberships),
+                (SELECT archived_sequence FROM market_event_archive_progress)",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    assert_eq!(restored_shape, (3, 1, 0, 0, 1, 2, 2));
+    let restored_original = restored
+        .read_provider_market_event_publication(
+            &latest_commit,
+            selectors[0],
+            Arc::clone(&capture_store),
+            Instant::now() + Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(restored_original.events(), original.events());
+    assert_eq!(
+        restored_original.publication_digest(),
+        original.publication_digest()
+    );
+    assert_eq!(restored_original.schema_ref(), original.schema_ref());
+    assert_eq!(
+        restored_original.lineage_digest()?,
+        original.lineage_digest()?
+    );
+    let restored_evidence = restored.provider_market_event_publication_evidence(
+        &latest_commit,
+        selectors[0],
+        &capture_store,
+    )?;
+    assert_eq!(restored_evidence, original_evidence);
+    restored
+        .verify_provider_market_event_point_in_time_restart(
+            &selected,
+            Arc::clone(&capture_store),
+            Instant::now() + Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await?;
     Ok(())
 }
 

@@ -1343,6 +1343,10 @@ impl LocalProduct {
                 startup_cancellation.child_token(),
             ),
         ) as startup::StartupFuture);
+        let market_event_archive = Some(Box::pin(startup::run_market_event_archive(
+            research.analytical_service(),
+            startup_cancellation.child_token(),
+        )) as startup::StartupFuture);
         let startup_tasks = startup::ProductStartupTasks::start(
             Arc::clone(&research_domains),
             startup_cancellation,
@@ -1351,6 +1355,7 @@ impl LocalProduct {
                 fiscal_startup,
                 daily_startup,
                 display_history_startup,
+                market_event_archive,
             ],
         );
         source_lifecycle.bind_public_startup_tasks(Arc::downgrade(&startup_tasks))?;

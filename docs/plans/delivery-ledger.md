@@ -15,44 +15,95 @@ supersedes forced password storage in development and any conflicting import-onl
 
 ### Current outcomes and verification
 
-**Current integration checkpoint — SQLite active events and independent source startup (2026-10-01).**
-Lead owns integration, Git and the sole compiler; all implementation-agent files are frozen.
-Active event ingestion and exact current/PIT readers now use logical SQLite commits. Existing
-restart/integrity, bulk-history and Fund NAV checks pass. Bounded archive handoff/reclamation and
-incremental raw custody remain required, unimplemented dependencies; this is not continuous-
-ingestion or complete installed-workflow acceptance.
+**Pushed checkpoint — `be6e661b` (2026-10-01).** SQLite active-event storage and its
+exact current/PIT/valuation consumers are integrated with independent startup preparation.
+PR #43 evidence: comment5928955440. Worktree was clean after push; one worktree and three
+local/origin branches remain. Main/release, original session and recovery backups are unchanged.
 
-Current source fixes include independent retained preparation, snapshot-based readiness,
-end-to-end frame admission, and official crypto reference selection in the unified feed.
-The most recent correction removes a pre-acknowledgement circular wait: Coinbase retains exact
-raw/decoded pairs in its existing bootstrap buffer, then drains them through normal publication
-admission after ACK. Original clocks, evidence and limits are preserved. Kraken book/trade share
-the same active permit budget. Direct/Alpaca async admission is outside this correction.
+Critical evidence: event restart/integrity, bulk history and Fund NAV checks pass; current shared-
+service startup/restart/optional-access passes1/1 in100.15s. Locked offline single-job control-plane
+build passes4m33s. Live crypto fails79.21s: Coinbase reports local `publication_admission` timeout,
+then the unified row has no selected source; official reference assertions pass. This is not live,
+continuous-ingestion or installed acceptance. The accidental prior-executable run was terminated
+and supplies no evidence. Current logs: `sqlite-bootstrap-raw-only-build.log`,
+`sqlite-bootstrap-raw-only-live-current.log`, `sqlite-current-shared-service-critical.log` under
+`.agents/tmp/v1-first-stock/`. The unrelated existing decision fixture still lacks genuine current-
+share evidence and remains failed/open.
 
-**Current check:** build passes4m33s (`sqlite-bootstrap-raw-only-build.log`, executable
-`control_plane-8273362dac5f04d9`). The unchanged live case fails79.21s
-(`sqlite-bootstrap-raw-only-live-current.log`): transport reports
-`stage="publication_admission"`, then the unified row has no selected source. Official reference
-assertions now pass. This isolates local pipeline admission, not an external network outage.
-An accidental old-executable run was immediately terminated and supplies no evidence.
-Astra research_options_failure owns read-only end-to-end admission/rendezvous diagnosis; lead
-owns all edits, builds and integration. Do not enlarge timeouts/caps or weaken assertions.
-The financial restart fixture remains open because it lacks the current-share proof already
-required at HEAD. No continuous-ingestion or installed completion is claimed.
+Archive integration checkpoint (this commit, based on `be6e661b`): bounded cold placement,
+exact hot/cold reads, mixed backup/restore and joined maintenance shutdown are implemented.
+Existing shared Desktop/CLI/MCP service authority/restart check passes **1/1,100.08s**
+(`sqlite-archive-shared-service-critical.log`). Event archive/backup, general backup and worker
+release checks pass as detailed below. These are focused working-tree checks, not quarter/release
+approval. The independently pending terminal-batch changes remain uncommitted; real Coinbase
+publication still fails and is not represented as completed live behavior.
 
-**Coherent checkpoint verification:** the current executable passes the shared-service
-startup/restart/optional-access check1/1 in100.15s
-(`sqlite-current-shared-service-critical.log`). The unchanged data restart/integrity,
-bulk-history and Fund NAV checks below also pass. This checkpoint implements SQLite active-event
-storage and its exact consumers plus independent startup preparation; it does not approve live
-crypto startup or continuous ingestion. Lead is committing this integrated work before the next
-bounded actor/publication outcome correction. No tests or authority checks were weakened.
+### Current dependency and ownership wave
 
-Read-only source diagnosis identifies a missing terminal outcome: actor nonfatal rejection can
-produce health/snapshot without committed research rows, while raw publication continues waiting.
-The actor export also uses frame capacity as a per-observation channel capacity. Astra is tracing
-exact rejection categories and a cohesive batch/outcome handoff before implementation ownership
-is assigned. No compiler or live source process remains running from this checkpoint.
+| Owner | Finite outcome / files | Dependency and critical evidence |
+| --- | --- | --- |
+| Astra research_options_failure | Read-only live admission failure trace: live-source admission/sink/publication supervision and crypto rendezvous | Terminal-batch and shutdown code frozen; unit checks pass. Real Coinbase still times out. Identify remaining dependency before editing; no build/Git. |
+| Astra first_brief_readiness | Raw-custody indexed/incremental recovery design completed; no active edits | Receipt-held object pins must precede background quarantine. Implement after current archive checkpoint; no discarded evidence or raised lifetime caps. |
+| Sol desktop_disconnect_recovery | Read-only streaming analytical-backup design: `catalog/evidence*`, `authority_transition/evidence*` and consumers | Archive/backup and SEC fixture changes frozen and critical checks pass. Replace whole-evidence collection ceiling without dropping exact evidence. |
+| Lead | Shared SQL, manifests, exports, composition, Git/build/test scheduling, ledger/PR evidence and archive integration | Archive critical checks pass; app build passes. Run independent shared-service restart check, then push the coherent storage checkpoint. Keep unresolved live-feed failure explicit. |
+
+Terminal-batch implementation and its corrected linear allocation accounting are frozen and
+lead-inspected. Existing `action_runtime` rejection checks pass **3/3** (0.02s; final single-job
+build4.84s), including complete seven-row export through one slot and exact rejected coverage
+(`sqlite-terminal-batch-accounting-critical.log`). This is focused evidence, not live admission or
+installed acceptance.
+
+Archive/backup critical now passes **1/1,4.41s** (`sqlite-archive-backup-retry-critical.log`).
+The fixture reacquires its exact durable reservation after reopen; capability checks are unchanged.
+Proof covers coherent WAL handoff, archived idempotent retry, late hot/cold arrival, mixed backup
+restore, exact original evidence and corruption rejection. All implementation files are frozen.
+
+The existing general backup case exposed a stale SEC fixture retaining a disk-backed selection
+across same-root reopen (`Parquet(RootAuthorityAlreadyOwned)`, 5.13s). Sol corrected only that
+fixture: preserve every evidence field and decoded row, release the original root, then compare the
+reopened selection. Production root exclusivity and evidence checks remain unchanged. The corrected existing case
+passes **1/1,5.14s** (`sqlite-archive-general-backup-retry.log`). Archive/restart/backup also
+passes **1/1,4.41s** after the worker-ownership fix (`sqlite-archive-shutdown-critical.log`,
+single-job build44.79s).
+
+The first application compile was deliberately stopped (exit143;
+`sqlite-archive-terminal-app-build.log`) and supplies no build evidence. Astra corrected the
+source-proven archive shutdown gap in `blocking_supervisor.rs`,
+`ingest/market_event_store/archive.rs` and `parquet_store/streaming.rs`: the operation now cancels
+and waits for its own SQL/encoder workers before returning. Encoder cancellation remains local so
+successful encoding does not cancel catalog publication. All implementation owners have frozen
+and released their files. Lead owns current critical verification and integration. Astra owns only the existing blocking
+supervisor test extension is frozen and passes **1/1,0.01s**
+(`sqlite-archive-worker-release-critical.log`, build27.09s), proving idle wait remains pending while
+a worker retains its guard and completes after release. No new harness or production changes.
+Application build passes **5m35s** (`sqlite-archive-terminal-app-rebuild.log`), producing
+`control_plane-63b9e23bcdd0961d`. The unchanged real Coinbase/Kraken publication/restart/Stop check
+has again reported Coinbase `publication_admission` timeout before source readiness
+(`sqlite-archive-terminal-live.log`), then fails **132.51s** without a usable unified feed. The terminal-export unit fix
+has not established the root cause of the live stall. Astra research_options_failure owns a
+read-only trace of the exact frame permit lifetime and pending publication tasks, limited to
+live-source admission/sink/publication supervision and crypto rendezvous. No edits/builds until it
+identifies the unresolved dependency; lead runs the independent shared-service critical check.
+
+The next raw-custody investigation is complete, with no implementation dispatched yet. Replace
+lifetime claim/byte admission and full-store startup scanning with indexed claim membership and
+retained incremental reconciliation. Background quarantine first requires receipt-held live-object
+pins to protect sealed objects awaiting catalog publication. Backup keeps full verification through
+an independent read snapshot. This is the next required dependency after the current archive/live
+batch checkpoint; it is not completed continuous-ingestion evidence. The existing analytical backup snapshot also
+materializes relation evidence under a 400,000-reference ceiling (`catalog/evidence.rs`,
+`authority_transition/evidence/catalog.rs`). Event rows now participate in that exact evidence;
+replace this whole-snapshot admission with streamed evidence in the same remaining backup work,
+rather than raising the ceiling or excluding event evidence. Sol desktop_disconnect_recovery
+has read-only ownership of this finite follow-up: trace snapshot/digest/inventory consumers and
+return the smallest streaming contract, shared-file boundaries and existing critical check. No
+implementation or additional build before the current checkpoint is integrated.
+
+Archive encoding remains uncompressed: existing streaming budgets do not yet account native
+compression workspaces; no compression or throughput claim is made. Raw-custody lifetime admission
+and whole-store startup scanning remain required unfinished work. The explicitly authorized live check owns temporary source processes during verification.
+No new branch/worktree, CI/release gate or whole-app RAM measurement. Historical investigation
+records below preserve evidence; their assignments and in-progress status are superseded by this table.
 
 The capacity candidate compiles (7m49s; `sqlite-public-capacity-build.log`) and the existing
 shared-service startup/restart critical passes1/1 in101.32s (`sqlite-shared-service-critical.log`).

@@ -2020,6 +2020,83 @@ CREATE INDEX provider_market_event_active_commit_order
 ON provider_market_event_selection_index(dataset_id,commit_sequence,publication_row_ordinal)
 WHERE dataset_id IS NOT NULL;
 
+CREATE TABLE market_event_archive_objects (
+    content_digest BLOB PRIMARY KEY CHECK (length(content_digest)=32),
+    relative_reference TEXT NOT NULL UNIQUE CHECK (length(CAST(relative_reference AS BLOB)) BETWEEN 1 AND 1024),
+    schema_name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    schema_fingerprint BLOB NOT NULL CHECK (length(schema_fingerprint)=32),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes>0),
+    row_count INTEGER NOT NULL CHECK (row_count>0),
+    created_at_ns INTEGER NOT NULL,
+    published_at_ns INTEGER NOT NULL CHECK (published_at_ns>=created_at_ns),
+    CHECK (schema_name='market_squawk.market_events' AND schema_version=1
+        AND schema_fingerprint=X'e0bf8cc9a74c880cc772d3987907b13eb3d4d8fc2dc3ca1a239873d650a151f0')
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE market_event_archive_memberships (
+    publication_digest BLOB PRIMARY KEY REFERENCES market_event_commits(publication_digest),
+    dataset_id TEXT NOT NULL,
+    commit_sequence INTEGER NOT NULL CHECK (commit_sequence>0),
+    object_content_digest BLOB NOT NULL REFERENCES market_event_archive_objects(content_digest),
+    first_row INTEGER NOT NULL CHECK (first_row>=0),
+    row_count INTEGER NOT NULL CHECK (row_count>0),
+    FOREIGN KEY (dataset_id,commit_sequence,publication_digest)
+        REFERENCES market_event_commits(dataset_id,commit_sequence,publication_digest),
+    UNIQUE (object_content_digest,first_row)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX market_event_archive_commit_order
+ON market_event_archive_memberships(dataset_id,commit_sequence);
+
+CREATE TABLE market_event_archive_progress (
+    dataset_id TEXT PRIMARY KEY REFERENCES market_event_storage_heads(dataset_id),
+    archived_sequence INTEGER NOT NULL CHECK (archived_sequence>=0)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER market_event_archive_memberships_guarded_insert
+BEFORE INSERT ON market_event_archive_memberships
+WHEN NOT EXISTS (
+    SELECT 1 FROM market_event_commits AS committed
+    JOIN ingest_runs AS run ON run.run_id=committed.run_id
+    JOIN market_event_archive_objects AS object ON object.content_digest=NEW.object_content_digest
+    WHERE committed.dataset_id=NEW.dataset_id AND committed.commit_sequence=NEW.commit_sequence
+      AND committed.publication_digest=NEW.publication_digest AND committed.row_count=NEW.row_count
+      AND object.schema_name=committed.schema_name AND object.schema_version=committed.schema_version
+      AND object.schema_fingerprint=committed.schema_fingerprint
+      AND NEW.first_row<=object.row_count AND NEW.row_count<=object.row_count-NEW.first_row
+      AND object.published_at_ns>=committed.available_at_ns
+      AND run.state='succeeded' AND run.completed_at_ns=committed.available_at_ns
+) OR EXISTS (
+    SELECT 1 FROM market_event_archive_memberships AS retained
+    WHERE retained.object_content_digest=NEW.object_content_digest
+      AND retained.first_row<NEW.first_row+NEW.row_count
+      AND NEW.first_row<retained.first_row+retained.row_count
+)
+BEGIN SELECT RAISE(ABORT,'invalid market event archive membership'); END;
+
+CREATE TRIGGER market_event_archive_progress_guarded_insert
+BEFORE INSERT ON market_event_archive_progress WHEN NEW.archived_sequence<>0
+BEGIN SELECT RAISE(ABORT,'invalid initial market event archive progress'); END;
+CREATE TRIGGER market_event_archive_progress_guarded_update
+BEFORE UPDATE ON market_event_archive_progress
+WHEN NEW.dataset_id<>OLD.dataset_id OR NEW.archived_sequence<=OLD.archived_sequence
+ OR NEW.archived_sequence>(SELECT committed_sequence FROM market_event_storage_heads WHERE dataset_id=NEW.dataset_id)
+ OR (SELECT COUNT(*) FROM market_event_archive_memberships
+     WHERE dataset_id=NEW.dataset_id AND commit_sequence>OLD.archived_sequence
+       AND commit_sequence<=NEW.archived_sequence)<>NEW.archived_sequence-OLD.archived_sequence
+BEGIN SELECT RAISE(ABORT,'incomplete market event archive progress'); END;
+
+CREATE TRIGGER market_event_archive_objects_immutable_update BEFORE UPDATE ON market_event_archive_objects
+BEGIN SELECT RAISE(ABORT,'market event archives are immutable'); END;
+CREATE TRIGGER market_event_archive_objects_immutable_delete BEFORE DELETE ON market_event_archive_objects
+BEGIN SELECT RAISE(ABORT,'market event archives are retained evidence'); END;
+CREATE TRIGGER market_event_archive_memberships_immutable_update BEFORE UPDATE ON market_event_archive_memberships
+BEGIN SELECT RAISE(ABORT,'market event archive memberships are immutable'); END;
+CREATE TRIGGER market_event_archive_memberships_immutable_delete BEFORE DELETE ON market_event_archive_memberships
+BEGIN SELECT RAISE(ABORT,'market event archive memberships are retained evidence'); END;
+CREATE TRIGGER market_event_archive_progress_immutable_delete BEFORE DELETE ON market_event_archive_progress
+BEGIN SELECT RAISE(ABORT,'market event archive progress cannot be deleted'); END;
+
 CREATE TABLE market_event_active_rows (
     publication_digest BLOB NOT NULL,
     publication_row_ordinal INTEGER NOT NULL,
@@ -2040,6 +2117,11 @@ WHEN NOT EXISTS (
 CREATE TRIGGER market_event_active_rows_immutable_update BEFORE UPDATE ON market_event_active_rows
 BEGIN SELECT RAISE(ABORT,'canonical active event rows are immutable'); END;
 CREATE TRIGGER market_event_active_rows_immutable_delete BEFORE DELETE ON market_event_active_rows
+WHEN NOT EXISTS (
+    SELECT 1 FROM market_event_archive_memberships AS archived
+    WHERE archived.publication_digest=OLD.publication_digest
+      AND OLD.publication_row_ordinal>=0 AND OLD.publication_row_ordinal<archived.row_count
+)
 BEGIN SELECT RAISE(ABORT,'canonical active event rows require archival before deletion'); END;
 
 CREATE VIEW market_event_complete_commits AS
@@ -2053,8 +2135,13 @@ JOIN ingest_run_provider_publication_bindings AS publication
 JOIN market_event_storage_heads AS head ON head.dataset_id=committed.dataset_id
 WHERE head.committed_sequence>=committed.commit_sequence
  AND publication.output_artifact_ordinal IS NULL AND publication.object_input_ordinal IS NULL
- AND (SELECT COUNT(*) FROM market_event_active_rows AS active
-      WHERE active.publication_digest=committed.publication_digest)=committed.row_count
+ AND ((SELECT COUNT(*) FROM market_event_active_rows AS active
+       WHERE active.publication_digest=committed.publication_digest)=committed.row_count
+      OR EXISTS (SELECT 1 FROM market_event_archive_memberships AS archived
+          WHERE archived.publication_digest=committed.publication_digest
+            AND archived.dataset_id=committed.dataset_id
+            AND archived.commit_sequence=committed.commit_sequence
+            AND archived.row_count=committed.row_count))
  AND (SELECT COUNT(*) FROM provider_market_event_selection_index AS indexed
       WHERE indexed.publication_digest=committed.publication_digest
         AND indexed.dataset_id=committed.dataset_id

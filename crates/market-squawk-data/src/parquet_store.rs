@@ -148,6 +148,7 @@ pub struct PublishedObject {
 #[derive(Debug)]
 pub(crate) struct StagedObject {
     cleanup: OwnedStagingCleanup,
+    _scratch: Option<OperationScratchDirectory>,
     content_hash: Sha256Digest,
     size_bytes: u64,
     row_count: u64,
@@ -778,6 +779,7 @@ impl ParquetObjectStore {
         };
         Ok(StagedObject {
             cleanup: owned_cleanup,
+            _scratch: None,
             content_hash,
             size_bytes,
             row_count: u64::try_from(batch.num_rows())
@@ -949,6 +951,7 @@ impl ParquetObjectStore {
                 directory: cleanup_directory,
                 reference: Some(stage),
             },
+            _scratch: None,
             content_hash,
             size_bytes,
             row_count: written_rows,

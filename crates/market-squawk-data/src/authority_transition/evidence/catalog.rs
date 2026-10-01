@@ -41,6 +41,19 @@ pub(crate) enum ProviderCatalogRelation {
     LogicalOriginalObject,
     CaptureOriginal,
     LogicalPartitionArtifact,
+    MarketEventStorageHead,
+    MarketEventCommit,
+    MarketEventActiveRow,
+    MarketEventArchiveObject,
+    MarketEventArchiveMembership,
+    MarketEventArchiveProgress,
+    NativeReferenceCapture,
+    ForecastInventoryVintage,
+    ForecastInventoryOutcome,
+    ModelInventorySeries,
+    ChartProjectionHeader,
+    ChartProjectionRow,
+    ModelInventoryRecord,
 }
 
 impl ProviderCatalogRelation {
@@ -62,6 +75,19 @@ impl ProviderCatalogRelation {
             Self::LogicalOriginalObject => 14,
             Self::CaptureOriginal => 15,
             Self::LogicalPartitionArtifact => 16,
+            Self::MarketEventStorageHead => 17,
+            Self::MarketEventCommit => 18,
+            Self::MarketEventActiveRow => 19,
+            Self::MarketEventArchiveObject => 20,
+            Self::MarketEventArchiveMembership => 21,
+            Self::MarketEventArchiveProgress => 22,
+            Self::NativeReferenceCapture => 23,
+            Self::ForecastInventoryVintage => 24,
+            Self::ForecastInventoryOutcome => 25,
+            Self::ModelInventorySeries => 26,
+            Self::ChartProjectionHeader => 27,
+            Self::ChartProjectionRow => 28,
+            Self::ModelInventoryRecord => 29,
         }
     }
 
@@ -87,6 +113,19 @@ impl ProviderCatalogRelation {
             Self::LogicalOriginalObject => "provider_logical_original_objects",
             Self::CaptureOriginal => "provider_capture_originals",
             Self::LogicalPartitionArtifact => "ingest_run_provider_logical_partition_artifacts",
+            Self::MarketEventStorageHead => "market_event_storage_heads",
+            Self::MarketEventCommit => "market_event_commits",
+            Self::MarketEventActiveRow => "market_event_active_rows",
+            Self::MarketEventArchiveObject => "market_event_archive_objects",
+            Self::MarketEventArchiveMembership => "market_event_archive_memberships",
+            Self::MarketEventArchiveProgress => "market_event_archive_progress",
+            Self::NativeReferenceCapture => "market_data_native_reference_captures",
+            Self::ForecastInventoryVintage => "forecast_inventory_vintages",
+            Self::ForecastInventoryOutcome => "forecast_inventory_outcomes",
+            Self::ModelInventorySeries => "model_inventory_series",
+            Self::ChartProjectionHeader => "chart_projection_headers",
+            Self::ChartProjectionRow => "chart_projection_rows",
+            Self::ModelInventoryRecord => "model_inventory_records",
         }
     }
 
@@ -112,6 +151,19 @@ impl ProviderCatalogRelation {
             "provider_logical_original_objects" => Self::LogicalOriginalObject,
             "provider_capture_originals" => Self::CaptureOriginal,
             "ingest_run_provider_logical_partition_artifacts" => Self::LogicalPartitionArtifact,
+            "market_event_storage_heads" => Self::MarketEventStorageHead,
+            "market_event_commits" => Self::MarketEventCommit,
+            "market_event_active_rows" => Self::MarketEventActiveRow,
+            "market_event_archive_objects" => Self::MarketEventArchiveObject,
+            "market_event_archive_memberships" => Self::MarketEventArchiveMembership,
+            "market_event_archive_progress" => Self::MarketEventArchiveProgress,
+            "market_data_native_reference_captures" => Self::NativeReferenceCapture,
+            "forecast_inventory_vintages" => Self::ForecastInventoryVintage,
+            "forecast_inventory_outcomes" => Self::ForecastInventoryOutcome,
+            "model_inventory_series" => Self::ModelInventorySeries,
+            "chart_projection_headers" => Self::ChartProjectionHeader,
+            "chart_projection_rows" => Self::ChartProjectionRow,
+            "model_inventory_records" => Self::ModelInventoryRecord,
             _ => return None,
         })
     }
@@ -138,8 +190,16 @@ impl ProviderCatalogRelationEvidenceRow {
         accounted_object_bytes: u64,
     ) -> Result<Self, EvidenceError> {
         let primary_key = primary_key.into();
+        // Event dataset keys mirror the schema's 256-byte dataset bound; a commit key
+        // appends one separator and the 19 decimal digits of a positive SQLite integer.
+        let maximum_key_bytes = match relation {
+            ProviderCatalogRelation::MarketEventStorageHead
+            | ProviderCatalogRelation::MarketEventArchiveProgress => 256,
+            ProviderCatalogRelation::MarketEventCommit => 256 + 1 + 19,
+            _ => MAX_PROVIDER_RELATION_KEY_BYTES,
+        };
         if primary_key.is_empty()
-            || primary_key.len() > MAX_PROVIDER_RELATION_KEY_BYTES
+            || primary_key.len() > maximum_key_bytes
             || (relation == ProviderCatalogRelation::SealedRawObject)
                 != (accounted_object_bytes > 0)
             || accounted_object_bytes > MAX_EVIDENCE_OBJECT_BYTES
@@ -661,6 +721,78 @@ impl QueryArtifactEvidenceRow {
     }
 }
 
+/// A retained market-event archive object, independent of ingest artifacts and manifests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MarketEventArchiveEvidenceRow {
+    relative_reference: Box<str>,
+    content_hash: Sha256Digest,
+    schema: DatasetSchemaRef,
+    size_bytes: u64,
+    row_count: u64,
+    created_at: Timestamp,
+    published_at: Timestamp,
+}
+
+impl MarketEventArchiveEvidenceRow {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row binds every durable archive object column"
+    )]
+    pub(crate) fn try_new(
+        relative_reference: impl Into<Box<str>>,
+        content_hash: Sha256Digest,
+        schema: DatasetSchemaRef,
+        size_bytes: u64,
+        row_count: u64,
+        created_at: Timestamp,
+        published_at: Timestamp,
+    ) -> Result<Self, EvidenceError> {
+        let relative_reference = relative_reference.into();
+        if size_bytes == 0
+            || size_bytes > MAX_EVIDENCE_OBJECT_BYTES
+            || row_count == 0
+            || published_at < created_at
+            || !canonical_object_reference(&relative_reference, content_hash)
+            || DatasetSchemaRegistry::local()
+                .canonical_market_events()
+                .map_err(|_| EvidenceError::InvalidCatalogEvidence)?
+                != schema
+        {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        Ok(Self {
+            relative_reference,
+            content_hash,
+            schema,
+            size_bytes,
+            row_count,
+            created_at,
+            published_at,
+        })
+    }
+    pub(crate) fn relative_reference(&self) -> &str {
+        &self.relative_reference
+    }
+    pub(crate) const fn content_hash(&self) -> Sha256Digest {
+        self.content_hash
+    }
+    pub(crate) const fn schema(&self) -> &DatasetSchemaRef {
+        &self.schema
+    }
+    pub(crate) const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+    pub(crate) const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+    pub(super) const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+    pub(super) const fn published_at(&self) -> Timestamp {
+        self.published_at
+    }
+}
+
 /// Validated, bounded relational evidence captured from one SQLite read snapshot.
 #[derive(Debug)]
 pub(crate) struct CatalogEvidenceSnapshot {
@@ -669,6 +801,7 @@ pub(crate) struct CatalogEvidenceSnapshot {
     manifests: Vec<ManifestEvidenceRow>,
     generations: Vec<GenerationEvidenceRow>,
     query_artifacts: Vec<QueryArtifactEvidenceRow>,
+    market_event_archives: Vec<MarketEventArchiveEvidenceRow>,
     provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
 }
 
@@ -688,6 +821,7 @@ impl CatalogEvidenceSnapshot {
             generations,
             query_artifacts,
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -697,6 +831,7 @@ impl CatalogEvidenceSnapshot {
         manifests: Vec<ManifestEvidenceRow>,
         generations: Vec<GenerationEvidenceRow>,
         query_artifacts: Vec<QueryArtifactEvidenceRow>,
+        market_event_archives: Vec<MarketEventArchiveEvidenceRow>,
         provider_relation_rows: Vec<(Box<str>, Box<[u8]>, Sha256Digest, u64)>,
     ) -> Result<Self, EvidenceError> {
         let provider_relations = provider_relation_rows
@@ -719,6 +854,7 @@ impl CatalogEvidenceSnapshot {
             manifests,
             generations,
             query_artifacts,
+            market_event_archives,
             provider_relations,
         )
     }
@@ -729,6 +865,7 @@ impl CatalogEvidenceSnapshot {
         manifests: Vec<ManifestEvidenceRow>,
         generations: Vec<GenerationEvidenceRow>,
         query_artifacts: Vec<QueryArtifactEvidenceRow>,
+        market_event_archives: Vec<MarketEventArchiveEvidenceRow>,
         provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
     ) -> Result<Self, EvidenceError> {
         let limits = request.limits;
@@ -748,6 +885,7 @@ impl CatalogEvidenceSnapshot {
             .and_then(|count| count.checked_add(generation_objects))
             .and_then(|count| count.checked_add(generation_parents))
             .and_then(|count| count.checked_add(query_artifacts.len()))
+            .and_then(|count| count.checked_add(market_event_archives.len()))
             .and_then(|count| count.checked_add(provider_relations.len()))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         let sealed_raw_objects = provider_relations
@@ -757,6 +895,7 @@ impl CatalogEvidenceSnapshot {
         let physical_artifacts = artifacts
             .len()
             .checked_add(query_artifacts.len())
+            .and_then(|count| count.checked_add(market_event_archives.len()))
             .and_then(|count| count.checked_add(sealed_raw_objects))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         if physical_artifacts > limits.max_artifacts || references > limits.max_references {
@@ -768,6 +907,7 @@ impl CatalogEvidenceSnapshot {
             &manifests,
             &generations,
             &query_artifacts,
+            &market_event_archives,
             &provider_relations,
         )?;
         Ok(Self {
@@ -776,6 +916,7 @@ impl CatalogEvidenceSnapshot {
             manifests,
             generations,
             query_artifacts,
+            market_event_archives,
             provider_relations,
         })
     }
@@ -800,12 +941,16 @@ impl CatalogEvidenceSnapshot {
         &self.query_artifacts
     }
 
+    pub(crate) fn market_event_archives(&self) -> &[MarketEventArchiveEvidenceRow] {
+        &self.market_event_archives
+    }
+
     pub(crate) fn provider_relations(&self) -> &[ProviderCatalogRelationEvidenceRow] {
         &self.provider_relations
     }
 
     pub(crate) fn physical_artifact_count(&self) -> usize {
-        self.artifacts.len() + self.query_artifacts.len()
+        self.artifacts.len() + self.query_artifacts.len() + self.market_event_archives.len()
     }
 
     pub(crate) fn check_cancellation(
@@ -830,6 +975,7 @@ fn validate_relational_evidence(
     manifests: &[ManifestEvidenceRow],
     generations: &[GenerationEvidenceRow],
     query_artifacts: &[QueryArtifactEvidenceRow],
+    market_event_archives: &[MarketEventArchiveEvidenceRow],
     provider_relations: &[ProviderCatalogRelationEvidenceRow],
 ) -> Result<(), EvidenceError> {
     let limits = request.limits;
@@ -948,6 +1094,21 @@ fn validate_relational_evidence(
         }
         total_bytes = total_bytes
             .checked_add(query.size_bytes)
+            .ok_or(EvidenceError::ResourceLimitExceeded)?;
+        if total_bytes > limits.max_total_bytes {
+            return Err(EvidenceError::ResourceLimitExceeded);
+        }
+    }
+    let mut archive_digests = BTreeSet::new();
+    for archive in market_event_archives {
+        if archive.size_bytes > limits.max_object_bytes
+            || !archive_digests.insert(archive.content_hash)
+            || !references.insert(archive.relative_reference.as_ref())
+        {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        total_bytes = total_bytes
+            .checked_add(archive.size_bytes)
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         if total_bytes > limits.max_total_bytes {
             return Err(EvidenceError::ResourceLimitExceeded);

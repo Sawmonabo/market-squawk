@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{CatalogEvidenceSnapshot, EvidenceError, MAX_PARQUET_METADATA_BYTES};
-use crate::Sha256Digest;
 use crate::authority_transition::ArtifactInventoryDigest;
+use crate::{DatasetSchemaRef, DatasetSchemaRegistry, Sha256Digest};
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const PARQUET_FOOTER_BYTES: u64 = 8;
@@ -68,7 +68,8 @@ pub(crate) struct VerifiedArtifact {
 
 #[derive(Clone, Copy)]
 struct ExpectedPhysicalArtifact<'a> {
-    artifact_id: Uuid,
+    expected_row_count: Option<u64>,
+    schema: Option<&'a DatasetSchemaRef>,
     relative_reference: &'a str,
     content_hash: Sha256Digest,
     size_bytes: u64,
@@ -103,7 +104,6 @@ pub(crate) fn verify_artifact_inventory(
         .try_clone_directory()
         .map_err(|_| EvidenceError::UnsafeArtifact)?;
     let source_directory_identity = FileIdentity::from_metadata(&directory.dir_metadata()?);
-    let expected_rows = expected_rows(snapshot)?;
     let mut artifacts = Vec::new();
     artifacts
         .try_reserve_exact(snapshot.physical_artifact_count())
@@ -136,11 +136,20 @@ pub(crate) fn verify_artifact_inventory(
             artifact.size_bytes,
             snapshot.request().limits().max_parquet_metadata_bytes(),
         )?;
-        if expected_rows
-            .get(&artifact.artifact_id)
-            .is_some_and(|expected| *expected != row_count)
+        if artifact
+            .expected_row_count
+            .is_some_and(|expected| expected != row_count)
         {
             return Err(EvidenceError::ArtifactMetadataMismatch);
+        }
+        if let Some(schema) = artifact.schema {
+            let expected = DatasetSchemaRegistry::local()
+                .resolve(schema)
+                .map_err(|_| EvidenceError::ArtifactMetadataMismatch)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file.try_clone()?)?;
+            if reader.schema().as_ref() != expected.as_ref() {
+                return Err(EvidenceError::ArtifactMetadataMismatch);
+            }
         }
         let named_after =
             named_identity(&directory, artifact.relative_reference, artifact.size_bytes)?;
@@ -177,6 +186,7 @@ pub(crate) fn verify_artifact_inventory(
 fn expected_physical_artifacts(
     snapshot: &CatalogEvidenceSnapshot,
 ) -> Result<Vec<ExpectedPhysicalArtifact<'_>>, EvidenceError> {
+    let rows = expected_rows(snapshot)?;
     let mut expected = Vec::new();
     expected
         .try_reserve_exact(snapshot.physical_artifact_count())
@@ -186,7 +196,8 @@ fn expected_physical_artifacts(
             .artifacts()
             .iter()
             .map(|artifact| ExpectedPhysicalArtifact {
-                artifact_id: artifact.artifact_id(),
+                expected_row_count: rows.get(&artifact.artifact_id()).copied(),
+                schema: None,
                 relative_reference: artifact.relative_reference(),
                 content_hash: artifact.content_hash(),
                 size_bytes: artifact.size_bytes(),
@@ -197,12 +208,22 @@ fn expected_physical_artifacts(
             .query_artifacts()
             .iter()
             .map(|artifact| ExpectedPhysicalArtifact {
-                artifact_id: artifact.artifact_id(),
+                expected_row_count: rows.get(&artifact.artifact_id()).copied(),
+                schema: None,
                 relative_reference: artifact.relative_reference(),
                 content_hash: artifact.content_hash(),
                 size_bytes: artifact.size_bytes(),
             }),
     );
+    expected.extend(snapshot.market_event_archives().iter().map(|archive| {
+        ExpectedPhysicalArtifact {
+            expected_row_count: Some(archive.row_count()),
+            schema: Some(archive.schema()),
+            relative_reference: archive.relative_reference(),
+            content_hash: archive.content_hash(),
+            size_bytes: archive.size_bytes(),
+        }
+    }));
     Ok(expected)
 }
 

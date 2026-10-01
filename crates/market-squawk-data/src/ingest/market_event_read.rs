@@ -3,8 +3,7 @@
 use super::*;
 use crate::MarketEventCommitRef;
 use crate::catalog::market_event_store::{
-    load_market_event_active_rows, load_market_event_commit,
-    load_market_event_commit_for_publication,
+    load_market_event_commit, load_market_event_commit_for_publication, load_market_event_rows,
 };
 
 impl AnalyticalDataService {
@@ -156,9 +155,10 @@ impl AnalyticalDataService {
             cancellation,
             snapshot,
         )?;
-        let rows = load_market_event_active_rows(
+        let rows = load_market_event_rows(
             snapshot.connection(),
             &origin,
+            &self.objects,
             self.catalog_read_limits,
             deadline,
             cancellation,

@@ -548,8 +548,8 @@ identity in the registry.
 The [2026-10-01 storage research](../research/2026-10-01-market-data-storage/final-report.md)
 defines the approved boundary: transactional SQLite microbatches for active events and indexed
 current/as-of reads, with bounded Parquet archives queried through DataFusion. The active-event
-slice is implemented and has focused restart/integrity evidence; archive handoff and reclamation
-remain required work. Whole-history event compaction is removed. No throughput or whole-app
+slice has focused restart/integrity evidence. Archive handoff, reclamation and exact backup
+are being integrated and remain subject to the critical checks in the delivery ledger. Whole-history event compaction is removed. No throughput or whole-app
 memory claim follows from this change. The delivery ledger owns integration and acceptance status.
 
 The durable layout extends the existing [research data plane](research-data-plane.md); it does not
@@ -561,7 +561,7 @@ replace it with a second database or a new data application.
 | Raw evidence | Exact bounded HTTP response/page bytes or bounded stream-frame micro-batches, written atomically and addressed by digest with a secret-free request/receipt. Never one file per event and never an unbounded response. |
 | Canonical batches | Code-owned Arrow schemas and validators convert one exact raw receipt into typed rows. Conversion rejects schema drift, impossible clocks/values, unresolved required identity, and partial pagination represented as complete. |
 | Active market events | SQLite commits canonical rows, exact publication/source evidence and successful ingest state atomically per microbatch. Indexed logical commit and row identities survive restart and remain independent of physical placement. No per-tick file or transaction is required. |
-| Bulk and cold analytical data | Immutable, content-addressed Parquet generations with code-owned schema metadata, exact parents, row/time bounds, quality summary, and manifests. Cold event export must publish bounded ranges with coherent reader visibility before reclaiming active rows; this handoff remains incomplete. Compression/statistics depend on the actual writer and must not be assumed. |
+| Bulk and cold analytical data | Immutable, content-addressed Parquet generations with code-owned schema metadata, exact parents, row/time bounds, quality summary, and manifests. Cold event export publishes bounded ranges with coherent reader visibility before reclaiming active rows; its current verification status is in the delivery ledger. Compression/statistics depend on the actual writer and must not be assumed. |
 | SQLite control plane | The same database owns provider declarations, entitlements, quota windows, permits, jobs, cursors/checkpoints, raw-object indexes, logical event commits, dataset/manifest authority, pins, health, and recovery. |
 | Derived datasets | Separate immutable Parquet generations for local bars, features, statements/ratios, model inputs/outputs, backtests, and decision evidence. Each binds all source generations and implementation identities. |
 | Product reads | Fixed, bounded typed application operations over exact pins/PIT selectors. Desktop receives closed results; operator DataFusion/Python access cannot become an unbounded frontend query path. |
@@ -603,16 +603,26 @@ validates that watch after reading, so a concurrent identity publication cannot 
 snapshot. Contention at the short mutation boundary observes the original cancellation/deadline;
 an occupied writer mutex alone is not an invalid identity.
 
-Market-event point reads resolve the selected publication's original artifact set through its
-verified creating ancestor and verify only those objects. The requested manifest remains the
-selection identity. Raw-capture, identity, cutoff and tie checks remain required; unrelated archived
-files are not reopened for each market card. Market compaction streams canonical rows through the
-existing bounded cursor/writer, preserving row order and lineage while retaining original objects
-and their per-publication metadata for exact evidence reads. Alpaca publication requests compaction
-before exceeding the configured object count. The existing restart critical verifies compaction,
-subsequent append and original-evidence reopening. Continuous ingestion remains incomplete while
-cumulative publication/source-run lineage retains a lifetime ceiling; the delivery ledger tracks
-the required direct-edge/ancestry correction and live verification.
+Market-event point reads select an immutable logical publication and its exact source evidence.
+Physical placement is resolved within that read's WAL snapshot: canonical active rows or the
+publication's exact interval in a catalog-admitted archive. Archival preserves publication/row
+identity and original knowledge clocks; it does not mint newer financial evidence. Late events
+append through normal commit order and cannot disappear behind an event-time archive watermark.
+
+The bounded archive implementation stages one file privately through the existing streaming writer.
+Encoding holds no publication lease or catalog writer mutex. Finalization follows the existing
+operation-gate then publication-lease order, synchronizes the file, and atomically publishes archive
+membership/progress and removes the corresponding active payloads. A crash before the database
+handoff leaves active rows authoritative; after it, the immutable archive is authoritative. Existing
+WAL readers retain their prior active-row snapshot. Published archive objects are retained, including
+those needed to reopen saved evidence. The application retains and joins one background maintenance
+future; live acknowledgement does not wait for it. Per-turn byte/publication targets bound work,
+not the total accepted history.
+
+Exact backup includes logical event relations, active payloads and archive membership plus every
+referenced physical archive. Archive and backup verification are tracked in the delivery ledger.
+Continuous-ingestion acceptance also requires replacing the separate raw-custody lifetime admission
+and whole-store startup scan; bounded canonical archives alone do not establish that acceptance.
 
 Alpaca stock history binds the current catalog-selected native asset UUID and listing to an
 explicit New York symbol-resolution date (`asof`). Capture and publication retain that selection's

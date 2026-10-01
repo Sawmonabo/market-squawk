@@ -2,7 +2,7 @@
 
 use arrow::datatypes::DataType;
 use parquet::basic::Encoding;
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReader};
 
@@ -247,6 +247,86 @@ impl ParquetObjectStore {
             expires_at: None,
         })
     }
+    /// Reopens only a catalog-selected row interval on the caller's supervised blocking worker.
+    /// The complete immutable file identity and decoder working set are checked before decoding.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact placement and independent read controls"
+    )]
+    pub(crate) fn read_published_row_range(
+        &self,
+        object: &PublishedObject,
+        schema: SchemaRef,
+        first_row: u64,
+        row_count: u64,
+        projection: Vec<usize>,
+        max_batch_bytes: usize,
+        deadline: Option<Instant>,
+        cancellation: &CancellationToken,
+        mut consume: impl FnMut(RecordBatch) -> Result<(), ParquetStoreError>,
+    ) -> Result<(), ParquetStoreError> {
+        if row_count == 0
+            || max_batch_bytes == 0
+            || projection.is_empty()
+            || first_row
+                .checked_add(row_count)
+                .is_none_or(|end| end > object.row_count)
+            || projection.windows(2).any(|pair| pair[0] >= pair[1])
+            || projection
+                .last()
+                .is_some_and(|column| *column >= schema.fields().len())
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        let mut state = CursorState {
+            directory: self.directory.try_clone()?,
+            _pin: None,
+            objects: vec![CursorObject {
+                reference: object.relative_reference.clone(),
+                digest: object.content_hash,
+                bytes: object.size_bytes,
+                rows: object.row_count,
+            }],
+            schema: Some(schema),
+            next_object: 0,
+            reader: None,
+            reader_schema: None,
+            object_rows: 0,
+            generation_rows: first_row,
+            expected_rows: object.row_count,
+            batch_rows: self.config.max_row_group_rows,
+            max_batch_bytes,
+            start_row: usize::try_from(first_row).map_err(|_| ParquetStoreError::SizeOverflow)?,
+            projection: Some(projection),
+        };
+        let mut remaining = row_count;
+        while remaining > 0 {
+            if cancellation.is_cancelled() {
+                return Err(ParquetStoreError::Cancelled);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(ParquetStoreError::RecoveryDeadlineExceeded);
+            }
+            let batch = state
+                .next(cancellation)?
+                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+            let take = usize::try_from(remaining.min(batch.num_rows() as u64))
+                .map_err(|_| ParquetStoreError::SizeOverflow)?;
+            if take == 0 {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            consume(batch.slice(0, take))?;
+            remaining -= take as u64;
+        }
+        if cancellation.is_cancelled() {
+            return Err(ParquetStoreError::Cancelled);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ParquetStoreError::RecoveryDeadlineExceeded);
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "exact artifact ownership and independent reader bounds"

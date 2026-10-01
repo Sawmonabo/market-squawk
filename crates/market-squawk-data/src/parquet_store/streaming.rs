@@ -9,6 +9,7 @@ use datafusion::execution::memory_pool::MemoryReservation;
 pub(crate) struct StreamingParquetWriter {
     state: Option<WriterState>,
     supervisor: BlockingIoSupervisor,
+    cancellation: CancellationToken,
     blocking_tasks: Arc<Semaphore>,
 }
 
@@ -16,6 +17,7 @@ struct WriterState {
     store: ParquetObjectStore,
     writer: ArrowWriter<File>,
     cleanup: OwnedStagingCleanup,
+    scratch: Option<OperationScratchDirectory>,
     rows: u64,
     schema: SchemaRef,
     active_limit: usize,
@@ -70,6 +72,55 @@ impl ParquetObjectStore {
         if !self.authority.publication.owns(lease) {
             return Err(ParquetStoreError::InvalidPublicationLease);
         }
+        self.open_streaming_writer(
+            schema,
+            BlockingIoSupervisor::new(cancellation.child_token()),
+            memory,
+            memory_limit,
+            max_output_bytes,
+            None,
+            #[cfg(test)]
+            barrier,
+        )
+    }
+
+    /// Stages bounded archival work in operation-owned storage, outside publication admission.
+    pub(crate) async fn begin_archive_writer(
+        &self,
+        schema: SchemaRef,
+        working_bytes: usize,
+        supervisor: &BlockingIoSupervisor,
+    ) -> Result<StreamingParquetWriter, ParquetStoreError> {
+        if working_bytes == 0 {
+            return Err(ParquetStoreError::InvalidConfiguration);
+        }
+        self.open_streaming_writer(
+            schema,
+            supervisor.clone(),
+            None,
+            u64::try_from(working_bytes).map_err(|_| ParquetStoreError::SizeOverflow)?,
+            self.config.max_staging_bytes,
+            Some(self.operation_scratch()?),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "existing writer resource authorities and owned scratch"
+    )]
+    fn open_streaming_writer(
+        &self,
+        schema: SchemaRef,
+        supervisor: BlockingIoSupervisor,
+        memory: Option<QueryArtifactMemoryLease>,
+        memory_limit: u64,
+        max_output_bytes: u64,
+        scratch: Option<OperationScratchDirectory>,
+        #[cfg(test)] barrier: Option<crate::ingest::QueryArtifactWriterWorkerBarrier>,
+    ) -> Result<StreamingParquetWriter, ParquetStoreError> {
+        let cancellation = supervisor.cancellation().child_token();
         if cancellation.is_cancelled() {
             return Err(ParquetStoreError::Cancelled);
         }
@@ -80,8 +131,19 @@ impl ParquetObjectStore {
             blocking_tasks: Arc::clone(&self.blocking_tasks),
             authority: Arc::clone(&self.authority),
         };
-        let supervisor = BlockingIoSupervisor::new(cancellation.child_token());
-        let stage = format!("{STAGING}/{}.tmp", Uuid::new_v4());
+        let stage = match &scratch {
+            Some(scratch) => {
+                let relative = scratch
+                    .path()
+                    .strip_prefix(self.root.root())
+                    .map_err(|_| ParquetStoreError::InvalidStagedObject)?;
+                let relative = relative
+                    .to_str()
+                    .ok_or(ParquetStoreError::InvalidStagedObject)?;
+                format!("{relative}/{}.tmp", Uuid::new_v4())
+            }
+            None => format!("{STAGING}/{}.tmp", Uuid::new_v4()),
+        };
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         configure_private_staging(&mut options);
@@ -104,14 +166,25 @@ impl ParquetObjectStore {
             .set_statistics_enabled(EnabledStatistics::None)
             .set_write_page_header_statistics(false)
             .set_data_page_size_limit(page_bytes)
-            .set_write_batch_size((page_bytes / size_of::<u64>()).clamp(1, 1024))
-            .build();
-        let writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))?;
+            .set_write_batch_size((page_bytes / size_of::<u64>()).clamp(1, 1024));
+        // Leave decoder headroom for one already-admitted large row crossing the soft group
+        // target. The ordinary leased writers retain their existing properties.
+        let properties = if scratch.is_some() {
+            properties.set_max_row_group_bytes(Some(
+                usize::try_from(memory_limit / 16)
+                    .map_err(|_| ParquetStoreError::SizeOverflow)?
+                    .max(1),
+            ))
+        } else {
+            properties
+        };
+        let writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties.build()))?;
         Ok(StreamingParquetWriter {
             state: Some(WriterState {
                 store,
                 writer,
                 cleanup,
+                scratch,
                 rows: 0,
                 schema,
                 active_limit: 0,
@@ -124,6 +197,7 @@ impl ParquetObjectStore {
                 barrier,
             }),
             supervisor,
+            cancellation,
             blocking_tasks: Arc::clone(&self.blocking_tasks),
         })
     }
@@ -162,7 +236,7 @@ impl StreamingParquetWriter {
             .state
             .take()
             .ok_or(ParquetStoreError::InvalidStagedObject)?;
-        let cancellation = self.supervisor.cancellation().clone();
+        let cancellation = self.cancellation.clone();
         let permit = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ParquetStoreError::Cancelled),
@@ -207,7 +281,7 @@ impl StreamingParquetWriter {
             .state
             .take()
             .ok_or(ParquetStoreError::InvalidStagedObject)?;
-        let cancellation = self.supervisor.cancellation().clone();
+        let cancellation = self.cancellation.clone();
         let permit = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ParquetStoreError::Cancelled),
@@ -231,7 +305,9 @@ impl StreamingParquetWriter {
 
 impl Drop for StreamingParquetWriter {
     fn drop(&mut self) {
-        self.supervisor.cancel();
+        // The archive supervisor also owns subsequent catalog publication. Dropping a finished
+        // writer cancels only its encoder, not the enclosing operation's remaining workers.
+        self.cancellation.cancel();
     }
 }
 
@@ -349,6 +425,7 @@ impl WriterState {
         let Self {
             writer,
             cleanup,
+            scratch,
             rows,
             memory: _memory,
             max_output_bytes,
@@ -363,6 +440,7 @@ impl WriterState {
         let content_hash = hash_file(&mut file, Some(cancellation))?;
         Ok(StagedObject {
             cleanup,
+            _scratch: scratch,
             content_hash,
             size_bytes: metadata.len(),
             row_count: rows,

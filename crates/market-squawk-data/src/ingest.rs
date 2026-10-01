@@ -13,6 +13,7 @@ pub use board_full_history::{
     BoardFullHistoryPublicationInput, BoardFullHistoryPublicationReference,
     BoardFullHistoryReservedPublication, BoardFullHistoryStagingLease,
 };
+pub use market_event_store::{MarketEventArchiveLimits, MarketEventArchiveTurn};
 mod provider_capture_metadata;
 pub use provider_capture_metadata::ProviderMacroMetadataCapture;
 mod provider_capture_original;
@@ -92,7 +93,7 @@ use crate::{
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
-const MAX_EVENT_PUBLICATION_READ_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_EVENT_PUBLICATION_READ_BYTES: usize = 128 * 1024 * 1024;
 const MAX_OPTION_PUBLICATION_READ_BYTES: usize = 192 * 1024 * 1024;
 const SEC_FUND_SOURCE_ID: &str = "sec-edgar";
 const SEC_FUND_CANONICAL_PARTITION_DOMAIN: &[u8] = b"market-squawk/sec-fund/canonical-partition/v1";

@@ -118,6 +118,21 @@ pub(super) fn evidence_digest(
         digest.update(query.expires_at().unix_nanos().to_be_bytes());
     }
 
+    let mut archives: Vec<_> = snapshot.market_event_archives().iter().collect();
+    archives.sort_unstable_by_key(|archive| archive.content_hash());
+    section_count(&mut digest, b"market-event-archives", archives.len())?;
+    for archive in archives {
+        digest.update(archive.content_hash().bytes());
+        text(&mut digest, archive.relative_reference())?;
+        text(&mut digest, archive.schema().name())?;
+        digest.update(archive.schema().version().get().to_be_bytes());
+        digest.update(archive.schema().fingerprint());
+        digest.update(archive.size_bytes().to_be_bytes());
+        digest.update(archive.row_count().to_be_bytes());
+        digest.update(archive.created_at().unix_nanos().to_be_bytes());
+        digest.update(archive.published_at().unix_nanos().to_be_bytes());
+    }
+
     let mut provider_relations: Vec<_> = snapshot.provider_relations().iter().collect();
     provider_relations.sort_unstable_by(|left, right| {
         left.relation()

@@ -75,7 +75,7 @@ impl ProductStartupTasks {
     pub(super) fn start(
         research: Arc<ResearchApplicationServices>,
         cancellation: CancellationToken,
-        futures: [Option<StartupFuture>; 4],
+        futures: [Option<StartupFuture>; 5],
     ) -> Arc<Self> {
         let owner = Arc::new(Self {
             research,
@@ -413,5 +413,40 @@ fn source_error(error: ServiceError) -> SourceLifecycleError {
         ServiceError::Cancelled => SourceLifecycleError::Cancelled,
         ServiceError::DeadlineExceeded => SourceLifecycleError::DeadlineExceeded,
         _ => SourceLifecycleError::Unavailable,
+    }
+}
+
+/// Moves bounded cold event batches off the live writer path, with retained shutdown ownership.
+pub(super) async fn run_market_event_archive(
+    analytical: Arc<market_squawk_data::AnalyticalDataService>,
+    cancellation: CancellationToken,
+) {
+    let mut cursor = None;
+    let mut cadence = tokio::time::interval(Duration::from_secs(5));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { biased;
+            () = cancellation.cancelled() => return,
+            _ = cadence.tick() => {},
+        }
+        let result = analytical
+            .maintain_market_event_archive(
+                cursor.as_ref(),
+                market_squawk_data::MarketEventArchiveLimits::default(),
+                Instant::now() + Duration::from_secs(30),
+                cancellation.child_token(),
+            )
+            .await;
+        if cancellation.is_cancelled() {
+            return;
+        }
+        match result {
+            Ok(turn) => cursor = turn.next_dataset().cloned(),
+            Err(_) => {
+                // Archive failure leaves active rows authoritative and does not stop a source.
+                tracing::warn!("market event archive turn could not complete");
+                cursor = None;
+            }
+        }
     }
 }

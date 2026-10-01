@@ -1,8 +1,10 @@
 //! Atomic canonical event microbatches and immutable logical publication horizons.
 
+pub(crate) mod archive;
+
 use std::time::Instant;
 
-use arrow::array::BinaryArray;
+use arrow::array::{Array as _, BinaryArray};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SchemaVersion, Timestamp};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
@@ -28,6 +30,7 @@ impl Catalog {
         dataset: &DatasetId,
         prepared: &PreparedProviderPublicationBinding,
         batch: &ProviderMarketEventArrowBatch,
+        objects: &crate::ParquetObjectStore,
         cancellation: &CancellationToken,
     ) -> Result<MarketEventCommitRef, CatalogError> {
         check_cancelled(cancellation)?;
@@ -80,19 +83,37 @@ impl Catalog {
             {
                 return Err(CatalogError::ProviderEventConflict);
             }
-            verify_active_payloads(
+            if let Some(rows) = archive::load_archived_payloads(
                 &transaction,
                 &commit,
+                objects,
                 self.result_bytes,
+                None,
                 cancellation,
-                |ordinal, payload| {
-                    if payload == payloads.value(ordinal) {
-                        Ok(())
-                    } else {
-                        Err(CatalogError::ProviderEventConflict)
-                    }
-                },
-            )?;
+            )? {
+                if rows.len() != payloads.len()
+                    || rows
+                        .iter()
+                        .enumerate()
+                        .any(|(ordinal, row)| row.as_slice() != payloads.value(ordinal))
+                {
+                    return Err(CatalogError::ProviderEventConflict);
+                }
+            } else {
+                verify_active_payloads(
+                    &transaction,
+                    &commit,
+                    self.result_bytes,
+                    cancellation,
+                    |ordinal, payload| {
+                        if payload == payloads.value(ordinal) {
+                            Ok(())
+                        } else {
+                            Err(CatalogError::ProviderEventConflict)
+                        }
+                    },
+                )?;
+            }
             check_cancelled(cancellation)?;
             transaction.commit()?;
             return Ok(commit);
@@ -351,10 +372,11 @@ pub(crate) fn load_market_event_commit_for_publication(
         .map(Option::flatten)
 }
 
-/// Loads one bounded publication in exact ordinal order on the caller's read snapshot.
-pub(crate) fn load_market_event_active_rows(
+/// Resolves one authoritative placement from the same snapshot as candidate selection.
+pub(crate) fn load_market_event_rows(
     connection: &Connection,
     commit: &MarketEventCommitRef,
+    objects: &crate::ParquetObjectStore,
     limits: CatalogResultLimits,
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -365,6 +387,28 @@ pub(crate) fn load_market_event_active_rows(
     {
         return Err(CatalogError::ProviderEventConflict);
     }
+    if let Some(rows) = archive::load_archived_payloads(
+        connection,
+        commit,
+        objects,
+        limits,
+        Some(deadline),
+        cancellation,
+    )? {
+        return Ok(rows);
+    }
+    load_market_event_active_rows(connection, commit, limits, deadline, cancellation)
+}
+
+/// Loads one bounded publication in exact ordinal order on the caller's read snapshot.
+fn load_market_event_active_rows(
+    connection: &Connection,
+    commit: &MarketEventCommitRef,
+    limits: CatalogResultLimits,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Vec<u8>>, CatalogError> {
+    check_read(deadline, cancellation)?;
     let count =
         usize::try_from(commit.row_count()).map_err(|_| CatalogError::ResultRowLimitExceeded)?;
     let mut budget = ResultBudget::new(limits);

@@ -16,10 +16,12 @@ use super::storage::{verify_integrity, verify_migration_identities};
 use super::types::MAX_SQLITE_RECORD_BYTES;
 use super::{Catalog, CatalogError};
 use crate::authority_transition::AuthoritySnapshot;
+
+mod market_events;
 use crate::authority_transition::evidence::{
     ArtifactEvidenceRow, CatalogEvidenceSnapshot, EvidenceError, EvidenceSnapshotRequest,
     GenerationEvidenceRow, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
-    ManifestEvidenceRow, QueryArtifactEvidenceRow,
+    ManifestEvidenceRow, MarketEventArchiveEvidenceRow, QueryArtifactEvidenceRow,
 };
 use crate::manifest::{DatasetBuildSpecDigest, GenerationParentRelation};
 use crate::{
@@ -94,7 +96,12 @@ fn evidence_snapshot(
     remaining_references = remaining_references
         .checked_sub(query_artifacts.len())
         .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
+    let market_event_archives = market_events::read_archives(transaction, remaining_references)?;
+    remaining_references = remaining_references
+        .checked_sub(market_event_archives.len())
+        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
     validate_provider_relation_integrity(transaction)?;
+    market_events::validate_integrity(transaction)?;
     let provider_relation_rows = read_provider_relation_rows(transaction, remaining_references)?;
     let evidence = CatalogEvidenceSnapshot::try_new_with_provider_relation_rows(
         request,
@@ -102,6 +109,7 @@ fn evidence_snapshot(
         manifests,
         generations,
         query_artifacts,
+        market_event_archives,
         provider_relation_rows,
     )
     .map_err(map_evidence_error)?;
@@ -464,7 +472,7 @@ fn read_provider_relation_rows(
     read_provider_capture_original_evidence(connection, maximum, &mut result)?;
     read_provider_option_evidence(connection, maximum, &mut result)?;
     read_direct_provider_input_evidence(connection, maximum, &mut result)?;
-    read_market_event_selection_evidence(connection, maximum, &mut result)?;
+    market_events::read_relations(connection, maximum, &mut result)?;
     read_indexed_resource_evidence(connection, maximum, &mut result)?;
     Ok(result)
 }
@@ -540,7 +548,7 @@ fn read_direct_provider_input_evidence(
     const CAPTURE_RELATION: &str = "ingest_run_provider_capture_bindings";
     let mut capture_statement = connection.prepare(
         "SELECT run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
-                binding_digest, source_id
+                binding_digest, source_id, metadata_dependency_digest
          FROM ingest_run_provider_capture_bindings
          ORDER BY run_id, input_ordinal LIMIT ?1",
     )?;
@@ -567,6 +575,7 @@ fn read_direct_provider_input_evidence(
         digest.integer(object_input_ordinal);
         digest.digest(binding);
         digest.text(&source)?;
+        digest.optional_bytes(row.get::<_, Option<Vec<u8>>>(6)?.as_deref())?;
         result.push(provider_relation_row(
             CAPTURE_RELATION,
             run_ordinal_primary_key(run, input_ordinal)?,
@@ -580,7 +589,7 @@ fn read_direct_provider_input_evidence(
         "SELECT run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
                 publication_digest, publication_kind, source_id,
                 response_binding_digest, event_binding_digest, composite_binding_digest,
-                option_binding_digest, logical_binding_digest
+                option_binding_digest, logical_binding_digest, active_dataset_id, active_commit_sequence
          FROM ingest_run_provider_publication_bindings
          ORDER BY run_id, input_ordinal LIMIT ?1",
     )?;
@@ -589,8 +598,8 @@ fn read_direct_provider_input_evidence(
         require_capacity(result, maximum)?;
         let run = parse_uuid(row.get::<_, String>(0)?)?;
         let input_ordinal: i64 = row.get(1)?;
-        let output_ordinal: i64 = row.get(2)?;
-        let object_input_ordinal: i64 = row.get(3)?;
+        let output_ordinal: Option<i64> = row.get(2)?;
+        let object_input_ordinal: Option<i64> = row.get(3)?;
         let publication = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
         let kind: String = row.get(5)?;
         let source: String = row.get(6)?;
@@ -599,9 +608,36 @@ fn read_direct_provider_input_evidence(
         let composite: Option<Vec<u8>> = row.get(9)?;
         let option: Option<Vec<u8>> = row.get(10)?;
         let logical: Option<Vec<u8>> = row.get(11)?;
+        let active_dataset: Option<String> = row.get(12)?;
+        let active_sequence: Option<i64> = row.get(13)?;
         if !(0..=4095).contains(&input_ordinal)
-            || !(0..=1023).contains(&output_ordinal)
-            || !(0..=4095).contains(&object_input_ordinal)
+            || match (
+                &active_dataset,
+                active_sequence,
+                output_ordinal,
+                object_input_ordinal,
+            ) {
+                (None, None, Some(output), Some(input)) => {
+                    !(0..=1023).contains(&output)
+                        || !(0..=4095).contains(&input)
+                        || !matches!(
+                            kind.as_str(),
+                            "option_snapshots" | "option_expirations" | "provider_logical"
+                        )
+                }
+                (Some(dataset), Some(sequence), None, None) => {
+                    sequence <= 0
+                        || input_ordinal != 0
+                        || DatasetId::try_from(dataset.as_str()).is_err()
+                        || !matches!(
+                            kind.as_str(),
+                            "response_market_event"
+                                | "event_microbatch"
+                                | "composite_response_event"
+                        )
+                }
+                _ => true,
+            }
             || SourceIdentifier::try_from(source.clone()).is_err()
         {
             return Err(CatalogError::CorruptCatalog);
@@ -609,8 +645,8 @@ fn read_direct_provider_input_evidence(
         let mut digest = ProviderRowDigest::new(PUBLICATION_RELATION)?;
         digest.bytes(run.as_bytes())?;
         digest.integer(input_ordinal);
-        digest.integer(output_ordinal);
-        digest.integer(object_input_ordinal);
+        digest.optional_integer(output_ordinal);
+        digest.optional_integer(object_input_ordinal);
         digest.digest(publication);
         digest.text(&kind)?;
         digest.text(&source)?;
@@ -619,6 +655,8 @@ fn read_direct_provider_input_evidence(
         digest.optional_bytes(composite.as_deref())?;
         digest.optional_bytes(option.as_deref())?;
         digest.optional_bytes(logical.as_deref())?;
+        digest.optional_bytes(active_dataset.as_deref().map(str::as_bytes))?;
+        digest.optional_integer(active_sequence);
         result.push(provider_relation_row(
             PUBLICATION_RELATION,
             run_ordinal_primary_key(run, input_ordinal)?,
@@ -1481,111 +1519,6 @@ fn read_provider_option_rows(
         result.push(provider_relation_row(
             RELATION,
             digest_ordinal_primary_key(binding, ordinal)?,
-            digest.finish(),
-            0,
-        ));
-    }
-    Ok(())
-}
-
-fn read_market_event_selection_evidence(
-    connection: &Connection,
-    maximum: usize,
-    result: &mut Vec<ProviderRelationEvidenceRow>,
-) -> Result<(), CatalogError> {
-    const RELATION: &str = "provider_market_event_selection_index";
-    let mut statement = connection.prepare(
-        "SELECT publication_digest, publication_kind, publication_row_ordinal,
-                component_kind, component_binding_digest, component_row_ordinal,
-                canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
-                source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
-                connection_generation_be, source_sequence_be, provider_event_id,
-                coordinate_digest
-         FROM provider_market_event_selection_index
-         ORDER BY publication_digest, publication_row_ordinal LIMIT ?1",
-    )?;
-    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
-    while let Some(row) = rows.next()? {
-        require_capacity(result, maximum)?;
-        let publication = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
-        let publication_kind: String = row.get(1)?;
-        let publication_ordinal: i64 = row.get(2)?;
-        let component_kind: String = row.get(3)?;
-        let component = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
-        let component_ordinal: i64 = row.get(5)?;
-        let canonical = parse_sha256(1, row.get::<_, Vec<u8>>(6)?)?;
-        let source: String = row.get(7)?;
-        SourceIdentifier::try_from(source.clone()).map_err(|_| CatalogError::CorruptCatalog)?;
-        let instrument_bytes: Vec<u8> = row.get(8)?;
-        let instrument = parse_uuid_blob(&instrument_bytes)?;
-        let venue: String = row.get(9)?;
-        let event_kind: String = row.get(10)?;
-        let source_timestamp: Option<i64> = row.get(11)?;
-        let received: i64 = row.get(12)?;
-        let available: i64 = row.get(13)?;
-        let ingested: i64 = row.get(14)?;
-        let connection_generation: Vec<u8> = row.get(15)?;
-        let source_sequence: Option<Vec<u8>> = row.get(16)?;
-        let provider_event_id: String = row.get(17)?;
-        let coordinate = parse_sha256(1, row.get::<_, Vec<u8>>(18)?)?;
-        validate_nonzero_u64_blob(&connection_generation)?;
-        validate_optional_u64_blob(source_sequence.as_deref())?;
-        let kind_matches = match publication_kind.as_str() {
-            "response_market_event" => component_kind == "response",
-            "event_microbatch" => component_kind == "stream",
-            "composite_response_event" => {
-                matches!(component_kind.as_str(), "response" | "stream")
-            }
-            _ => false,
-        };
-        if !kind_matches
-            || !(0..=127).contains(&publication_ordinal)
-            || !(0..=63).contains(&component_ordinal)
-            || (publication_kind != "composite_response_event"
-                && publication_ordinal != component_ordinal)
-            || venue.is_empty()
-            || venue.len() > 128
-            || !matches!(
-                event_kind.as_str(),
-                "trade"
-                    | "quote"
-                    | "book_snapshot"
-                    | "book_delta"
-                    | "auction"
-                    | "trading_halt"
-                    | "instrument_status"
-                    | "corporate_action"
-            )
-            || received > available
-            || available > ingested
-            || provider_event_id.is_empty()
-            || provider_event_id.len() > 512
-        {
-            return Err(CatalogError::CorruptCatalog);
-        }
-        let mut digest = ProviderRowDigest::new(RELATION)?;
-        digest.digest(publication);
-        digest.text(&publication_kind)?;
-        digest.integer(publication_ordinal);
-        digest.text(&component_kind)?;
-        digest.digest(component);
-        digest.integer(component_ordinal);
-        digest.digest(canonical);
-        digest.text(&source)?;
-        digest.bytes(instrument.as_bytes())?;
-        digest.text(&venue)?;
-        digest.text(&event_kind)?;
-        digest.optional_integer(source_timestamp);
-        digest.integer(received);
-        digest.integer(available);
-        digest.integer(ingested);
-        digest.bytes(&connection_generation)?;
-        digest.optional_bytes(source_sequence.as_deref())?;
-        digest.text(&provider_event_id)?;
-        digest.digest(coordinate);
-        result.push(provider_relation_row(
-            RELATION,
-            digest_ordinal_primary_key(publication, publication_ordinal)?,
             digest.finish(),
             0,
         ));
