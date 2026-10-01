@@ -68,6 +68,48 @@ impl LiveActionHook for ActionInvocationProbe {
     }
 }
 
+#[test]
+fn startup_health_refresh_uses_actual_deadline_and_acknowledgement_time() -> TestResult {
+    use super::super::sink::{health_rebind_due, rebind_at};
+
+    let received_at = Timestamp::from_unix_nanos(10_000_000_000);
+    let acknowledged_at = received_at.checked_add_nanos(400_000_000)?;
+    // Five seconds of configured market age does not enlarge the remaining source/identity
+    // window. At acknowledgement only 600ms of this genuine one-second lease remains.
+    let configured_market_deadline = received_at.checked_add_nanos(5_000_000_000)?;
+    let actual_valid_until = received_at.checked_add_nanos(1_000_000_000)?;
+    let refresh_at = rebind_at(acknowledged_at, actual_valid_until)?;
+    assert_eq!(refresh_at, received_at.checked_add_nanos(700_000_000)?);
+    assert!(refresh_at < configured_market_deadline);
+    assert!(!health_rebind_due(
+        received_at,
+        Some(refresh_at),
+        Some(actual_valid_until)
+    ));
+    let later_acknowledgement = received_at.checked_add_nanos(800_000_000)?;
+    assert!(health_rebind_due(
+        later_acknowledgement,
+        Some(refresh_at),
+        Some(actual_valid_until)
+    ));
+    // Reaching the genuine expiry requires qualification even with a later cached schedule;
+    // a zero remaining interval never grants a synthetic extra nanosecond of authority.
+    assert!(health_rebind_due(
+        actual_valid_until,
+        Some(configured_market_deadline),
+        Some(actual_valid_until)
+    ));
+    assert_eq!(
+        rebind_at(actual_valid_until, actual_valid_until)?,
+        actual_valid_until
+    );
+    assert_eq!(
+        rebind_at(later_acknowledgement, acknowledged_at)?,
+        later_acknowledgement
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn pre_acknowledgement_snapshot_is_bounded_and_published_only_after_exact_ack() -> TestResult
 {

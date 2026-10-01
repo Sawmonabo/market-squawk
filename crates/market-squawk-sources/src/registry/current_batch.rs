@@ -263,13 +263,69 @@ pub struct CurrentSourceAuthorityLease {
     trusted_valid_from: Timestamp,
     trusted_valid_from_monotonic: RegistryMonotonicInstant,
     valid_until_monotonic: RegistryMonotonicInstant,
+    permission_valid_until: Timestamp,
+    permission_valid_until_monotonic: RegistryMonotonicInstant,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
     budget: CurrentBudgetAuthority,
     clock: Arc<SealedRegistryClock>,
 }
 
+/// Opaque permission to persist an observation admitted while its live lease was valid.
+/// This receipt cannot admit a new observation or mint live/execution authority.
+#[derive(Clone, Debug)]
+pub struct CommittedSourceObservationAuthority {
+    source: CurrentSourceAuthorityLease,
+    identity: CurrentProviderIdentity,
+    admitted_at: Timestamp,
+}
+
+impl CommittedSourceObservationAuthority {
+    /// Returns the exact identity selected and validated at admission.
+    pub const fn provider_identity(&self) -> &CurrentProviderIdentity {
+        &self.identity
+    }
+
+    /// Revalidates original admission, continuing permission and revocation for durable storage.
+    /// Expired price freshness does not backdate or renew the committed observation.
+    pub fn validate_publication(&self) -> Result<(), RegistryError> {
+        let source = &self.source;
+        let trusted = source.clock.observe()?;
+        if trusted.monotonic() < source.trusted_valid_from_monotonic {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if trusted.wall() < source.trusted_valid_from
+            || trusted.wall() > source.permission_valid_until
+            || trusted.monotonic() > source.permission_valid_until_monotonic
+            || self.admitted_at < source.valid_from
+            || self.admitted_at > source.valid_until
+            || !source.lease.validate_health_epoch(source.health_epoch)
+            || !source.capture.is_healthy()
+            || !source.budget.is_available()
+        {
+            return Err(RegistryError::HealthNotQualified);
+        }
+        self.identity.validate_at(trusted.wall())?;
+        self.identity.validate_at(self.admitted_at)
+    }
+}
+
 impl CurrentSourceAuthorityLease {
+    /// Seals exact observation authority only while live admission and selected identity are valid.
+    /// The resulting receipt grants durable publication only, never new live admission.
+    pub fn commit_provider_observation(
+        &self,
+        identity: CurrentProviderIdentity,
+        admitted_at: Timestamp,
+    ) -> Result<CommittedSourceObservationAuthority, RegistryError> {
+        self.validate_provider_identity_at(&identity, admitted_at)?;
+        Ok(CommittedSourceObservationAuthority {
+            source: self.clone(),
+            identity,
+            admitted_at,
+        })
+    }
+
     /// Revalidates a selected identity together with source, capture, health and budget authority.
     /// A fresh sealed clock sample prevents a retained event timestamp from extending identity
     /// validity. This does not grant observation or mutation authority to either input alone.

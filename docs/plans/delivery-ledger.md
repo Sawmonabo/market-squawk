@@ -4869,3 +4869,60 @@ or builds. Current test is still joining/finalizing and has not reached restart.
 Healthy-renewal live run finishes failed132.52s; no prior count-eviction, SQLite or definition-writer
 rejection is reported. Exact trusted lease expiry remains open; no live/restart acceptance claimed.
 Critical renewal, revocation, evidence-change, budget and terminal-epoch checks pass as above.
+
+### Committed live evidence publication boundary — active
+
+Base: `56c7ea45` (pushed; focused checks, live failure remains). Required outcome: admitted
+Coinbase/Kraken observations persist and reopen without confusing elapsed price freshness with
+permission to store evidence. Existing live admission and real permission/revocation checks remain.
+
+| Owner | Dependencies / exclusive files | Outcome / check |
+| --- | --- | --- |
+| Astra `research_options_failure` | Diagnosis complete; sources registry authority files and existing registry authority tests; live `qualification.rs` only | Opaque committed-evidence authority with original qualification and continuing permission/revocation checks; existing critical admission/expiry/revocation cases extended only for this gap. No builds or Git. |
+| Lead | Agent contract first; application crypto publication callers, shared exports/manifests, documentation and integration | Wire persistence boundary; inspect changes, serialized single-job focused checks and real public feed restart test; commit/push coherent result. |
+
+No lifetime/freshness timeout increase, fabricated receipts, compatibility path, or new worktree.
+Live-first publication is blocked by original live freshness expiry after actor admission; permission
+expiry must remain independently enforced. Native Desktop and full stock journey remain unverified.
+
+Implementation integrated: source registry computes separate static/runtime permission deadlines;
+actor commit seals an opaque identity/admission receipt; Coinbase/Kraken precommit retain that receipt
+instead of replaying live freshness checks. Original live validation is unchanged. Lead inspected
+all constructor propagation, adapter consumers and the existing memory-charge path (size-based
+carrier accounting). No new compatibility path or duplicate identity/lease is retained.
+
+Critical evidence: `committed-publication-authority-critical.log` passed 1/1 (0.01 s; build12.57 s),
+extending the existing sealed-expiry test for delayed publication versus unchanged live rejection,
+wall/monotonic permission expiry and session revocation. `committed-publication-live-guards.log`
+passed existing pre-feed deadline/capture/health/registry check 1/1 (0.01 s; build14.32 s).
+Application build and genuine public-network restart check remain pending; no live success claimed.
+
+Application build passed (6m31s), but `committed-publication-live.log` failed at132.52s before
+first feed acceptance. Earliest failure is now sink authority rejection, followed by pending
+publication revocation, rather than publication freshness expiry. Read-only trace found data
+renewal scheduled from configured market-age/2, ignoring the earlier actual admitted minimum
+(source/transport/native/permission) deadline already returned by the actor. This is a concrete
+adjacent startup defect; no freshness or timeout increase is authorized.
+
+Next bounded ownership: Astra `research_options_failure` owns `live_source/sink.rs` and the existing
+sink fixture case only, to schedule renewal from actual remaining authority and validate that the
+original timestamps/expiry remain unchanged. Lead retains integration/docs/build/Git. No new branch,
+worktree, harness, broad review or concurrent compilation.
+
+Actual-deadline correction integrated: both HTTP and active streaming paths schedule refresh within
+the actual returned minimum authority interval; active data compares genuine health observation
+time, including buffered acknowledgement. Later batches preserve an earlier/shorter schedule until
+renewal. Original receipt/source clocks, stale-data qualification and deadlines remain unchanged.
+One new deterministic case in existing sink tests covers the previously uncovered shortened-deadline
+startup failure; no new harness. Build/check/live verification pending in `actual-deadline-*` logs.
+
+Integrated verification: `actual-deadline-app-build.log` passed (7m54s, one compiler job);
+`actual-deadline-scheduling-critical.log` passed 1/1 (0.00s). The real public test in
+`actual-deadline-live.log` still failed132.63s: first Coinbase exact publication missed its original
+deadline because Market.GetUnifiedFeed returned unavailable. Unlike earlier runs, no sink or
+publication-authority failure is logged. This is not proof of live completion or durable output;
+next dependency is the read/runtime availability path. Kraken and restart remain unreached.
+
+Checkpoint includes source/publication authority and actual-deadline scheduling together, with
+all affected callers inspected. No full gate/CI, native Desktop proof or whole-app RAM measurement.
+One primary worktree and the three intended local/remote branches remain; no extra refs were made.

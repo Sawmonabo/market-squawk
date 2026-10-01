@@ -1164,6 +1164,8 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             trusted_valid_from: self.health.accepted_at.wall(),
             trusted_valid_from_monotonic: self.health.accepted_at.monotonic(),
             valid_until_monotonic: self.health.valid_until_monotonic,
+            permission_valid_until: self.health.permission_valid_until,
+            permission_valid_until_monotonic: self.health.permission_valid_until_monotonic,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
             budget: self.health.budget.clone(),
@@ -1311,6 +1313,21 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         {
             return Err(RegistryError::HealthNotQualified);
         }
+        let permission_valid_until = self
+            .attestation
+            .and_then(InstrumentUniverseAttestation::inclusive_deadline)
+            .map_or(self.health.permission_valid_until, |until| {
+                until.min(self.health.permission_valid_until)
+            });
+        let permission_valid_until = provider_identity
+            .inclusive_deadline()
+            .map_or(permission_valid_until, |until| {
+                until.min(permission_valid_until)
+            });
+        let permission_valid_until_monotonic = scope_validated_at
+            .checked_deadline(permission_valid_until)?
+            .ok_or(RegistryError::HealthNotQualified)?
+            .min(self.health.permission_valid_until_monotonic);
         let topology = self.validated.metadata.coverage().topology();
         let consolidation = if topology.is_single_venue() {
             CoverageConsolidation::SingleVenue
@@ -1356,6 +1373,8 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             trusted_valid_from: self.health.accepted_at.wall(),
             trusted_valid_from_monotonic: self.health.accepted_at.monotonic(),
             valid_until_monotonic: scope_deadline.ok_or(RegistryError::HealthNotQualified)?,
+            permission_valid_until,
+            permission_valid_until_monotonic,
             health_epoch: self.health.epoch,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),

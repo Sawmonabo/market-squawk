@@ -213,6 +213,37 @@ impl AuthoritativeSourceRegistry {
                 return Err(RegistryError::HealthEpochExhausted);
             }
         };
+        // Permission survives ordinary price freshness, but never its own static/runtime expiry.
+        let permission_valid_until = match (health.authorization(), health.coverage()) {
+            (
+                crate::AuthorizationHealth::Valid {
+                    valid_until: authorization,
+                    ..
+                },
+                crate::CoverageHealth::Sufficient {
+                    valid_until: coverage,
+                    ..
+                },
+            ) => Some(
+                (*authorization)
+                    .min(*coverage)
+                    .min(
+                        entry
+                            .metadata
+                            .authorization()
+                            .inclusive_authorization_deadline()
+                            .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
+                    )
+                    .min(
+                        entry
+                            .metadata
+                            .coverage()
+                            .inclusive_coverage_deadline()
+                            .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
+                    ),
+            ),
+            _ => None,
+        };
         let next_authority = if qualified {
             Some(CurrentHealthAuthority {
                 snapshot: Arc::new(health.clone()),
@@ -223,6 +254,13 @@ impl AuthoritativeSourceRegistry {
                 valid_from: health.observed_at(),
                 valid_until: valid_until.ok_or(RegistryError::HealthNotQualified)?,
                 valid_until_monotonic: valid_until_monotonic
+                    .ok_or(RegistryError::HealthNotQualified)?,
+                permission_valid_until: permission_valid_until
+                    .ok_or(RegistryError::HealthNotQualified)?,
+                permission_valid_until_monotonic: validation_at
+                    .checked_deadline(
+                        permission_valid_until.ok_or(RegistryError::HealthNotQualified)?,
+                    )?
                     .ok_or(RegistryError::HealthNotQualified)?,
                 authorization: health.authorization().clone(),
                 coverage: health.coverage().clone(),

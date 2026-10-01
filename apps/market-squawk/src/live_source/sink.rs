@@ -40,10 +40,9 @@ use market_squawk_sources::{
     CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind,
     CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthRecording,
     CurrentHealthReporter, CurrentSourceSession, DecodeInternalError, DecodeOutcome,
-    FreshnessPolicy, NormalizedHttpResponseBatch, ProviderTimestampEvidence, QuarantineReason,
-    RawMarketFrame, RawMarketSink, RegistryError, ResynchronizationReason, SinkError,
-    SourceHealthError, SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider,
-    ValidatedSessionDecodeOutcome,
+    NormalizedHttpResponseBatch, ProviderTimestampEvidence, QuarantineReason, RawMarketFrame,
+    RawMarketSink, RegistryError, ResynchronizationReason, SinkError, SourceHealthError,
+    SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider, ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -617,9 +616,8 @@ impl<'a> ProductionRawMarketSink<'a> {
                     .map_or(source_at, |previous| previous.max(source_at)),
             );
         }
-        let requires_rebind = self
-            .health_rebind_at
-            .is_none_or(|deadline| received_at >= deadline);
+        let requires_rebind =
+            health_rebind_due(received_at, self.health_rebind_at, self.health_valid_until);
         if requires_rebind {
             match self.record_health(received_at)? {
                 CurrentHealthRecording::Qualified => {}
@@ -643,10 +641,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             .validate_http_response_batch_owned(batch)
             .map_err(ProductionSinkFailure::Registry)?;
         let valid_until = self.output.try_publish(batches, received_at)?;
-        if requires_rebind {
-            self.health_rebind_at = Some(rebind_at(received_at, self.metadata.freshness_policy())?);
-            self.health_valid_until = Some(valid_until);
-        }
+        self.retain_health_deadline(received_at, valid_until, requires_rebind)?;
         self.publish_startup_readiness()?;
         Ok(())
     }
@@ -864,9 +859,11 @@ impl<'a> ProductionRawMarketSink<'a> {
                     .map_or(source_at, |previous| previous.max(source_at)),
             );
         }
-        let requires_rebind = self
-            .health_rebind_at
-            .is_none_or(|deadline| received_at >= deadline);
+        let requires_rebind = health_rebind_due(
+            health_observed_at,
+            self.health_rebind_at,
+            self.health_valid_until,
+        );
         if requires_rebind {
             match self.record_health(health_observed_at)? {
                 CurrentHealthRecording::Qualified => {}
@@ -880,24 +877,62 @@ impl<'a> ProductionRawMarketSink<'a> {
                 }
             }
         }
+        let cached_deadline_reached = self
+            .health_valid_until
+            .is_some_and(|deadline| health_observed_at >= deadline);
         let current = self
             .registry
             .validate_current_authority(self.session)
-            .map_err(ProductionSinkFailure::Registry)?;
-        let batches = current
-            .validate_data_outcome_owned(data)
-            .map_err(ProductionSinkFailure::Registry)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    stage = "current_authority",
+                    requires_rebind,
+                    cached_deadline_reached,
+                    health_not_qualified = matches!(error, RegistryError::HealthNotQualified),
+                    "sink current authority rejected data"
+                );
+                ProductionSinkFailure::Registry(error)
+            })?;
+        let batches = current.validate_data_outcome_owned(data).map_err(|error| {
+            tracing::warn!(
+                stage = "data_qualification",
+                requires_rebind,
+                cached_deadline_reached,
+                health_not_qualified = matches!(error, RegistryError::HealthNotQualified),
+                "sink current authority rejected data"
+            );
+            ProductionSinkFailure::Registry(error)
+        })?;
         // Buffered data becomes available only after its genuine acknowledgement qualifies
         // health. Keep the captured receipt and source timestamps inside each batch unchanged.
         let valid_until = self.output.try_publish(batches, health_observed_at)?;
-        if requires_rebind {
-            self.health_rebind_at = Some(rebind_at(
-                health_observed_at,
-                self.metadata.freshness_policy(),
-            )?);
-            self.health_valid_until = Some(valid_until);
-        }
+        self.retain_health_deadline(health_observed_at, valid_until, requires_rebind)?;
         Ok(ActiveDataDisposition::Published)
+    }
+
+    fn retain_health_deadline(
+        &mut self,
+        observed_at: Timestamp,
+        valid_until: Timestamp,
+        renewed: bool,
+    ) -> Result<(), ProductionSinkFailure> {
+        // Another route can have a shorter identity/permission window within the same health
+        // revision. Retain its minimum, and never postpone a refresh without requalification.
+        let valid_until = if renewed {
+            valid_until
+        } else {
+            self.health_valid_until
+                .map_or(valid_until, |previous| previous.min(valid_until))
+        };
+        let refresh = rebind_at(observed_at, valid_until)?;
+        self.health_rebind_at = Some(if renewed {
+            refresh
+        } else {
+            self.health_rebind_at
+                .map_or(refresh, |previous| previous.min(refresh))
+        });
+        self.health_valid_until = Some(valid_until);
+        Ok(())
     }
 
     fn publish_startup_readiness(&mut self) -> Result<(), ProductionSinkFailure> {
@@ -1558,12 +1593,26 @@ fn latest_source_timestamp(outcome: &DecodeOutcome) -> Option<Timestamp> {
         .max()
 }
 
-fn rebind_at(
+pub(super) fn health_rebind_due(
     observed_at: Timestamp,
-    freshness: FreshnessPolicy,
+    refresh_at: Option<Timestamp>,
+    valid_until: Option<Timestamp>,
+) -> bool {
+    refresh_at.is_none_or(|deadline| observed_at >= deadline)
+        || valid_until.is_none_or(|deadline| observed_at >= deadline)
+}
+
+pub(super) fn rebind_at(
+    observed_at: Timestamp,
+    valid_until: Timestamp,
 ) -> Result<Timestamp, ProductionSinkFailure> {
-    let half_life = freshness.max_market_age_nanos() / 2;
-    let offset = i64::try_from(half_life.max(1))
+    // Source age, transport, native identity and permissions can all shorten the configured
+    // market age. This schedules a fresh qualification; it does not extend that actual window.
+    if valid_until <= observed_at {
+        return Ok(observed_at);
+    }
+    let remaining = i128::from(valid_until.unix_nanos()) - i128::from(observed_at.unix_nanos());
+    let offset = i64::try_from(remaining / 2)
         .map_err(|_error| ProductionSinkFailure::HealthDeadlineRange)?;
     observed_at
         .checked_add_nanos(offset)

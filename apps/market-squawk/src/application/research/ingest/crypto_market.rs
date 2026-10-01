@@ -1501,27 +1501,19 @@ pub(crate) enum CryptoMarketPublicationError {
 #[derive(Debug)]
 struct CommittedNativePublicationAuthority {
     inner: Arc<dyn IngestPrecommitAuthority>,
-    rows: Vec<(
-        market_squawk_sources::CurrentProviderIdentity,
-        market_squawk_sources::CurrentSourceAuthorityLease,
-        Timestamp,
-    )>,
+    rows: Vec<market_squawk_sources::CommittedSourceObservationAuthority>,
 }
 
 impl CommittedNativePublicationAuthority {
     fn validate_rows(&self) -> Result<(), IngestError> {
-        for (identity, source, ingested_at) in &self.rows {
-            source
-                .validate_provider_identity_at(identity, *ingested_at)
-                .map_err(|error| {
-                    tracing::warn!(
-                        ?error,
-                        before_valid_from = *ingested_at < source.valid_from(),
-                        after_valid_until = *ingested_at > source.valid_until(),
-                        "committed crypto row authority failed precommit revalidation"
-                    );
-                    IngestError::PublicationAuthorityRevoked
-                })?;
+        for authority in &self.rows {
+            authority.validate_publication().map_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    "committed crypto row authority failed precommit revalidation"
+                );
+                IngestError::PublicationAuthorityRevoked
+            })?;
         }
         Ok(())
     }
@@ -1565,24 +1557,17 @@ fn committed_publication_authority(
         .try_reserve_exact(rows.len())
         .map_err(|_| CryptoMarketPublicationError::AuthorityInvalid)?;
     for row in rows {
-        // Reuse the actor's genuine commit clock. Pre-ACK raw availability can precede the
-        // accepted health epoch, while current sealed-clock/revocation checks still run here.
-        let ingested_at = row.ingested_at();
-        row.validate_at(ingested_at).map_err(|error| {
+        // The actor already admitted these exact rows while live-qualified. Persistence keeps
+        // that evidence and rechecks permission/revocation without renewing price freshness.
+        row.validate_for_publication().map_err(|error| {
             tracing::warn!(
                 ?error,
-                before_valid_from = ingested_at < row.source_authority().valid_from(),
-                after_valid_until = ingested_at > row.source_authority().valid_until(),
                 "committed crypto row authority rejected publication"
             );
             CryptoMarketPublicationError::AuthorityInvalid
         })?;
         selections.push(row.native_identity_selection().clone());
-        authorities.push((
-            row.provider_identity().clone(),
-            row.source_authority().clone(),
-            ingested_at,
-        ));
+        authorities.push(row.publication_authority().clone());
     }
     Ok((
         selections,

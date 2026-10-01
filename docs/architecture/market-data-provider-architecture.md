@@ -625,12 +625,26 @@ validates that watch after reading, so a concurrent identity publication cannot 
 snapshot. Contention at the short mutation boundary observes the original cancellation/deadline;
 an occupied writer mutex alone is not an invalid identity.
 
+Feed health renewal is scheduled from the actual admitted authority interval, including its
+source/transport, native-identity and permission cutoffs. A configured market-age duration alone
+does not define that interval. Buffered startup uses the genuine acknowledgement/health observation
+for renewal scheduling while preserving original raw receipt and source timestamps.
+
 Queued source authority retains each lease's original wall-clock, monotonic and event-time bounds.
 Benign healthy renewals preserve that authority through a constant-size epoch floor, independent of
 refresh count. Degradation, session invalidation, changed authorization/subscription evidence,
 narrower authority or a gap in qualified time starts a new run; later recovery cannot revive old
 leases. Capture, budget and native-identity revocation checks remain separate. This is queued-work
 continuity, not an extension of price freshness or permission to use expired observations.
+
+The actor seals publication-only authority for each research observation after live admission
+succeeds. Durable publication retains that exact admission time and original qualification; it does
+not require the price to remain live-fresh while raw evidence is synchronized. Before database
+commit, the receipt still checks session and health-run revocation, capture integrity, budget,
+native identity, and the independent static/runtime permission deadlines using sealed wall and
+monotonic clocks. It cannot admit another live observation or renew price/execution authority.
+The ordinary live validator retains its original freshness checks. Verification status belongs in
+the delivery ledger.
 
 Market-event point reads select an immutable logical publication and its exact source evidence.
 Physical placement is resolved within that read's WAL snapshot: canonical active rows or the

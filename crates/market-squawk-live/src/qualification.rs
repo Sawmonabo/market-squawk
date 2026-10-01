@@ -108,8 +108,7 @@ pub struct CommittedResearchMarketObservation {
     committed_state_revision: u64,
     generation: ConnectionGeneration,
     source_coordinate: CommittedResearchSourceCoordinate,
-    provider_identity: market_squawk_sources::CurrentProviderIdentity,
-    source_authority: market_squawk_sources::CurrentSourceAuthorityLease,
+    publication_authority: market_squawk_sources::CommittedSourceObservationAuthority,
     stable_trade_id: Option<SourceIdentifier>,
 }
 
@@ -177,23 +176,24 @@ impl CommittedResearchMarketObservation {
     pub fn native_identity_selection(
         &self,
     ) -> &market_squawk_sources::ProviderIdentitySelectionEvidence {
-        self.provider_identity.evidence()
+        self.publication_authority.provider_identity().evidence()
     }
 
     /// Returns the catalog-selected identity retained through the actual live commit.
     pub const fn provider_identity(&self) -> &market_squawk_sources::CurrentProviderIdentity {
-        &self.provider_identity
+        self.publication_authority.provider_identity()
     }
 
-    /// Returns the current source authority retained through the actual live commit.
-    pub const fn source_authority(&self) -> &market_squawk_sources::CurrentSourceAuthorityLease {
-        &self.source_authority
+    /// Returns publication-only authority sealed during the actual actor commit.
+    pub const fn publication_authority(
+        &self,
+    ) -> &market_squawk_sources::CommittedSourceObservationAuthority {
+        &self.publication_authority
     }
 
-    /// Rechecks source and catalog currentness before publication, using the source's sealed clock.
-    pub fn validate_at(&self, at: Timestamp) -> Result<(), market_squawk_sources::RegistryError> {
-        self.source_authority
-            .validate_provider_identity_at(&self.provider_identity, at)
+    /// Rechecks permission and revocation without requiring the committed price to remain fresh.
+    pub fn validate_for_publication(&self) -> Result<(), market_squawk_sources::RegistryError> {
+        self.publication_authority.validate_publication()
     }
 
     pub(crate) fn from_committed(
@@ -221,12 +221,12 @@ impl CommittedResearchMarketObservation {
                 != Some(provider_identity.evidence().native.instrument)
             || assessment.binding().venue_id() != &provider_identity.evidence().native.venue
             || assessment.binding().source_id() != provider_identity.source_id()
-            || source_authority
-                .validate_provider_identity_at(&provider_identity, provenance.ingested_at())
-                .is_err()
         {
             return None;
         }
+        let publication_authority = source_authority
+            .commit_provider_observation(provider_identity, provenance.ingested_at())
+            .ok()?;
         let source_coordinate =
             CommittedResearchSourceCoordinate::try_new(source_evidence, row_ordinal, row_count)?;
         Some(Self {
@@ -236,8 +236,7 @@ impl CommittedResearchMarketObservation {
             committed_state_revision,
             generation,
             source_coordinate,
-            provider_identity,
-            source_authority,
+            publication_authority,
             stable_trade_id,
         })
     }
@@ -305,8 +304,7 @@ impl CommittedResearchMarketObservation {
             committed_state_revision: self.committed_state_revision,
             generation: self.generation,
             source_coordinate: self.source_coordinate,
-            provider_identity: self.provider_identity,
-            source_authority: self.source_authority,
+            publication_authority: self.publication_authority,
             stable_trade_id: self.stable_trade_id,
         }
     }
@@ -321,8 +319,7 @@ pub struct CommittedResearchMarketObservationParts {
     pub committed_state_revision: u64,
     pub generation: ConnectionGeneration,
     pub source_coordinate: CommittedResearchSourceCoordinate,
-    pub provider_identity: market_squawk_sources::CurrentProviderIdentity,
-    pub source_authority: market_squawk_sources::CurrentSourceAuthorityLease,
+    pub publication_authority: market_squawk_sources::CommittedSourceObservationAuthority,
     pub stable_trade_id: Option<SourceIdentifier>,
 }
 

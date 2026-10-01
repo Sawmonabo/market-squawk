@@ -219,6 +219,8 @@ struct CurrentHealthAuthority {
     valid_from: Timestamp,
     valid_until: Timestamp,
     valid_until_monotonic: RegistryMonotonicInstant,
+    permission_valid_until: Timestamp,
+    permission_valid_until_monotonic: RegistryMonotonicInstant,
     authorization: crate::AuthorizationHealth,
     coverage: crate::CoverageHealth,
     budget: CurrentBudgetAuthority,
