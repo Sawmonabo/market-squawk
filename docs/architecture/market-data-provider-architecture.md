@@ -204,6 +204,13 @@ Only read-only routes belong in provider profiles. Endpoints and hard caps remai
 | BEA | **VERIFIED PROVIDER FACT:** prior-minute ceilings are 100 requests, 100 MB, and 30 errors | **APPLICATION POLICY:** 60 requests, 60 MB, and 10 errors/minute |
 | FRED/ALFRED | **VERIFIED PROVIDER FACT:** v1 series observations allow 1–100,000 rows/page with offset pagination; no reviewed v1 page publishes a numeric request-rate ceiling. V2 release observations allow 1–500,000 rows/page, default to 500,000, use `has_more`/`next_cursor`, and permit up to 2 requests/second before HTTP 429. | **APPLICATION POLICY:** one shared 1-request/second v1/v2 queue; version-specific pagination remains separate and runtime pressure may only lower the shared rate |
 
+Kraken's live trade connection requests new events (`snapshot:false`); book connections retain
+initial snapshots. A trade snapshot contains the last 50 trades and can predate newly observed
+instrument-reference validity. The live feed must not backdate that authority to admit them.
+Matching subscription acknowledgements are checked exactly; historical snapshot decoding still
+requires identity evidence valid at each original trade time. See the [official trade contract](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade)
+(reviewed 2026-10-01). This changes live subscription semantics, not stored history retention.
+
 The 150/120 Alpaca values are safety policies, not free-plan guarantees. A runtime limit below them
 wins immediately; an observed limit above them does not automatically raise the policy.
 

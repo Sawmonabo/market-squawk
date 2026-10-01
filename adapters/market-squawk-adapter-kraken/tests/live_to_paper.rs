@@ -187,6 +187,43 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     )?;
     let mut bounded_trade_decoder =
         KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    let trade_ack = br#"{"method":"subscribe","result":{"channel":"trade","snapshot":false,"symbol":"BTC/USD"},"success":true,"time_in":"1970-01-01T00:00:01Z","time_out":"1970-01-01T00:00:01.001Z","req_id":1}"#;
+    assert!(matches!(
+        bounded_trade_decoder.decode_payload(trade_ack)?,
+        KrakenDecodeOutcome::Control(
+            market_squawk_adapter_kraken::KrakenPublicControl::Subscribed { .. }
+        )
+    ));
+    let current_trade = br#"{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":1.0,"qty":1.0,"ord_type":"market","trade_id":1,"timestamp":"1970-01-01T00:00:01Z"}]}"#;
+    let KrakenDecodeOutcome::Market(current_trades) =
+        bounded_trade_decoder.decode_payload(current_trade)?
+    else {
+        return Err("first current trade update did not produce market observations".into());
+    };
+    assert_eq!(current_trades.len(), 1);
+    assert_eq!(
+        bounded_trade_decoder.state(),
+        market_squawk_adapter_kraken::KrakenDecoderState::Healthy
+    );
+    let mut authorized_snapshot_decoder =
+        KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    let mut authorized_snapshot: serde_json::Value = serde_json::from_slice(current_trade)?;
+    authorized_snapshot["type"] = serde_json::Value::String("snapshot".to_owned());
+    assert!(matches!(
+        authorized_snapshot_decoder.decode_payload(&serde_json::to_vec(&authorized_snapshot)?)?,
+        KrakenDecodeOutcome::Market(rows) if rows.len() == 1
+    ));
+
+    let mut unexpected_snapshot_decoder =
+        KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    let mut unexpected_snapshot_ack: serde_json::Value = serde_json::from_slice(trade_ack)?;
+    unexpected_snapshot_ack["result"]["snapshot"] = serde_json::Value::Bool(true);
+    assert!(matches!(
+        unexpected_snapshot_decoder
+            .decode_payload(&serde_json::to_vec(&unexpected_snapshot_ack)?),
+        Err(DecodeError::ResynchronizationRequired)
+    ));
+
     assert!(matches!(
         bounded_trade_decoder.decode_payload(
             br#"{"channel":"trade","type":"snapshot","data":[{"symbol":"BTC/USD","side":"buy","price":"1.0","qty":"1.0","ord_type":"market","trade_id":1,"timestamp":"1970-01-01T00:00:00Z"}]}"#,

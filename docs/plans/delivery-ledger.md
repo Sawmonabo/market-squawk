@@ -43,22 +43,30 @@ Its focused evidence is recorded below. Independent terminal-batch WIP remains p
 
 ### Current dependency and ownership wave
 
-Latest pushed checkpoint: **`1a23ad84`**, reference-capture custody through publication/recovery
-(PR #43 comment5934574027). Active storage uses SQLite microbatches and indexed reads plus bounded
-Parquet archives; streamed backup/recovery and graceful accepted-publication drain are integrated.
-The latest real installed-service test completes Coinbase publication, clean shutdown, resumed
-publication, original-evidence equality and explicit-stop persistence. Kraken reference preparation
-now passes, but its first status message is rejected for documented unused advisory fields. Neither
-native Desktop completion nor complete V1/live continuous-ingestion acceptance is established.
+Latest integrated outcome: **real Coinbase and Kraken installed-service publication/restart
+journeys PASS** (`kraken-live-trades-status-live.log`, 155.49s). Both publish genuine typed events,
+stop cleanly, resume publication after restart, reopen identical original publication/evidence, and
+remain stopped across a third start after explicit Source.Stop. Kraken also reuses the prepared
+anonymous configuration session and exposes both required book/trade streams. This is installed
+service plus typed Desktop transport evidence, not native WebView or complete-V1 acceptance.
 
-| Owner | Exact ownership and dependency | Next completion barrier |
+The checkpoint containing this entry implements live Kraken trade updates without requesting
+historical snapshot rows under newly observed identity authority. Matching ACK checks and all
+original timestamp/identity validation remain; book snapshots and authorized historical decoding
+are retained. Shared status correction was pushed as `60578fa6` (PR #43 comment5935128626).
+Storage, reference custody and graceful publication drain were integrated through `1a23ad84`.
+
+| Owner | State / exact scope | Next barrier |
 | --- | --- | --- |
-| Astra `research_options_failure` | Kraken `src/{messages.rs,decoder.rs,session_tests.rs}` and `src/level3/{messages.rs,decoder.rs}` only. Shared required status validation is implemented; existing critical test needs genuine catalog-selected identity setup before it can exercise decoding. | Freeze the existing fixture repair without weakening production admission; no independent builds/Git. |
-| Lead | Shared dev-dependency/lock edges, integration, ledger/architecture, builds, Git/PR | Inspect actual diff → one existing critical Kraken case → serialized application build → unchanged live publication/restart check → coherent commit/push. |
+| Astra `research_options_failure` | Released: Kraken config/decoder and existing critical case. Lead inspected; focused case PASS1/1. | No active edits. |
+| Astra `calendar_currentness_failure` | Read-only stock trace complete: real current-share projection wiring exists; fixture failure alone proves no runtime defect. | Inspect real FinalPrepare receipts when resuming stock journey. |
+| Lead | Current integration, docs, Git/PR. Application build PASS5m03s; test-helper rebuild PASS17.54s; combined live journey PASS155.49s. | Commit/push this coherent checkpoint, then real stock/Everyday-Advanced workflow evidence. |
 
 One primary worktree and three local/three origin branches remain; no new branches/worktrees.
-No compilation is concurrent. The stock current-share proof and remaining full product workflows
-remain open; this provider protocol repair does not waive them. Dated details below preserve prior
+No build or live check remains running. Native Desktop startup/screens, remaining provider and
+stock/financial workflows, final owner packages and whole-app measurement remain incomplete.
+The stock decision fixture still lacks genuine current-share proof; do not confuse it with the
+verified runtime wiring or waive it as final acceptance. Dated details below preserve prior
 checks/failures and are historical evidence, not additional active assignments.
 
 ### Raw capture serialization correction — base `ee77ff55`
@@ -5100,3 +5108,43 @@ flow quarantines `ProtocolInvariantViolation`; subsequent `HealthNotQualified` a
 publication/seal operations follow teardown. No Kraken publication/restart acceptance. Checkpoint
 the independently critical-tested shared status/real fixture correction; Astra is read-only tracing
 the first invariant failure, lead retains integration/build/Git. No timeout or evidence weakening.
+
+Status checkpoint pushed `60578fa6` (PR #43 comment5935128626). Read-only trace found a
+concrete fresh-start contradiction: trade subscription requests the last50 historical trades,
+while selected reference validity begins at the newly observed reference. An earlier trade fails
+the unchanged native-identity interval check and maps to ProtocolInvariantViolation. The exact
+logged branch remains unproven, but the request/authority mismatch is established from source.
+Official trade API defaults snapshot:false; live updates do not require an initializing snapshot.
+Next bounded Astra ownership: Kraken `src/config.rs`, `src/decoder.rs`, existing
+`tests/live_to_paper.rs` case `metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence`.
+Request updates only for live trades and validate the exact matching ACK; retain book snapshots,
+temporal identity checks and separately authorized snapshot decoding. No backdated authority,
+row filtering, new history restriction, test harness or independent build. Lead owns integration.
+
+Live-trade correction focused existing metadata/authority case PASS1/1 (0.00s, build4.97s;
+`kraken-live-trades-critical.log`); application build PASS5m03s (`kraken-live-trades-build.log`).
+The unchanged real installed-service lifecycle test is running from its freshly printed executable.
+
+Independent Astra stock trace completed without edits: runtime current-share wiring is present
+(`workflow_driver.rs` final preparation/publication arguments; `investment_generation.rs` original
+history + automatic valuation + current action projection). The old fixture failure is not proof
+of a runtime wiring defect. Next real stock evidence must inspect FinalPrepare.sources entries
+current_share_actions/fundamental_share_actions and sourceActionReference, then exact history
+reopening/selected valuation. Do not weaken share authority or rewrite working producers merely
+to make the stale fixture pass. No stock live-completion claim.
+
+Live updates-only run reaches genuine Kraken durable publication, then FAIL130.60s on the
+existing test helper's singleton Source.GetStatus assertion (`kraken-live-trades-live.log`).
+Lead and Astra confirmed production contract is one row per runtime stream: Kraken has separate
+book/trade streams under one surface with a common lifecycle. Lead owns correction in existing
+production_mcp_composition.rs helper: require the complete exact active stream pair, identical
+lifecycle and requested surface for every row, and singleton inactive status after stop. Return
+validation failures through Result so the service shuts down before temporary-root deletion; do
+not filter away extra rows. Post-panic teardown warnings are not independent startup evidence.
+
+Live trade/status recheck PASS1/1 in155.49s (`kraken-live-trades-status-live.log`) after the
+17.54s helper-only rebuild (`kraken-live-trades-status-build.log`). Both configured public providers
+complete genuine typed publication, clean stop/restart, new publication, exact prior evidence
+readback and explicit-stop persistence. No warnings/errors in the passing log. This is focused
+working-tree live evidence, not clean-head full-gate, native WebView, throughput or RAM acceptance.
+No additional test matrix or gate is needed for this coherent commit; remaining V1 work stays open.

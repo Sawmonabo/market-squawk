@@ -1369,7 +1369,7 @@ fn validate_subscription_result(
         KrakenChannel::Trades
             if result.channel == "trade"
                 && result.depth.is_none()
-                && result.snapshot == Some(true) =>
+                && result.snapshot == Some(false) =>
         {
             Ok(channel)
         }

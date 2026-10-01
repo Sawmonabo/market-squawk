@@ -4255,9 +4255,42 @@ async fn exact_public_crypto_status(
     let rows = status
         .as_array()
         .context("crypto source status was not an array")?;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["profile"]["id"], fixture.surface());
-    Ok(rows[0].clone())
+    let first = rows.first().context("crypto source status had no rows")?;
+    anyhow::ensure!(
+        rows.iter()
+            .all(|row| row["profile"]["id"] == fixture.surface()
+                && row["lifecycle"] == first["lifecycle"]),
+        "crypto status surface or shared lifecycle disagreed"
+    );
+    if matches!(fixture, ExactPublicCryptoFixture::Kraken)
+        && first["lifecycle"]["state"] == "active"
+    {
+        // Kraken's single product surface owns independently governed book and trade streams.
+        let expected = [
+            ("kraken-public-book-v2", "book-v2"),
+            ("kraken-public-trades-v2", "trade-v2"),
+        ];
+        anyhow::ensure!(
+            rows.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|(source, channel)| rows.iter().any(|row| {
+                        row["runtime"]["state"] == "active"
+                            && row["runtime"]["sourceId"] == *source
+                            && row["runtime"]["providerChannel"] == *channel
+                    })),
+            "active Kraken status did not contain its exact book and trade streams"
+        );
+    } else {
+        anyhow::ensure!(rows.len() == 1, "unexpected crypto status cardinality");
+        if first["lifecycle"]["state"] == "stopped" {
+            anyhow::ensure!(
+                first["runtime"]["state"] == "not_active",
+                "stopped crypto surface retained an active runtime"
+            );
+        }
+    }
+    Ok(first.clone())
 }
 
 #[cfg(debug_assertions)]
@@ -4282,7 +4315,10 @@ async fn invoke_exact_public_crypto(
     }
     let value = &response.result()["value"];
     if operation == "Market.GetUnifiedFeed" && value["data"].is_null() {
-        anyhow::bail!("crypto unified feed has no rows; metadata: {}", value["metadata"]);
+        anyhow::bail!(
+            "crypto unified feed has no rows; metadata: {}",
+            value["metadata"]
+        );
     }
     Ok(value["data"].clone())
 }

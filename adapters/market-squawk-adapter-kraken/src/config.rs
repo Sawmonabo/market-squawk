@@ -694,7 +694,12 @@ pub(crate) fn public_subscription_payload(
         "symbol".to_owned(),
         serde_json::Value::Array(vec![serde_json::Value::String(symbol.to_owned())]),
     );
-    params.insert("snapshot".to_owned(), serde_json::Value::Bool(true));
+    // Books need an initial state; current trades start with subsequent executions rather than
+    // historical rows that can predate the freshly selected native-identity authority.
+    params.insert(
+        "snapshot".to_owned(),
+        serde_json::Value::Bool(depth.is_some()),
+    );
     if let Some(depth) = depth {
         params.insert("depth".to_owned(), serde_json::Value::from(depth));
     }
