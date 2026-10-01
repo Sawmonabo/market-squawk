@@ -112,6 +112,7 @@ impl ProviderAdapterActivation {
             source,
             rights.clone(),
         )
+        .and_then(|generation| generation.with_runtime_verification(lease))
         .map_err(|_| ServiceError::Unauthorized)?;
         {
             let guard = activation

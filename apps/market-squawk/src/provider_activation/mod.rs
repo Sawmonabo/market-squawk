@@ -2825,7 +2825,8 @@ fn public_live_runtime_generation(
         lease.authority_effective_at(),
         metadata.clone(),
         rights.clone(),
-    )?;
+    )?
+    .with_runtime_verification(lease)?;
     Ok((generation, rights))
 }
 
@@ -2971,5 +2972,6 @@ fn runtime_generation(
         metadata,
         rights,
     )
+    .and_then(|generation| generation.with_runtime_verification(lease))
     .map_err(Into::into)
 }

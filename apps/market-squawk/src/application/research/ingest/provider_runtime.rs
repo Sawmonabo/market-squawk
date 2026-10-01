@@ -12,8 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
-    ProviderCapabilityRevision, SEC_EDGAR_PROFILE_ID, SEC_EDGAR_SOURCE_ID,
-    SchwabMarketDataDoctorReceiptV1, SourceMetadata, SourceMetadataProvider,
+    ProviderCapabilityRevision, RuntimeVerificationEvidence, SEC_EDGAR_PROFILE_ID,
+    SEC_EDGAR_SOURCE_ID, SchwabMarketDataDoctorReceiptV1, SourceMetadata, SourceMetadataProvider,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -43,6 +43,7 @@ pub struct ResearchProviderRuntimeGeneration {
     credential_generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
     authority_effective_at: Timestamp,
+    runtime_verification: Option<RuntimeVerificationEvidence>,
     metadata: SourceMetadata,
     rights: ResearchRightsAuthority,
 }
@@ -121,9 +122,36 @@ impl ResearchProviderRuntimeGeneration {
             credential_generation,
             secret_reference,
             authority_effective_at,
+            runtime_verification: None,
             metadata,
             rights,
         })
+    }
+
+    /// Retains the typed doctor already admitted by this exact activation lease. Digest-only
+    /// verification cannot authorize same-credential renewal and keeps its existing identity.
+    pub(crate) fn with_runtime_verification(
+        mut self,
+        lease: &crate::ProviderActivationLease,
+    ) -> Result<Self, ResearchIngestCompositionError> {
+        let evidence = lease.runtime_verification_evidence();
+        if evidence.verified_at().is_none() {
+            return Ok(self);
+        }
+        if self.session_id != lease.session_id()
+            || self.capability_revision != lease.capability_revision()
+            || self.capability_digest != lease.capability_digest()
+            || self.credential_generation != lease.generation()
+            || self.secret_reference.as_ref() != lease.secret_reference()
+            || self.authority_effective_at != lease.authority_effective_at()
+            || self.rights.parent_authorization_evidence != lease.rights_decision_digest()
+            || evidence.exclusive_expires_at() != lease.verification_expires_at()
+            || !evidence.admits_activation_at(lease.issued_at())
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        self.runtime_verification = Some(evidence.clone());
+        Ok(self)
     }
 
     /// Returns the profile/surface identity selecting the runtime slot.
@@ -224,6 +252,8 @@ impl ResearchProviderRuntimeGeneration {
             credential_generation: Option<SecretGeneration>,
             secret_reference: Option<&'a SecretRef>,
             authority_effective_at: Timestamp,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            runtime_verification_digest: Option<EvidenceDigest>,
             metadata: &'a SourceMetadata,
             rights_source_id: &'a market_squawk_domain::SourceId,
             rights_basis_reference: &'a str,
@@ -246,6 +276,10 @@ impl ResearchProviderRuntimeGeneration {
                 credential_generation: self.credential_generation,
                 secret_reference: self.secret_reference.as_ref(),
                 authority_effective_at: self.authority_effective_at,
+                runtime_verification_digest: self
+                    .runtime_verification
+                    .as_ref()
+                    .map(RuntimeVerificationEvidence::evidence_digest),
                 metadata: &self.metadata,
                 rights_source_id: &self.rights.source_id,
                 rights_basis_reference: self.rights.basis.reference(),
@@ -275,18 +309,22 @@ impl ResearchProviderRuntimeGeneration {
         if self.session_id != expected.session_id {
             return Ok(true);
         }
-        // A bounded Instruments or quote generation is renewed by a freshly verified doctor when
-        // the application credential itself has not changed. Its dedicated publisher rechecks
-        // the exact doctor, OAuth epoch and active account before acquisition and precommit.
-        // The predecessor must already be drained at registration, and the common checks above
-        // require an actual later authority interval in the same exact source slot.
-        if (self.profile.as_str()
-            == super::schwab_instrument_reference::SCHWAB_INSTRUMENT_REFERENCE_PROFILE
-            || self.profile.as_str() == market_squawk_sources::SCHWAB_MARKET_DATA_SURFACE_ID)
+        // Renewal preserves credentials while replacing provider-observed verification. The
+        // current lease proves the durable doctor chain, including any intervening receipts;
+        // this slot may have been unused during those renewals. Registration still requires
+        // the exact predecessor's revocation to be fully drained.
+        if self.credential_generation.is_some()
             && self.credential_generation == expected.credential_generation
             && self.secret_reference == expected.secret_reference
             && self.capability_revision == expected.capability_revision
             && self.capability_digest == expected.capability_digest
+            && self.rights.parent_authorization_evidence
+                == expected.rights.parent_authorization_evidence
+            && self.rights.authorization_evidence == expected.rights.authorization_evidence
+            && self.rights.basis == expected.rights.basis
+            && self.rights.permitted_operations == expected.rights.permitted_operations
+            && self.rights.exact_subjects == expected.rights.exact_subjects
+            && self.has_renewed_runtime_verification(expected)
         {
             return Ok(true);
         }
@@ -312,6 +350,61 @@ impl ResearchProviderRuntimeGeneration {
                 }
                 _ => false,
             })
+    }
+
+    fn has_renewed_runtime_verification(&self, expected: &Self) -> bool {
+        let (Some(current), Some(prior)) = (
+            self.runtime_verification.as_ref(),
+            expected.runtime_verification.as_ref(),
+        ) else {
+            return false;
+        };
+        if current.verified_at() <= prior.verified_at()
+            || current.exclusive_expires_at() < prior.exclusive_expires_at()
+            || !current.is_activation_ready()
+            || !prior.is_activation_ready()
+        {
+            return false;
+        }
+        match (current, prior) {
+            (
+                RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(current),
+                RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(prior),
+            ) => {
+                current.surface_id() == prior.surface_id()
+                    && current.session_identifier() == prior.session_identifier()
+                    && current.generation() == prior.generation()
+                    && current.realm() == prior.realm()
+                    && current.market_data_principal_sha256()
+                        == prior.market_data_principal_sha256()
+                    && current.capability_revision() == prior.capability_revision()
+                    && current.capability_digest() == prior.capability_digest()
+                    && current.public_configuration_digest() == prior.public_configuration_digest()
+                    && current.rights_decision_digest() == prior.rights_decision_digest()
+                    && current.rate_policy_digest() == prior.rate_policy_digest()
+                    && current.doctor_revision() == prior.doctor_revision()
+                    && current.doctor_contract_digest() == prior.doctor_contract_digest()
+            }
+            (
+                RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(current),
+                RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(prior),
+            ) => {
+                current.surface_id() == prior.surface_id()
+                    && current.session_identifier() == prior.session_identifier()
+                    && current.application_credential_generation()
+                        == prior.application_credential_generation()
+                    && current.application_credential_reference_sha256()
+                        == prior.application_credential_reference_sha256()
+                    && current.market_data_principal_sha256()
+                        == prior.market_data_principal_sha256()
+                    && current.capability_revision() == prior.capability_revision()
+                    && current.capability_digest() == prior.capability_digest()
+                    && current.public_configuration_digest() == prior.public_configuration_digest()
+                    && current.rights_decision_digest() == prior.rights_decision_digest()
+                    && current.rate_policy_digest() == prior.rate_policy_digest()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1452,15 +1545,27 @@ impl ResearchProviderRuntimeMutationAuthority {
     pub(crate) fn retained_credential_generations(
         &self,
     ) -> Result<Vec<ResearchProviderRuntimeGeneration>, ResearchIngestCompositionError> {
-        let authority = self.coordinator.authority.lock()
+        let authority = self
+            .coordinator
+            .authority
+            .lock()
             .map_err(|_| ResearchIngestCompositionError::AuthorityUnavailable)?;
         if !authority.pending_replacements.is_empty() {
             return Err(ResearchIngestCompositionError::ReplacementInProgress);
         }
-        Ok(authority.sources.values().filter_map(|source| source.generation.as_ref())
-            .chain(authority.publication_sources.values().map(|source| &source.generation))
+        Ok(authority
+            .sources
+            .values()
+            .filter_map(|source| source.generation.as_ref())
+            .chain(
+                authority
+                    .publication_sources
+                    .values()
+                    .map(|source| &source.generation),
+            )
             .filter(|generation| generation.secret_reference().is_some())
-            .cloned().collect())
+            .cloned()
+            .collect())
     }
 
     /// Releases drained process adapters while retaining their durable catalog history.
@@ -1468,14 +1573,27 @@ impl ResearchProviderRuntimeMutationAuthority {
         &self,
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ResearchIngestCompositionError> {
-        let mut authority = self.coordinator.authority.lock()
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
             .map_err(|_| ResearchIngestCompositionError::AuthorityUnavailable)?;
-        if authority.pending_replacements.contains_key(expected.profile()) {
+        if authority
+            .pending_replacements
+            .contains_key(expected.profile())
+        {
             return Err(ResearchIngestCompositionError::ReplacementInProgress);
         }
-        let super::CoordinatorAuthority { registry, sources, publication_sources, .. } = &mut *authority;
+        let super::CoordinatorAuthority {
+            registry,
+            sources,
+            publication_sources,
+            ..
+        } = &mut *authority;
         let registration = if let Some(current) = sources.get(expected.profile()) {
-            if current.generation.as_ref() != Some(expected) || !current.admission.revocation_drained() {
+            if current.generation.as_ref() != Some(expected)
+                || !current.admission.revocation_drained()
+            {
                 return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
             }
             let registry_owners = match &current.typed_capability {
@@ -1496,7 +1614,9 @@ impl ResearchProviderRuntimeMutationAuthority {
         } else {
             return Err(ResearchIngestCompositionError::RuntimeGenerationUnavailable);
         };
-        registry.as_mut().ok_or(ResearchIngestCompositionError::ShuttingDown)?
+        registry
+            .as_mut()
+            .ok_or(ResearchIngestCompositionError::ShuttingDown)?
             .release_process_registration_exact(registration)?;
         drop(sources.remove(expected.profile()));
         drop(publication_sources.remove(expected.profile()));
@@ -2713,7 +2833,85 @@ mod tests {
     #[tokio::test]
     async fn exact_generation_revocation_drains_the_publication_lease()
     -> Result<(), Box<dyn std::error::Error>> {
-        let admission = ResearchProviderAdmission::new(None)?;
+        let directory = tempfile::tempdir()?;
+        let session = Uuid::new_v4();
+        let (oauth, _, reference) =
+            scripted_market_authority(directory.path().join("renewal"), session, 1_800, 60).await?;
+        let (_, epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
+        let prior_doctor = doctor_receipt(session, digest(31), digest(32), epoch.receipt())?;
+        let mut renewed_input: SchwabMarketDataDoctorReceiptInput =
+            serde_json::from_value(serde_json::to_value(&prior_doctor)?["input"].clone())?;
+        let renewed_at = prior_doctor
+            .verified_at()
+            .checked_add_nanos(1_000_000_000)?;
+        renewed_input.observation.completed_at = renewed_at;
+        renewed_input.observation.user_preference.received_at = renewed_at;
+        for family in renewed_input.observation.families.iter_mut() {
+            if family.observed_at.is_some() {
+                family.observed_at = Some(renewed_at);
+            }
+        }
+        renewed_input.exclusive_expires_at = prior_doctor
+            .exclusive_expires_at()
+            .checked_add_nanos(1_000_000_000)?;
+        // A publication slot may skip intermediate doctor renewals. The current lease, not
+        // adjacency to the last used slot, proves the durable verification chain.
+        renewed_input.predecessor_digest = Some(digest(35));
+        let renewed_doctor = SchwabMarketDataDoctorReceiptV1::try_new(renewed_input)?;
+        let source = SourceId::try_from("schwab-trader-api")?;
+        let metadata = quote_metadata(
+            source.clone(),
+            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+            ProviderProduct::new(SourceIdentifier::try_from("schwab-rest")?),
+            ProviderChannel::new(SourceIdentifier::try_from("schwab-rest-quotes")?),
+        )?;
+        let rights = ResearchRightsAuthority::try_new_source_wide(
+            source,
+            RightsBasis::reviewed_terms("https://developer.schwab.com/terms", digest(33))?,
+            digest(32),
+            Some(prior_doctor.exclusive_expires_at()),
+            vec![SourceOperation::Persist],
+        )?;
+        let mut prior = ResearchProviderRuntimeGeneration::try_new(
+            // Renewal is authorized by the typed receipt, never a hard-coded profile name.
+            SourceIdentifier::try_from("account-publication-renewal-test")?,
+            session,
+            ProviderCapabilityRevision::new(1)?,
+            digest(31),
+            Some(reference.generation()),
+            Some(reference),
+            prior_doctor.verified_at(),
+            metadata,
+            rights,
+        )?;
+        prior.runtime_verification = Some(
+            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(prior_doctor)),
+        );
+        let mut renewed = prior.clone();
+        renewed.authority_effective_at = renewed_at;
+        renewed.rights.authorization_expires_at = Some(renewed_doctor.exclusive_expires_at());
+        renewed.runtime_verification = Some(
+            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(renewed_doctor)),
+        );
+        assert!(renewed.is_exact_successor_of(&prior)?);
+        assert!(!prior.is_exact_successor_of(&renewed)?);
+        let mut unverified = renewed.clone();
+        unverified.runtime_verification = None;
+        assert!(!unverified.is_exact_successor_of(&prior)?);
+        assert_ne!(
+            unverified.generation_digest()?,
+            renewed.generation_digest()?
+        );
+        let mut stale = renewed.clone();
+        stale.runtime_verification = prior.runtime_verification.clone();
+        assert!(!stale.is_exact_successor_of(&prior)?);
+        let mut changed_rights = renewed.clone();
+        changed_rights.rights.parent_authorization_evidence = digest(36);
+        assert!(!changed_rights.is_exact_successor_of(&prior)?);
+
+        let admission = ResearchProviderAdmission::new(Some(&prior))?;
         let publication = admission.acquire_publication_lease().await?;
         let cancellation = admission.cancellation().clone();
         let revoking = admission.clone();
@@ -2728,6 +2926,16 @@ mod tests {
         drop(publication);
         tokio::time::timeout(Duration::from_secs(1), drain).await??;
         assert!(admission.revocation_drained());
+        let successor = ResearchProviderAdmission::new(Some(&renewed))?;
+        assert!(successor.admits_generation(&renewed)?);
+        assert!(!successor.admits_generation(&prior)?);
+        assert!(
+            successor
+                .acquire_publication_lease()
+                .await?
+                .validate_precommit()
+                .is_ok()
+        );
         Ok(())
     }
 

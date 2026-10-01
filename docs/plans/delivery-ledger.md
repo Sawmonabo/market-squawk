@@ -2,7 +2,7 @@
 
 ## Active startup, optional-lock and previous-close integration — 2026-09-30
 
-History checkpoint: `0206d13a` (PR #43 comment 5923592639). Request-admission checkpoint: `e092a17b` (PR #43 comment 5923423225); Desktop reconnect: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
+Independent-read checkpoint: `1e82c1e5` (PR #43 comment 5923702152). History checkpoint: `0206d13a` (PR #43 comment 5923592639). Request-admission checkpoint: `e092a17b` (PR #43 comment 5923423225); Desktop reconnect: `251c8e2e` (PR #43 comment 5923314684); currentness: `bb600ce5`; data-read checkpoint: `a9277150` (PR #43 comment 5923037557); startup checkpoint: `98104fff` (comment 5922645807).
 History integration audit base: `a0e8b77b`; both preserved on `feature/v1-installed-product-experience`.
 One primary worktree, three local branches and three origin branches; no linked worktrees.
 Original session and recovery backups remain protected. No CI or release gate has run for this wave.
@@ -15,9 +15,11 @@ supersedes forced password storage in development and any conflicting import-onl
 
 ### Current outcomes and verification
 
+Lease-bound renewal is integrated across generic/public runtime construction and the three Schwab publication producers. The existing exact-generation drain case passes (9.31s; `verified-renewal-critical-rerun.log`), covering same-credential renewal, missing/stale verification rejection, changed rights, digest binding and drained publication authority. The serialized native build now combines it with the pushed read-snapshot correction. Automatic Alpaca proof renewal and asynchronous starter warming remain the next dependency; this commit alone does not implement them.
+
 Current integrated slice: independent read-only WAL snapshots remove the writer/manifest mutexes from market PIT reads without changing their clocks, limits or evidence. The existing provider-event restart case now holds the real writer mutex at precommit while an exact read must return its unchanged selection; this and existing cancellation/deadline/corruption assertions pass (1.26s; `independent-market-read-critical.log`). The app also omits validated empty event-family selections instead of failing its complete route. These changes are critically verified; the snapshot binary has not yet been live exercised.
 
-Latest actual native sweep: all 17 routes Ready/connected with no active query errors and no password (`history-rejoin-native-routes.json`). Starter prices remain unavailable. Calendar selection now succeeds, but history canonical-publication fails before any ingest record. Its cause remains under diagnosis. Separately, Retry successfully refreshes the provider doctor but the publication registry rejects same-credential renewal for Alpaca; a shared lease-bound renewal correction is in progress. Preserve exact expiry/currentness and drained predecessors, not longer time limits. No compiler is currently running. Prior observations below are historical evidence, not additional active queues.
+Latest actual native sweep: all 17 routes Ready/connected with no active query errors and no password (`history-rejoin-native-routes.json`). Starter prices remain unavailable. Calendar selection now succeeds, but history canonical-publication fails before any ingest record. Its cause remains under diagnosis. Separately, Retry successfully refreshes the provider doctor but the publication registry rejects same-credential renewal for Alpaca; a shared lease-bound renewal correction is in progress. Preserve exact expiry/currentness and drained predecessors, not longer time limits. One serialized native compiler is running. Prior observations below are historical evidence, not additional active queues.
 
 ### Prior integrated observations
 
@@ -56,6 +58,10 @@ Evidence under `.agents/tmp/v1-first-stock/`:
 `calendar-currentness-diagnostic-retry.json`, `credential-access-diagnostic-service.log`.
 
 ### Dependency and ownership
+
+Next dependency after the current renewal/native checkpoint: reuse the existing account-health reconnect owner for expired Alpaca doctor receipts. The saved keys remain valid; current code drains non-Schwab accounts at the application's 15-minute proof expiry and never renews them automatically. No new poller or longer expiry. Exact durable revision/runtime checks and user Stop/Lock win. Separately, move finite starter history preparation from the source activation response into existing ProductStartupTasks ownership with exact-generation admission, cancellation/drain and restart re-admission together; no detached future or new job framework. These are bounded follow-up proposals, not implemented outcomes.
+
+Current renewal critical compilation exposed a diagnostic type mismatch (identity selection returns RegistryError); lead corrected its closed classifier and reruns the focused check. No acceptance is inferred from the failed run.
 
 Confirmed source renewal defect: current-generation replacement recognizes fresh unchanged-credential doctor evidence only for named Schwab profiles, rejecting the renewed Alpaca asset-reference slot after expiry. Astra `credential_runtime_lifecycle` owns `application/research/ingest/provider_runtime.rs` and its existing exact-generation critical case: replace named exceptions with lease-bound renewal evidence, preserving later interval, exact slot/credentials/capability and drained predecessor. Lead owns composition in `provider_activation/mod.rs` and callers `schwab_reference.rs`, `schwab_quote_metadata.rs`, `schwab_market_hours.rs`. No expiry increase or bypass.
 
