@@ -101,25 +101,6 @@ pub(super) struct Heartbeat<'a> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct StatusEnvelope<'a> {
-    pub(super) channel: &'a str,
-    #[serde(rename = "type")]
-    pub(super) kind: &'a str,
-    #[serde(borrow)]
-    pub(super) data: Vec<StatusData<'a>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct StatusData<'a> {
-    pub(super) system: &'a str,
-    pub(super) api_version: &'a str,
-    pub(super) connection_id: u64,
-    pub(super) version: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct SubscribeAck<'a> {
     pub(super) method: &'a str,
     pub(super) success: bool,

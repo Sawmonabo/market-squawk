@@ -32,8 +32,9 @@ use crate::handoff::{
 };
 use crate::messages::{
     BookData, BookEnvelope, EnvelopeKind, Heartbeat, MAX_SUBSCRIPTION_ERROR_BYTES,
-    PUBLIC_SUBSCRIPTION_REQUEST_ID, Pong, StatusEnvelope, SubscribeAck, TradeData, TradeEnvelope,
-    WireLevel, bounded_trade_count, classify, exact_decimal, validate_warnings,
+    PUBLIC_SUBSCRIPTION_REQUEST_ID, Pong, StatusValidationError, SubscribeAck, TradeData,
+    TradeEnvelope, WireLevel, bounded_trade_count, classify, exact_decimal, status_system,
+    validate_warnings,
 };
 use crate::qualification::{KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_TRADE_SEQUENCE_RULE};
 use crate::session::KrakenSentSubscriptionReceipt;
@@ -1285,23 +1286,15 @@ fn validate_heartbeat(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError
 }
 
 fn validate_status(payload: &[u8]) -> Result<KrakenDecodeOutcome, DecodeError> {
-    let status: StatusEnvelope<'_> =
-        serde_json::from_slice(payload).map_err(|_| DecodeError::MalformedPayload)?;
-    let value = status.data.first().ok_or(DecodeError::MalformedPayload)?;
-    if status.channel != "status"
-        || status.kind != "update"
-        || status.data.len() != 1
-        || value.api_version.is_empty()
-        || value.version.is_empty()
-        || value.connection_id == 0
-    {
-        return Err(DecodeError::ResynchronizationRequired);
-    }
-    if value.system == "online" {
+    let system = status_system(payload).map_err(|error| match error {
+        StatusValidationError::Malformed => DecodeError::MalformedPayload,
+        StatusValidationError::InvalidState => DecodeError::ResynchronizationRequired,
+    })?;
+    if system == "online" {
         return Ok(KrakenDecodeOutcome::Control(KrakenPublicControl::Online));
     }
-    let system = KrakenProviderText::try_new(value.system)
-        .map_err(|_| DecodeError::ResynchronizationRequired)?;
+    let system =
+        KrakenProviderText::try_new(system).map_err(|_| DecodeError::ResynchronizationRequired)?;
     Ok(KrakenDecodeOutcome::Control(
         KrakenPublicControl::ProviderReset { system },
     ))

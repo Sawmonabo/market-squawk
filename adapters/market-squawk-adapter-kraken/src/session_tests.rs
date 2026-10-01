@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -92,7 +92,8 @@ impl RawMarketSink for RecordingSink<'_> {
 #[cfg(all(feature = "loopback-fixture", debug_assertions))]
 const SUBSCRIPTION_REFUSAL: &str = r#"{"method":"subscribe","success":false,"error":"rate limit exceeded","time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25.010Z","req_id":1}"#;
 const PUBLIC_BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD"},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25.010Z","req_id":1}"#;
-const PUBLIC_RESET: &str = r#"{"channel":"status","type":"update","data":[{"system":"maintenance","api_version":"v2","connection_id":42,"version":"2.0.0"}]}"#;
+const PUBLIC_RESET: &str = r#"{"channel":"status","type":"update","data":[{"system":"maintenance","api_version":"v2","connection_id":42,"version":"2.0.0","upcoming_maintenance":[],"emergency":[]}]}"#;
+const STATUS_ONLINE_WITH_ADVISORIES: &str = r#"{"channel":"status","type":"update","data":[{"system":"online","api_version":"v2","connection_id":42,"version":"2.0.0","upcoming_maintenance":[],"emergency":[]}]}"#;
 const LEVEL3_ACK: &str = r#"{"method":"subscribe","result":{"channel":"level3","depth":10,"snapshot":true,"symbol":"BTC/USD"},"success":true,"time_in":"2024-01-08T12:26:45.900000000Z","time_out":"2024-01-08T12:26:45.910000000Z","req_id":7}"#;
 const LEVEL3_INVALID: &str = r#"{"channel":"level3","type":"update","data":[{"symbol":"BTC/USD","timestamp":"2024-01-08T12:26:46.600000000Z","checksum":1,"bids":[{"event":"modify","order_id":"OJPMIN-NXZL5-SOWP6V","limit_price":"44937.1","order_qty":"0.01000000","timestamp":"2024-01-08T12:26:46.500000000Z"}]}]}"#;
 
@@ -100,6 +101,22 @@ const LEVEL3_INVALID: &str = r#"{"channel":"level3","type":"update","data":[{"sy
 async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_atomic_recovery()
 -> TestResult {
     assert_eq!(KRAKEN_L3_WEBSOCKET_ENDPOINT, "wss://ws-l3.kraken.com/v2");
+    assert_eq!(
+        crate::messages::status_system(
+            &STATUS_ONLINE_WITH_ADVISORIES
+                .replace("\"connection_id\":42,", "")
+                .into_bytes()
+        ),
+        Err(crate::messages::StatusValidationError::Malformed)
+    );
+    assert_eq!(
+        crate::messages::status_system(
+            &STATUS_ONLINE_WITH_ADVISORIES
+                .replace("\"connection_id\":42", "\"connection_id\":0")
+                .into_bytes()
+        ),
+        Err(crate::messages::StatusValidationError::InvalidState)
+    );
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
     let public_snapshot = include_bytes!("../fixtures/official_book_checksum.json");
     let level3_snapshot = include_bytes!("../fixtures/official_level3_checksum.json");
@@ -117,6 +134,9 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
             .send(Message::Text(PUBLIC_BOOK_ACK.into()))
             .await?;
         public_socket
+            .send(Message::Text(STATUS_ONLINE_WITH_ADVISORIES.into()))
+            .await?;
+        public_socket
             .send(Message::Text(std::str::from_utf8(public_snapshot)?.into()))
             .await?;
         public_socket
@@ -125,6 +145,9 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
 
         let mut level3_socket = accept_subscription(&listener).await?;
         level3_socket.send(Message::Text(LEVEL3_ACK.into())).await?;
+        level3_socket
+            .send(Message::Text(STATUS_ONLINE_WITH_ADVISORIES.into()))
+            .await?;
         level3_socket
             .send(Message::Text(std::str::from_utf8(level3_snapshot)?.into()))
             .await?;
@@ -137,7 +160,7 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         TestResult::Ok(())
     });
 
-    let (public_config, mut public_registry, public_registered) =
+    let (public_config, mut public_registry, public_registered, _public_catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let public_session = public_registry.begin_session(
         &public_registered,
@@ -181,6 +204,19 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
     assert!(acknowledgement_publication.is_some());
     assert!(terminal.is_none());
     assert!(public_decode_control.health().book_subscribed());
+
+    let (status, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
+    assert!(
+        matches!(status.into_parts().0, DecodeOutcome::Control(control)
+        if control.kind() == market_squawk_sources::ControlFrameKind::ProviderFlowControl)
+    );
+    assert!(terminal.is_none());
+    assert_eq!(public_decode_control.health().market_messages(), 0);
 
     let (public_snapshot_handoff, terminal) = decode_public_frame_through_socket_handoff(
         &mut public_authority,
@@ -254,13 +290,16 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         Err(crate::KrakenL3ConfigError::CredentialAuthorityMismatch)
     ));
 
-    let mut level3_registry =
+    let level3_registry =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
             Arc::new(FixtureAuthorizationSubject),
         )?;
-    let level3_registered = level3_registry.register(
-        level3_config.metadata().clone(),
-        Timestamp::from_unix_nanos(1),
+    let (mut level3_registry, level3_registered, _level3_catalog, _, _) = selected_registry(
+        level3_registry,
+        level3_config.metadata(),
+        &public_definition(instrument)?,
+        SourceId::try_from("kraken")?,
+        ProviderInstrumentId::try_from("BTC/USD")?,
     )?;
     let level3_session = level3_registry.begin_session(
         &level3_registered,
@@ -302,6 +341,16 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         Some(&mut level3_dispatch),
     )?;
     assert!(level3_dispatch.is_settled());
+    let status = decode_level3_frame(
+        &mut level3_authority,
+        &mut level3_decoder,
+        receive_text(&mut level3_socket).await?,
+        None,
+    )?;
+    assert!(matches!(
+        disposition_kind(&status)?,
+        KrakenControlOrDiscontinuityKind::AuthenticatedControl(crate::KrakenL3Control::Online)
+    ));
     let level3_snapshot_handoff = decode_level3_frame(
         &mut level3_authority,
         &mut level3_decoder,
@@ -577,7 +626,7 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
     });
 
     let endpoint = format!("ws://{address}");
-    let (first_config, mut first_registry, first_registered) =
+    let (first_config, mut first_registry, first_registered, _first_catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let first_config = first_config.with_local_endpoint_for_test(&endpoint)?;
     let first_session = first_registry.begin_session(
@@ -609,7 +658,7 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
     assert_eq!(first_source.health().market_messages(), 0);
     assert!(!first_source.health().book_subscribed());
 
-    let (config, mut registry, registered) =
+    let (config, mut registry, registered, _catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let config = config.with_local_endpoint_for_test(&endpoint)?;
     let session = registry.begin_session(
@@ -670,7 +719,7 @@ async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStrea
 
 #[test]
 fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_sessions() -> TestResult {
-    let (config, mut registry, registered) =
+    let (config, mut registry, registered, _catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let first = registry.begin_session(
         &registered,
@@ -700,7 +749,7 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
         Err(RegistryError::RawFrameFactoryAlreadyTaken)
     ));
 
-    let (foreign_config, mut foreign_registry, foreign_registered) =
+    let (foreign_config, mut foreign_registry, foreign_registered, _foreign_catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     assert_eq!(
         foreign_config.metadata().source_id(),
@@ -729,7 +778,7 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
 
 #[tokio::test]
 async fn source_uses_the_session_budget_and_cannot_run_twice() -> TestResult {
-    let (config, mut registry, registered) =
+    let (config, mut registry, registered, _catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let session = registry.begin_session(
         &registered,
@@ -770,6 +819,114 @@ fn live_generation(
     Ok(registry.take_live_source_generation(session)?)
 }
 
+// Both public and authenticated fixture sessions must select genuine catalog identities before
+// registry admission. The caller retains the directory; the registry retains its reader owner.
+fn selected_registry(
+    registry: AuthoritativeSourceRegistry,
+    metadata: &SourceMetadata,
+    definition: &InstrumentDefinition,
+    namespace: SourceId,
+    native_id: ProviderInstrumentId,
+) -> TestResult<(
+    AuthoritativeSourceRegistry,
+    market_squawk_sources::RegisteredSource,
+    tempfile::TempDir,
+    KrakenReferenceSelectionEvidence,
+    Timestamp,
+)> {
+    use market_squawk_data::{
+        CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
+        MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
+        MarketDataInstrumentSynchronizationCapability, MarketDataProviderIdentityQuery,
+    };
+    use market_squawk_domain::{
+        MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+    };
+    let directory = tempfile::tempdir()?;
+    let paths = market_squawk_platform::LocalPaths::prepare(directory.path().join("catalog"))?;
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?)?));
+    let cancellation = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let writer = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(authority, deadline, &cancellation)?;
+    let original = &definition.provider_identities()[0];
+    let evidence = ExactPayloadEvidence::from_content_digest(original.evidence().content_digest());
+    let catalog_definition =
+        MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id: definition.instrument_id(),
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                original.metadata_revision().clone(),
+                evidence.clone(),
+            ),
+            effective_interval: original.validity(),
+            asset_class: definition.asset_class(),
+            display_name: None,
+            quote_currency: definition.quote_currency(),
+            quote_currency_evidence: evidence,
+            venue_mappings: definition.venue_mappings().to_vec(),
+            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: definition.instrument_id(),
+                source_id: namespace.clone(),
+                provider_instrument_id: native_id.clone(),
+                evidence: original.evidence().clone(),
+                source_timestamp: original.source_timestamp(),
+                observed_at: original.observed_at(),
+                metadata_revision: original.metadata_revision().clone(),
+                validity: original.validity(),
+                supersedes: None,
+            })],
+            identifiers: definition.identifiers().to_vec(),
+        })?;
+    writer.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![catalog_definition], 1)?,
+        deadline,
+        &cancellation,
+    )?;
+    let selected_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let selection = reader
+        .select_provider_identity_as_of(
+            MarketDataProviderIdentityQuery::try_new(
+                namespace.clone(),
+                native_id.clone(),
+                selected_at,
+                selected_at,
+            )?,
+            deadline,
+            &cancellation,
+        )?
+        .ok_or("fixture catalog did not select Kraken identity")?;
+    let exact = selection.exact_receipt()?;
+    let reference = KrakenReferenceSelectionEvidence::try_new(
+        exact.definition_reference_revision().clone(),
+        exact.definition_reference_payload_digest(),
+        exact.definition_revision_digest(),
+        exact.definition_revision_sequence(),
+        exact.definition_published_at(),
+        original.validity(),
+        selection.selection_digest(),
+    )?;
+    let request = market_squawk_sources::ProviderNativeIdentityRequest {
+        namespace,
+        provider_instrument_id: native_id,
+        instrument: definition.instrument_id(),
+        venue: definition.venue_mappings()[0].venue_id().clone(),
+        venue_symbol: definition.venue_mappings()[0].venue_symbol().clone(),
+        knowledge_at: selected_at,
+        effective_at: selected_at,
+    };
+    let mut registry = registry.with_provider_identity_authority(Arc::new(reader))?;
+    let registered = registry.register(metadata.clone(), selected_at)?;
+    registry.record_provider_identities(&registered, &[request], deadline, &cancellation)?;
+    Ok((registry, registered, directory, reference, selected_at))
+}
+
 fn test_source(
     source_id: &str,
     metadata_revision: &str,
@@ -777,6 +934,7 @@ fn test_source(
     KrakenConfig,
     AuthoritativeSourceRegistry,
     market_squawk_sources::RegisteredSource,
+    tempfile::TempDir,
 )> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let exact = |byte| {
@@ -824,29 +982,26 @@ fn test_source(
         budget,
     )
     .try_build()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
     let definition = public_definition(instrument)?;
-    let provider_identity_key = definition.provider_identities()[0].key();
-    let reference_selection = KrakenReferenceSelectionEvidence::try_new(
-        MetadataRevision::new(SourceIdentifier::try_from("kraken-test-reference-v1")?),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [22; 32]),
-        1,
-        Timestamp::from_unix_nanos(0),
-        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [23; 32]),
+    let identity = &definition.provider_identities()[0];
+    let provider_identity_key = identity.key();
+    let (registry, registered, catalog, reference_selection, selected_at) = selected_registry(
+        AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?,
+        &metadata,
+        &definition,
+        identity.source_id().clone(),
+        identity.provider_instrument_id().clone(),
     )?;
     let config = KrakenConfig::try_new(
         metadata,
         &definition,
         &provider_identity_key,
         &reference_selection,
-        Timestamp::from_unix_nanos(1),
+        selected_at,
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
-    Ok((config, registry, registered))
+    Ok((config, registry, registered, catalog))
 }
 
 fn public_definition(instrument: InstrumentId) -> TestResult<InstrumentDefinition> {

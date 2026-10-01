@@ -43,13 +43,23 @@ Its focused evidence is recorded below. Independent terminal-batch WIP remains p
 
 ### Current dependency and ownership wave
 
-Storage and backup integration is pushed through `0852aad6` (PR #43 comment5931971854), including
-valid100-row batches and independent latest execution-definition reads. Current source-authority
-renewal correction has passed its three critical checks and combined build, but live ingestion
-still fails132.52s (`healthy-renewal-live.log`) before Kraken/restart. Diagnostics isolate trusted
-wall/monotonic lease expiry; epoch/session, capture and budget remain valid. Astra owns read-only
-lease provenance/refresh tracing; the lead owns accepted checkpoint integration and scheduling.
-No current evidence establishes completed live ingestion or installed Desktop workflows.
+Latest pushed checkpoint: **`1a23ad84`**, reference-capture custody through publication/recovery
+(PR #43 comment5934574027). Active storage uses SQLite microbatches and indexed reads plus bounded
+Parquet archives; streamed backup/recovery and graceful accepted-publication drain are integrated.
+The latest real installed-service test completes Coinbase publication, clean shutdown, resumed
+publication, original-evidence equality and explicit-stop persistence. Kraken reference preparation
+now passes, but its first status message is rejected for documented unused advisory fields. Neither
+native Desktop completion nor complete V1/live continuous-ingestion acceptance is established.
+
+| Owner | Exact ownership and dependency | Next completion barrier |
+| --- | --- | --- |
+| Astra `research_options_failure` | Kraken `src/{messages.rs,decoder.rs,session_tests.rs}` and `src/level3/{messages.rs,decoder.rs}` only. Shared required status validation is implemented; existing critical test needs genuine catalog-selected identity setup before it can exercise decoding. | Freeze the existing fixture repair without weakening production admission; no independent builds/Git. |
+| Lead | Shared dev-dependency/lock edges, integration, ledger/architecture, builds, Git/PR | Inspect actual diff → one existing critical Kraken case → serialized application build → unchanged live publication/restart check → coherent commit/push. |
+
+One primary worktree and three local/three origin branches remain; no new branches/worktrees.
+No compilation is concurrent. The stock current-share proof and remaining full product workflows
+remain open; this provider protocol repair does not waive them. Dated details below preserve prior
+checks/failures and are historical evidence, not additional active assignments.
 
 ### Raw capture serialization correction — base `ee77ff55`
 
@@ -5051,3 +5061,42 @@ two repaired hazards; this run does not retrospectively identify which caused th
 Checkpoint the reference-custody/protocol fixes. Next bounded Astra read-only lane traces Kraken
 trade continuity against the official schema and a small public WebSocket sample; no mutation or
 build assigned. Lead retains application/Git/verification ownership. No final lifecycle/V1 approval.
+
+Reference custody checkpoint pushed `1a23ad84`. Bounded live Kraken probe (3 public messages,
+0.79s, then close) identified the trade startup failure: status includes `upcoming_maintenance`
+and `emergency`; the strict StatusData model rejects them. Both are documented paired optional
+object arrays in the official status schema. ACK and trade snapshot shapes matched the adapter.
+Next Astra ownership: Kraken `src/messages.rs`, `src/decoder.rs`, `src/level3/messages.rs`,
+`src/level3/decoder.rs` and their existing critical status tests only. Accept documented advisory
+shape through a shared status contract; retain authoritative system/connection/API validation and
+all financial integrity checks. Lead owns build/test/Git; no new harness or broad provider rewrite.
+
+Status implementation decision after source/official-schema review: consume the authoritative
+required status-row fields and allow additive unused advisory fields on StatusData only. Advisory
+text does not qualify observations or authorize orders and remains in original raw capture. Keep
+strict envelope and financial-message schemas, required field types and existing status-state
+checks. Reuse shared status parsing/validation across public and Level3. This is upstream protocol
+handling, not an application backward-compatibility stack. Astra may extend only the existing
+`session_tests.rs::captured_public_and_level3_handoffs_preserve_identity_continuity_and_atomic_recovery`
+case/fixture for the actual additive status fields and existing reset behavior. No new harness.
+
+The focused Kraken critical test failed in preexisting fixture admission (`LiveScopeNotCovered`),
+before status decoding. Extend the same Astra ownership to its existing session fixture: install
+a real catalog identity authority and record selected public/L3 identities before session start.
+Retain catalog lifetime through the case; do not bypass production authority or add a harness.
+Lead owns the necessary existing-workspace dev-dependency edges and locked build scheduling.
+
+Kraken status/fixture changes frozen and lead-inspected. Existing captured public/L3 handoff,
+identity/continuity/recovery test PASS1/1 (0.55s, build3.63s), and both affected existing source
+authority/budget cases PASS2/2 (0.72s). Logs `kraken-status-selected-fixture-test.log` and
+`kraken-status-source-authority-test.log`. One shared local fixture synchronizes real catalog
+identities and uses the actual selected reference receipt; no bypass or new harness. Application
+rebuild and unchanged live lifecycle check are next; no live Kraken claim yet.
+
+Status application build PASS4m47s (`kraken-status-app-build.log`). Unchanged live combined
+check FAIL245.24s (`kraken-status-live.log`), after the full Coinbase restart/original-evidence/
+explicit-stop journey again completes. Kraken now passes status decoding but generation1 trade
+flow quarantines `ProtocolInvariantViolation`; subsequent `HealthNotQualified` and cancelled
+publication/seal operations follow teardown. No Kraken publication/restart acceptance. Checkpoint
+the independently critical-tested shared status/real fixture correction; Astra is read-only tracing
+the first invariant failure, lead retains integration/build/Git. No timeout or evidence weakening.

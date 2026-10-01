@@ -30,6 +30,9 @@ url.workspace = true
 [dev-dependencies]
 market-squawk-adapter-paper.workspace = true
 market-squawk-execution.workspace = true
+market-squawk-data.workspace = true
+market-squawk-platform.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -22,8 +22,8 @@ use super::config::{
     KrakenL3SubscriptionRequestEvidence,
 };
 use super::messages::{
-    EnvelopeKind, Heartbeat, Level3Envelope, Pong, SnapshotData, SnapshotOrder, StatusEnvelope,
-    SubscribeAck, UpdateData, UpdateOrder, WireError, classify, ensure_array_bound, exact_decimal,
+    EnvelopeKind, Heartbeat, Level3Envelope, Pong, SnapshotData, SnapshotOrder, SubscribeAck,
+    UpdateData, UpdateOrder, WireError, classify, ensure_array_bound, exact_decimal,
 };
 use crate::config::KRAKEN_PROVIDER;
 use crate::handoff::{
@@ -34,7 +34,7 @@ use crate::handoff::{
     authenticated_control_or_discontinuity, authenticated_market_handoff, captured_acknowledgement,
     instrument_binding,
 };
-use crate::messages::validate_warnings;
+use crate::messages::{StatusValidationError, status_system, validate_warnings};
 use crate::session::KrakenSentSubscriptionReceipt;
 
 const CHECKSUM_PRICE_LEVELS: usize = 10;
@@ -1874,26 +1874,15 @@ fn validate_heartbeat(payload: &[u8]) -> Result<KrakenL3DecodeOutcome, KrakenL3D
 }
 
 fn validate_status(payload: &[u8]) -> Result<KrakenL3DecodeOutcome, KrakenL3DecodeError> {
-    let status: StatusEnvelope<'_> =
-        serde_json::from_slice(payload).map_err(|_| KrakenL3DecodeError::MalformedPayload)?;
-    let value = status
-        .data
-        .first()
-        .ok_or(KrakenL3DecodeError::MalformedPayload)?;
-    if status.channel != "status"
-        || status.kind != "update"
-        || status.data.len() != 1
-        || value.api_version.is_empty()
-        || value.version.is_empty()
-        || value.connection_id == 0
-    {
-        return Err(KrakenL3DecodeError::ResynchronizationRequired);
-    }
-    let control = if value.system == "online" {
+    let system = status_system(payload).map_err(|error| match error {
+        StatusValidationError::Malformed => KrakenL3DecodeError::MalformedPayload,
+        StatusValidationError::InvalidState => KrakenL3DecodeError::ResynchronizationRequired,
+    })?;
+    let control = if system == "online" {
         KrakenL3Control::Online
     } else {
         KrakenL3Control::ProviderReset {
-            system: KrakenProviderText::try_new(value.system)
+            system: KrakenProviderText::try_new(system)
                 .map_err(|_| KrakenL3DecodeError::ResynchronizationRequired)?,
         }
     };
