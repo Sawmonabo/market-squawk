@@ -545,6 +545,13 @@ identity in the registry.
 
 ### Physical storage and publication
 
+The [2026-10-01 storage research](../research/2026-10-01-market-data-storage/final-report.md)
+recommends revising the current boundary below: transactional SQLite microbatches for active
+events and indexed current/as-of reads, with bounded Parquet archives queried through DataFusion.
+That design is not yet implemented or performance-verified. Whole-generation compaction below
+is an interim behavior, not the accepted continuous-ingestion solution. The delivery ledger owns
+implementation status and the required producer-to-consumer refresh.
+
 The durable layout extends the existing [research data plane](research-data-plane.md); it does not
 replace it with a second database or a new data application.
 

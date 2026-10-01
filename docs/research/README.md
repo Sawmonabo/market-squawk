@@ -57,6 +57,11 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Market-data storage architecture](2026-10-01-market-data-storage/final-report.md) — database-primary
+  active microbatches versus direct Parquet and native DuckDB; durable acknowledgment, indexed
+  reads, archive handoff and saved-evidence retention. Recommended design, not implemented or
+  performance-verified.
+
 - [Unified Markets provider ecosystem](2026-08-08-unified-markets-provider-ecosystem.md) — audited
   review of 16 maintained investment/data repositories and 53 additional research, official, and
   reputable sources; defines the approved one-feed experience, provider federation, best-available-
