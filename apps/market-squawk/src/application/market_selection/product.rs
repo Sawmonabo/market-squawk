@@ -256,6 +256,7 @@ pub(crate) fn product_market_identities(
     let mut history_tokens = std::collections::BTreeSet::new();
     for record in market_data {
         let definition = record.definition();
+        let symbol = record.display_symbol_at(effective_at);
         let instrument_bytes = definition.instrument_id().as_uuid().into_bytes();
         let selection_token = individual_selection_token(record)?;
         let history_token = token(
@@ -272,8 +273,7 @@ pub(crate) fn product_market_identities(
             instrument_id: definition.instrument_id(),
             selection_token,
             history_token,
-            symbol: record
-                .display_symbol_at(effective_at)
+            symbol: symbol
                 .map(|symbol| try_boxed_product_text(symbol, 256))
                 .transpose()
                 .map_err(|_| ServiceError::ResourceExhausted)?,
@@ -283,13 +283,17 @@ pub(crate) fn product_market_identities(
                     .map_err(map_market_definition_read_error)?,
                 None => true,
             },
-            name: record
-                .definition()
-                .display_name()
-                .map(|name| try_boxed_product_text(name.as_str(), 256))
-                .transpose()
-                .map_err(|_error| ServiceError::ResourceExhausted)?
-                .ok_or(ServiceError::Unavailable)?,
+            // Display names are optional reference enrichment. Their absence must not
+            // reject this identity or unrelated investments in the same population.
+            name: try_boxed_product_text(
+                definition
+                    .display_name()
+                    .map(|name| name.as_str())
+                    .or(symbol)
+                    .unwrap_or("Investment name unavailable"),
+                256,
+            )
+            .map_err(|_| ServiceError::ResourceExhausted)?,
             asset_class: product_asset_class(definition.asset_class()),
             population_binding,
         });

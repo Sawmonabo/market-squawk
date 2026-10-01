@@ -392,19 +392,37 @@ mod tests {
             DigestAlgorithm::Sha256,
             [1; 32],
         ));
+        let name_source = SourceId::try_from("official-listing")?;
+        let name_rights = IdentifierRightsPolicyReference::new(
+            SourceIdentifier::try_from("local-use-v1")?,
+            IdentifierEntitlement::LicensedInternalUse,
+            SourceIdentifier::try_from("https://example.test/listing")?,
+        );
         let mut definitions = Vec::new();
         for (id, symbol, name) in [
             (
                 "00000000-0000-0000-0000-000000000101",
                 "SPY",
-                "State Street SPDR S&P 500 ETF Trust",
+                Some("State Street SPDR S&P 500 ETF Trust"),
             ),
             (
                 "00000000-0000-0000-0000-000000000102",
                 "VTI",
-                "Vanguard Total Stock Market ETF",
+                Some("Vanguard Total Stock Market ETF"),
             ),
+            ("00000000-0000-0000-0000-000000000103", "BTC/USD", None),
         ] {
+            let mut venue_mappings = vec![VenueMapping::new(
+                VenueId::try_from("ARCX")?,
+                VenueSymbol::try_from(symbol)?,
+            )];
+            if name.is_none() {
+                // Real crypto references can have no name and differing venue symbols.
+                venue_mappings.push(VenueMapping::new(
+                    VenueId::try_from("XNAS")?,
+                    VenueSymbol::try_from("BTC-USD")?,
+                ));
+            }
             definitions.push(MarketDataInstrumentDefinition::try_new(
                 MarketDataInstrumentDefinitionInput {
                     instrument_id: id.parse()?,
@@ -416,30 +434,31 @@ mod tests {
                         Timestamp::from_unix_nanos(1),
                         None,
                     )?,
-                    asset_class: AssetClass::Fund,
-                    display_name: Some(MarketDataDisplayName::try_new(
-                        name,
-                        SourceId::try_from("official-listing")?,
-                        evidence.clone(),
-                        IdentifierRightsPolicyReference::new(
-                            SourceIdentifier::try_from("local-use-v1")?,
-                            IdentifierEntitlement::LicensedInternalUse,
-                            SourceIdentifier::try_from("https://example.test/listing")?,
-                        ),
-                    )?),
+                    asset_class: if name.is_some() {
+                        AssetClass::Fund
+                    } else {
+                        AssetClass::Crypto
+                    },
+                    display_name: name
+                        .map(|name| {
+                            MarketDataDisplayName::try_new(
+                                name,
+                                name_source.clone(),
+                                evidence.clone(),
+                                name_rights.clone(),
+                            )
+                        })
+                        .transpose()?,
                     quote_currency: Currency::try_from("USD")?,
                     quote_currency_evidence: evidence.clone(),
-                    venue_mappings: vec![VenueMapping::new(
-                        VenueId::try_from("ARCX")?,
-                        VenueSymbol::try_from(symbol)?,
-                    )],
+                    venue_mappings,
                     provider_identities: Vec::new(),
                     identifiers: Vec::new(),
                 },
             )?);
         }
         MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority)).synchronize(
-            MarketDataInstrumentSynchronization::try_new(definitions, 2)?,
+            MarketDataInstrumentSynchronization::try_new(definitions, 3)?,
             deadline,
             &cancellation,
         )?;
@@ -448,6 +467,7 @@ mod tests {
         for id in [
             "00000000-0000-0000-0000-000000000101",
             "00000000-0000-0000-0000-000000000102",
+            "00000000-0000-0000-0000-000000000103",
         ] {
             records.push(
                 reader
@@ -460,6 +480,24 @@ mod tests {
             .map(|record| record.published_at())
             .max()
             .ok_or("missing cutoff")?;
+        let crypto = product_market_identities(&records, cutoff, Some("BTC"))?;
+        let (crypto_page, count, _) = product_search_page(&crypto, "BTC", 100, None)?;
+        assert_eq!(count, 1);
+        assert_eq!(
+            crypto_page["data"][0]["name"],
+            "Investment name unavailable"
+        );
+        assert!(crypto_page["data"][0]["symbol"].is_null());
+        assert_eq!(
+            resolve_selection_token(
+                &crypto,
+                crypto_page["data"][0]["selectionToken"]
+                    .as_str()
+                    .ok_or("missing crypto token")?
+            )?
+            .to_string(),
+            "00000000-0000-0000-0000-000000000103"
+        );
         let ticker = product_market_identities(&records, cutoff, Some("spy"))?;
         let (ticker_page, count, more) = product_search_page(&ticker, "spy", 100, None)?;
         assert_eq!(count, 1);

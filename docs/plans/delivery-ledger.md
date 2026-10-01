@@ -5225,3 +5225,12 @@ arc-swap1.9.2 dependency reused, no manifest change. Closed health cause diagnos
 This independently coherent source-authority correction is ready for commit/push; live proof waits
 for rebuilt service. Optional-name product fix remains separate WIP with corrected critical compile
 running. No completed V1/combined-live or exact-head full-gate claim.
+
+Optional-name discovery check PASS1/1 in0.36s after6m15s serialized rebuild
+(`optional-market-name-critical-retry.log`). Existing real-catalog test now includes an admitted
+unnamed crypto instrument with ambiguous venue symbols alongside SPY/VTI: named stock lookup,
+pagination, token resolution and truthful unavailable-price projection still pass; nameless crypto
+remains selectable with honest label and no invented symbol. Shared product projection falls back
+to its admitted unambiguous symbol, otherwise explicitly unavailable name. No rows/evidence are
+dropped, no financial identity or rights checks changed. Native live recheck requires service
+rebuild; baseline Home/Markets failures are not yet declared closed.
