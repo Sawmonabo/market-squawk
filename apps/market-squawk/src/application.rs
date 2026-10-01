@@ -683,7 +683,10 @@ impl ToolServices for Application {
             result
                 .validate_against(context.limits())
                 .map_err(ServiceError::from)?;
-            result.validate_for(descriptor).map_err(ServiceError::from)
+            result.validate_for(descriptor).map_err(|error| {
+                tracing::warn!(operation = descriptor.name(), %error, "application result contract failed");
+                ServiceError::from(error)
+            })
         })();
         match validation {
             Ok(()) => {

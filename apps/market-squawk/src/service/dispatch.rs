@@ -304,7 +304,10 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
             .call(request, context)
             .await
             .map(|result| result.into_envelope(projection))
-            .map_err(map_service_error)
+            .map_err(|error| {
+                tracing::warn!(operation = descriptor.name(), %error, "application operation failed");
+                map_service_error(error)
+            })
     }
 
     fn mutation_response_committed(&self) -> Result<(), DispatchError> {

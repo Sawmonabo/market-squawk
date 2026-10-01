@@ -3011,7 +3011,7 @@ fn live_selected_market_source() -> Value {
             ("health", market_source_health()),
             ("healthObservedAt", canonical_market_timestamp()),
             ("stateRevision", unsigned_integer_text()),
-            ("shardId", uuid()),
+            ("shardId", bounded_text(32)),
             ("shardSnapshotRevision", positive_integer_text()),
             ("snapshotPublishedAt", canonical_market_timestamp()),
             ("providerBudget", market_source_budget()),

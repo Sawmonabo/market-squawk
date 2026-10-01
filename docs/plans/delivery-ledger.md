@@ -4926,3 +4926,40 @@ next dependency is the read/runtime availability path. Kraken and restart remain
 Checkpoint includes source/publication authority and actual-deadline scheduling together, with
 all affected callers inspected. No full gate/CI, native Desktop proof or whole-app RAM measurement.
 One primary worktree and the three intended local/remote branches remain; no extra refs were made.
+
+Pushed checkpoint: `c9ab294a`; PR43 evidence comment5933027823. Ownership released for completed
+source-authority/sink changes. Next bounded read-only diagnosis: Astra `research_options_failure`
+traces unified-feed reference loading against real public crypto synchronization. The unified read
+requires execution definitions for every stream; crypto synchronization publishes market-data
+reference records. Establish the canonical producer/consumer mismatch before any further edit.
+Lead retains all write/build/Git ownership; no new verification currently running.
+Execution-definition absence and database endpoint mismatch were ruled out: startup seeds and pins
+exact terms, and ingest composition enforces matching catalog bindings. Lead added failure-only
+closed stage/error/count attribution to existing market reads; no query/admission behavior changes.
+Next run locates the first real unavailable stage before any corrective design change.
+
+Market-stage diagnostic build passed4m31s; real test `market-read-stage-live.log` failed132.48s
+with the same endpoint unavailable, but no market-read stage warning. Read-only Astra diagnosis
+now traces installed request routing before the Market domain (runtime dispatch, installed tool
+routing, application composition); no edits/builds/Git. Lead retains all source ownership and
+checks remaining uninstrumented market-result exits. No acceptance weakened.
+
+Confirmed root cause: `live_selected_market_source` required a UUID for `shardId`, while the real
+scalar producer emits canonical ShardId Display `index/count` (e.g. `0/1`). Application output
+validation rejected valid rows as InvalidResult; installed dispatch collapsed that to unavailable.
+Corrected selected-source schema to the same bounded shard text contract already used by market
+details. No identity change or compatibility path. Removed the temporary repeated stage probes;
+retained two central failure-only logs of closed error/operation categories at application result
+validation and installed dispatch, without request/result payloads. Existing real selected-row
+restart test supplies the critical coverage; no duplicate fixture or new harness. Lead owns all
+changes; Astra diagnosis is complete. Next: serialized application build and unchanged live test.
+
+Shard contract build passed4m32s. `market-shard-contract-live.log` now passes first Coinbase
+selected market row, durable publication probe and exact typed readback (the test reaches the
+first service shutdown after these assertions). The full test fails77.10s at shutdown: pending
+publication receives HealthNotQualified/authority revocation, and Market plus dependent research
+domains report incomplete drain. Restart/Kraken remain unreached. No live lifecycle completion
+claimed. This proves the prior selected-row contract failure is fixed; checkpoint it separately.
+Next bounded Astra read-only diagnosis owns shutdown/publication ordering trace; lead retains
+all mutation/integration/build/Git authority. Preserve cancellation and revocation guarantees;
+do not turn arbitrary publication failures into successful shutdown.
