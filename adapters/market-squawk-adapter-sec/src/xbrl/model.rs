@@ -169,6 +169,8 @@ pub(crate) struct SecXbrlTaxonomyReference {
     target_logical_locator: SourceIdentifier,
     target_physical_locator: SourceIdentifier,
     fragment: Option<SourceIdentifier>,
+    declared_namespace: Option<SourceIdentifier>,
+    referenced_uri: Option<SourceIdentifier>,
     role: SecXbrlTaxonomyReferenceRole,
     origin: SecXbrlTaxonomyOrigin,
 }
@@ -188,6 +190,14 @@ impl SecXbrlTaxonomyReference {
 
     pub(crate) const fn fragment(&self) -> Option<&SourceIdentifier> {
         self.fragment.as_ref()
+    }
+
+    pub(crate) const fn declared_namespace(&self) -> Option<&SourceIdentifier> {
+        self.declared_namespace.as_ref()
+    }
+
+    pub(crate) const fn referenced_uri(&self) -> Option<&SourceIdentifier> {
+        self.referenced_uri.as_ref()
     }
 
     pub(crate) const fn role(&self) -> &'static str {
@@ -612,6 +622,18 @@ impl SecValidatedXbrlTaxonomySet {
                             .fragment
                             .as_ref()
                             .map_or(0, SourceIdentifier::retained_bytes),
+                    )?
+                    .checked_add(
+                        reference
+                            .declared_namespace
+                            .as_ref()
+                            .map_or(0, SourceIdentifier::retained_bytes),
+                    )?
+                    .checked_add(
+                        reference
+                            .referenced_uri
+                            .as_ref()
+                            .map_or(0, SourceIdentifier::retained_bytes),
                     )?;
                 total.checked_add(dynamic)
             },
@@ -905,6 +927,7 @@ fn build_taxonomy_graph(
         filing_locator,
         parser_limits,
         cancellation,
+        None,
     )?;
     let mut queue = VecDeque::new();
     if filing_scan.references.len() > MAX_TAXONOMY_REFERENCES {
@@ -975,8 +998,9 @@ fn build_taxonomy_graph(
             filing_locator,
             parser_limits,
             cancellation,
+            None,
         )?;
-        validate_pinned_namespace(&request, scanned.target_namespace.as_ref())?;
+        validate_schema_namespace(&request, scanned.target_namespace.as_ref())?;
         match target_namespaces.get(request.physical_locator.as_str()) {
             Some(existing) if existing != &scanned.target_namespace => {
                 return Err(SecXbrlError::InvalidTaxonomySet);
@@ -1016,6 +1040,16 @@ fn build_taxonomy_graph(
     {
         return Err(SecXbrlError::InvalidTaxonomySet);
     }
+    validate_taxonomy_reference_bindings(
+        filing_locator,
+        &references,
+        &requests_by_logical,
+        &target_namespaces,
+        &artifacts_by_physical,
+        parser_limits,
+        cancellation,
+        &mut scanned_bytes,
+    )?;
     for requests in requests_by_physical.values_mut() {
         requests.sort_unstable_by(|left, right| {
             left.logical_locator
@@ -1087,6 +1121,15 @@ fn build_taxonomy_graph(
             }
             None => graph_digest.update([0]),
         }
+        for value in [&reference.declared_namespace, &reference.referenced_uri] {
+            match value {
+                Some(value) => {
+                    graph_digest.update([1]);
+                    hash_taxonomy_field(&mut graph_digest, value.as_str().as_bytes());
+                }
+                None => graph_digest.update([0]),
+            }
+        }
         graph_digest.update([reference.role.ordinal(), reference.origin.ordinal()]);
     }
     Ok(BuiltTaxonomyGraph {
@@ -1101,6 +1144,103 @@ fn build_taxonomy_graph(
         requests_by_physical,
         target_namespaces,
     })
+}
+
+fn validate_taxonomy_reference_bindings(
+    filing_locator: &str,
+    references: &BTreeSet<SecXbrlTaxonomyReference>,
+    requests: &BTreeMap<String, SecXbrlTaxonomyArtifactRequest>,
+    namespaces: &BTreeMap<String, Option<SourceIdentifier>>,
+    artifacts: &BTreeMap<&str, &RetrievedSecBytes>,
+    parser_limits: SecParserLimits,
+    cancellation: &CancellationToken,
+    scanned_bytes: &mut u64,
+) -> Result<(), SecXbrlError> {
+    let mut fragments_by_target = BTreeMap::<&str, BTreeSet<SourceIdentifier>>::new();
+    for reference in references {
+        check_taxonomy_cancelled(cancellation)?;
+        let child = namespaces
+            .get(reference.target_physical_locator.as_str())
+            .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+        match reference.role {
+            SecXbrlTaxonomyReferenceRole::SchemaImport
+            | SecXbrlTaxonomyReferenceRole::SchemaInclude
+            | SecXbrlTaxonomyReferenceRole::SchemaRedefine => {
+                let parent = requests
+                    .get(reference.parent_logical_locator.as_str())
+                    .and_then(|request| namespaces.get(request.physical_locator.as_str()))
+                    .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+                let valid = if reference.role == SecXbrlTaxonomyReferenceRole::SchemaImport {
+                    &reference.declared_namespace == child && parent != child
+                } else {
+                    // XML Schema inclusion/redefinition permits a namespace-less child.
+                    child.is_none() || child == parent
+                };
+                if !valid {
+                    return Err(SecXbrlError::InvalidTaxonomySet);
+                }
+            }
+            SecXbrlTaxonomyReferenceRole::RoleDefinition
+            | SecXbrlTaxonomyReferenceRole::ArcroleDefinition => {
+                let fragment = reference
+                    .fragment
+                    .as_ref()
+                    .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+                if reference.referenced_uri.is_none() {
+                    return Err(SecXbrlError::InvalidTaxonomySet);
+                }
+                fragments_by_target
+                    .entry(reference.target_logical_locator.as_str())
+                    .or_default()
+                    .insert(fragment.clone());
+            }
+            _ => {}
+        }
+    }
+    // Only IDs actually referenced by the bounded graph are indexed, not every concept in a
+    // large base taxonomy. Original bodies remain the authority for ID/type/URI associations.
+    for (logical, fragments) in fragments_by_target {
+        check_taxonomy_cancelled(cancellation)?;
+        let request = requests
+            .get(logical)
+            .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+        let artifact = artifacts
+            .get(request.physical_locator.as_str())
+            .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+        *scanned_bytes = scanned_bytes
+            .checked_add(
+                u64::try_from(artifact.bytes().len())
+                    .map_err(|_| SecXbrlError::ByteLimitExceeded)?,
+            )
+            .filter(|bytes| *bytes <= MAX_TAXONOMY_GRAPH_SCAN_BYTES)
+            .ok_or(SecXbrlError::ByteLimitExceeded)?;
+        let scanned = scan_taxonomy_references(
+            artifact.bytes(),
+            TaxonomyXmlExpectation::Schema,
+            logical,
+            filing_locator,
+            parser_limits,
+            cancellation,
+            Some(&fragments),
+        )?;
+        for reference in references.iter().filter(|reference| {
+            reference.target_logical_locator.as_str() == logical
+                && reference.referenced_uri.is_some()
+        }) {
+            let definition = reference
+                .fragment
+                .as_ref()
+                .and_then(|fragment| scanned.fragments.get(fragment))
+                .and_then(Option::as_ref)
+                .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+            if definition.role != reference.role
+                || Some(&definition.uri) != reference.referenced_uri.as_ref()
+            {
+                return Err(SecXbrlError::InvalidTaxonomySet);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn taxonomy_artifact_request(
@@ -1144,6 +1284,7 @@ pub(crate) fn filing_taxonomy_seed_requests(
         filing_locator,
         parser_limits,
         cancellation,
+        None,
     )?;
     requests_from_references(filing_locator, scan.references)
 }
@@ -1165,8 +1306,9 @@ pub(crate) fn taxonomy_request_dependencies(
         filing_locator,
         parser_limits,
         cancellation,
+        None,
     )?;
-    validate_pinned_namespace(request, scan.target_namespace.as_ref())?;
+    validate_schema_namespace(request, scan.target_namespace.as_ref())?;
     requests_from_references(filing_locator, scan.references)
 }
 
@@ -1194,6 +1336,12 @@ enum TaxonomyXmlExpectation {
 struct ScannedTaxonomyXml {
     target_namespace: Option<SourceIdentifier>,
     references: Vec<SecXbrlTaxonomyReference>,
+    fragments: BTreeMap<SourceIdentifier, Option<TaxonomyFragmentDefinition>>,
+}
+
+struct TaxonomyFragmentDefinition {
+    role: SecXbrlTaxonomyReferenceRole,
+    uri: SourceIdentifier,
 }
 
 fn scan_taxonomy_references(
@@ -1203,6 +1351,7 @@ fn scan_taxonomy_references(
     filing_locator: &str,
     parser_limits: SecParserLimits,
     cancellation: &CancellationToken,
+    requested_fragments: Option<&BTreeSet<SourceIdentifier>>,
 ) -> Result<ScannedTaxonomyXml, SecXbrlError> {
     if bytes.is_empty() || bytes.len() > parser_limits.decoded_bytes() {
         return Err(SecXbrlError::ByteLimitExceeded);
@@ -1216,6 +1365,7 @@ fn scan_taxonomy_references(
     let mut declaration_seen = false;
     let mut target_namespace = None;
     let mut references = Vec::new();
+    let mut fragments = BTreeMap::new();
     loop {
         check_taxonomy_cancelled(cancellation)?;
         let (resolution, event) = reader.read_resolved_event()?;
@@ -1258,6 +1408,40 @@ fn scan_taxonomy_references(
                             .transpose()?;
                     }
                     root_seen = true;
+                }
+                if let Some(id) = values.unqualified("id")
+                    && requested_fragments.is_some_and(|requested| {
+                        requested.iter().any(|fragment| fragment.as_str() == id)
+                    })
+                {
+                    let role = if is_element(&name, XBRL_LINK_NAMESPACE, "roleType") {
+                        Some((SecXbrlTaxonomyReferenceRole::RoleDefinition, "roleURI"))
+                    } else if is_element(&name, XBRL_LINK_NAMESPACE, "arcroleType") {
+                        Some((
+                            SecXbrlTaxonomyReferenceRole::ArcroleDefinition,
+                            "arcroleURI",
+                        ))
+                    } else {
+                        None
+                    };
+                    let definition = role
+                        .map(|(role, attribute)| {
+                            Ok::<_, SecXbrlError>(TaxonomyFragmentDefinition {
+                                role,
+                                uri: SourceIdentifier::try_from(
+                                    values
+                                        .unqualified(attribute)
+                                        .ok_or(SecXbrlError::InvalidTaxonomySet)?,
+                                )?,
+                            })
+                        })
+                        .transpose()?;
+                    if fragments
+                        .insert(SourceIdentifier::try_from(id)?, definition)
+                        .is_some()
+                    {
+                        return Err(SecXbrlError::InvalidTaxonomySet);
+                    }
                 }
                 let reference = taxonomy_reference_for_element(
                     expectation,
@@ -1321,6 +1505,7 @@ fn scan_taxonomy_references(
     Ok(ScannedTaxonomyXml {
         target_namespace,
         references,
+        fragments,
     })
 }
 
@@ -1439,7 +1624,15 @@ fn reference_from_schema_location(
     let href = attributes
         .unqualified("schemaLocation")
         .ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    resolve_taxonomy_reference(parent_logical_locator, filing_locator, role, href, false)
+    let mut reference =
+        resolve_taxonomy_reference(parent_logical_locator, filing_locator, role, href, false)?;
+    if role == SecXbrlTaxonomyReferenceRole::SchemaImport {
+        reference.declared_namespace = attributes
+            .unqualified("namespace")
+            .map(SourceIdentifier::try_from)
+            .transpose()?;
+    }
+    Ok(reference)
 }
 
 fn reference_from_xlink(
@@ -1454,7 +1647,7 @@ fn reference_from_xlink(
     let href = attributes
         .namespaced(XLINK_NAMESPACE, "href")
         .ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    resolve_taxonomy_reference(
+    let mut reference = resolve_taxonomy_reference(
         parent_logical_locator,
         filing_locator,
         role,
@@ -1464,7 +1657,23 @@ fn reference_from_xlink(
             SecXbrlTaxonomyReferenceRole::RoleDefinition
                 | SecXbrlTaxonomyReferenceRole::ArcroleDefinition
         ),
-    )
+    )?;
+    let uri_attribute = match role {
+        SecXbrlTaxonomyReferenceRole::RoleDefinition => Some("roleURI"),
+        SecXbrlTaxonomyReferenceRole::ArcroleDefinition => Some("arcroleURI"),
+        _ => None,
+    };
+    reference.referenced_uri = uri_attribute
+        .map(|attribute| {
+            SourceIdentifier::try_from(
+                attributes
+                    .unqualified(attribute)
+                    .ok_or(SecXbrlError::InvalidTaxonomySet)?,
+            )
+            .map_err(SecXbrlError::from)
+        })
+        .transpose()?;
+    Ok(reference)
 }
 
 fn resolve_taxonomy_reference(
@@ -1497,6 +1706,8 @@ fn resolve_taxonomy_reference(
         target_logical_locator,
         target_physical_locator,
         fragment,
+        declared_namespace: None,
+        referenced_uri: None,
         role,
         origin,
     })
@@ -1676,125 +1887,18 @@ fn pinned_taxonomy_release(
     SourceIdentifier::try_from(release).map_err(Into::into)
 }
 
-fn validate_pinned_namespace(
+// Namespace identifiers describe schema components, not the authority that supplied bytes.
+// Exact import/include and role bindings are verified on the closed captured graph below.
+fn validate_schema_namespace(
     request: &SecXbrlTaxonomyArtifactRequest,
     target_namespace: Option<&SourceIdentifier>,
 ) -> Result<(), SecXbrlError> {
-    if request.kind == SecXbrlTaxonomyArtifactKind::Linkbase {
-        return if target_namespace.is_none() {
-            Ok(())
-        } else {
-            Err(SecXbrlError::InvalidTaxonomySet)
-        };
-    }
-    let namespace = target_namespace.ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    if namespace.as_str().is_empty() {
-        return Err(SecXbrlError::InvalidTaxonomySet);
-    }
-    if request.origin == SecXbrlTaxonomyOrigin::SecFiling {
-        return Ok(());
-    }
-    let parsed = Url::parse(namespace.as_str()).map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.port().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
+    if request.kind == SecXbrlTaxonomyArtifactKind::Linkbase && target_namespace.is_some()
+        || target_namespace.is_some_and(|namespace| namespace.as_str().is_empty())
     {
         return Err(SecXbrlError::InvalidTaxonomySet);
     }
-    let namespace_segments = parsed
-        .path_segments()
-        .ok_or(SecXbrlError::InvalidTaxonomySet)?
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let release = request.pinned_release.as_str();
-    let matches_release = match request.origin {
-        SecXbrlTaxonomyOrigin::SecFiling => true,
-        SecXbrlTaxonomyOrigin::SecTaxonomy => {
-            matches!(parsed.host_str(), Some("xbrl.sec.gov" | "xbrl.us"))
-                && publisher_namespace_matches(request, &namespace_segments, "sec")?
-        }
-        SecXbrlTaxonomyOrigin::XbrlUsLegacyTaxonomy => {
-            matches!(parsed.host_str(), Some("xbrl.us" | "taxonomies.xbrl.us"))
-                && namespace_segments.len() >= 2
-                && namespace_segments[0] == "us-gaap"
-                && release
-                    .strip_prefix("xbrl-us-us-gaap-")
-                    .is_some_and(|request_release| {
-                        taxonomy_releases_compatible(request_release, namespace_segments[1])
-                    })
-        }
-        SecXbrlTaxonomyOrigin::FasbTaxonomy => {
-            matches!(parsed.host_str(), Some("fasb.org" | "xbrl.fasb.org"))
-                && publisher_namespace_matches(request, &namespace_segments, "fasb")?
-        }
-        SecXbrlTaxonomyOrigin::XbrlStandard => {
-            if !matches!(parsed.host_str(), Some("www.xbrl.org" | "xbrl.org")) {
-                false
-            } else if let Some(core_release) = release.strip_prefix("xbrl-standard-") {
-                namespace_segments.first().copied() == Some(core_release)
-            } else if release.starts_with("xbrl-lrr-") {
-                namespace_segments
-                    .iter()
-                    .any(|segment| matches!(*segment, "lrr" | "role"))
-            } else if release.starts_with("xbrl-dtr-") {
-                namespace_segments
-                    .windows(2)
-                    .any(|segments| matches!(segments, ["dtr", "type"]))
-                    || matches!(namespace_segments.as_slice(), ["2009", "dtr", ..])
-            } else {
-                false
-            }
-        }
-        SecXbrlTaxonomyOrigin::W3cStandard => {
-            parsed.host_str() == Some("www.w3.org")
-                && namespace_segments
-                    .first()
-                    .is_some_and(|year| release == format!("w3c-standard-{year}"))
-        }
-    };
-    if matches_release {
-        Ok(())
-    } else {
-        Err(SecXbrlError::InvalidTaxonomySet)
-    }
-}
-
-// Publisher namespaces use a release-qualified family. A component schema may declare its
-// own exact file family (for example ecd/2025/ecd-sub-2025.xsd -> ecd-sub/2025), rather
-// than the containing directory's family. Neither a prefix match nor a different year suffices.
-fn publisher_namespace_matches(
-    request: &SecXbrlTaxonomyArtifactRequest,
-    namespace_segments: &[&str],
-    publisher: &str,
-) -> Result<bool, SecXbrlError> {
-    let [namespace_family, namespace_release] = namespace_segments else {
-        return Ok(false);
-    };
-    if !is_taxonomy_family(namespace_family) {
-        return Ok(false);
-    }
-    admitted_taxonomy_release(namespace_release)?;
-    let locator = Url::parse(request.logical_locator.as_str())
-        .map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
-    let mut segments = locator
-        .path_segments()
-        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    let family = segments.next().ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    let release = request
-        .pinned_release
-        .as_str()
-        .strip_prefix(&format!("{publisher}-{family}-"))
-        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    let file = locator
-        .path()
-        .rsplit('/')
-        .next()
-        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
-    Ok(taxonomy_releases_compatible(release, namespace_release)
-        && (*namespace_family == family || file == format!("{namespace_family}-{release}.xsd")))
+    Ok(())
 }
 
 fn filing_directory(filing: &Url) -> Result<String, SecXbrlError> {
@@ -1866,7 +1970,9 @@ fn xbrl_standard_release(segments: &[&str]) -> Result<String, SecXbrlError> {
             admitted_taxonomy_release(release)?;
             Ok(format!("xbrl-standard-{release}"))
         }
-        ["lrr", "role", file] => Ok(format!("xbrl-lrr-{}", dated_taxonomy_schema_release(file)?)),
+        ["lrr", "role" | "arcrole", file] => {
+            Ok(format!("xbrl-lrr-{}", dated_taxonomy_schema_release(file)?))
+        }
         ["dtr", "type", release, ..] => {
             let release = release
                 .strip_prefix("CR-")
@@ -3467,8 +3573,13 @@ mod tests {
                     <link:linkbaseRef xlink:type="simple"
                       xlink:role="http://www.xbrl.org/2003/role/presentationLinkbase"
                       xlink:href="company-20251231_pre.xml"/>
-                    <link:roleRef xlink:type="simple"
+                    <link:roleRef xlink:type="simple" roleURI="http://www.xbrl.org/2003/role/custom"
                       xlink:href="http://www.xbrl.org/2003/role/role-2003-12-31.xsd#custom"/>
+                    <xs:annotation><xs:appinfo><link:linkbase>
+                      <link:arcroleRef xlink:type="simple"
+                        arcroleURI="http://www.esma.europa.eu/xbrl/esef/arcrole/wider-narrower"
+                        xlink:href="http://www.xbrl.org/lrr/arcrole/esma-arcrole-2018-11-21.xsd#wider-narrower"/>
+                    </link:linkbase></xs:appinfo></xs:annotation>
                     </xs:schema>"#,
                 sec_source.clone(),
                 sec_revision.clone(),
@@ -3488,8 +3599,12 @@ mod tests {
                 br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                     targetNamespace="http://fasb.org/us-gaap/2025">
                     <xs:include schemaLocation="us-types-2025.xsd"/>
-                    <xs:import namespace="http://www.w3.org/2001/XMLSchema"
+                    <xs:redefine schemaLocation="us-common-2025.xsd"/>
+                    <xs:import schemaLocation="us-common-2025.xsd"/>
+                    <xs:import namespace="http://www.w3.org/XML/1998/namespace"
                       schemaLocation="http://www.w3.org/2001/xml.xsd"/>
+                    <xs:import namespace="http://www.w3.org/1999/xlink"
+                      schemaLocation="http://www.xbrl.org/2003/xlink-2003-12-31.xsd"/>
                     </xs:schema>"#,
                 FASB_XBRL_TAXONOMY_AUTHORITY.canonical_source_id()?,
                 FASB_XBRL_TAXONOMY_AUTHORITY.metadata_revision()?,
@@ -3508,7 +3623,13 @@ mod tests {
                 &store,
                 "https://www.xbrl.org/2003/role/role-2003-12-31.xsd",
                 br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
-                    targetNamespace="http://www.xbrl.org/2003/role"/>"#,
+                    xmlns:link="http://www.xbrl.org/2003/linkbase"
+                    targetNamespace="http://www.xbrl.org/2003/role">
+                    <xs:annotation><xs:appinfo>
+                      <link:roleType id="custom" roleURI="http://www.xbrl.org/2003/role/custom">
+                        <link:usedOn>link:presentationLink</link:usedOn>
+                      </link:roleType>
+                    </xs:appinfo></xs:annotation></xs:schema>"#,
                 XBRL_INTERNATIONAL_STANDARDS_AUTHORITY.canonical_source_id()?,
                 XBRL_INTERNATIONAL_STANDARDS_AUTHORITY.metadata_revision()?,
                 observed_at,
@@ -3517,7 +3638,7 @@ mod tests {
                 &store,
                 "https://www.w3.org/2001/xml.xsd",
                 br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
-                    targetNamespace="http://www.w3.org/2001/XMLSchema"/>"#,
+                    targetNamespace="http://www.w3.org/XML/1998/namespace"/>"#,
                 W3C_XML_SCHEMA_STANDARDS_AUTHORITY.canonical_source_id()?,
                 W3C_XML_SCHEMA_STANDARDS_AUTHORITY.metadata_revision()?,
                 observed_at,
@@ -3572,24 +3693,142 @@ mod tests {
                 origin,
             };
             assert_eq!(request.authority()?, publisher);
-            for incompatible in [
-                namespace
-                    .replace("/2025", "/2024")
-                    .replace("/2020", "/2019"),
-                namespace
-                    .replace("xbrl.sec.gov", "unrelated.test")
-                    .replace("fasb.org", "unrelated.test")
-                    .replace("xbrl.org", "unrelated.test"),
-            ] {
+        }
+        // Exact registered ESMA arcrole used by the retained MSFT extension, hosted by XBRL.
+        let arcrole_locator = "https://www.xbrl.org/lrr/arcrole/esma-arcrole-2018-11-21.xsd";
+        artifacts.push(captured_artifact(
+            &store,
+            arcrole_locator,
+            br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                xmlns:link="http://www.xbrl.org/2003/linkbase"
+                targetNamespace="http://www.esma.europa.eu/xbrl/esef/arcrole/wider-narrower">
+                <xs:annotation><xs:appinfo>
+                  <link:arcroleType id="wider-narrower" cyclesAllowed="undirected"
+                    arcroleURI="http://www.esma.europa.eu/xbrl/esef/arcrole/wider-narrower">
+                    <link:usedOn>link:definitionArc</link:usedOn>
+                  </link:arcroleType>
+                </xs:appinfo></xs:annotation>
+                </xs:schema>"#,
+            XBRL_INTERNATIONAL_STANDARDS_AUTHORITY.canonical_source_id()?,
+            XBRL_INTERNATIONAL_STANDARDS_AUTHORITY.metadata_revision()?,
+            observed_at,
+        )?);
+        let arcrole_request = SecXbrlTaxonomyArtifactRequest {
+            logical_locator: SourceIdentifier::try_from(arcrole_locator)?,
+            physical_locator: SourceIdentifier::try_from(arcrole_locator)?,
+            kind: SecXbrlTaxonomyArtifactKind::Schema,
+            pinned_release: pinned_taxonomy_release(
+                filing_locator,
+                arcrole_locator,
+                SecXbrlTaxonomyOrigin::XbrlStandard,
+            )?,
+            origin: SecXbrlTaxonomyOrigin::XbrlStandard,
+        };
+        assert_eq!(
+            arcrole_request.authority()?,
+            XBRL_INTERNATIONAL_STANDARDS_AUTHORITY
+        );
+        assert!(
+            map_taxonomy_locator(
+                filing_locator,
+                "https://www.esma.europa.eu/lrr/arcrole/esma-arcrole-2018-11-21.xsd",
+                SecXbrlTaxonomyArtifactKind::Schema,
+            )
+            .is_err()
+        );
+        for (locator, body, authority) in [
+            (
+                "https://www.xbrl.org/2003/xlink-2003-12-31.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="http://www.w3.org/1999/xlink"/>"#,
+                XBRL_INTERNATIONAL_STANDARDS_AUTHORITY,
+            ),
+            (
+                "https://xbrl.fasb.org/us-gaap/2025/us-common-2025.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>"#,
+                FASB_XBRL_TAXONOMY_AUTHORITY,
+            ),
+        ] {
+            artifacts.push(captured_artifact(
+                &store,
+                locator,
+                body.as_bytes(),
+                authority.canonical_source_id()?,
+                authority.metadata_revision()?,
+                observed_at,
+            )?);
+        }
+        // The closed graph must validate authored edges, not infer namespace ownership from
+        // the download host. Each hostile body gets genuine capture custody before admission.
+        let reject_changed =
+            |locator: &str, old: &str, new: &str| -> Result<(), Box<dyn std::error::Error>> {
+                let mut hostile = artifacts.clone();
+                let index = hostile
+                    .iter()
+                    .position(|artifact| artifact.locator() == Some(locator))
+                    .ok_or("fixture artifact")?;
+                let original = &hostile[index];
+                let body = std::str::from_utf8(original.bytes())?.replace(old, new);
+                assert_ne!(body.as_bytes(), original.bytes().as_ref());
+                let receipt = original.capture_receipt().ok_or("fixture receipt")?;
+                hostile[index] = captured_artifact(
+                    &store,
+                    locator,
+                    body.as_bytes(),
+                    receipt.source_id().clone(),
+                    receipt.metadata_revision().clone(),
+                    observed_at,
+                )?;
                 assert!(matches!(
-                    validate_pinned_namespace(
-                        &request,
-                        Some(&SourceIdentifier::try_from(incompatible)?)
+                    SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
+                        Arc::clone(&store),
+                        &sec_source,
+                        &sec_revision,
+                        &filing,
+                        hostile,
+                        SecParserLimits::production_defaults(),
+                        &CancellationToken::new()
                     ),
                     Err(SecXbrlError::InvalidTaxonomySet)
                 ));
-            }
-        }
+                Ok(())
+            };
+        let extension = "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/company-20251231.xsd";
+        // Mismatched import, absent import namespace, include and redefine namespace mismatch.
+        reject_changed(
+            "https://www.xbrl.org/2003/xlink-2003-12-31.xsd",
+            "http://www.w3.org/1999/xlink",
+            "http://unrelated.test/xlink",
+        )?;
+        reject_changed(extension, "namespace=\"http://fasb.org/srt/2025\"", "")?;
+        reject_changed(
+            "https://xbrl.fasb.org/us-gaap/2025/us-types-2025.xsd",
+            "http://fasb.org/us-gaap/2025",
+            "http://fasb.org/srt/2025",
+        )?;
+        reject_changed(
+            "https://xbrl.fasb.org/us-gaap/2025/us-common-2025.xsd",
+            "<xs:schema ",
+            "<xs:schema targetNamespace=\"http://unrelated.test/namespace\" ",
+        )?;
+        // Correct host/namespace cannot compensate for a missing, wrong-type or wrong-URI ID.
+        reject_changed(arcrole_locator, "id=\"wider-narrower\"", "id=\"other\"")?;
+        reject_changed(arcrole_locator, "link:arcroleType", "link:roleType")?;
+        reject_changed(
+            arcrole_locator,
+            "<xs:annotation>",
+            "<xs:annotation id=\"wider-narrower\">",
+        )?;
+        reject_changed(
+            arcrole_locator,
+            "arcroleURI=\"http://www.esma.europa.eu/xbrl/esef/arcrole/wider-narrower\"",
+            "arcroleURI=\"http://unrelated.test/arcrole\"",
+        )?;
+        reject_changed(
+            extension,
+            "roleURI=\"http://www.xbrl.org/2003/role/custom\"",
+            "",
+        )?;
+        reject_changed(extension, "#custom", "#absent")?;
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
@@ -3655,7 +3894,7 @@ mod tests {
             SecParserLimits::production_defaults(),
             &CancellationToken::new(),
         )?;
-        assert_eq!(admitted.validated().artifacts().len(), 10);
+        assert_eq!(admitted.validated().artifacts().len(), 13);
         let parser_context = || {
             XbrlDocumentContext::new(
                 SourceIdentifier::try_from("0001").expect("static accession"),
@@ -3707,8 +3946,10 @@ mod tests {
                 "filing_schema",
                 "schema_import",
                 "schema_include",
+                "schema_redefine",
                 "presentation_linkbase",
                 "role_definition",
+                "arcrole_definition",
             ]
             .into_iter()
             .all(|role| roles.contains(role))

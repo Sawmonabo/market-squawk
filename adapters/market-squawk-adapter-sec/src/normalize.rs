@@ -117,6 +117,8 @@ impl Serialize for SecXbrlTaxonomyReferencesV1<'_> {
                 target_logical_locator: reference.target_logical_locator(),
                 target_physical_locator: reference.target_physical_locator(),
                 fragment: reference.fragment(),
+                declared_namespace: reference.declared_namespace(),
+                referenced_uri: reference.referenced_uri(),
                 role: reference.role(),
                 origin: reference.origin().as_str(),
             })?;
@@ -132,6 +134,8 @@ struct SecXbrlTaxonomyReferenceV1<'a> {
     target_logical_locator: &'a SourceIdentifier,
     target_physical_locator: &'a SourceIdentifier,
     fragment: Option<&'a SourceIdentifier>,
+    declared_namespace: Option<&'a SourceIdentifier>,
+    referenced_uri: Option<&'a SourceIdentifier>,
     role: &'static str,
     origin: &'static str,
 }

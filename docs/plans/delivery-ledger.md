@@ -2,6 +2,8 @@
 
 ## Current execution — 2026-10-02
 
+Pushed checkpoint `dc9ea88e` separates recovery verification from foreground read exclusion, routes bulk financial reads away from compact price reads, and keeps SEC publication on its owned worker. Recovery critical checks pass; native facts still time out.
+
 Pushed checkpoint `89eb2353` integrates financial preparation jobs, bounded facts storage/read,
 shared native/CLI/MCP commands and valid taxonomy graph admission. Critical data checks pass;
 actual first-page latency is still unresolved.
@@ -17,9 +19,8 @@ do not establish complete V1 acceptance.
 
 Development supervisor(session37993/PID27544) owns Desktop, Vite, watcher
 and serialized single-job compilation. Service98300 crashed during SEC activation; crash publication was moved to the existing owned
-ingest worker. Replacement build PASS7m21s; service6192/Desktop6236 now run. SEC session
-e54972b4-90ef-44b9-b4ac-407afe74e2c1 restored active_scoped; no duplicate Activate was sent. No duplicate
-Start/Activate is authorized without reconciling original state. No agent builds or new branches/worktrees. Three local
+ingest worker. Replacement build PASS7m21s; service6192/Desktop6236 verified that batch. Current stream/quote build passed8m28s, then LRR build passed5m29s. Arrow/diagnostic build24445 PASS42m49s under concurrent host load; service96132/Desktop96612 now run. This runtime precedes the later taxonomy-edge/archive-reuse source edits. SEC session
+e54972b4-90ef-44b9-b4ac-407afe74e2c1 restored active_scoped; no duplicate Activate was sent. Original financial job053b2f82-bdd5-404d-9d06-7aafaaa96e30 is terminal failed. After LRR replacement, exactly one new financial job640d66bd-b0da-4979-9fcb-7cb8a339c8fb failed with InvalidTaxonomySet after20 further dependency captures; reconcile its terminal state before any further start. No agent builds or new branches/worktrees. Three local
 branches, three origin branches plus origin/HEAD, one primary worktree last verified.
 Main/release and original recovery/session remain preserved.
 
@@ -41,8 +42,8 @@ MSFT financial failures are now separately evidenced:
 | Owner | Exact ownership/outcome | State / next dependency |
 | --- | --- | --- |
 | Lead | Shared contracts/jobs/service/CLI/MCP/native composition, source_authority.rs, Git/docs/build scheduling | Applied frozen read and taxonomy candidates together. Recovery/routing correction applied; both existing recovery critical cases PASS. Actual price/history remain usable; facts still exceed15s in logical index construction. One financial acquisition started after SEC status reconciliation; track exact original job. |
-| Astra financial_pages | Candidate-only data sec_research.rs, pit/disk.rs and application research/company_research.rs | Routing/publication-owner candidates integrated. Frozen candidate-only sec_research/{logical,indexed}.rs removes measured intermediate full-index reconstruction; lead inspecting before application, no deadline/cap raise. |
-| Astra startup_read_diagnosis | Candidate-only SEC xbrl/model.rs; separate suggested shared authority diff | Inspected candidate applied. Recovery correction integrated and critical verified. Separate read-only diagnosis of actual MSFT price display_projection invalid-result error; exact file ownership requested beforepatch. No agent runtime/builds/Git. |
+| Astra financial_pages | Candidate-only SEC xbrl/model.rs and narrow normalize.rs reference serializer | Streaming logical reader and Arrow reuse/slice-decoding candidates integrated by lead. Existing quote critical PASS1/1. Lead applied frozen model.rs/normalize.rs candidate in place (V1 ruleset labels retained); it replaces guessed namespace host/year admission (including temporary ESMA exception) with actual import/include/redefine namespace and role/arcrole declaration validation; official download/capture authority retained. Existing mixed-graph fixture covers the contract. No source edits/builds/Git. |
+| Astra startup_read_diagnosis | Frozen Alpaca error.rs/market_publication.rs and startup.rs diagnostic packet | Lead integrated typed capture-rejoin stages and archive error causes plus re-export/exhaustive mapping. No policy changes. Await replacement runtime's actual rejection before a behavior correction. Frozen data ingest/market_event_store/archive.rs candidate inspected and applied by lead for one-turn catalog connection reuse for measured thousands of repeated schema opens. Keep fresh transactions, cancellation, original evidence and final exact-plan commit. This removes demonstrated redundant work; actual archive failure resolution still requires new diagnostic evidence. Existing publication_recovery fixture reserved only for an uncovered critical gap. |
 | Sol investment_profile_ui | InvestmentQuote presentation in investment-page.tsx | Compact dated quote layout types/live verified and pushed; ownership released. |
 | Sol financial_preparation_ui_resume | Chart/read/shared financial controls and existing UI journey case | Stable chart checkpoint pushed; financial terminal settlement integrated. Ownership released. |
 
@@ -60,10 +61,31 @@ Desktop types and three existing market/lookup/refresh journeys, facts clock1/1,
 recent-first cursor1/1, corrected large writer/PIT/reopen1/1, writer cancellation1/1 and retained
 quote/current-mark separation1/1. Read/taxonomy affected checks now pass. Financial-page live completion remains blocked by logical index construction; the latest sample no longer shows recovery exclusion waiting.
 No per-task CI, broad release gate or whole-app RAM claim.
+Current critical checks: taxonomy edge/fragment fixture PASS1/1 (4.69s), Arrow roundtrip/exactness/tamper cases PASS6/6 (0.01s). Full facts/PIT/reopen check still runs in the serialized queue. W3C WebDriver execute request timed out after restart, while supported /wdio/eval directly returned complete page/title/URL; direct evaluation now checks actual MSFT without focus. Archive runtime diagnostics confirm analytical operation deadline exceeded; reuse remains awaiting live proof.
 
 Recovery/read routing and owned SEC publication are implemented and built; existing quarantine/read concurrency and logical recovery checks pass. The fresh financial job `053b2f82-bdd5-404d-9d06-7aafaaa96e30` failed acquisition with `InvalidTaxonomySet`; service6192 survived, and no duplicate job was started.
 
-Next barrier: integrate the frozen two-file streaming logical-reader correction, run existing large PIT/reopen and filing critical checks, then time native facts and inspect statements/ratios/filings and cursor navigation. Resolve the separately evidenced trade-depth rejection and remaining filing-schema failure. Commit/push coherent integration and update PR43. Complete stock analysis, installed lifecycle and V1
+Watcher PID27555 is temporarily SIGSTOP-paused while build24445 finishes. Lead critical queue
+session79049 waits for Cargo idle, then runs the existing taxonomy edge, Arrow roundtrip and full
+facts/PIT/reopen cases serially; its finally block resumes the watcher with SIGCONT. Native check
+session23737 waits for service17280 replacement before inspecting the MSFT page. The current
+build excludes later taxonomy-edge and archive-connection changes. Critical session80253 waits
+for all three checks, then runs the existing archive/restart case on the newly built publication
+recovery binary without another Cargo invocation. No other compilation is scheduled.
+83 older duplicate executable outputs were removed from target/debug/deps (35.04GiB apparent);
+two newest per target, active binaries, libraries, object files, source and evidence retained.
+Free filesystem space rose to52GiB. This is build-artifact cleanup, not whole-app memory evidence.
+PR43 checkpoint evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5954545457
+
+Taxonomy relationship rationale: W3C XML Schema src-import/src-include/src-redefine define
+namespace relationships independently of download host; XBRL2.1 sections3.5.2.4/5 define role and
+arcrole references. Current adapter changes enforce those captured relationships while keeping
+existing physical source authority. Sources checked2026-10-02:
+https://www.w3.org/TR/xmlschema-1/#src-import and
+https://www.xbrl.org/Specification/XBRL-2.1/REC-2003-12-31/XBRL-2.1-REC-2003-12-31%2Bcorrected-errata-2013-02-20.html.
+
+
+Next barrier: one watcher build now integrates streaming reader, Arrow decode reuse and typed diagnostics. Run existing Arrow/large PIT/reopen critical checks, then time native facts and inspect statements/ratios/filings and cursor navigation. Review and integrate the namespace-relationship candidate when frozen. Resolve the separately evidenced trade-depth rejection and remaining filing-schema failure. Commit/push coherent integration and update PR43. Complete stock analysis, installed lifecycle and V1
 acceptance remain open. A painted native chart is verified separately from canvas presence,
 which alone is insufficient when background macOS animation frames are suspended.
 
