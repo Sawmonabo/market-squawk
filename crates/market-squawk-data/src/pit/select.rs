@@ -4,7 +4,10 @@ use std::cmp::Ordering;
 use std::mem::size_of;
 use std::time::Instant;
 
-use market_squawk_domain::{AvailabilityEvidence, ResearchTemporalCoordinate};
+use market_squawk_domain::{
+    AvailabilityEvidence, ResearchObservation, ResearchTemporalCoordinate, Timestamp,
+};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::canonical::{evidence_identity, family_encoding, payload_identity, provenance_identity};
@@ -91,7 +94,8 @@ pub(super) fn select<'a>(
             provenance,
             &mut control,
         )?;
-        let (initial_reasons, revision_state) = admission(request, candidate);
+        let temporal = TemporalAdmission::from_observation(candidate.observation());
+        let (initial_reasons, revision_state) = admission(request, &temporal);
         prepared.push(PreparedCandidate {
             candidate,
             family_key: family.bytes,
@@ -231,33 +235,67 @@ pub(super) fn select<'a>(
     })
 }
 
+/// Cutoff-independent temporal inputs derived from an already admitted observation.
+/// Payload and provenance identities still cover the complete original evidence.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TemporalAdmission {
+    availability: AdmissionAvailability,
+    effective: ResearchTemporalCoordinate,
+    published: Option<ResearchTemporalCoordinate>,
+    superseded: Option<ResearchTemporalCoordinate>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+enum AdmissionAvailability {
+    Known(Timestamp),
+    Inferred,
+    Unknown,
+}
+
+impl TemporalAdmission {
+    pub(super) fn from_observation(observation: &ResearchObservation) -> Self {
+        let context = observation_context(observation);
+        let availability = match context.provenance().availability() {
+            AvailabilityEvidence::Evidenced { available_at, .. }
+            | AvailabilityEvidence::LocalFirstObserved {
+                observed_at: available_at,
+            } => AdmissionAvailability::Known(*available_at),
+            AvailabilityEvidence::Inferred { .. } => AdmissionAvailability::Inferred,
+            AvailabilityEvidence::Unknown => AdmissionAvailability::Unknown,
+        };
+        Self {
+            availability,
+            effective: context.time().effective().clone(),
+            published: context.time().published().cloned(),
+            superseded: context.time().superseded().cloned(),
+        }
+    }
+}
+
 pub(super) fn admission(
     request: &PointInTimeRequest,
-    candidate: &PointInTimeCandidate,
+    temporal: &TemporalAdmission,
 ) -> (PointInTimeExclusionReasons, PointInTimeRevisionState) {
     let mut reasons = PointInTimeExclusionReasons::default();
-    let context = observation_context(candidate.observation());
-    match context.provenance().availability() {
-        AvailabilityEvidence::Evidenced { available_at, .. }
-        | AvailabilityEvidence::LocalFirstObserved {
-            observed_at: available_at,
-        } if *available_at > request.as_of() => {
+    match temporal.availability {
+        AdmissionAvailability::Known(available_at) if available_at > request.as_of() => {
             reasons.insert(PointInTimeExclusionReason::AvailabilityAfterAsOf);
         }
-        AvailabilityEvidence::Evidenced { .. }
-        | AvailabilityEvidence::LocalFirstObserved { .. } => {}
-        AvailabilityEvidence::Inferred { .. } => {
+        AdmissionAvailability::Known(_) => {}
+        AdmissionAvailability::Inferred => {
             reasons.insert(PointInTimeExclusionReason::InferredAvailability);
         }
-        AvailabilityEvidence::Unknown => {
+        AdmissionAvailability::Unknown => {
             reasons.insert(PointInTimeExclusionReason::UnknownAvailability);
         }
     }
-    if let Some(published) = context.time().published() {
+    if let Some(published) = &temporal.published {
         publication_reasons(request, published, &mut reasons);
     }
-    effective_reasons(request, context.time().effective(), &mut reasons);
-    let revision_state = revision_state(request, context.time().superseded());
+    effective_reasons(request, &temporal.effective, &mut reasons);
+    let revision_state = revision_state(request, temporal.superseded.as_ref());
     if request.policy().revision_mode() == PointInTimeRevisionMode::LatestKnown {
         match revision_state {
             PointInTimeRevisionState::Superseded => {
@@ -680,14 +718,14 @@ fn materialize_conflicts<'a>(
 #[cfg(test)]
 mod disk_regression {
     use std::error::Error;
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU16, NonZeroU32};
     use std::time::{Duration, Instant};
 
     use market_squawk_domain::{
-        AvailabilityEvidence, DataQuality, DigestAlgorithm, MacroObservation, PayloadHash,
-        PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-        ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
-        SourceId, SourceIdentifier, Timestamp,
+        AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, MacroObservation,
+        PayloadHash, PayloadReference, ResearchContext, ResearchObservation, ResearchPeriod,
+        ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
+        RevisionNumber, SourceId, SourceIdentifier, Timestamp,
     };
     use rust_decimal::Decimal;
     use tokio_util::sync::CancellationToken;
@@ -706,7 +744,13 @@ mod disk_regression {
             DatasetSchemaRegistry::local().canonical_research_observations()?,
             Sha256Digest::new([1; 32]),
         )?;
-        let make = |revision, value, available| -> Result<PointInTimeCandidate, Box<dyn Error>> {
+        let make_temporal = |revision,
+                             value,
+                             availability,
+                             effective,
+                             published,
+                             superseded|
+         -> Result<PointInTimeCandidate, Box<dyn Error>> {
             let context = ResearchContext::new(
                 ResearchProvenance::try_new(ResearchProvenanceInput {
                     source_id: SourceId::try_from("pit-disk")?,
@@ -721,15 +765,13 @@ mod disk_regression {
                         DigestAlgorithm::Sha256,
                         [7; 32],
                     )),
-                    availability: AvailabilityEvidence::local_first_observed(
-                        Timestamp::from_unix_nanos(available),
-                    ),
+                    availability,
                 })?,
                 ResearchTime::try_new_with_coordinates(
-                    ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(10)),
-                    None,
+                    effective,
+                    published,
                     RevisionNumber::new(revision)?,
-                    None,
+                    superseded,
                 )?,
             )?;
             Ok(PointInTimeCandidate::new(
@@ -741,6 +783,17 @@ mod disk_regression {
                 )),
                 manifest.clone(),
             ))
+        };
+        let exact = |value| ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(value));
+        let make = |revision, value, available| {
+            make_temporal(
+                revision,
+                value,
+                AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(available)),
+                exact(10),
+                None,
+                None,
+            )
         };
         let cancellation = CancellationToken::new();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -780,12 +833,219 @@ mod disk_regression {
             assert!(filtered.records().is_empty());
             assert_eq!(filtered.content_identity(), expected.content_identity());
             assert_eq!(filtered.audit_identity(), expected.audit_identity());
+            let decisions = disk.select_decisions(&request)?;
+            assert!(decisions.records().is_empty());
+            assert_eq!(decisions.content_identity(), expected.content_identity());
+            assert_eq!(decisions.audit_identity(), expected.audit_identity());
+            assert_eq!(decisions.exclusion_counts(), expected.exclusion_counts());
+            assert_eq!(decisions.revision_counts(), expected.revision_counts());
             let complete = disk.select(&request, |_| true)?;
             assert_eq!(complete.records().len(), expected.records().len());
             for (actual, expected) in complete.records().iter().zip(expected.records()) {
                 assert_eq!(actual.candidate(), expected.candidate());
                 assert_eq!(actual.evidence_identity(), expected.evidence_identity());
             }
+        }
+        // Metadata survives repeated selection at different cutoffs without promoting
+        // inferred availability or collapsing calendar/provider precision into timestamps.
+        let date = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(1970, 1, 1)?);
+        let period = ResearchTemporalCoordinate::source_period(ResearchPeriod::try_new(
+            SourceIdentifier::try_from("monthly")?,
+            2026,
+            NonZeroU16::MIN,
+            SourceIdentifier::try_from("M01")?,
+        )?);
+        let known = AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(20));
+        let temporal_cases = [
+            (AvailabilityEvidence::unknown(), exact(10), None, None),
+            (
+                AvailabilityEvidence::inferred(
+                    Timestamp::from_unix_nanos(20),
+                    SourceIdentifier::try_from("estimate")?,
+                ),
+                exact(10),
+                None,
+                None,
+            ),
+            (
+                AvailabilityEvidence::evidenced(
+                    Timestamp::from_unix_nanos(100),
+                    SourceIdentifier::try_from("release")?,
+                ),
+                exact(50),
+                None,
+                None,
+            ),
+            (AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(200)), exact(10), Some(exact(200)), None),
+            (known.clone(), exact(10), Some(exact(20)), Some(exact(100))),
+            (known.clone(), exact(10), None, Some(exact(200))),
+            (known.clone(), exact(10), Some(date.clone()), None),
+            (known.clone(), exact(10), None, Some(date.clone())),
+            (known.clone(), date.clone(), None, None),
+            (known.clone(), period.clone(), None, None),
+            (known.clone(), exact(10), Some(period.clone()), None),
+            (known, exact(10), None, Some(period.clone())),
+        ];
+        let mut temporal_candidates = Vec::new();
+        let mut temporal_disk =
+            CandidateStore::for_test(1024 * 1024, 32 * 1024 * 1024, &cancellation, deadline)?;
+        for (index, (available, effective, published, superseded)) in
+            temporal_cases.into_iter().enumerate()
+        {
+            let candidate = make_temporal(
+                u32::try_from(index)? + 1,
+                10,
+                available,
+                effective,
+                published,
+                superseded,
+            )?;
+            temporal_disk.append(
+                vec![candidate.observation().clone()],
+                candidate.source_manifest(),
+            )?;
+            temporal_candidates.push(candidate);
+        }
+        for mode in [
+            PointInTimeRevisionMode::LatestKnown,
+            PointInTimeRevisionMode::AllKnown,
+        ] {
+            for (as_of, publication, effective, label) in [
+                (100, None, exact(50), None),
+                (300, Some(exact(50)), exact(50), None),
+                (100, Some(exact(100)), exact(10), Some(exact(50))),
+                (100, Some(date.clone()), date.clone(), None),
+                (100, Some(period.clone()), period.clone(), None),
+            ] {
+                let request = PointInTimeRequest::try_new(
+                    PointInTimePolicy::try_new(NonZeroU32::MIN, mode)?,
+                    Timestamp::from_unix_nanos(as_of),
+                    publication,
+                    effective,
+                    label,
+                    limits,
+                )?;
+                let expected =
+                    super::select(&request, &temporal_candidates, &cancellation, deadline)
+                        .map_err(|error| format!("{error:?}"))?;
+                let decisions = temporal_disk.select_decisions(&request)?;
+                assert!(decisions.records().is_empty());
+                assert_eq!(decisions.content_identity(), expected.content_identity());
+                assert_eq!(decisions.audit_identity(), expected.audit_identity());
+                assert_eq!(decisions.exclusion_counts(), expected.exclusion_counts());
+                assert_eq!(decisions.revision_counts(), expected.revision_counts());
+                let complete = temporal_disk.select(&request, |_| true)?;
+                assert_eq!(complete.records().len(), expected.records().len());
+                assert_eq!(complete.content_identity(), expected.content_identity());
+                assert_eq!(complete.audit_identity(), expected.audit_identity());
+                for (actual, expected) in complete.records().iter().zip(expected.records()) {
+                    assert_eq!(actual.candidate(), expected.candidate());
+                    assert_eq!(actual.evidence_identity(), expected.evidence_identity());
+                }
+            }
+        }
+        // A new read-only connection reuses immutable candidates after the operation
+        // staging owner is gone; all request decisions remain connection-local TEMP state.
+        let prepared_owner = crate::parquet_store::OperationScratchDirectory::for_test()?;
+        let prepared_path = prepared_owner.path().join("prepared.sqlite3");
+        let destination = rusqlite::Connection::open(&prepared_path)?;
+        temporal_disk.export_prepared(&destination)?;
+        drop(destination);
+        drop(temporal_disk);
+        let immutable_bytes = std::fs::read(&prepared_path)?;
+        for mode in [
+            PointInTimeRevisionMode::LatestKnown,
+            PointInTimeRevisionMode::AllKnown,
+        ] {
+            let connection = rusqlite::Connection::open_with_flags(
+                &prepared_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let mut prepared = CandidateStore::open_prepared(
+                connection,
+                vec![manifest.clone()],
+                temporal_candidates.len(),
+                1024 * 1024,
+                32 * 1024 * 1024,
+                &cancellation,
+                deadline,
+            )?;
+            let request = PointInTimeRequest::try_new(
+                PointInTimePolicy::try_new(NonZeroU32::MIN, mode)?,
+                Timestamp::from_unix_nanos(100),
+                None,
+                exact(50),
+                None,
+                limits,
+            )?;
+            let admitted: Vec<_> = temporal_candidates
+                .iter()
+                .enumerate()
+                .filter(|(ordinal, _)| *ordinal != 1 && *ordinal != 7)
+                .map(|(_, candidate)| candidate.clone())
+                .collect();
+            let expected = super::select(&request, &admitted, &cancellation, deadline)
+                .map_err(|error| format!("{error:?}"))?;
+            let actual = prepared
+                .select_decisions_filtered(&request, |ordinal| Ok(ordinal != 1 && ordinal != 7))?;
+            assert!(actual.records().is_empty());
+            assert_eq!(actual.content_identity(), expected.content_identity());
+            assert_eq!(actual.audit_identity(), expected.audit_identity());
+            assert_eq!(actual.exclusion_counts(), expected.exclusion_counts());
+            assert_eq!(actual.revision_counts(), expected.revision_counts());
+            let mut ordinals = Vec::new();
+            prepared.visit_decisions(|ordinal, _, _| {
+                ordinals.push(ordinal);
+                Ok(())
+            })?;
+            ordinals.sort_unstable();
+            assert_eq!(
+                ordinals,
+                (0..temporal_candidates.len())
+                    .filter(|ordinal| *ordinal != 1 && *ordinal != 7)
+                    .collect::<Vec<_>>()
+            );
+            let empty = super::select(&request, &[], &cancellation, deadline)
+                .map_err(|error| format!("{error:?}"))?;
+            let actual = prepared.select_decisions_filtered(&request, |_| Ok(false))?;
+            assert_eq!(actual.content_identity(), empty.content_identity());
+            assert_eq!(actual.audit_identity(), empty.audit_identity());
+            let complete = super::select(&request, &temporal_candidates, &cancellation, deadline)
+                .map_err(|error| format!("{error:?}"))?;
+            let retained = prepared.select(&request, |_| true)?;
+            assert_eq!(retained.records().len(), complete.records().len());
+            assert_eq!(retained.content_identity(), complete.content_identity());
+            assert_eq!(retained.audit_identity(), complete.audit_identity());
+            for (actual, expected) in retained.records().iter().zip(complete.records()) {
+                assert_eq!(actual.candidate(), expected.candidate());
+                assert_eq!(actual.evidence_identity(), expected.evidence_identity());
+            }
+            // Candidate and family limits apply to this request's admitted source input.
+            let restricted = PointInTimeRequest::try_new(
+                request.policy(),
+                request.as_of(),
+                None,
+                exact(50),
+                None,
+                PointInTimeLimits::try_new(1, 1, 1, 1, 1024 * 1024)?,
+            )?;
+            let expected = super::select(
+                &restricted,
+                &temporal_candidates[2..3],
+                &cancellation,
+                deadline,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            let actual =
+                prepared.select_decisions_filtered(&restricted, |ordinal| Ok(ordinal == 2))?;
+            assert_eq!(actual.content_identity(), expected.content_identity());
+            assert_eq!(actual.audit_identity(), expected.audit_identity());
+            assert!(matches!(
+                prepared.append(Vec::new(), &manifest),
+                Err(PointInTimeError::ScratchStorage)
+            ));
+            drop(prepared);
+            assert_eq!(std::fs::read(&prepared_path)?, immutable_bytes);
         }
         let conflict = make(2, 21, 20)?;
         disk.append(
@@ -815,6 +1075,52 @@ mod disk_regression {
         };
         assert_eq!(counts, report.conflict_counts());
         assert_eq!(audit_identity, report.audit_identity());
+        let Err(PointInTimeError::DiskRevisionConflicts {
+            counts,
+            audit_identity,
+        }) = disk.select_decisions(&request)
+        else {
+            return Err("expected decision-only disk conflict".into());
+        };
+        assert_eq!(counts, report.conflict_counts());
+        assert_eq!(audit_identity, report.audit_identity());
+        let conflict_path = prepared_owner.path().join("conflicts.sqlite3");
+        let destination = rusqlite::Connection::open(&conflict_path)?;
+        disk.export_prepared(&destination)?;
+        drop(destination);
+        let connection = rusqlite::Connection::open_with_flags(
+            &conflict_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut prepared = CandidateStore::open_prepared(
+            connection,
+            vec![manifest.clone()],
+            candidates.len(),
+            1024 * 1024,
+            32 * 1024 * 1024,
+            &cancellation,
+            deadline,
+        )?;
+        let Err(PointInTimeError::DiskRevisionConflicts {
+            counts,
+            audit_identity,
+        }) = prepared.select_decisions(&request)
+        else {
+            return Err("expected reopened conflict".into());
+        };
+        assert_eq!(counts, report.conflict_counts());
+        assert_eq!(audit_identity, report.audit_identity());
+        let expected = super::select(
+            &request,
+            &candidates[..candidates.len() - 1],
+            &cancellation,
+            deadline,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let actual = prepared
+            .select_decisions_filtered(&request, |ordinal| Ok(ordinal < candidates.len() - 1))?;
+        assert_eq!(actual.content_identity(), expected.content_identity());
+        assert_eq!(actual.audit_identity(), expected.audit_identity());
         cancellation.cancel();
         assert!(matches!(
             disk.select(&request, |_| true),
