@@ -678,9 +678,12 @@ impl CatalogAuthority {
         &self,
         input: ResearchUseRevocationInput,
     ) -> Result<ResearchUseRevocationReceipt, ResearchUseCatalogError> {
-        self.with_research_use_transaction(move |transaction, session_id, now| {
+        let receipt = self.with_research_use_transaction(move |transaction, session_id, now| {
             persistence::revoke_grant(transaction, session_id, now, input)
-        })
+        })?;
+        self.publication_observer
+            .record(crate::DataPublication::ResearchUseRevocation);
+        Ok(receipt)
     }
 
     /// Traverses exact lineage, commits its canonical decision, and issues a session permit.

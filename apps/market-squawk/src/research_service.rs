@@ -430,7 +430,8 @@ impl market_squawk_data::DataPublicationObserver for ResearchPublicationObserver
             }
             DataPublication::MacroGeneration => &[ServiceDomain::Research, ServiceDomain::Macro],
             DataPublication::MarketEvents => &[ServiceDomain::Market, ServiceDomain::Portfolio],
-            DataPublication::Reference => &[
+            DataPublication::Reference | DataPublication::ResearchUseRevocation => &[
+                ServiceDomain::Source,
                 ServiceDomain::Market,
                 ServiceDomain::Research,
                 ServiceDomain::Fundamental,

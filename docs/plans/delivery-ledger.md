@@ -2,15 +2,28 @@
 
 ## Current execution — 2026-10-02
 
-Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop64107,
-service64054, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
-The previous queued application builds finished sequentially. Shared-service rerun3350 is terminal0;
-its empty-collection/MCP correction is pushed as `56412314` (PASS1/1, 47.06s). Lead inspected and
-applied the complete canonical FilingForm candidate (now pushed as `bd15961c`) after verifying all19 base hashes. The serialized watcher
-build54381 passed (8m01s), followed by domain1/1, SEC parser2/2 and PIT1/1 critical checks.
-Evidence: `.agents/tmp/v1-first-stock/filing-form-{domain,parser,pit}-critical.log`.
-The first live activation retry returned service unavailable; live financial loading remains unproved.
-Original runtime roots and recovery history remain preserved.
+Accepted read/refresh checkpoint: backend build78707 PASS6m19s; current service82279/Desktop82321.
+Existing retained-event publication/restart case PASS1/1 (8.82s), covering current grants under
+writer contention, renewal, denied scope/revocation, cancellation and restart. Desktop types PASS;
+existing lookup/market/coalescing journeys PASS3/3. Native positive chart/financial rendering is
+still unproved; SEC correction and selected adjusted-history acquisition remain separate pending work.
+Evidence: `.agents/tmp/v1-first-stock/{retained-authorization-critical,investment-refresh-critical,
+investment-refresh-types}.log`. Live overview returned9/9 prices in26.01s, not an acceptable latency claim.
+
+Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop72244,
+service72187, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
+Lead applied the inspected SEC composite-budget correction, retained-event read authorization,
+source/revocation notifications and visible WebDriver opt-in in one source batch. The watcher
+owns the sole native build; frontend snapshot-refresh changes remain deferred until that backend
+is running. No second native workspace client is launched. Existing restore/rights tests and live
+SEC/detail checks are the next verification barrier; no positive financial/chart claim yet.
+
+Pushed `a889b983` aligns history results and batches retained closes; both critical cases pass.
+The live diagnostic identified submissions parser_byte_limit_exceeded: a small composite
+manifest incorrectly governed the size of referenced bodies. The applied fix retains aggregate
+request accounting. Snapshot authorization now avoids mutation for already-valid grants, with
+explicit revocation/integrity failures retained. The selected adjusted-history job candidate is
+frozen; lead-owned producer/consumer registration remains required before applying it.
 
 Pushed `ba7679b6` implements the selected-detail layout/refresh correction; Desktop types and the
 two existing critical journeys pass. Lead has now applied the five-file close-page candidate after
@@ -28,6 +41,47 @@ A temporary hidden native check could not admit a second workspace client (gener
 failure); its process65422/session was stopped and the visible Desktop64107 remained running.
 No native screenshot or visual-completion claim is made from that attempt.
 
+
+Current bounded follow-up ownership (all candidate-only while SEC diagnostic compiles):
+
+| Owner | Required outcome and exact ownership | Dependency / critical check |
+| --- | --- | --- |
+| Astra startup_read_diagnosis | Remove unnecessary retained-event mutation waiting in `research_service/retained_use.rs` (confirm exact path in candidate); snapshot-first exact grant validation, fallback only for legitimate policy admission/renewal. | Preserve explicit revocation/integrity/cancellation; existing held-writer/rights case. Lead integrates shared authority. |
+| Sol financial_detail_ui | Typed snapshot-refresh query metadata/helper plus selected chart/financial query consumers; existing app event-coalescing case only. | Candidate must preserve authority-change and reconnect validation, not suppress every domain event indiscriminately. |
+| Astra sec_automatic_resolution | Selected-history acquisition and narrow durable runner candidate: existing preflight `history.rs`/`display_history.rs`, new `jobs/market_history.rs`. | Reuse job authority and true ingest precommit fence; immutable selected record/lookback; lead owns registration and all shared operations. |
+| Sol dev_launcher | Diagnose hidden second-native admission; candidate-only explicit visible WebDriver mode in native `lib.rs`, `scripts/develop.mjs`, troubleshooting and existing launcher check. Avoid a second owner of the MCP receipt lock. | No runtime/process changes or focus automation; visible owner app remains running. Lead integrates shared launch code after current compile. |
+| Lead | SEC diagnostic, manifests/lock; history-preparation job contracts/composition; Git/build/native verification. | Complete and push each coherent producer/consumer checkpoint; next selected-chart acquisition reuses installed job authority. |
+
+SEC live diagnostic now proves `parser_byte_limit_exceeded`, submissions extraction. The request
+parser limit uses the composite manifest byte length (~736 bytes) for its larger referenced JSON
+components. Discovery succeeded; do not change provider locks or raise a global budget for this.
+Astra startup_read_diagnosis has frozen the retained-authorization candidate and now owns only
+candidate SEC `extraction.rs` plus the existing composite restore regression. Lead will preserve
+shared aggregate allocation accounting and inspect the actual consumer before integration.
+Native diagnostic build passed7m58; current service72187/Desktop72244.
+
+Current checks: refresh TypeScript check PASS and existing Desktop lookup/market/coalescing
+journeys PASS3/3 (3.64s); launcher actual-child lifecycle PASS1/1. First native batch build75955
+passed6m25s, service78622/Desktop78663. A subsequent formatting save queued one serialized
+rebuild78707; no concurrent compiler is permitted. Avoid source writes until that queue drains.
+Live collection with market data returned9/9 prices in26.01s: timeout avoided on this attempt,
+but latency remains unacceptable. SEC now publishes AAPL submissions; subsequent CompanyFacts
+fails exact capture/dataset binding (InvalidSelection). Astra is correcting canonical dataset
+construction and the introduced shared-helper FilingXbrl regression before SEC acceptance.
+
+Next candidate-only consumer ownership: Sol financial_detail_ui owns Desktop
+`lib/{transport,tauri-transport,schemas}.ts`, `features/markets/{market-history-read,market-history-chart}.tsx`
+and cohesive `history-preparation.tsx`; Sol dev_launcher owns native
+`{contracts,service_client,lib}.rs` (bridge only if genuinely necessary). They coordinate the closed
+start/reconciliation DTO before edits. Lead owns source application after backend/check barrier,
+CLI, committed-job notifications, shared contracts, integration checks and pushes. Viewport All
+means all saved history, not a fabricated unlimited provider request.
+
+Selected-history next dependency: Astra sec_automatic_resolution has frozen the preflight
+`history.rs`/`display_history.rs` plus `jobs/market_history.rs` candidate. Approved candidate-only
+shared wiring ownership is exactly `jobs/{mod,research}.rs`, `application/contracts{,/output}.rs`,
+`service/{tool_services,jobs}.rs`. Lead reserves final application/native/CLI/MCP/renderer integration,
+Git and all checks. No source application until this read/financial-rejection checkpoint completes.
 
 Further confirmed chart gap: startup acquires raw daily bars/close projections, while the selected
 chart requests FullyAdjusted and has no acquisition step. Astra sec_automatic_resolution owns only

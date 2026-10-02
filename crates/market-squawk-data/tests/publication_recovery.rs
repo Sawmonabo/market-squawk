@@ -3906,8 +3906,18 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         basis: RightsBasis::reviewed_terms("https://example.test/alpaca-terms/v1", digest(41))?,
         authorization_evidence: digest(43),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-        permitted_operations: vec![SourceOperation::Persist],
+        permitted_operations: vec![SourceOperation::Persist, SourceOperation::Display],
     })?;
+    let display_expiry = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
+    .checked_add_nanos(1_000_000_000)?;
+    authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::Display])?,
+        digest(44),
+        Some(display_expiry),
+    )?)?;
     authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
         rights.rights_id(),
         ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
@@ -4141,6 +4151,73 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         reauthorized.rights_input_digest(),
         authorized.rights_input_digest()
     );
+    // A current grant never needs mutation admission. Only an expired/missing grant may
+    // request the existing policy renewal, and no renewable outcome itself authorizes rows.
+    let display_request = market_squawk_data::MarketEventUseRequest::try_new(
+        first_commit.clone(),
+        coordinates.clone(),
+        ResearchUse::Display,
+        research_limits,
+    )?;
+    let before_expiry_check =
+        i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    if before_expiry_check < display_expiry.unix_nanos() {
+        tokio::time::sleep(Duration::from_nanos(u64::try_from(
+            display_expiry.unix_nanos() - before_expiry_check,
+        )?))
+        .await;
+    }
+    assert!(matches!(
+        restarted.authorize_market_event_use(display_request.clone(), &cancellation),
+        Err(market_squawk_data::ResearchUseCatalogError::Expired)
+    ));
+    assert!(
+        restarted
+            .authorize_current_market_event_use(display_request.clone(), deadline, &cancellation,)?
+            .is_none()
+    );
+    let display_policy = market_squawk_data::RetainedResearchUsePolicy::try_new(
+        RightsBasis::reviewed_terms("https://example.test/alpaca-terms/v1", digest(41))?,
+        digest(43),
+        None,
+        vec![SourceOperation::Persist, SourceOperation::Display],
+    )?;
+    let renewed_display = restarted
+        .authorize_market_event_use_with_retained_policy(
+            display_request.clone(),
+            &[display_policy],
+            deadline,
+            &cancellation,
+        )
+        .await?;
+    assert_eq!(renewed_display.inputs(), display_request.inputs());
+    assert!(renewed_display.expires_at() > display_expiry);
+    let current_display = restarted
+        .authorize_current_market_event_use(display_request.clone(), deadline, &cancellation)?
+        .ok_or("current Display grant requested redundant admission")?;
+    assert_eq!(current_display.inputs(), renewed_display.inputs());
+    restarted.recheck_market_event_use(&current_display, deadline, &cancellation)?;
+    assert!(matches!(
+        restarted.authorize_current_market_event_use(
+            display_request.clone(),
+            Instant::now(),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::DeadlineExceeded)
+            | Err(market_squawk_data::ResearchUseCatalogError::Catalog(
+                CatalogError::MarketRecoveryReadDeadlineExceeded
+            ))
+    ));
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        restarted
+            .authorize_current_market_event_use(display_request.clone(), deadline, &cancelled,),
+        Err(market_squawk_data::ResearchUseCatalogError::Cancelled)
+            | Err(market_squawk_data::ResearchUseCatalogError::Catalog(
+                CatalogError::MarketRecoveryReadCancelled,
+            ))
+    ));
     // Current policy is matched to the original exact payload and policy evidence. It
     // preserves the publication/row identity while retaining independently selected rights.
     let retained_policy = market_squawk_data::RetainedResearchUsePolicy::try_new(
@@ -4234,6 +4311,19 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         retained.origin_committed_at(),
     )?;
     assert!(matches!(
+        restarted.authorize_current_market_event_use(
+            market_squawk_data::MarketEventUseRequest::try_from_retained(
+                authorized.commit().clone(),
+                vec![altered.clone()],
+                authorized.research_use(),
+                research_limits,
+            )?,
+            deadline,
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidPublication)
+    ));
+    assert!(matches!(
         restarted.authorize_market_event_use(
             market_squawk_data::MarketEventUseRequest::try_from_retained(
                 authorized.commit().clone(),
@@ -4244,6 +4334,19 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             &cancellation,
         ),
         Err(market_squawk_data::ResearchUseCatalogError::InvalidPublication)
+    ));
+    assert!(matches!(
+        restarted.authorize_current_market_event_use(
+            market_squawk_data::MarketEventUseRequest::try_new(
+                first_commit.clone(),
+                coordinates.clone(),
+                ResearchUse::Train,
+                research_limits,
+            )?,
+            deadline,
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidGrant)
     ));
     assert!(matches!(
         restarted.authorize_market_event_use(
@@ -4377,6 +4480,11 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     cancellation.clone(),
                 )
                 .await;
+            let display_during_write = restarted.authorize_current_market_event_use(
+                display_request.clone(),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            );
             let routes_during_write = restarted.provider_market_event_durable_routes(
                 instrument,
                 &[LiveEventClass::Trade],
@@ -4430,6 +4538,10 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             let committed = publication??;
             released?;
             assert_eq!(during_write, selected);
+            let display_during_write =
+                display_during_write?.ok_or("held writer hid an already admitted Display grant")?;
+            assert_eq!(display_during_write.inputs(), display_request.inputs());
+            assert_eq!(display_during_write.commit(), &first_commit);
             assert_eq!(routes_during_write, retained_routes);
             assert_eq!(metadata_during_write, Some(source.clone()));
             assert!(definitions_during_write?.is_empty());
@@ -4948,6 +5060,14 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
+    assert!(matches!(
+        revoked_service.authorize_current_market_event_use(
+            policy_request.clone(),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::Revoked)
+    ));
     assert!(matches!(
         revoked_service
             .authorize_market_event_use_with_retained_policy(

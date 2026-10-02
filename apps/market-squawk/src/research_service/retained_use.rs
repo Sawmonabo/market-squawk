@@ -125,7 +125,7 @@ impl ResearchService {
         Ok(result)
     }
 
-    /// Admits exact logical observations on the retained-read worker with the existing writer lease.
+    /// Reuses current exact-row grants before admitting any required policy renewal.
     /// The worker owns only the existing analytical service, never this worker's owner.
     pub(crate) async fn authorize_market_event_use(
         &self,
@@ -147,7 +147,30 @@ impl ResearchService {
             ));
         };
         let deadline = deadline.min(traversal_deadline);
-        // Admit before occupying the I/O lane needed by original-capture gate holders.
+        let analytical = Arc::clone(&self.analytical);
+        let current_request = request.clone();
+        let current = self
+            .run_owned_research_read(deadline, cancellation, move |worker_cancellation| {
+                analytical.authorize_current_market_event_use(
+                    current_request,
+                    deadline,
+                    &worker_cancellation,
+                )
+            })
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(market_squawk_data::IngestError::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(market_squawk_data::IngestError::DeadlineExceeded.into());
+        }
+        match current {
+            Ok(Some(authorization)) => return Ok(Ok(authorization)),
+            Err(error) => return Ok(Err(error)),
+            Ok(None) => {}
+        }
+        // Only semantic grant admission/renewal needs the mutation gate. Release the read
+        // worker before awaiting it so original-capture gate holders can still make progress.
         let admission = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(Err(market_squawk_data::ResearchUseCatalogError::Cancelled)),

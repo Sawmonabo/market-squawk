@@ -962,6 +962,11 @@ impl PreparedResearchProviderReplacement {
             authority.selections.revoke_profile(&self.profile);
             admission
         };
+        // Revocation has taken effect even if draining later fails or is cancelled.
+        self.coordinator
+            .research
+            .application_changes()
+            .record(market_squawk_services::ServiceDomain::Source);
         admission.revoke_and_drain().await;
         super::treasury::drain_generation_replay(&self.coordinator, &self.expected).await?;
         Ok(())
@@ -1307,6 +1312,10 @@ impl PreparedResearchProviderPublicationReplacement {
             current.admission.revoke();
             current.admission.clone()
         };
+        self.coordinator
+            .research
+            .application_changes()
+            .record(market_squawk_services::ServiceDomain::Source);
         predecessor.revoke_and_drain().await;
         Ok(())
     }
@@ -2655,6 +2664,11 @@ impl ResearchProviderRuntimeMutationAuthority {
             authority.selections.revoke_profile(expected.profile());
             admission
         };
+        // Revocation has taken effect even if draining later fails or is cancelled.
+        self.coordinator
+            .research
+            .application_changes()
+            .record(market_squawk_services::ServiceDomain::Source);
         admission.revoke_and_drain().await;
 
         let mut authority = self
@@ -2728,6 +2742,11 @@ impl ResearchProviderRuntimeMutationAuthority {
                 admission
             }
         };
+        // Revocation has taken effect even if draining later fails or is cancelled.
+        self.coordinator
+            .research
+            .application_changes()
+            .record(market_squawk_services::ServiceDomain::Source);
         admission.revoke_and_drain().await;
         super::treasury::drain_generation_replay(&self.coordinator, expected).await?;
         Ok(())

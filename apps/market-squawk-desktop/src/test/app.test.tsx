@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { QueryClientProvider, QueryObserver } from "@tanstack/react-query"
 import { ProductProvider } from "@/app/product-context"
-import { createProductQueryClient, productKeys } from "@/app/query-client"
+import { createProductQueryClient, productKeys, snapshotQueryMeta } from "@/app/query-client"
 import { describe, expect, it, vi } from "vitest"
 
 import { App } from "@/app/app"
@@ -18,6 +18,7 @@ import { lifecycleControls, type SourceEvidence } from "@/features/sources/sourc
 import {
   type ApplicationResult,
   type DesktopSystemBootstrap,
+  type DesktopInvalidationDomain,
   type NativeEvidenceApplicationResult,
 } from "@/lib/schemas"
 import {
@@ -1677,6 +1678,31 @@ describe("Market Squawk desktop boundary", () => {
       }),
     })
     const releaseObserver = observer.subscribe(() => undefined)
+    const snapshotKeys = [
+      productKeys.operation(scope, "market", "Market.GetHistory", { generationToken: "saved", pointLimit: 512 }),
+      productKeys.operation(scope, "market", "Market.GetHistory", { generationToken: "saved", originalOrdinal: "1" }),
+      productKeys.operation(scope, "research", "Research.GetInvestmentFinancials", { cursor: "saved-page" }),
+    ]
+    const snapshotReads: { signal: AbortSignal; resolve: (result: ApplicationResult) => void }[][] = snapshotKeys.map(() => [])
+    const snapshotObservers = snapshotKeys.map((snapshotKey, index) => {
+      queryClient.setQueryData(snapshotKey, marketOverviewResult)
+      return new QueryObserver(queryClient, {
+        queryKey: snapshotKey,
+        meta: snapshotQueryMeta,
+        queryFn: ({ signal }) => new Promise<ApplicationResult>((resolve) => {
+          snapshotReads[index]!.push({ signal, resolve })
+        }),
+      })
+    })
+    const releaseSnapshots = snapshotObservers.map((snapshotObserver) => snapshotObserver.subscribe(() => undefined))
+    const profileKey = productKeys.operation(scope, "research", "Research.GetInvestmentProfile", { selectionToken: marketSelectionToken })
+    queryClient.setQueryData(profileKey, marketOverviewResult)
+    let profileReads = 0
+    const profileObserver = new QueryObserver(queryClient, {
+      queryKey: profileKey,
+      queryFn: async () => { profileReads += 1; return marketOverviewResult },
+    })
+    const releaseProfile = profileObserver.subscribe(() => undefined)
     const subscriptions: Parameters<SystemTransport["subscribe"]>[1][] = []
     const base = transport()
     const view = render(<QueryClientProvider client={queryClient}>
@@ -1688,13 +1714,31 @@ describe("Market Squawk desktop boundary", () => {
       } }}>{null}</ProductProvider>
     </QueryClientProvider>)
     let sequence = 0
-    const invalidate = () => subscriptions[0]!({ productSessionToken: scope,
-      sequence: String(++sequence), body: { type: "invalidate", domains: ["market"] } })
+    const invalidate = (domains: DesktopInvalidationDomain[] = ["market"]) => subscriptions[0]!({ productSessionToken: scope,
+      sequence: String(++sequence), body: { type: "invalidate", domains } })
     try {
       await waitFor(() => expect(subscriptions).toHaveLength(1))
       const initial = observer.refetch()
       expect(reads).toHaveLength(1)
-      await act(async () => { invalidate(); invalidate(); invalidate() })
+      // Routine publications refresh current data without opening saved snapshots.
+      await act(async () => { invalidate(["market", "research"]) })
+      await waitFor(() => expect(profileReads).toBe(1))
+      snapshotReads.forEach((requests) => expect(requests).toHaveLength(0))
+      snapshotKeys.forEach((snapshotKey) => expect(queryClient.getQueryState(snapshotKey)?.isInvalidated).toBe(false))
+      // An explicit read is still allowed, and publications arriving during it
+      // neither cancel it nor schedule another snapshot read afterward.
+      const explicitSnapshots = snapshotObservers.map((snapshotObserver) => snapshotObserver.refetch())
+      snapshotReads.forEach((requests) => expect(requests).toHaveLength(1))
+      await act(async () => { invalidate(["market", "research"]); invalidate(); invalidate() })
+      snapshotReads.forEach((requests) => {
+        expect(requests).toHaveLength(1)
+        expect(requests[0]!.signal.aborted).toBe(false)
+      })
+      await act(async () => {
+        snapshotReads.forEach((requests) => requests[0]!.resolve(marketOverviewResult))
+        await Promise.all(explicitSnapshots)
+      })
+      snapshotReads.forEach((requests) => expect(requests).toHaveLength(1))
       expect(reads).toHaveLength(1)
       expect(reads[0]!.signal.aborted).toBe(false)
       expect(queryClient.getQueryState(inactiveKey)?.isInvalidated).toBe(true)
@@ -1720,8 +1764,18 @@ describe("Market Squawk desktop boundary", () => {
       expect(queryClient.getQueryData(queryKey)).toEqual(marketOverviewResult)
       expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(true)
 
-      await act(async () => { invalidate() })
+      // Even a Source-only lifecycle event revalidates both saved domains.
+      await act(async () => { invalidate(["source"]) })
+      await waitFor(() => snapshotReads.forEach((requests) => expect(requests).toHaveLength(2)))
       expect(reads).toHaveLength(4)
+      await act(async () => {
+        // Authority changes during a read retain one revalidation after it.
+        invalidate(["source", "market", "research"])
+        snapshotReads.forEach((requests) => requests[1]!.resolve(marketOverviewResult))
+      })
+      await waitFor(() => snapshotReads.forEach((requests) => expect(requests).toHaveLength(3)))
+      await act(async () => { snapshotReads.forEach((requests) => requests[2]!.resolve(marketOverviewResult)) })
+      await waitFor(() => snapshotKeys.forEach((snapshotKey) => expect(queryClient.getQueryState(snapshotKey)?.fetchStatus).toBe("idle")))
       await act(async () => {
         invalidate()
         subscriptions[0]!({ productSessionToken: scope, sequence: String(sequence), body: { type: "stream_disconnected" } })
@@ -1730,9 +1784,16 @@ describe("Market Squawk desktop boundary", () => {
       await act(async () => { reads[3]!.resolve(updated) })
       expect(reads).toHaveLength(4)
       expect(queryClient.getQueryData(queryKey)).toEqual(marketOverviewResult)
+      // The same admitted scope reconnect still revalidates every snapshot.
+      await waitFor(() => expect(subscriptions).toHaveLength(2), { timeout: 3_000 })
+      await waitFor(() => snapshotReads.forEach((requests) => expect(requests).toHaveLength(4)))
+      snapshotReads.forEach((requests) => expect(requests[3]!.signal.aborted).toBe(false))
+      await act(async () => { snapshotReads.forEach((requests) => requests[3]!.resolve(marketOverviewResult)) })
     } finally {
       view.unmount()
       releaseObserver()
+      releaseSnapshots.forEach((releaseSnapshot) => releaseSnapshot())
+      releaseProfile()
       queryClient.clear()
     }
   })

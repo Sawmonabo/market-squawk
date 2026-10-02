@@ -1764,6 +1764,8 @@ pub enum DataPublication {
     MarketEvents,
     /// Reference identity or reference-selection evidence changed.
     Reference,
+    /// A committed downstream-use revocation requires fresh display authorization.
+    ResearchUseRevocation,
     /// A previously absent immutable chart projection became available.
     ChartProjection,
     /// A new analytical generation derived from exact parents became available.
@@ -3139,6 +3141,34 @@ impl AnalyticalDataService {
                 .read_snapshot(self.catalog_read_limits, deadline, cancellation)?;
         snapshot.read(|snapshot| {
             crate::research_use::authorize_market_event_use_in_snapshot(
+                snapshot,
+                self.catalog_id,
+                request,
+                deadline,
+                cancellation,
+            )
+        })
+    }
+
+    /// Evaluates already admitted exact-row grants without analytical mutation admission.
+    /// `None` requires policy admission/renewal; revocation, scope, integrity and control
+    /// failures remain errors. This does not itself admit or extend any source authority.
+    pub fn authorize_current_market_event_use(
+        &self,
+        request: crate::MarketEventUseRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::AuthorizedMarketEventUse>, crate::ResearchUseCatalogError> {
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(request.limits().traversal_deadline())
+                .ok_or(crate::ResearchUseCatalogError::DeadlineExceeded)?,
+        );
+        let snapshot =
+            self.manifests
+                .read_snapshot(self.catalog_read_limits, deadline, cancellation)?;
+        snapshot.read(|snapshot| {
+            crate::research_use::authorize_current_market_event_use_in_snapshot(
                 snapshot,
                 self.catalog_id,
                 request,

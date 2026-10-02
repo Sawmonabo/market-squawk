@@ -2,7 +2,7 @@ import * as React from "react"
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Tabs } from "radix-ui"
 
-import { productKeys } from "@/app/query-client"
+import { productKeys, snapshotQueryMeta } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { CursorNavigation, useCursorNavigation } from "@/features/shared/cursor-navigation"
 import { formatMoney, groupDecimal } from "@/lib/formatters"
@@ -104,6 +104,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
   const page = useQuery({
     queryKey,
     gcTime: 0,
+    meta: snapshotQueryMeta,
     retry: false,
     refetchOnWindowFocus: false,
     placeholderData: keepPreviousData,

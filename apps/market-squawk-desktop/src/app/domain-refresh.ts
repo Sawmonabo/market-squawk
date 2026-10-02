@@ -48,11 +48,20 @@ export function createDomainRefresh(queryClient: QueryClient, scope: ProductScop
   return {
     invalidate(domains?: readonly DesktopInvalidationDomain[]) {
       if (disposed) return
-      const keys = domains
-        ? [...new Set(domains)].map((domain) => productKeys.domain(scope, domain))
+      const authorityChanged = domains?.includes("source") === true
+      const affected = domains ? new Set<DesktopInvalidationDomain>(domains) : undefined
+      if (authorityChanged && affected) {
+        // Source authority changes must revalidate both saved financial evidence
+        // and price snapshots, including Source-only lifecycle events.
+        affected.add("market")
+        affected.add("research")
+      }
+      const keys = affected
+        ? [...affected].map((domain) => productKeys.domain(scope, domain))
         : [productKeys.root(scope)]
       for (const queryKey of keys) {
         for (const query of cache.findAll({ queryKey })) {
+          if (domains !== undefined && !authorityChanged && query.meta?.domainRefresh === "explicit") continue
           pending.add(query)
           query.invalidate()
           if (query.state.fetchStatus === "idle") schedule()

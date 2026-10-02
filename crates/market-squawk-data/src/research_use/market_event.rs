@@ -310,6 +310,45 @@ pub(crate) fn authorize_market_event_use_in_snapshot(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<AuthorizedMarketEventUse, ResearchUseCatalogError> {
+    evaluate_market_event_use_in_snapshot(
+        snapshot,
+        session_id,
+        request,
+        deadline,
+        cancellation,
+        false,
+    )?
+    .ok_or(ResearchUseCatalogError::InvalidGrant)
+}
+
+/// Returns no permit only when exact, otherwise valid inputs need grant admission or renewal.
+/// Every input is checked before that disposition, so a later revocation or damaged coordinate
+/// cannot be hidden by an earlier missing/expired grant.
+pub(crate) fn authorize_current_market_event_use_in_snapshot(
+    snapshot: &CatalogReadSnapshot,
+    session_id: Uuid,
+    request: MarketEventUseRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Option<AuthorizedMarketEventUse>, ResearchUseCatalogError> {
+    evaluate_market_event_use_in_snapshot(
+        snapshot,
+        session_id,
+        request,
+        deadline,
+        cancellation,
+        true,
+    )
+}
+
+fn evaluate_market_event_use_in_snapshot(
+    snapshot: &CatalogReadSnapshot,
+    session_id: Uuid,
+    request: MarketEventUseRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    defer_renewable_denials: bool,
+) -> Result<Option<AuthorizedMarketEventUse>, ResearchUseCatalogError> {
     check_control(cancellation, deadline)?;
     if session_id.is_nil() {
         return Err(ResearchUseCatalogError::InvalidPermitSession);
@@ -328,10 +367,11 @@ pub(crate) fn authorize_market_event_use_in_snapshot(
     let mut expires_at = now
         .checked_add_nanos(lifetime)
         .map_err(|_| ResearchUseCatalogError::LimitExceeded)?;
+    let mut requires_policy_admission = false;
     for input in &request.inputs {
         check_control(cancellation, deadline)?;
         let (run, rights) = validate_input(connection, &request.commit, input)?;
-        let grant = selected_grant(select_source_use_grant(
+        let selection = select_source_use_grant(
             connection,
             rights,
             &input.source,
@@ -341,7 +381,34 @@ pub(crate) fn authorize_market_event_use_in_snapshot(
             None,
             cancellation,
             deadline,
-        )?)?;
+        )?;
+        let grant = match selection {
+            SourceGrantSelection::Denied(reason)
+                if defer_renewable_denials
+                    && matches!(
+                        reason,
+                        ResearchUseDenialReason::MissingGrant | ResearchUseDenialReason::Expired
+                    ) =>
+            {
+                // Current policy cannot extend the original operation scope. A missing use
+                // outside that scope is a final denial, not a reason to enter the writer gate.
+                let required = i64::from(
+                    super::ResearchUseSet::try_new(vec![request.requested_use])?
+                        .required_source_operation_mask(),
+                );
+                let permitted: bool = connection.query_row(
+                    "SELECT (operation_mask & ?2)=?2 FROM source_rights WHERE rights_id=?1",
+                    params![rights, required],
+                    |row| row.get(0),
+                )?;
+                if !permitted {
+                    return Err(ResearchUseCatalogError::InvalidGrant);
+                }
+                requires_policy_admission = true;
+                continue;
+            }
+            selection => selected_grant(selection)?,
+        };
         for expiry in [grant.rights_expires_at, grant.grant_expires_at]
             .into_iter()
             .flatten()
@@ -349,6 +416,11 @@ pub(crate) fn authorize_market_event_use_in_snapshot(
             expires_at = expires_at.min(expiry);
         }
         grants.push(SelectedGrant { run, rights, grant });
+    }
+    if requires_policy_admission {
+        check_control(cancellation, deadline)?;
+        checked_read_clock(connection, Some(now))?;
+        return Ok(None);
     }
     if expires_at <= now {
         return Err(ResearchUseCatalogError::Expired);
@@ -370,7 +442,7 @@ pub(crate) fn authorize_market_event_use_in_snapshot(
     {
         return Err(ResearchUseCatalogError::Expired);
     }
-    Ok(AuthorizedMarketEventUse {
+    Ok(Some(AuthorizedMarketEventUse {
         session_id,
         request,
         grants: grants.into_boxed_slice(),
@@ -378,7 +450,7 @@ pub(crate) fn authorize_market_event_use_in_snapshot(
         expires_at,
         monotonic_expiry,
         decision_digest,
-    })
+    }))
 }
 
 /// Revalidates original capture/run bindings and the exact previously selected grants.

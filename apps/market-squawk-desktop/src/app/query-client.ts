@@ -2,6 +2,20 @@ import { QueryClient } from "@tanstack/react-query"
 
 import type { DesktopBootstrap, DesktopInvalidationDomain } from "@/lib/schemas"
 
+export interface ProductQueryMeta extends Record<string, unknown> {
+  domainRefresh?: "automatic" | "explicit"
+}
+
+declare module "@tanstack/react-query" {
+  interface Register {
+    queryMeta: ProductQueryMeta
+  }
+}
+
+// These reads acquire or address a frozen snapshot. Routine publication events
+// do not replace that snapshot; explicit reads, source authority changes and full reconnect refreshes do.
+export const snapshotQueryMeta = { domainRefresh: "explicit" } as const satisfies ProductQueryMeta
+
 export type ProductScope = DesktopBootstrap["productSessionToken"]
 
 export const productKeys = {

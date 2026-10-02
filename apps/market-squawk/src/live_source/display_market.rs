@@ -1574,6 +1574,7 @@ async fn run_actor(
             },
         }
     }
+    application_changes.record(market_squawk_services::ServiceDomain::Source);
     application_changes.record(market_squawk_services::ServiceDomain::Market);
     application_changes.record(market_squawk_services::ServiceDomain::Portfolio);
 }
@@ -1590,6 +1591,7 @@ fn enter_terminal(
     if state.terminal_failure.is_none() {
         state.terminal_failure = Some(failure);
         status.send_replace(Some(failure));
+        application_changes.record(market_squawk_services::ServiceDomain::Source);
         application_changes.record(market_squawk_services::ServiceDomain::Market);
         application_changes.record(market_squawk_services::ServiceDomain::Portfolio);
     }

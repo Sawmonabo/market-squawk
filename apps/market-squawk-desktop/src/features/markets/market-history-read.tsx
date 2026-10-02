@@ -1,7 +1,7 @@
 import * as React from "react"
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
 
-import { productKeys } from "@/app/query-client"
+import { productKeys, snapshotQueryMeta } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
@@ -33,6 +33,7 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
   const history = useQuery({
     queryKey,
     gcTime: 0,
+    meta: snapshotQueryMeta,
     placeholderData: keepPreviousData,
     enabled: !refreshing,
     queryFn: async ({ signal }) => {
@@ -87,6 +88,7 @@ function OriginalMarketBarRead({ bar, historyToken, generationToken, bootstrap, 
   const original = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetHistory", { historyToken, generationToken, ...viewport }),
     gcTime: 0,
+    meta: snapshotQueryMeta,
     queryFn: async ({ signal }) => {
       const result = parseMarketHistoryResult(await transport.query({ query: "marketHistory", historyToken, generationToken, ...viewport }, { signal }), historyToken, viewport, generationToken)
       const point = result.data?.bars.find((candidate) => candidate.originalOrdinal === bar.originalOrdinal)
