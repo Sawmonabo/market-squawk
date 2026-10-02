@@ -46,8 +46,8 @@ use input_staging::{
 use mcp_clients::{mcp_client_control, mcp_status};
 use service_client::{
     analysis_control, backtest_products, dashboard_query, decision_control, fair_value_control,
-    governance_control, governance_query, job_control, model_control, model_products,
-    operations_control, paper_control, research_control, source_control,
+    governance_control, governance_query, job_control, market_history_preparation, model_control,
+    model_products, operations_control, paper_control, research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -315,6 +315,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             governance_control,
             governance_query,
             job_control,
+            market_history_preparation,
             installation_control,
             import_provider_credential_bundle,
             mcp_client_control,

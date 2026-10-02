@@ -14,6 +14,7 @@ use market_squawk_services::{
     ResultEnvelopeProjection, ServiceLimits, ToolResultMetadata, TypedToolResult,
 };
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +47,7 @@ const CLI_JSON_MAXIMUM_BYTES: u64 = 8 * 1024 * 1024;
 const CLI_DEFAULT_MAXIMUM_ITEMS: usize = 10_000;
 const CLI_DEFAULT_MAXIMUM_BYTES: usize = 16 * 1024 * 1024;
 const CLI_HARD_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
+const HISTORY_PREPARATION_START: &str = "Market.StartHistoryPreparation";
 static LOCAL_PAPER_CLI_ORIGIN: OnceLock<RequestOrigin> = OnceLock::new();
 
 /// Structured result returned by one product CLI command.
@@ -126,6 +128,17 @@ pub enum CliProductError {
     /// A mutation command omitted its explicit operator confirmation.
     #[error("CLI mutation requires --confirm")]
     ConfirmationRequired,
+    /// Start admission is unresolved; retain this binding instead of submitting another start.
+    #[error(
+        "history preparation start remains {state}; check the original Market.StartHistoryPreparation request with `market-squawk market reconcile-history-preparation --request-id {request_id} --arguments-sha256 {arguments_sha256}`"
+    )]
+    HistoryPreparationStartUncertain {
+        request_id: String,
+        arguments_sha256: String,
+        state: &'static str,
+        #[source]
+        cause: Box<CliProductError>,
+    },
     /// A typed settings preview omitted every closed setting value.
     #[error("CLI settings change requires at least one typed setting option")]
     SettingsChangeRequired,
@@ -691,7 +704,150 @@ async fn market(
             )
             .await
         }
+        MarketCommand::PrepareHistory {
+            history_token,
+            lookback_days,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            prepare_history(authority, history_token, lookback_days).await
+        }
+        MarketCommand::HistoryPreparation {
+            history_token,
+            job_id,
+            generation,
+        } => {
+            require_installed(authority, "Market.GetHistoryPreparation")?;
+            invoke_without_result_limits(
+                authority,
+                "Market.GetHistoryPreparation",
+                json!({"historyToken": history_token, "jobId": job_id, "generation": generation}),
+                "history preparation read",
+            )
+            .await
+        }
+        MarketCommand::CancelHistoryPreparation {
+            history_token,
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            require_installed(authority, "Market.CancelHistoryPreparation")?;
+            invoke_without_result_limits(
+                authority,
+                "Market.CancelHistoryPreparation",
+                json!({
+                    "historyToken": history_token,
+                    "jobId": job_id,
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "confirm": true,
+                }),
+                "history preparation cancellation requested",
+            )
+            .await
+        }
+        MarketCommand::ReconcileHistoryPreparation {
+            request_id,
+            arguments_sha256,
+        } => reconcile_history_preparation(authority, &request_id, &arguments_sha256).await,
     }
+}
+
+async fn prepare_history(
+    authority: CliAuthority<'_>,
+    history_token: String,
+    lookback_days: u16,
+) -> Result<CliProductResult, CliProductError> {
+    let CliAuthority::Installed(client) = authority else {
+        return Err(CliProductError::InstalledServiceRequired {
+            operation: HISTORY_PREPARATION_START,
+        });
+    };
+    market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(lookback_days)
+        .map_err(|_| CliProductError::RequestShape)?;
+    let arguments = json!({
+        "historyToken": history_token,
+        "lookbackDays": lookback_days,
+        "confirm": true,
+    });
+    // Match InstalledJobOperations::begin_start: hash every admitted argument, including
+    // confirmation. This operation has no resultLimits, so no transport adds that field.
+    let encoded = serde_json::to_vec(&arguments).map_err(|_| CliProductError::RequestShape)?;
+    let arguments_sha256 = hex(&Sha256::digest(encoded));
+    let request_id = format!("cli-history-{}", uuid::Uuid::new_v4().simple());
+    let original_request =
+        RequestId::try_string(request_id.clone()).map_err(|_| CliProductError::RuntimeRequest)?;
+    let delivered = client
+        .invoke_operation(
+            original_request,
+            HISTORY_PREPARATION_START,
+            arguments,
+            CLI_INSTALLED_REQUEST_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(CliProductError::from)
+        .and_then(|response| unwrap_application_result(response.result()));
+    let cause = match delivered {
+        Ok(value) => {
+            return Ok(CliProductResult {
+                summary: "history preparation job admitted",
+                value,
+            });
+        }
+        Err(error) => error,
+    };
+
+    // A failed acknowledgement never authorizes another start. Inspect the same binding once;
+    // unresolved admission stays explicit and can be checked by the next CLI invocation.
+    let (state, cause) =
+        match reconcile_history_preparation(authority, &request_id, &arguments_sha256).await {
+            Ok(mut result) => match result
+                .value()
+                .pointer("/data/state")
+                .and_then(Value::as_str)
+            {
+                Some("admitted") => {
+                    result.summary = "history preparation admission reconciled";
+                    return Ok(result);
+                }
+                Some("not_admitted") => return Err(cause),
+                Some("pending") => ("pending", cause),
+                Some("unknown") => ("unknown", cause),
+                _ => ("unresolved", CliProductError::RuntimeRequest),
+            },
+            Err(error) => ("unresolved", error),
+        };
+    Err(CliProductError::HistoryPreparationStartUncertain {
+        request_id,
+        arguments_sha256,
+        state,
+        cause: Box::new(cause),
+    })
+}
+
+async fn reconcile_history_preparation(
+    authority: CliAuthority<'_>,
+    request_id: &str,
+    arguments_sha256: &str,
+) -> Result<CliProductResult, CliProductError> {
+    require_installed(authority, "Job.ReconcileStart")?;
+    let request_id =
+        RequestId::try_string(request_id).map_err(|_| CliProductError::RequestShape)?;
+    invoke_without_result_limits(
+        authority,
+        "Job.ReconcileStart",
+        json!({
+            "requestId": request_id,
+            "operation": HISTORY_PREPARATION_START,
+            "argumentsSha256": lowercase_sha256(arguments_sha256)?,
+        }),
+        "history preparation start checked",
+    )
+    .await
 }
 
 async fn source(

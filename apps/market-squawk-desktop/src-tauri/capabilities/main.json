@@ -25,6 +25,7 @@
     "allow-import-provider-credential-bundle",
     "allow-installation-control",
     "allow-job-control",
+    "allow-market-history-preparation",
     "allow-mcp-client-control",
     "allow-mcp-status",
     "allow-model-control",

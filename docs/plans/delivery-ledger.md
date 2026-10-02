@@ -2,7 +2,7 @@
 
 ## Current execution — 2026-10-02
 
-Last pushed head: `1c10b218`. Current read/SEC checkpoint keeps original canonical SEC evidence
+Last pushed head: `c8795d8b` (SEC archive-summary correction); read/SEC batching checkpoint `cc179307`. Current read/SEC checkpoint keeps original canonical SEC evidence
 while retaining repeat captures, batches exact price selections within one read snapshot, and removes
 actor-only Source invalidations. Native build2527 PASS6m24s. Existing SEC replay/restart case PASS1/1
 (6.70s); retained batched selection/restart case PASS1/1 (10.88s). The actual visible Desktop collection
@@ -11,19 +11,34 @@ on prior15.59–26.01s observations but is not an instant-read or streaming-quot
 Evidence: sec-reobservation-critical.log, retained-batch-critical.log, retained-batch-native-collection.json
 under `.agents/tmp/v1-first-stock/`.
 
-Supervisor66579/PID83744 owns service5073, visible Desktop5118, Vite and the sole watcher.
-No compiler is active after queue14651 PASS. History producer/consumer and layout remain uncommitted:
-Desktop types/lookup/market/coalescing PASS; notification/lossless-number/shared-service checks PASS.
-The corrected native history permission now admits actual job4c547cb8-3a8e-4aba-ac5a-259758d06577,
-but it fails operation-input-rejected before any chart is rendered. Real MSFT financial discovery
-fails parser_invalid_companion_coverage. No positive financial/chart or installed completion claim.
+Native build9608 PASS5m29s with history receipt cardinality and SEC archive-summary corrections.
+Both existing SEC summary/integrity cases PASS1/1 (queue95303). Replacement was blocked because
+service5073 exited1 on stale Alpaca historical parent during shutdown; Desktop5118 also exited.
+Lead restores the single visible supervisor. Financial/history positive native evidence remains open.
+History/layout checks already pass; no installed completion or successful shutdown claim.
 
 | Owner | Concrete outcome / exclusive ownership | Current evidence and next dependency |
 | --- | --- | --- |
-| Lead | History runner/contracts, native/CLI/UI integration, shared manifests/permissions, ledger/Git and serialized checks | Freeze read/SEC checkpoint; correct actual history rejection, then verify visible MSFT chart and stable refresh. |
-| Astra financial_pages | Read-only history rejection diagnosis: jobs/market_history.rs and corporate_actions/preflight/{display_history,history}.rs | Admitted job fails before historical-publication diagnostics. Trace exact request/limits/runtime validation; no live edits. |
+| Lead | History runner/contracts, native/CLI/UI integration, shared manifests/permissions, ledger/Git and serialized checks | History producer/consumer implementation critically checked; checkpoint with explicit live ingestion blocker, then resolve actual MSFT chart/financials. |
+| Astra financial_pages | Candidate-only shutdown correction in application/market_runtime/group.rs and research/ingest/alpaca_historical.rs, including closest existing critical case | Trace original parent retirement versus replacement, ensure owned runtime drains and stale handles cannot retire replacements. No live edits/builds/Git. |
 | Astra startup_read_diagnosis | Candidate-only adapter json/submissions.rs and tests/official_fixtures.rs | Exact MSFT archive count/identity passes, but declared end2008-08-11 disagrees with one actual2008-08-12 filing. Preserve both dates and all strict identity/count checks; classify summary disagreement. |
 | Sol financial_detail_ui / investment_profile_ui, integrated | History preparation + existing stock fixture; selected-detail layout | Open chart, separate ticker/company, stable refresh and viewport checks pass; native data completion remains required. |
+
+Native retry evidence: service14502/Desktop14547 are visible under supervisor83295; restart reused
+fresh Cargo outputs in1.03s. MSFT history job8eae4f2f passed receipt admission but failed nested
+history-registered-ingest with DeadlineExceeded despite the independent1h job deadline. No chart
+completion claimed. Astra history_ingest_deadline owns read-only tracing of this nested ingest
+failure and writes only `.agents/tmp/v1-first-stock/history-ingest-deadline.md`; no live edits,
+builds or calls. Lead retains ingest coordinator edits. Other agent ownership is unchanged.
+
+Financial preparation next dependency wave (candidate-only while the current native build runs):
+Astra startup_read_diagnosis owns application/research/investment_financial_preparation.rs,
+research/ingest/{sec_fundamentals,sec_live}.rs, provider_activation/mod.rs and new
+jobs/investment_financials.rs. Deliver retained-only reads plus one existing-runner-owned selected
+preparation with typed complete/partial family evidence and original cancellation/publication
+semantics. No live edits/builds. Lead reserves all composition, shared contracts/transports/native
+permissions/CLI/UI. Freeze interfaces before callers change; existing fixture/native selected-stock
+proof is the gate. This closes the proven cold-read lifetime defect, not speculative hardening.
 
 Next barrier: integrate the two concrete native-data failure fixes → one serialized build/critical
 checks → actual MSFT chart/financials and refresh observation → coherent commits/push. Cold financial

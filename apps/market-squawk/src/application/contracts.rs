@@ -61,6 +61,9 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Market.SelectInvestmentEvidence"
             | "Market.ReadInvestmentEvidence"
             | "Market.GetHistory"
+            | "Market.StartHistoryPreparation"
+            | "Market.GetHistoryPreparation"
+            | "Market.CancelHistoryPreparation"
             | "Market.SearchUniverse"
             | MACRO_GET_CONTEXT
             | "Macro.ListSeries"
@@ -696,6 +699,45 @@ const RECOMMENDATION_BACKTEST_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("actionToken", ArgumentKind::Uuid),
     ArgumentSpec::optional("requestDigest", ArgumentKind::Sha256),
     ArgumentSpec::optional("evidenceDigest", ArgumentKind::Sha256),
+];
+const MARKET_HISTORY_START_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("historyToken", ArgumentKind::MarketHistoryToken),
+    ArgumentSpec::required(
+        "lookbackDays",
+        ArgumentKind::Unsigned {
+            minimum: market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS as u64,
+            maximum: market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS as u64,
+        },
+    ),
+];
+const MARKET_HISTORY_JOB_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("historyToken", ArgumentKind::MarketHistoryToken),
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+];
+const MARKET_HISTORY_CANCEL_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("historyToken", ArgumentKind::MarketHistoryToken),
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "expectedSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
 ];
 const MARKET_HISTORY_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("historyToken", ArgumentKind::MarketHistoryToken),
@@ -1562,6 +1604,7 @@ const JOB_START_RECONCILIATION_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required(
         "operation",
         ArgumentKind::Enumeration(&[
+            "Market.StartHistoryPreparation",
             "Research.StartIngestSource",
             "Research.StartExport",
             "Research.StartDatasetBuild",
@@ -1952,6 +1995,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         JOB_SCOPE,
         MARKET_INSTRUMENT_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Market.StartHistoryPreparation",
+        "Prepare adjusted daily history for one selected investment as a durable job.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_HISTORY_START_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Market.GetHistoryPreparation",
+        "Read the saved history preparation job for this investment.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_HISTORY_JOB_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Market.CancelHistoryPreparation",
+        "Cancel the exact history preparation job for this investment.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_HISTORY_CANCEL_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
     ),
     read(
         "Market.GetHistory",

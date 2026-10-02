@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_platform::JobDatabaseLocation;
 use rusqlite::{Connection, OptionalExtension as _, params};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
@@ -80,6 +80,7 @@ struct RepositoryInner {
     location: JobDatabaseLocation,
     config: JobRepositoryConfig,
     writer: mpsc::Sender<WriteCommand>,
+    committed_changes: watch::Receiver<()>,
     tracker: TaskTracker,
     closing: AtomicBool,
 }
@@ -144,6 +145,8 @@ impl SqliteJobRepository {
         location.validate_sqlite_sidecars().map_err(map_path)?;
 
         let (writer, receiver) = mpsc::channel(config.writer_queue_capacity);
+        // Only the writer owns the sender, so subscribers close with the actual writer.
+        let (committed, committed_changes) = watch::channel(());
         let tracker = TaskTracker::new();
         let writer_location = location.clone();
         tracker.spawn(async move {
@@ -154,6 +157,7 @@ impl SqliteJobRepository {
                     receiver,
                     database_file,
                     writer_guard,
+                    committed,
                 );
             })
             .await;
@@ -167,10 +171,20 @@ impl SqliteJobRepository {
                 location,
                 config,
                 writer,
+                committed_changes,
                 tracker,
                 closing: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Coalesced invalidation after committed job snapshot changes; not an event journal.
+    ///
+    /// The retained receiver is never marked seen, so startup recovery commits remain pending
+    /// for a later service subscriber. Read durable snapshots/events for authoritative state.
+    /// The channel closes when the sole writer exits, including after ordered shutdown.
+    pub fn committed_changes(&self) -> watch::Receiver<()> {
+        self.inner.committed_changes.clone()
     }
 
     /// Reads only model activity through the existing transaction-fenced job authority.

@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from "react"
 import { CandlestickSeries, LineSeries, ColorType, createChart, type BusinessDay, type CandlestickData, type IChartApi, type ISeriesApi, type Time, type UTCTimestamp } from "lightweight-charts"
 
+import { formatTimestamp } from "@/lib/time"
+
 import { useDebouncedChartCallback } from "@/components/charts/market-price-chart"
 
 import { sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryResult, type MarketHistoryViewportInput } from "./market-history"
 
-export function MarketHistoryChart({ result, onViewportChange, onObservationSelect }: {
+export function MarketHistoryChart({ result, onViewportChange, onObservationSelect, windowDays, onWindowChange }: {
   result: MarketHistoryResult | null
+  windowDays?: string
+  onWindowChange?: (days: string) => void
   onViewportChange: (viewport: MarketHistoryViewportInput) => void
   onObservationSelect: (bar: MarketHistoryBar) => void
 }) {
@@ -18,13 +22,18 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
   return <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
     <h3 className="text-base font-semibold">Price history</h3>
     <p className="mt-2 text-xs leading-5 text-muted-foreground">
-      {history.display.returnedPointCount} original observations shown from {history.display.visibleOriginalPointCount} within the requested window.
-      {history.display.reduced ? " The service retains first, last, minimum and maximum original observations for drawing." : ""}
+      Saved range: {history.viewport.fullStartDate ?? (history.viewport.fullStartUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullStartUnixNanos))}
+      {" – "}{history.viewport.fullEndDate ?? (history.viewport.fullEndUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullEndUnixNanos))}.
+      {" "}Prices in {history.currency}.{history.partial ? " Partial saved history." : ""}
     </p>
-    {history.bars.length > 0 ? <PriceSeries history={history} nominal={history.bars[0]!.time.precision === "nominal_date"} onViewportChange={onViewportChange} onObservationSelect={onObservationSelect} />
-      : <p className="mt-4 text-xs text-muted-foreground">No original price observations fall within this requested window.</p>}
+    {history.bars.length > 0 ? <PriceSeries history={history} nominal={history.bars[0]!.time.precision === "nominal_date"} onViewportChange={onViewportChange} onObservationSelect={onObservationSelect} windowDays={windowDays} onWindowChange={onWindowChange} />
+      : <p className="mt-4 text-xs text-muted-foreground">No saved prices fall within this window.</p>}
     <details className="mt-4">
       <summary className="cursor-pointer text-xs font-medium">Displayed closing prices</summary>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        {history.display.returnedPointCount} original observations shown from {history.display.visibleOriginalPointCount} within the requested window.
+        {history.display.reduced ? " The chart preserves first, last, minimum and maximum original observations for drawing." : ""}
+      </p>
       <ol className="mt-3 divide-y divide-border" aria-label="Displayed closing prices">
         {history.bars.slice(-30).map((bar) => {
           const coordinate = bar.time.precision === "nominal_date" ? bar.time.date : bar.time.startsAt
@@ -38,8 +47,10 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
   </section>
 }
 
-function PriceSeries({ history, nominal, onViewportChange, onObservationSelect }: {
+function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, windowDays, onWindowChange }: {
   history: NonNullable<MarketHistoryResult["data"]>; nominal: boolean
+  windowDays?: string
+  onWindowChange?: (days: string) => void
   onViewportChange: (viewport: MarketHistoryViewportInput) => void
   onObservationSelect: (bar: MarketHistoryBar) => void
 }) {
@@ -55,13 +66,14 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect }
   const [pendingViewport, setPendingViewport] = useState<MarketHistoryViewportInput | null>(null)
   useDebouncedChartCallback(pendingViewport === null ? null : JSON.stringify(pendingViewport), pendingViewport, onViewportChange)
   const [drawingIssue, setDrawingIssue] = useState<string | null>(null)
-  const [days, setDays] = useState("all")
+  const [days, setDays] = useState(windowDays ?? "all")
   const [showClose, setShowClose] = useState(true)
   const [showCandles, setShowCandles] = useState(false)
   const [selectedCoordinate, setSelectedCoordinate] = useState<string | null>(null)
   const visibleBars = bars
   const requestWindow = (next: string) => {
     setDays(next)
+    onWindowChange?.(next)
     setSelectedCoordinate(null)
     lastRange.current = null
     interacting.current = false
@@ -180,8 +192,8 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect }
       <label className="flex items-center gap-2">History window
         <select className="rounded-md border border-input bg-background px-2 py-1.5" value={days}
           onChange={(event) => requestWindow(event.target.value)}>
-          <option value="all">All available</option><option value="30">Last 30 days</option>
-          <option value="90">Last 90 days</option><option value="365">Last year</option>
+          <option value="all">All saved</option><option value="30">30D</option>
+          <option value="90">90D</option><option value="365">1Y</option>
         </select>
       </label>
       <label className="flex items-center gap-2"><input type="checkbox" className="accent-primary" checked={showClose} onChange={(event) => setShowClose(event.target.checked)} />Closing-price line</label>
@@ -193,7 +205,7 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect }
     {drawingIssue ? <p role="status" className="mt-3 text-xs text-muted-foreground">{drawingIssue}</p> : null}
     <figcaption className="mt-2 text-xs leading-5 text-muted-foreground">
       {nominal ? "Daily prices by trading date; no intraday time is implied" : "Prices by recorded period"} · {currency}.
-      Drag to pan or scroll to zoom; the visible window requests original observations from the same saved generation. Select a date to load its exact evidence.
+      Drag to pan or scroll to zoom. Select a date to inspect its recorded prices.
     </figcaption>
     {selected ? <div className="mt-4 rounded-lg border border-border bg-background/25 p-3">
       <label className="grid gap-2 text-xs">Inspect a recorded date

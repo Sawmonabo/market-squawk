@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
+import { HistoryPreparation } from "./history-preparation"
 import { MarketHistoryChart } from "./market-history-chart"
 import { parseMarketHistoryResult, sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryResult, type MarketHistoryViewportInput } from "./market-history"
 
@@ -24,6 +25,7 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
   const [revision, setRevision] = React.useState(0)
   const [refreshing, setRefreshing] = React.useState(false)
   const [viewport, setViewport] = React.useState<MarketHistoryViewportInput>({ pointLimit: 512 })
+  const [windowDays, setWindowDays] = React.useState("all")
   const [selectedBar, setSelectedBar] = React.useState<MarketHistoryBar | null>(null)
   React.useEffect(() => {
     alive.current = true
@@ -61,7 +63,11 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
   const result = history.data ?? lastChecked.current
   const busy = history.isFetching || refreshing
   return <div className="mt-3 min-h-[640px]">
-    <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void reset()}>Refresh saved history</Button>
+    <div className="flex flex-wrap items-start justify-between gap-3">
+      <HistoryPreparation historyToken={historyToken} bootstrap={bootstrap} transport={transport}
+        hasSavedHistory={Boolean(result?.data)} onPrepared={reset} />
+      <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void reset()}>Refresh saved history</Button>
+    </div>
     <div className="mt-2 min-h-16 text-xs leading-5">
       {history.isError ? <div className="flex items-start justify-between gap-3">
         <p role="alert" className="text-destructive">{result?.data
@@ -72,6 +78,7 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
     </div>
     {result ? <div className={`[&>section]:mt-0 [&>section]:rounded-none [&>section]:border-0 [&>section]:bg-transparent [&>section]:p-0 ${result.data ? "[&>section>h3]:hidden" : ""}`}>
       <MarketHistoryChart key={result.data?.generationToken ?? "unavailable"} result={result}
+        windowDays={windowDays} onWindowChange={setWindowDays}
         onViewportChange={(next) => { if (!refreshing) { setViewport(next); setSelectedBar(null) } }} onObservationSelect={setSelectedBar} />
     </div> : <div className="flex h-[536px] items-center justify-center text-sm text-muted-foreground">{history.isError ? "No checked price history is available." : "Opening saved price history…"}</div>}
     {selectedBar !== null && result?.data ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${result.data.generationToken}`}

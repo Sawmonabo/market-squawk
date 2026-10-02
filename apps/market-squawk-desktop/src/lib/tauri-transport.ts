@@ -56,6 +56,7 @@ export function createDesktopTransport(): DesktopTransport {
 function productPort(transport: ProductTransport): ProductTransport {
   return Object.freeze({
     query: transport.query.bind(transport),
+    marketHistoryPreparation: transport.marketHistoryPreparation.bind(transport),
     analyticalController: transport.analyticalController.bind(transport),
     modelProducts: transport.modelProducts.bind(transport),
     backtestProducts: transport.backtestProducts.bind(transport),
@@ -145,6 +146,18 @@ class TauriTransport implements ProductTransport, SystemTransport {
   async systemQuery(request: SystemQuery, options?: ReadOptions) {
     const value = await this.read("dashboard_query", { request }, options)
     return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async marketHistoryPreparation(
+    request: Parameters<ProductTransport["marketHistoryPreparation"]>[0],
+    confirmed = false,
+    options?: ReadOptions,
+  ) {
+    const args = { request, confirmed }
+    const value = request.action === "get" || request.action === "reconcileStart"
+      ? await this.read("market_history_preparation", args, options)
+      : await invoke("market_history_preparation", args)
+    return applicationResultSchema.parse(value)
   }
 
   async modelProducts(request: Parameters<ProductTransport["modelProducts"]>[0], options?: ReadOptions) {
@@ -483,6 +496,10 @@ class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
   }
 
   systemQuery(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  marketHistoryPreparation(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

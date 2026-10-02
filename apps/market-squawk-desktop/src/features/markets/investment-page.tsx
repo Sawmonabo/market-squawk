@@ -51,29 +51,32 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   const row = detail.data ?? null
   const title = row === null ? "Investment" : [row.identity.symbol, row.identity.name]
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
+  const companyName = row?.identity.name !== row?.identity.symbol ? row?.identity.name : null
+  const priceLabels = row === null ? "Checking price information" : [marketPriceBasisLabel(row),
+    detail.isError && row.price !== null ? "Saved price · Freshness not checked" : marketAvailabilityLabel(row)]
+    .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
 
-  return <main className="mx-auto w-full max-w-[1180px] space-y-5 p-5 lg:p-7">
+  return <main className="mx-auto w-full max-w-[1180px] space-y-4 p-5 lg:p-7">
     <header className="border-b border-border pb-4">
       <Link className="text-xs text-primary underline-offset-4 hover:underline" to="/markets">Back to Markets</Link>
-      <div className="mt-3 grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="mt-3 grid items-start gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
-          <p className="mt-2 text-sm text-muted-foreground">Price, company information and investment analysis</p>
+          <h1 aria-label={title} className="min-w-0">
+            <span className="block break-words font-mono text-2xl font-semibold tracking-tight">{row?.identity.symbol ?? row?.identity.name ?? "Investment"}</span>
+            {row?.identity.symbol && companyName ? <span className="mt-1 block max-w-[52ch] break-words text-sm font-normal leading-5 text-muted-foreground">{companyName}</span> : null}
+          </h1>
         </div>
         <section aria-label="Investment price" className="min-w-0 sm:text-right">
-          <div className="flex items-center gap-3 sm:justify-end">
+          <div className="flex flex-wrap items-center gap-3 sm:justify-end">
             <h2 className="sr-only">Price</h2>
             <p className="font-mono text-2xl tabular-nums">{row?.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
             <Button variant="outline" size="sm" disabled={detail.isFetching} onClick={() => void detail.refetch()}>Refresh price</Button>
           </div>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row ? marketPriceBasisLabel(row) : "Checking price information"}</p>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row ? <>{detail.isError && row.price !== null
-            ? "Saved price · Freshness not checked"
-            : detail.isFetching ? `${marketAvailabilityLabel(row)} at last check` : marketAvailabilityLabel(row)}{row.changePercent !== null ? ` · ${row.changePercent}%` : ""}</> : "Availability not established"}</p>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : null}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row?.changePercent !== null && row?.changePercent !== undefined ? ` · ${row.changePercent}%` : ""}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : "Availability not established"}</p>
         </section>
       </div>
-      <div className="mt-2 min-h-10 text-xs leading-5">
+      <div className="mt-1 min-h-5 text-xs leading-5">
         {detail.isError ? <p role="alert" className="text-destructive">{row === null
           ? "This investment could not be opened. Try again, or search Markets to choose a fresh selection."
           : "The price could not be refreshed. Showing the last checked information; its freshness is unverified."}</p>
@@ -81,7 +84,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
       </div>
       {row !== null ? <InvestmentQuote row={row} unverified={detail.isError} /> : null}
     </header>
-    <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+    <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
       <section className="min-w-0 rounded-xl border border-border bg-card/30 p-4" aria-label="Investment price history">
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-base font-semibold">Price history</h2>
@@ -93,7 +96,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
             <p role="status">{detail.isFetching && row === null ? "Checking available price history…" : "Price history is unavailable for this investment."}</p>
           </div> : <p className="mt-3 text-xs text-muted-foreground">Price history is hidden. Show it to reopen the chart.</p>}
       </section>
-      <aside className="min-w-0 space-y-5" aria-label="Investment details and analysis">
+      <aside className="min-w-0 space-y-4" aria-label="Investment details and analysis">
         <InvestmentProfile selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
         <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment analysis">
           <h2 className="mb-3 text-base font-semibold">Investment analysis</h2>

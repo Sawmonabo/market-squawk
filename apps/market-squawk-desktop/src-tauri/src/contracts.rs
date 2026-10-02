@@ -114,6 +114,9 @@ pub(crate) enum ProductCapability {
     MacroContext,
     MacroRevisions,
     MarketHistory,
+    MarketHistoryPreparationStart,
+    MarketHistoryPreparationGet,
+    MarketHistoryPreparationCancel,
     MarketInstrument,
     MarketOverview,
     MarketCollection,
@@ -213,6 +216,9 @@ impl ProductCapability {
             "Macro.GetContext" => Self::MacroContext,
             "Macro.GetRevisions" => Self::MacroRevisions,
             "Market.GetHistory" => Self::MarketHistory,
+            "Market.StartHistoryPreparation" => Self::MarketHistoryPreparationStart,
+            "Market.GetHistoryPreparation" => Self::MarketHistoryPreparationGet,
+            "Market.CancelHistoryPreparation" => Self::MarketHistoryPreparationCancel,
             "Market.GetInstrument" => Self::MarketInstrument,
             "Market.GetOverview" => Self::MarketOverview,
             "Market.GetCollection" => Self::MarketCollection,
@@ -1307,6 +1313,42 @@ pub(crate) enum PaperControlCommand {
 pub(crate) enum TrainingInputKind {
     Configuration,
     ModelAuthority,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
+pub(crate) enum MarketHistoryPreparationCommand {
+    Start {
+        history_token: String,
+        lookback_days: u16,
+        start_request_id: Uuid,
+    },
+    Get {
+        history_token: String,
+        job_id: Uuid,
+        generation: String,
+    },
+    Cancel {
+        history_token: String,
+        job_id: Uuid,
+        generation: String,
+        expected_sequence: String,
+    },
+    ReconcileStart {
+        history_token: String,
+        lookback_days: u16,
+        start_request_id: Uuid,
+    },
+    CancelStart {
+        history_token: String,
+        lookback_days: u16,
+        start_request_id: Uuid,
+    },
 }
 
 #[derive(Debug, Deserialize)]

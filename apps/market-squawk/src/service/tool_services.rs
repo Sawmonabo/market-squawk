@@ -76,6 +76,7 @@ use super::{
     research_file_import::{InstalledResearchFileImportOperations, PreparedResearchFileCommit},
 };
 
+const START_HISTORY: &str = "Market.StartHistoryPreparation";
 const START_INGEST: &str = "Research.StartIngestSource";
 const START_EXPORT: &str = "Research.StartExport";
 const START_DATASET: &str = "Research.StartDatasetBuild";
@@ -540,6 +541,45 @@ impl InstalledToolServices {
             super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
         let limits = context.limits();
         let (admission, revoke) = match request.name() {
+            START_HISTORY => {
+                use crate::application::market_selection::product::{
+                    MarketProductSelectionReadCapability, product_market_identities, resolve_token,
+                };
+                let input: HistoryPreparationStart = decode(request.arguments())?;
+                let lookback =
+                    market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(
+                        input.lookback_days,
+                    )
+                    .map_err(|_| ServiceError::InvalidRequest)?;
+                let selection = MarketProductSelectionReadCapability::new(
+                    Arc::clone(&self.profile_research),
+                    self.profile_research.market_data_instruments(),
+                );
+                let records = selection
+                    .population(captured_at, context.deadline(), context.cancellation())
+                    .await?;
+                let identities = product_market_identities(&records, captured_at, None)?;
+                let instrument_id = resolve_token(&identities, &input.history_token, |identity| {
+                    identity.history_token()
+                })?;
+                let instrument = records
+                    .into_iter()
+                    .find(|record| record.definition().instrument_id() == instrument_id)
+                    .ok_or(ServiceError::InvalidResult)?;
+                ensure_live(context)?;
+                let admission = self
+                    .runners
+                    .market_history()
+                    .admit(
+                        instrument,
+                        input.history_token,
+                        lookback,
+                        limits,
+                        captured_at,
+                    )
+                    .map_err(map_research_admission)?;
+                (admission, JobAdmissionOwner::MarketHistory)
+            }
             START_INGEST => {
                 let terminal = self.terminal_request(request, "Research.IngestSource")?;
                 let admission = self
@@ -1031,6 +1071,9 @@ impl InstalledToolServices {
 
     fn revoke(&self, owner: JobAdmissionOwner, admission: &crate::application::job::JobAdmission) {
         match owner {
+            JobAdmissionOwner::MarketHistory => {
+                let _result = self.runners.market_history().revoke(admission);
+            }
             JobAdmissionOwner::Ingest => {
                 let _result = self.runners.ingest().revoke(admission);
             }
@@ -1160,6 +1203,7 @@ fn required_argument<'a>(
 
 #[derive(Clone, Copy)]
 enum JobAdmissionOwner {
+    MarketHistory,
     Ingest,
     Export,
     ResearchPhaseOneGeneration,
@@ -1323,7 +1367,10 @@ impl InstalledToolServices {
                 {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let result = self.jobs.call(&request, &context).await?;
+                let result = self
+                    .jobs
+                    .call(&request, &context, self.runners.market_history())
+                    .await?;
                 result
                     .validate_against(context.limits())
                     .map_err(ServiceError::from)?;
@@ -2021,7 +2068,8 @@ impl InstalledToolServices {
 fn owns_job_start(name: &str) -> bool {
     matches!(
         name,
-        START_INGEST
+        START_HISTORY
+            | START_INGEST
             | START_EXPORT
             | START_DATASET
             | START_FEATURE_DATASET
@@ -2043,6 +2091,13 @@ fn owns_job_start(name: &str) -> bool {
             | current_find::START_DATASET
             | current_find::START_SCREEN
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HistoryPreparationStart {
+    history_token: String,
+    lookback_days: u16,
 }
 
 #[derive(Deserialize)]

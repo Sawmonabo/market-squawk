@@ -1,20 +1,23 @@
 //! Narrow desktop controls over the shared application service.
 
+use market_squawk_services::RequestId;
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use tauri::State;
 
 use crate::{
     bridge::{
-        DesktopState, InvocationAuthority, invoke_application, invoke_private_application,
-        invoke_read_application,
+        DesktopState, InvocationAuthority, invoke_analytical_operation, invoke_application,
+        invoke_private_application, invoke_read_application, prepare_analytical_arguments,
     },
     contracts::{
         AnalysisControlCommand, ApplicationInvocation, BacktestProductCommand,
         DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
         FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
-        JobControlCommand, ModelControlCommand, ModelProductCommand, OperationLogDomain,
-        OperationLogSeverity, OperationSettingValue, OperationsControlCommand, PaperControlCommand,
-        ProductSessionToken, ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
+        JobControlCommand, MarketHistoryPreparationCommand, ModelControlCommand,
+        ModelProductCommand, OperationLogDomain, OperationLogSeverity, OperationSettingValue,
+        OperationsControlCommand, PaperControlCommand, ProductSessionToken, ResearchControlCommand,
+        SourceLifecycleAction, SourceLifecycleInput,
     },
 };
 
@@ -2195,6 +2198,183 @@ pub(crate) async fn research_control(
 }
 
 #[tauri::command]
+pub(crate) async fn market_history_preparation(
+    request: MarketHistoryPreparationCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+    request_id: Option<uuid::Uuid>,
+    product_session_token: Option<ProductSessionToken>,
+) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
+    let read = if matches!(
+        &request,
+        MarketHistoryPreparationCommand::Get { .. }
+            | MarketHistoryPreparationCommand::ReconcileStart { .. }
+    ) {
+        Some(generation.begin_read(
+            request_id.ok_or_else(|| {
+                DesktopCommandError::invalid_request("The screen read requires a request identity.")
+            })?,
+            product_session_token.ok_or_else(|| {
+                DesktopCommandError::invalid_request(
+                    "The screen read requires its current session.",
+                )
+            })?,
+        )?)
+    } else {
+        if request_id.is_some() || product_session_token.is_some() {
+            return Err(DesktopCommandError::invalid_request(
+                "A history preparation change is not a cancellable read.",
+            ));
+        }
+        None
+    };
+    let (operation, arguments, mutation) = match request {
+        MarketHistoryPreparationCommand::Start {
+            history_token,
+            lookback_days,
+            start_request_id,
+        } => {
+            require_confirmation(confirmed)?;
+            let request_id = history_preparation_request_id(start_request_id)?;
+            let arguments = history_preparation_start_arguments(history_token, lookback_days);
+            state.admit_current(&generation)?;
+            // The renderer retains this UUID before sending; replay uses the same durable start.
+            let mut result = invoke_analytical_operation(
+                &generation,
+                "Market.StartHistoryPreparation",
+                arguments,
+                InvocationAuthority::ExactConfirmed("Market.StartHistoryPreparation"),
+                request_id,
+                generation.cancellation(),
+            )
+            .await?;
+            state.admit_current(&generation)?;
+            canonicalize_job_result("Market.StartHistoryPreparation", &mut result)?;
+            return Ok(result);
+        }
+        MarketHistoryPreparationCommand::Get {
+            history_token,
+            job_id,
+            generation,
+        } => {
+            let mut arguments = map_with_job_id(job_id);
+            arguments.insert("historyToken".to_owned(), json!(history_token));
+            arguments.insert(
+                "generation".to_owned(),
+                json!(parse_job_generation(generation)?),
+            );
+            ("Market.GetHistoryPreparation", arguments, false)
+        }
+        MarketHistoryPreparationCommand::Cancel {
+            history_token,
+            job_id,
+            generation,
+            expected_sequence,
+        } => {
+            let mut arguments = job_mutation_arguments(job_id, generation, expected_sequence)?;
+            arguments.insert("historyToken".to_owned(), json!(history_token));
+            ("Market.CancelHistoryPreparation", arguments, true)
+        }
+        MarketHistoryPreparationCommand::ReconcileStart {
+            history_token,
+            lookback_days,
+            start_request_id,
+        } => (
+            "Job.ReconcileStart",
+            history_preparation_reconciliation_arguments(
+                &generation,
+                history_token,
+                lookback_days,
+                start_request_id,
+            )?,
+            false,
+        ),
+        MarketHistoryPreparationCommand::CancelStart {
+            history_token,
+            lookback_days,
+            start_request_id,
+        } => (
+            "Job.CancelStart",
+            history_preparation_reconciliation_arguments(
+                &generation,
+                history_token,
+                lookback_days,
+                start_request_id,
+            )?,
+            true,
+        ),
+    };
+    if let Some(read) = read {
+        let mut result = invoke_read_application(operation, arguments, &state, &read).await?;
+        canonicalize_job_result(operation, &mut result)?;
+        Ok(result)
+    } else {
+        invoke_narrow(
+            operation,
+            arguments,
+            mutation,
+            confirmed,
+            &state,
+            &generation,
+        )
+        .await
+    }
+}
+
+fn history_preparation_start_arguments(
+    history_token: String,
+    lookback_days: u16,
+) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert("historyToken".to_owned(), json!(history_token));
+    arguments.insert("lookbackDays".to_owned(), json!(lookback_days));
+    arguments
+}
+
+fn history_preparation_request_id(
+    start_request_id: uuid::Uuid,
+) -> Result<RequestId, DesktopCommandError> {
+    if start_request_id.is_nil() {
+        return Err(DesktopCommandError::invalid_request(
+            "The history preparation requires its original request identity.",
+        ));
+    }
+    RequestId::try_string(format!("desktop-history-{}", start_request_id.simple()))
+        .map_err(|_error| DesktopCommandError::internal())
+}
+
+fn history_preparation_reconciliation_arguments(
+    generation: &crate::bridge::DesktopGeneration,
+    history_token: String,
+    lookback_days: u16,
+    start_request_id: uuid::Uuid,
+) -> Result<Map<String, Value>, DesktopCommandError> {
+    let request_id = history_preparation_request_id(start_request_id)?;
+    // Match InstalledJobOperations::begin_start: hash the exact admitted argument map,
+    // including the same native confirmation/result limits. No caller-selected operation or digest.
+    let original = prepare_analytical_arguments(
+        generation,
+        "Market.StartHistoryPreparation",
+        history_preparation_start_arguments(history_token, lookback_days),
+        InvocationAuthority::ExactConfirmed("Market.StartHistoryPreparation"),
+    )?;
+    let encoded =
+        serde_json::to_vec(&original).map_err(|_error| DesktopCommandError::internal())?;
+    let mut arguments = Map::new();
+    arguments.insert("requestId".to_owned(), json!(request_id));
+    arguments.insert(
+        "operation".to_owned(),
+        json!("Market.StartHistoryPreparation"),
+    );
+    arguments.insert(
+        "argumentsSha256".to_owned(),
+        json!(format!("{:x}", Sha256::digest(encoded))),
+    );
+    Ok(arguments)
+}
+
+#[tauri::command]
 pub(crate) async fn job_control(
     request: JobControlCommand,
     confirmed: bool,
@@ -2370,7 +2550,17 @@ async fn invoke_narrow(
     .await?;
     if matches!(
         operation,
-        "Job.List" | "Job.Get" | "Job.Watch" | "Job.Cancel" | "Job.Confirm" | "Job.Retry"
+        "Job.List"
+            | "Job.Get"
+            | "Job.Watch"
+            | "Job.Cancel"
+            | "Job.Confirm"
+            | "Job.Retry"
+            | "Market.StartHistoryPreparation"
+            | "Market.GetHistoryPreparation"
+            | "Market.CancelHistoryPreparation"
+            | "Job.ReconcileStart"
+            | "Job.CancelStart"
     ) {
         canonicalize_job_result(operation, &mut result)?;
     }
@@ -2699,8 +2889,22 @@ fn canonicalize_job_result(
                 canonicalize_job_view(job)?;
             }
         }
-        "Job.Get" | "Job.Cancel" | "Job.Confirm" => canonicalize_job_view(data)?,
-        "Job.Retry" => canonicalize_job_receipt(data)?,
+        "Job.Get"
+        | "Job.Cancel"
+        | "Job.Confirm"
+        | "Market.GetHistoryPreparation"
+        | "Market.CancelHistoryPreparation" => {
+            canonicalize_job_view(data)?;
+        }
+        "Job.Retry" | "Market.StartHistoryPreparation" => canonicalize_job_receipt(data)?,
+        "Job.ReconcileStart" | "Job.CancelStart" => {
+            let job = data
+                .get_mut("job")
+                .ok_or_else(DesktopCommandError::internal)?;
+            if !job.is_null() {
+                canonicalize_job_view(job)?;
+            }
+        }
         "Job.Watch" => canonicalize_job_event_page(data)?,
         _ => return Err(DesktopCommandError::internal()),
     }
@@ -2793,7 +2997,38 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::project_research_activity_payload;
+    use super::{canonicalize_job_result, project_research_activity_payload};
+
+    #[test]
+    fn scoped_history_job_results_keep_lossless_generation_and_sequence() {
+        for operation in [
+            "Market.StartHistoryPreparation",
+            "Market.GetHistoryPreparation",
+            "Market.CancelHistoryPreparation",
+            "Job.ReconcileStart",
+            "Job.CancelStart",
+        ] {
+            let job = json!({"generation": u64::MAX, "sequence": u64::MAX});
+            let reconciliation = matches!(operation, "Job.ReconcileStart" | "Job.CancelStart");
+            let mut result = if reconciliation {
+                json!({"data": {"state": "admitted", "job": job}})
+            } else {
+                json!({"data": job})
+            };
+            canonicalize_job_result(operation, &mut result).expect("supported scoped job result");
+            let data = if reconciliation {
+                &result["data"]["job"]
+            } else {
+                &result["data"]
+            };
+            assert_eq!(data["generation"], json!(u64::MAX.to_string()));
+            assert_eq!(data["sequence"], json!(u64::MAX.to_string()));
+        }
+        let mut unknown = json!({"data": {"state": "unknown", "job": null}});
+        canonicalize_job_result("Job.ReconcileStart", &mut unknown)
+            .expect("unknown start does not invent a job receipt");
+        assert!(unknown["data"]["job"].is_null());
+    }
 
     #[test]
     fn research_activity_projection_keeps_internal_authority_native() {

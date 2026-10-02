@@ -557,7 +557,16 @@ async fn lifecycle_rejects_illegal_transitions_and_stale_sequences() -> Result<(
     let temp = TempDir::new()?;
     let repository = repository(&temp).await?;
     let spec = job_spec("training")?;
+    let mut early = repository.committed_changes();
+    assert!(!early.has_changed()?);
     let queued = repository.create(&spec).await?;
+    assert!(early.has_changed()?);
+    early.borrow_and_update();
+    // A subscriber attached after startup/recovery must still observe prior commits.
+    let mut committed = repository.committed_changes();
+    assert!(committed.has_changed()?);
+    committed.borrow_and_update();
+    assert!(!committed.has_changed()?);
     let preparing = repository
         .append(
             spec.id(),
@@ -566,6 +575,8 @@ async fn lifecycle_rejects_illegal_transitions_and_stale_sequences() -> Result<(
             event(JobState::Preparing, 3)?,
         )
         .await?;
+    assert!(committed.has_changed()?);
+    committed.borrow_and_update();
     let running = repository
         .append(
             spec.id(),
@@ -574,6 +585,10 @@ async fn lifecycle_rejects_illegal_transitions_and_stale_sequences() -> Result<(
             event(JobState::Running, 4)?,
         )
         .await?;
+
+    assert!(committed.has_changed()?);
+    committed.borrow_and_update();
+    assert_eq!(repository.get(spec.id(), spec.generation()).await?, running);
 
     assert_eq!(
         repository
@@ -597,7 +612,10 @@ async fn lifecycle_rejects_illegal_transitions_and_stale_sequences() -> Result<(
             .await,
         Err(JobRepositoryError::InvalidTransition),
     );
+    assert!(!committed.has_changed()?);
     assert_eq!(repository.get(spec.id(), spec.generation()).await?, running);
+    repository.shutdown().await?;
+    assert!(committed.changed().await.is_err());
     Ok(())
 }
 

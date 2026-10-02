@@ -90,6 +90,10 @@ function transport(
       availableItems: 0,
     },
   }),
+  marketHistoryPreparation: ProductTransport["marketHistoryPreparation"] = async () => {
+    throw new Error("History preparation is not configured for this test.")
+  },
+  subscriptions?: Parameters<SystemTransport["subscribe"]>[1][],
 ): DesktopTransport {
   const productResult = (data: unknown): ApplicationResult => ({
     data,
@@ -130,6 +134,7 @@ function transport(
       restartRequired: false,
     }),
     query,
+    marketHistoryPreparation,
     systemQuery: async () => systemResult(null),
     modelProducts: async (request) =>
       productResult(request.action === "list" ? { models: [], nextCursor: null } : { activities: [], nextCursor: null }),
@@ -272,20 +277,24 @@ function transport(
     },
     mcpClientControl: async () =>
       Promise.reject(new Error("MCP mutation is not configured for this test.")),
-    subscribe: async (request) => ({
-      receipt: {
-        subscriptionId: "f49e02f6-8c47-43a5-bb33-030e8e0d12bb",
-        productSessionToken: request.productSessionToken,
-        sequence: request.afterSequence,
-        resumed: request.afterSequence !== "0",
-      },
-      unsubscribe: async () => undefined,
-    }),
+    subscribe: async (request, onEvent) => {
+      subscriptions?.push(onEvent)
+      return {
+        receipt: {
+          subscriptionId: "f49e02f6-8c47-43a5-bb33-030e8e0d12bb",
+          productSessionToken: request.productSessionToken,
+          sequence: request.afterSequence,
+          resumed: request.afterSequence !== "0",
+        },
+        unsubscribe: async () => undefined,
+      }
+    },
     onboard,
     openOfficialProviderPage: async () => undefined,
   }
   const product: ProductTransport = {
     query: bridge.query,
+    marketHistoryPreparation: bridge.marketHistoryPreparation,
     analyticalController: bridge.analyticalController,
     modelProducts: bridge.modelProducts,
     backtestProducts: bridge.backtestProducts,
@@ -636,8 +645,57 @@ describe("Market Squawk desktop boundary", () => {
     )
     savedScreen.unmount()
 
+    const historyToken = "history_0123456789abcdef0123456789abcdef"
+    const historyJobId = "781276a0-33f1-4fb3-8cbb-bb2095acd0cf"
+    const jobGeneration = "9007199254740993"
+    const initialHistoryGeneration = "a".repeat(64)
+    const publishedHistoryGeneration = "c".repeat(64)
+    let preparationState: "running" | "completed" = "running"
+    let reconciliations = 0
+    const preparationRequests: { request: Parameters<ProductTransport["marketHistoryPreparation"]>[0]; confirmed: boolean | undefined }[] = []
+    const subscriptions: Parameters<SystemTransport["subscribe"]>[1][] = []
+    const recoveryKey = `market-squawk.history-preparation.v1:${blockedBootstrap.productSessionToken}:${historyToken}`
+    sessionStorage.removeItem(recoveryKey)
+    const historyJob = () => ({
+      jobId: historyJobId, generation: jobGeneration, sequence: preparationState === "completed" ? "11" : "10",
+      kind: "market.prepare-history.v1", state: preparationState, phase: null,
+      completedUnits: preparationState === "completed" ? 1 : 0, totalUnits: 1,
+      cancellationRequested: false, failure: null, updatedAt: "1786363200000000000", recovery: null,
+      result: preparationState === "completed" ? {
+        authority: "market.adjusted-history-publication.v1", identity: "prepared-selected-history",
+        evidenceDigest: { algorithm: "sha256", bytes: Array<number>(32).fill(1) }, artifacts: [],
+      } : null,
+    })
+    const historyPreparation: ProductTransport["marketHistoryPreparation"] = async (request, confirmed) => {
+      preparationRequests.push({ request, confirmed })
+      if (request.action === "start") throw new Error("The durable start acknowledgment was lost.")
+      const data = request.action === "get" ? historyJob()
+        : request.action === "reconcileStart" ? ++reconciliations === 1
+          ? { state: "unknown", job: null } : { state: "admitted", job: historyJob() }
+          : null
+      if (data === null) throw new Error(`Unexpected history action: ${request.action}`)
+      return { data, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } }
+    }
+    const savedHistory: ProductTransport["query"] = async (request) => {
+      if (request.query !== "marketHistory") throw new Error("Expected a saved history read.")
+      const generationToken = request.generationToken ?? (preparationState === "completed" ? publishedHistoryGeneration : initialHistoryGeneration)
+      const bars = ["2026-06-01", "2026-08-08"].map((date, index) => ({
+        originalOrdinal: String(index), breakBefore: [false, false, false],
+        time: { precision: "nominal_date", date }, open: "120", high: "130", low: "110",
+        close: generationToken === publishedHistoryGeneration ? "124.56789" : "123.456789", volume: "12",
+      })).filter((bar) => (!request.startDate || bar.time.date >= request.startDate)
+        && (!request.endDate || bar.time.date <= request.endDate))
+      return { data: { data: {
+        historyToken, currency: "USD", partial: false, generationToken, bars,
+        display: { method: "first_last_min_max", originalPointCount: "2", visibleOriginalPointCount: String(bars.length),
+          returnedPointCount: bars.length, firstTimeUnixNanos: null, lastTimeUnixNanos: null, projectionDigest: "b".repeat(64), reduced: false },
+        viewport: { startUnixNanos: null, endUnixNanos: null, startDate: request.startDate ?? null, endDate: request.endDate ?? null,
+          pointLimit: request.pointLimit ?? 512, fullStartUnixNanos: null, fullEndUnixNanos: null,
+          fullStartDate: "2026-06-01", fullEndDate: "2026-08-08" },
+      }, unavailableReason: null }, metadata: { completeness: "complete", returnedItems: bars.length, availableItems: bars.length } }
+    }
     const requestedRow: MarketProductRow = {
-      ...marketOverviewRow,
+      ...marketOverviewRow, historyToken,
       identity: { symbol: "MSQ", name: "Requested investment", assetClass: "equity" },
     }
     let wrongProfileSelection = false
@@ -683,7 +741,7 @@ describe("Market Squawk desktop boundary", () => {
     const openInvestment = (route: string, supportsFinancials = true) => render(
       <MemoryRouter initialEntries={[route]}>
         <App transport={transport(
-          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument", ...(supportsFinancials ? ["investment_financials", "investment_financials_close"] as const : [])] },
+          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument", "market_history", "market_history_preparation_start", "market_history_preparation_get", "market_history_preparation_cancel", ...(supportsFinancials ? ["investment_financials", "investment_financials_close"] as const : [])] },
           undefined,
           async (request, options) => {
             issuedQueries.push(request)
@@ -698,6 +756,7 @@ describe("Market Squawk desktop boundary", () => {
               }
               return financialResult(request.cursor)
             }
+            if (request.query === "marketHistory") return savedHistory(request, options)
             if (request.query === "marketOverview") return marketOverviewResult
             if (request.query === "investmentProfile" && request.selectionToken === marketSelectionToken) return profileResult()
             if (request.query === "marketInstrument" && request.selectionToken === marketSelectionToken) {
@@ -705,6 +764,8 @@ describe("Market Squawk desktop boundary", () => {
             }
             throw new Error("This investment selection is no longer available.")
           },
+          historyPreparation,
+          subscriptions,
         )} />
       </MemoryRouter>,
     )
@@ -743,7 +804,83 @@ describe("Market Squawk desktop boundary", () => {
     finishFinancial?.(financialResult())
     await waitFor(() => expect(issuedQueries).toContainEqual({ query: "closeInvestmentFinancials", selectionToken: marketSelectionToken, readToken: financialRead }))
     expect(screen.queryByRole("region", { name: "Reported financial facts" })).toBeNull()
+
+    // This same selected-stock journey admits one explicit one-year preparation.
+    // A lost acknowledgment is recovered through the original request, not Start.
+    const user = userEvent.setup()
+    await screen.findByLabelText("History window")
+    expect(preparationRequests).toHaveLength(0)
+    await user.selectOptions(screen.getByLabelText("History window"), "30")
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+      query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512,
+      generationToken: initialHistoryGeneration,
+    }))
+    expect(preparationRequests).toHaveLength(0)
+    const retainedChart = screen.getByRole("img", { name: /Daily investment prices in USD/ })
+    await user.click(screen.getByRole("button", { name: "Update history" }))
+    await screen.findByText("Preparation could not be verified. Check the original request before loading again.")
+    expect(preparationRequests).toHaveLength(1)
+    const started = preparationRequests[0]!
+    expect(started.confirmed).toBe(true)
+    expect(started.request).toMatchObject({ action: "start", historyToken, lookbackDays: 365 })
+    if (started.request.action !== "start") throw new Error("The first preparation request was not Start.")
+    const startRequestId = started.request.startRequestId
+    expect(startRequestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(JSON.parse(sessionStorage.getItem(recoveryKey)!).startRequestId).toBe(startRequestId)
+    expect((screen.getByRole("button", { name: "Update history" }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByRole("img", { name: /Daily investment prices in USD/ })).toBe(retainedChart)
+    await user.click(screen.getByRole("button", { name: "Check preparation" }))
+    await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toHaveLength(1))
+    await screen.findByText("The original preparation request has not been verified.")
+    expect((screen.getByRole("button", { name: "Update history" }) as HTMLButtonElement).disabled).toBe(true)
+    await user.click(screen.getByRole("button", { name: "Check preparation" }))
+    await screen.findByText("Preparing history… 0 of 1 steps complete.")
+    expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toEqual([
+      { request: { action: "reconcileStart", historyToken, lookbackDays: 365, startRequestId }, confirmed: false },
+      { request: { action: "reconcileStart", historyToken, lookbackDays: 365, startRequestId }, confirmed: false },
+    ])
+    expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+
+    // A real App remount creates a new QueryClient. Keep only sessionStorage and
+    // the durable fake job, then recover the receipt through scoped Get.
+    const getsBeforeReload = preparationRequests.filter(({ request }) => request.action === "get").length
     investment.unmount()
+    wrongProfileSelection = false
+    const reloaded = openInvestment(lookupRoute(parsed.matches[0]!))
+    await screen.findByText("Preparing history… 0 of 1 steps complete.")
+    await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(getsBeforeReload + 1))
+    expect(preparationRequests.at(-1)).toEqual({ request: { action: "get", historyToken, jobId: historyJobId, generation: jobGeneration }, confirmed: false })
+    expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toHaveLength(2)
+    await screen.findByLabelText("History window")
+    await user.selectOptions(screen.getByLabelText("History window"), "30")
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+      query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512,
+      generationToken: initialHistoryGeneration,
+    }))
+    const historyReadsBeforeCompletion = issuedQueries.filter((request) => request.query === "marketHistory").length
+    await waitFor(() => expect(subscriptions).toHaveLength(2))
+    let eventSequence = 0
+    // Reuse the existing subscription callback fixture from the coalescing case;
+    // emit the actual Job invalidation, rather than manually refetching queries.
+    const publishJob = () => subscriptions[1]!({ productSessionToken: blockedBootstrap.productSessionToken,
+      sequence: String(++eventSequence), body: { type: "invalidate", domains: ["job"] } })
+    preparationState = "completed"
+    await act(async () => { publishJob() })
+    await screen.findByText("History preparation completed.")
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1))
+    expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+      query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512,
+    })
+    await waitFor(() => expect(screen.getAllByText("124.56789 USD").length).toBeGreaterThan(0))
+    expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("30")
+    expect(sessionStorage.getItem(recoveryKey)).toBeNull()
+    const completedGets = preparationRequests.filter(({ request }) => request.action === "get").length
+    await act(async () => { publishJob() })
+    await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(completedGets + 1))
+    expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1)
+    expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    reloaded.unmount()
 
     // A development UI refresh must not send a new command to an older running native bridge.
     const financialQueriesBefore = issuedQueries.filter((request) => request.query === "investmentFinancials").length
@@ -1704,14 +1841,9 @@ describe("Market Squawk desktop boundary", () => {
     })
     const releaseProfile = profileObserver.subscribe(() => undefined)
     const subscriptions: Parameters<SystemTransport["subscribe"]>[1][] = []
-    const base = transport()
+    const base = transport(undefined, undefined, undefined, undefined, subscriptions)
     const view = render(<QueryClientProvider client={queryClient}>
-      <ProductProvider transport={{ ...base, system: { ...base.system,
-        subscribe: async (request, onEvent, onError) => {
-          subscriptions.push(onEvent)
-          return base.system.subscribe(request, onEvent, onError)
-        },
-      } }}>{null}</ProductProvider>
+      <ProductProvider transport={base}>{null}</ProductProvider>
     </QueryClientProvider>)
     let sequence = 0
     const invalidate = (domains: DesktopInvalidationDomain[] = ["market"]) => subscriptions[0]!({ productSessionToken: scope,

@@ -874,6 +874,9 @@ impl InstalledService {
             _selected_workspace_guard,
         } = self;
         let _workflow_cancel_on_drop = analytical_workflow.cancellation_on_drop();
+        let mut job_commits = jobs.repository().committed_changes();
+        let application_changes = product.research().application_changes();
+        let mut job_notifications_open = true;
         // Startup failure still traverses admission, transport, task, job, application,
         // repository and credential shutdown; no fallible early exit owns live authorities.
         let workflow_start = runtime
@@ -905,25 +908,37 @@ impl InstalledService {
         ) = if workflow_start.is_err() {
             (None, false, false, None)
         } else {
-            tokio::select! {
-                biased;
-                expected_next = lifecycle.wait_for_restart() => {
-                    (Some(expected_next), false, false, None)
-                }
-                () = cancellation.cancelled() => {
-                    (None, false, false, None)
-                }
-                result = &mut serving => {
-                    (None, true, false, Some(result.is_ok()))
-                }
-                () = admission.failed() => {
-                    (None, false, true, None)
-                }
-                () = &mut credential_monitor => {
-                    (None, false, false, None)
+            loop {
+                tokio::select! {
+                    biased;
+                    expected_next = lifecycle.wait_for_restart() => {
+                        break (Some(expected_next), false, false, None);
+                    }
+                    () = cancellation.cancelled() => {
+                        break (None, false, false, None);
+                    }
+                    result = &mut serving => {
+                        break (None, true, false, Some(result.is_ok()));
+                    }
+                    () = admission.failed() => {
+                        break (None, false, true, None);
+                    }
+                    () = &mut credential_monitor => {
+                        break (None, false, false, None);
+                    }
+                    committed = job_commits.changed(), if job_notifications_open => {
+                        match committed {
+                            Ok(()) => application_changes.record(ServiceDomain::Job),
+                            // A closed writer must not turn this branch into a ready busy loop.
+                            // Existing repository operations retain their own failure authority.
+                            Err(_) => job_notifications_open = false,
+                        }
+                    }
                 }
             }
         };
+        // This relay is owned by the serving future; it creates no detached task to drain.
+        drop(job_commits);
         drop(credential_monitor);
         let admission_retired = admission.shutdown().await;
         transport_cancellation.cancel();

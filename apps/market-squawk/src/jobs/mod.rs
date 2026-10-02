@@ -3,8 +3,10 @@
 mod backtest;
 mod backup;
 mod forecast;
+mod market_history;
 mod recovery;
 mod research;
+pub(crate) use market_history::MarketHistoryJobRunner;
 mod scenario;
 mod screen;
 mod training;
@@ -59,6 +61,7 @@ const RUNNER_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// Code-owned installed runner set retained for both scheduling and typed admission.
 pub struct InstalledJobRunners {
     ingest: Arc<ResearchJobRunner>,
+    market_history: Arc<MarketHistoryJobRunner>,
     research_phase_one_derived_generation: Arc<PhaseOneDerivedGenerationJobRunner>,
     analysis_phase_one_feature_derived_generation: Arc<PhaseOneDerivedGenerationJobRunner>,
     export: Arc<ResearchExportJobRunner>,
@@ -91,6 +94,15 @@ impl InstalledJobRunners {
                 RUNNER_DEADLINE,
             )
             .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let market_history = Arc::new(
+            MarketHistoryJobRunner::try_new(
+                product.source_action_preparation(),
+                Arc::clone(&artifacts),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_| InstalledJobError::RunnerComposition)?,
         );
         let research_phase_one_derived_generation = Arc::new(
             PhaseOneDerivedGenerationJobRunner::try_new_research_dataset(
@@ -137,7 +149,8 @@ impl InstalledJobRunners {
             )
             .map_err(|_error| InstalledJobError::RunnerComposition)?
             .with_recommendations(backtest::RecommendationBacktestRuntimeV1 {
-                inputs: product.backtest_inputs(), repository: product.backtest_repository(),
+                inputs: product.backtest_inputs(),
+                repository: product.backtest_repository(),
             }),
         );
         let forecast_preparation = product.model_runtime().map(|runtime| {
@@ -207,6 +220,7 @@ impl InstalledJobRunners {
         );
         Ok(Self {
             ingest,
+            market_history,
             research_phase_one_derived_generation,
             analysis_phase_one_feature_derived_generation,
             export,
@@ -226,6 +240,7 @@ impl InstalledJobRunners {
     pub fn registered(&self) -> Vec<JobRunnerRegistration> {
         let mut runners = vec![
             mutation_registration(self.ingest.clone()),
+            mutation_registration(self.market_history.clone()),
             mutation_registration(self.research_phase_one_derived_generation.clone()),
             mutation_registration(self.analysis_phase_one_feature_derived_generation.clone()),
             mutation_registration(self.export.clone()),
@@ -245,6 +260,10 @@ impl InstalledJobRunners {
 
     pub(crate) const fn ingest(&self) -> &Arc<ResearchJobRunner> {
         &self.ingest
+    }
+
+    pub(crate) const fn market_history(&self) -> &Arc<MarketHistoryJobRunner> {
+        &self.market_history
     }
 
     pub(crate) const fn export(&self) -> &Arc<ResearchExportJobRunner> {

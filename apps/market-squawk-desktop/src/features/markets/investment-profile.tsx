@@ -29,11 +29,11 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
   const result = profile.data
 
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment profile">
-    <div className="flex items-start justify-between gap-3">
+    <div className="flex items-center justify-between gap-3">
       <h2 className="text-base font-semibold">Profile</h2>
       <Button variant="outline" size="sm" disabled={profile.isFetching} onClick={() => void profile.refetch()}>Refresh profile</Button>
     </div>
-    <div className="mt-2 min-h-16 text-xs leading-5">
+    <div className="mt-1 min-h-5 text-xs leading-5">
     {profile.isError ? <div className="flex items-start justify-between gap-2">
       <p role="alert" className="text-destructive">{result
         ? "The profile could not be refreshed. Showing the last checked information."
@@ -41,11 +41,11 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
       <Button variant="outline" size="sm" disabled={profile.isFetching} onClick={() => void profile.refetch()}>Retry</Button>
     </div> : profile.isFetching ? <p role="status" className="text-muted-foreground">{result ? "Updating profile information…" : "Loading profile information…"}</p> : null}
     </div>
-    <div className="min-h-[200px]">
+    <div className="min-h-[180px]">
     {result ? <>
       {result.state === "available" ? <ReferenceProfile profile={result.profile} />
         : <p role="status" className="mt-3 text-sm text-muted-foreground">{profileAvailability(result)}</p>}
-      <p className="mt-4 text-xs text-muted-foreground">{profile.isError || profile.isFetching ? "Last checked information through" : "Information through"} <ProfileTime value={result.knowledgeAt} /></p>
+      <p className="mt-3 text-xs text-muted-foreground">{profile.isError ? "Last checked information through" : "Information through"} <ProfileTime value={result.knowledgeAt} /></p>
     </> : null}
     </div>
   </section>
@@ -57,18 +57,18 @@ function ReferenceProfile({ profile }: { profile: InvestmentReferenceProfile }) 
     foreign_exchange: "Currency", crypto: "Crypto", commodity: "Commodity", fund: "Fund", index: "Index", cash: "Cash",
   }
   return <>
-    <dl className="grid grid-cols-2 gap-4">
+    <dl className="grid grid-cols-2 gap-x-3 gap-y-3">
       {([
         ["Name", profile.displayName], ["Symbol", profile.symbol],
         ["Investment type", profile.exchangeTradedFund ? "Exchange-traded fund" : assetLabels[profile.assetClass]],
         ["Currency", profile.currency], ["Listing venue", profile.listingVenue],
         ["Standard trading lot", groupDecimal(String(profile.roundLotSize))],
-      ] as const).map(([label, value]) => <div key={label} className="min-w-0">
+      ] as const).map(([label, value]) => <div key={label} className={label === "Name" ? "col-span-2 min-w-0" : "min-w-0"}>
         <dt className="text-xs text-muted-foreground">{label}</dt>
-        <dd className="mt-1 break-words text-sm">{value}</dd>
+        <dd className="mt-1 break-words text-sm leading-5">{value}</dd>
       </div>)}
     </dl>
-    <details className="mt-4 border-t border-border pt-3">
+    <details className="mt-3 border-t border-border pt-3">
       <summary className="cursor-pointer text-sm focus-visible:outline-ring">Record dates</summary>
       <dl className="mt-3 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
         {([

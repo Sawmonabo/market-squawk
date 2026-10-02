@@ -20,6 +20,7 @@ fn main() {
         "import_provider_credential_bundle",
         "installation_control",
         "job_control",
+        "market_history_preparation",
         "mcp_client_control",
         "mcp_status",
         "model_control",

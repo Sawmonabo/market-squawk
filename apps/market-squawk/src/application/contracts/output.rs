@@ -96,7 +96,11 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ],
             &["jobs", "next"],
         ),
-        "Job.Get" | "Job.Cancel" | "Job.Confirm" => job_view(),
+        "Job.Get"
+        | "Job.Cancel"
+        | "Job.Confirm"
+        | "Market.GetHistoryPreparation"
+        | "Market.CancelHistoryPreparation" => job_view(),
         "Job.ReconcileStart" | "Job.CancelStart" => one_of(vec![
             closed_complete(vec![("state", constant("admitted")), ("job", job_view())]),
             closed_complete(vec![
@@ -251,7 +255,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Macro.GetObservations" | "Macro.GetVintages" | "Macro.GetRevisions" => {
             observation_result()
         }
-        "Research.StartIngestSource"
+        "Market.StartHistoryPreparation"
+        | "Research.StartIngestSource"
         | "Research.CommitStagedFile"
         | "Research.StartDatasetBuild"
         | "Research.StartExport"
@@ -10516,12 +10521,19 @@ mod tests {
         }
         // History returns native coverage/quality evidence even when no bars are available.
         // Validate full results, not just JSON shapes: a mismatched evidence policy hid every chart.
-        let history = capabilities.find("Market.GetHistory").ok_or("missing market history")?;
+        let history = capabilities
+            .find("Market.GetHistory")
+            .ok_or("missing market history")?;
         let digest = "a".repeat(64);
         for (content, count, coverage, quality) in [
-            (json!({"data":null,"unavailableReason":"not_available"}), 0,
-             json!({"availability":"unavailable"}), json!({"quality":"unavailable"})),
-            (json!({"data": {
+            (
+                json!({"data":null,"unavailableReason":"not_available"}),
+                0,
+                json!({"availability":"unavailable"}),
+                json!({"quality":"unavailable"}),
+            ),
+            (
+                json!({"data": {
                 "historyToken":"history_0123456789abcdef0123456789abcdef",
                 "currency":"USD", "generationToken":digest, "partial":false,
                 "bars":[{"time":{"precision":"nominal_date","date":"2026-10-01"},
@@ -10533,12 +10545,19 @@ mod tests {
                 "viewport":{"startUnixNanos":null,"endUnixNanos":null,"startDate":null,"endDate":null,
                     "pointLimit":512,"fullStartUnixNanos":null,"fullEndUnixNanos":null,
                     "fullStartDate":"2026-10-01","fullEndDate":"2026-10-01"}
-             },"unavailableReason":null}), 1,
-             json!({"availability":"available","generationToken":digest,"projectionDigest":digest}),
-             json!({"quality":"verified","originalBarsRetained":true,"displayOnly":true})),
+             },"unavailableReason":null}),
+                1,
+                json!({"availability":"available","generationToken":digest,"projectionDigest":digest}),
+                json!({"quality":"verified","originalBarsRetained":true,"displayOnly":true}),
+            ),
         ] {
-            TypedToolResult::try_new(content, count, ToolResultMetadata::try_complete(coverage, quality)?, limits)?
-                .validate_for(history)?;
+            TypedToolResult::try_new(
+                content,
+                count,
+                ToolResultMetadata::try_complete(coverage, quality)?,
+                limits,
+            )?
+            .validate_for(history)?;
         }
         Ok(())
     }

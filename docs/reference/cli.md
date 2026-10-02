@@ -120,6 +120,19 @@ as Desktop and MCP:
 | `market profile --selection-token <token>` | Read the selected investment's reference and listing profile independently of price availability. |
 | `market financials --selection-token <token> --section <facts\|statements\|ratios\|filings> [--cursor <cursor>] [--limit 1..100]` | Read one financial section; the default page size is 32. A first page may retrieve missing issuer evidence using an already configured connection. |
 | `market close-financials --selection-token <token> --read-token <UUID>` | Release an open financial read without deleting its stored source evidence or cancelling a separate durable job. |
+| `market prepare-history --history-token <token> --lookback-days <days> --confirm` | Start selected adjusted daily-history acquisition; returns the durable job receipt. |
+| `market history-preparation --history-token <token> --job-id <UUID> --generation <positive>` | Read the selected job's exact generation, progress, outcome and publication result. |
+| `market cancel-history-preparation --history-token <token> --job-id <UUID> --generation <positive> --expected-sequence <n> --confirm` | Cancel against the exact observed sequence; already committed evidence remains retained. |
+| `market reconcile-history-preparation --request-id <original> --arguments-sha256 <digest>` | Resolve an uncertain start using its original request identity and digest; does not start another job. |
+
+History preparation uses the returned `historyToken`, not the investment's `selectionToken`.
+`lookback-days` requests 30–3650 calendar days ending at admission; the result reports actual
+coverage and gaps. These are acquisition parameters, not limits on retained history. Desktop uses
+the same `Market.StartHistoryPreparation`, `Market.GetHistoryPreparation` and
+`Market.CancelHistoryPreparation` operations available to ordinary MCP clients. Read the completed
+publication with `market history`; a queued receipt does not establish that chart data is ready.
+An interrupted process does not silently restart provider acquisition. Reconcile an uncertain start
+before attempting another; the CLI prints the original request identity and digest on that failure.
 
 Financial pages return `currentCursor`, `nextCursor`, `readToken`, frozen `knowledgeAt` and
 `effectiveOn`, per-family availability, and explicit omissions/limitations. Pass cursor strings

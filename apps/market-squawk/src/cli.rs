@@ -581,6 +581,55 @@ pub enum MarketCommand {
         #[arg(long)]
         read_token: uuid::Uuid,
     },
+    /// Prepare adjusted daily history for one selected investment as a durable job.
+    PrepareHistory {
+        #[arg(long)]
+        history_token: String,
+        /// Intended history coverage in calendar days.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(
+            i64::from(market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS)
+                ..=i64::from(market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS)
+        ))]
+        lookback_days: u16,
+        /// Authorize source acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read one exact history preparation job for the selected investment.
+    HistoryPreparation {
+        #[arg(long)]
+        history_token: String,
+        /// Durable job identity returned by preparation.
+        #[arg(long)]
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Cancel history preparation at the exact observed generation and sequence.
+    CancelHistoryPreparation {
+        #[arg(long)]
+        history_token: String,
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Check the original history start after an uncertain acknowledgement; never start again.
+    ReconcileHistoryPreparation {
+        /// Original request identity reported by the uncertain start.
+        #[arg(long)]
+        request_id: String,
+        /// Exact lowercase SHA-256 reported with that request identity.
+        #[arg(long)]
+        arguments_sha256: String,
+    },
     /// Return immutable daily history for one opaque investment selection.
     History {
         #[arg(long)]

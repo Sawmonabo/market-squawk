@@ -69,6 +69,12 @@ struct JobIngestCommitAuthority {
     slot: Arc<JobTerminalCommitSlot>,
 }
 
+pub(super) fn ingest_commit_authority(
+    slot: Arc<JobTerminalCommitSlot>,
+) -> Arc<dyn ResearchIngestCommitAuthority> {
+    Arc::new(JobIngestCommitAuthority { slot })
+}
+
 impl IngestPrecommitAuthority for JobIngestCommitAuthority {
     fn validate_precommit(&self) -> Result<(), IngestError> {
         self.slot.claim().map_err(|error| match error {

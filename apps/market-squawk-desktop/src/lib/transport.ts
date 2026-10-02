@@ -365,7 +365,13 @@ export type RecommendationSetupRequest =
 
 export type ReadOptions = { signal?: AbortSignal }
 
+export type MarketHistoryPreparationRequest =
+  | { action: "start" | "reconcileStart" | "cancelStart"; historyToken: string; lookbackDays: number; startRequestId: string }
+  | { action: "get"; historyToken: string; jobId: string; generation: string }
+  | { action: "cancel"; historyToken: string; jobId: string; generation: string; expectedSequence: string }
+
 export interface ProductTransport {
+  marketHistoryPreparation(request: MarketHistoryPreparationRequest, confirmed?: boolean, options?: ReadOptions): Promise<ApplicationResult>
   recommendationSetup(request: RecommendationSetupRequest, confirmed?: boolean): Promise<ApplicationResult>
   query(request: ProductQuery, options?: ReadOptions): Promise<ApplicationResult>
   analyticalController(

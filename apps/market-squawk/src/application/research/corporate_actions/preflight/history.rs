@@ -4,7 +4,10 @@ use super::*;
 use crate::application::market_runtime::{
     AccountMarketSurface, PreparedMarketProviderConfigurationRequest,
 };
-use crate::application::{ResearchIngestCoordinator as _, ResearchSourceDiscoveryCoordinator as _};
+use crate::application::{
+    ResearchIngestCommitAuthority, ResearchIngestCoordinator as _,
+    ResearchSourceDiscoveryCoordinator as _,
+};
 use market_squawk_adapter_alpaca::{AlpacaAdjustment, AlpacaHistoricalEquityPreflightPlan};
 use market_squawk_data::{
     CompleteMarketBarHistoryOutput, CompleteMarketBarHistoryRequest, DatasetSchemaRef, Sha256Digest,
@@ -64,6 +67,19 @@ impl SourceActionPreparationCapability {
         runtime: &AlpacaHistoricalRuntimeCapability,
         plan: AlpacaHistoricalEquityPreflightPlan,
         instrument: &MarketDataInstrumentRecord,
+        context: &RequestContext,
+    ) -> Result<PublishedAnchorHistory, ServiceError> {
+        self.publish_canonical_history_with_commit(runtime, plan, instrument, None, context)
+            .await
+    }
+
+    /// Composes the job's authority into the existing irreversible ingest boundary.
+    pub(super) async fn publish_canonical_history_with_commit(
+        &self,
+        runtime: &AlpacaHistoricalRuntimeCapability,
+        plan: AlpacaHistoricalEquityPreflightPlan,
+        instrument: &MarketDataInstrumentRecord,
+        commit: Option<Arc<dyn ResearchIngestCommitAuthority>>,
         context: &RequestContext,
     ) -> Result<PublishedAnchorHistory, ServiceError> {
         check(context)?;
@@ -149,6 +165,7 @@ impl SourceActionPreparationCapability {
         let adjustment = match plan.adjustment() {
             AlpacaAdjustment::Raw => MarketBarAdjustment::Raw,
             AlpacaAdjustment::Split => MarketBarAdjustment::Split,
+            AlpacaAdjustment::All => MarketBarAdjustment::All,
             _ => return Err(ServiceError::InvalidRequest),
         };
         let request = PreparedMarketProviderConfigurationRequest::try_new(
@@ -232,11 +249,13 @@ impl SourceActionPreparationCapability {
         let descriptor = capabilities
             .find("Research.IngestSource")
             .ok_or(ServiceError::Internal)?;
+        // Ingestion returns one publication receipt; transport result ceilings are not
+        // requested item counts and do not bound the acquired historical observations.
         let arguments = serde_json::json!({
             "provider":profile, "dataset":provider_dataset,
             "object":object.source_object().object_id(), "discoveryReceipt":object.discovery_receipt(),
             "confirm":true,
-            "resultLimits":{"maximumItems":context.limits().maximum_result_items(),
+            "resultLimits":{"maximumItems":1,
                 "maximumBytes":context.limits().maximum_result_bytes()},
         });
         let admitted = descriptor.admit(
@@ -247,17 +266,25 @@ impl SourceActionPreparationCapability {
         )?;
         // Calls the sole coordinator directly under this operation's existing context. No child
         // job, second runtime, callback publisher, or native-authored capture is introduced.
-        let publication = self
-            .ingest
-            .ingest(&admitted, context, context.limits())
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(
-                    ?error,
-                    stage = "history-registered-ingest",
-                    "historical publication unavailable"
-                );
-            })?;
+        let publication = match commit {
+            Some(commit) => {
+                self.ingest
+                    .ingest_with_precommit(&admitted, context, context.limits(), commit)
+                    .await
+            }
+            None => {
+                self.ingest
+                    .ingest(&admitted, context, context.limits())
+                    .await
+            }
+        }
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                stage = "history-registered-ingest",
+                "historical publication unavailable"
+            );
+        })?;
         drop(rollback); // Receipt revocation is idempotent after the one-use ingest consumes it.
         let manifest: ManifestWire = serde_json::from_value(
             publication

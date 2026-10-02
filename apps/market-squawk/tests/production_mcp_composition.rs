@@ -322,6 +322,21 @@ async fn run_installed_service_authority_scenario(
             assert_eq!(descriptor["metadata"]["privateInstalledClient"], true);
         }
 
+        // Selected history preparation is a shared product surface, even before provider setup.
+        for (operation, read_only) in [
+            ("Market.StartHistoryPreparation", false),
+            ("Market.GetHistoryPreparation", true),
+            ("Market.CancelHistoryPreparation", false),
+        ] {
+            let descriptor = descriptors
+                .iter()
+                .find(|value| value["name"] == operation)
+                .context("history preparation omitted from native product descriptors")?;
+            assert_eq!(descriptor["contract"]["domain"], "market");
+            assert_eq!(descriptor["effects"]["readOnly"], read_only);
+            assert_ne!(descriptor["metadata"]["privateInstalledClient"], true);
+        }
+
         let jobs = cli
             .invoke_operation(
                 RequestId::try_string("installed-job-list")
@@ -3723,6 +3738,16 @@ async fn exercise_installed_relay_with_gate(
     assert!(names.contains(&"Analysis.Lookup"));
     assert!(names.contains(&"Market.GetOverview"));
     assert!(names.contains(&"Market.GetCollection"));
+    for operation in [
+        "Market.StartHistoryPreparation",
+        "Market.GetHistoryPreparation",
+        "Market.CancelHistoryPreparation",
+    ] {
+        assert!(
+            names.contains(&operation),
+            "history operation missing from ordinary MCP: {operation}"
+        );
+    }
     assert!(!names.contains(&"Portfolio.GetRecommendationSetup"));
     assert!(names.contains(&"Macro.GetContext"));
     assert!(names.contains(&"Model.ListProductActivity"));

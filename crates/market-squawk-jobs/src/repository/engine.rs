@@ -2,7 +2,7 @@ use market_squawk_domain::Timestamp;
 use market_squawk_platform::{JobDatabaseFileGuard, JobDatabaseLocation, JobDatabaseWriterGuard};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use super::backup::{capture, verify_database};
@@ -248,6 +248,7 @@ pub(super) fn writer_loop(
     mut receiver: mpsc::Receiver<WriteCommand>,
     database_file: JobDatabaseFileGuard,
     writer_guard: JobDatabaseWriterGuard,
+    committed: watch::Sender<()>,
 ) {
     let connection = open_writer(&location, config);
     let mut shutdown_reply = None;
@@ -272,6 +273,11 @@ pub(super) fn writer_loop(
                     .as_ref()
                     .map_err(|error| *error)
                     .and_then(|connection| create_snapshot(connection, &spec));
+                if result.is_ok() {
+                    // These operations return success only after their SQLite transaction commits.
+                    // Signal even if the requesting caller no longer receives its reply.
+                    committed.send_replace(());
+                }
                 let _ignored = reply.send(result);
             }
             WriteCommand::Append {
@@ -287,6 +293,11 @@ pub(super) fn writer_loop(
                     .and_then(|connection| {
                         append_event(connection, id, generation, expected, event)
                     });
+                if result.is_ok() {
+                    // These operations return success only after their SQLite transaction commits.
+                    // Signal even if the requesting caller no longer receives its reply.
+                    committed.send_replace(());
+                }
                 let _ignored = reply.send(result);
             }
             WriteCommand::Recover {
@@ -298,6 +309,11 @@ pub(super) fn writer_loop(
                     .as_ref()
                     .map_err(|error| *error)
                     .and_then(|connection| begin_recovery(connection, &orphaned, at));
+                if result.is_ok() {
+                    // These operations return success only after their SQLite transaction commits.
+                    // Signal even if the requesting caller no longer receives its reply.
+                    committed.send_replace(());
+                }
                 let _ignored = reply.send(result);
             }
             WriteCommand::Retry { failed, at, reply } => {
@@ -305,6 +321,11 @@ pub(super) fn writer_loop(
                     .as_ref()
                     .map_err(|error| *error)
                     .and_then(|connection| begin_retry(connection, &failed, at));
+                if result.is_ok() {
+                    // These operations return success only after their SQLite transaction commits.
+                    // Signal even if the requesting caller no longer receives its reply.
+                    committed.send_replace(());
+                }
                 let _ignored = reply.send(result);
             }
             WriteCommand::Snapshot {

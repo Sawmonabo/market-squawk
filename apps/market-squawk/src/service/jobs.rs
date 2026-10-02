@@ -20,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     application::job::{JobAdmission, JobApplication, JobApplicationError, JobReceipt, JobView},
-    jobs::InstalledJobAuthority,
+    jobs::{InstalledJobAuthority, MarketHistoryJobRunner},
 };
 
 /// Closed typed job query and mutation authority.
@@ -121,7 +121,9 @@ impl InstalledJobOperations {
     pub(super) fn owns(operation: &str) -> bool {
         matches!(
             operation,
-            "Job.List"
+            "Market.GetHistoryPreparation"
+                | "Market.CancelHistoryPreparation"
+                | "Job.List"
                 | "Job.Get"
                 | "Job.Watch"
                 | "Job.Cancel"
@@ -136,10 +138,33 @@ impl InstalledJobOperations {
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
+        history_runner: &MarketHistoryJobRunner,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
         let arguments = super::business_arguments(request.arguments());
         let content = match request.name() {
+            "Market.GetHistoryPreparation" | "Market.CancelHistoryPreparation" => {
+                let input: HistoryPreparationRequest = decode(&arguments)?;
+                let snapshot = self
+                    .history_snapshot(history_runner, &input, context)
+                    .await?;
+                let view = if request.name() == "Market.CancelHistoryPreparation" {
+                    self.cancel_generation(
+                        snapshot.id(),
+                        snapshot.generation(),
+                        JobEventSequence::new(
+                            input
+                                .expected_sequence
+                                .ok_or(ServiceError::InvalidRequest)?,
+                        ),
+                        history_runner,
+                    )
+                    .await?
+                } else {
+                    JobView::from_snapshot(&snapshot).map_err(map_application)?
+                };
+                encode(view)?
+            }
             "Job.ReconcileStart" | "Job.CancelStart" => {
                 let input: StartReconciliationRequest = decode(&arguments)?;
                 let binding = JobStartBinding::new(
@@ -206,16 +231,13 @@ impl InstalledJobOperations {
             "Job.Cancel" => {
                 let input: MutationRequest = decode(&arguments)?;
                 encode(
-                    self.application
-                        .cancel(
-                            parse_id(&input.job_id)?,
-                            parse_generation(input.generation)?,
-                            JobEventSequence::new(input.expected_sequence),
-                            super::runtime::current_timestamp()
-                                .map_err(|_error| ServiceError::Unavailable)?,
-                        )
-                        .await
-                        .map_err(map_application)?,
+                    self.cancel_generation(
+                        parse_id(&input.job_id)?,
+                        parse_generation(input.generation)?,
+                        JobEventSequence::new(input.expected_sequence),
+                        history_runner,
+                    )
+                    .await?,
                 )?
             }
             "Job.Confirm" => {
@@ -263,6 +285,67 @@ impl InstalledJobOperations {
             context.limits(),
         )
         .map_err(Into::into)
+    }
+
+    /// Applies the same durable cancellation and queued-input release for scoped and generic calls.
+    async fn cancel_generation(
+        &self,
+        id: JobId,
+        generation: JobGeneration,
+        expected: JobEventSequence,
+        history_runner: &MarketHistoryJobRunner,
+    ) -> Result<JobView, ServiceError> {
+        let view = self
+            .application
+            .cancel(
+                id,
+                generation,
+                expected,
+                super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?,
+            )
+            .await
+            .map_err(map_application)?;
+        if view.state().is_terminal() {
+            // After a durable cancellation, cleanup must not be skipped merely because its caller
+            // disconnected. The repository owns bounded IO; only queued input can be released.
+            let snapshot = self
+                .repository
+                .get(id, generation)
+                .await
+                .map_err(|_| ServiceError::Unavailable)?;
+            if history_runner.input(&snapshot).is_some() {
+                history_runner
+                    .release_terminal(&snapshot)
+                    .map_err(super::tool_services::map_research_admission)?;
+            }
+        }
+        Ok(view)
+    }
+
+    async fn history_snapshot(
+        &self,
+        runner: &MarketHistoryJobRunner,
+        input: &HistoryPreparationRequest,
+        context: &RequestContext,
+    ) -> Result<market_squawk_jobs::JobSnapshot, ServiceError> {
+        let origin = authenticated_origin(context)?;
+        let id = parse_id(&input.job_id)?;
+        let generation = parse_generation(input.generation)?;
+        let snapshot = tokio::select! {
+            biased;
+            _ = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+            _ = tokio::time::sleep_until(context.deadline().into()) => return Err(ServiceError::DeadlineExceeded),
+            result = self.repository.get(id, generation) => result.map_err(|error| match error {
+                market_squawk_jobs::JobRepositoryError::NotFound => ServiceError::NotFound,
+                _ => ServiceError::Unavailable,
+            })?,
+        };
+        if snapshot.spec().origin() != &origin
+            || !runner.belongs_to(&snapshot, &input.history_token)
+        {
+            return Err(ServiceError::Unauthorized);
+        }
+        Ok(snapshot)
     }
 
     pub(super) async fn start(
@@ -457,6 +540,15 @@ struct StartReconciliationRequest {
     request_id: Value,
     operation: SourceIdentifier,
     arguments_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct HistoryPreparationRequest {
+    history_token: String,
+    job_id: String,
+    generation: u64,
+    expected_sequence: Option<u64>,
 }
 
 #[derive(Deserialize)]
