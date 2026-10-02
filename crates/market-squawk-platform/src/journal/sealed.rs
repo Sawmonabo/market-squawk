@@ -551,7 +551,7 @@ impl RawStoreOwner {
 ///
 /// The retained filesystem lock prevents two store instances from racing publication or startup
 /// recovery. The mutation mutex serializes seals and recovery; immutable reads share a separate
-/// guard that excludes each bounded recovery turn without blocking seals or other reads.
+/// guard that excludes recovery mutations while permitting its read-only verification.
 /// Recovery checks live pins and fresh exact catalog membership before quarantining an object.
 #[derive(Debug)]
 pub struct SealedResearchJournalStore {
@@ -2224,6 +2224,56 @@ mod tests {
         let retained_claim = receipt.claim().clone();
         drop(reopened);
         drop(receipt);
+        let late_record = RawCaptureRecord::try_new_live(
+            Uuid::new_v4(),
+            Arc::from("research.fixture"),
+            Uuid::new_v4(),
+            Some(0),
+            None,
+            observed,
+            Bytes::from_static(br#"{"page":3}"#),
+        )?;
+        let late_receipt = store.seal(&[late_record])?;
+        let late_claim = late_receipt.claim().clone();
+        drop(late_receipt);
+        let mut late_membership_reads = 0;
+        struct RecoveryReadProbe<'a> {
+            store: &'a SealedResearchJournalStore,
+            claim: &'a super::SealedResearchJournalSegmentClaim,
+            hash_checks: std::cell::Cell<usize>,
+            mutation_checks: std::cell::Cell<usize>,
+        }
+        impl ResearchObjectControl for RecoveryReadProbe<'_> {
+            fn checkpoint(
+                &self,
+                point: ResearchObjectControlPoint,
+            ) -> Result<(), ResearchObjectControlError> {
+                if matches!(
+                    point,
+                    ResearchObjectControlPoint::BeforeVerificationChunk { .. }
+                ) {
+                    // A foreground exact read remains usable inside the recovery hashing turn.
+                    assert!(self.store.recovery_exclusion.try_read().is_some());
+                    self.store
+                        .verify_claim_with_control(self.claim, &Allow)
+                        .map_err(|_| ResearchObjectControlError::Unavailable)?;
+                    self.hash_checks.set(self.hash_checks.get() + 1);
+                } else if matches!(
+                    point,
+                    ResearchObjectControlPoint::BeforeRecoveryMutation { .. }
+                ) {
+                    assert!(self.store.recovery_exclusion.try_read().is_none());
+                    self.mutation_checks.set(self.mutation_checks.get() + 1);
+                }
+                Ok(())
+            }
+        }
+        let probe = RecoveryReadProbe {
+            store: &store,
+            claim: &retained_claim,
+            hash_checks: std::cell::Cell::new(0),
+            mutation_checks: std::cell::Cell::new(0),
+        };
         let mut recovery = store.begin_recovery()?;
         let mut quarantined = Vec::new();
         let mut retained = 0;
@@ -2231,9 +2281,28 @@ mod tests {
             let turn = recovery.advance(
                 &store,
                 SealedResearchRecoveryAdmission::try_new(1, 8)?,
-                &Allow,
+                &probe,
                 |_, digest| {
-                    Ok((digest == retained_claim.content_digest()).then(|| authoritative.clone()))
+                    if digest == late_claim.content_digest() {
+                        late_membership_reads += 1;
+                        // A commit between the optimistic lookup and mutation admission must
+                        // retain its exact evidence, not act on the earlier absence.
+                        assert_eq!(
+                            store.recovery_exclusion.try_read().is_none(),
+                            late_membership_reads == 2
+                        );
+                        return Ok((late_membership_reads == 2).then(|| {
+                            SealedResearchRawClaim::JournalSegment(late_claim.clone())
+                        }));
+                    }
+                    if digest == retained_claim.content_digest() {
+                        assert!(store.recovery_exclusion.try_read().is_some());
+                        store
+                            .verify_claim_with_control(&retained_claim, &Allow)
+                            .map_err(|_| ResearchObjectControlError::Unavailable)?;
+                        return Ok(Some(authoritative.clone()));
+                    }
+                    Ok(None)
                 },
             )?;
             quarantined.extend_from_slice(turn.report().quarantined_objects());
@@ -2246,7 +2315,11 @@ mod tests {
             quarantined,
             vec![orphan_claim.relative_reference().to_owned()]
         );
-        assert_eq!(retained, 1);
+        assert_eq!(retained, 2);
+        assert_eq!(late_membership_reads, 2);
+        assert!(probe.hash_checks.get() > 0);
+        assert_eq!(probe.mutation_checks.get(), 1);
+        store.verify_claim_with_control(&late_claim, &Allow)?;
         let receipt = store.verify_claim_with_control(&retained_claim, &Allow)?;
         assert_eq!(
             store.open_verified(&receipt)?.records()[0].payload(),

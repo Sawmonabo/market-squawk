@@ -46,21 +46,22 @@ impl AnalyticalDataService {
                     deadline,
                     cancellation: &token,
                 };
+                // Opening validates the endpoint and schema once. Each `read` below still
+                // starts a fresh transaction, including the final negative membership check.
+                let snapshot = manifests
+                    .read_snapshot(limits, deadline, &token)
+                    .map_err(map_market_recovery_catalog_error)?;
                 let mut catalog_failure = None;
                 let result = session.advance(
                     store,
                     SealedResearchRecoveryAdmission::default(),
                     &control,
                     |kind, digest| {
-                        // This read begins AFTER the platform pin check while publication/reopen is
-                        // excluded. A snapshot retained from before that check could miss a new commit.
-                        let result = manifests.read_snapshot(limits, deadline, &token).and_then(
-                            |snapshot| {
-                                snapshot.read(|snapshot| {
-                                    snapshot.authoritative_provider_raw_claim(kind, digest)
-                                })
-                            },
-                        );
+                        // Never retain a transaction between membership lookups: the platform
+                        // rechecks absence under mutation exclusion after its fresh pin check.
+                        let result = snapshot.read(|snapshot| {
+                            snapshot.authoritative_provider_raw_claim(kind, digest)
+                        });
                         match result {
                             Ok(claim) => Ok(claim),
                             Err(error) => {

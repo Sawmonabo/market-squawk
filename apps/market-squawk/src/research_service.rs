@@ -807,6 +807,24 @@ impl ResearchService {
             .await
     }
 
+    /// Runs complete retained-generation verification or indexing independently of compact
+    /// price and rights reads. Reuses the existing bulk owner and its interruption/shutdown
+    /// custody; the closure must not reacquire this lane or retain a ResearchService Arc.
+    pub(crate) async fn run_owned_research_generation_read<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.retained_generation_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
     /// Runs one synchronous operation and drains its admitted handle before returning on
     /// cancellation or deadline, keeping the caller's authority lease alive through completion.
     pub(crate) async fn run_owned_research_io_joined<T, F>(

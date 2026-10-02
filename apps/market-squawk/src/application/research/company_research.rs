@@ -280,14 +280,18 @@ impl CompanyResearchReadCapability {
         // The existing worker retains their owner through interruption; its closure holds
         // exact read capabilities, never the ResearchService or another read-lane permit.
         self.research
-            .run_owned_research_read(deadline, &cancellation, move |worker_cancellation| {
-                runtime.block_on(reader.select_by_identity(
-                    data_request,
-                    raw_store.as_ref(),
-                    deadline,
-                    worker_cancellation,
-                ))
-            })
+            .run_owned_research_generation_read(
+                deadline,
+                &cancellation,
+                move |worker_cancellation| {
+                    runtime.block_on(reader.select_by_identity(
+                        data_request,
+                        raw_store.as_ref(),
+                        deadline,
+                        worker_cancellation,
+                    ))
+                },
+            )
             .await
             .map_err(|error| match error {
                 crate::ResearchServiceError::Ingest(IngestError::Cancelled) => {

@@ -105,8 +105,9 @@ impl SealedResearchJournalStore {
     }
 }
 impl SealedResearchRecoverySession {
-    /// Advances one bounded turn. Membership must be read freshly after the live-pin check;
-    /// returning `None` authorizes orphan quarantine only while this turn owns store exclusion.
+    /// Advances one bounded turn. Verification permits immutable readers; only reconciliation
+    /// and quarantine exclude them. Negative membership is re-read after a fresh live-pin check
+    /// under exclusion before it can authorize quarantine.
     pub fn advance(
         &mut self,
         store: &SealedResearchJournalStore,
@@ -128,13 +129,10 @@ impl SealedResearchRecoverySession {
             .operation
             .try_lock()
             .map_err(|_| ResearchObjectControlError::Unavailable)?;
-        let _recovery = store
-            .recovery_exclusion
-            .try_write()
-            .ok_or(ResearchObjectControlError::Unavailable)?;
-        // Tuple fields drop in order: poison mutation on unwind before reopening the read
-        // barrier. Immutable readers validate that poison before issuing any authority.
-        let _exclusion = (_operation, _recovery);
+        // Keep seals and other recovery sessions serialized, but permit immutable readers
+        // during catalog lookup and hashing. Install the read barrier only around mutations.
+        // Tuple fields drop in order: poison mutation on unwind before reopening that barrier.
+        let mut exclusion = (_operation, None);
         store.validate_owner()?;
         let mut report = SealedResearchJournalRecoveryReport {
             quarantined_staging: Vec::new(),
@@ -148,6 +146,7 @@ impl SealedResearchRecoverySession {
         let mut inspected = 0;
         let mut hashed = 0;
         'work: loop {
+            drop(exclusion.1.take());
             match control.checkpoint(ResearchObjectControlPoint::BeforeRecoveryEntry {
                 inspected_entries: inspected,
             }) {
@@ -196,6 +195,16 @@ impl SealedResearchRecoverySession {
                     pending.hasher.clone().finalize().into(),
                 );
                 if pending.linked_stage {
+                    let Some(recovery) = store.recovery_exclusion.try_write() else {
+                        break;
+                    };
+                    exclusion.1 = Some(recovery);
+                    // A selected reopen may have acquired its pin during hashing.
+                    if store.owner.pinned(&pending.reference)? {
+                        self.hashing = None;
+                        continue;
+                    }
+                    pending.validate()?;
                     let disposition = store.reconcile_linked_stage(
                         pending.kind,
                         &pending.name,
@@ -214,6 +223,7 @@ impl SealedResearchRecoverySession {
                     if disposition == LinkedStageDisposition::Quarantined {
                         report.quarantined_staging.push(pending.name);
                     }
+                    drop(exclusion.1.take());
                 } else {
                     let pending = self
                         .hashing
@@ -272,6 +282,14 @@ impl SealedResearchRecoverySession {
                     })?;
                     match cap_fs_ext::MetadataExt::nlink(&metadata) {
                         1 => {
+                            let Some(recovery) = store.recovery_exclusion.try_write() else {
+                                self.pending_entry = Some(entry);
+                                break;
+                            };
+                            exclusion.1 = Some(recovery);
+                            if store.owner.pinned(&reference)? {
+                                continue;
+                            }
                             if let Err(error) = quarantine_stage_no_replace(
                                 &store.staging,
                                 &name,
@@ -337,14 +355,34 @@ impl SealedResearchRecoverySession {
                         if store.owner.pinned(&reference)? {
                             continue;
                         }
-                        let claim = match membership(kind, digest) {
+                        let mut claim = match membership(kind, digest) {
                             Ok(claim) => claim,
                             Err(error) => {
                                 self.pending_entry = Some(entry);
                                 return Err(error.into());
                             }
                         };
+                        if claim.is_none() {
+                            let Some(recovery) = store.recovery_exclusion.try_write() else {
+                                self.pending_entry = Some(entry);
+                                break;
+                            };
+                            exclusion.1 = Some(recovery);
+                            if store.owner.pinned(&reference)? {
+                                continue;
+                            }
+                            // The first absence was observed without excluding reopen/publication.
+                            // Only this fresh transaction after the pin check can authorize mutation.
+                            claim = match membership(kind, digest) {
+                                Ok(claim) => claim,
+                                Err(error) => {
+                                    self.pending_entry = Some(entry);
+                                    return Err(error.into());
+                                }
+                            };
+                        }
                         if let Some(claim) = claim {
+                            drop(exclusion.1.take());
                             let (claim_kind, claim_digest, size) = match &claim {
                                 SealedResearchRawClaim::JournalSegment(claim) => {
                                     super::super::validate_claim_shape(claim)?;

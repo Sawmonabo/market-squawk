@@ -2,7 +2,11 @@
 
 ## Current execution — 2026-10-02
 
-Pushed checkpoints: `f5d92426` retained dated quotes with unchanged fresh-mark eligibility;
+Pushed checkpoint `89eb2353` integrates financial preparation jobs, bounded facts storage/read,
+shared native/CLI/MCP commands and valid taxonomy graph admission. Critical data checks pass;
+actual first-page latency is still unresolved.
+
+Earlier pushed checkpoints: `f5d92426` retained dated quotes with unchanged fresh-mark eligibility;
 `78bcecc1` recent-first financial reports with stable cursors; `1537370a` bounded catalog writer
 admission; `7ac69488` stable chart refresh; `c0df3336` history normalization/runtime retirement.
 Actual MSFT 365-day history/OHLC reopens after service replacement. Native refresh retained all
@@ -11,8 +15,11 @@ September2026. Native quote shows retained bid493.86/ask545.98/last512.71 with o
 these are not current prices. Quote sizes are shown only where available. These focused outcomes
 do not establish complete V1 acceptance.
 
-One visible development supervisor(session37993/PID27544) owns Desktop/service, Vite, watcher
-and serialized single-job compilation. No agent builds or new branches/worktrees. Three local
+Development supervisor(session37993/PID27544) owns Desktop, Vite, watcher
+and serialized single-job compilation. Service98300 crashed during SEC activation; crash publication was moved to the existing owned
+ingest worker. Replacement build PASS7m21s; service6192/Desktop6236 now run. SEC session
+e54972b4-90ef-44b9-b4ac-407afe74e2c1 restored active_scoped; no duplicate Activate was sent. No duplicate
+Start/Activate is authorized without reconciling original state. No agent builds or new branches/worktrees. Three local
 branches, three origin branches plus origin/HEAD, one primary worktree last verified.
 Main/release and original recovery/session remain preserved.
 
@@ -33,9 +40,9 @@ MSFT financial failures are now separately evidenced:
 
 | Owner | Exact ownership/outcome | State / next dependency |
 | --- | --- | --- |
-| Lead | Shared contracts/jobs/service/CLI/MCP/native composition, source_authority.rs, Git/docs/build scheduling | Applied frozen read and taxonomy candidates together. Native build PASS7m19s(service98300/Desktop98348); graph and full facts/PIT checks PASS. Actual financial page still times out under background recovery; commit coherent storage/job checkpoint then apply recovery/routing candidates. |
-| Astra financial_pages | Candidate-only data sec_research.rs, pit/disk.rs and application research/company_research.rs | First candidate critical verified, native latency still fails. Candidate-only follow-up routes bulk reads through existing generation worker; shared research_service.rs and financial snapshot routing remain lead applied. No new worker/runtime. |
-| Astra startup_read_diagnosis | Candidate-only SEC xbrl/model.rs; separate suggested shared authority diff | Inspected candidate applied. Current SEC replacement Start completed using saved public contact. Candidate-only platform sealed_recovery.rs and existing sealed.rs regression plus data ingest/provider_capture_recovery.rs remove full-turn read exclusion and reuse catalog connection with fresh per-read transactions. No agent runtime/builds/Git. |
+| Lead | Shared contracts/jobs/service/CLI/MCP/native composition, source_authority.rs, Git/docs/build scheduling | Applied frozen read and taxonomy candidates together. Recovery/routing correction applied; both existing recovery critical cases PASS. Actual price/history remain usable; facts still exceed15s in logical index construction. One financial acquisition started after SEC status reconciliation; track exact original job. |
+| Astra financial_pages | Candidate-only data sec_research.rs, pit/disk.rs and application research/company_research.rs | Routing/publication-owner candidates integrated. Frozen candidate-only sec_research/{logical,indexed}.rs removes measured intermediate full-index reconstruction; lead inspecting before application, no deadline/cap raise. |
+| Astra startup_read_diagnosis | Candidate-only SEC xbrl/model.rs; separate suggested shared authority diff | Inspected candidate applied. Recovery correction integrated and critical verified. Separate read-only diagnosis of actual MSFT price display_projection invalid-result error; exact file ownership requested beforepatch. No agent runtime/builds/Git. |
 | Sol investment_profile_ui | InvestmentQuote presentation in investment-page.tsx | Compact dated quote layout types/live verified and pushed; ownership released. |
 | Sol financial_preparation_ui_resume | Chart/read/shared financial controls and existing UI journey case | Stable chart checkpoint pushed; financial terminal settlement integrated. Ownership released. |
 
@@ -51,13 +58,12 @@ cancellation1/1, retained facts/restart/corruption1/1(257rows), repeated submiss
 native lossless history/financial metadata1/1, company relationship/PIT/restart with writer wait1/1,
 Desktop types and three existing market/lookup/refresh journeys, facts clock1/1, full-parent1/1,
 recent-first cursor1/1, corrected large writer/PIT/reopen1/1, writer cancellation1/1 and retained
-quote/current-mark separation1/1. Read/taxonomy affected checks now pass. Financial-page live completion remains blocked by recovery/read contention.
+quote/current-mark separation1/1. Read/taxonomy affected checks now pass. Financial-page live completion remains blocked by logical index construction; the latest sample no longer shows recovery exclusion waiting.
 No per-task CI, broad release gate or whole-app RAM claim.
 
-Next barrier: integrate recovery/read routing correction, then time saved facts and inspect
-statements/ratios/filings and cursor navigation; rerun only affected critical verification;
-refresh SEC activation and reconcile one acquisition from known terminal state; commit/push
-coherent integration and update PR43. Complete stock analysis, installed lifecycle and V1
+Recovery/read routing and owned SEC publication are implemented and built; existing quarantine/read concurrency and logical recovery checks pass. The fresh financial job `053b2f82-bdd5-404d-9d06-7aafaaa96e30` failed acquisition with `InvalidTaxonomySet`; service6192 survived, and no duplicate job was started.
+
+Next barrier: integrate the frozen two-file streaming logical-reader correction, run existing large PIT/reopen and filing critical checks, then time native facts and inspect statements/ratios/filings and cursor navigation. Resolve the separately evidenced trade-depth rejection and remaining filing-schema failure. Commit/push coherent integration and update PR43. Complete stock analysis, installed lifecycle and V1
 acceptance remain open. A painted native chart is verified separately from canvas presence,
 which alone is insufficient when background macOS animation frames are suspended.
 

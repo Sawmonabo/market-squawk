@@ -1172,7 +1172,10 @@ impl SecFundamentalsApplicationBridge {
         )?
         .with_company_identity(company_identity)?
         .with_precommit_authority(precommit_authority);
-        let committed = self.research.ingest(ingest, cancellation.clone()).await?;
+        let committed = self
+            .research
+            .ingest_with_job_context(None, ingest, cancellation.clone(), deadline)
+            .await?;
         let original_binding = committed
             .original_binding_for_reobservation(restart.binding_digest)
             .unwrap_or(restart.binding_digest);
