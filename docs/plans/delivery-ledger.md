@@ -10,6 +10,16 @@ still unproved; SEC correction and selected adjusted-history acquisition remain 
 Evidence: `.agents/tmp/v1-first-stock/{retained-authorization-critical,investment-refresh-critical,
 investment-refresh-types}.log`. Live overview returned9/9 prices in26.01s, not an acceptable latency claim.
 
+Visible inspection checkpoint: same native83905 accepted embedded WebDriver script, selected
+MSFT navigation and WebView screenshot. During1200 focus samples, frontmost stayed loginwindow;
+no global activation/keystroke was used. This proves background WebView inspection here, not OS
+dialog behavior or a test with the owner actively typing. Existing launcher lifecycle PASS1/1,
+syntax check PASS and native build PASS. Evidence: `visible-investment{.png,-summary.json,-focus.log}`.
+Actual page: profile and previous close512.71USD load, open history returns unavailable, financial
+facts return operation_failed. Overview native15s request still times out even though CLI30s request
+returned9/9 in26.01s; record this as unresolved latency, not complete startup. Source correction and
+history producer/consumer batch remain required.
+
 Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop72244,
 service72187, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
 Lead applied the inspected SEC composite-budget correction, retained-event read authorization,
@@ -76,6 +86,18 @@ and cohesive `history-preparation.tsx`; Sol dev_launcher owns native
 start/reconciliation DTO before edits. Lead owns source application after backend/check barrier,
 CLI, committed-job notifications, shared contracts, integration checks and pushes. Viewport All
 means all saved history, not a fabricated unlimited provider request.
+
+Additional exact next-batch candidate ownership: Astra sec_automatic_resolution owns
+`crates/market-squawk-jobs/src/{repository.rs,repository/engine.rs,tests.rs}` and
+`apps/market-squawk/src/service/mod.rs` for committed-transition notification + owned relay.
+Sol listing_profile_reads owns only `apps/market-squawk/src/{cli.rs,local_product/cli_transport.rs}`
+for the three scoped history operations. Astra startup_read_diagnosis owns SEC adapter
+`{extraction.rs,client/contracts.rs}` for the confirmed canonical CompanyFacts capture and shared
+FilingXbrl helper correction. These remain candidate-only and cannot launch builds or touch Git.
+
+Read/refresh checkpoint pushed `e2b4589b`. Coordinator66579/PID83744 now owns service83866 and
+visible native83905 with the same workspace and explicit loopback WebDriver4445. Initial build
+reused outputs (1.19s). Old supervisor98843/PID89778 and its children exited cleanly first.
 
 Selected-history next dependency: Astra sec_automatic_resolution has frozen the preflight
 `history.rs`/`display_history.rs` plus `jobs/market_history.rs` candidate. Approved candidate-only

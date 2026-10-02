@@ -184,7 +184,8 @@ export class DevelopmentSupervisor {
     const command = this.commands[kind]?.(directory) ?? {
       program: path.join(directory, "bin", `market-squawk-${native ? "desktop" : "service"}${SUFFIX}`),
       args: native ? this.args : [...this.args.filter((_, index, all) =>
-        all[index] !== "--webdriver-port" && all[index - 1] !== "--webdriver-port"), "--development-control-stdin"],
+        all[index] !== "--webdriver-visible" && all[index] !== "--webdriver-port"
+        && all[index - 1] !== "--webdriver-port"), "--development-control-stdin"],
     };
     const record = ownedProcess(command.program, command.args, { cwd: this.root, env });
     record.stage = directory;
@@ -333,6 +334,7 @@ async function main() {
   const { values } = parseArgs({ options: {
     "data-dir": { type: "string" }, "installation-data-root": { type: "string" },
     "training-release-root": { type: "string" }, "webdriver-port": { type: "string" },
+    "webdriver-visible": { type: "boolean" },
   } });
   const args = [];
   for (const name of ["data-dir", "installation-data-root", "training-release-root"]) {
@@ -344,6 +346,10 @@ async function main() {
       throw new Error("--webdriver-port must be an integer from 1 to 65535.");
     }
     args.push("--webdriver-port", values["webdriver-port"]);
+  }
+  if (values["webdriver-visible"]) {
+    if (values["webdriver-port"] === undefined) throw new Error("--webdriver-visible requires --webdriver-port.");
+    args.push("--webdriver-visible");
   }
   const desktop = path.join(ROOT, "apps", "market-squawk-desktop");
   const config = JSON.parse(await readFile(path.join(desktop, "src-tauri", "tauri.conf.json"), "utf8"));

@@ -64,10 +64,14 @@ const DEVELOPMENT_MCP_RELAY_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY
 #[command(about = "Market Squawk Obsidian Signal desktop application")]
 #[command(version)]
 struct DesktopArgs {
-    /// Run the hidden native WebView with a loopback WebDriver endpoint (development only).
+    /// Run the native WebView with a loopback WebDriver endpoint (hidden by default; development only).
     #[cfg(all(debug_assertions, feature = "desktop-automation"))]
     #[arg(long, hide = true)]
     webdriver_port: Option<std::num::NonZeroU16>,
+    /// Keep the development WebDriver window visible with ordinary native startup behavior.
+    #[cfg(all(debug_assertions, feature = "desktop-automation"))]
+    #[arg(long, hide = true, requires = "webdriver_port")]
+    webdriver_visible: bool,
     /// Explicit local Market Squawk TOML configuration.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -265,7 +269,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let background_automation = {
         #[cfg(all(debug_assertions, feature = "desktop-automation"))]
         {
-            args.webdriver_port.is_some()
+            args.webdriver_port.is_some() && !args.webdriver_visible
         }
         #[cfg(not(all(debug_assertions, feature = "desktop-automation")))]
         {

@@ -323,13 +323,23 @@ target/debug/market-squawk-desktop --webdriver-port 4445 \
 ```
 
 The explicit port enables a loopback-only WebDriver endpoint, keeps the native window hidden and
-skips foreground activation. On macOS the application uses accessory activation policy. Standard
-WebDriver session, element, script and screenshot requests operate within the native WebView.
+skips foreground activation. On macOS this hidden mode uses accessory activation policy. To inspect
+the single visible development Desktop, add `--webdriver-visible` alongside `--webdriver-port`.
+Its initial launch follows normal visible startup and can take focus; subsequent standard WebDriver
+WebView requests do not use global keystrokes. The visibility option requires a port and is available
+only with the same development feature/debug configuration. Standard WebDriver session, element,
+script and screenshot requests operate within the native WebView.
+
+For coordinated development, pass both options to the existing `scripts/develop.mjs` invocation
+instead of starting an additional Desktop. An already running process without a port has no
+WebDriver endpoint to attach to; the lead must replace that single supervised instance before
+inspection. Two full Desktop processes cannot simultaneously compose the same workspace's
+exclusive MCP-registration receipt authority.
 Check `http://127.0.0.1:4445/status`, then create a session with `POST /session` and
 `{"capabilities":{"alwaysMatch":{}}}`. Delete the session when finished. Keep the endpoint local
 and stop the development process when the check is complete.
 
-The feature is off by default; the port option and plugin registration are compiled only with
+The feature is off by default; both options and plugin registration are compiled only with
 debug assertions. A feature-enabled development binary without the port follows normal visible
 startup. Release builds cannot activate this endpoint. Do not use an instrumented build for final
 whole-application resource acceptance. Background WebView interaction does not establish support
