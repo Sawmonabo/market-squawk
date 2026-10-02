@@ -969,7 +969,7 @@ impl ProviderAdapterActivation {
             .cloned()
             .ok_or(SecFundProductError::SetupRequired)?;
         self.onboarding
-            .try_acquire_runtime_mutation_authority()
+            .try_acquire_runtime_read_authority()
             .and_then(|authority| authority.require_active(&activation.lease))
             .map_err(|_| SecFundProductError::Unavailable)?;
         if self

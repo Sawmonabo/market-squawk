@@ -493,9 +493,26 @@ impl RetrievedCompanyFacts {
         &self.raw
     }
 
-    /// Returns the exact online Company Facts response material, or `None` for an offline import.
+    /// Returns exact online response material under the canonical Company Facts dataset.
+    /// Offline imports have no provider capture and return `None`.
     pub fn capture_material(&self) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
-        self.raw.capture_material()
+        let Some(transport) = self.raw.capture_material()? else {
+            return Ok(None);
+        };
+        let selection = crate::SecResearchDataset::company_facts(self.document.cik().as_str())?;
+        if self.raw.locator() != Some(selection.initial_provider_locator().as_str()) {
+            return Err(SecClientError::InvalidCaptureMaterial);
+        }
+        let original = transport.receipt();
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            original.source_id().clone(),
+            original.metadata_revision().clone(),
+            selection.dataset().clone(),
+            original.request_set_identity(),
+            original.terminal(),
+            original.pages().to_vec(),
+        )?;
+        provider_capture_material(receipt, self.raw.bytes().clone()).map(Some)
     }
 }
 
@@ -847,6 +864,126 @@ mod tests {
         validation_health_for_error,
     };
     use crate::SecParserError;
+
+    #[test]
+    fn online_company_facts_capture_binds_canonical_dataset_and_exact_transport()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{RetrievedCompanyFacts, RetrievedSecBytes, SecObjectLocator};
+        use crate::{CompanyFactsDocument, SecParserLimits, SecResearchDataset};
+        use bytes::Bytes;
+        use market_squawk_domain::{
+            DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
+            Timestamp,
+        };
+        use market_squawk_sources::{
+            ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+            ProviderCaptureTerminalDisposition, SourceObjectCaptureIdentity,
+        };
+        use sha2::{Digest as _, Sha256};
+
+        let bytes = include_bytes!("../../fixtures/company-facts.json");
+        let document = CompanyFactsDocument::parse(bytes, SecParserLimits::production_defaults())?;
+        let body_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into());
+        let received_at = Timestamp::from_unix_nanos(100);
+        let captured = |locator: &str| -> Result<RetrievedSecBytes, Box<dyn std::error::Error>> {
+            let request_identity = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(locator.as_bytes()).into(),
+            );
+            let page = ProviderCapturePageReceipt::try_new(
+                0,
+                request_identity,
+                None,
+                None,
+                200,
+                u64::try_from(bytes.len())?,
+                body_digest,
+                received_at,
+            )?;
+            let receipt = ProviderCaptureSetReceipt::try_new(
+                SourceId::try_from("sec-test")?,
+                MetadataRevision::new(SourceIdentifier::try_from("sec-test-v1")?),
+                SourceIdentifier::try_from(locator)?,
+                request_identity,
+                ProviderCaptureTerminalDisposition::StandaloneResponse,
+                vec![page],
+            )?;
+            Ok(RetrievedSecBytes::captured_online(
+                bytes.to_vec(),
+                body_digest,
+                received_at,
+                locator.to_owned(),
+                1,
+                receipt,
+            ))
+        };
+        let locator = SecObjectLocator::company_facts(document.cik().as_str())?;
+        let retrieved = RetrievedCompanyFacts {
+            document: document.clone(),
+            raw: captured(locator.url())?,
+        };
+        let transport = retrieved
+            .raw()
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        let material = retrieved
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        let expected = SecResearchDataset::company_facts(document.cik().as_str())?;
+        assert_eq!(material.receipt().dataset(), expected.dataset());
+        assert_eq!(transport.receipt().dataset().as_str(), locator.url());
+        assert_eq!(retrieved.raw().capture_receipt(), Some(transport.receipt()));
+        assert_eq!(
+            material.receipt().source_id(),
+            transport.receipt().source_id()
+        );
+        assert_eq!(
+            material.receipt().metadata_revision(),
+            transport.receipt().metadata_revision()
+        );
+        assert_eq!(
+            material.receipt().request_set_identity(),
+            transport.receipt().request_set_identity()
+        );
+        assert_eq!(material.receipt().pages(), transport.receipt().pages());
+        assert_eq!(material.records()[0].payload(), bytes);
+        assert!(
+            matches!(SourceObjectCaptureIdentity::try_from_capture(material.receipt())?,
+            SourceObjectCaptureIdentity::Paged { page_count,
+                terminal: ProviderCaptureTerminalDisposition::StandaloneResponse, .. }
+                if page_count.get() == 1)
+        );
+
+        let wrong_company = RetrievedCompanyFacts {
+            document: document.clone(),
+            raw: captured(SecObjectLocator::company_facts("0000789019")?.url())?,
+        };
+        assert!(matches!(
+            wrong_company.capture_material(),
+            Err(SecClientError::InvalidCaptureMaterial)
+        ));
+        let mut corrupted = retrieved.clone();
+        let mut corrupted_bytes = bytes.to_vec();
+        corrupted_bytes[0] ^= 1;
+        corrupted.raw.bytes = Bytes::from(corrupted_bytes);
+        assert!(matches!(
+            corrupted.capture_material(),
+            Err(SecClientError::ProviderCapture(_))
+        ));
+        let mut truncated = retrieved.clone();
+        truncated.raw.bytes = Bytes::copy_from_slice(&bytes[..bytes.len() - 1]);
+        assert!(matches!(
+            truncated.capture_material(),
+            Err(SecClientError::InvalidCaptureMaterial)
+        ));
+        let offline = RetrievedCompanyFacts {
+            document,
+            raw: RetrievedSecBytes::offline_import(bytes, body_digest, received_at),
+        };
+        assert!(offline.capture_material()?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn provider_statuses_fail_closed_into_distinct_extraction_health() {

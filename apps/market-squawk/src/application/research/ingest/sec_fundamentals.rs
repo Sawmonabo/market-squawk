@@ -294,6 +294,18 @@ impl SecFundamentalsCoordinatorClosure {
         if Instant::now() >= deadline {
             return Err(SecFundamentalsApplicationError::DeadlineExceeded);
         }
+        // Preserve the opaque adapter admission before extraction consumes its taxonomy graph.
+        // Only the small exact identifiers survive; no serialized filing identifier is reparsed.
+        let selection = handoff.dataset();
+        if selection.kind() != SecResearchDatasetKind::FilingXbrl
+            || handoff.capture_material().receipt().dataset() != selection.dataset()
+        {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        let provider_dataset = selection.dataset().clone();
+        let analytical_dataset =
+            DatasetId::try_from(selection.analytical_dataset_identifier()?.as_str())
+                .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?;
         let scratch = Arc::new(self.bridge.research.analytical().operation_scratch()?);
         let worker_scratch = Arc::clone(&scratch);
         let raw_store = self.bridge.research.provider_capture_store();
@@ -347,6 +359,18 @@ impl SecFundamentalsCoordinatorClosure {
             }
         };
         let (stream, material, objects, scratch) = extracted;
+        let object = stream.request().object();
+        let capture = material.receipt();
+        if object.dataset() != &provider_dataset
+            || capture.dataset() != &provider_dataset
+            || object.source_id() != self.source.metadata().source_id()
+            || object.metadata_revision() != self.source.metadata().revision()
+            || capture.source_id() != object.source_id()
+            || capture.metadata_revision() != object.metadata_revision()
+            || SourceObjectCaptureIdentity::try_from_capture(capture)? != object.capture_identity()
+        {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
         let (expectation, request) = material.into_whole_seal_parts();
         let sealed = self
             .bridge
@@ -363,6 +387,7 @@ impl SecFundamentalsCoordinatorClosure {
                 token, objects, &control,
             )?;
         Ok(SecFilingStreamHandoff {
+            analytical_dataset,
             stream,
             objects,
             receipt,
@@ -385,17 +410,13 @@ impl SecFundamentalsCoordinatorClosure {
         };
         precommit.validate_precommit()?;
         let SecFilingStreamHandoff {
+            analytical_dataset,
             mut stream,
             mut objects,
             receipt,
             _scratch,
         } = handoff;
         let source = self.source.metadata().clone();
-        let selection =
-            SecResearchDataset::try_from_identifier(stream.request().object().dataset())?;
-        let analytical_dataset =
-            DatasetId::try_from(selection.analytical_dataset_identifier()?.as_str())
-                .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?;
         let company_identity = stream.company_identity().clone();
         let total_records = stream.total_records();
         let mut content = None;
@@ -913,6 +934,7 @@ impl SecFundamentalsApplicationBridge {
 
 #[derive(Debug)]
 pub(crate) struct SecFilingStreamHandoff {
+    analytical_dataset: DatasetId,
     stream: SecFilingXbrlExtractionStream,
     objects: Vec<market_squawk_sources::SealedLogicalObjectInput>,
     receipt: SealedProviderCaptureSetReceipt,

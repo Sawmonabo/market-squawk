@@ -956,7 +956,7 @@ mod tests {
         let recent = include_bytes!("../fixtures/submissions-recent.json");
         let archive = include_bytes!("../fixtures/submissions-archive.json");
         let observed_at = Timestamp::from_unix_nanos(100);
-        let manifest = SubmissionsCompositeManifest {
+        let mut manifest = SubmissionsCompositeManifest {
             schema_version: "market-squawk-sec-submissions-composite-v1",
             cik: "0000320193".to_owned(),
             representations: vec![
@@ -980,16 +980,122 @@ mod tests {
         };
         let manifest_bytes = serde_json::to_vec(&manifest)?;
         let manifest_evidence = store.persist(&manifest_bytes)?;
+        // Exercise the production extraction limit selection, not standalone parser defaults:
+        // this exact component is larger than its manifest and must keep its own input scope.
+        assert!(recent.len() > manifest_bytes.len());
+        let request_for = |bytes: &[u8],
+                           evidence: EvidenceDigest,
+                           maximum: u64|
+         -> Result<
+            market_squawk_sources::ExtractionRequest,
+            Box<dyn std::error::Error>,
+        > {
+            use market_squawk_domain::{EffectiveInterval, ExactPayloadEvidence};
+            use market_squawk_sources::{DiscoveryRequest, ExtractionRequest, SourceObject};
+            use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+            let deadline = Timestamp::from_unix_nanos(i64::MAX);
+            let discovery = DiscoveryRequest::try_new(
+                SourceIdentifier::try_from("sec.submissions.cik.0000320193")?,
+                None,
+                NonZeroU16::try_from(1_u16)?,
+                deadline,
+            )?;
+            let object = SourceObject::try_new(
+                SourceId::try_from("sec-test")?,
+                MetadataRevision::new(SourceIdentifier::try_from("sec-test-v1")?),
+                &discovery,
+                SourceIdentifier::try_from("submissions-composite")?,
+                SourceIdentifier::try_from("application/json")?,
+                ExactPayloadEvidence::from_content_digest(evidence),
+                EffectiveInterval::new(observed_at, None)?,
+                None,
+                Some(u64::try_from(bytes.len())?),
+            )?;
+            Ok(ExtractionRequest::try_new(
+                object,
+                NonZeroU32::try_from(64_u32)?,
+                NonZeroU64::try_from(maximum)?,
+                deadline,
+            )?)
+        };
+        let request = request_for(&manifest_bytes, manifest_evidence, 1024 * 1024)?;
+        let limits = crate::extraction::request_parser_limits(
+            &request,
+            manifest_bytes.len(),
+            manifest_bytes.capacity(),
+        )?;
         let restored = restore_online_submissions(
             &store,
             &manifest_bytes,
             manifest_evidence,
             SecCompositeBounds::production_defaults(),
-            SecParserLimits::production_defaults(),
+            limits,
             &CancellationToken::new(),
         )?;
         assert_eq!(restored.document().filings().len(), 3);
         assert_eq!(restored.components().len(), 2);
+        assert_eq!(restored.components()[0].bytes().as_ref(), recent);
+        assert_eq!(restored.components()[1].bytes().as_ref(), archive);
+
+        // The same request-bound path still rejects aggregate retained exhaustion.
+        let tight_request = request_for(
+            &manifest_bytes,
+            manifest_evidence,
+            u64::try_from(manifest_bytes.capacity())? + 1,
+        )?;
+        let tight_limits = crate::extraction::request_parser_limits(
+            &tight_request,
+            manifest_bytes.len(),
+            manifest_bytes.capacity(),
+        )?;
+        assert!(matches!(
+            restore_online_submissions(
+                &store,
+                &manifest_bytes,
+                manifest_evidence,
+                SecCompositeBounds::production_defaults(),
+                tight_limits,
+                &CancellationToken::new(),
+            ),
+            Err(SecClientError::Parser(
+                SecParserError::RetainedOutputLimitExceeded
+            ))
+        ));
+        assert!(matches!(
+            restore_online_submissions(
+                &store,
+                &manifest_bytes,
+                manifest_evidence,
+                SecCompositeBounds::try_new(1, u64::try_from(recent.len() + archive.len())? - 1)?,
+                limits,
+                &CancellationToken::new(),
+            ),
+            Err(SecClientError::CompositeByteLimitExceeded)
+        ));
+
+        // A correctly hashed but malformed referenced body remains a parser failure.
+        let malformed = b"{";
+        manifest.representations[1].evidence = store.persist(malformed)?;
+        manifest.representations[1].size_bytes = u64::try_from(malformed.len())?;
+        let malformed_manifest = serde_json::to_vec(&manifest)?;
+        let malformed_evidence = store.persist(&malformed_manifest)?;
+        let malformed_request = request_for(&malformed_manifest, malformed_evidence, 1024 * 1024)?;
+        let malformed_limits = crate::extraction::request_parser_limits(
+            &malformed_request,
+            malformed_manifest.len(),
+            malformed_manifest.capacity(),
+        )?;
+        assert!(matches!(
+            restore_online_submissions(
+                &store,
+                &malformed_manifest,
+                malformed_evidence,
+                SecCompositeBounds::production_defaults(),
+                malformed_limits,
+                &CancellationToken::new(),
+            ),
+            Err(SecClientError::Parser(SecParserError::Json(_)))
+        ));
         Ok(())
     }
 

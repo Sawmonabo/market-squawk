@@ -447,6 +447,7 @@ impl SecEdgarSource {
                 child.cancel();
                 ExtractionSourceError::DeadlineExceeded
             })?
+            .inspect_err(|error| trace_protocol_failure(error, "discovery", dataset.kind()))
             .map_err(map_client_error)?;
             self.validate_authority(&authority)
                 .map_err(map_client_error)?;
@@ -546,6 +547,8 @@ impl SecEdgarSource {
             self.validate_authority(&authority)
                 .map_err(map_client_error)?;
             let remaining = deadline_remaining(request.deadline())?;
+            let family = SecResearchDataset::try_from_identifier(request.object().dataset())
+                .map(|dataset| dataset.kind());
             let worker_cancellation = cancellation.child_token();
             let worker_authority = authority.clone();
             let worker = self.run_validation_blocking(&worker_cancellation, move |worker_token| {
@@ -560,7 +563,11 @@ impl SecEdgarSource {
             tokio::pin!(worker);
             tokio::select! {
                 result = &mut worker => {
-                    let extracted = result.map_err(map_client_error)?;
+                    let extracted = result.inspect_err(|error| {
+                        if let Ok(family) = family {
+                            trace_protocol_failure(error, "extraction", family);
+                        }
+                    }).map_err(map_client_error)?;
                     self.validate_authority(&authority).map_err(map_client_error)?;
                     Ok(extracted)
                 },
@@ -1853,14 +1860,32 @@ fn observation_context(
     }
 }
 
-fn request_parser_limits(
+pub(crate) fn request_parser_limits(
     request: &ExtractionRequest,
     decoded_bytes: usize,
     decoded_capacity: usize,
 ) -> Result<SecParserLimits, SecClientError> {
+    let dataset = SecResearchDataset::try_from_identifier(request.object().dataset())
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    // A submissions manifest indexes separately verified current/archive bodies. Admit those
+    // bodies against the remaining request budget, not the small manifest's encoded length.
+    // Filing XBRL calls the family-agnostic helper directly with its opaque admitted dataset.
+    let decoded_limit = if dataset.kind() == SecResearchDatasetKind::Submissions {
+        usize::try_from(
+            request
+                .max_bytes()
+                .min(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES),
+        )
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?
+        .checked_sub(decoded_capacity)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(SecClientError::ResponseTooLarge)?
+    } else {
+        decoded_bytes
+    };
     request_parser_limits_with_record_limit(
         request,
-        decoded_bytes,
+        decoded_limit,
         decoded_capacity,
         usize::try_from(request.max_records())
             .map_err(|_| SecClientError::InvalidCompositeRepresentation)?,
@@ -1911,6 +1936,115 @@ fn deadline_remaining(
         u64::try_from(remaining)
             .map(Duration::from_nanos)
             .map_err(|_| ExtractionSourceError::DeadlineExceeded)
+    }
+}
+
+// Static categories retain the concrete rejection while excluding JSON/XML text, URLs,
+// contact declarations and transport errors that can contain request data.
+fn trace_protocol_failure(
+    error: &SecClientError,
+    stage: &'static str,
+    family: SecResearchDatasetKind,
+) {
+    let category = match error {
+        SecClientError::Parser(error) => match error {
+            SecParserError::Cancelled => return,
+            SecParserError::InvalidLimits => "parser_invalid_limits",
+            SecParserError::ByteLimitExceeded => "parser_byte_limit_exceeded",
+            SecParserError::DepthLimitExceeded => "parser_depth_limit_exceeded",
+            SecParserError::StringLimitExceeded => "parser_string_limit_exceeded",
+            SecParserError::RecordLimitExceeded => "parser_record_limit_exceeded",
+            SecParserError::NodeLimitExceeded => "parser_node_limit_exceeded",
+            SecParserError::ByteCountOverflow => "parser_byte_count_overflow",
+            SecParserError::AllocationFailed => "parser_allocation_failed",
+            SecParserError::AllocationAuthorityPoisoned => "parser_allocation_authority_poisoned",
+            SecParserError::RetainedOutputLimitExceeded => "parser_retained_output_limit_exceeded",
+            SecParserError::DuplicateKey => "parser_duplicate_key",
+            SecParserError::InvalidNumber => "parser_invalid_number",
+            SecParserError::MissingField => "parser_missing_field",
+            SecParserError::WrongType => "parser_wrong_type",
+            SecParserError::ColumnLengthMismatch => "parser_column_length_mismatch",
+            SecParserError::InvalidCik => "parser_invalid_cik",
+            SecParserError::InvalidAccession => "parser_invalid_accession",
+            SecParserError::InvalidCompanionName => "parser_invalid_companion_name",
+            SecParserError::InvalidCompanionCoverage => "parser_invalid_companion_coverage",
+            SecParserError::InvalidConcept => "parser_invalid_concept",
+            SecParserError::InvalidDate => "parser_invalid_date",
+            SecParserError::InvalidTimestamp => "parser_invalid_timestamp",
+            SecParserError::InvalidPeriod => "parser_invalid_period",
+            SecParserError::InvalidFiscalContext => "parser_invalid_fiscal_context",
+            SecParserError::InvalidDecimal => "parser_invalid_decimal",
+            SecParserError::NonNumericCompanyFact => "parser_non_numeric_company_fact",
+            SecParserError::ConflictingAccession => "parser_conflicting_accession",
+            SecParserError::InvalidCompanyMetadata => "parser_invalid_company_metadata",
+            SecParserError::MetadataAssociationLengthMismatch => {
+                "parser_metadata_association_length_mismatch"
+            }
+            SecParserError::DuplicateMetadataAssociation => "parser_duplicate_metadata_association",
+            SecParserError::ConflictingMetadataAssociation => {
+                "parser_conflicting_metadata_association"
+            }
+            SecParserError::Json(_) => "parser_json",
+            SecParserError::Identity(_) => "parser_identity",
+            SecParserError::FilingForm(_) => "parser_filing_form",
+            SecParserError::Time(_) => "parser_time",
+        },
+        SecClientError::Normalization(error) => match error {
+            SecNormalizationError::Xbrl(_) => "normalization_xbrl",
+            SecNormalizationError::Cancelled => return,
+            SecNormalizationError::IngestedBeforeReceived => {
+                "normalization_ingested_before_received"
+            }
+            SecNormalizationError::InvalidXbrlDataset => "normalization_invalid_xbrl_dataset",
+            SecNormalizationError::XbrlDocumentBindingMismatch => {
+                "normalization_xbrl_document_binding_mismatch"
+            }
+            SecNormalizationError::PublicationAfterReceipt => {
+                "normalization_publication_after_receipt"
+            }
+            SecNormalizationError::RevisionOverflow => "normalization_revision_overflow",
+            SecNormalizationError::AllocationFailed => "normalization_allocation_failed",
+            SecNormalizationError::FundamentalContext(_) => "normalization_fundamental_context",
+            SecNormalizationError::PublicationAfterIngestion => {
+                "normalization_publication_after_ingestion"
+            }
+            SecNormalizationError::Identity(_) => "normalization_identity",
+            SecNormalizationError::Provenance(_) => "normalization_provenance",
+            SecNormalizationError::Research(_) => "normalization_research",
+        },
+        SecClientError::CompanyIdentity(_) => "company_identity",
+        SecClientError::Xbrl(_) => "xbrl",
+        SecClientError::RevisionAuthority(_) => "revision_authority",
+        SecClientError::ProviderCapture(_) => "provider_capture",
+        SecClientError::RawCapture(_) => "raw_capture",
+        SecClientError::RegistrationMismatch => "registration_mismatch",
+        SecClientError::ResponseCikMismatch => "response_cik_mismatch",
+        SecClientError::InvalidCaptureMaterial => "invalid_capture_material",
+        SecClientError::InvalidCompositeRepresentation => "invalid_composite_representation",
+        SecClientError::InvalidCompanionSet => "invalid_companion_set",
+        _ => return,
+    };
+    let family = match family {
+        SecResearchDatasetKind::Submissions => "submissions",
+        SecResearchDatasetKind::CompanyFacts => "company_facts",
+        SecResearchDatasetKind::FilingXbrl => "filing_xbrl",
+    };
+    if let SecClientError::Parser(SecParserError::Json(error)) = error {
+        tracing::warn!(
+            stage,
+            family,
+            category,
+            line = error.line(),
+            column = error.column(),
+            "SEC extraction rejected retained input"
+        );
+    } else {
+        tracing::warn!(
+            stage,
+            family,
+            category,
+            "SEC extraction rejected retained input"
+        );
     }
 }
 

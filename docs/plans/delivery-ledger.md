@@ -2,6 +2,24 @@
 
 ## Current execution — 2026-10-02
 
+Current SEC checkpoint: native build86475 PASS5m28s; supervisor83744 now owns service88641
+and visible Desktop88695. The three existing adapter cases pass individually: composite restore,
+canonical CompanyFacts capture/transport binding and streamed XBRL cancellation. Exact logs:
+`sec-{composite-budget,company-capture,filing-stream}-critical.log`. Live activation advanced past
+the corrected parser/capture boundary but fails Catalog(EvidenceConflict); financial rendering
+is not live verified. Preserve captured evidence and diagnose the exact conflicting publication.
+
+Current remaining ownership (candidate-only; no competing Cargo): Astra startup_read_diagnosis
+owns diagnosis of that live SEC catalog conflict, with no source edits yet. Astra financial_pages
+owns request-scoped retained-event read batching in application `paper/market.rs`,
+`research/ingest/crypto_market.rs`, data `ingest/market_event_read.rs`, `manifest/catalog.rs`, and
+existing `tests/publication_recovery.rs`. Sol financial_detail_ui owns the frozen history renderer
+transport/chart/preparation candidate; Sol dev_launcher closes native management-visibility and
+unnecessary Source-notification questions. Lead integrates the completed history runner/contracts,
+job notifications, CLI/native and renderer as one producer-to-consumer checkpoint, backend first.
+Live 9-stock selection remains15.59–26.01s; native15s latency, real adjusted chart and financials
+remain required. No completion inferred from the focused adapter checks.
+
 Accepted read/refresh checkpoint: backend build78707 PASS6m19s; current service82279/Desktop82321.
 Existing retained-event publication/restart case PASS1/1 (8.82s), covering current grants under
 writer contention, renewal, denied scope/revocation, cancellation and restart. Desktop types PASS;
