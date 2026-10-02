@@ -2,6 +2,19 @@
 
 ## Current execution — 2026-10-02
 
+Matched market projection is implemented and critically verified: independent retained quote/trade
+components, qualified supplied quote sizes, exact backend change with dated completed-close basis,
+and matched closed Desktop/native descriptors. Single-job development build PASS (7m52s),
+Desktop typecheck PASS, existing destination validation and complete market journey PASS. Existing
+saved-valuation and paired macro-cutoff checks PASS; the latter's stale 13-indicator count and
+source-order assertion were aligned with its existing 15 indicators and category-grouped screen.
+The market journey assertion now includes the accessible comparison-basis description. No new
+test targets. Logs `market-projection-{types,ui-critical,journey-critical}.log` and
+`readable-dates-{critical,macro-critical}.log` preserve intermediate failures and final outcomes.
+Native replacement and real MSFT quote/filing verification are next; no live closure yet.
+
+Readable-date checkpoint `27f8ac03` is pushed; PR43 evidence comment5962343253.
+
 Readable date presentation is implemented and live verified on the existing native MSFT page:
 the selected history period now displays Aug 24/25, 2026 with local EDT times, financial reporting
 dates remain their original calendar dates, and no raw nanosecond strings appear in those labels.

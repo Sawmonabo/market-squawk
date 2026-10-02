@@ -1,3 +1,4 @@
+import { formatProductTimestamp } from "@/lib/time"
 import { RefreshButton } from "@/components/ui/refresh-button"
 import { useState } from "react"
 import { useQuery, useQueryClient, useIsFetching } from "@tanstack/react-query"
@@ -15,7 +16,7 @@ import type { ProductTransport } from "@/lib/transport"
 import { MarketHistoryRead } from "./market-history-read"
 import { InvestmentProfile } from "./investment-profile"
 import { InvestmentFinancials } from "./investment-financials"
-import { marketAvailabilityLabel, marketPriceBasisLabel, marketSelectionTokenSchema, parseMarketInstrumentResult, type MarketProductRow } from "./market-product"
+import { marketAvailabilityLabel, marketChangeDescription, marketPriceBasisLabel, marketSelectionTokenSchema, parseMarketInstrumentResult, type MarketProductRow } from "./market-product"
 
 export function InvestmentPage() {
   const product = useProduct()
@@ -97,8 +98,8 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
             <p className="font-mono text-2xl tabular-nums">{row?.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
             <RefreshButton label="Refresh investment" refreshing={pageReads > 0} onClick={refresh} />
           </div>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row ? <> · <PercentageChange value={row.changePercent} /></> : null}</p>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : "Availability not established"}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row ? <> · <PercentageChange value={row.changePercent} description={marketChangeDescription(row)} /></> : null}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{formatProductTimestamp(row.asOf)}</time> : "Availability not established"}</p>
         </section>
       </div>
       <div className="mt-1 min-h-5 text-xs leading-5">
@@ -137,14 +138,15 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
 function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverified: boolean }) {
   const quote = row.quote
   const price = (value: string | null) => value === null || quote === null ? "Unavailable" : formatMoney({ amount: value, currency: quote.currency })
-  const size = (value: string | null) => value === null ? "Unavailable" : groupDecimal(value)
+  const size = (value: string | null, sourceUnits = false) => value === null ? "Unavailable"
+    : `${groupDecimal(value)}${sourceUnits ? " (unit unconfirmed)" : ""}`
   return <section className="border-t border-border pt-3" aria-label="Quote and last trade">
     <h2 className="sr-only">Quote and last trade</h2>
     {quote === null ? <p className="text-sm text-muted-foreground">Bid, ask and trade information is not available for this investment yet.</p> : <>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
         {([
-          ["Bid", price(quote.bidPrice), "Bid size", size(quote.bidSize)],
-          ["Ask", price(quote.askPrice), "Ask size", size(quote.askSize)],
+          ["Bid", price(quote.bidPrice), "Bid size", size(quote.bidSize, quote.quoteSizeBasis === "source_units")],
+          ["Ask", price(quote.askPrice), "Ask size", size(quote.askSize, quote.quoteSizeBasis === "source_units")],
           ["Midpoint", price(quote.midPrice), null, null],
           ["Last trade", price(quote.lastPrice), "Trade size", size(quote.lastSize)],
         ] as const).map(([label, value, sizeLabel, sizeValue]) => <div key={label} className="min-w-0">
@@ -159,9 +161,9 @@ function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverifie
       {quote.tradeStatus === "ambiguous" ? <p role="status" className="mt-3 text-xs text-muted-foreground">Several trades share the latest timestamp, so a single last trade cannot be established. Bid and ask are shown separately when available.</p> : null}
       <div className="mt-2 grid gap-x-4 gap-y-1 text-xs leading-5 text-muted-foreground sm:grid-cols-2">
         <p>Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
-          {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{new Date(quote.quoteObservedAt).toLocaleString()}</time></> : null}</p>
+          {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{formatProductTimestamp(quote.quoteObservedAt)}</time></> : null}</p>
         <p>Last trade: {unverified ? "freshness not checked" : quote.lastFresh ? "current at last check" : "not current"}
-          {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{new Date(quote.lastObservedAt).toLocaleString()}</time></> : null}</p>
+          {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{formatProductTimestamp(quote.lastObservedAt)}</time></> : null}</p>
       </div>
     </>}
   </section>

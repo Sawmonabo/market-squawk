@@ -151,6 +151,9 @@ struct DurableMarketRouteEvidence {
     venue_id: VenueId,
     selections: Vec<MarketEventPointInTimeReceipt>,
     trade_status: TradeStatus,
+    // Only retained Display assembly may combine independently acquired event families.
+    // Each revision remains the original acquisition authority, never a renewal of its clocks.
+    retained_metadata: Option<Vec<SourceMetadata>>,
     display_authorizations: Vec<Arc<market_squawk_data::AuthorizedMarketEventUse>>,
 }
 
@@ -216,6 +219,7 @@ impl DurableMarketRouteEvidence {
         instrument_id: InstrumentId,
         venue_id: VenueId,
         mut selections: Vec<MarketEventPointInTimeReceipt>,
+        retained_metadata: Option<Vec<SourceMetadata>>,
     ) -> Result<Option<Self>, ServiceError> {
         let invalid = |stage: &'static str| {
             tracing::warn!(
@@ -279,6 +283,28 @@ impl DurableMarketRouteEvidence {
                         != coordinate.connection_generation()
                 {
                     return Err(invalid("candidate_identity_or_provenance"));
+                }
+                if let Some(retained_metadata) = &retained_metadata {
+                    let original = retained_metadata
+                        .iter()
+                        .find(|metadata| {
+                            metadata.revision() == provenance.binding().metadata_revision()
+                        })
+                        .ok_or_else(|| invalid("component_metadata_missing"))?;
+                    let live = original
+                        .coverage()
+                        .live()
+                        .ok_or_else(|| invalid("component_live_coverage_missing"))?;
+                    if original.source_id() != &source_id
+                        || original.provider() != metadata.provider()
+                        || original.authorization().basis()
+                            != provenance.binding().authorization_basis()
+                        || live.provider_product() != provenance.binding().provider_product()
+                        || live.provider_channel() != provenance.binding().provider_channel()
+                        || !original.is_effective_at(provenance.received_at())
+                    {
+                        return Err(invalid("component_acquisition_authority"));
+                    }
                 }
             }
             retained_event_status(
@@ -349,15 +375,20 @@ impl DurableMarketRouteEvidence {
             }
         }
         selections.retain(|receipt| {
-            receipt.selection().sources()[0]
-                .tied_candidates()
-                .iter()
-                .all(|candidate| {
-                    same_durable_cohort(
-                        market_event_provenance(candidate.event()).binding(),
-                        &cohort_binding,
-                    )
-                })
+            (retained_metadata.is_some()
+                && matches!(
+                    receipt.selection().request().event_kind(),
+                    LiveEventClass::Quote | LiveEventClass::Trade
+                ))
+                || receipt.selection().sources()[0]
+                    .tied_candidates()
+                    .iter()
+                    .all(|candidate| {
+                        same_durable_cohort(
+                            market_event_provenance(candidate.event()).binding(),
+                            &cohort_binding,
+                        )
+                    })
         });
         let trade_status = selections
             .iter()
@@ -386,6 +417,7 @@ impl DurableMarketRouteEvidence {
             venue_id,
             selections,
             trade_status,
+            retained_metadata,
             display_authorizations: Vec::new(),
         };
         if route.evidence_candidate().is_some() {
@@ -471,9 +503,7 @@ impl DurableMarketRouteEvidence {
         &self,
         candidate: &ProviderMarketEventSelectedCandidate,
     ) -> Option<Timestamp> {
-        if self.display_authorizations.is_empty() {
-            return None;
-        }
+        let authorization = self.display_authorization(candidate)?;
         let provenance = market_event_provenance(candidate.event());
         if matches!(
             provenance.recorded_quality(),
@@ -484,7 +514,8 @@ impl DurableMarketRouteEvidence {
         ) {
             return None;
         }
-        let policy = self.metadata.freshness_policy();
+        let metadata = self.component_metadata(candidate)?;
+        let policy = metadata.freshness_policy();
         let mut until = provenance
             .source_timestamp()?
             .checked_add_nanos(i64::try_from(policy.max_source_age_nanos()).ok()?)
@@ -496,20 +527,103 @@ impl DurableMarketRouteEvidence {
                     .ok()?,
             );
         for deadline in [
-            self.metadata
-                .authorization()
-                .inclusive_authorization_deadline(),
-            self.metadata.coverage().inclusive_coverage_deadline(),
+            metadata.authorization().inclusive_authorization_deadline(),
+            metadata.coverage().inclusive_coverage_deadline(),
         ]
         .into_iter()
         .flatten()
         {
             until = until.min(deadline);
         }
-        for authorization in &self.display_authorizations {
-            until = until.min(authorization.expires_at().checked_sub_nanos(1).ok()?);
-        }
+        until = until.min(authorization.expires_at().checked_sub_nanos(1).ok()?);
         (candidate.coordinate().origin_committed_at() <= until).then_some(until)
+    }
+
+    fn component_metadata(
+        &self,
+        candidate: &ProviderMarketEventSelectedCandidate,
+    ) -> Option<&SourceMetadata> {
+        let revision = market_event_provenance(candidate.event())
+            .binding()
+            .metadata_revision();
+        match &self.retained_metadata {
+            Some(metadata) => metadata
+                .iter()
+                .find(|metadata| metadata.revision() == revision),
+            None => (self.metadata.revision() == revision).then_some(&self.metadata),
+        }
+    }
+
+    fn display_authorization(
+        &self,
+        candidate: &ProviderMarketEventSelectedCandidate,
+    ) -> Option<&market_squawk_data::AuthorizedMarketEventUse> {
+        let receipt = self.selections.iter().find(|receipt| {
+            receipt.selection().request().event_kind() == candidate.coordinate().event_kind()
+        })?;
+        let coordinate = candidate.coordinate();
+        self.display_authorizations
+            .iter()
+            .find(|authorization| {
+                authorization.research_use() == market_squawk_data::ResearchUse::Display
+                    && authorization.admits_event(
+                        receipt.selection().commit(),
+                        coordinate.publication().digest(),
+                        coordinate.publication_row_ordinal(),
+                        coordinate.canonical_event_digest(),
+                    )
+            })
+            .map(Arc::as_ref)
+    }
+
+    /// Saved presentation is governed by current exact-row Display permits. Original live
+    /// authorization still bounds freshness, but its expiry does not revoke retained use.
+    fn display_rights(
+        &self,
+        operations: MarketOperationSet,
+        reference_at: Timestamp,
+    ) -> Result<MarketSurfaceRightsPolicy, ServiceError> {
+        if self.retained_metadata.is_none() {
+            return surface_rights(&self.metadata, operations, reference_at);
+        }
+        if operations != presentation_surface_operations()? {
+            return Err(ServiceError::Unauthorized);
+        }
+        let mut decided_at = None;
+        let mut expires_at = None;
+        for candidate in self
+            .selections
+            .iter()
+            .flat_map(|receipt| receipt.selection().sources())
+            .flat_map(|source| source.tied_candidates())
+        {
+            let authorization = self
+                .display_authorization(candidate)
+                .ok_or(ServiceError::Unauthorized)?;
+            decided_at = Some(
+                decided_at.map_or(authorization.evaluated_at(), |at: Timestamp| {
+                    at.max(authorization.evaluated_at())
+                }),
+            );
+            expires_at = minimum_optional_timestamp(expires_at, Some(authorization.expires_at()));
+        }
+        let decided_at = decided_at.ok_or(ServiceError::Unauthorized)?;
+        let expires_at = expires_at.ok_or(ServiceError::Unauthorized)?;
+        if reference_at < decided_at || reference_at >= expires_at {
+            return Err(ServiceError::Unauthorized);
+        }
+        MarketSurfaceRightsPolicy::try_admitted(
+            self.metadata.revision().as_source_identifier().clone(),
+            operations,
+            decided_at,
+            decided_at,
+            Some(
+                expires_at
+                    .checked_sub_nanos(1)
+                    .map_err(|_| ServiceError::InvalidResult)?,
+            ),
+        )
+        .map_err(|_| ServiceError::InvalidResult)
     }
 
     fn display_current_through(&self) -> Option<Timestamp> {
@@ -1271,7 +1385,7 @@ async fn load_retained_display_evidence(
         publication: EvidenceDigest,
         source: SourceId,
         coordinates: Vec<market_squawk_data::ProviderMarketEventSelectionCoordinate>,
-        routes: Vec<usize>,
+        components: Vec<(usize, LiveEventClass)>,
     }
     let mut use_groups: Vec<DisplayUseGroup> = Vec::new();
     for (route, instrument, record, count) in pending {
@@ -1295,51 +1409,52 @@ async fn load_retained_display_evidence(
         if unavailable {
             continue;
         }
-        let Some(latest) = selections
-            .iter()
-            .flat_map(|receipt| receipt.selection().sources())
-            .flat_map(|source| source.tied_candidates())
-            .max_by_key(|candidate| durable_cohort_recency_key(candidate))
-        else {
-            continue;
-        };
-        let provenance = market_event_provenance(latest.event());
-        let Some(metadata) = research
-            .analytical()
-            .retained_source_metadata(
-                provenance.binding().source_id(),
-                provenance.binding().metadata_revision(),
-                reference_at,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .map_err(map_durable_market_ingest_error)?
-        else {
-            continue;
-        };
-        if !metadata.is_effective_at(reference_at) {
-            continue;
-        }
-        let surface = SourceIdentifier::try_from(route.source_surface().as_str())
-            .map_err(|_| ServiceError::InvalidResult)?;
-        let Some(evidence) = DurableMarketRouteEvidence::try_new(
-            surface,
-            metadata,
-            route.source_surface().clone(),
-            *instrument,
-            route.venue_id().clone(),
-            selections,
-        )?
-        else {
-            continue;
-        };
-        let mut denied = false;
-        for receipt in &evidence.selections {
-            for candidate in receipt.selection().sources()[0].tied_candidates() {
+        let mut retained_metadata: Vec<SourceMetadata> = Vec::new();
+        let mut admitted_selections = Vec::new();
+        let mut denied_book = false;
+        for receipt in selections {
+            let mut denied = false;
+            for candidate in receipt
+                .selection()
+                .sources()
+                .iter()
+                .flat_map(|source| source.tied_candidates())
+            {
                 let provenance = market_event_provenance(candidate.event());
+                let revision = provenance.binding().metadata_revision();
+                if !retained_metadata
+                    .iter()
+                    .any(|metadata| metadata.revision() == revision)
+                {
+                    if let Some(metadata) = research
+                        .analytical()
+                        .retained_source_metadata(
+                            provenance.binding().source_id(),
+                            revision,
+                            reference_at,
+                            context.deadline(),
+                            context.cancellation(),
+                        )
+                        .map_err(map_durable_market_ingest_error)?
+                    {
+                        retained_metadata.push(metadata);
+                    } else {
+                        tracing::warn!(source_id = %route.source_surface(), %instrument,
+                            event_kind = ?candidate.coordinate().event_kind(),
+                            "retained market component original metadata is unavailable");
+                        denied = true;
+                        break;
+                    }
+                }
                 // Retrieval authority applies at receipt; a retained closing quote may
                 // describe an observation from before this authorization began.
-                if !evidence.metadata.is_effective_at(provenance.received_at()) {
+                if !retained_metadata.iter().any(|metadata| {
+                    metadata.revision() == revision
+                        && metadata.is_effective_at(provenance.received_at())
+                }) {
+                    tracing::warn!(source_id = %route.source_surface(), %instrument,
+                        event_kind = ?candidate.coordinate().event_kind(),
+                        "retained market component was received outside its original authority");
                     denied = true;
                     break;
                 }
@@ -1350,6 +1465,9 @@ async fn load_retained_display_evidence(
                 };
                 if let Some(reference) = native_reference {
                     if reference.definition_digest() != record.revision_digest() {
+                        tracing::warn!(source_id = %route.source_surface(), %instrument,
+                            event_kind = ?candidate.coordinate().event_kind(),
+                            "retained market component reference revision does not match the selected instrument");
                         denied = true;
                         break;
                     }
@@ -1362,13 +1480,53 @@ async fn load_retained_display_evidence(
                     )?;
                 }
             }
-            if denied {
-                break;
+            if !denied {
+                admitted_selections.push(receipt);
+            } else if matches!(
+                receipt.selection().request().event_kind(),
+                LiveEventClass::BookSnapshot | LiveEventClass::BookDelta
+            ) {
+                denied_book = true;
             }
         }
-        if denied {
-            continue;
+        if denied_book {
+            admitted_selections.retain(|receipt| {
+                !matches!(
+                    receipt.selection().request().event_kind(),
+                    LiveEventClass::BookSnapshot | LiveEventClass::BookDelta
+                )
+            });
         }
+        let Some(latest) = admitted_selections
+            .iter()
+            .flat_map(|receipt| receipt.selection().sources())
+            .flat_map(|source| source.tied_candidates())
+            .max_by_key(|candidate| durable_cohort_recency_key(candidate))
+        else {
+            continue;
+        };
+        let latest_revision = market_event_provenance(latest.event())
+            .binding()
+            .metadata_revision();
+        let metadata = retained_metadata
+            .iter()
+            .find(|metadata| metadata.revision() == latest_revision)
+            .cloned()
+            .ok_or(ServiceError::InvalidResult)?;
+        let surface = SourceIdentifier::try_from(route.source_surface().as_str())
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let Some(evidence) = DurableMarketRouteEvidence::try_new(
+            surface,
+            metadata,
+            route.source_surface().clone(),
+            *instrument,
+            route.venue_id().clone(),
+            admitted_selections,
+            Some(retained_metadata),
+        )?
+        else {
+            continue;
+        };
         let route_index = routes.len();
         for receipt in &evidence.selections {
             for candidate in receipt.selection().sources()[0].tied_candidates() {
@@ -1393,7 +1551,7 @@ async fn load_retained_display_evidence(
                             publication,
                             source: source.clone(),
                             coordinates: Vec::new(),
-                            routes: Vec::new(),
+                            components: Vec::new(),
                         });
                         use_groups.len() - 1
                     }
@@ -1402,8 +1560,9 @@ async fn load_retained_display_evidence(
                 if !group.coordinates.contains(coordinate) {
                     group.coordinates.push(coordinate.clone());
                 }
-                if !group.routes.contains(&route_index) {
-                    group.routes.push(route_index);
+                let component = (route_index, receipt.selection().request().event_kind());
+                if !group.components.contains(&component) {
+                    group.components.push(component);
                 }
             }
         }
@@ -1412,11 +1571,11 @@ async fn load_retained_display_evidence(
     if results.next().is_some() {
         return Err(ServiceError::InvalidResult);
     }
-    let mut denied = vec![false; routes.len()];
+    let mut denied = vec![Vec::new(); routes.len()];
     for DisplayUseGroup {
         commit,
         coordinates,
-        routes: members,
+        components: members,
         ..
     } in use_groups
     {
@@ -1461,15 +1620,31 @@ async fn load_retained_display_evidence(
                     && system_timestamp()? < authorization.expires_at() =>
             {
                 let authorization = Arc::new(authorization);
-                for index in members {
-                    routes[index]
+                for (index, _) in members {
+                    if !routes[index]
                         .display_authorizations
-                        .push(Arc::clone(&authorization));
+                        .iter()
+                        .any(|existing| Arc::ptr_eq(existing, &authorization))
+                    {
+                        routes[index]
+                            .display_authorizations
+                            .push(Arc::clone(&authorization));
+                    }
                 }
             }
             Ok(_) | Err(ServiceError::Unauthorized) => {
-                for index in members {
-                    denied[index] = true;
+                for (index, event_kind) in members {
+                    tracing::warn!(source_id = %routes[index].source_id,
+                        instrument_id = %routes[index].instrument_id, ?event_kind,
+                        "retained market component has no current Display-use permit");
+                    denied[index].push(event_kind);
+                    if matches!(
+                        event_kind,
+                        LiveEventClass::BookSnapshot | LiveEventClass::BookDelta
+                    ) {
+                        denied[index]
+                            .extend([LiveEventClass::BookSnapshot, LiveEventClass::BookDelta]);
+                    }
                 }
             }
             Err(error) => return Err(error),
@@ -1478,7 +1653,34 @@ async fn load_retained_display_evidence(
     let routes = routes
         .into_iter()
         .zip(denied)
-        .filter_map(|(route, denied)| (!denied).then_some(route))
+        .filter_map(|(mut route, denied)| {
+            route
+                .selections
+                .retain(|receipt| !denied.contains(&receipt.selection().request().event_kind()));
+            if denied.contains(&LiveEventClass::Trade) {
+                route.trade_status = TradeStatus::Unavailable;
+            }
+            // A rejected component must not withhold another family's independent permission.
+            route.display_authorizations.retain(|authorization| {
+                route.selections.iter().any(|receipt| {
+                    receipt
+                        .selection()
+                        .sources()
+                        .iter()
+                        .flat_map(|source| source.tied_candidates())
+                        .any(|candidate| {
+                            let coordinate = candidate.coordinate();
+                            authorization.admits_event(
+                                receipt.selection().commit(),
+                                coordinate.publication().digest(),
+                                coordinate.publication_row_ordinal(),
+                                coordinate.canonical_event_digest(),
+                            )
+                        })
+                })
+            });
+            route.evidence_candidate().is_some().then_some(route)
+        })
         .collect();
     DurableMarketEvidenceSet::try_new(sources, routes, expected)
 }
@@ -1539,6 +1741,7 @@ async fn load_durable_route_evidence(
         route.instrument(),
         route.venue().clone(),
         selections,
+        None,
     ) {
         Ok(route) => Ok(route),
         Err(ServiceError::ResourceExhausted) => Err(ServiceError::ResourceExhausted),
@@ -2347,4 +2550,95 @@ fn system_timestamp() -> Result<Timestamp, ServiceError> {
         .timestamp_nanos_opt()
         .map(Timestamp::from_unix_nanos)
         .ok_or(ServiceError::Internal)
+}
+
+/// Extends the real Alpaca capture/publication fixture through retained product assembly.
+#[cfg(test)]
+pub(crate) async fn assert_retained_quote_trade_components(
+    research: &Arc<crate::ResearchService>,
+    record: &MarketDataInstrumentRecord,
+    trade_metadata: &SourceMetadata,
+    quote_metadata: &SourceMetadata,
+    trade_source_at: Timestamp,
+    quote_source_at: Timestamp,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let instrument = record.definition().instrument_id();
+    let context = RequestContext::new(
+        market_squawk_services::RequestId::try_string("retained-component-fixture")?,
+        tokio_util::sync::CancellationToken::new(),
+        Instant::now() + std::time::Duration::from_secs(30),
+        market_squawk_services::ServiceLimits::try_new(
+            4096,
+            8,
+            4096,
+            8,
+            market_squawk_services::JsonStructureLimits::try_new(16, 4096, 64, 64)?,
+        )?,
+    );
+    // The explicit read horizon crosses original acquisition expiry without sleeping or
+    // changing any stored clock. Independently admitted retained permits cover this horizon.
+    let reference_at = trade_metadata
+        .authorization()
+        .effective_interval()
+        .ends_at()
+        .ok_or("fixture must exercise expired acquisition authority")?;
+    assert!(!trade_metadata.is_effective_at(reference_at));
+    let evidence = load_retained_display_evidence(
+        research,
+        std::slice::from_ref(record),
+        &[instrument],
+        reference_at,
+        &context,
+    )
+    .await?;
+    assert_eq!(evidence.routes.len(), 1);
+    let route = &evidence.routes[0];
+    assert_eq!(route.trade_status, TradeStatus::Available);
+    let trade = route
+        .candidate(LiveEventClass::Trade)
+        .ok_or("missing independently retained trade")?;
+    let quote = route
+        .candidate(LiveEventClass::Quote)
+        .ok_or("missing independently retained quote")?;
+    assert_eq!(durable_candidate_effective_at(trade), trade_source_at);
+    assert_eq!(durable_candidate_effective_at(quote), quote_source_at);
+    assert!(trade_source_at > quote_source_at);
+    assert!(durable_cohort_recency_key(quote) > durable_cohort_recency_key(trade));
+    assert_eq!(route.component_metadata(trade), Some(trade_metadata));
+    assert_eq!(route.component_metadata(quote), Some(quote_metadata));
+    assert!(!quote_metadata.is_effective_at(market_event_provenance(trade.event()).received_at()));
+    for candidate in [trade, quote] {
+        assert!(route.display_authorization(candidate).is_some());
+        assert!(
+            route
+                .display_fresh_until(candidate)
+                .is_none_or(|until| until < reference_at)
+        );
+    }
+    assert!(matches!(trade.event(), MarketEvent::MarketDataTrade(trade)
+        if trade.price().amount() == rust_decimal::Decimal::new(51271, 2)
+            && trade.quantity() == rust_decimal::Decimal::new(2, 0)));
+    route.display_rights(presentation_surface_operations()?, reference_at)?;
+    assert!(
+        route
+            .display_rights(
+                MarketOperationSet::try_new(&[MarketOperation::PaperDecision])?,
+                reference_at
+            )
+            .is_err()
+    );
+    let runtime = DurableMarketRouteEvidence::try_new(
+        route.surface_id.clone(),
+        quote_metadata.clone(),
+        route.source_id.clone(),
+        instrument,
+        route.venue_id.clone(),
+        route.selections.clone(),
+        None,
+    )?
+    .ok_or("missing runtime quote cohort")?;
+    assert!(runtime.candidate(LiveEventClass::Quote).is_some());
+    assert!(runtime.candidate(LiveEventClass::Trade).is_none());
+    assert!(runtime.display_authorizations.is_empty());
+    Ok(())
 }

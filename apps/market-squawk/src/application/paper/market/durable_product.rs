@@ -251,7 +251,6 @@ impl MarketDomainService {
                 .product_retained_rows(&records, &missing, reference_at, limits, context)
                 .await?;
             let fallback_count = missing.len();
-            let mut close_instruments = Vec::new();
             for instrument_id in missing {
                 let retained_row = retained
                     .iter()
@@ -259,64 +258,43 @@ impl MarketDomainService {
                 let row_index = rows
                     .iter()
                     .position(|row| row_instrument(row) == Some(instrument_id));
-                let mut row =
-                    if let Some(retained) = retained_row.filter(|row| has_current_price(row)) {
-                        retained.clone()
-                    } else {
-                        row_index
-                            .map(|index| rows[index].clone())
-                            .or_else(|| retained_row.cloned())
-                            .unwrap_or_else(|| {
-                                json!({"instrumentId": instrument_id.to_string(),
+                // The retained projection includes independently admitted quote/trade
+                // components. An older runtime row must not hide those observations.
+                let row = retained_row
+                    .cloned()
+                    .or_else(|| row_index.map(|index| rows[index].clone()))
+                    .unwrap_or_else(|| {
+                        json!({"instrumentId": instrument_id.to_string(),
                             "currentPrice": Value::Null, "availability": "unavailable"})
-                            })
-                    };
-                if !has_current_price(&row) {
-                    // Keep the original quote, depth and market clocks when a completed close
-                    // supplies the compact card's price. A close never becomes a live quote.
-                    if let Some(retained) = retained_row {
-                        if row.get("quote").is_none_or(|quote| quote.is_null())
-                            || row.get("availability").and_then(Value::as_str)
-                                == Some("unavailable")
-                        {
-                            row = retained.clone();
-                        }
-                    }
-                    close_instruments.push(instrument_id);
-                }
+                    });
                 if let Some(index) = row_index {
                     rows[index] = row;
                 } else {
                     rows.push(row);
                 }
             }
-            if !close_instruments.is_empty() {
-                progress.enter("previous_close", None);
-                let closes = match self
-                    .previous_close_product_rows(
-                        &records,
-                        &close_instruments,
-                        reference_at,
-                        context,
-                    )
-                    .await
-                {
-                    Ok(closes) => closes,
-                    Err(ServiceError::Unavailable | ServiceError::Unauthorized) => Vec::new(),
-                    Err(error) => return Err(error),
-                };
-                for close in closes {
-                    let instrument = row_instrument(&close).ok_or(ServiceError::InvalidResult)?;
-                    let row = rows
-                        .iter_mut()
-                        .find(|row| row_instrument(row) == Some(instrument))
-                        .ok_or(ServiceError::InvalidResult)?;
-                    row["currentPrice"] = close["currentPrice"].clone();
-                    row["availability"] = close["availability"].clone();
-                }
-            }
             progress.fallback_completed += fallback_count;
         }
+        // Fresh prices need the same admitted completed-session baseline as fallback cards.
+        // Read the whole selected page once; raw snapshot bars are never close authority.
+        progress.enter("previous_close", None);
+        let closes = match self
+            .previous_close_product_rows(&records, &instrument_ids, reference_at, context)
+            .await
+        {
+            Ok(closes) => closes,
+            Err(ServiceError::Unavailable | ServiceError::Unauthorized) => Vec::new(),
+            Err(error @ (ServiceError::Cancelled | ServiceError::DeadlineExceeded)) => {
+                return Err(error);
+            }
+            Err(error) => {
+                // A supplemental baseline failure cannot revoke independently admitted
+                // quote/trade evidence. The failed close supplies neither fallback nor change.
+                tracing::warn!(request_id = ?context.request_id(), ?error,
+                    "supplementary previous close unavailable for product market read");
+                Vec::new()
+            }
+        };
         // Other instruments may have required retained reads after the actor snapshot.
         // Keep its observation details, but never return an expired observation as current.
         let projected_at = system_timestamp()?;
@@ -345,6 +323,16 @@ impl MarketDomainService {
             {
                 row["currentPrice"] = Value::Null;
                 row["availability"] = json!("stale");
+            }
+            if let Some(close) = closes
+                .iter()
+                .find(|close| row_instrument(close) == row_instrument(row))
+            {
+                row["previousClose"] = close["previousClose"].clone();
+                if !has_current_price(row) {
+                    row["currentPrice"] = close["currentPrice"].clone();
+                    row["availability"] = close["availability"].clone();
+                }
             }
         }
         progress.enter("page_projection", None);
@@ -434,6 +422,14 @@ impl MarketDomainService {
                     "currency": close.currency().as_str(),
                     "observedAt": timestamp_value(close.session_close()),
                     "currentThrough": timestamp_value(close.session_close())},
+                "previousClose": {
+                    "instrumentId": instrument_id.to_string(),
+                    "value": close.close().amount().normalize().to_string(),
+                    "currency": close.currency().as_str(),
+                    "sessionDate": close.native_date().to_string(),
+                    "asOf": timestamp_value(close.session_close()),
+                    "adjustment": "raw",
+                },
             }));
         }
         Ok(rows)
@@ -653,7 +649,7 @@ impl MarketDomainService {
                     &route.metadata,
                     *asset_class,
                     operations,
-                    surface_rights(&route.metadata, operations, selected_at)?,
+                    route.display_rights(operations, selected_at)?,
                 )?;
             }
             if route

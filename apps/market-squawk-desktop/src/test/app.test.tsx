@@ -417,13 +417,18 @@ const marketOverviewRow = {
   priceBasis: "last_trade",
   priceCurrentThrough: "2026-08-09T14:30:05.000000000Z",
   quote: {
-    currency: "USD", bidPrice: "68000.1", bidSize: "2", askPrice: "68000.2", askSize: "3",
+    quoteSizeBasis: "quantity", currency: "USD", bidPrice: "68000.1", bidSize: "2", askPrice: "68000.2", askSize: "3",
     midPrice: "68000.15", lastPrice: "68000.15", lastSize: "0.5", tradeStatus: "available",
     quoteObservedAt: marketObservedAt, lastObservedAt: marketObservedAt,
     quoteCurrentThrough: "2026-08-09T14:30:05.000000000Z", lastCurrentThrough: "2026-08-09T14:30:05.000000000Z",
     quoteFresh: true, lastFresh: true,
   },
   changePercent: "1.25",
+  changeBasis: {
+    priceBasis: "last_trade", priceAsOf: marketObservedAt, adjustment: "raw",
+    previousClose: { value: "67160.64197530864197530864197531", currency: "USD", sessionDate: "2026-08-08", asOf: "2026-08-08T20:00:00.000000000Z" },
+  },
+  changeUnavailableReason: null,
   asOf: marketObservedAt,
   availability: "current",
 } satisfies MarketProductRow
@@ -1113,6 +1118,7 @@ describe("Market Squawk desktop boundary", () => {
               if (holdInstrumentRead) await new Promise<void>((resolve) => { resolveInstrument = resolve })
               return marketResult({
                 ...marketOverviewRow, historyToken, priceBasis: "bid_ask_midpoint",
+                changeBasis: { ...marketOverviewRow.changeBasis, priceBasis: "bid_ask_midpoint" },
                 quote: { ...marketOverviewRow.quote, tradeStatus: "ambiguous", lastPrice: null, lastSize: null,
                   lastObservedAt: null, lastCurrentThrough: null, lastFresh: false },
               })
@@ -1201,7 +1207,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(quote.queryByText("0.5")).toBeNull()
     const investmentPrice = within(screen.getByRole("region", { name: "Investment price" }))
     expect(investmentPrice.getByText(/^Bid\/ask midpoint · Current/)).toBeTruthy()
-    expect(investmentPrice.getByText("Gain: +1.25%")).toBeTruthy()
+    expect(investmentPrice.getByText(/^Gain: \+1\.25% Compared with/)).toBeTruthy()
     expect(
       issuedQueries.some((request) => request.query === "marketOverview"),
     ).toBe(true)
@@ -1373,12 +1379,12 @@ describe("Market Squawk desktop boundary", () => {
     if (!(macroSection instanceof HTMLElement)) {
       throw new Error("The economic context is absent")
     }
-    expect(within(macroSection).getByText("13 of 13 available")).toBeTruthy()
+    expect(within(macroSection).getByText(`${macroIndicatorDefinitions.length} of ${macroIndicatorDefinitions.length} available`)).toBeTruthy()
     expect(
       within(macroSection)
         .getAllByRole("heading", { level: 4 })
-        .map((heading) => heading.textContent),
-    ).toEqual(macroIndicatorDefinitions.map(([, label]) => label))
+        .map((heading) => heading.textContent).sort(),
+    ).toEqual(macroIndicatorDefinitions.map(([, label]) => label).sort())
 
     fireEvent.change(within(macroSection).getByLabelText("What was known by"), {
       target: { value: "2026-08-26T15:00:00Z" },

@@ -1,4 +1,6 @@
 import { z } from "zod"
+import { formatCalendarDate } from "@/lib/time"
+import { formatMoney } from "@/lib/formatters"
 
 import type { ApplicationResult } from "@/lib/schemas"
 
@@ -25,6 +27,7 @@ const moneySchema = z.object({
 }).strict()
 
 const marketQuoteSchema = z.object({
+  quoteSizeBasis: z.enum(["quantity", "source_units"]),
   currency: z.string().regex(/^[A-Z]{3}$/),
   bidPrice: exactDecimalSchema.nullable(),
   bidSize: exactDecimalSchema.nullable(),
@@ -59,9 +62,20 @@ export const marketProductRowSchema = z.object({
   priceCurrentThrough: productInstantSchema.nullable(),
   quote: marketQuoteSchema.nullable(),
   changePercent: exactDecimalSchema.nullable(),
+  changeBasis: z.object({
+    priceBasis: z.enum(["last_trade", "bid_ask_midpoint"]),
+    priceAsOf: productInstantSchema,
+    previousClose: moneySchema.extend({ sessionDate: z.iso.date(), asOf: productInstantSchema }).strict(),
+    adjustment: z.literal("raw"),
+  }).strict().nullable(),
+  changeUnavailableReason: z.enum(["current_price_unavailable", "previous_close_unavailable", "incompatible_basis", "arithmetic_unavailable"]).nullable(),
   asOf: productInstantSchema.nullable(),
   availability: z.enum(["current", "delayed", "previous_close", "unavailable"]),
 }).strict().superRefine((row, context) => {
+  if ((row.changePercent === null) !== (row.changeBasis === null)
+    || (row.changePercent === null) !== (row.changeUnavailableReason !== null)) {
+    context.addIssue({ code: "custom", message: "Price change needs its dated comparison or a reason it is unavailable." })
+  }
   if ((row.price === null) !== (row.priceBasis === null)) {
     context.addIssue({ code: "custom", message: "A displayed price requires its basis." })
   }
@@ -186,5 +200,19 @@ export function marketPriceBasisLabel(row: MarketProductRow): string | null {
     case "bid_ask_midpoint": return "Bid/ask midpoint"
     case "previous_close": return "Previous close"
     case null: return null
+  }
+}
+
+export function marketChangeDescription(row: MarketProductRow): string {
+  if (row.changeBasis) {
+    const { previousClose } = row.changeBasis
+    return `Compared with the ${formatCalendarDate(previousClose.sessionDate)} completed close of ${formatMoney({ amount: previousClose.value, currency: previousClose.currency })}.`
+  }
+  switch (row.changeUnavailableReason) {
+    case "current_price_unavailable": return "A current price is needed to calculate change from the previous close."
+    case "previous_close_unavailable": return "The previous completed close is not available yet."
+    case "incompatible_basis": return "The available price and completed close cannot be compared on the same basis."
+    case "arithmetic_unavailable": return "Price change could not be calculated from the available values."
+    case null: return "Price change is unavailable."
   }
 }

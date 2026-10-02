@@ -742,6 +742,22 @@ Projection reads use endpoint-bound WAL snapshots; only publication uses the cat
 This is display evidence, never fresh-price execution authority; reading a page does not initiate
 provider acquisition. Automatic preparation/update acceptance remains tracked in the ledger.
 
+Retained quote and trade display can combine independently acquired components. Each keeps its
+original metadata revision, observation clocks and exact publication identity; current retained-use
+permission is checked separately for each component. Expired acquisition credentials do not erase
+permitted saved evidence or renew its market freshness. Coherent book and execution selection retain
+their original single-session requirements. Percentage change is calculated in Rust from a qualified
+current component and an admitted raw completed close, with both dates returned; missing or
+incompatible inputs remain explicit rather than becoming zero.
+
+Quote-size interpretation is endpoint/feed/date specific. As checked on 2026-10-02, Alpaca's
+[stock stream schema](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data#quotes) labels
+sizes as round lots, while its [2025-10-30 CTA/UTP notice](https://docs.alpaca.markets/us/changelog/marketdata-bid-and-ask-size-display-change)
+changes consolidated sizes to shares without explicitly resolving direct IEX. Until that contract
+is established, retained IEX sizes are displayed unchanged with an unconfirmed-unit label. They are
+neither omitted as missing nor converted using an assumed lot multiplier, and convey no sizing or
+execution authority.
+
 Current-price presentation uses one selected page of live display snapshots. Only instruments
 without an eligible snapshot price query retained market routes, using the page's existing canonical
 definitions and fresh Display authorization. Financial analysis keeps its separate analytical

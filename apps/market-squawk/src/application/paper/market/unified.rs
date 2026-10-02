@@ -1923,6 +1923,7 @@ fn instrument_row(
 const MAXIMUM_PRODUCT_DEPTH_LEVELS: usize = 64;
 
 struct ProductQuote {
+    quote_size_basis: &'static str,
     trade_status: TradeStatus,
     bid_price: Option<String>,
     bid_size: Option<String>,
@@ -1944,6 +1945,7 @@ impl ProductQuote {
         let trade_available = self.trade_status == TradeStatus::Available;
         json!({
             "tradeStatus": self.trade_status.as_str(),
+            "quoteSizeBasis": self.quote_size_basis,
             "bidPrice": self.bid_price,
             "bidSize": self.bid_size,
             "askPrice": self.ask_price,
@@ -2079,6 +2081,7 @@ fn product_display_symbol(
 
 fn empty_product_quote() -> ProductQuote {
     ProductQuote {
+        quote_size_basis: "quantity",
         trade_status: TradeStatus::Unavailable,
         bid_price: None,
         bid_size: None,
@@ -2128,6 +2131,7 @@ fn product_quote(
                 .transpose()?;
             let trade = view.stream.last_trade();
             Ok(ProductQuote {
+                quote_size_basis: "quantity",
                 trade_status: if trade.is_some() {
                     TradeStatus::Available
                 } else {
@@ -2184,6 +2188,7 @@ fn product_quote(
             let bid_price = bid.map(|value| value.price().value());
             let ask_price = ask.map(|value| value.price().value());
             Ok(ProductQuote {
+                quote_size_basis: "quantity",
                 trade_status: if trade.is_some() {
                     TradeStatus::Available
                 } else {
@@ -2242,6 +2247,7 @@ fn product_quote(
                 .map(|level| decimal_price_with_terms(level.price(), terms))
                 .transpose()?;
             Ok(ProductQuote {
+                quote_size_basis: "quantity",
                 trade_status: TradeStatus::Unavailable,
                 bid_price: bid_price.map(|value| value.normalize().to_string()),
                 bid_size: bid
@@ -2262,6 +2268,16 @@ fn product_quote(
                 last_fresh: false,
             })
         }
+    }
+}
+
+fn native_quote_size(size: &market_squawk_domain::MarketDataQuoteSize) -> Option<String> {
+    match size {
+        market_squawk_domain::MarketDataQuoteSize::UnresolvedUnit(value) => {
+            Some(value.normalize().to_string())
+        }
+        market_squawk_domain::MarketDataQuoteSize::Absent
+        | market_squawk_domain::MarketDataQuoteSize::Null => None,
     }
 }
 
@@ -2289,7 +2305,10 @@ fn durable_product_quote(
                     .ask()
                     .map(|side| native_money_price(side.price(), definition.quote_currency()))
                     .transpose()?;
-                // Native quote size remains explicitly unresolved; never claim shares/lots.
+                // Retain supplied values without inventing shares or a lot multiplier.
+                result.quote_size_basis = "source_units";
+                result.bid_size = quote.bid().and_then(|side| native_quote_size(side.size()));
+                result.ask_size = quote.ask().and_then(|side| native_quote_size(side.size()));
             }
             MarketEvent::Quote(quote) => {
                 if let Some(executable) = definition.executable {
@@ -2468,8 +2487,12 @@ mod product_quote_tests {
         };
         // The source can provide quotes, but a selected trade/status never gains book depth.
         assert_eq!(
-            capabilities(ObservationTiming::RealTime, None, MarketCoverage::SingleVenue)?
-                .depth(),
+            capabilities(
+                ObservationTiming::RealTime,
+                None,
+                MarketCoverage::SingleVenue
+            )?
+            .depth(),
             None,
         );
         assert_eq!(
@@ -2492,11 +2515,19 @@ mod product_quote_tests {
             );
         }
         assert_eq!(
-            capabilities(ObservationTiming::Delayed, None, MarketCoverage::SingleVenue),
+            capabilities(
+                ObservationTiming::Delayed,
+                None,
+                MarketCoverage::SingleVenue
+            ),
             Err(ServiceError::InvalidResult),
         );
         assert_eq!(
-            capabilities(ObservationTiming::RealTime, None, MarketCoverage::Consolidated),
+            capabilities(
+                ObservationTiming::RealTime,
+                None,
+                MarketCoverage::Consolidated
+            ),
             Err(ServiceError::InvalidResult),
         );
         let usd = Currency::try_from("USD")?;
@@ -2509,6 +2540,16 @@ mod product_quote_tests {
             Err(ServiceError::InvalidResult)
         );
         let mut quote = empty_product_quote();
+        quote.quote_size_basis = "source_units";
+        quote.bid_size = native_quote_size(
+            &market_squawk_domain::MarketDataQuoteSize::UnresolvedUnit(Decimal::from(40)),
+        );
+        assert_eq!(quote.value()["bidSize"], "40");
+        assert_eq!(quote.value()["quoteSizeBasis"], "source_units");
+        assert_eq!(
+            native_quote_size(&market_squawk_domain::MarketDataQuoteSize::Null),
+            None
+        );
         quote.trade_status = TradeStatus::Available;
         quote.midpoint = Some(value.normalize().to_string());
         quote.last_price = Some("125".to_owned());

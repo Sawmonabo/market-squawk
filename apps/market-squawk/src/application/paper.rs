@@ -8,6 +8,8 @@ pub(crate) use backup::{
 };
 mod equity;
 mod market;
+#[cfg(test)]
+pub(crate) use market::assert_retained_quote_trade_components;
 pub(crate) use equity::EquityPaperServices;
 use equity::PaperMarketPurpose;
 mod product;

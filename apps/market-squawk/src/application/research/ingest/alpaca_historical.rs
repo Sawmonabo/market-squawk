@@ -2443,39 +2443,61 @@ mod tests {
             at,
         )?;
         let history = fixture_metadata(21, HttpRequestBounds::default())?;
-        let config = AlpacaIexLiveConfig::try_new(
-            SourceId::try_from("alpaca-live-reconnect-test")?,
-            RevisionBoundPayloadEvidence::new(
-                MetadataRevision::new(SourceIdentifier::try_from("alpaca-live-reconnect-v1")?),
-                exact_evidence(61),
+        let make_config = |revision: &str,
+                           authorization|
+         -> Result<AlpacaIexLiveConfig, Box<dyn std::error::Error>> {
+            Ok(AlpacaIexLiveConfig::try_new(
+                SourceId::try_from("alpaca-live-reconnect-test")?,
+                RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from(revision)?),
+                    exact_evidence(61),
+                ),
+                authorization,
+                exact_evidence(62),
+                original.effective_interval(),
+                vec![
+                    AlpacaInstrumentMapping::try_new(
+                        "AAPL".to_owned(),
+                        original.instrument_id(),
+                        AssetClass::Equity,
+                    )?
+                    .try_with_native_identity(native.clone())?,
+                ],
+                history.freshness_policy(),
+                history
+                    .budget_policy()
+                    .ok_or("missing fixture budget")?
+                    .clone(),
+                AlpacaTransportLimits::try_new(
+                    1024 * 1024,
+                    Duration::from_secs(5),
+                    Duration::from_secs(10),
+                )?,
+            )?)
+        };
+        let acquisition_expiry = at.checked_add_nanos(60_000_000_000)?;
+        let mut config = make_config(
+            "alpaca-live-reconnect-v1",
+            AuthorizationGrant::new(
+                history.authorization().mode(),
+                history.authorization().basis().clone(),
+                history.authorization().evidence().clone(),
+                EffectiveInterval::new(at, Some(acquisition_expiry))?,
             ),
-            history.authorization().clone(),
-            exact_evidence(62),
-            original.effective_interval(),
-            vec![
-                AlpacaInstrumentMapping::try_new(
-                    "AAPL".to_owned(),
-                    original.instrument_id(),
-                    AssetClass::Equity,
-                )?
-                .try_with_native_identity(native.clone())?,
-            ],
-            history.freshness_policy(),
-            history
-                .budget_policy()
-                .ok_or("missing fixture budget")?
-                .clone(),
-            AlpacaTransportLimits::try_new(
-                1024 * 1024,
-                Duration::from_secs(5),
-                Duration::from_secs(10),
-            )?,
         )?;
+        let trade_metadata = config.metadata().clone();
+        let trade_source_at = at.checked_sub_nanos(60_000_000_000)?;
+        let quote_source_at = at.checked_sub_nanos(61_000_000_000)?;
         let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
             Arc::new(TestAuthorizationSubjectResolver { evidence: exact_evidence(22).content_digest(), record: SourceIdentifier::try_from("alpaca-test-credential-record")? }),
         )?.with_provider_identity_authority(Arc::new(catalog.clone()))?;
-        let registered = registry.register(config.metadata().clone(), at)?;
-        registry.record_provider_identities(&registered, &[native], deadline, &cancellation)?;
+        let mut registered = registry.register(config.metadata().clone(), at)?;
+        registry.record_provider_identities(
+            &registered,
+            std::slice::from_ref(&native),
+            deadline,
+            &cancellation,
+        )?;
         let process =
             initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
                 NonZeroUsize::new(1024 * 1024).ok_or("zero process bound")?,
@@ -2483,14 +2505,43 @@ mod tests {
         let expected_directory = tempfile::tempdir()?;
         let expected_paths = LocalPaths::prepare(expected_directory.path().join("expected"))?;
         let expected_store = expected_paths.sealed_research_journal_store()?;
-        let publication = market::AlpacaMarketPublicationClosure::try_new(
+        let mut publication = market::AlpacaMarketPublicationClosure::try_new(
             Arc::clone(research),
             config.metadata().clone(),
             fixture_rights(config.metadata().source_id().clone(), 24)?,
             at,
         )?;
         let mut published = None;
-        for generation in 1..=2 {
+        for generation in 1..=3 {
+            if generation == 3 {
+                let renewed_at = system_timestamp()?;
+                config = make_config(
+                    "alpaca-live-reconnect-v2",
+                    AuthorizationGrant::new(
+                        history.authorization().mode(),
+                        history.authorization().basis().clone(),
+                        history.authorization().evidence().clone(),
+                        EffectiveInterval::new(renewed_at, None)?,
+                    ),
+                )?;
+                registered = registry.replace_metadata(
+                    &registered,
+                    config.metadata().clone(),
+                    renewed_at,
+                )?;
+                registry.record_provider_identities(
+                    &registered,
+                    std::slice::from_ref(&native),
+                    deadline,
+                    &cancellation,
+                )?;
+                publication = market::AlpacaMarketPublicationClosure::try_new(
+                    Arc::clone(research),
+                    config.metadata().clone(),
+                    fixture_rights(config.metadata().source_id().clone(), 24)?,
+                    renewed_at,
+                )?;
+            }
             let session = registry.begin_session(
                 &registered,
                 SessionId::new(SourceIdentifier::try_from(format!(
@@ -2543,10 +2594,21 @@ mod tests {
                 ));
                 assert!(pending.is_none());
             }
-            let payload = serde_json::to_vec(&serde_json::json!([{
-                "T":"t", "S":"AAPL", "i":generation, "x":"V", "p":512.71, "s":2,
-                "t":chrono::Utc::now().to_rfc3339(),
-            }]))?;
+            let source_at = if generation == 3 {
+                quote_source_at
+            } else {
+                trade_source_at
+            };
+            let timestamp =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(source_at.unix_nanos())
+                    .to_rfc3339();
+            let payload = serde_json::to_vec(&if generation == 3 {
+                serde_json::json!([{"T":"q", "S":"AAPL", "bx":"V", "bp":510.25, "bs":40,
+                    "ax":"V", "ap":514.75, "as":40, "t":timestamp}])
+            } else {
+                serde_json::json!([{"T":"t", "S":"AAPL", "i":generation, "x":"V", "p":512.71, "s":2,
+                    "t":timestamp}])
+            })?;
             let frame = frames.try_frame(TransportFrameKind::Text, Bytes::from(payload.clone()))?;
             let mut captured = publisher.try_publish(&frame)?;
             let admitted = session.validate_live_frame(&frame)?;
@@ -2593,7 +2655,7 @@ mod tests {
                     .publish_market_events(
                         binding,
                         DatasetId::try_from("market_squawk.market_events")?,
-                        "alpaca-successor-fixture",
+                        format!("alpaca-successor-fixture-{generation}"),
                         system_timestamp()?,
                         Arc::new(QueuedAlpacaFixturePrecommit {
                             deadline,
@@ -2604,11 +2666,13 @@ mod tests {
                     .await?;
                 assert_eq!(
                     receipt.commit().sequence(),
-                    1,
+                    generation - 1,
                     "obsolete capture acquired a commit"
                 );
                 assert_eq!(receipt.event_count(), 1);
-                published = Some(receipt);
+                if generation == 2 {
+                    published = Some(receipt);
+                }
                 registry.end_session(&session, system_timestamp()?)?;
             }
             drop(publisher);
@@ -2630,7 +2694,7 @@ mod tests {
                 selectors[0],
                 research.provider_capture_store(),
                 deadline,
-                cancellation,
+                cancellation.clone(),
             )
             .await?;
         assert_eq!(reopened.events().len(), 1);
@@ -2638,6 +2702,15 @@ mod tests {
             matches!(&reopened.events()[0], market_squawk_domain::MarketEvent::MarketDataTrade(trade)
             if trade.price().amount() == rust_decimal::Decimal::new(51271, 2))
         );
+        crate::application::paper::assert_retained_quote_trade_components(
+            research,
+            &record,
+            &trade_metadata,
+            config.metadata(),
+            trade_source_at,
+            quote_source_at,
+        )
+        .await?;
         Ok(())
     }
 

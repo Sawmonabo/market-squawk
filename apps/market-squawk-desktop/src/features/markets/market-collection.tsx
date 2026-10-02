@@ -1,3 +1,4 @@
+import { formatProductTimestamp } from "@/lib/time"
 import { RefreshButton } from "@/components/ui/refresh-button"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Activity, CircleAlert } from "lucide-react"
@@ -14,7 +15,7 @@ import { formatMoney } from "@/lib/formatters"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-import { marketAvailabilityLabel, marketPriceBasisLabel, marketProductRowSchema, type MarketProductRow } from "./market-product"
+import { marketAvailabilityLabel, marketChangeDescription, marketPriceBasisLabel, marketProductRowSchema, type MarketProductRow } from "./market-product"
 
 const revisionSchema = z.string().max(20).regex(/^[1-9][0-9]*$/)
   .pipe(z.string().refine((value) => BigInt(value) <= 18_446_744_073_709_551_615n))
@@ -193,8 +194,8 @@ function CollectionInvestment({ symbol, market, unverified, refreshing }: {
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
         <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : refreshing
           ? `${marketAvailabilityLabel(market)} at last check · Updating`
-          : marketAvailabilityLabel(market)} · <PercentageChange value={market.changePercent} /></p>
-        {market.asOf ? <time dateTime={market.asOf}>{new Date(market.asOf).toLocaleString()}</time> : null}
+          : marketAvailabilityLabel(market)} · <PercentageChange value={market.changePercent} description={marketChangeDescription(market)} /></p>
+        {market.asOf ? <time dateTime={market.asOf}>{formatProductTimestamp(market.asOf)}</time> : null}
       </div>}
   </>
 }

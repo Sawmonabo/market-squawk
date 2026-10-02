@@ -2214,6 +2214,35 @@ fn market_product_row() -> Value {
         ),
         ("quote", nullable(market_product_quote())),
         ("changePercent", nullable(canonical_decimal_text())),
+        (
+            "changeBasis",
+            nullable(closed_complete(vec![
+                (
+                    "priceBasis",
+                    enumeration(&["last_trade", "bid_ask_midpoint"]),
+                ),
+                ("priceAsOf", canonical_market_timestamp()),
+                (
+                    "previousClose",
+                    closed_complete(vec![
+                        ("value", canonical_decimal_text()),
+                        ("currency", investment_analysis_currency()),
+                        ("sessionDate", exact_calendar_date()),
+                        ("asOf", canonical_market_timestamp()),
+                    ]),
+                ),
+                ("adjustment", constant("raw")),
+            ])),
+        ),
+        (
+            "changeUnavailableReason",
+            nullable(enumeration(&[
+                "current_price_unavailable",
+                "previous_close_unavailable",
+                "incompatible_basis",
+                "arithmetic_unavailable",
+            ])),
+        ),
         ("asOf", nullable(canonical_market_timestamp())),
         (
             "availability",
@@ -2463,6 +2492,7 @@ fn investment_profile() -> Value {
 
 fn market_product_quote() -> Value {
     closed_complete(vec![
+        ("quoteSizeBasis", enumeration(&["quantity", "source_units"])),
         ("currency", investment_analysis_currency()),
         ("bidPrice", nullable(canonical_decimal_text())),
         ("bidSize", nullable(canonical_decimal_text())),

@@ -1,3 +1,4 @@
+import { formatProductTimestamp } from "@/lib/time"
 import * as React from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
@@ -13,7 +14,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  marketAvailabilityLabel, marketPriceBasisLabel, marketSessionRequestSchema, parseMarketProductResult,
+  marketAvailabilityLabel, marketChangeDescription, marketPriceBasisLabel, marketSessionRequestSchema, parseMarketProductResult,
   parseMarketSessionContext, type MarketProductRow, type MarketSessionContext,
   type MarketSessionReference, type MarketSessionRequest,
 } from "./market-product"
@@ -219,10 +220,10 @@ function MarketCard({ row, unverified, onSelect }: {
     <h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2>
     <p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p>
     <p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p>
-    <p className="mt-1 text-sm"><PercentageChange value={row.changePercent} /></p>
+    <p className="mt-1 text-sm"><PercentageChange value={row.changePercent} description={marketChangeDescription(row)} /></p>
     <p className="mt-1 min-h-8 text-xs leading-4 text-muted-foreground">{unverified ? row.price ? "Saved price · Freshness not checked" : "Availability not checked"
       : marketAvailabilityLabel(row)}</p>
-    {row.asOf ? <time className="mt-1 block text-xs text-muted-foreground" dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : null}
+    {row.asOf ? <time className="mt-1 block text-xs text-muted-foreground" dateTime={row.asOf}>{formatProductTimestamp(row.asOf)}</time> : null}
   </button>
 }
 

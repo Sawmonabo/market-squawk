@@ -264,6 +264,7 @@ pub(super) fn product_row(
         .map(canonical_time)
         .transpose()?;
     let quote = product_quote(row)?;
+    let change = product_price_change(row, current_price, availability)?;
     Ok(json!({
         "selectionToken": identity.selection_token(),
         "historyToken": identity.history_token(),
@@ -276,10 +277,117 @@ pub(super) fn product_row(
         "priceBasis": price_basis,
         "priceCurrentThrough": price_current_through,
         "quote": quote,
-        "changePercent": Value::Null,
+        "changePercent": change.percent,
+        "changeBasis": change.basis,
+        "changeUnavailableReason": change.unavailable_reason,
         "asOf": as_of,
         "availability": availability,
     }))
+}
+
+struct ProductPriceChange {
+    percent: Option<String>,
+    basis: Value,
+    unavailable_reason: Option<&'static str>,
+}
+
+impl ProductPriceChange {
+    fn unavailable(reason: &'static str) -> Self {
+        Self {
+            percent: None,
+            basis: Value::Null,
+            unavailable_reason: Some(reason),
+        }
+    }
+}
+
+/// Display quotes and trades carry original, unadjusted economics. The sole baseline
+/// producer is the admitted raw completed-session reader, never a provider snapshot bar.
+fn product_price_change(
+    row: &serde_json::Map<String, Value>,
+    current_price: Option<&serde_json::Map<String, Value>>,
+    availability: &str,
+) -> Result<ProductPriceChange, ServiceError> {
+    let Some(price) = current_price.filter(|_| matches!(availability, "current" | "delayed"))
+    else {
+        return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
+    };
+    let price_basis = exact_text(price, "basis")?;
+    let (fresh_field, value_field, time_field) = match price_basis {
+        "last_trade" => ("lastFresh", "lastPrice", "lastObservedAt"),
+        "bid_ask_midpoint" => ("quoteFresh", "midPrice", "quoteObservedAt"),
+        _ => return Ok(ProductPriceChange::unavailable("current_price_unavailable")),
+    };
+    let quote = row.get("quote");
+    if quote
+        .and_then(|quote| quote.get(fresh_field))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
+    }
+    if quote.and_then(|quote| quote.get(value_field)) != price.get("value")
+        || quote.and_then(|quote| quote.get(time_field)) != price.get("observedAt")
+    {
+        return Ok(ProductPriceChange::unavailable("incompatible_basis"));
+    }
+    let Some(close) = row.get("previousClose").filter(|value| !value.is_null()) else {
+        return Ok(ProductPriceChange::unavailable(
+            "previous_close_unavailable",
+        ));
+    };
+    let close = close.as_object().ok_or(ServiceError::InvalidResult)?;
+    let price_value = exact_decimal_text(price, "value")?
+        .parse::<Decimal>()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let close_text = exact_decimal_text(close, "value")?;
+    let close_value = close_text
+        .parse::<Decimal>()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let currency = currency_text(price, "currency")?;
+    let observed_at = canonical_time(price.get("observedAt").ok_or(ServiceError::InvalidResult)?)?;
+    let close_at = canonical_time(close.get("asOf").ok_or(ServiceError::InvalidResult)?)?;
+    let observed =
+        DateTime::parse_from_rfc3339(&observed_at).map_err(|_| ServiceError::InvalidResult)?;
+    let closed =
+        DateTime::parse_from_rfc3339(&close_at).map_err(|_| ServiceError::InvalidResult)?;
+    let session_date = exact_text(close, "sessionDate")?;
+    let session = chrono::NaiveDate::parse_from_str(session_date, "%Y-%m-%d")
+        .map_err(|_| ServiceError::InvalidResult)?;
+    if session.to_string() != session_date {
+        return Err(ServiceError::InvalidResult);
+    }
+    // Current display observations do not carry exchange-session affiliation. Require
+    // an earlier native close date than the canonical UTC source date, plus an earlier
+    // actual close. The result retains both dates rather than claiming a session return.
+    if row.get("instrumentId") != close.get("instrumentId")
+        || currency != currency_text(close, "currency")?
+        || exact_text(close, "adjustment")? != "raw"
+        || price_value <= Decimal::ZERO
+        || close_value <= Decimal::ZERO
+        || closed >= observed
+        || session >= observed.date_naive()
+    {
+        return Ok(ProductPriceChange::unavailable("incompatible_basis"));
+    }
+    let Some(percent) = price_value
+        .checked_sub(close_value)
+        .and_then(|difference| difference.checked_div(close_value))
+        .and_then(|change| change.checked_mul(Decimal::from(100_u8)))
+    else {
+        return Ok(ProductPriceChange::unavailable("arithmetic_unavailable"));
+    };
+    Ok(ProductPriceChange {
+        percent: Some(percent.normalize().to_string()),
+        basis: json!({
+            "priceBasis": price_basis,
+            "priceAsOf": observed_at,
+            "previousClose": {"value": close_text, "currency": currency,
+                "sessionDate": session_date, "asOf": close_at},
+            "adjustment": "raw",
+        }),
+        unavailable_reason: None,
+    })
 }
 
 /// Carries independently timed quote and trade evidence through the closed product boundary.
@@ -290,6 +398,11 @@ fn product_quote(row: &serde_json::Map<String, Value>) -> Result<Value, ServiceE
     let native = native.as_object().ok_or(ServiceError::InvalidResult)?;
     let mut quote = serde_json::Map::new();
     quote.insert("currency".into(), json!(currency_text(row, "currency")?));
+    let size_basis = exact_text(native, "quoteSizeBasis")?;
+    if !matches!(size_basis, "quantity" | "source_units") {
+        return Err(ServiceError::InvalidResult);
+    }
+    quote.insert("quoteSizeBasis".into(), json!(size_basis));
     for field in [
         "bidPrice",
         "bidSize",
@@ -762,7 +875,7 @@ mod tests {
             "instrumentId": selected.to_string(), "availability": "live", "currency": "USD",
             "currentPrice": {"value": "68000.15", "currency": "USD", "basis": "bid_ask_midpoint",
                 "observedAt": observed, "currentThrough": through},
-            "quote": {"bidPrice": "68000.1", "bidSize": "2", "askPrice": "68000.2", "askSize": "3",
+            "quote": {"quoteSizeBasis": "quantity", "bidPrice": "68000.1", "bidSize": "2", "askPrice": "68000.2", "askSize": "3",
                 "midPrice": "68000.15", "lastPrice": null, "lastSize": null,
                 "quoteObservedAt": observed, "quoteCurrentThrough": through,
                 "lastObservedAt": null, "lastCurrentThrough": null,
@@ -774,6 +887,65 @@ mod tests {
         assert_eq!(projected["quote"]["bidPrice"], "68000.1");
         assert_eq!(projected["quote"]["quoteCurrentThrough"], through);
         assert!(projected["quote"]["lastPrice"].is_null());
+        assert!(projected["changePercent"].is_null());
+        assert_eq!(
+            projected["changeUnavailableReason"],
+            "previous_close_unavailable"
+        );
+        quote_row["previousClose"] = json!({
+            "instrumentId": selected.to_string(), "value": "64000", "currency": "USD",
+            "sessionDate": "2026-08-08", "asOf": "2026-08-08T20:00:00.000000000Z",
+            "adjustment": "raw",
+        });
+        let changed = product_row(identity, &quote_row)?;
+        assert_eq!(changed["changePercent"], "6.250234375");
+        assert_eq!(changed["changeBasis"]["priceBasis"], "bid_ask_midpoint");
+        assert_eq!(changed["changeBasis"]["priceAsOf"], observed);
+        assert_eq!(changed["changeBasis"]["previousClose"]["value"], "64000");
+        assert_eq!(
+            changed["changeBasis"]["previousClose"]["sessionDate"],
+            "2026-08-08"
+        );
+        assert!(changed["changeUnavailableReason"].is_null());
+        let mut declining = quote_row.clone();
+        declining["currentPrice"]["value"] = json!("63999.99");
+        declining["quote"]["midPrice"] = json!("63999.99");
+        declining["quote"]["bidPrice"] = json!("63999.98");
+        declining["quote"]["askPrice"] = json!("64000");
+        assert_eq!(
+            product_row(identity, &declining)?["changePercent"],
+            "-0.000015625"
+        );
+        declining["currentPrice"]["observedAt"] = json!(through);
+        assert_eq!(
+            product_row(identity, &declining)?["changeUnavailableReason"],
+            "incompatible_basis"
+        );
+        // Currentness, compatible economics and a preceding completed date are mandatory.
+        // In particular a close from later in the read cannot become this price's baseline.
+        for (field, invalid) in [
+            (
+                "instrumentId",
+                records[1].definition().instrument_id().to_string(),
+            ),
+            ("currency", "EUR".to_owned()),
+            ("adjustment", "split_adjusted".to_owned()),
+            ("value", "0".to_owned()),
+            ("sessionDate", "2026-08-09".to_owned()),
+            ("asOf", through.to_owned()),
+        ] {
+            let mut incompatible = quote_row.clone();
+            incompatible["previousClose"][field] = json!(invalid);
+            let result = product_row(identity, &incompatible)?;
+            assert!(result["changePercent"].is_null());
+            assert_eq!(result["changeUnavailableReason"], "incompatible_basis");
+        }
+        quote_row["quote"]["quoteFresh"] = json!(false);
+        assert_eq!(
+            product_row(identity, &quote_row)?["changeUnavailableReason"],
+            "current_price_unavailable"
+        );
+        quote_row["quote"]["quoteFresh"] = json!(true);
         quote_row["quote"]["lastPrice"] = json!("68000.15");
         assert!(matches!(
             product_row(identity, &quote_row),
@@ -786,6 +958,12 @@ mod tests {
         assert_eq!(closed["availability"], "previous_close");
         assert_eq!(closed["priceBasis"], "previous_close");
         assert_eq!(closed["quote"], projected["quote"]);
+        assert!(closed["changePercent"].is_null());
+        assert!(closed["changeBasis"].is_null());
+        assert_eq!(
+            closed["changeUnavailableReason"],
+            "current_price_unavailable"
+        );
         quote_row["quote"]["quoteFresh"] = json!(false);
         let retained = product_row(identity, &quote_row)?;
         assert_eq!(retained["priceBasis"], "previous_close");
