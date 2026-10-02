@@ -1173,6 +1173,8 @@ impl CompanyResearchFact {
 pub(crate) struct CompanyResearchFactLineage {
     filing_identity: Box<str>,
     publication_identity: EvidenceDigest,
+    // Exact context and occurrence IDs within this authenticated filing publication.
+    xbrl_identity: Option<(SourceIdentifier, SourceIdentifier)>,
 }
 
 impl fmt::Debug for CompanyResearchFactLineage {
@@ -1188,6 +1190,10 @@ impl CompanyResearchFactLineage {
 
     pub(crate) const fn publication_identity(&self) -> EvidenceDigest {
         self.publication_identity
+    }
+
+    pub(crate) const fn xbrl_identity(&self) -> Option<&(SourceIdentifier, SourceIdentifier)> {
+        self.xbrl_identity.as_ref()
     }
 }
 
@@ -1668,6 +1674,26 @@ fn append_authenticated_company_row(
         (SecResearchFamily::CompanyFacts, ResearchObservation::Fundamental(fundamental))
         | (SecResearchFamily::FilingXbrl, ResearchObservation::Fundamental(fundamental)) => {
             let fact_context = fundamental.fact_context();
+            let xbrl_identity = match family {
+                SecResearchFamily::FilingXbrl => {
+                    let evidence = fundamental
+                        .xbrl_evidence()
+                        .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+                    if fact_context.xbrl_context_id() != Some(evidence.context_id())
+                        || fact_context.accession() != evidence.accession()
+                    {
+                        return Err(CanonicalResearchReadError::EvidenceConflict);
+                    }
+                    Some((
+                        evidence.context_id().clone(),
+                        evidence.occurrence_id().clone(),
+                    ))
+                }
+                SecResearchFamily::CompanyFacts => None,
+                SecResearchFamily::Submissions => {
+                    return Err(CanonicalResearchReadError::EvidenceConflict);
+                }
+            };
             facts
                 .try_reserve(1)
                 .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
@@ -1675,6 +1701,7 @@ fn append_authenticated_company_row(
                 lineage: CompanyResearchFactLineage {
                     filing_identity: try_boxed_text(fact_context.accession().as_str())?,
                     publication_identity,
+                    xbrl_identity,
                 },
                 scope: match family {
                     SecResearchFamily::CompanyFacts => CompanyFactScope::CompanyWide,

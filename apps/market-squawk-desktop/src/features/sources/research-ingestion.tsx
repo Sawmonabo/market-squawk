@@ -143,8 +143,8 @@ export function ResearchIngestion({
       <>
         <ResearchFileImport bootstrap={projectDesktopBootstrap(bootstrap)} onStarted={onStarted} />
         <ActionUnavailable
-          title="Connected-source ingestion is not available"
-          detail="Connect and verify an eligible source before starting a durable import."
+          title="Import from a connection is unavailable"
+          detail="Connect and verify a supported source before importing data."
         />
       </>
     )
@@ -159,14 +159,11 @@ export function ResearchIngestion({
             <div className="flex items-center gap-2">
               <DatabaseZap className="size-4 text-primary" aria-hidden="true" />
               <h2 className="text-sm font-semibold">
-                Ingest a discovered source object
+                Import from a connection
               </h2>
             </div>
             <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-              Choose an object from a configured source. Confirmation creates a
-              short-lived, single-use discovery receipt and immediately starts a durable
-              ingestion job for that exact object. No filesystem path or unrestricted
-              query is accepted.
+              Choose an available file from a configured source to save its information locally.
             </p>
           </div>
           <RefreshButton label="Refresh inputs" refreshing={sources.isFetching || objects.isFetching} onClick={() => {
@@ -188,10 +185,10 @@ export function ResearchIngestion({
         ) : sources.data.length === 0 ? (
           <div className="mt-4 rounded-lg border border-dashed border-border p-4">
             <p className="text-xs font-medium">
-              No ingest-capable source input is configured.
+              No source is ready to import data.
             </p>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-              Complete a research source setup before discovering provider objects.
+              Set up a research source to find available files.
             </p>
             <Button className="mt-3" size="sm" onClick={onSetup}>
               Set up connections
@@ -200,7 +197,7 @@ export function ResearchIngestion({
         ) : (
           <div className="mt-4 grid gap-4 lg:grid-cols-2">
             <label className="text-xs font-medium">
-              Configured source dataset
+              Source dataset
               <select
                 className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 value={source ? identity(source) : ""}
@@ -218,7 +215,7 @@ export function ResearchIngestion({
               </select>
             </label>
             <label className="text-xs font-medium">
-              Exact provider object
+              Available file
               <select
                 className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
                 value={object?.object_id ?? ""}
@@ -242,7 +239,7 @@ export function ResearchIngestion({
 
         {source && objects.isPending ? (
           <p className="mt-3 text-xs text-muted-foreground">
-            Listing bounded source objects…
+            Finding available files…
           </p>
         ) : null}
         {objects.isError ? (
@@ -255,7 +252,7 @@ export function ResearchIngestion({
         !objects.isError &&
         objects.data?.length === 0 ? (
           <p className="mt-3 text-xs leading-5 text-muted-foreground">
-            The selected source returned no ingestible object. Refresh the source or
+            The selected source returned no files to import. Refresh the source or
             review its setup and coverage.
           </p>
         ) : null}
@@ -272,7 +269,7 @@ export function ResearchIngestion({
               ) : (
                 <DatabaseZap aria-hidden="true" />
               )}
-              Start ingestion
+              Start import
             </Button>
             <p className="text-[10px] text-muted-foreground">
               {object.expected_bytes === null
@@ -285,11 +282,12 @@ export function ResearchIngestion({
         {receipt ? (
           <Alert className="mt-4">
             <DatabaseZap aria-hidden="true" />
-            <AlertTitle>Durable ingestion queued</AlertTitle>
+            <AlertTitle>Import queued</AlertTitle>
             <AlertDescription>
-              Job {receipt.jobId} · generation {receipt.generation} · sequence{" "}
-              {receipt.sequence}. Progress remains available in Research activity and
-              Operations if this window closes.
+              The import is queued. Follow progress in Research activity or Operations, even after closing this window.
+              <details className="mt-2"><summary className="cursor-pointer">Job details</summary>
+                Job {receipt.jobId} · generation {receipt.generation} · sequence {receipt.sequence}
+              </details>
             </AlertDescription>
           </Alert>
         ) : null}
@@ -302,13 +300,12 @@ export function ResearchIngestion({
         <Dialog open={confirmationOpen} onOpenChange={setConfirmationOpen}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Start this ingestion job?</DialogTitle>
+              <DialogTitle>Import this file?</DialogTitle>
               <DialogDescription>
-                Market Squawk will confirm discovery of{" "}
+                Market Squawk will retrieve{" "}
                 {object?.object_id ?? "the selected object"}
-                {source ? ` from ${source.label}` : ""}, consume its single-use receipt,
-                and queue durable local ingestion. The source request may use the provider
-                network budget.
+                {source ? ` from ${source.label}` : ""} and save its information locally.
+                This uses the provider connection and its request allowance.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

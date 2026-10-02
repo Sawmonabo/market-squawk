@@ -13,19 +13,20 @@ export const dataQualities = [
 export type DataQuality = (typeof dataQualities)[number]
 
 const labels: Record<DataQuality, string> = {
-  direct_verified: "Direct verified",
-  direct_unverified: "Direct unverified",
-  official_delayed: "Official delayed",
+  direct_verified: "Verified",
+  direct_unverified: "Unverified",
+  official_delayed: "Delayed",
   aggregated: "Aggregated",
   indicative: "Indicative",
   modeled: "Modeled",
   estimated: "Estimated",
-  stale: "Stale",
-  quarantined: "Quarantined",
+  stale: "Out of date",
+  quarantined: "Needs review",
 }
 
-export function qualityLabel(quality: DataQuality): string {
-  return labels[quality]
+export function qualityLabel(quality: string | null): string {
+  const known = dataQualities.find((candidate) => candidate === quality)
+  return known === undefined ? "Not rated" : labels[known]
 }
 
 export function isExecutionEligible(quality: DataQuality): boolean {

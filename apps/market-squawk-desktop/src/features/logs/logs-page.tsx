@@ -104,7 +104,7 @@ function LogsWorkspace({
     onSuccess: (next) => {
       setReceipt(next)
       setConfirmExport(false)
-      setAnnouncement("The controlled redacted diagnostic artifact is ready.")
+      setAnnouncement("Log export saved.")
     },
   })
 
@@ -119,7 +119,7 @@ function LogsWorkspace({
     setSelected(null)
     setReceipt(null)
     exportMutation.reset()
-    setAnnouncement("Log filters applied. The bounded query was refreshed.")
+    setAnnouncement("Log filters applied.")
   }
 
   const resetFilters = () => {
@@ -130,13 +130,13 @@ function LogsWorkspace({
     setSelected(null)
     setReceipt(null)
     exportMutation.reset()
-    setAnnouncement("Log filters reset to the bounded default.")
+    setAnnouncement("Log filters reset.")
   }
 
   return (
     <LogsFrame
       action={
-        <RefreshButton label="Restart query" refreshing={logs.isFetching} onClick={() => { navigation.restart(); setSelected(null); if (cursor === undefined) void logs.refetch() }}
+        <RefreshButton label="Refresh logs" refreshing={logs.isFetching} onClick={() => { navigation.restart(); setSelected(null); if (cursor === undefined) void logs.refetch() }}
           disabled={logs.isFetching} />
       }
     >
@@ -147,10 +147,10 @@ function LogsWorkspace({
           <ShieldCheck className="mt-0.5 size-5 text-primary" aria-hidden="true" />
           <div>
             <h2 id="log-scope-heading" className="text-sm font-semibold">
-              Redacted, retained diagnostic evidence
+              Saved logs
             </h2>
             <p className="mt-1 max-w-4xl text-sm leading-6 text-muted-foreground">
-              This is a bounded query over the installed service&apos;s structured, retention-limited logs—not a live raw tail. Record fields are already redacted before they reach this page; secrets, paths, and raw payloads are not exposed here.
+              Search saved logs. Sensitive values are removed before display.
             </p>
           </div>
         </div>
@@ -159,9 +159,9 @@ function LogsWorkspace({
       <form className="mt-5 rounded-xl border border-border bg-card/35 p-5" onSubmit={applyFilters}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">Bounded query</p>
-            <h2 className="mt-1 text-lg font-semibold">Find diagnostic records</h2>
-            <p className="mt-1 text-sm text-muted-foreground">All filters are combined. Local times are sent to the service as exact signed Unix-nanosecond decimals.</p>
+            <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">Log filters</p>
+            <h2 className="mt-1 text-lg font-semibold">Find logs</h2>
+            <p className="mt-1 text-sm text-muted-foreground">All filters are combined. Dates and times use your local time zone.</p>
           </div>
           <div className="flex gap-2">
             <Button type="button" size="sm" variant="outline" onClick={resetFilters} disabled={logs.isFetching}>
@@ -196,7 +196,7 @@ function LogsWorkspace({
             <Input id="logs-source" value={draft.sourceId} maxLength={256} onChange={(event) => setDraft((current) => ({ ...current, sourceId: event.target.value }))} placeholder="Exact source identifier" />
           </FilterField>
           <FilterField label="Job ID" htmlFor="logs-job">
-            <Input id="logs-job" value={draft.jobId} maxLength={256} onChange={(event) => setDraft((current) => ({ ...current, jobId: event.target.value }))} placeholder="Exact durable job identifier" />
+            <Input id="logs-job" value={draft.jobId} maxLength={256} onChange={(event) => setDraft((current) => ({ ...current, jobId: event.target.value }))} placeholder="Job identifier" />
           </FilterField>
           <FilterField label="Correlation ID" htmlFor="logs-correlation">
             <Input id="logs-correlation" value={draft.correlationId} maxLength={256} onChange={(event) => setDraft((current) => ({ ...current, correlationId: event.target.value }))} placeholder="Request or operation correlation" />
@@ -222,15 +222,15 @@ function LogsWorkspace({
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">Query results</p>
-            <h2 id="log-results-heading" className="mt-1 text-xl font-semibold">Structured records</h2>
-            <p className="mt-1 text-sm text-muted-foreground">At most {filter.limit.toLocaleString()} records are requested per page; open a record to inspect its safe, typed details.</p>
+            <h2 id="log-results-heading" className="mt-1 text-xl font-semibold">Log records</h2>
+            <p className="mt-1 text-sm text-muted-foreground">Up to {filter.limit.toLocaleString()} records per page. Open a record to see details.</p>
           </div>
           {exportAvailable ? (
             <Button variant="outline" size="sm" onClick={() => { exportMutation.reset(); setConfirmExport(true) }} disabled={logs.isPending || logs.isError || exportMutation.isPending}>
-              <Download aria-hidden="true" /> Export this bounded query
+              <Download aria-hidden="true" /> Export matching logs
             </Button>
           ) : (
-            <span className="text-xs text-muted-foreground">Controlled export is unavailable from this service.</span>
+            <span className="text-xs text-muted-foreground">Log export is unavailable.</span>
           )}
         </div>
 
@@ -259,18 +259,18 @@ function LogsWorkspace({
       <Dialog open={confirmExport} onOpenChange={(open) => { if (!open && !exportMutation.isPending) setConfirmExport(false) }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Export this bounded redacted query?</DialogTitle>
-            <DialogDescription>The service will publish a controlled diagnostic artifact for the active filters and current pagination cursor. It will not receive a filesystem path or raw log authority.</DialogDescription>
+            <DialogTitle>Export these logs?</DialogTitle>
+            <DialogDescription>Save logs matching your filters, starting at the current page and continuing through the remaining results. Sensitive values are removed from the export.</DialogDescription>
           </DialogHeader>
           <dl className="grid gap-2 rounded-lg border border-border bg-muted/20 p-3 text-sm">
-            <ReceiptFact label="Requested records" value={filter.limit.toLocaleString()} />
+            <ReceiptFact label="Records per page" value={filter.limit.toLocaleString()} />
             <ReceiptFact label="Current page" value={String(navigation.page)} />
             <ReceiptFact label="Scope" value={filterSummary(filter)} />
           </dl>
           {exportMutation.isError ? <Alert variant="destructive"><AlertTriangle aria-hidden="true" /><AlertTitle>Export was not published</AlertTitle><AlertDescription>{messageFrom(exportMutation.error)}</AlertDescription></Alert> : null}
           <DialogFooter>
             <Button variant="outline" disabled={exportMutation.isPending} onClick={() => setConfirmExport(false)}>Cancel</Button>
-            <Button disabled={exportMutation.isPending} onClick={() => exportMutation.mutate()}>{exportMutation.isPending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <ClipboardCheck aria-hidden="true" />}{exportMutation.isPending ? "Publishing…" : "Confirm controlled export"}</Button>
+            <Button disabled={exportMutation.isPending} onClick={() => exportMutation.mutate()}>{exportMutation.isPending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <ClipboardCheck aria-hidden="true" />}{exportMutation.isPending ? "Saving…" : "Export logs"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -281,13 +281,13 @@ function LogsWorkspace({
 const selectClassName = "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
 
 function LogsFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {
-  return <main className="mx-auto w-full max-w-[1320px] p-5 lg:p-7"><header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Local operations · bounded diagnostic evidence</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Logs</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Search retained, structured service evidence without opening a raw tail or exposing secrets.</p></div>{action}</header><div className="mt-6">{children}</div></main>
+  return <main className="mx-auto w-full max-w-[1320px] p-5 lg:p-7"><header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Diagnostics</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Logs</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Find saved logs and export records for troubleshooting.</p></div>{action}</header><div className="mt-6">{children}</div></main>
 }
 
 function LogsLoading() { return <LogsFrame><div className="grid gap-4"><Skeleton className="h-28 rounded-xl" /><Skeleton className="h-72 rounded-xl" /><Skeleton className="h-80 rounded-xl" /></div></LogsFrame> }
 function LogsUnavailable({ detail }: { detail: string }) { return <LogsFrame><Alert><AlertTriangle aria-hidden="true" /><AlertTitle>Logs are unavailable</AlertTitle><AlertDescription>{detail} Restore the local service connection, then retry this page.</AlertDescription></Alert></LogsFrame> }
 function FilterField({ label, htmlFor, children }: { label: string; htmlFor: string; children: React.ReactNode }) { return <label className="grid gap-1.5 text-sm font-medium" htmlFor={htmlFor}><span>{label}</span>{children}</label> }
-function LogResultsLoading() { return <div className="mt-4 grid gap-3" role="status"><Skeleton className="h-20 rounded-xl" /><Skeleton className="h-20 rounded-xl" /><Skeleton className="h-20 rounded-xl" /><span className="sr-only">Loading bounded log records</span></div> }
+function LogResultsLoading() { return <div className="mt-4 grid gap-3" role="status"><Skeleton className="h-20 rounded-xl" /><Skeleton className="h-20 rounded-xl" /><Skeleton className="h-20 rounded-xl" /><span className="sr-only">Loading logs</span></div> }
 function QueryError({ detail, onRetry }: { detail: string; onRetry: () => void }) { return <Alert variant="destructive" className="mt-4"><AlertTriangle aria-hidden="true" /><AlertTitle>Log query could not be completed</AlertTitle><AlertDescription>{detail}<div className="mt-3"><Button variant="outline" size="sm" onClick={onRetry}>Retry query</Button></div></AlertDescription></Alert> }
 function EmptyResults() { return <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm text-muted-foreground"><Eye className="size-5" aria-hidden="true" /><h3 className="mt-3 font-medium text-foreground">No retained records match this query</h3><p className="mt-1 leading-6">Try a wider time range or fewer filters. This page only searches records still retained by the local service.</p></div> }
 
@@ -315,7 +315,7 @@ function LogRecords({ records, onSelect }: { records: StructuredLogRecord[]; onS
   </div>
 }
 
-function ArtifactReceipt({ receipt }: { receipt: DiagnosticArtifactReceipt }) { return <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5" aria-labelledby="export-receipt-heading"><div className="flex gap-3"><FileCheck2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div className="min-w-0"><h2 id="export-receipt-heading" className="text-sm font-semibold">Controlled export receipt</h2><p className="mt-1 text-sm text-muted-foreground">The service published the bounded, redacted artifact under its controlled artifact authority.</p><dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><ReceiptFact label="Artifact reference" value={receipt.artifactReference} mono /><ReceiptFact label="Size" value={`${groupDecimal(String(receipt.byteLength))} bytes`} /><ReceiptFact label="SHA-256" value={receipt.sha256} mono /></dl></div></div></section> }
+function ArtifactReceipt({ receipt }: { receipt: DiagnosticArtifactReceipt }) { return <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5" aria-labelledby="export-receipt-heading"><div className="flex gap-3"><FileCheck2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div className="min-w-0"><h2 id="export-receipt-heading" className="text-sm font-semibold">Log export saved</h2><p className="mt-1 text-sm text-muted-foreground">The selected logs have been saved with sensitive values removed.</p><dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><ReceiptFact label="Artifact reference" value={receipt.artifactReference} mono /><ReceiptFact label="Size" value={`${groupDecimal(String(receipt.byteLength))} bytes`} /><ReceiptFact label="SHA-256" value={receipt.sha256} mono /></dl></div></div></section> }
 function LogRecordDetails({ record }: { record: StructuredLogRecord }) {
   const event = record.event
   const redactedFieldCount = Object.values(event.fields).filter(

@@ -41,7 +41,7 @@ export function PlanningSaveControl({ accountToken, calculation, kind, bootstrap
       Saved {formatUnixNanos(save.data.savedAtUnixNanos)}. Open or refresh Saved planning results to reopen it.
     </p> : null}
     {save.isError ? <p role="alert" className="text-xs text-destructive">
-      {save.error instanceof Error ? save.error.message : "The save could not be confirmed. Try again to save this same calculation."}
+      The save could not be confirmed. Try again to save this same calculation.
     </p> : null}
   </div>
 }

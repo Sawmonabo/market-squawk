@@ -7,10 +7,9 @@ import { useDebouncedChartCallback } from "@/components/charts/market-price-char
 
 import { sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryResult, type MarketHistoryViewportInput } from "./market-history"
 
-export function MarketHistoryChart({ result, onViewportChange, onObservationSelect, windowDays, onWindowChange }: {
+export function MarketHistoryChart({ result, onViewportChange, onObservationSelect, windowDays }: {
   result: MarketHistoryResult | null
   windowDays?: string
-  onWindowChange?: (days: string) => void
   onViewportChange: (viewport: MarketHistoryViewportInput) => void
   onObservationSelect: (bar: MarketHistoryBar) => void
 }) {
@@ -26,7 +25,7 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
       {" – "}{history.viewport.fullEndDate !== null ? formatCalendarDate(history.viewport.fullEndDate) : (history.viewport.fullEndUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullEndUnixNanos))}.
       {" "}Prices in {history.currency}.{history.partial ? " Partial saved history." : ""}
     </p>
-    {history.bars.length > 0 ? <PriceSeries history={history} nominal={history.bars[0]!.time.precision === "nominal_date"} onViewportChange={onViewportChange} onObservationSelect={onObservationSelect} windowDays={windowDays} onWindowChange={onWindowChange} />
+    {history.bars.length > 0 ? <PriceSeries history={history} nominal={history.bars[0]!.time.precision === "nominal_date"} onViewportChange={onViewportChange} onObservationSelect={onObservationSelect} windowDays={windowDays} />
       : <p className="mt-4 text-xs text-muted-foreground">No saved prices fall within this window.</p>}
     <details className="mt-4">
       <summary className="cursor-pointer text-xs font-medium">Displayed closing prices</summary>
@@ -47,10 +46,9 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
   </section>
 }
 
-function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, windowDays, onWindowChange }: {
+function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, windowDays }: {
   history: NonNullable<MarketHistoryResult["data"]>; nominal: boolean
   windowDays?: string
-  onWindowChange?: (days: string) => void
   onViewportChange: (viewport: MarketHistoryViewportInput) => void
   onObservationSelect: (bar: MarketHistoryBar) => void
 }) {
@@ -68,29 +66,16 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
   const [pendingViewport, setPendingViewport] = useState<MarketHistoryViewportInput | null>(null)
   useDebouncedChartCallback(pendingViewport === null ? null : JSON.stringify(pendingViewport), pendingViewport, onViewportChange)
   const [drawingIssue, setDrawingIssue] = useState<string | null>(null)
-  const [days, setDays] = useState(windowDays ?? "all")
   const [showClose, setShowClose] = useState(true)
   const [showCandles, setShowCandles] = useState(false)
   const [selectedCoordinate, setSelectedCoordinate] = useState<string | null>(null)
   const visibleBars = bars
-  const requestWindow = (next: string) => {
-    setDays(next)
-    onWindowChange?.(next)
+  useEffect(() => {
     setSelectedCoordinate(null)
+    setPendingViewport(null)
     lastRange.current = null
     interacting.current = false
-    const bounds = history.viewport
-    if (nominal) {
-      if (bounds.fullStartDate === null || bounds.fullEndDate === null) return
-      const from = next === "all" ? bounds.fullStartDate : new Date(Date.parse(`${bounds.fullEndDate}T00:00:00Z`) - Number(next) * 86_400_000).toISOString().slice(0, 10)
-      onViewportChange({ startDate: from < bounds.fullStartDate ? bounds.fullStartDate : from, endDate: bounds.fullEndDate, pointLimit: 512 })
-    } else {
-      if (bounds.fullStartUnixNanos === null || bounds.fullEndUnixNanos === null) return
-      const first = BigInt(bounds.fullStartUnixNanos)
-      const from = next === "all" ? first : BigInt(bounds.fullEndUnixNanos) - BigInt(next) * 86_400_000_000_000n
-      onViewportChange({ startUnixNanos: (from < first ? first : from).toString(), endUnixNanos: bounds.fullEndUnixNanos, pointLimit: 512 })
-    }
-  }
+  }, [windowDays])
   const selectedOriginal = selectedCoordinate === null ? null : visibleBars.find((bar) => coordinate(bar) === selectedCoordinate) ?? null
   useDebouncedChartCallback(selectedOriginal === null ? null : `${history.generationToken}:${coordinate(selectedOriginal)}:${selectedOriginal.originalOrdinal}`, selectedOriginal, onObservationSelect)
   const selectedIndex = visibleBars.findIndex((bar) => coordinate(bar) === selectedCoordinate)
@@ -224,13 +209,6 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
   }, [visibleBars, nominal])
   return <figure className="mt-4">
     <div className="flex flex-wrap items-center gap-4 text-xs">
-      <label className="flex items-center gap-2">History window
-        <select className="rounded-md border border-input bg-background px-2 py-1.5" value={days}
-          onChange={(event) => requestWindow(event.target.value)}>
-          <option value="all">All saved</option><option value="30">30D</option>
-          <option value="90">90D</option><option value="365">1Y</option>
-        </select>
-      </label>
       <label className="flex items-center gap-2"><input type="checkbox" className="accent-primary" checked={showClose} onChange={(event) => setShowClose(event.target.checked)} />Closing-price line</label>
       <label className="flex items-center gap-2"><input type="checkbox" className="accent-primary" checked={showCandles} onChange={(event) => setShowCandles(event.target.checked)} />Candlesticks</label>
     </div>

@@ -40,7 +40,6 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   transport: ProductTransport
 }) {
   const { eventConnection } = useSystem()
-  const [showHistory, setShowHistory] = useState(true)
   const [refreshRevision, setRefreshRevision] = useState(0)
   const queryClient = useQueryClient()
   const refresh = () => {
@@ -79,7 +78,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
   const companyName = row?.identity.name !== row?.identity.symbol ? row?.identity.name : null
   const priceLabels = row === null ? "Checking price information" : [marketPriceBasisLabel(row),
-    unverified && row.price !== null ? "Saved price · Freshness not checked" : marketAvailabilityLabel(row)]
+    unverified && row.price !== null ? "Saved price" : marketAvailabilityLabel(row)]
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
 
   return <main className="mx-auto w-full max-w-[1180px] space-y-4 p-5 lg:p-7">
@@ -99,29 +98,28 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
             <RefreshButton label="Refresh investment" refreshing={pageReads > 0} onClick={refresh} />
           </div>
           <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row ? <> · <PercentageChange value={row.changePercent} description={marketChangeDescription(row)} /></> : null}</p>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{formatProductTimestamp(row.asOf)}</time> : "Availability not established"}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{formatProductTimestamp(row.asOf)}</time> : "No price received yet"}</p>
         </section>
       </div>
       <div className="mt-1 min-h-5 text-xs leading-5">
         {detail.isError ? <p role="alert" className="text-destructive">{row === null
           ? "This investment could not be opened. Try again, or search Markets to choose a fresh selection."
-          : "The price could not be refreshed. Showing the last checked information; its freshness is unverified."}</p>
-          : disconnected && row !== null ? <p role="status" className="text-muted-foreground">Connection interrupted. Showing the last checked information; its freshness is unverified.</p>
-            : detail.isFetching && !detail.isFetchedAfterMount ? <p role="status" className="text-muted-foreground">{row ? "Checking price freshness…" : "Opening the selected investment…"}</p> : null}
+          : "Could not update prices. Showing saved prices."}</p>
+          : disconnected && row !== null ? <p role="status" className="text-muted-foreground">Connection interrupted. Showing saved prices.</p>
+            : detail.isFetching && !detail.isFetchedAfterMount ? <p role="status" className="text-muted-foreground">{row ? "Updating price…" : "Opening the selected investment…"}</p> : null}
       </div>
-      {row !== null ? <InvestmentQuote row={row} unverified={unverified} /> : null}
+      {row !== null ? <InvestmentQuote row={row} /> : null}
     </header>
     <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
       <section className="min-w-0 rounded-xl border border-border bg-card/30 p-4" aria-label="Investment price history">
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-base font-semibold">Price history</h2>
-          <Button variant="ghost" size="sm" onClick={() => setShowHistory((shown) => !shown)}>{showHistory ? "Hide price history" : "Show price history"}</Button>
         </div>
-        {showHistory ? row?.historyToken ? <MarketHistoryRead key={`${bootstrap.productSessionToken}:${row.historyToken}`}
+        {row?.historyToken ? <MarketHistoryRead key={`${bootstrap.productSessionToken}:${row.historyToken}`}
           historyToken={row.historyToken} bootstrap={bootstrap} transport={transport} refreshRevision={refreshRevision} />
           : <div className="mt-3 flex min-h-[640px] items-center justify-center text-sm text-muted-foreground">
             <p role="status">{detail.isFetching && row === null ? "Checking available price history…" : "Price history is unavailable for this investment."}</p>
-          </div> : <p className="mt-3 text-xs text-muted-foreground">Price history is hidden. Show it to reopen the chart.</p>}
+          </div>}
       </section>
       <aside className="min-w-0 space-y-4" aria-label="Investment details and analysis">
         <InvestmentProfile selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
@@ -135,7 +133,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   </main>
 }
 
-function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverified: boolean }) {
+function InvestmentQuote({ row }: { row: MarketProductRow }) {
   const quote = row.quote
   const price = (value: string | null) => value === null || quote === null ? "Unavailable" : formatMoney({ amount: value, currency: quote.currency })
   const size = (value: string | null) => value === null ? "Unavailable" : groupDecimal(value)
@@ -159,10 +157,8 @@ function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverifie
       </dl>
       {quote.tradeStatus === "ambiguous" ? <p role="status" className="mt-3 text-xs text-muted-foreground">Several trades share the latest timestamp, so a single last trade cannot be established. Bid and ask are shown separately when available.</p> : null}
       <div className="mt-2 grid gap-x-4 gap-y-1 text-xs leading-5 text-muted-foreground sm:grid-cols-2">
-        <p>Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
-          {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{formatProductTimestamp(quote.quoteObservedAt)}</time></> : null}</p>
-        <p>Last trade: {unverified ? "freshness not checked" : quote.lastFresh ? "current at last check" : "not current"}
-          {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{formatProductTimestamp(quote.lastObservedAt)}</time></> : null}</p>
+        {quote.quoteObservedAt ? <p>Quote · <time dateTime={quote.quoteObservedAt}>{formatProductTimestamp(quote.quoteObservedAt)}</time></p> : null}
+        {quote.lastObservedAt ? <p>Last trade · <time dateTime={quote.lastObservedAt}>{formatProductTimestamp(quote.lastObservedAt)}</time></p> : null}
       </div>
     </>}
   </section>

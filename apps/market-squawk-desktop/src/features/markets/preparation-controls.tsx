@@ -55,7 +55,9 @@ function restorePreparation(kind: PreparationKind, scope: string, token: string)
     return { value: { startRequestId: saved.startRequestId, lookbackDays: "lookbackDays" in saved ? saved.lookbackDays : undefined,
       receipt: saved.receipt, admission: saved.receipt ? "admitted" : "uncertain", busy: false, error: null, applied: false, settled: false }, error: null }
   } catch {
-    return { value: null, error: "Saved preparation recovery could not be read. Reload to retry before loading more information." }
+    return { value: null, error: kind === "history"
+      ? "The previous loading request could not be recovered. Reload before trying again."
+      : "The previous loading request could not be recovered. Reload before trying again." }
   }
 }
 
@@ -70,36 +72,35 @@ function persistPreparation(kind: PreparationKind, scope: string, token: string,
     throw new Error("Preparation recovery was not retained.")
 }
 
-type ControlsProps = {
+export type PreparationControllerProps = {
   kind: PreparationKind
   token: string
   bootstrap: DesktopBootstrap
   transport: ProductTransport
-  hasSavedData?: boolean
   onPrepared: () => Promise<void>
   onSettled?: () => Promise<void>
 }
 
 // Shared only by selected history and selected financial information. The native
 // calls remain the two closed product contracts; this is not an operation runner.
-export function PreparationControls(props: ControlsProps) {
-  const available = props.kind === "history"
+function preparationAvailable(props: PreparationControllerProps) {
+  return props.kind === "history"
     ? hasProductCapability(props.bootstrap, "market_history_preparation_start")
       && hasProductCapability(props.bootstrap, "market_history_preparation_get")
       && hasProductCapability(props.bootstrap, "market_history_preparation_cancel")
     : hasProductCapability(props.bootstrap, "investment_financial_preparation_start")
       && hasProductCapability(props.bootstrap, "investment_financial_preparation_get")
       && hasProductCapability(props.bootstrap, "investment_financial_preparation_cancel")
-  return available ? <SelectedPreparation key={`${props.kind}:${props.bootstrap.productSessionToken}:${props.token}`} {...props} /> : null
 }
 
-function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, onPrepared, onSettled }: ControlsProps) {
-  const noun = kind === "history" ? "history" : "financial information"
+export function usePreparationController(props: PreparationControllerProps) {
+  const { kind, token, bootstrap, transport, onPrepared, onSettled } = props
+  const available = preparationAvailable(props)
   const title = kind === "history" ? "History" : "Financial information"
   const target = kind === "history" ? { historyToken: token } : { selectionToken: token }
   const queryClient = useQueryClient()
   const scope = bootstrap.productSessionToken
-  const [restored] = React.useState(() => restorePreparation(kind, scope, token))
+  const [restored] = React.useState(() => available ? restorePreparation(kind, scope, token) : { value: null, error: null })
   const [storageError, setStorageError] = React.useState(restored.error)
   const receiptKey = productKeys.operation(bootstrap.productSessionToken, "job", kind === "history" ? "Desktop.HistoryPreparationReceipt" : "Desktop.FinancialPreparationReceipt", target)
   const receipt = useQuery<Preparation | null>({
@@ -110,13 +111,12 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
     gcTime: Infinity,
   })
   const preparation = receipt.data
-  const [lookbackDays, setLookbackDays] = React.useState(preparation?.lookbackDays ?? 365)
   const jobKey = productKeys.operation(bootstrap.productSessionToken, "job", kind === "history" ? "Market.GetHistoryPreparation" : "Research.GetInvestmentFinancialPreparation", {
     ...target, jobId: preparation?.receipt?.jobId, generation: preparation?.receipt?.generation,
   })
   const status = useQuery({
     queryKey: jobKey,
-    enabled: preparation?.receipt !== null && preparation?.receipt !== undefined,
+    enabled: available && preparation?.receipt !== null && preparation?.receipt !== undefined,
     gcTime: 0,
     retry: false,
     refetchOnWindowFocus: false,
@@ -134,24 +134,13 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
   const job = status.data
   const mutate = useMutation({
     retry: false,
-    mutationFn: async (action: "start" | "reconcileStart" | "cancelStart" | "cancel") => {
-      let current = queryClient.getQueryData<Preparation | null>(receiptKey)
-      if (current?.busy || restored.error) return
-      if (action === "start") {
-        if (current && current.admission !== "not_admitted"
-          && (!current.receipt || !job || isActiveJob(job.state))) return
-        current = { startRequestId: crypto.randomUUID(), lookbackDays: kind === "history" ? lookbackDays : undefined, receipt: null,
-          admission: "starting", busy: true, error: null, applied: false, settled: false }
-      } else {
-        if (!current) return
-        current = { ...current, busy: true, error: null }
-      }
-      const original = current
-      // Retain the exact identity before any durable start can be admitted.
-      if (action === "start") {
-        try { persistPreparation(kind, scope, token, original); setStorageError(null) }
-        catch { setStorageError(`Preparation recovery could not be saved. ${title} was not started; try again.`); return }
-      }
+    mutationFn: async (command: { action: "start"; original: Preparation } | { action: "reconcileStart" | "cancelStart" | "cancel" }) => {
+      if (!available || restored.error) return
+      const { action } = command
+      const current = queryClient.getQueryData<Preparation | null>(receiptKey)
+      if (!current || (action !== "start" && current.busy)) return
+      const original = command.action === "start" ? command.original : { ...current, busy: true, error: null }
+      if (current.startRequestId !== original.startRequestId) return
       queryClient.setQueryData(receiptKey, original)
       const save = (next: Preparation) => {
         if (queryClient.getQueryData<Preparation | null>(receiptKey)?.startRequestId !== original.startRequestId) return
@@ -160,12 +149,12 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
           if (next.admission === "not_admitted") sessionStorage.removeItem(storageKey(kind, scope, token))
           else persistPreparation(kind, scope, token, next)
           setStorageError(null)
-        } catch { setStorageError("Preparation recovery could not be updated. Keep this page open until preparation is checked.") }
+        } catch { setStorageError(kind === "history" ? "Loading recovery could not be saved. Keep this page open until loading is checked."
+          : "Loading recovery could not be saved. Keep this page open until loading is checked.") }
       }
       try {
         if (action === "start") {
-          // This direct click authorizes the stated finite coverage. Never invoke
-          // start from an effect, viewport request, retry, reconnect or job event.
+          // A selected history range or missing financial reports authorize this exact request.
           const result = kind === "history"
             ? await transport.marketHistoryPreparation({ action, historyToken: token,
               lookbackDays: original.lookbackDays!, startRequestId: original.startRequestId }, true)
@@ -197,8 +186,11 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
         // A failed acknowledgment is not proof that no durable job started.
         save({ ...original, busy: false,
           admission: original.receipt ? original.admission : "uncertain",
-          error: action === "cancel" ? "Cancellation could not be verified. Check preparation before trying again."
-            : "Preparation could not be verified. Check the original request before loading again." })
+          error: kind === "history"
+            ? action === "cancel" ? "Cancellation could not be checked. Check loading before trying again."
+              : "History loading could not be checked. Check the original request before trying again."
+            : action === "cancel" ? "Cancellation could not be checked. Check loading before trying again."
+              : "Loading could not be checked. Check the original request before trying again." })
       }
     },
   })
@@ -209,7 +201,7 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
     if (recoveryChecked.current || !restored.value || !preparation || preparation.busy
       || preparation.admission !== "uncertain") return
     recoveryChecked.current = true
-    mutate.mutate("reconcileStart")
+    mutate.mutate({ action: "reconcileStart" })
   }, [preparation, restored.value, mutate])
   React.useEffect(() => {
     try {
@@ -223,9 +215,19 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
   }, [kind, scope])
   React.useEffect(() => {
     if (!job || isActiveJob(job.state)) return
-    try { sessionStorage.removeItem(storageKey(kind, scope, token)) }
-    catch { setStorageError("The completed preparation recovery record could not be cleared.") }
-  }, [job, kind, scope, token])
+    try {
+      if (kind === "history") sessionStorage.removeItem(storageKey(kind, scope, token))
+      else {
+        // Keep the terminal request and sequence across remounts. Missing data
+        // must not silently retry a cancelled/failed request or accept older status.
+        const current = queryClient.getQueryData<Preparation | null>(receiptKey)
+        if (!current?.receipt || current.receipt.sequence === job.sequence) return
+        const next = { ...current, receipt: { ...current.receipt, sequence: job.sequence } }
+        persistPreparation(kind, scope, token, next)
+        queryClient.setQueryData(receiptKey, next)
+      }
+    } catch { setStorageError("The completed loading request could not be saved for recovery.") }
+  }, [job, kind, scope, token, queryClient, receiptKey])
   React.useEffect(() => {
     if (!job || isActiveJob(job.state) || (kind === "history" && job.state !== "completed")
       || !preparation?.receipt || preparation.settled || preparation.applied) return
@@ -242,41 +244,68 @@ function SelectedPreparation({ kind, token, bootstrap, transport, hasSavedData, 
     && (preparation.admission === "starting" || preparation.admission === "uncertain")
   const active = Boolean(preparation?.receipt && (!job || isActiveJob(job.state)))
   const busy = Boolean(preparation?.busy)
-  return <div className="min-w-0 flex-1 text-xs" role="group" aria-label={`${title} preparation`}>
+  const canStart = available && !restored.error && !busy && !active && !unresolved
+  const start = (lookbackDays?: number) => {
+    if (!available || restored.error) return false
+    const current = queryClient.getQueryData<Preparation | null>(receiptKey)
+    const checked = queryClient.getQueryData<JobView>(jobKey)
+    if (current?.busy || current && current.admission !== "not_admitted"
+      && (!current.receipt || !checked || isActiveJob(checked.state))) return false
+    const original: Preparation = { startRequestId: crypto.randomUUID(), lookbackDays: kind === "history" ? lookbackDays : undefined,
+      receipt: null, admission: "starting", busy: true, error: null, applied: false, settled: false }
+    // Reserve and retain the original intent synchronously, before scheduling the call.
+    try { persistPreparation(kind, scope, token, original); setStorageError(null) }
+    catch { setStorageError(kind === "history" ? "History loading could not be saved for recovery. Try again."
+      : `${title} loading could not be saved for recovery. Try again.`); return false }
+    queryClient.setQueryData(receiptKey, original)
+    mutate.mutate({ action: "start", original })
+    return true
+  }
+  const checkStatus = () => void status.refetch().then((checked) => {
+    const current = queryClient.getQueryData<Preparation | null>(receiptKey)
+    if (checked.isSuccess && current && current.startRequestId === preparation?.startRequestId)
+      queryClient.setQueryData(receiptKey, { ...current, error: null })
+  })
+  return { available, preparation, job, busy, active, unresolved, canStart, storageError, status, start, checkStatus,
+    reconcileStart: () => mutate.mutate({ action: "reconcileStart" }),
+    cancelStart: () => mutate.mutate({ action: "cancelStart" }),
+    cancel: () => mutate.mutate({ action: "cancel" }),
+  }
+}
+
+export type PreparationController = ReturnType<typeof usePreparationController>
+
+export function PreparationStatus({ kind, controller }: {
+  kind: PreparationKind; controller: PreparationController
+}) {
+  const { preparation, job, busy, unresolved, storageError, status } = controller
+  const noun = kind === "history" ? "history" : "financial information"
+  const title = kind === "history" ? "History" : "Financial information"
+  if (!controller.available) return null
+  return <div className="min-w-0 flex-1 text-xs" role="group" aria-label={`${title} loading`}>
     <div className="flex flex-wrap items-center gap-2">
-      {kind === "history" ? <label className="flex items-center gap-2">History to load
-        <select className="rounded-md border border-input bg-background px-2 py-1.5"
-          value={lookbackDays} disabled={busy || active || unresolved}
-          onChange={(event) => setLookbackDays(Number(event.target.value))}>
-          <option value={30}>30 days</option><option value={90}>90 days</option>
-          <option value={365}>1 year</option><option value={3650}>10 years</option>
-        </select>
-      </label> : null}
-      <Button variant="outline" size="sm" disabled={busy || active || unresolved || restored.error !== null}
-        onClick={() => mutate.mutate("start")}>{hasSavedData || preparation?.applied ? `Update ${noun}` : `Load ${noun}`}</Button>
+      {kind === "financial" && controller.canStart && (storageError || preparation?.admission === "not_admitted"
+        || job && ["failed", "cancelled", "interrupted"].includes(job.state)) ? <Button variant="outline" size="sm"
+          onClick={() => controller.start()}>Retry</Button> : null}
       {unresolved ? <>
-        <Button variant="outline" size="sm" disabled={busy} onClick={() => mutate.mutate("reconcileStart")}>Check preparation</Button>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={() => mutate.mutate("cancelStart")}>Cancel pending start</Button>
+        <Button variant="outline" size="sm" disabled={busy} onClick={controller.reconcileStart}>Check loading</Button>
+        <Button variant="ghost" size="sm" disabled={busy} onClick={controller.cancelStart}>Cancel loading</Button>
       </> : job && canCancel(job) ? <Button variant="ghost" size="sm" disabled={busy}
-        onClick={() => mutate.mutate("cancel")}>Cancel preparation</Button> : null}
+        onClick={controller.cancel}>Cancel loading</Button> : null}
       {status.isError || preparation?.error && preparation.receipt ? <Button variant="outline" size="sm" disabled={busy || status.isFetching}
-        onClick={() => void status.refetch().then((checked) => {
-          const current = queryClient.getQueryData<Preparation | null>(receiptKey)
-          if (checked.isSuccess && current && current.startRequestId === preparation?.startRequestId)
-            queryClient.setQueryData(receiptKey, { ...current, error: null })
-        })}>Check preparation</Button> : null}
+        onClick={controller.checkStatus}>Check loading</Button> : null}
     </div>
-    <div className="mt-2 min-h-10 leading-5" aria-live="polite">
-      <p className="text-muted-foreground">{kind === "history"
-        ? `Loads up to ${lookbackDays} calendar days ending at preparation time. Saved dates and gaps determine the chart coverage.`
-        : "Load the available company reports and filings for this investment."}</p>
+    <div className="mt-2 leading-5" aria-live="polite">
+
       {storageError ? <p role="alert" className="text-destructive">{storageError}</p> : null}
       {preparation?.error ? <p role="alert" className="text-destructive">{preparation.error}</p>
-        : status.isError ? <p role="alert" className="text-destructive">Preparation status could not be checked. The last checked information is retained.</p>
-          : unresolved ? <p role="status" className="text-muted-foreground">{busy ? `Checking ${noun} preparation…` : "The original preparation request has not been verified."}</p>
+        : status.isError ? <p role="alert" className="text-destructive">{kind === "history" ? "Loading status could not be checked. Showing the last checked prices." : "Loading status could not be checked. Showing the last checked information."}</p>
+          : unresolved ? <p role="status" className="text-muted-foreground">{kind === "history"
+            ? busy ? "Checking history loading…" : "The original loading request has not been checked."
+            : busy ? `Checking ${noun} loading…` : "The original loading request has not been checked."}</p>
             : job ? <p role={job.state === "failed" || job.state === "interrupted" ? "alert" : "status"}
               className={job.state === "failed" || job.state === "interrupted" ? "text-destructive" : "text-muted-foreground"}>{jobMessage(job, kind)}</p>
-              : preparation?.admission === "not_admitted" ? <p role="status" className="text-muted-foreground">The original request did not start. Information can be loaded again.</p> : null}
+              : preparation?.admission === "not_admitted" ? <p role="status" className="text-muted-foreground">{kind === "history" ? "The original request did not start. Select a history range to try again." : "The original request did not start. Information can be loaded again."}</p> : null}
     </div>
   </div>
 }
@@ -296,15 +325,26 @@ function checkedJob(data: unknown, kind: PreparationKind, receipt?: BackupJobRec
 function jobMessage(job: JobView, kind: PreparationKind): string {
   const noun = kind === "history" ? "history" : "financial information"
   const title = kind === "history" ? "History" : "Financial information"
+  if (kind === "history") {
+    switch (job.state) {
+      case "completed": return "History is ready."
+      case "failed": return "History could not be loaded. Select a history range to try again."
+      case "cancelled": return "History loading was cancelled."
+      case "interrupted": return "History loading was interrupted."
+      case "cancelling": return "Cancelling history loading…"
+      case "recovering": return "Resuming history loading…"
+      case "awaiting_confirmation": return "History loading needs your authorization."
+      default: return "Loading history…"
+    }
+  }
   switch (job.state) {
-    case "completed": return `${title} preparation completed.`
-    case "failed": return `${title} could not be prepared. Try loading ${noun} again.`
-    case "cancelled": return `${title} preparation was cancelled.`
-    case "interrupted": return `${title} preparation was interrupted.`
-    case "cancelling": return `Cancelling ${noun} preparation…`
-    case "recovering": return `Checking an interrupted ${noun} preparation…`
-    case "awaiting_confirmation": return `${title} preparation requires additional authorization.`
-    default: return job.totalUnits !== null && job.completedUnits !== null
-      ? `Preparing ${noun}… ${job.completedUnits} of ${job.totalUnits} steps complete.` : `Preparing ${noun}…`
+    case "completed": return `${title} is ready.`
+    case "failed": return `${title} could not be loaded.`
+    case "cancelled": return `${title} loading was cancelled.`
+    case "interrupted": return `${title} loading was interrupted.`
+    case "cancelling": return `Cancelling ${noun} loading…`
+    case "recovering": return `Resuming ${noun} loading…`
+    case "awaiting_confirmation": return `${title} loading needs your authorization.`
+    default: return `Loading ${noun}…`
   }
 }

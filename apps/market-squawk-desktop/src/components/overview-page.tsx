@@ -62,7 +62,7 @@ export function OverviewPage() {
             <p className="text-lg font-semibold">Evidence before action</p>
             <p className="mt-2 text-xs leading-5 text-muted-foreground">
               Check the horizon, ranges, reasons, risks, assumptions, expiry,
-              invalidators, evidence coverage, and uncertainty together.
+              what could change the guidance, evidence coverage, and uncertainty together.
             </p>
           </div>
         </section>
@@ -76,8 +76,7 @@ export function OverviewPage() {
       <section className="rounded-xl border border-border bg-card/35 p-5">
         <h2 className="text-sm font-semibold">Setup and connections</h2>
         <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-          Manage setup and connectivity in Settings. Home shows only the resulting
-          investment guidance and availability.
+          Manage your data connections and preferences in Settings.
         </p>
         <Button asChild className="mt-4" variant="outline">
           <Link to="/system/settings/onboarding">Manage connections</Link>

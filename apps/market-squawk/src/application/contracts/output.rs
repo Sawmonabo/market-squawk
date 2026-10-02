@@ -2246,7 +2246,13 @@ fn market_product_row() -> Value {
         ("asOf", nullable(canonical_market_timestamp())),
         (
             "availability",
-            enumeration(&["current", "delayed", "previous_close", "unavailable"]),
+            enumeration(&[
+                "current",
+                "delayed",
+                "last_known",
+                "previous_close",
+                "unavailable",
+            ]),
         ),
     ])
 }

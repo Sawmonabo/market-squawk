@@ -120,7 +120,7 @@ function StressRead({ account, bootstrap, transport, refresh }: ScenarioProps & 
         <div className="rounded-lg border border-border bg-background/25 p-4">
           <h3 className="text-sm font-semibold">Investments available on this page</h3>
           {page.holdings.length ? <ul className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-            {page.holdings.map((holding) => <li key={holding.instrumentId}>{investmentDisplayName(holding.investment, holding.instrumentId)}</li>)}
+            {page.holdings.map((holding) => <li key={holding.instrumentId}>{investmentDisplayName(holding.investment)}</li>)}
           </ul> : <p className="mt-3 text-xs text-muted-foreground">No positions are available on this page.</p>}
           <p className="mt-3 text-xs text-muted-foreground">Choose an investment from this page in a price shock below. Earlier choices stay selected while you browse.</p>
         </div>
@@ -138,7 +138,7 @@ function StressRead({ account, bootstrap, transport, refresh }: ScenarioProps & 
             <option value="batch" disabled={!batchAvailable}>Compare scenarios</option>
           </select>
         </label>
-        {mode === "single" && !singleAvailable ? <p className="text-xs text-muted-foreground">Choose Compare scenarios to use the available batch calculation.</p> : null}
+        {mode === "single" && !singleAvailable ? <p className="text-xs text-muted-foreground">Choose Compare scenarios to compare several results.</p> : null}
         {scenarios.map((scenario, index) => <ScenarioFields key={scenario.key} scenario={scenario} index={index}
           holdings={page?.holdings ?? []} positionsReady={!!page && !positions.query.isFetching && !positions.query.isError}
           change={changeScenario} nextKey={() => nextKey.current++}
@@ -210,14 +210,14 @@ function ScenarioFields({ scenario, index, holdings, positionsReady, change, nex
             onChange={(event) => {
               const holding = holdings.find((item) => item.instrumentId === event.target.value)
               const changed = { ...shock, instrumentId: event.target.value,
-                investmentLabel: holding ? investmentDisplayName(holding.investment, holding.instrumentId) : "" }
+                investmentLabel: holding ? investmentDisplayName(holding.investment) : "" }
               change({ ...scenario, shocks: scenario.shocks.map((item) => item.key === shock.key ? changed : item) })
             }}>
             <option value="">Choose an investment</option>
             {shock.instrumentId && (!positionsReady || !holdings.some((holding) => holding.instrumentId === shock.instrumentId))
               ? <option value={shock.instrumentId}>{shock.investmentLabel}</option> : null}
             {positionsReady ? holdings.map((holding) => <option key={holding.instrumentId} value={holding.instrumentId}>
-              {investmentDisplayName(holding.investment, holding.instrumentId)}
+              {investmentDisplayName(holding.investment)}
             </option>) : null}
           </select>
         </label>
@@ -249,7 +249,7 @@ function ScenarioResult({ scenario }: { scenario: PortfolioScenarioResult }) {
       <p className="mt-1 text-muted-foreground">{scenario.composition === "additive" ? "Additive" : "Compounded"} price shocks</p>
       <ul className="mt-2 space-y-1 text-muted-foreground">{scenario.shocks.map((shock, index) => {
         const contribution = scenario.contributions.find((item) => item.instrumentId === shock.instrumentId)
-        return <li key={index}>{investmentDisplayName(contribution?.investment ?? null, shock.instrumentId)}: {shock.percentChange}%</li>
+        return <li key={index}>{investmentDisplayName(contribution?.investment ?? null)}: {shock.percentChange}%</li>
       })}</ul>
     </div>
     <dl className="text-xs"><dt className="text-muted-foreground">Total hypothetical position-value change</dt>
@@ -261,7 +261,7 @@ function ScenarioResult({ scenario }: { scenario: PortfolioScenarioResult }) {
         <th scope="col" className="px-3 py-3 font-medium">Hypothetical change</th>
       </tr></thead>
       <tbody>{scenario.contributions.map((contribution) => <tr key={contribution.instrumentId} className="border-b border-border/60">
-        <th scope="row" className="px-3 py-3 font-medium">{investmentDisplayName(contribution.investment, contribution.instrumentId)}</th>
+        <th scope="row" className="px-3 py-3 font-medium">{investmentDisplayName(contribution.investment)}</th>
         <td className="whitespace-nowrap px-3 py-3 font-mono tabular-nums">{formatMoney(contribution.amount)}</td>
       </tr>)}</tbody>
     </table></div>

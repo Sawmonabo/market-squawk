@@ -78,10 +78,10 @@ export function AppHeader() {
           onClick={() => setOpen(true)}
           disabled={product.status === "loading"}
           className="ml-auto hidden h-8 min-w-52 items-center gap-2 rounded-lg border border-border bg-card/40 px-3 text-left text-[11px] text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex"
-          aria-label="Search or run a command"
+          aria-label="Go to a page"
         >
           <Search className="size-3.5" aria-hidden="true" />
-          <span>Search or run a command</span>
+          <span>Go to a page</span>
           <kbd className="ml-auto rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[9px]">
             {shortcut}
           </kbd>
@@ -91,12 +91,12 @@ export function AppHeader() {
       <CommandDialog
         open={product.status !== "loading" && open}
         onOpenChange={setOpen}
-        title="Navigate Market Squawk"
-        description="Search the available product routes."
+        title="Go to a page"
+        description="Search pages in Market Squawk."
       >
-        <CommandInput placeholder="Search Market Squawk…" />
+        <CommandInput placeholder="Search pages…" />
         <CommandList>
-          <CommandEmpty>No matching route.</CommandEmpty>
+          <CommandEmpty>No matching pages.</CommandEmpty>
           {product.status !== "loading"
             ? navigationSections.map((section) => (
                 <CommandGroup key={section.label} heading={section.label}>

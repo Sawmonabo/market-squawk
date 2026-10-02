@@ -32,7 +32,7 @@ export function CensusSelectionFields() {
     {advanced ? <>
       <p className="text-sm leading-6 text-muted-foreground">
         Enter a key-free Census configuration for a published dataset. It can specify a year or time series,
-        variables or a group, typed filters, standard or uniform geography, time ranges, variable mappings,
+        variables or a group, filters, standard or uniform geography, time ranges, variable mappings,
         and reported or fixed time coordinates. Published metadata and the connection service validate the selection.
       </p>
       <Label htmlFor="census-configuration">Dataset configuration (JSON)</Label>

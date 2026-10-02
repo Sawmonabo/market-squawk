@@ -13,6 +13,8 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
+import { qualityLabel } from "@/lib/quality"
+import { formatCalendarDate, formatProductTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import { DemandPanel } from "../shared/demand-panel"
@@ -311,29 +313,13 @@ function numberValue(value: unknown) {
 }
 
 function temporalValue(value: unknown) {
-  if (typeof value === "string" && value.length) return value
-  if (typeof value === "number" && Number.isFinite(value)) return String(value)
+  if (typeof value === "string") {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return formatCalendarDate(value)
+    if (/^\d{4}-\d{2}-\d{2}T/.test(value)) return formatProductTimestamp(value)
+  }
   return "Not reported"
 }
 
 function formatCount(value: number) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value)
-}
-
-function qualityLabel(value: string | null) {
-  if (!value) return "Not rated"
-  const quality = value.toLocaleLowerCase()
-  if (["estimated", "preliminary", "provisional"].some((part) => quality.includes(part))) {
-    return "Preliminary"
-  }
-  if (["revised", "superseded"].some((part) => quality.includes(part))) {
-    return "Revised"
-  }
-  if (["missing", "incomplete", "degraded", "suspect", "invalid"].some((part) => quality.includes(part))) {
-    return "Needs review"
-  }
-  if (["verified", "final", "complete", "valid", "good"].some((part) => quality.includes(part))) {
-    return "Checked"
-  }
-  return "Not rated"
 }

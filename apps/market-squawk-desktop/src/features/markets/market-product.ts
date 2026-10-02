@@ -70,7 +70,7 @@ export const marketProductRowSchema = z.object({
   }).strict().nullable(),
   changeUnavailableReason: z.enum(["current_price_unavailable", "previous_close_unavailable", "incompatible_basis", "arithmetic_unavailable"]).nullable(),
   asOf: productInstantSchema.nullable(),
-  availability: z.enum(["current", "delayed", "previous_close", "unavailable"]),
+  availability: z.enum(["current", "delayed", "last_known", "previous_close", "unavailable"]),
 }).strict().superRefine((row, context) => {
   if ((row.changePercent === null) !== (row.changeBasis === null)
     || (row.changePercent === null) !== (row.changeUnavailableReason !== null)) {
@@ -185,10 +185,11 @@ export function parseMarketSessionContext(
   return context
 }
 
-export function marketAvailabilityLabel(row: MarketProductRow): string {
+export function marketAvailabilityLabel(row: MarketProductRow): string | null {
   switch (row.availability) {
     case "current": return "Current"
     case "delayed": return "Delayed"
+    case "last_known": return null
     case "previous_close": return "Previous close"
     case "unavailable": return "Unavailable"
   }

@@ -139,8 +139,8 @@ fn fiscal_context() -> Value {
     ])
 }
 
-fn reporting_context() -> Value {
-    closed_complete(vec![
+fn reporting_context(fact: bool) -> Value {
+    let mut fields = vec![
         (
             "dimensionality",
             enumeration(&["unavailable", "no_dimensions"]),
@@ -161,15 +161,19 @@ fn reporting_context() -> Value {
             "restatement",
             enumeration(&["reported_restated", "reported_not_restated", "unavailable"]),
         ),
-        ("occurrence", bounded_unsigned(u64::from(u32::MAX))),
-    ])
+    ];
+    if fact {
+        fields.push(("occurrence", bounded_unsigned(u64::from(u32::MAX))));
+    }
+    closed_complete(fields)
 }
 
-fn reporting_fields() -> Vec<(&'static str, Value)> {
+fn reporting_fields(fact: bool) -> Vec<(&'static str, Value)> {
     vec![
         ("period", period()),
         ("fiscalContext", fiscal_context()),
-        ("reportingContext", reporting_context()),
+        ("reportingContext", reporting_context(fact)),
+        ("scope", enumeration(&["company_wide", "filing_detail"])),
         ("filedOn", nullable(calendar_date())),
         ("effective", time()),
         ("knownAt", integer()),
@@ -177,9 +181,8 @@ fn reporting_fields() -> Vec<(&'static str, Value)> {
 }
 
 fn fact() -> Value {
-    let mut fields = reporting_fields();
+    let mut fields = reporting_fields(true);
     fields.extend([
-        ("scope", enumeration(&["company_wide", "filing_detail"])),
         ("revision", revision()),
         ("metric", metric()),
         ("displayName", text()),
@@ -254,7 +257,7 @@ fn statement() -> Value {
                 "share_data",
             ]),
         ),
-        ("envelope", closed_complete(reporting_fields())),
+        ("envelope", closed_complete(reporting_fields(false))),
         ("items", array(fact())),
     ])
 }
@@ -284,7 +287,10 @@ fn ratio() -> Value {
         ),
         ("value", nullable(canonical_decimal_text())),
         ("unit", constant("ratio")),
-        ("envelope", nullable(closed_complete(reporting_fields()))),
+        (
+            "envelope",
+            nullable(closed_complete(reporting_fields(false))),
+        ),
         (
             "inputs",
             array(closed_complete(vec![

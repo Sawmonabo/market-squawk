@@ -67,8 +67,7 @@ export function ClientCard({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Credential cleanup pending</AlertTitle>
           <AlertDescription>
-            The new generation is authoritative. Market Squawk will retry removal of the retired
-            protected generation during service recovery.
+            The new credential is active. Market Squawk will retry removing the old credential when the service recovers.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -79,8 +78,7 @@ export function ClientCard({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Credential recovery required</AlertTitle>
           <AlertDescription>
-            A protected credential change was interrupted before activation. Restart Market Squawk
-            to reconcile the recorded replacement safely.
+            A credential change was interrupted. Restart Market Squawk to finish it safely.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -88,12 +86,12 @@ export function ClientCard({
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
         <EvidenceCard
           icon={KeyRound}
-          label="Credential & receipt"
-          headline={client.receipt ? "Owned receipt present" : "No owned receipt"}
+          label="Connection configuration"
+          headline={client.receipt ? "Connection configuration saved" : "No saved connection configuration"}
           detail={
             client.receipt
               ? "The client credential remains protected by native secret storage and is not exposed here."
-              : "No Market Squawk-owned client credential is active."
+              : "No credential created by Market Squawk is active for this client."
           }
         >
           {client.receipt ? (
@@ -129,7 +127,7 @@ export function ClientCard({
           detail={
             client.verification
               ? `Verified ${formatObservedAt(client.verification.verifiedAtUnixSeconds)}`
-              : "Run verification after connecting to prove the real protocol path."
+              : "Check the connection after connecting."
           }
         >
           {client.verification ? (
@@ -162,7 +160,7 @@ export function ClientCard({
               value={`${client.service.activeRequests} of ${client.service.maximumActiveRequests}`}
             />
             <EvidenceRow
-              label="Admitted / limited"
+              label="Accepted / limited"
               value={`${client.service.admittedRequests} / ${client.service.rateLimitedRequests}`}
             />
             <EvidenceRow

@@ -89,7 +89,7 @@ function McpWorkspace({
   return (
     <McpFrame
       action={
-        <RefreshButton label="Refresh discovery" refreshing={status.isFetching} onClick={() => void status.refetch()}
+        <RefreshButton label="Refresh connections" refreshing={status.isFetching} onClick={() => void status.refetch()}
           disabled={status.isFetching || control.isPending} />
       }
     >
@@ -120,8 +120,7 @@ function McpWorkspace({
                 Claude Code and Codex
               </h2>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-                Each client receives an independent registration, credential, session identity,
-                and receipt while sharing this workspace's single application service.
+                Each client has its own secure connection and uses the same workspace as Desktop.
               </p>
             </div>
 
@@ -141,11 +140,10 @@ function McpWorkspace({
             <div className="flex items-start gap-3">
               <ShieldCheck className="mt-0.5 size-5 text-primary" aria-hidden="true" />
               <div>
-                <h2 className="text-sm font-semibold">Governed access</h2>
+                <h2 className="text-sm font-semibold">Workspace access</h2>
                 <p className="mt-1 max-w-4xl text-xs leading-relaxed text-muted-foreground">
-                  Every MCP request remains bound to typed product operations, an independent
-                  client identity, bounded results, central risk evaluation, and durable local
-                  audit evidence. Conversation contents stay separate between clients.
+                  AI clients use the same operations, request limits, and risk checks as Desktop.
+                  Their conversations stay separate.
                 </p>
               </div>
             </div>
@@ -209,12 +207,11 @@ function McpFrame({
       <header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
-            One shared service · independent client sessions
+            AI clients · shared workspace
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">MCP</h1>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight">AI Connections</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Connect supported AI clients, verify the real bounded protocol path, and repair only
-            Market Squawk-owned registrations without closing the desktop.
+            Connect Claude Code or Codex to your workspace. Check or repair their connections here.
           </p>
         </div>
         {action}

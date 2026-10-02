@@ -324,12 +324,17 @@ impl MarketDomainService {
                 row["currentPrice"] = Value::Null;
                 row["availability"] = json!("stale");
             }
-            if let Some(close) = closes
+            let close = closes
                 .iter()
-                .find(|close| row_instrument(close) == row_instrument(row))
-            {
+                .find(|close| row_instrument(close) == row_instrument(row));
+            if let Some(close) = close {
                 row["previousClose"] = close["previousClose"].clone();
-                if !has_current_price(row) {
+            }
+            if !has_current_price(row) {
+                if let Some(price) = product::retained_display_price(row, close, projected_at)? {
+                    row["currentPrice"] = price;
+                    row["availability"] = json!("last_known");
+                } else if let Some(close) = close {
                     row["currentPrice"] = close["currentPrice"].clone();
                     row["availability"] = close["availability"].clone();
                 }

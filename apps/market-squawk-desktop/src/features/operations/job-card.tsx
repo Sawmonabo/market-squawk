@@ -1,3 +1,4 @@
+import { jobFailureLabel, jobKindLabel, jobPhaseLabel, jobStateLabel } from "./job-presentation"
 import { DemandPanel } from "../shared/demand-panel"
 import {
   CheckCircle2,
@@ -11,7 +12,6 @@ import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
-import { humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
 import type { LosslessInteger } from "@/lib/lossless-integer"
 import type { SystemTransport } from "@/lib/transport"
@@ -84,17 +84,11 @@ export function JobCard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <StateBadge state={job.state} />
-            {!productPresentation ? (
-              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-                Generation {job.generation} · Sequence {job.sequence}
-              </span>
-            ) : null}
           </div>
-          <h3 className="mt-2 truncate text-sm font-semibold" title={job.kind}>
-            {humanize(job.kind)}
+          <h3 className="mt-2 truncate text-sm font-semibold" title={jobKindLabel(job.kind)}>
+            {jobKindLabel(job.kind)}
           </h3>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            {!productPresentation ? `Job ${shortId(job.jobId)} · ` : ""}
             Updated {formatJobTime(job.updatedAt)}
           </p>
         </div>
@@ -120,7 +114,7 @@ export function JobCard({
             >
               <CheckCircle2 aria-hidden="true" />
               {confirmationQuery.isPending
-                ? "Checking evidence"
+                ? "Checking confirmation"
                 : confirmationExpired
                   ? "Confirmation expired"
                   : "Review"}
@@ -140,7 +134,22 @@ export function JobCard({
         </div>
       </div>
 
-      <JobProgress job={job} productPresentation={productPresentation} />
+      <JobProgress job={job} />
+      {!productPresentation ? (
+        <details className="mt-3 rounded-lg border border-border/70 p-3 text-xs">
+          <summary className="cursor-pointer text-muted-foreground">Job diagnostics</summary>
+          <dl className="mt-3 grid gap-2">
+            <div><dt>Job ID</dt><dd className="break-all font-mono">{job.jobId}</dd></div>
+            <div><dt>Job kind</dt><dd className="break-all font-mono">{job.kind}</dd></div>
+            <div><dt>Generation / sequence</dt><dd>{job.generation} / {job.sequence}</dd></div>
+            {job.phase ? <div><dt>Phase</dt><dd className="break-all font-mono">{job.phase}</dd></div> : null}
+            {job.failure ? <div><dt>Failure</dt><dd className="break-all font-mono">{job.failure.class} · {job.failure.diagnostic}</dd></div> : null}
+            {job.recovery ? <div><dt>Recovery</dt><dd className="break-all font-mono">{job.recovery}</dd></div> : null}
+            {job.result ? <div><dt>Result</dt><dd className="break-all font-mono">{job.result.authority} · {job.result.identity}</dd></div> : null}
+            {confirmationQuery.isError ? <div><dt>Confirmation</dt><dd>{messageFrom(confirmationQuery.error)}</dd></div> : null}
+          </dl>
+        </details>
+      ) : null}
 
       {job.cancellationRequested && (
         <p className="mt-3 text-xs text-amber-300">
@@ -150,14 +159,10 @@ export function JobCard({
       {job.failure && (
         <div className="mt-3 rounded-lg border border-destructive/35 bg-destructive/10 p-3">
           <p className="text-xs font-medium text-destructive">
-            {humanize(job.failure.class)}
+            {jobFailureLabel(job.failure.class)}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {productPresentation
-              ? job.failure.retryable
-                ? "You can retry this backtest."
-                : "Review Logs & Diagnostics for details."
-              : `${humanize(job.failure.diagnostic)}. ${job.failure.retryable ? "A fenced retry is available." : "The service did not admit a retry."}`}
+            {job.failure.retryable ? "You can retry this job." : "Review Logs & Diagnostics for details."}
           </p>
         </div>
       )}
@@ -165,19 +170,19 @@ export function JobCard({
         <div className="mt-3 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3">
           <p className="text-xs font-medium text-amber-300">Recovery status</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {productPresentation
-              ? "This backtest is recovering. Available actions will appear when it is ready."
-              : `${humanize(job.recovery)}. No recovery action is shown unless the current state admits an exact typed mutation.`}
+            {job.recovery === "interrupted-requires-explicit-retry"
+              ? "This job was interrupted. Review the available actions before continuing."
+              : "Recovery is in progress. Available actions appear when the job is ready."}
           </p>
         </div>
       )}
       {job.result && (
         <div className="mt-3 rounded-lg border border-emerald-400/25 bg-emerald-400/5 p-3">
-          <p className="text-xs font-medium text-emerald-300">Result published</p>
+          <p className="text-xs font-medium text-emerald-300">Results ready</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {productPresentation
-              ? "This backtest completed. Select it to inspect the result."
-              : `${humanize(job.result.authority)} owns ${humanize(job.result.identity)}${job.result.artifacts.length > 0 ? ` with ${job.result.artifacts.length} controlled artifact${job.result.artifacts.length === 1 ? "" : "s"}.` : "."}`}
+            {job.result.artifacts.length > 0
+              ? `${job.result.artifacts.length} result file${job.result.artifacts.length === 1 ? " is" : "s are"} available below.`
+              : "The job completed and its result was saved."}
           </p>
           {!productPresentation && job.result.artifacts.length > 0 && (
             <div className="mt-3 grid gap-3">
@@ -195,17 +200,14 @@ export function JobCard({
       )}
       {confirmationQuery.isError && job.state === "awaiting_confirmation" && (
         <p className="mt-3 text-xs text-destructive">
-          {productPresentation
-            ? "Confirmation is unavailable. Try again or review Logs & Diagnostics."
-            : `Confirmation is disabled because the exact current evidence could not be retrieved: ${messageFrom(confirmationQuery.error)}`}
+          Confirmation could not be checked. Try again or review Logs & Diagnostics.
         </p>
       )}
       {confirmationQuery.isSuccess &&
         !confirmation &&
         job.state === "awaiting_confirmation" && (
           <p className="mt-3 text-xs text-destructive">
-            Confirmation is disabled because the current event did not contain
-            exact confirmation evidence.
+            Confirmation is unavailable for the current job status.
           </p>
         )}
     </article>
@@ -223,9 +225,9 @@ function JobArtifactPreview({
 }) {
   const mediaType = previewableMediaType(artifact)
   return <section className="rounded-md border border-border/70 bg-background/25 p-3">
-    <p className="flex items-center gap-2 text-xs font-medium"><FileText className="size-3.5" aria-hidden="true" />Controlled artifact</p>
+    <p className="flex items-center gap-2 text-xs font-medium"><FileText className="size-3.5" aria-hidden="true" />Result file</p>
     <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">{artifact.id} · sha256:{artifact.sha256} · {artifact.byteCount.toLocaleString()} bytes</p>
-    {mediaType ? <DemandPanel title="View controlled preview" className="mt-3">
+    {mediaType ? <DemandPanel title="View preview" className="mt-3">
       <JobArtifactPreviewRead artifact={artifact} transport={transport} scope={scope} />
     </DemandPanel> : <p className="mt-2 text-xs text-muted-foreground">Viewing is unavailable: this dashboard can safely render only JSON or NDJSON artifact previews.</p>}
   </section>
@@ -311,11 +313,11 @@ function JobArtifactPreviewRead({
   return (
     <div>
       <Button size="sm" variant="outline" disabled={previewQuery.isFetching} onClick={() => void previewQuery.refetch()}>
-        {previewQuery.isFetching ? "Retrieving preview…" : "Refresh controlled preview"}
+        {previewQuery.isFetching ? "Retrieving preview…" : "Refresh preview"}
       </Button>
       {previewQuery.isError && (
         <p className="mt-2 text-xs text-destructive">
-          The controlled preview could not be retrieved: {messageFrom(previewQuery.error)}
+          The preview could not be retrieved: {messageFrom(previewQuery.error)}
         </p>
       )}
       {preview && content !== null && (
@@ -349,26 +351,12 @@ function decodeUtf8(chunksBase64: string[]): string {
     }
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes)
   } catch {
-    return "The service returned a bounded artifact chunk that is not valid UTF-8 text."
+    return "This result file cannot be displayed as text."
   }
 }
 
-function JobProgress({
-  job,
-  productPresentation,
-}: {
-  job: JobView
-  productPresentation: boolean
-}) {
-  if (!job.phase) {
-    return (
-      <p className="mt-4 text-xs text-muted-foreground">
-        {productPresentation
-          ? "Progress details are not available yet."
-          : "No progress evidence has been published for this generation."}
-      </p>
-    )
-  }
+function JobProgress({ job }: { job: JobView }) {
+  if (!job.phase) return null
 
   const total = job.totalUnits
   const completed = job.completedUnits
@@ -380,26 +368,18 @@ function JobProgress({
   return (
     <div className="mt-4">
       <div className="flex items-center justify-between gap-3 text-xs">
-        <span className="font-medium">{humanize(job.phase)}</span>
-        <span className="font-mono text-muted-foreground">
-          {total !== null && completed !== null
-            ? `${completed.toLocaleString()} / ${total.toLocaleString()} units`
-            : "Phase only"}
-        </span>
+        <span className="font-medium">{jobPhaseLabel(job.phase)}</span>
+        {total !== null && completed !== null ? <span className="font-mono text-muted-foreground">
+          {completed.toLocaleString()} / {total.toLocaleString()}
+        </span> : null}
       </div>
       {percent !== null ? (
         <Progress
           className="mt-2"
           value={percent}
-          aria-label={`${humanize(job.phase)} progress`}
+          aria-label={`${jobPhaseLabel(job.phase)} progress`}
         />
-      ) : (
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          {productPresentation
-            ? "A completion percentage is not available for this step."
-            : "The runner supplied a phase without a measurable nonzero total."}
-        </p>
-      )}
+      ) : null}
     </div>
   )
 }
@@ -412,7 +392,7 @@ function StateBadge({ state }: { state: JobState }) {
         stateTone(state),
       )}
     >
-      {humanize(state)}
+      {jobStateLabel(state)}
     </span>
   )
 }
@@ -431,10 +411,6 @@ function stateTone(state: JobState): string {
     default:
       return "border-primary/30 bg-primary/10 text-blue-300"
   }
-}
-
-function shortId(value: string): string {
-  return `${value.slice(0, 8)}…${value.slice(-4)}`
 }
 
 function formatJobTime(value: LosslessInteger): string {

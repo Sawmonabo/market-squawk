@@ -48,7 +48,11 @@ const envelopeFields = {
   effective: productTimeSchema,
   knownAt: timestampSchema,
 }
-const reportingEnvelopeSchema = z.object(envelopeFields).strict()
+const reportingEnvelopeSchema = z.object({
+  ...envelopeFields,
+  scope: z.enum(["company_wide", "filing_detail"]),
+  reportingContext: reportingContextSchema.omit({ occurrence: true }),
+}).strict()
 const currencySchema = z.string().regex(/^[A-Z]{3}$/)
 const factSchema = z.object({
   ...envelopeFields,

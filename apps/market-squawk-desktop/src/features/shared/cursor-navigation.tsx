@@ -38,11 +38,11 @@ export function CursorNavigation({ navigation, current, next, busy, error = fals
   return <nav className="mt-4 flex flex-wrap items-center justify-between gap-3" aria-label="Result pages">
     <span className="text-xs text-muted-foreground" aria-live="polite">Page {navigation.page}</span>
     <div className="flex gap-2">
-      <Button size="sm" variant="outline" disabled={busy} onClick={() => { navigation.restart(); onNavigate?.(); onRestart?.() }}>Restart from first page</Button>
+      <Button size="sm" variant="outline" disabled={busy} onClick={() => { navigation.restart(); onNavigate?.(); onRestart?.() }}>First page</Button>
       <Button size="sm" variant="outline" disabled={busy || !navigation.canGoPrevious} onClick={() => { navigation.previous(); onNavigate?.() }}>Previous</Button>
       <Button size="sm" variant="outline" disabled={busy || next === null || next === undefined || invalidNext} onClick={() => { navigation.next(next, current); onNavigate?.() }}>Next</Button>
     </div>
-    {error ? <p role="alert" className="w-full text-xs text-destructive">This page could not be opened. Restart from the first page to read a fresh snapshot.</p> : null}
-    {invalidNext ? <p role="alert" className="w-full text-xs text-destructive">The next page could not be opened. Restart from the first page to refresh these results.</p> : null}
+    {error ? <p role="alert" className="w-full text-xs text-destructive">This page could not be opened. Go to the first page for updated results.</p> : null}
+    {invalidNext ? <p role="alert" className="w-full text-xs text-destructive">The next page could not be opened. Go to the first page to refresh these results.</p> : null}
   </nav>
 }

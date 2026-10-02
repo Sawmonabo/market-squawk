@@ -76,7 +76,7 @@ function ReferenceProfile({ profile }: { profile: InvestmentReferenceProfile }) 
       <dl className="mt-3 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
         {([
           ["Applies from", profile.effectiveFrom], ["Applies until", profile.effectiveUntil],
-          ["Known at", profile.knownAt], ["Record updated", profile.referenceUpdatedAt],
+          ["Information available on", profile.knownAt], ["Record updated", profile.referenceUpdatedAt],
         ] as const).map(([label, value]) => <div key={label}>
           <dt className="text-muted-foreground">{label}</dt>
           <dd className="mt-1">{value === null ? "End date not reported" : <ProfileTime value={value} />}</dd>

@@ -298,7 +298,7 @@ function ForecastDetail({
   if (chart !== null && (chart.target.valueKind !== detail.target.valueKind || chart.target.label !== detail.target.label
     || chart.target.currencyCode !== detail.target.currencyCode || chart.target.unitLabel !== detail.target.unitLabel
     || chart.observedThroughUnixNanos !== detail.observedThroughUnixNanos)) {
-    return <Unavailable text="The forecast chart target and information cutoff could not be verified." />
+    return <Unavailable text="The saved forecast chart could not be checked." />
   }
 
   const estimates = chart?.estimates ?? []
@@ -681,7 +681,7 @@ function ProbabilityEventEvidence({ vintage, estimates }: { vintage: ForecastVin
         <Fact label="Starting observation" value={event.originBasis === "completed_bar_close" ? "Completed price bar"
           : event.originBasis === "named_session_close_for_nominal_daily_bar" ? "Recorded close of the named trading session" : "Exact recorded observation"} />
         <Fact label="Horizon" value={vintage.horizon.label} />
-        {definition.kind === "benchmark_outperformance" ? <Fact label="Selected benchmark identifier" value={definition.benchmarkInstrumentId} /> : null}
+        {definition.kind === "benchmark_outperformance" ? <Fact label="Comparison" value="Comparison name unavailable" /> : null}
         {definition.kind === "profit_after_costs" ? <>
           <Fact label="Trade size" value={`${definition.policy.quantity_lots} lots`} />
           <Fact label="Reporting currency" value={definition.policy.reporting_currency} />

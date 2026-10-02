@@ -76,7 +76,7 @@ function PriceSummary({ holding }: { holding: PortfolioHolding }) {
   const price = holding.price
   const label = price.state === "reported" ? "Reported portfolio value"
     : price.state === "current" ? "Current market price"
-      : price.state === "stale" ? "Stale price" : "Price unavailable"
+      : price.state === "stale" ? "Older price" : "Price unavailable"
   const confidence = price.confidence === "limited" ? "Limited"
     : price.confidence === "moderate" ? "Moderate" : "Strong"
   return (

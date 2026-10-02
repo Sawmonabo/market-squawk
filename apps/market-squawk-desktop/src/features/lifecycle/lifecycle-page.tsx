@@ -183,22 +183,22 @@ function ReadyLifecycle({
     onSuccess: async (result) => {
       setPending(null)
       if ("preview" in result) {
-        setNotice("Trusted metadata was checked and the staged candidate now has a fresh activation preflight.")
+        setNotice("Update check finished. Review the available version before installing.")
         queryClient.setQueryData(updatePreviewKey, result.preview)
       }
       if ("receipt" in result && result.receipt) {
         setReceipt(result.receipt)
         setNotice(
           result.kind === "start-update"
-            ? "The update was admitted as a durable job. Reconnect below for activation and health evidence."
-            : "The program rollback was admitted as a durable job. It does not restore workspace data.",
+            ? "Update queued. Follow progress in Operations to confirm installation and health checks."
+            : "Program rollback queued. It does not restore workspace data.",
         )
       }
       if ("installation" in result) {
         setNotice(
           result.kind === "repair"
-            ? "Program repair was accepted by the native installation authority."
-            : "Native program removal was accepted. User data remains preserved unless a separate, explicit data-purge workflow is used.",
+            ? "Program repair request accepted."
+            : "Program removal request accepted. Your saved data is preserved.",
         )
       }
       await Promise.all([
@@ -227,18 +227,18 @@ function ReadyLifecycle({
   return (
     <LifecycleFrame
       action={
-        <RefreshButton label="Refresh evidence" refreshing={status.isFetching} disabled={status.isFetching || !supportsUpdateStatus}
+        <RefreshButton label="Refresh status" refreshing={status.isFetching} disabled={status.isFetching || !supportsUpdateStatus}
           onClick={() => void status.refetch()} />
       }
     >
       {!supportsUpdateStatus ? (
-        <UnavailableState detail="The installed service did not advertise the closed update-status operation." />
+        <UnavailableState detail="Update status is unavailable in this installation." />
       ) : status.isPending ? (
         <LoadingEvidence />
       ) : status.isError ? (
         <UnavailableState detail={messageFrom(status.error)} retry={() => void status.refetch()} />
       ) : !status.data ? (
-        <UnavailableState detail="The service returned no trusted update-status evidence." />
+        <UnavailableState detail="Update status could not be read." />
       ) : (
         <>
           <UpdateStatusPanel status={status.data} />
@@ -310,7 +310,7 @@ function UpdateStatusPanel({ status }: { status: UpdateStatus }) {
             )}
           </span>
           <div>
-            <h2 className="text-lg font-semibold">Trusted release status</h2>
+            <h2 className="text-lg font-semibold">Update status</h2>
             <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
               {availabilityDetail(status.availability)}
             </p>
@@ -332,7 +332,7 @@ function UpdateStatusPanel({ status }: { status: UpdateStatus }) {
         <Fact label="Known-good version" value={status.knownGoodVersion} />
         <Fact label="Active generation" value={status.currentGeneration} />
         <Fact
-          label="Last trusted check"
+          label="Last update check"
           value={status.lastCheckedAt ? formatTimestamp(status.lastCheckedAt) : "No completed check recorded"}
         />
         <Fact
@@ -345,7 +345,7 @@ function UpdateStatusPanel({ status }: { status: UpdateStatus }) {
           <TriangleAlert aria-hidden="true" />
           <AlertTitle>Program recovery needs attention</AlertTitle>
           <AlertDescription>
-            Do not treat a program rollback as a data restore. Review the program rollback preflight below; backup and restore remain separate data-recovery workflows.
+            Review program rollback below to recover the program. Use Backup & Recovery to restore saved data.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -382,19 +382,19 @@ function UpdateFlow({
       <div className="flex items-start gap-3">
         <Download className="mt-0.5 size-5 text-primary" aria-hidden="true" />
         <div>
-          <h2 id="update-flow-heading" className="text-lg font-semibold">Check, stage, and activate</h2>
+          <h2 id="update-flow-heading" className="text-lg font-semibold">Program updates</h2>
           <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-            A metadata check stages only an admitted candidate. Activation is a separate, explicitly confirmed durable job.
+            Check for available updates, then review and confirm installation.
           </p>
         </div>
       </div>
       {!updateAvailable ? (
         <UnavailableCard
-          title="Trusted updates are unavailable"
+          title="Updates are unavailable"
           detail={
             lifecycleAvailable
               ? availabilityDetail(status.availability)
-              : "The installed service did not advertise every closed update operation required for this workflow."
+              : "This installation does not support all required update steps."
           }
         />
       ) : (
@@ -402,23 +402,23 @@ function UpdateFlow({
           <div className="mt-5 flex flex-wrap gap-2">
             <Button disabled={busy} onClick={onCheck}>
               <ShieldCheck aria-hidden="true" />
-              Check trusted metadata and stage
+              Check for updates
             </Button>
             <Button variant="outline" disabled={busy || previewLoading} onClick={onPreview}>
               <RefreshCw className={cn(previewLoading && "animate-spin")} aria-hidden="true" />
-              Review current activation preflight
+              Review update
             </Button>
           </div>
-          {previewError ? <FailureNotice title="Activation preflight unavailable" detail={previewError} /> : null}
+          {previewError ? <FailureNotice title="Update review unavailable" detail={previewError} /> : null}
           {preview ? (
             <UpdatePreflight preview={preview} stale={previewStale} busy={busy} onStart={onStart} />
           ) : status.stagedCandidate ? (
             <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-              A trusted candidate is staged. Review a current activation preflight before starting the update.
+              An update is available. Review it before installing.
             </p>
           ) : (
             <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-              No staged candidate is available. A confirmed trusted metadata check is required before activation can be considered.
+              Check for updates to find an available version.
             </p>
           )}
         </>
@@ -443,29 +443,29 @@ function UpdatePreflight({
     <div className="mt-5 rounded-lg border border-border bg-background/35 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h3 className="font-medium">Activation preflight for {candidate.version}</h3>
+          <h3 className="font-medium">Review update to {candidate.version}</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            This preview is bound to the current service, workspace, candidate, and evidence. It expires at {formatTimestamp(preview.expiresAt)}.
+            These checks apply to the current workspace and selected version. This review expires {formatTimestamp(preview.expiresAt)}.
           </p>
         </div>
         <PreflightBadge eligible={canApprove && !stale} />
       </div>
       <dl className="mt-4 grid gap-3 sm:grid-cols-2">
         <Fact label="Workspace schema" value={`${activity.schemaVersion} (candidate supports ${candidate.minimumSchemaVersion}–${candidate.maximumSchemaVersion})`} />
-        <Fact label="Disk evidence" value={`${formatBytes(activity.availableDiskBytes)} available; ${formatBytes(activity.requiredDiskBytes)} required`} />
-        <Fact label="Active mutation jobs" value={String(activity.runningMutationJobs)} />
+        <Fact label="Disk space" value={`${formatBytes(activity.availableDiskBytes)} available; ${formatBytes(activity.requiredDiskBytes)} required`} />
+        <Fact label="Jobs changing saved data" value={String(activity.runningMutationJobs)} />
         <Fact label="Paper execution" value={activity.paperExecutionActive ? "Active — blocks activation" : "Inactive"} />
         <Fact label="Execution reconciliation" value={activity.executionReconciliationPending ? "Pending — blocks activation" : "Current"} />
-        <Fact label="Restart and health" value="The update job restarts the program, proves health, and automatically restores the retained program on health failure." />
+        <Fact label="Restart and health" value="The update restarts the program and checks its health. If checks fail, the previous program version is restored." />
       </dl>
       {stale ? (
-        <FailureNotice title="This preview expired" detail="Get a fresh activation preflight. Preview evidence expires after fifteen minutes and is invalidated by a service restart." />
+        <FailureNotice title="This preview expired" detail="Review the update again. Reviews expire after fifteen minutes or a service restart." />
       ) : !canApprove ? (
-        <FailureNotice title="Activation is blocked" detail="Resolve the displayed compatibility, disk, active-work, paper, or reconciliation blocker, then obtain a fresh preview." />
+        <FailureNotice title="Update is blocked" detail="Resolve the compatibility, disk space, active job, or paper trading issue shown above, then review again." />
       ) : (
         <Button className="mt-4" disabled={busy} onClick={() => onStart(preview)}>
           <Download aria-hidden="true" />
-          Start verified update
+          Install update
         </Button>
       )}
     </div>
@@ -503,14 +503,14 @@ function RollbackFlow({
         </div>
       </div>
       {!lifecycleAvailable ? (
-        <UnavailableCard title="Program rollback unavailable" detail="The installed service did not advertise the closed rollback preview and start operations." />
+        <UnavailableCard title="Program rollback unavailable" detail="Program rollback is unavailable in this installation." />
       ) : (
         <>
           <Button className="mt-5" variant="outline" disabled={busy || loading} onClick={onPreview}>
             <RefreshCw className={cn(loading && "animate-spin")} aria-hidden="true" />
-            Review program rollback preflight
+            Review program rollback
           </Button>
-          {error ? <FailureNotice title="Program rollback preflight unavailable" detail={error} /> : null}
+          {error ? <FailureNotice title="Program rollback review unavailable" detail={error} /> : null}
           {preview ? (
             <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
@@ -528,7 +528,7 @@ function RollbackFlow({
                 <Fact label="Data preservation" value="This action changes program files only. Data recovery requires the separate Backup & Recovery workflow." />
               </dl>
               {stale ? (
-                <FailureNotice title="This preview expired" detail="Get a fresh program rollback preflight before approval." />
+                <FailureNotice title="This preview expired" detail="Review program rollback again before confirming." />
               ) : preview.evidence.activeWorkBlocked || !preview.evidence.knownGoodVerified ? (
                 <FailureNotice title="Program rollback is blocked" detail="Resolve active work or recovery evidence, then request a fresh preview." />
               ) : (
@@ -540,7 +540,7 @@ function RollbackFlow({
             </div>
           ) : (
             <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-              No program rollback preflight has been requested. The service decides whether a retained known-good program is eligible.
+              Review the retained program version to check whether rollback is available.
             </p>
           )}
         </>
@@ -566,9 +566,9 @@ function NativeProgramControls({
 }) {
   return (
     <section className="mt-6 rounded-xl border border-border bg-card/30 p-5" aria-labelledby="native-controls-heading">
-      <h2 id="native-controls-heading" className="text-lg font-semibold">Native program maintenance</h2>
+      <h2 id="native-controls-heading" className="text-lg font-semibold">Program maintenance</h2>
       <p className="mt-1 max-w-3xl text-sm leading-relaxed text-muted-foreground">
-        These controls use the platform installation authority, separately from service-owned trusted updates and program rollback. They do not expose paths or delete data by default.
+        Repair or remove the installed program. Your saved data is preserved.
       </p>
       {installationError ? (
         <FailureNotice title="Installed-program evidence is unavailable" detail={installationError} />
@@ -596,7 +596,7 @@ function NativeProgramControls({
           <Trash2 className="size-5 text-destructive" aria-hidden="true" />
           <h3 className="mt-3 font-medium">Remove installed programs</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            Removes native program components only. Data remains preserved; data purge is a separate explicit, inventory-driven action and is not available here.
+            Removes native program components only. Your saved data is preserved.
           </p>
           <Button className="mt-4" variant="destructive" disabled={busy || installationLoading || !installation?.installed} onClick={() => installation && onRemove(installation)}>
             <Trash2 aria-hidden="true" />
@@ -647,36 +647,36 @@ function confirmationContent(pending: PendingConfirmation) {
   switch (pending.kind) {
     case "check":
       return {
-        title: "Check trusted metadata and stage a candidate?",
-        description: "The service will contact only its immutable trusted update channel and may stage a verified candidate. It will not activate any program release.",
-        scope: "This is a confirmed metadata check and staging operation. Activation remains a separate confirmation after a fresh preflight.",
+        title: "Check for updates?",
+        description: "Market Squawk will contact its configured update channel and prepare an available version for review.",
+        scope: "Installation requires a separate review and confirmation.",
         confirm: "Check and stage",
       }
     case "start-update":
       return {
-        title: `Start verified update to ${pending.preview.evidence.candidate.version}?`,
-        description: "The service will consume this exact preflight, drain to declared safe boundaries, activate the immutable release, restart, and check program and data health.",
-        scope: "If startup health fails, the lifecycle authority restores the retained program. Data migrations are not blindly reversed.",
-        confirm: "Start verified update",
+        title: `Install update to ${pending.preview.evidence.candidate.version}?`,
+        description: "Current work finishes before the update is installed. The program then restarts and checks program and data health.",
+        scope: "If startup checks fail, the previous program version is restored. Changes to saved data are not automatically reversed.",
+        confirm: "Install update",
       }
     case "start-rollback":
       return {
         title: `Start program rollback to ${pending.preview.evidence.targetVersion}?`,
-        description: "The service will select the exact retained known-good program release from this fresh preflight.",
+        description: "Market Squawk will switch to the retained program version shown in this review.",
         scope: "Program rollback changes program files only. It does not restore workspace data, portfolios, datasets, settings, logs, or credentials.",
         confirm: "Start program rollback",
       }
     case "repair":
       return {
         title: `Repair installed program ${pending.installation.active_version ?? "release"}?`,
-        description: "The native installation authority will verify and repair program components through the platform-safe installation workflow.",
+        description: "Market Squawk will check and repair the installed program components.",
         scope: `Exact program target: ${pending.installation.target ?? "unavailable"}. Current component health: ${pending.installation.healthy ? "verified" : "repair required"}. User data is preserved: configuration, credentials, portfolios, datasets, models, logs, and artifacts are not removed.`,
         confirm: "Repair programs",
       }
     case "remove":
       return {
         title: `Remove installed program ${pending.installation.active_version ?? "release"}?`,
-        description: "The native installation authority will remove installed program components for this user.",
+        description: "Market Squawk will remove the installed program components for this user.",
         scope: `Exact program target: ${pending.installation.target ?? "unavailable"}. User data is preserved. This is not a data purge and does not remove configuration, credentials, portfolios, datasets, models, logs, or artifacts.`,
         confirm: "Remove programs",
         destructive: true,
@@ -688,9 +688,10 @@ function JobReceipt({ receipt }: { receipt: LifecycleJobReceipt }) {
   return (
     <Alert className="mt-5">
       <CheckCircle2 aria-hidden="true" />
-      <AlertTitle>Durable lifecycle job accepted</AlertTitle>
+      <AlertTitle>Program change queued</AlertTitle>
       <AlertDescription>
-        Receipt {receipt.jobId} at generation {receipt.generation} is queued. <Link className="underline underline-offset-4" to="/system/operations-jobs">Reconnect in Operations</Link> for current phase, health evidence, recovery state, and terminal receipt.
+        Follow progress in <Link className="underline underline-offset-4" to="/system/operations-jobs">Operations</Link> to confirm completion and health checks.
+        <details className="mt-2"><summary className="cursor-pointer">Job details</summary>Job {receipt.jobId} · generation {receipt.generation}</details>
       </AlertDescription>
     </Alert>
   )
@@ -700,7 +701,7 @@ function PreflightBadge({ eligible }: { eligible: boolean }) {
   return (
     <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium", eligible ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" : "border-amber-500/40 bg-amber-500/10 text-amber-300")}>
       {eligible ? <CheckCircle2 className="size-3.5" aria-hidden="true" /> : <CircleAlert className="size-3.5" aria-hidden="true" />}
-      {eligible ? "Eligible for confirmation" : "Not eligible"}
+      {eligible ? "Ready to confirm" : "Needs attention"}
     </span>
   )
 }
@@ -728,7 +729,7 @@ function SuccessNotice({ text }: { text: string }) {
   return (
     <Alert className="mt-5">
       <CheckCircle2 aria-hidden="true" />
-      <AlertTitle>Lifecycle evidence refreshed</AlertTitle>
+      <AlertTitle>Program status updated</AlertTitle>
       <AlertDescription>{text}</AlertDescription>
     </Alert>
   )
@@ -760,7 +761,7 @@ function LoadingEvidence() {
   return (
     <div className="rounded-xl border border-border bg-card/30 p-6" role="status">
       <LoaderCircle className="size-5 animate-spin text-primary" aria-hidden="true" />
-      <p className="mt-3 text-sm text-muted-foreground">Loading trusted update and recovery evidence…</p>
+      <p className="mt-3 text-sm text-muted-foreground">Loading update and recovery status…</p>
     </div>
   )
 }
@@ -779,9 +780,9 @@ function LifecycleFrame({ children, action }: { children: React.ReactNode; actio
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div className="max-w-3xl">
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Operations</p>
-          <h1 className="mt-2 text-2xl font-semibold tracking-tight">Updates & program recovery</h1>
+          <h1 className="mt-2 text-2xl font-semibold tracking-tight">Updates & Repair</h1>
           <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-            Review trusted program lifecycle evidence before a confirmed check, activation, rollback, repair, or native program removal.
+            Check for updates, restore a previous program version, repair the installation, or remove the program.
           </p>
         </div>
         {action}
@@ -794,11 +795,11 @@ function LifecycleFrame({ children, action }: { children: React.ReactNode; actio
 function availabilityDetail(availability: UpdateStatus["availability"]): string {
   switch (availability) {
     case "available":
-      return "This installed release has an admitted immutable update channel and trusted metadata authority."
+      return "Updates are available through the configured update channel."
     case "source_or_development_execution":
-      return "This source or development execution has no installed update trust channel. It will not invent an update location or trust material."
+      return "Updates are unavailable for this source or development installation."
     case "production_signing_material_unavailable":
-      return "This installed package has no admitted production update-signing material. Trusted update staging and activation remain unavailable."
+      return "Updates are unavailable for this installation because update verification is not configured."
   }
 }
 

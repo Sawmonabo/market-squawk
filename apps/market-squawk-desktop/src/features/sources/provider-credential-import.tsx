@@ -93,18 +93,18 @@ export function ProviderCredentialImport({
       const value = await transport.importProviderCredentialBundle()
       if (value === null) {
         cancelled = true
-        setNotice("No credential bundle was selected. Provider setup is unchanged.")
+        setNotice("No credential file was selected. Provider setup is unchanged.")
         return
       }
       const parsed = providerCredentialImportSchema.safeParse(value)
       if (!parsed.success) {
-        setError("The installed service returned an unsupported import result. Earlier entries may already have been stored. Refresh connection evidence before trying again.")
+        setError("The installed service returned an unsupported import result. Earlier entries may already have been stored. Refresh connection status before trying again.")
         return
       }
       setResult(parsed.data)
     } catch (failure) {
       setError(
-        `${messageFrom(failure)} If the import started, earlier entries may already have been stored. Review refreshed connection evidence before trying again.`,
+        `${messageFrom(failure)} If the import started, earlier entries may already have been stored. Review refreshed connection status before trying again.`,
       )
     } finally {
       if (!cancelled) onAttempted()
@@ -144,9 +144,9 @@ export function ProviderCredentialImport({
             <FileKey2 aria-hidden="true" />
           )}
           {pending
-            ? "Importing safely…"
+            ? "Importing…"
             : result
-              ? "Select another bundle"
+              ? "Select another file"
               : "Choose existing credential file"}
         </Button>
       </div>
@@ -156,8 +156,7 @@ export function ProviderCredentialImport({
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Credential import is unavailable</AlertTitle>
           <AlertDescription>
-            This installed service does not advertise the protected credential-bundle operation.
-            No file can be selected through an incomplete authority chain.
+            Credential file import is not supported by this installation.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -190,11 +189,11 @@ export function ProviderCredentialImport({
         <div className="mt-4 rounded-lg border border-border bg-background/45 p-4" role="status">
           <div className="flex items-center gap-2">
             <CheckCircle2 className="size-4 text-emerald-300" aria-hidden="true" />
-            <p className="text-sm font-medium">Credential bundle processed</p>
+            <p className="text-sm font-medium">Credential file processed</p>
           </div>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
             {selectedProviders.length} selected provider
-            {selectedProviders.length === 1 ? "" : "s"} returned a protected setup result;{" "}
+            {selectedProviders.length === 1 ? "" : "s"} returned a setup result;{" "}
             {disabledCount} provider{disabledCount === 1 ? " was" : "s were"} not selected.
           </p>
           {selectedProviders.length > 0 ? (

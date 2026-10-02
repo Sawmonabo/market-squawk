@@ -2,12 +2,87 @@
 
 ## Current execution — 2026-10-02
 
+Integrated owner correction checkpoint (pending lead commit): concise product copy, automatic
+selected history/financial loading, dated retained price/change and exact filing-context ratios.
+All assigned agents have finished and released ownership. Lead integrated shared schemas,
+financial lifecycle, presentation helpers and existing caller checks in this one worktree.
+The former watcher pause is over; the supervisor completed one matched single-job build
+(5m17s) and launched service77729/Desktop77783. React changes remain live through Vite.
+
+Evidence: two existing Rust critical cases PASS; all11 existing Desktop app journeys PASS;
+Desktop typecheck PASS. Actual native MSFT has USD517.13/+0.86%, first32 ratio rows reported,
+no page alerts/root or main overflow, and a full-precision tooltip without explanatory prose.
+Financial preparation completed automatically after opening the post-restart investment;
+no manual Load/Update financial action was used. History stays visible with one range selector.
+These are scoped implemented/critically verified/live verified outcomes, not installed completion.
+
+Current audit and remaining findings: `docs/reports/2026-10-02-desktop-product-copy-audit.md`.
+Next dependencies remain real workflow/data gaps, including observation-relative close lookup,
+saved comparison labels and full stock analysis; no speculative hardening or new review quarter.
+No new branches/worktrees, CI/release gate, RAM measurement or publication were performed.
+
+
+Owner correction wave at `1ac7cbff`: audit ordinary product copy recursively across all
+screens, tabs, menus and shared renderers, and resolve MSFT's missing change through its
+actual quote/close semantics. Acceptance items 1 and 5; do not substitute invented values
+or remove honest financial uncertainty. Initial independent lanes converge before edits to
+shared contracts or runtime replacement.
+
+| Owner | Exact ownership | Outcome / evidence |
+| --- | --- | --- |
+| Sol product_copy_audit | Read-only `apps/market-squawk-desktop/src`; write only `.agents/tmp/v1-first-stock/product-copy-audit.md` | Enumerate reachable engineering placeholders, manual loading copy and raw values across every feature/shared renderer, with exact paths, proposed product wording and separate legitimate empty states. Lead owns implementation assignment. |
+| Astra change_semantics | Read-only backend market/quote/history paths and existing native evidence; write only `.agents/tmp/v1-first-stock/change-semantics-diagnosis.md` | Explain MSFT missing change from actual values, source timestamps, freshness and session basis; recommend smallest financially correct fix with current primary documentation where needed. No source edits/builds. |
+| Astra ratio_context_diagnosis | Read-only selected financial page/index and `research/company_product.rs`; write only `.agents/tmp/v1-first-stock/ratio-context-diagnosis.md` | Explain repeated missing ratios after detailed filing publication; preserve exact contexts and avoid cross-context financial arithmetic. |
+| Lead | Shared integration, native read-only probe, ledger, all edits until delegated, checks and Git | Verify current running state, integrate source-backed fixes, focused critical checks and pushed checkpoint. |
+
+No branches/worktrees, competing builds, runtime changes or broad test additions by agents.
+
+Recursive copy remediation follows `.agents/tmp/v1-first-stock/product-copy-audit.md`:
+Sol product_copy_audit owns the report's remaining ordinary-screen labels in profile,
+analysis-activity/saved-benchmark-chart/investment-brief, forecast-preparation/bundle-evidence,
+backtests, fair-value/valuation-evidence, portfolio impact/scenarios, account-risk,
+financial-preference-controls, app-header/overview-page, navigation and cursor-navigation.
+Sol system_copy owns only listed visible copy in Settings, Sources, MCP, Operations, Lifecycle,
+Backup and Logs TSX renderers; no contracts, transport, state/control changes or provider secrets.
+Lead retains Research evidence quality/date mapping, all Markets controls/schema and integration.
+No new prose tests; existing affected workflow checks and native views establish scope-limited proof.
+
+Owner history-range correction: one range selection must render cached coverage and acquire
+missing selected history without another Load/Update click; remove redundant explanation.
+Sol history_range_interaction owns `features/markets/{preparation-controls,history-preparation,
+market-history-read,market-history-chart}.tsx` and only the history-recovery section of the
+existing `src/test/app.test.tsx` journey. Preserve explicit durable request identity and
+acknowledgment-loss recovery; no repeated job admission on redraw/remount. Lead owns financial
+wrapper/native contracts and scheduling. Ordinary user parameter changes authorize their reads;
+financial analyses, saves and virtual orders remain deliberate.
+
+Astra ratio_context_diagnosis implementation owns only `application/research/company_research.rs`,
+`company_product.rs`, `investment_financials/projection.rs` and existing ratio fixture in
+company_product. Lead owns financial output/schema/renderer synchronization. Exact XBRL context
+must replace per-concept occurrence as grouping identity while every input occurrence remains
+retained; equal operands can agree, conflicting operands cannot silently win.
+
+Implementation assignment: Sol product_copy_audit may now edit product-copy strings in
+`features/opportunities/investment-brief.tsx`, `features/models/forecast-review.tsx`, and
+`features/portfolio/{portfolio-format,holdings-table}.tsx` (actual formatter is `.ts`), with
+exact formatter callers if removing its unused raw-ID argument. Lead retains all Markets and
+shared percentage/schema files. Additional changes require named ownership first.
+
+Implementation assignment: Astra change_semantics now owns only
+`application/paper/market/{product,durable_product}.rs` for dated last-known display and
+matching existing critical cases. Lead owns shared output/schema and UI changes. Watcher99703
+is paused while native changes are integrated; existing Desktop/service remain available.
+No display change grants execution freshness. Latest-close-only indexing remains a separate
+observed dependency: a close at/after the observation cannot become its comparison baseline.
+
 Owner correction: ordinary bid/ask size labels must not expose engineering copy such as
 “unit unconfirmed.” Removed that suffix and fixed text spacing; native HMR now shows
 “Bid size 40,” “Ask size 40,” and “Trade size 4” (`msft-quote-clean-copy.json`).
 Original reported values and internal unit provenance/authority are unchanged. No new tests or
-Rust rebuild were needed for this copy-only correction. Filing preparation remains running at
-sequence3; no completion claim or duplicate retry.
+Rust rebuild were needed for this copy-only correction. The filing job subsequently completed
+at sequence4; its terminal artifact records 32,671 company-fact rows, 4,525 filing rows and
+1,581 detailed-filing rows. The current Ratios tab still exposes repeated sparse filing contexts;
+that product defect remains open despite successful source preparation.
 
 Native market correction is live verified after the supervised restart to generation `Dxbarz`
 (service26909, Desktop26961). MSFT now exposes original last trade 517.13 USD, size4, and both
@@ -20,8 +95,9 @@ profile, history and financial reads succeeded, with no page alert or horizontal
 Formatting follow-up retains floor semantics for negative fractional Unix timestamps; direct
 -1ns boundary check and final Desktop typecheck PASS. Readable dates remain visible after restart.
 The explicit MSFT filing retry is job `6b80fcf8-13fa-4aa9-90c5-ed16ccd5de97`; its current
-recorded state is running, sequence3 (`msft-filing-occurrence-job.json`). Do not retry again or
-claim detailed-filing success until its terminal result is observed.
+recorded state is completed, sequence4 (`msft-filing-occurrence-job.json`), result identity
+`financial-result-2c4e3fa7f55a890969c952ca12ac1fddb15c1602de30310e2ca698559f46c7eb`.
+Detailed filing publication is verified; full financial-page correctness is not. Do not retry.
 
 Operational note: touching unchanged Rust to wake the watcher retriggered Cargo compilation.
 That extra serialized build passed in6m03s but was unnecessary. Do not change Rust source

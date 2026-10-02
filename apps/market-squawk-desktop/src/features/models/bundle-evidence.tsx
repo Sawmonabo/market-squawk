@@ -85,7 +85,7 @@ export function BundleEvidence({
             <Fact
               label="Training source basis"
               value={model.training.studyBasis === "historical_as_known"
-                ? "Information known at the historical cutoff"
+                ? "Information known at the time"
                 : "Retrospective frozen source snapshot"}
             />
           ) : null}

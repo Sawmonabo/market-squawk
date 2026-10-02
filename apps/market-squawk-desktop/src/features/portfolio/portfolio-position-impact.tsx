@@ -132,7 +132,7 @@ export function PortfolioPositionImpact({ account, bootstrap, transport }: {
   </section>
 }
 
-export function PortfolioPositionReportView({ report, investmentLabel = investmentDisplayName(null, report.instrumentId) }: { report: PortfolioCandidateImpact; investmentLabel?: string }) {
+export function PortfolioPositionReportView({ report, investmentLabel = investmentDisplayName(null) }: { report: PortfolioCandidateImpact; investmentLabel?: string }) {
   return <section className="space-y-4 rounded-lg border border-border bg-background/25 p-4" aria-label="Position comparison results">
     <h3 className="text-sm font-semibold">{investmentLabel} · {report.positionState === "new" ? "New position" : "Existing position"}</h3>
     <p className="text-xs leading-5 text-muted-foreground">
@@ -179,7 +179,7 @@ export function PortfolioPositionReportView({ report, investmentLabel = investme
         <Fact label="Price used" value={formatMoney(report.price.amount)} />
         <Fact label="Price method" value={report.price.method} />
         <Fact label="Price observation time" value={formatUnixNanos(report.price.asOfUnixNanos)} />
-        <Fact label="Price freshness cutoff" value={formatUnixNanos(report.price.freshUntilUnixNanos)} />
+        <Fact label="Price valid until" value={formatUnixNanos(report.price.freshUntilUnixNanos)} />
         <Fact label="Price confidence" value={report.price.confidence} />
         <Fact label="Supported lot size" value={groupDecimal(report.instrumentTerms.lotSize)} />
         <Fact label="Contract multiplier" value={groupDecimal(report.instrumentTerms.contractMultiplier)} />
@@ -187,7 +187,7 @@ export function PortfolioPositionReportView({ report, investmentLabel = investme
         <Fact label="Risk checks completed" value={report.riskAssessment.checksCompleted.toLocaleString()} />
         <Fact label="Risk checks unavailable" value={report.riskAssessment.checksUnavailable.toLocaleString()} />
       </dl>
-      <p className="mt-3 text-xs leading-5 text-muted-foreground">The price was checked when calculated. Its freshness cutoff does not guarantee the price remains available now.</p>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">The price was checked for this calculation. Compare again to check the current price.</p>
       {report.missingInformation.length ? <div className="mt-3 text-xs">
         <h4 className="font-semibold">Missing information</h4>
         <ul className="mt-2 space-y-1 text-muted-foreground">{report.missingInformation.map((item) => <li key={item}>{item}</li>)}</ul>

@@ -199,7 +199,7 @@ function CoverageRead({ transport, scope, workflowToken }: {
 
 function coverageReasonLabel(reason: Extract<AnalyticalControllerResponse, { kind: "workflow_coverage" }>["rows"][number]["reason"]) {
   const labels = {
-    no_effective_canonical_definition: "Investment identity was unavailable at the search cutoff.",
+    no_effective_canonical_definition: "Investment details were unavailable as of the search date.",
     outside_profile_asset_scope: "Outside your selected investment scope.",
     missing_official_listing: "Official listing information was unavailable.",
     ambiguous_official_listing: "Official listing information was ambiguous.",

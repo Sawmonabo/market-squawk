@@ -21,11 +21,10 @@ export function portfolioDisplayName(account: PortfolioAccount): string {
 export function investmentDisplayName(investment: {
   name: string | null
   symbol: string | null
-} | null, instrumentId?: string): string {
+} | null): string {
   const name = investment?.name ?? "Investment name unavailable"
   const symbol = investment?.symbol ? ` (${investment.symbol})` : ""
-  const identity = !investment?.name && !investment?.symbol && instrumentId ? ` · ${instrumentId}` : ""
-  return `${name}${symbol}${identity}`
+  return `${name}${symbol}`
 }
 
 /** Shift an exact unit-rate string to percentage units without floating point. */

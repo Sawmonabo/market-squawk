@@ -221,7 +221,7 @@ function MarketCard({ row, unverified, onSelect }: {
     <p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p>
     <p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p>
     <p className="mt-1 text-sm"><PercentageChange value={row.changePercent} description={marketChangeDescription(row)} /></p>
-    <p className="mt-1 min-h-8 text-xs leading-4 text-muted-foreground">{unverified ? row.price ? "Saved price · Freshness not checked" : "Availability not checked"
+    <p className="mt-1 min-h-8 text-xs leading-4 text-muted-foreground">{unverified ? row.price ? "Saved price" : "Checking prices…"
       : marketAvailabilityLabel(row)}</p>
     {row.asOf ? <time className="mt-1 block text-xs text-muted-foreground" dateTime={row.asOf}>{formatProductTimestamp(row.asOf)}</time> : null}
   </button>

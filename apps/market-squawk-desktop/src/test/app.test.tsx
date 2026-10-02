@@ -796,7 +796,13 @@ describe("Market Squawk desktop boundary", () => {
                 return new Promise<ApplicationResult>((resolve) => { finishFinancial = resolve })
               }
               if (request.section !== "facts") return {
-                ...financialResult(), data: { ...financialResult().data as object, section: request.section, items: [] },
+                ...financialResult(), data: {
+                  ...financialResult().data as object, section: request.section, items: [],
+                  state: financialVersion === 0 ? "missing" : "reported",
+                  families: [{ family: "filings", state: financialVersion === 0 ? "missing" : "reported",
+                    reason: financialVersion === 0 ? "no_records" : null }],
+                  nextCursor: null,
+                },
                 metadata: { completeness: "complete", returnedItems: 0, availableItems: 0 },
               }
               return financialResult(request.cursor)
@@ -815,7 +821,7 @@ describe("Market Squawk desktop boundary", () => {
         )} />
       </MemoryRouter>,
     )
-    const investment = openInvestment(lookupRoute(parsed.matches[0]!))
+    let investment = openInvestment(lookupRoute(parsed.matches[0]!))
     expect(await screen.findByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: marketSelectionToken })
     const profile = within(screen.getByRole("region", { name: "Investment profile" }))
@@ -830,6 +836,8 @@ describe("Market Squawk desktop boundary", () => {
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials").every((request) => request.section === "facts")).toBe(true)
     const facts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
     expect(await facts.findByText("USD 123,456.78")).toBeTruthy()
+    expect(financialPreparationRequests).toHaveLength(0)
+    expect(screen.queryByRole("button", { name: /^(Load|Update) financial information$/ })).toBeNull()
     await userEvent.setup().click(facts.getByRole("button", { name: "Next" }))
     expect(await facts.findByText("USD 234,567.89")).toBeTruthy()
     expect(issuedQueries).toContainEqual({ query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32, cursor: "financial-next" })
@@ -838,7 +846,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(issuedQueries).toContainEqual({ query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32, cursor: "financial-first" })
     financialMode = "mismatch"
     await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
-    expect((await facts.findByRole("alert")).textContent).toContain("could not be updated")
+    expect((await facts.findByRole("alert")).textContent).toContain("Could not update financial information")
     expect(facts.getByText("USD 123,456.78")).toBeTruthy()
     expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     financialMode = "pending"
@@ -851,35 +859,36 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(issuedQueries).toContainEqual({ query: "closeInvestmentFinancials", selectionToken: marketSelectionToken, readToken: financialRead }))
     expect(screen.queryByRole("region", { name: "Reported financial facts" })).toBeNull()
 
-    // Financial acquisition is explicit and independent of retained section reads.
-    // Recover a lost Start acknowledgment, reject another job, and cancel using
+    // A successful missing-family read loads financial information automatically.
+    // Recover its lost acknowledgment, reject another job, and cancel using
     // the original lossless generation and the last checked sequence.
-    const financialControlNode = screen.getByRole("group", { name: "Financial information preparation" })
-    const financialControls = within(financialControlNode)
-    expect(financialPreparationRequests).toHaveLength(0)
-    await userEvent.setup().click(financialControls.getByRole("button", { name: "Load financial information" }))
-    await financialControls.findByText("Preparation could not be verified. Check the original request before loading again.")
+    let financialControlNode = screen.getByRole("group", { name: "Financial information loading" })
+    let financialControls = within(financialControlNode)
+    await financialControls.findByText("Loading could not be checked. Check the original request before trying again.")
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(financialControls.queryByRole("button", { name: /^(Load|Update) financial information$/ })).toBeNull()
     const financialStart = financialPreparationRequests[0]!.request
     if (financialStart.action !== "start") throw new Error("Expected financial Start.")
     expect(financialPreparationRequests[0]!.confirmed).toBe(true)
     expect(financialStart).toEqual({ action: "start", selectionToken: marketSelectionToken, startRequestId: financialStart.startRequestId })
     expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).startRequestId).toBe(financialStart.startRequestId)
-    await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel pending start" }))
-    await financialControls.findByText("Preparation status could not be checked. The last checked information is retained.")
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel loading" }))
+    await financialControls.findByText("Loading status could not be checked. Showing the last checked information.")
     expect(financialPreparationRequests.find(({ request }) => request.action === "cancelStart")).toEqual({
       request: { action: "cancelStart", selectionToken: marketSelectionToken, startRequestId: financialStart.startRequestId }, confirmed: true,
     })
-    expect(financialControls.queryByRole("button", { name: "Cancel preparation" })).toBeNull()
-    expect((financialControls.getByRole("button", { name: "Load financial information" }) as HTMLButtonElement).disabled).toBe(true)
+    expect(financialControls.queryByRole("button", { name: "Cancel loading" })).toBeNull()
+    expect(financialControls.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
     wrongFinancialJob = false
-    await userEvent.setup().click(financialControls.getByRole("button", { name: "Check preparation" }))
-    await financialControls.findByText("Preparing financial information… 0 of 1 steps complete.")
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Check loading" }))
+    await financialControls.findByText(/^Loading financial information…/)
     expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).receipt).toMatchObject({
       jobId: financialJobId, generation: jobGeneration, sequence: financialSequence,
     })
     const financialReadsBeforeCancel = issuedQueries.filter((request) => request.query === "investmentFinancials").length
-    await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel preparation" }))
-    await financialControls.findByText("Financial information preparation was cancelled.")
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel loading" }))
+    await financialControls.findByText("Financial information loading was cancelled.")
     expect(financialPreparationRequests.at(-1)).toEqual({ request: {
       action: "cancel", selectionToken: marketSelectionToken, jobId: financialJobId,
       generation: jobGeneration, expectedSequence: financialSequence,
@@ -888,22 +897,37 @@ describe("Market Squawk desktop boundary", () => {
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials").at(-1)).toEqual({
       query: "investmentFinancials", selectionToken: marketSelectionToken, section: "filings", limit: 32,
     })
-    expect(financialControls.getByText("Financial information preparation was cancelled.")).toBeTruthy()
-    expect(financialControls.queryByText("Financial information preparation completed.")).toBeNull()
+    expect(financialControls.getByText("Financial information loading was cancelled.")).toBeTruthy()
+    expect(financialControls.queryByText("Financial information is ready.")).toBeNull()
     expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
-    expect(sessionStorage.getItem(financialRecoveryKey)).toBeNull()
+    expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!)).toMatchObject({
+      startRequestId: financialStart.startRequestId,
+      receipt: { jobId: financialJobId, generation: jobGeneration, sequence: "9007199254740995" },
+    })
 
-    await userEvent.setup().click(financialControls.getByRole("button", { name: "Load financial information" }))
-    await financialControls.findByText("Preparing financial information… 0 of 1 steps complete.")
+    investment.unmount()
+    investment = openInvestment(lookupRoute(parsed.matches[0]!))
+    await screen.findByRole("heading", { name: "MSQ · Requested investment" })
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Filings" }))
+    financialControlNode = screen.getByRole("group", { name: "Financial information loading" })
+    financialControls = within(financialControlNode)
+    await financialControls.findByText("Financial information loading was cancelled.")
+    await within(screen.getByRole("region", { name: "Filings" })).findByText("No reported information is available for this section at the information date.")
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).startRequestId).toBe(financialStart.startRequestId)
+
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Retry" }))
+    await financialControls.findByText(/^Loading financial information…/)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
     await userEvent.setup().click(screen.getByRole("tab", { name: "Facts" }))
-    expect(screen.getByRole("group", { name: "Financial information preparation" })).toBe(financialControlNode)
+    expect(screen.getByRole("group", { name: "Financial information loading" })).toBe(financialControlNode)
     const preparedFacts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
     await preparedFacts.findByText("USD 123,456.78")
     await userEvent.setup().click(preparedFacts.getByRole("button", { name: "Next" }))
     await preparedFacts.findByText("USD 234,567.89")
     const pagedReads = issuedQueries.filter((request) => request.query === "investmentFinancials").length
     let financialEventSequence = 0
-    const publishFinancialJob = () => subscriptions[0]!({ productSessionToken: blockedBootstrap.productSessionToken,
+    const publishFinancialJob = () => subscriptions.at(-1)!({ productSessionToken: blockedBootstrap.productSessionToken,
       sequence: String(++financialEventSequence), body: { type: "invalidate", domains: ["job"] } })
     financialVersion = 1
     financialPreparationState = "completed"
@@ -925,14 +949,13 @@ describe("Market Squawk desktop boundary", () => {
       query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32,
     })
 
-    // A verified completion on page one opens fresh information automatically;
-    // a failed read still keeps the previously checked values visible.
-    await userEvent.setup().click(financialControls.getByRole("button", { name: "Update financial information" }))
-    await financialControls.findByText("Preparing financial information… 0 of 1 steps complete.")
+    // Refresh failures preserve the verified page and recover through the read's
+    // Retry; a completed loading request cannot admit another automatic job.
+    await financialControls.findByText("Financial information is ready.")
+    expect(financialControls.queryByRole("button", { name: /^(Load|Update) financial information$/ })).toBeNull()
     financialVersion = 2
     financialMode = "mismatch"
-    financialPreparationState = "completed"
-    await act(async () => { publishFinancialJob() })
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
     await preparedFacts.findByRole("alert")
     expect(preparedFacts.getByText("USD 345,678.90")).toBeTruthy()
     financialMode = "available"
@@ -940,90 +963,97 @@ describe("Market Squawk desktop boundary", () => {
     await preparedFacts.findByText("USD 456,789.01")
     const freshReads = issuedQueries.filter((request) => request.query === "investmentFinancials").length
     await act(async () => { publishFinancialJob() })
-    await financialControls.findByText("Financial information preparation completed.")
+    await financialControls.findByText("Financial information is ready.")
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(freshReads)
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(3)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+    expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).receipt).toMatchObject({
+      jobId: "781276a0-33f1-4fb3-8cbb-bb2095acd0cb", generation: jobGeneration, sequence: "9007199254740995",
+    })
     await userEvent.setup().click(screen.getByRole("tab", { name: "Filings" }))
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "investmentFinancials").at(-1)).toEqual({
       query: "investmentFinancials", selectionToken: marketSelectionToken, section: "filings", limit: 32,
     }))
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
 
-    // This same selected-stock journey admits one explicit one-year preparation.
-    // A lost acknowledgment is recovered through the original request, not Start.
+    // Selecting a recent range loads it immediately; a lost acknowledgment
+    // survives a fresh App/QueryClient without replaying the durable start.
     const user = userEvent.setup()
-    await screen.findByLabelText("History window")
-    expect(preparationRequests).toHaveLength(0)
-    await user.selectOptions(screen.getByLabelText("History window"), "30")
-    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
-      query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512,
-      generationToken: initialHistoryGeneration,
-    }))
-    expect(preparationRequests).toHaveLength(0)
-    const retainedChart = screen.getByRole("img", { name: /Daily investment prices in USD/ })
-    await user.click(screen.getByRole("button", { name: "Update history" }))
-    await screen.findByText("Preparation could not be verified. Check the original request before loading again.")
-    expect(preparationRequests).toHaveLength(1)
-    const started = preparationRequests[0]!
-    expect(started.confirmed).toBe(true)
-    expect(started.request).toMatchObject({ action: "start", historyToken, lookbackDays: 365 })
-    if (started.request.action !== "start") throw new Error("The first preparation request was not Start.")
-    const startRequestId = started.request.startRequestId
-    expect(startRequestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-    expect(JSON.parse(sessionStorage.getItem(recoveryKey)!).startRequestId).toBe(startRequestId)
-    expect((screen.getByRole("button", { name: "Update history" }) as HTMLButtonElement).disabled).toBe(true)
-    expect(screen.getByRole("img", { name: /Daily investment prices in USD/ })).toBe(retainedChart)
-    await user.click(screen.getByRole("button", { name: "Check preparation" }))
-    await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toHaveLength(1))
-    await screen.findByText("The original preparation request has not been verified.")
-    expect((screen.getByRole("button", { name: "Update history" }) as HTMLButtonElement).disabled).toBe(true)
-    await user.click(screen.getByRole("button", { name: "Check preparation" }))
-    await screen.findByText("Preparing history… 0 of 1 steps complete.")
-    expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toEqual([
-      { request: { action: "reconcileStart", historyToken, lookbackDays: 365, startRequestId }, confirmed: false },
-      { request: { action: "reconcileStart", historyToken, lookbackDays: 365, startRequestId }, confirmed: false },
-    ])
-    expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    const selectedAt = Date.parse("2026-08-10T12:00:00Z")
+    const rangeClock = vi.spyOn(Date, "now").mockReturnValue(selectedAt)
+    const requestedWindow = {
+      startDate: new Date(selectedAt - 90 * 86_400_000).toISOString().slice(0, 10),
+      endDate: new Date(selectedAt).toISOString().slice(0, 10), pointLimit: 512,
+    }
+    try {
+      const retainedChart = await screen.findByRole("img", { name: /Daily investment prices in USD/ })
+      expect(preparationRequests).toHaveLength(0)
+      await user.selectOptions(screen.getByLabelText("History window"), "90")
+      await screen.findByText("History loading could not be checked. Check the original request before trying again.")
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+        query: "marketHistory", historyToken, ...requestedWindow, generationToken: initialHistoryGeneration,
+      }))
+      expect(screen.queryByRole("button", { name: /^(Load|Update) history$/ })).toBeNull()
+      expect(preparationRequests).toHaveLength(1)
+      const started = preparationRequests[0]!
+      expect(started.confirmed).toBe(true)
+      expect(started.request).toMatchObject({ action: "start", historyToken, lookbackDays: 90 })
+      if (started.request.action !== "start") throw new Error("The first preparation request was not Start.")
+      const startRequestId = started.request.startRequestId
+      expect(startRequestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+      expect(JSON.parse(sessionStorage.getItem(recoveryKey)!)).toMatchObject({ startRequestId, lookbackDays: 90 })
+      expect((screen.getByLabelText("History window") as HTMLSelectElement).disabled).toBe(true)
+      expect(screen.getByRole("img", { name: /Daily investment prices in USD/ })).toBe(retainedChart)
+      await user.click(screen.getByRole("button", { name: "Check loading" }))
+      await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toHaveLength(1))
+      await screen.findByText("The original loading request has not been checked.")
+      expect((screen.getByLabelText("History window") as HTMLSelectElement).disabled).toBe(true)
 
-    // A real App remount creates a new QueryClient. Keep only sessionStorage and
-    // the durable fake job, then recover the receipt through scoped Get.
-    const getsBeforeReload = preparationRequests.filter(({ request }) => request.action === "get").length
-    investment.unmount()
-    wrongProfileSelection = false
-    const reloaded = openInvestment(lookupRoute(parsed.matches[0]!))
-    await screen.findByText("Preparing history… 0 of 1 steps complete.")
-    await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(getsBeforeReload + 1))
-    expect(preparationRequests.at(-1)).toEqual({ request: { action: "get", historyToken, jobId: historyJobId, generation: jobGeneration }, confirmed: false })
-    expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
-    expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toHaveLength(2)
-    await screen.findByLabelText("History window")
-    await user.selectOptions(screen.getByLabelText("History window"), "30")
-    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
-      query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512,
-      generationToken: initialHistoryGeneration,
-    }))
-    const historyReadsBeforeCompletion = issuedQueries.filter((request) => request.query === "marketHistory").length
-    await waitFor(() => expect(subscriptions).toHaveLength(2))
-    let eventSequence = 0
-    // Reuse the existing subscription callback fixture from the coalescing case;
-    // emit the actual Job invalidation, rather than manually refetching queries.
-    const publishJob = () => subscriptions[1]!({ productSessionToken: blockedBootstrap.productSessionToken,
-      sequence: String(++eventSequence), body: { type: "invalidate", domains: ["job"] } })
-    preparationState = "completed"
-    await act(async () => { publishJob() })
-    await screen.findByText("History preparation completed.")
-    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1))
-    expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
-      query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512,
-    })
-    await waitFor(() => expect(screen.getAllByText("124.56789 USD").length).toBeGreaterThan(0))
-    expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("30")
-    expect(sessionStorage.getItem(recoveryKey)).toBeNull()
-    const completedGets = preparationRequests.filter(({ request }) => request.action === "get").length
-    await act(async () => { publishJob() })
-    await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(completedGets + 1))
-    expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1)
-    expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
-    reloaded.unmount()
+      const subscriptionsBeforeReload = subscriptions.length
+      const getsBeforeReload = preparationRequests.filter(({ request }) => request.action === "get").length
+      investment.unmount()
+      wrongProfileSelection = false
+      const reloaded = openInvestment(lookupRoute(parsed.matches[0]!))
+      await screen.findByText("Loading history…")
+      await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(getsBeforeReload + 1))
+      expect(preparationRequests.at(-1)).toEqual({ request: { action: "get", historyToken, jobId: historyJobId, generation: jobGeneration }, confirmed: false })
+      expect(preparationRequests.filter(({ request }) => request.action === "reconcileStart")).toEqual([
+        { request: { action: "reconcileStart", historyToken, lookbackDays: 90, startRequestId }, confirmed: false },
+        { request: { action: "reconcileStart", historyToken, lookbackDays: 90, startRequestId }, confirmed: false },
+      ])
+      expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+      await waitFor(() => expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("90"))
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+        query: "marketHistory", historyToken, ...requestedWindow, generationToken: initialHistoryGeneration,
+      }))
+      const historyReadsBeforeCompletion = issuedQueries.filter((request) => request.query === "marketHistory").length
+      await waitFor(() => expect(subscriptions).toHaveLength(subscriptionsBeforeReload + 1))
+      let eventSequence = 0
+      const publishJob = () => subscriptions.at(-1)!({ productSessionToken: blockedBootstrap.productSessionToken,
+        sequence: String(++eventSequence), body: { type: "invalidate", domains: ["job"] } })
+      rangeClock.mockReturnValue(selectedAt + 86_400_000)
+      preparationState = "completed"
+      await act(async () => { publishJob() })
+      await screen.findByText("History is ready.")
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1))
+      expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+        query: "marketHistory", historyToken, ...requestedWindow,
+      })
+      await waitFor(() => expect(screen.getAllByText("124.56789 USD").length).toBeGreaterThan(0))
+      expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("90")
+      expect(sessionStorage.getItem(recoveryKey)).toBeNull()
+      const completedGets = preparationRequests.filter(({ request }) => request.action === "get").length
+      await act(async () => { publishJob() })
+      await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(completedGets + 1))
+      expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1)
+      await user.selectOptions(screen.getByLabelText("History window"), "all")
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+        query: "marketHistory", historyToken, pointLimit: 512, generationToken: publishedHistoryGeneration,
+      }))
+      expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+      reloaded.unmount()
+    } finally {
+      rangeClock.mockRestore()
+    }
 
     // A development UI refresh must not send a new command to an older running native bridge.
     const financialQueriesBefore = issuedQueries.filter((request) => request.query === "investmentFinancials").length
@@ -1167,7 +1197,7 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))
     await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(true))
     expect(await collection.findByText("Saved watchlist could not be refreshed")).toBeTruthy()
-    expect(collection.getByText(/Saved price · Freshness not checked/)).toBeTruthy()
+    expect(collection.getByText(/Saved price/)).toBeTruthy()
     expect(collection.getByText("USD 68,000.15")).toBeTruthy()
     expect(collection.queryByText(/^Current/)).toBeNull()
     expect(screen.getByRole("region", { name: "Watchlist" }).querySelector("time")?.dateTime).toBe(priceTime)
@@ -1225,7 +1255,7 @@ describe("Market Squawk desktop boundary", () => {
       ),
     ).toBe(false)
 
-    await screen.findByLabelText("History window")
+    await screen.findByRole("img", { name: /Daily investment prices in USD/ })
     expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
       { query: "marketHistory", historyToken, pointLimit: 512 },
     ])
@@ -1233,21 +1263,28 @@ describe("Market Squawk desktop boundary", () => {
     const historyWindow = screen.getByLabelText("History window")
     expect(screen.getByRole("button", { name: "Refresh investment" }).textContent).toBe("")
     expect(screen.queryByRole("button", { name: /Refresh (price|profile|saved history|this section)/ })).toBeNull()
-    expect(screen.getByLabelText("History window")).toBe(historyWindow)
-    await user.selectOptions(screen.getByLabelText("History window"), "30")
+    const selectedAt = Date.now()
+    await user.selectOptions(historyWindow, "30")
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
       { query: "marketHistory", historyToken, pointLimit: 512 },
-      { query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512, generationToken },
+      { query: "marketHistory", historyToken,
+        startDate: new Date(selectedAt - 30 * 86_400_000).toISOString().slice(0, 10),
+        endDate: new Date(selectedAt).toISOString().slice(0, 10), pointLimit: 512, generationToken },
     ]))
+    expect(screen.getByLabelText("History window")).toBe(historyWindow)
+    expect(screen.getAllByText("68001.123456789 USD").length).toBeGreaterThan(0)
     expect(viewportSignal?.aborted).toBe(false)
-    await user.click(screen.getByRole("button", { name: "Hide price history" }))
+    await user.click(screen.getByRole("link", { name: "Back to Markets" }))
     await waitFor(() => expect(viewportSignal?.aborted).toBe(true))
     expect(screen.queryByLabelText("History window")).toBeNull()
-    // A late cancelled response cannot repopulate a closed panel or pin a new
-    // reader to the old window. Reopening starts from unpinned saved history.
+    // A late cancelled response cannot repopulate the departed detail route.
+    // Returning opens saved history without the previous window or generation.
     resolveViewport?.(historyResult)
-    await user.click(screen.getByRole("button", { name: "Show price history" }))
-    await screen.findByLabelText("History window")
+    const reopenedCard = (await screen.findByRole("heading", { name: "Bitcoin" })).closest("button")
+    if (!reopenedCard) throw new Error("The returning market card is absent")
+    await user.click(reopenedCard)
+    await screen.findByRole("img", { name: /Daily investment prices in USD/ })
+    expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("all")
     expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
     await user.click(screen.getByRole("button", { name: "Refresh investment" }))
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(4))
@@ -1262,7 +1299,7 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(returningCard)
     const returningPrice = within(await screen.findByRole("region", { name: "Investment price" }))
     expect(returningPrice.getByText("USD 68,000.15")).toBeTruthy()
-    expect(returningPrice.getByText(/Saved price · Freshness not checked/)).toBeTruthy()
+    expect(returningPrice.getByText(/Saved price/)).toBeTruthy()
     expect(returningPrice.queryByText(/^Bid\/ask midpoint · Current/)).toBeNull()
     await waitFor(() => expect(resolveInstrument).toBeTypeOf("function"))
     resolveInstrument?.()

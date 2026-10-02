@@ -58,7 +58,7 @@ function RebalanceRead({ account, bootstrap, transport, refresh }: RebalanceProp
   const changeTarget = (holding: PortfolioHolding, targetPercent: string) => {
     invalidate()
     const entered = { instrumentId: holding.instrumentId, targetPercent,
-      investmentLabel: investmentDisplayName(holding.investment, holding.instrumentId) }
+      investmentLabel: investmentDisplayName(holding.investment) }
     setTargets((current) => targetPercent === ""
       ? current.filter((target) => target.instrumentId !== holding.instrumentId)
       : current.some((target) => target.instrumentId === holding.instrumentId)
@@ -111,7 +111,7 @@ function RebalanceRead({ account, bootstrap, transport, refresh }: RebalanceProp
         </div> : page ? <fieldset className="space-y-3 rounded-lg border border-border p-4">
           <legend className="px-1 text-xs font-semibold">Targets for investments on this page</legend>
           {page.holdings.length ? page.holdings.map((holding) => <label key={holding.instrumentId} className="grid gap-1.5 text-xs">
-            <span className="font-semibold">Target for {investmentDisplayName(holding.investment, holding.instrumentId)} (%)</span>
+            <span className="font-semibold">Target for {investmentDisplayName(holding.investment)} (%)</span>
             <Input type="text" inputMode="decimal" autoComplete="off"
               value={targets.find((target) => target.instrumentId === holding.instrumentId)?.targetPercent ?? ""}
               disabled={positions.query.isFetching}
@@ -202,9 +202,9 @@ export function PortfolioRebalanceReportView({ report, targets = [] }: { report:
       <ul className="space-y-1">{report.proposal.targets.map((target) => {
         const trade = report.trades.find((item) => item.instrumentId === target.instrumentId)
         const label = trade?.investment
-          ? investmentDisplayName(trade.investment, target.instrumentId)
+          ? investmentDisplayName(trade.investment)
           : targets.find((entered) => entered.instrumentId === target.instrumentId)?.investmentLabel
-            ?? investmentDisplayName(null, target.instrumentId)
+            ?? investmentDisplayName(null)
         return <li key={target.instrumentId}>{label}: {target.targetPercent}%</li>
       })}</ul>
     </section>
@@ -217,7 +217,7 @@ export function PortfolioRebalanceReportView({ report, targets = [] }: { report:
         <th scope="col" className="px-3 py-3 font-medium">Projected value</th>
       </tr></thead>
       <tbody>{report.trades.map((trade) => <tr key={trade.instrumentId} className="border-b border-border/60">
-        <th scope="row" className="px-3 py-3 font-medium">{investmentDisplayName(trade.investment, trade.instrumentId)}</th>
+        <th scope="row" className="px-3 py-3 font-medium">{investmentDisplayName(trade.investment)}</th>
         <td className="whitespace-nowrap px-3 py-3 font-mono tabular-nums">{formatMoney(trade.currentValue)}</td>
         <td className="whitespace-nowrap px-3 py-3 font-mono tabular-nums">{formatMoney(trade.valueChange)}</td>
         <td className="whitespace-nowrap px-3 py-3 font-mono tabular-nums">{formatMoney(trade.projectedValue)}</td>

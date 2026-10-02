@@ -50,6 +50,7 @@ import {
 } from "./contracts"
 
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { jobFailureLabel, jobKindLabel, jobPhaseLabel, jobStateLabel } from "../operations/job-presentation"
 
 const INVENTORY_LIMIT = 64
 const JOB_LIMIT = 50
@@ -187,7 +188,7 @@ function ReadyBackupRecovery({
       setRestorePreview(null)
       setRollbackPreview(null)
       setAnnouncement(
-        `The service queued job ${newReceipt.jobId.slice(0, 8)}. Completion is not yet confirmed.`,
+        "The operation is queued. Follow progress to confirm completion.",
       )
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "operations") }),
@@ -218,16 +219,16 @@ function ReadyBackupRecovery({
   return (
     <BackupFrame
       action={
-        <RefreshButton label="Refresh evidence" refreshing={inventory.isFetching} onClick={refresh} disabled={inventory.isFetching} />
+        <RefreshButton label="Refresh backups" refreshing={inventory.isFetching} onClick={refresh} disabled={inventory.isFetching} />
       }
     >
       <p className="sr-only" aria-live="polite">{announcement}</p>
 
       <Alert>
         <ShieldCheck aria-hidden="true" />
-        <AlertTitle>Recovery preserves authority boundaries</AlertTitle>
+        <AlertTitle>Restore from a checked backup</AlertTitle>
         <AlertDescription>
-          A data restore stages a verified backup into a fresh service-owned workspace, then switches only after validation. It never accepts a browser path or merges files into the active workspace.
+          A restore checks the backup in a separate workspace before making it active. It does not merge backup data with your current workspace.
         </AlertDescription>
       </Alert>
 
@@ -244,10 +245,10 @@ function ReadyBackupRecovery({
       <section className="mt-6" aria-labelledby="backup-inventory-heading">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Managed inventory</p>
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Saved backups</p>
             <h2 id="backup-inventory-heading" className="mt-1 text-xl font-semibold">Verified backups</h2>
             <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-              Immutable backup identities, ownership, encryption, and component evidence. Raw manifests and filesystem locations remain private to the service.
+              Review saved backups, their contents, and encryption.
             </p>
           </div>
           <Button onClick={() => setPendingConfirmation({ kind: "create" })} disabled={control.isPending}>
@@ -344,16 +345,16 @@ function BackupCard({
     <article className="rounded-xl border border-border bg-card/45 p-4 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Immutable backup</p>
+          <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Saved backup</p>
           <h3 className="mt-1 font-mono text-sm font-semibold" title={backup.backupId}>{shortBackupId(backup.backupId)}</h3>
-          <p className="mt-1 text-xs text-muted-foreground">Snapshot cutoff {formatSnapshotTime(backup.snapshot.cutoff)}</p>
+          <p className="mt-1 text-xs text-muted-foreground">Backup as of {formatSnapshotTime(backup.snapshot.cutoff)}</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button size="sm" variant="outline" disabled={busy} onClick={onVerify}>
             <ShieldCheck aria-hidden="true" /> Verify
           </Button>
           <Button size="sm" disabled={busy} onClick={onRestore}>
-            <HardDrive aria-hidden="true" /> Preview restore
+            <HardDrive aria-hidden="true" /> Review restore
           </Button>
         </div>
       </div>
@@ -405,7 +406,7 @@ function RetentionPanel({
         <Trash2 className="mt-0.5 text-amber-300" aria-hidden="true" />
         <div>
           <h2 id="retention-heading" className="text-lg font-semibold">Retention preview</h2>
-          <p className="mt-1 text-sm text-muted-foreground">The service calculates the exact immutable identities it will remove. Nothing is deleted when you make a preview.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Review which older backups will be deleted. Reviewing does not delete anything.</p>
         </div>
       </div>
       <div className="mt-4 flex flex-wrap items-end gap-3">
@@ -421,10 +422,10 @@ function RetentionPanel({
         </label>
         <Button variant="outline" onClick={onPreview} disabled={previewBusy || controlBusy}>
           {previewBusy ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
-          Calculate delete set
+          Review older backups
         </Button>
       </div>
-      {pendingDeletions > 0 ? <p className="mt-3 text-xs text-amber-300">{pendingDeletions.toLocaleString()} deletion{pendingDeletions === 1 ? " is" : "s are"} already being processed by durable work.</p> : null}
+      {pendingDeletions > 0 ? <p className="mt-3 text-xs text-amber-300">{pendingDeletions.toLocaleString()} deletion{pendingDeletions === 1 ? " is" : "s are"} already being processed.</p> : null}
       {previewError ? <InlineFailure detail={messageFrom(previewError)} /> : null}
       {preview ? (
         <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
@@ -432,18 +433,18 @@ function RetentionPanel({
             <Alert variant="destructive">
               <CircleAlert aria-hidden="true" />
               <AlertTitle>Retention preview is stale</AlertTitle>
-              <AlertDescription>The inventory revision changed. Calculate the exact delete set again before confirmation.</AlertDescription>
+              <AlertDescription>The backup list changed. Review older backups again before confirming.</AlertDescription>
             </Alert>
           ) : preview.evidence.deleteBackupIds.length === 0 ? (
-            <p className="text-sm text-muted-foreground">The service found no backups to delete at this retention count. No retention job can be started.</p>
+            <p className="text-sm text-muted-foreground">There are no older backups to delete with this setting.</p>
           ) : (
             <>
-              <p className="text-sm font-medium">This confirmation deletes {preview.evidence.deleteBackupIds.length.toLocaleString()} exact backup {preview.evidence.deleteBackupIds.length === 1 ? "identity" : "identities"}.</p>
+              <p className="text-sm font-medium">Delete {preview.evidence.deleteBackupIds.length.toLocaleString()} older backup{preview.evidence.deleteBackupIds.length === 1 ? "" : "s"} after confirmation.</p>
               <ul className="mt-3 grid gap-1 font-mono text-[11px] text-muted-foreground">
                 {preview.evidence.deleteBackupIds.map((id) => <li key={id}>{shortBackupId(id)}</li>)}
               </ul>
               <Button className="mt-4" variant="destructive" disabled={controlBusy} onClick={onConfirm}>
-                <Trash2 aria-hidden="true" /> Review retention deletion
+                <Trash2 aria-hidden="true" /> Review deletion
               </Button>
             </>
           )}
@@ -472,12 +473,12 @@ function RestorePanel({
         <HardDrive className="mt-0.5 text-primary" aria-hidden="true" />
         <div>
           <h2 id="restore-heading" className="text-lg font-semibold">Data restore</h2>
-          <p className="mt-1 text-sm text-muted-foreground">Select a verified backup above to inspect compatibility, active-work fences, and required disk before this page can offer approval.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Choose a backup above to check compatibility, current jobs, and disk space before restoring.</p>
         </div>
       </div>
       {previewBusy ? <p className="mt-4 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="animate-spin" aria-hidden="true" /> Preparing restore preview…</p> : null}
       {previewError ? <InlineFailure detail={messageFrom(previewError)} /> : null}
-      {preview ? <RestoreEvidence preview={preview} controlBusy={controlBusy} onConfirm={onConfirm} /> : <p className="mt-4 text-xs text-muted-foreground">No restore preview is active. A durable restore cannot be started without one.</p>}
+      {preview ? <RestoreEvidence preview={preview} controlBusy={controlBusy} onConfirm={onConfirm} /> : <p className="mt-4 text-xs text-muted-foreground">Choose a backup to review before restoring.</p>}
     </section>
   )
 }
@@ -502,7 +503,7 @@ function RestoreEvidence({ preview, controlBusy, onConfirm }: { preview: Restore
           <AlertTitle>Restore is blocked</AlertTitle>
           <AlertDescription>
             <ul className="list-disc pl-4">
-              {!evidence.schemaCompatible ? <li>The staged workspace schema is not compatible.</li> : null}
+              {!evidence.schemaCompatible ? <li>The backup data format is not compatible.</li> : null}
               {!diskSufficient ? <li>Available disk is below the service-required amount.</li> : null}
               {evidence.blockers.map((blocker) => <li key={blocker}>{humanize(blocker)}</li>)}
             </ul>
@@ -510,9 +511,9 @@ function RestoreEvidence({ preview, controlBusy, onConfirm }: { preview: Restore
         </Alert>
       ) : (
         <>
-          <p className="mt-4 text-xs text-muted-foreground">The service will restore this data into a fresh managed workspace, validate it, and atomically switch generation only after health checks. A queued receipt is not completion.</p>
+          <p className="mt-4 text-xs text-muted-foreground">The backup is checked before its workspace becomes active. Follow progress to confirm completion.</p>
           <Button className="mt-4" disabled={controlBusy} onClick={onConfirm}>
-            <HardDrive aria-hidden="true" /> Review durable restore
+            <HardDrive aria-hidden="true" /> Review restore
           </Button>
         </>
       )}
@@ -542,8 +543,8 @@ function ProgramRollbackPanel({
         <div className="flex items-start gap-3">
           <RotateCcw className="mt-0.5 text-amber-300" aria-hidden="true" />
           <div>
-            <h2 id="program-rollback-heading" className="text-lg font-semibold">Program rollback is not data restore</h2>
-            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">This distinct recovery action changes only the installed program release. It never restores backup data, switches a workspace, or reverses data migrations.</p>
+            <h2 id="program-rollback-heading" className="text-lg font-semibold">Program rollback</h2>
+            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">Restore the previous program version. This changes program files only; use Data restore for saved-data recovery.</p>
           </div>
         </div>
         <Button variant="outline" disabled={previewBusy || controlBusy} onClick={onPreview}>
@@ -558,9 +559,9 @@ function ProgramRollbackPanel({
             <Fact label="Current program generation" value={preview.evidence.currentGeneration} />
             <Fact label="Known-good target" value={preview.evidence.targetVersion} />
             <Fact label="Known-good verification" value={preview.evidence.knownGoodVerified ? "Verified" : "Not verified"} />
-            <Fact label="Active-work fence" value={preview.evidence.activeWorkBlocked ? "Blocked" : "Clear"} />
+            <Fact label="Active jobs" value={preview.evidence.activeWorkBlocked ? "Blocked" : "Clear"} />
           </dl>
-          {allowed ? <Button className="mt-4" variant="outline" disabled={controlBusy} onClick={onConfirm}><RotateCcw aria-hidden="true" /> Review program rollback</Button> : <p className="mt-4 text-xs text-amber-300">The service will not admit rollback until active work is clear and the known-good release is verified.</p>}
+          {allowed ? <Button className="mt-4" variant="outline" disabled={controlBusy} onClick={onConfirm}><RotateCcw aria-hidden="true" /> Review program rollback</Button> : <p className="mt-4 text-xs text-amber-300">Rollback is unavailable until current work finishes and the previous program version passes verification.</p>}
         </div>
       ) : null}
     </section>
@@ -576,20 +577,20 @@ function JobReceiptStatus({ receipt, job, loading, error }: { receipt: BackupJob
     <section className="mt-4 rounded-xl border border-primary/30 bg-primary/5 p-4" aria-labelledby="backup-job-heading">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="font-mono text-[10px] uppercase tracking-wider text-primary">Durable job receipt</p>
-          <h2 id="backup-job-heading" className="mt-1 text-sm font-semibold">{job ? humanize(job.kind) : "Queued operation"}</h2>
-          <p className="mt-1 text-xs text-muted-foreground">Job {shortId(receipt.jobId)} · generation {receipt.generation} · initial state {humanize(receipt.state)}.</p>
+          <p className="font-mono text-[10px] uppercase tracking-wider text-primary">Operation progress</p>
+          <h2 id="backup-job-heading" className="mt-1 text-sm font-semibold">{job ? jobKindLabel(job.kind) : "Queued operation"}</h2>
+          <p className="mt-1 text-xs text-muted-foreground">Job {shortId(receipt.jobId)} · generation {receipt.generation} · initial state {jobStateLabel(receipt.state)}.</p>
         </div>
-        <Button asChild size="sm" variant="outline"><Link to="/system/logs-diagnostics">Open Job surface</Link></Button>
+        <Button asChild size="sm" variant="outline"><Link to="/system/logs-diagnostics">Open job logs</Link></Button>
       </div>
       {error ? <InlineFailure detail={`The job could not be refreshed: ${messageFrom(error)}`} /> : null}
-      {!job && !error ? <p className="mt-3 text-xs text-muted-foreground">{loading ? "Reconnecting to durable job evidence…" : "The queued job is not in this bounded page yet. Reconnect through the Job surface; this receipt does not prove completion."}</p> : null}
+      {!job && !error ? <p className="mt-3 text-xs text-muted-foreground">{loading ? "Loading job status…" : "The queued job is not shown yet. Open job logs for details; completion is not yet confirmed."}</p> : null}
       {job ? (
         <div className="mt-3">
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span className="font-medium">{humanize(job.state)}{job.phase ? ` · ${humanize(job.phase)}` : ""}</span><span className="font-mono text-muted-foreground">{job.completedUnits !== null && job.totalUnits !== null ? `${job.completedUnits.toLocaleString()} / ${job.totalUnits.toLocaleString()} units` : "No measurable progress yet"}</span></div>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span className="font-medium">{jobStateLabel(job.state)}{job.phase ? ` · ${jobPhaseLabel(job.phase)}` : ""}</span><span className="font-mono text-muted-foreground">{job.completedUnits !== null && job.totalUnits !== null ? `${job.completedUnits.toLocaleString()} / ${job.totalUnits.toLocaleString()} units` : "No measurable progress yet"}</span></div>
           {progress !== null ? <Progress className="mt-2" value={progress} aria-label="Backup job progress" /> : null}
-          {job.state === "completed" ? <p className="mt-3 text-xs text-emerald-300">The durable Job surface reports a completed result. After a restore, reconnect to the new workspace generation and confirm its health before continuing work.</p> : null}
-          {job.state === "failed" || job.state === "interrupted" ? <p className="mt-3 text-xs text-destructive">{job.failure ? `${humanize(job.failure.class)}: ${humanize(job.failure.diagnostic)}.` : "The job did not complete."} The active workspace remains the recovery authority until the service publishes a successful result.</p> : null}
+          {job.state === "completed" ? <p className="mt-3 text-xs text-emerald-300">The job completed. After a restore, reconnect and check the restored workspace before continuing.</p> : null}
+          {job.state === "failed" || job.state === "interrupted" ? <p className="mt-3 text-xs text-destructive">{job.failure ? `${jobFailureLabel(job.failure.class)}.` : "The job did not complete."} The workspace changes only after a successful restore.</p> : null}
         </div>
       ) : null}
     </section>
@@ -618,11 +619,11 @@ function ConfirmationDialog({ pending, submitting, error, onClose, onConfirm }: 
 
 function confirmationContent(pending: PendingConfirmation): { title: string; description: string; details: string | null; confirm: string } {
   switch (pending.kind) {
-    case "create": return { title: "Create coherent backup?", description: "The service will prepare a coherent snapshot as durable work. This acknowledgement only queues the job.", details: "No browser-selected destination or ambient path is accepted.", confirm: "Queue backup" }
-    case "verify": return { title: "Verify this exact backup?", description: "The service will verify the selected immutable backup identity as durable work.", details: `Backup ${shortBackupId(pending.backup.backupId)}.`, confirm: "Queue verification" }
-    case "retention": return { title: "Delete the previewed backups?", description: "Only the exact immutable identities in the current retention preview can be removed. The service rejects stale or changed evidence.", details: `${pending.preview.evidence.deleteBackupIds.length.toLocaleString()} backup identities will be scheduled for deletion.`, confirm: "Queue retention deletion" }
-    case "restore": return { title: "Restore verified data?", description: "The service will stage this data into a fresh managed workspace, validate it, then switch only after durable health checks. It does not merge into the active workspace.", details: `Active workspace ${shortId(pending.preview.evidence.active.workspaceId)} at generation ${pending.preview.evidence.active.generation}.`, confirm: "Queue durable restore" }
-    case "programRollback": return { title: "Roll back the installed program?", description: "This changes program files only. It does not restore backup data, switch a workspace, or reverse a data migration.", details: `Known-good program target ${pending.preview.evidence.targetVersion}.`, confirm: "Queue program rollback" }
+    case "create": return { title: "Create a backup?", description: "Create a backup of the current workspace. Follow progress to confirm completion.", details: null, confirm: "Create backup" }
+    case "verify": return { title: "Verify this backup?", description: "Check that the selected backup is intact and can be used for recovery.", details: `Backup ${shortBackupId(pending.backup.backupId)}.`, confirm: "Verify backup" }
+    case "retention": return { title: "Delete the previewed backups?", description: "Permanently delete the backups listed in this review. They will no longer be available for recovery. Review again if the backup list changes.", details: `${pending.preview.evidence.deleteBackupIds.length.toLocaleString()} backups will be scheduled for deletion.`, confirm: "Delete backups" }
+    case "restore": return { title: "Restore this backup?", description: "The backup is checked in a separate workspace before becoming active. Changes made since this backup will not appear in the restored workspace; current data is not merged into it. Follow progress to confirm completion.", details: `Backup ${shortBackupId(pending.preview.evidence.backup.backupId)}. Active workspace ${shortId(pending.preview.evidence.active.workspaceId)} at generation ${pending.preview.evidence.active.generation}.`, confirm: "Restore backup" }
+    case "programRollback": return { title: "Roll back the installed program?", description: "This changes program files only. It does not restore backup data, switch a workspace, or reverse a data migration.", details: `Known-good program target ${pending.preview.evidence.targetVersion}.`, confirm: "Roll back program" }
   }
 }
 
@@ -637,12 +638,12 @@ function controlRequest(pending: PendingConfirmation): OperationsControlRequest 
 }
 
 function BackupFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {
-  return <div className="mx-auto w-full max-w-[1180px] p-5 lg:p-7"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Market Squawk · Operations</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Backup &amp; Recovery</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Create and verify coherent backups, preview retained identities before deletion, and recover through service-owned validation and durable jobs.</p></div>{action}</div><div className="mt-6">{children}</div></div>
+  return <div className="mx-auto w-full max-w-[1180px] p-5 lg:p-7"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Market Squawk · Operations</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Backup &amp; Recovery</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Create and verify backups, review older backups before deletion, and restore saved data.</p></div>{action}</div><div className="mt-6">{children}</div></div>
 }
 
 function InventoryLoading() { return <div className="mt-4 grid gap-3">{Array.from({ length: 3 }, (_, index) => <div key={index} className="h-44 animate-pulse rounded-xl border border-border bg-muted/35" />)}</div> }
 function BackupLoading() { return <BackupFrame><InventoryLoading /></BackupFrame> }
-function InventoryEmpty() { return <div className="mt-4 rounded-xl border border-dashed border-border bg-card/30 p-6 text-sm text-muted-foreground"><p className="font-medium text-foreground">No verified backups are retained</p><p className="mt-1">Create a coherent backup before relying on recovery or retention controls.</p></div> }
+function InventoryEmpty() { return <div className="mt-4 rounded-xl border border-dashed border-border bg-card/30 p-6 text-sm text-muted-foreground"><p className="font-medium text-foreground">No verified backups are retained</p><p className="mt-1">Create a backup before using recovery or retention controls.</p></div> }
 function Unavailable({ detail, onRetry }: { detail: string; onRetry: () => void }) { return <Alert variant="destructive" className="mt-4"><CircleAlert aria-hidden="true" /><AlertTitle>Backup &amp; Recovery is unavailable</AlertTitle><AlertDescription>{detail}<Button className="mt-2" variant="outline" size="sm" onClick={onRetry}>Reconnect</Button></AlertDescription></Alert> }
 function InlineFailure({ detail }: { detail: string }) { return <p className="mt-3 text-xs text-destructive" role="alert">{detail}</p> }
 function Fact({ label, value }: { label: string; value: React.ReactNode }) { return <div><dt className="text-muted-foreground">{label}</dt><dd className="mt-1 break-words font-medium text-foreground">{value}</dd></div> }

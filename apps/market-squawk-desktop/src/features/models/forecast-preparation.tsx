@@ -135,7 +135,7 @@ export function ForecastPreparation({
             Prepare a statistical forecast
           </h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Choose an investment, historical cutoff, and horizon. Review the
+            Choose an investment, information date, and horizon. Review the
             uncertainty and limitations before starting.
           </p>
         </div>
@@ -179,7 +179,7 @@ export function ForecastPreparation({
           />
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
             <p className="max-w-3xl text-[11px] leading-5 text-muted-foreground">
-              Review the evidence cutoff, horizon, uncertainty, and limitations
+              Review the information date, horizon, uncertainty, and limitations
               before continuing.
             </p>
             <Button
@@ -222,7 +222,7 @@ export function ForecastPreparation({
           <DialogHeader>
             <DialogTitle>Start this forecast?</DialogTitle>
             <DialogDescription>
-              Review the purpose, evidence cutoff, limitations, and uncertainty
+              Review the purpose, information date, limitations, and uncertainty
               before the forecast begins.
             </DialogDescription>
           </DialogHeader>
@@ -435,7 +435,7 @@ function ForecastPreviewEvidence({
       "Observed history",
       `${preview.observationCount.toLocaleString()} observations`,
     ],
-    ["Observed cutoff", formatTimestamp(preview.observedThroughUnixNanos)],
+    ["Observed through", formatTimestamp(preview.observedThroughUnixNanos)],
     ["Evidence available", formatTimestamp(preview.availableAtUnixNanos)],
     ["Forecast horizon", preview.horizon.label],
     ["Horizon meaning", preview.horizon.description],

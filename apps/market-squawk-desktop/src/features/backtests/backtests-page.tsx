@@ -226,7 +226,7 @@ const STUDY_POPULATION_LABELS = {
   completedSubjectAndBenchmark: "Investment and main comparison completed",
   noAction: "No action",
   unavailable: "Decision unavailable",
-  censoredTargetAfterCutoff: "Target beyond simulation cutoff",
+  censoredTargetAfterCutoff: "Target after the simulation end",
   censoredOutsideFold: "Target outside its test period",
   entryUnfilled: "Entry unfilled",
   exitUnfilled: "Exit unfilled",
@@ -716,7 +716,7 @@ function BacktestPreview({ preview }: { preview: BacktestPreparationPreview }) {
     ["Investment approach", preview.method],
     ["Portfolio rules", preview.portfolio],
     ["Comparison", preview.comparison],
-    ["Point-in-time evidence", evidenceStateLabel(preview.pointInTimeEvidence)],
+    ["Information known at the time", evidenceStateLabel(preview.pointInTimeEvidence)],
     ["Out-of-sample plan", preview.outOfSamplePlan],
   ] as const
   return (
@@ -862,11 +862,11 @@ function CompletedBacktestView({ result }: { result: CompletedBacktest }) {
       <div className="grid gap-3 lg:grid-cols-2">
         <EvidenceCard
           icon={ShieldCheck}
-          title="Point-in-time evidence"
+          title="Information known at the time"
           state={result.pointInTimeEvidence.state}
           interpretation={result.pointInTimeEvidence.interpretation}
           facts={[
-            ["Information cutoff", formatDateTime(result.pointInTimeEvidence.informationCutoff)],
+            ["Information as of", formatDateTime(result.pointInTimeEvidence.informationCutoff)],
             [
               "History covered",
               `${formatDate(result.pointInTimeEvidence.observedFrom)} through ${formatDate(result.pointInTimeEvidence.observedThrough)}`,

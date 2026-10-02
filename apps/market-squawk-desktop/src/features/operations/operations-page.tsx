@@ -38,6 +38,7 @@ import {
   type PendingJobAction,
 } from "./contracts"
 import { JobCard } from "./job-card"
+import { jobKindLabel } from "./job-presentation"
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 import {
   EmptyJobs,
@@ -154,13 +155,13 @@ function ReadyOperations({
           icon={ShieldAlert}
           label="Needs attention"
           value={attention}
-          detail="Confirmation, failure, or interruption evidence is present."
+          detail="Jobs needing confirmation, retry, or recovery."
         />
         <SummaryFact
           icon={CheckCircle2}
           label="Completed in this view"
           value={completed}
-          detail="The owning domain published a durable terminal result."
+          detail="Results have been saved."
         />
       </div>
 
@@ -168,11 +169,11 @@ function ReadyOperations({
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 id="jobs-heading" className="text-lg font-semibold">
-              Durable jobs
+              Jobs
             </h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Browse reconnectable jobs in pages of {JOB_PAGE_LIMIT}.
-              The current first page follows service updates.
+              Follow jobs that continue after you close the app.
+              Up to {JOB_PAGE_LIMIT} jobs are shown per page.
             </p>
           </div>
           <RefreshButton label="Refresh" refreshing={jobsQuery.isFetching} onClick={() => void jobsQuery.refetch()}
@@ -277,32 +278,40 @@ function ActionDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{actionTitle(action.kind)}</DialogTitle>
+          <p className="text-sm font-medium">{jobKindLabel(action.job.kind)}</p>
           <DialogDescription>
-            This request is bound to generation {action.job.generation}, sequence{" "}
-            {action.job.sequence}. If the job changed, the service will reject it.
+            {action.kind === "cancel"
+              ? "Request cancellation. The job stops when it reaches a safe stopping point."
+              : action.kind === "retry"
+                ? "Run this job again using its original inputs."
+                : "Approve the pending action for this job. Refresh and review again if the job has changed."}
           </DialogDescription>
         </DialogHeader>
         {action.kind === "confirm" && (
-          <dl className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs">
-            <div>
-              <dt className="text-muted-foreground">Confirmation purpose</dt>
-              <dd className="mt-1 font-medium">
-                {humanize(action.confirmation.identity)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Evidence digest</dt>
-              <dd className="mt-1 break-all font-mono text-[10px]">
-                sha256:{digestHex(action.confirmation.digest)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Expires</dt>
-              <dd className="mt-1">
-                {formatJobTime(action.confirmation.expiresAt)}
-              </dd>
-            </div>
-          </dl>
+          <div className="rounded-lg border border-border bg-card/40 p-4 text-xs">
+            <dl className="grid gap-3">
+              <div>
+                <dt className="text-muted-foreground">Pending action</dt>
+                <dd className="mt-1 break-all font-medium">{humanize(action.confirmation.identity)}</dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">Expires</dt>
+                <dd className="mt-1">{formatJobTime(action.confirmation.expiresAt)}</dd>
+              </div>
+            </dl>
+            <details className="mt-3">
+              <summary className="cursor-pointer text-muted-foreground">Confirmation diagnostics</summary>
+              <dl className="mt-3 grid gap-3">
+              <div>
+                <dt className="text-muted-foreground">Evidence digest</dt>
+                <dd className="mt-1 break-all font-mono text-[10px]">
+                  sha256:{digestHex(action.confirmation.digest)}
+                </dd>
+              </div>
+                <div><dt className="text-muted-foreground">Confirmation reference</dt><dd className="mt-1 break-all font-mono">{action.confirmation.identity}</dd></div>
+              </dl>
+            </details>
+          </div>
         )}
         {error && (
           <Alert variant="destructive">
@@ -317,7 +326,7 @@ function ActionDialog({
             onClick={() => onOpenChange(false)}
             disabled={pending}
           >
-            Keep current state
+            Go back
           </Button>
           <Button
             variant={isCancel ? "destructive" : "default"}
@@ -343,8 +352,7 @@ function OperationsFrame({ children }: { children: React.ReactNode }) {
       </p>
       <h1 className="mt-2 text-3xl font-semibold tracking-tight">Operations</h1>
       <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-        Follow durable work, reconnect after closing the dashboard, and take
-        only actions authorized by the job&apos;s current evidence.
+        Follow background jobs, review results, and manage jobs that need attention.
       </p>
       <div className="mt-6">{children}</div>
     </div>
@@ -377,9 +385,9 @@ function actionTitle(kind: PendingJobAction["kind"]): string {
     case "cancel":
       return "Cancel this job?"
     case "confirm":
-      return "Confirm the exact request?"
+      return "Confirm this job action?"
     case "retry":
-      return "Start a new retry generation?"
+      return "Retry this job?"
   }
 }
 
@@ -388,7 +396,7 @@ function actionButtonLabel(kind: PendingJobAction["kind"]): string {
     case "cancel":
       return "Request cancellation"
     case "confirm":
-      return "Confirm exact request"
+      return "Confirm action"
     case "retry":
       return "Start retry"
   }

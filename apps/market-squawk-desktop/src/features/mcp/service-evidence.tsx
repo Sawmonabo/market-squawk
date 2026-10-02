@@ -37,8 +37,7 @@ export function ServiceEvidence({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Shared MCP service needs attention</AlertTitle>
           <AlertDescription>
-            The application service or its shared endpoint is not ready. Client
-            changes remain unavailable until service repair restores both facts.
+            The local service connection is unavailable. Restore it before changing AI connections.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -72,7 +71,7 @@ export function ServiceEvidence({
           icon={ShieldCheck}
           label="Protocol"
           value={status.protocolVersion}
-          detail="Shared through a stateless stdio relay"
+          detail="Used by connected AI clients"
           healthy={Boolean(status.protocolVersion)}
         />
         <ServiceFact
@@ -86,7 +85,7 @@ export function ServiceEvidence({
           detail={
             latestVerification
               ? `${verifiedClients.length} client${verifiedClients.length === 1 ? "" : "s"} verified`
-              : "Verify a connected client to inspect the real surface"
+              : "Check a connected client to see available tools and resources"
           }
           healthy={Boolean(latestVerification)}
         />
@@ -94,7 +93,7 @@ export function ServiceEvidence({
           icon={CircleAlert}
           label="Request activity"
           value={`${status.runtime.activeRequests} active`}
-          detail={`${status.runtime.activeClients} active clients · ${status.runtime.admittedRequests ?? "overflow"} admitted · ${status.runtime.rateLimitedRequests ?? "overflow"} limited`}
+          detail={`${status.runtime.activeClients} active clients · Accepted requests: ${status.runtime.admittedRequests ?? "Count unavailable"} · Limited requests: ${status.runtime.rateLimitedRequests ?? "Count unavailable"}`}
           healthy={status.runtime.rateLimitedRequests === 0}
         />
       </section>
@@ -103,22 +102,22 @@ export function ServiceEvidence({
         <RuntimeFact
           label="Service process"
           value={formatBytes(status.runtime.process.residentMemoryBytes)}
-          detail={`${formatDuration(status.runtime.uptimeSeconds)} uptime · ${status.runtime.sessionModel === "stateless_request_scoped" ? "stateless request sessions" : status.runtime.sessionModel}`}
+          detail={`${formatDuration(status.runtime.uptimeSeconds)} uptime · ${status.runtime.sessionModel === "stateless_request_scoped" ? "independent requests" : "Session details unavailable"}`}
         />
         <RuntimeFact
-          label="Global request ceiling"
+          label="Concurrent request limit"
           value={`${status.runtime.limits.maximumActiveRequests} requests`}
           detail={`${formatBytes(status.runtime.limits.maximumBodyBytes)} request body · ${status.runtime.limits.requestTimeoutMilliseconds / 1_000}s deadline`}
         />
         <RuntimeFact
-          label="Inline result ceiling"
+          label="Results shown directly"
           value={formatBytes(status.runtime.limits.maximumInlineBytes)}
-          detail={`${status.runtime.limits.maximumInlineItems.toLocaleString()} logical items before artifact handoff`}
+          detail={`${status.runtime.limits.maximumInlineItems.toLocaleString()} results; larger results saved as files`}
         />
         <RuntimeFact
           label="Maximum result"
           value={formatBytes(status.runtime.limits.maximumResultBytes)}
-          detail={`${status.runtime.limits.maximumResultItems.toLocaleString()} logical items · ${status.runtime.rejectedCredentials} rejected credentials`}
+          detail={`${status.runtime.limits.maximumResultItems.toLocaleString()} results · ${status.runtime.rejectedCredentials} rejected credentials`}
         />
       </section>
     </>

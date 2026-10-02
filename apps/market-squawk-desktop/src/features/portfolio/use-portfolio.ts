@@ -219,7 +219,7 @@ function usePortfolioCalculation<Result>(
       if (active.current !== controller || controller.signal.aborted) return
       active.current = null
       setState({ pending: false, result: null,
-        error: error instanceof Error ? error.message : failureMessage, cancelled: false })
+        error: failureMessage, cancelled: false })
     }
   }
   return { ...state, calculate, invalidate, cancel }

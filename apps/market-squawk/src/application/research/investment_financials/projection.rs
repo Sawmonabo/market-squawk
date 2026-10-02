@@ -18,7 +18,7 @@ use super::super::{
 pub(crate) fn financial_display_identity() -> EvidenceDigest {
     EvidenceDigest::new(
         DigestAlgorithm::Sha256,
-        Sha256::digest(b"market-squawk/investment-financial-display/v1\0").into(),
+        Sha256::digest(b"market-squawk/investment-financial-display/xbrl-context/v1\0").into(),
     )
 }
 

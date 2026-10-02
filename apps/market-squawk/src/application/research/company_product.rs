@@ -12,7 +12,7 @@ use std::{
 use market_squawk_domain::{
     CalendarDate, Currency, FundamentalAmendmentStatus, FundamentalCadence,
     FundamentalConsolidation, FundamentalPeriod, InstrumentId, ResearchTemporalCoordinate,
-    RevisionNumber, Timestamp,
+    RevisionNumber, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -198,6 +198,7 @@ pub(crate) struct CompanyFactProduct {
 struct CompanyFactPrivateLineage {
     filing_identity: Box<str>,
     publication_identity: [u8; 32],
+    xbrl_identity: Option<(SourceIdentifier, SourceIdentifier)>,
 }
 
 impl fmt::Debug for CompanyFactPrivateLineage {
@@ -485,12 +486,23 @@ pub(crate) enum CompanyProductRevisionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyReportingEnvelopeProduct {
+    scope: CompanyFactProductScope,
     period: FundamentalPeriod,
     fiscal_context: CompanyFactFiscalContext,
-    reporting_context: CompanyFactReportingContext,
+    reporting_context: CompanyEnvelopeReportingContext,
     filed_on: Option<CalendarDate>,
     effective: CompanyProductTime,
     known_at: Timestamp,
+}
+
+/// A reporting context contains multiple original fact occurrences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanyEnvelopeReportingContext {
+    dimensionality: CompanyFactDimensionality,
+    consolidation: CompanyFactConsolidation,
+    amendment: CompanyFactAmendment,
+    restatement: CompanyFactRestatement,
 }
 
 /// Exact reported facts grouped only inside one reporting and filing envelope.
@@ -1288,7 +1300,8 @@ struct CompanyFactEnvelopeKey<'fact> {
     consolidation: u8,
     amendment: u8,
     restatement: u8,
-    occurrence: u32,
+    occurrence: Option<u32>,
+    xbrl_context_identity: Option<&'fact str>,
     filed_on_present: bool,
     filed_on: i32,
     effective_kind: u8,
@@ -1462,11 +1475,11 @@ fn append_ratio(
         CompanyRatioInputRole::Denominator,
     )?;
     let denominator_count = inputs.len() - numerator_count;
-    let numerator = (numerator_count == 1).then(|| &inputs[0].fact);
-    let denominator = (denominator_count == 1).then(|| &inputs[numerator_count].fact);
+    let numerator = ratio_operand(&inputs[..numerator_count]);
+    let denominator = ratio_operand(&inputs[numerator_count..]);
     let (state, value) = if numerator_count == 0 || denominator_count == 0 {
         (CompanyRatioState::MissingInput, None)
-    } else if numerator_count != 1 || denominator_count != 1 {
+    } else if numerator.is_none() || denominator.is_none() {
         (CompanyRatioState::ConflictingInput, None)
     } else {
         let numerator = numerator.ok_or(CompanyProductProjectionError::InvalidEvidence)?;
@@ -1496,6 +1509,24 @@ fn append_ratio(
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
     ratios.push(product);
     Ok(())
+}
+
+// Repeated exact filing occurrences are evidence of one operand, never amounts to sum.
+// CompanyFacts and alternative financial concepts retain their existing conflict semantics.
+fn ratio_operand(inputs: &[CompanyRatioInputProduct]) -> Option<&CompanyFactProduct> {
+    let first = &inputs.first()?.fact;
+    if inputs.len() == 1 {
+        return Some(first);
+    }
+    (first.scope == CompanyFactProductScope::FilingDetail
+        && first.lineage.xbrl_identity.is_some()
+        && inputs.iter().all(|input| {
+            input.fact.metric == first.metric
+                && input.fact.unit == first.unit
+                && input.fact.value == first.value
+                && fact_envelope_key(&input.fact) == fact_envelope_key(first)
+        }))
+    .then_some(first)
 }
 
 fn append_ratio_inputs(
@@ -1587,7 +1618,13 @@ fn fact_envelope_key(fact: &CompanyFactProduct) -> CompanyFactEnvelopeKey<'_> {
             CompanyFactRestatement::ReportedNotRestated => 1,
             CompanyFactRestatement::Unavailable => 2,
         },
-        occurrence: fact.reporting_context.occurrence.get(),
+        occurrence: (fact.scope == CompanyFactProductScope::CompanyWide)
+            .then_some(fact.reporting_context.occurrence.get()),
+        xbrl_context_identity: fact
+            .lineage
+            .xbrl_identity
+            .as_ref()
+            .map(|(context, _)| context.as_str()),
         filed_on_present: fact.filed_on.is_some(),
         filed_on: fact.filed_on.map_or(0, CalendarDate::days_since_unix_epoch),
         effective_kind,
@@ -1598,9 +1635,15 @@ fn fact_envelope_key(fact: &CompanyFactProduct) -> CompanyFactEnvelopeKey<'_> {
 
 const fn reporting_envelope(fact: &CompanyFactProduct) -> CompanyReportingEnvelopeProduct {
     CompanyReportingEnvelopeProduct {
+        scope: fact.scope,
         period: fact.period,
         fiscal_context: fact.fiscal_context,
-        reporting_context: fact.reporting_context,
+        reporting_context: CompanyEnvelopeReportingContext {
+            dimensionality: fact.reporting_context.dimensionality,
+            consolidation: fact.reporting_context.consolidation,
+            amendment: fact.reporting_context.amendment,
+            restatement: fact.reporting_context.restatement,
+        },
         filed_on: fact.filed_on,
         effective: fact.effective,
         known_at: fact.known_at,
@@ -1626,11 +1669,16 @@ pub(crate) fn project_fact(
     let Some(reporting_context) = product_reporting_context(fact) else {
         return Ok(None);
     };
+    if (fact.scope() == CompanyFactScope::FilingDetail) != fact.lineage().xbrl_identity().is_some()
+    {
+        return Err(CompanyProductProjectionError::InvalidEvidence);
+    }
     Ok(Some(CompanyFactProduct {
         lineage: CompanyFactPrivateLineage {
             filing_identity: try_boxed_product_text(fact.lineage().filing_identity(), 256)
                 .map_err(map_product_text_error)?,
             publication_identity: fact.lineage().publication_identity().bytes(),
+            xbrl_identity: fact.lineage().xbrl_identity().cloned(),
         },
         scope: match fact.scope() {
             CompanyFactScope::CompanyWide => CompanyFactProductScope::CompanyWide,
@@ -2081,6 +2129,124 @@ mod tests {
             }
         }
 
+        // A filing's per-concept occurrence ordinal is not a reporting context. One
+        // context has complete operands even when repetitions consume different ordinals.
+        let mut filing_facts = facts[2..].to_vec();
+        for (index, (fact, ordinal)) in filing_facts.iter_mut().zip([3, 1, 5, 2]).enumerate() {
+            fact.scope = CompanyFactProductScope::FilingDetail;
+            fact.lineage.xbrl_identity = Some((
+                SourceIdentifier::try_from("annual-context")?,
+                SourceIdentifier::try_from(format!("source-fact-{index}"))?,
+            ));
+            fact.reporting_context.occurrence = RevisionNumber::new(ordinal)?;
+        }
+        for (index, ordinal) in [(0, 8), (3, 5)] {
+            let mut repeated = filing_facts[index].clone();
+            repeated.lineage.xbrl_identity = Some((
+                SourceIdentifier::try_from("annual-context")?,
+                SourceIdentifier::try_from(format!("repeated-fact-{index}"))?,
+            ));
+            repeated.reporting_context.occurrence = RevisionNumber::new(ordinal)?;
+            filing_facts.push(repeated);
+        }
+        let originals = filing_facts.clone();
+        let filing_ratios = project_ratios(
+            &filing_facts,
+            CompanyProductSectionState::Reported,
+            &mut CompanySerializedBudget::new(),
+        )?;
+        assert_eq!(filing_ratios.items().len(), 3);
+        assert!(filing_ratios.items().iter().all(|ratio| {
+            ratio.state() == CompanyRatioState::Reported
+                && ratio
+                    .envelope()
+                    .is_some_and(|envelope| envelope.scope == CompanyFactProductScope::FilingDetail)
+        }));
+        for (ratio, expected) in filing_ratios.items().iter().zip([40, 20, 10]) {
+            assert_eq!(ratio.value(), Some(Decimal::new(expected, 2)));
+            assert_eq!(ratio.inputs().len(), if expected == 10 { 4 } else { 3 });
+            assert!(
+                ratio
+                    .inputs()
+                    .iter()
+                    .all(|input| originals.contains(input.fact()))
+            );
+        }
+        assert_eq!(filing_facts, originals);
+        let paged_ratios = project_financial_envelope(&filing_facts, true)?;
+        assert_eq!(paged_ratios.len(), 3);
+        assert!(paged_ratios.iter().all(|ratio| {
+            ratio["envelope"]["scope"] == "filing_detail"
+                && ratio["envelope"]["reportingContext"]
+                    .get("occurrence")
+                    .is_none()
+                && ratio["inputs"].as_array().is_some_and(|inputs| {
+                    inputs
+                        .iter()
+                        .all(|input| input["fact"]["reportingContext"]["occurrence"].is_number())
+                })
+        }));
+        let filing_statements = project_statements(
+            &filing_facts,
+            CompanyProductSectionState::Reported,
+            &mut CompanySerializedBudget::new(),
+        )?;
+        assert_eq!(filing_statements.groups().len(), 1);
+        assert_eq!(filing_statements.groups()[0].items().len(), originals.len());
+        for original in &originals {
+            assert!(filing_statements.groups()[0].items().contains(original));
+        }
+
+        let mut other_context = filing_facts[1].clone();
+        other_context.lineage.xbrl_identity = Some((
+            SourceIdentifier::try_from("other-annual-context")?,
+            SourceIdentifier::try_from("other-context-profit")?,
+        ));
+        let split_contexts = [filing_facts[0].clone(), other_context];
+        assert_ne!(
+            fact_envelope_bytes(&split_contexts[0])?,
+            fact_envelope_bytes(&split_contexts[1])?
+        );
+        assert_eq!(
+            project_financial_envelope(&split_contexts, true),
+            Err(CompanyProductProjectionError::InvalidEvidence)
+        );
+        assert!(
+            project_ratios(
+                &split_contexts,
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new(),
+            )?
+            .items()
+            .iter()
+            .all(|ratio| ratio.state() == CompanyRatioState::MissingInput)
+        );
+
+        // Retaining all occurrences must not select a winner when repeated values differ.
+        let mut conflicting_occurrences = filing_facts.clone();
+        conflicting_occurrences[4].value += Decimal::ONE;
+        let conflicting_ratios = project_ratios(
+            &conflicting_occurrences,
+            CompanyProductSectionState::Reported,
+            &mut CompanySerializedBudget::new(),
+        )?;
+        assert!(conflicting_ratios.items().iter().all(|ratio| {
+            ratio.state() == CompanyRatioState::ConflictingInput && ratio.value().is_none()
+        }));
+        // Equal values from alternative concepts are not duplicate source occurrences.
+        conflicting_occurrences[4] = filing_facts[4].clone();
+        conflicting_occurrences[4].metric = CompanyFinancialMetric::NetSales;
+        assert!(
+            project_ratios(
+                &conflicting_occurrences,
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new(),
+            )?
+            .items()
+            .iter()
+            .all(|ratio| ratio.state() == CompanyRatioState::ConflictingInput)
+        );
+
         let distinct_filings = vec![
             fact(
                 CompanyFinancialMetric::CurrentAssets,
@@ -2353,6 +2519,7 @@ mod tests {
             lineage: CompanyFactPrivateLineage {
                 filing_identity: filing_identity.into(),
                 publication_identity: [publication_byte; 32],
+                xbrl_identity: None,
             },
             scope: CompanyFactProductScope::CompanyWide,
             revision: CompanyProductRevisionState::Current,

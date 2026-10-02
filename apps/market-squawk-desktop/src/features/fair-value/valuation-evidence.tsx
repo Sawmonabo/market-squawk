@@ -37,8 +37,8 @@ export function ValuationEvidence({ analysis }: { analysis: InvestmentAnalysis }
         Each amount retains its original value basis. Total equity, entity and position values cannot be compared directly with a price per instrument unit.
       </p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-3">
-        <MethodFact label="Source information cutoff" value={formatUnixNanos(methods.sourceCutoffUnixNanos)} />
-        <MethodFact label="Market information cutoff" value={formatUnixNanos(methods.marketCutoffUnixNanos)} />
+        <MethodFact label="Source information as of" value={formatUnixNanos(methods.sourceCutoffUnixNanos)} />
+        <MethodFact label="Market information as of" value={formatUnixNanos(methods.marketCutoffUnixNanos)} />
         <MethodFact label="Calculation completed" value={formatUnixNanos(methods.completedAtUnixNanos)} />
       </dl>
       <div className="mt-4 grid gap-4 lg:grid-cols-2">

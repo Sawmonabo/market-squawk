@@ -1,7 +1,7 @@
 //! Closed provider-neutral identities for ordinary Market product reads.
 
 use chrono::DateTime;
-use market_squawk_domain::{Currency, InstrumentId};
+use market_squawk_domain::{Currency, InstrumentId, Timestamp};
 use market_squawk_services::{ServiceError, ServiceLimits, ToolResultMetadata, TypedToolResult};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -244,6 +244,7 @@ pub(super) fn product_row(
     let availability = match row.get("availability").and_then(Value::as_str) {
         Some("live") => "current",
         Some("delayed") => "delayed",
+        Some("last_known") => "last_known",
         Some("end_of_day" | "stored") => "previous_close",
         Some("stale" | "unavailable") => "unavailable",
         _ => return Err(ServiceError::InvalidResult),
@@ -291,6 +292,62 @@ struct ProductPriceChange {
     unavailable_reason: Option<&'static str>,
 }
 
+/// Selects presentation evidence only. Expired observations retain their original clocks
+/// without gaining current-mark authority or displacing a newer completed close.
+pub(super) fn retained_display_price(
+    native_row: &Value,
+    completed_close: Option<&Value>,
+    selected_at: Timestamp,
+) -> Result<Option<Value>, ServiceError> {
+    let row = native_row.as_object().ok_or(ServiceError::InvalidResult)?;
+    let quote = product_quote(row)?;
+    let Some(quote) = quote.as_object() else {
+        return Ok(None);
+    };
+    let close_at = completed_close
+        .map(|close| canonical_time(&close["currentPrice"]["observedAt"]))
+        .transpose()?
+        .map(|at| DateTime::parse_from_rfc3339(&at).map_err(|_| ServiceError::InvalidResult))
+        .transpose()?;
+    for (basis, value_field, time_field) in [
+        ("last_trade", "lastPrice", "lastObservedAt"),
+        ("bid_ask_midpoint", "midPrice", "quoteObservedAt"),
+    ] {
+        if basis == "last_trade" && exact_text(quote, "tradeStatus")? != "available" {
+            continue;
+        }
+        let Some(value) = quote.get(value_field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let Some(observed_at) = quote.get(time_field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let observed_at = canonical_time(observed_at)?;
+        let observed =
+            DateTime::parse_from_rfc3339(&observed_at).map_err(|_| ServiceError::InvalidResult)?;
+        let observed_nanos = observed
+            .timestamp_nanos_opt()
+            .ok_or(ServiceError::InvalidResult)?;
+        let amount = exact_decimal_text(quote, value_field)?
+            .parse::<Decimal>()
+            .map_err(|_| ServiceError::InvalidResult)?;
+        if amount <= Decimal::ZERO
+            || observed_nanos > selected_at.unix_nanos()
+            || close_at.is_some_and(|close| observed <= close)
+        {
+            continue;
+        }
+        return Ok(Some(json!({
+            "value": value,
+            "currency": currency_text(quote, "currency")?,
+            "basis": basis,
+            "observedAt": observed_at,
+            "currentThrough": Value::Null,
+        })));
+    }
+    Ok(None)
+}
+
 impl ProductPriceChange {
     fn unavailable(reason: &'static str) -> Self {
         Self {
@@ -308,7 +365,8 @@ fn product_price_change(
     current_price: Option<&serde_json::Map<String, Value>>,
     availability: &str,
 ) -> Result<ProductPriceChange, ServiceError> {
-    let Some(price) = current_price.filter(|_| matches!(availability, "current" | "delayed"))
+    let Some(price) =
+        current_price.filter(|_| matches!(availability, "current" | "delayed" | "last_known"))
     else {
         return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
     };
@@ -319,10 +377,11 @@ fn product_price_change(
         _ => return Ok(ProductPriceChange::unavailable("current_price_unavailable")),
     };
     let quote = row.get("quote");
-    if quote
-        .and_then(|quote| quote.get(fresh_field))
-        .and_then(Value::as_bool)
-        != Some(true)
+    if availability != "last_known"
+        && quote
+            .and_then(|quote| quote.get(fresh_field))
+            .and_then(Value::as_bool)
+            != Some(true)
     {
         return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
     }
@@ -357,7 +416,7 @@ fn product_price_change(
     if session.to_string() != session_date {
         return Err(ServiceError::InvalidResult);
     }
-    // Current display observations do not carry exchange-session affiliation. Require
+    // Display observations do not carry exchange-session affiliation. Require
     // an earlier native close date than the canonical UTC source date, plus an earlier
     // actual close. The result retains both dates rather than claiming a session return.
     if row.get("instrumentId") != close.get("instrumentId")
@@ -921,7 +980,8 @@ mod tests {
             product_row(identity, &declining)?["changeUnavailableReason"],
             "incompatible_basis"
         );
-        // Currentness, compatible economics and a preceding completed date are mandatory.
+        // A current label requires freshness; all comparisons require compatible economics
+        // and a preceding completed date.
         // In particular a close from later in the read cannot become this price's baseline.
         for (field, invalid) in [
             (
@@ -970,6 +1030,88 @@ mod tests {
         assert_eq!(retained["quote"]["bidPrice"], "68000.1");
         assert_eq!(retained["quote"]["quoteObservedAt"], observed);
         assert_eq!(retained["quote"]["quoteFresh"], false);
+
+        // A dated retained trade remains comparable after its current-mark lease expires.
+        // This is the native MSFT failure: a later trade must not disappear behind a close.
+        let read_at = DateTime::parse_from_rfc3339("2026-10-02T22:35:00Z")?
+            .timestamp_nanos_opt()
+            .ok_or("read time out of range")?;
+        let read_at = Timestamp::from_unix_nanos(read_at);
+        let close = json!({
+            "currentPrice": {"observedAt": "2026-10-01T20:00:00.000000000Z"},
+        });
+        let mut historical = json!({
+            "instrumentId": selected.to_string(), "availability": "stale", "currency": "USD",
+            "currentPrice": null,
+            "previousClose": {
+                "instrumentId": selected.to_string(), "value": "512.71", "currency": "USD",
+                "sessionDate": "2026-10-01", "asOf": "2026-10-01T20:00:00.000000000Z",
+                "adjustment": "raw",
+            },
+            "quote": {
+                "quoteSizeBasis": "source_units", "bidPrice": "493.32", "bidSize": "40",
+                "askPrice": "545.76", "askSize": "40", "midPrice": "519.54",
+                "lastPrice": "517.13", "lastSize": "4", "tradeStatus": "available",
+                "quoteObservedAt": "2026-10-02T20:00:01.412460730Z",
+                "lastObservedAt": "2026-10-02T20:01:26.342735121Z",
+                "quoteFresh": false, "lastFresh": false,
+                "quoteCurrentThrough": null, "lastCurrentThrough": null,
+            },
+        });
+        historical["currentPrice"] = retained_display_price(&historical, Some(&close), read_at)?
+            .ok_or("missing retained price")?;
+        historical["availability"] = json!("last_known");
+        let historical_result = product_row(identity, &historical)?;
+        assert_eq!(historical_result["availability"], "last_known");
+        assert_eq!(historical_result["price"]["value"], "517.13");
+        assert_eq!(historical_result["priceBasis"], "last_trade");
+        assert_eq!(
+            historical_result["asOf"],
+            historical["quote"]["lastObservedAt"]
+        );
+        assert_eq!(historical_result["quote"]["lastFresh"], false);
+        assert!(historical_result["priceCurrentThrough"].is_null());
+        assert_eq!(
+            historical_result["changePercent"]
+                .as_str()
+                .ok_or("missing change")?
+                .parse::<Decimal>()?
+                .round_dp(2),
+            Decimal::new(86, 2)
+        );
+        assert_eq!(
+            historical_result["changeBasis"]["previousClose"]["value"],
+            "512.71"
+        );
+        assert_eq!(
+            historical_result["changeBasis"]["priceAsOf"],
+            historical_result["asOf"]
+        );
+        assert!(historical_result["changeUnavailableReason"].is_null());
+        let mut unresolved = historical.clone();
+        unresolved["quote"]["tradeStatus"] = json!("ambiguous");
+        unresolved["quote"]["lastPrice"] = Value::Null;
+        unresolved["quote"]["lastSize"] = Value::Null;
+        assert_eq!(
+            retained_display_price(&unresolved, Some(&close), read_at)?
+                .ok_or("missing retained midpoint")?["basis"],
+            "bid_ask_midpoint"
+        );
+        let newer_close = json!({
+            "currentPrice": {"observedAt": "2026-10-02T21:00:00.000000000Z"},
+        });
+        assert!(retained_display_price(&historical, Some(&newer_close), read_at)?.is_none());
+        let mut future = historical.clone();
+        for field in ["lastObservedAt", "quoteObservedAt"] {
+            future["quote"][field] = json!("2026-10-03T20:00:00.000000000Z");
+        }
+        assert!(retained_display_price(&future, Some(&close), read_at)?.is_none());
+        historical["previousClose"]["sessionDate"] = json!("2026-10-02");
+        historical["previousClose"]["asOf"] = json!("2026-10-02T20:00:00.000000000Z");
+        assert_eq!(
+            product_row(identity, &historical)?["changeUnavailableReason"],
+            "incompatible_basis"
+        );
 
         let all = product_market_identities(&records, cutoff, Some("etf"))?;
         let (first, count, more) = product_search_page(&all, "etf", 1, None)?;

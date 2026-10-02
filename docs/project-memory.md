@@ -41,6 +41,22 @@ focus or screen. Use the optional development-only embedded WebDriver path docum
 service. Do not resume global keystrokes or foreground automation while the owner works. Native
 dialog and external OAuth interaction require separate evidence; WebView checks do not prove them.
 
+## Owner correction: ordinary data interaction and concise copy — 2026-10-02
+
+Opening an investment or financial tab loads its required information automatically. Changing
+its history range reads and loads that range without a separate Load/Update confirmation.
+Keep price history visible. Shared loading must preserve exact request recovery and must not
+silently retry cancelled or failed work on remount; show Retry only when recovery needs it.
+Analysis, saved changes and virtual orders remain deliberate actions.
+
+Use concise product labels and existing date/number formatters throughout screens, menus,
+details and tooltips. Rounded values expose full precision on hover/keyboard focus without an
+“Exact value” disclosure or rounding explanation. “Last trade” with its original timestamp needs
+no extra “Last known” label. These presentation choices never grant freshness or execution rights.
+Keep real uncertainty and missing inputs honest; diagnostics belong in explicit system details.
+The recursive findings and remaining contract gaps are in the
+[product-copy audit](reports/2026-10-02-desktop-product-copy-audit.md); current status stays in the ledger.
+
 ## Owner correction: application lock is opt-in — 2026-09-30
 
 A configured personal installation opens and reuses its saved provider credentials/sessions without

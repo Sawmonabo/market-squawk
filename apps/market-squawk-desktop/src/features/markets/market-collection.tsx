@@ -192,9 +192,9 @@ function CollectionInvestment({ symbol, market, unverified, refreshing }: {
       : <div className="mt-2 text-[10px] text-muted-foreground">
         <p>{marketPriceBasisLabel(market)}</p>
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
-        <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : refreshing
-          ? `${marketAvailabilityLabel(market)} at last check · Updating`
-          : marketAvailabilityLabel(market)} · <PercentageChange value={market.changePercent} description={marketChangeDescription(market)} /></p>
+        <p>{unverified && market.price !== null ? <>Saved price · </> : refreshing ? <>Updating… · </>
+          : marketAvailabilityLabel(market) ? <>{marketAvailabilityLabel(market)} · </> : null}
+          <PercentageChange value={market.changePercent} description={marketChangeDescription(market)} /></p>
         {market.asOf ? <time dateTime={market.asOf}>{formatProductTimestamp(market.asOf)}</time> : null}
       </div>}
   </>

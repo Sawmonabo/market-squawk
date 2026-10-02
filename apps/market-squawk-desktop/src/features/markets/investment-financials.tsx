@@ -4,6 +4,7 @@ import { Tabs } from "radix-ui"
 
 import { productKeys, snapshotQueryMeta } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { CursorNavigation, useCursorNavigation } from "@/features/shared/cursor-navigation"
 import { formatMoney, groupDecimal } from "@/lib/formatters"
 import { hasProductCapability } from "@/lib/product-capabilities"
@@ -53,6 +54,11 @@ export function InvestmentFinancials(props: FinancialProps) {
 
 function SelectedFinancials(props: FinancialProps) {
   const [preparedRevision, setPreparedRevision] = React.useState(0)
+  const [needsData, setNeedsData] = React.useState(false)
+  const onRead = React.useCallback((result: InvestmentFinancialsResult) => {
+    setNeedsData(result.state === "preparation_required" || result.families.some((family) =>
+      family.reason === "preparation_required" || family.state === "missing" && family.reason === "no_records"))
+  }, [])
   const [preparationCompleted, setPreparationCompleted] = React.useState(false)
   const onPrepared = React.useCallback(async () => {
     setPreparationCompleted(true)
@@ -64,8 +70,8 @@ function SelectedFinancials(props: FinancialProps) {
   }, [])
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment financial information">
     <h2 className="text-base font-semibold">Financial information</h2>
-    <p className="mt-1 text-xs text-muted-foreground">Reported company values, with their reporting periods and source context.</p>
-    <div className="mt-4"><FinancialPreparation {...props} onPrepared={onPrepared} onSettled={onSettled} /></div>
+    <p className="mt-1 text-xs text-muted-foreground">Company reports, financial statements and ratios.</p>
+    <div className="mt-4"><FinancialPreparation {...props} needsData={needsData} onPrepared={onPrepared} onSettled={onSettled} /></div>
     <Tabs.Root defaultValue="facts" activationMode="manual" className="mt-4">
       <Tabs.List aria-label="Financial sections" className="flex flex-wrap gap-1 border-b border-border pb-2">
         {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Trigger key={section} value={section}
@@ -74,16 +80,17 @@ function SelectedFinancials(props: FinancialProps) {
         </Tabs.Trigger>)}
       </Tabs.List>
       {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Content key={section} value={section} className="pt-4 focus-visible:outline-ring">
-        <FinancialSectionRead {...props} section={section} preparedRevision={preparedRevision} preparationCompleted={preparationCompleted} />
+        <FinancialSectionRead {...props} section={section} onRead={onRead} preparedRevision={preparedRevision} preparationCompleted={preparationCompleted} />
       </Tabs.Content>)}
     </Tabs.Root>
   </section>
 }
 
-function FinancialSectionRead({ selectionToken, section, bootstrap, transport, preparedRevision, preparationCompleted, refreshRevision = 0 }: FinancialProps & {
+function FinancialSectionRead({ selectionToken, section, bootstrap, transport, preparedRevision, preparationCompleted, onRead, refreshRevision = 0 }: FinancialProps & {
   section: InvestmentFinancialSection
   preparedRevision: number
   preparationCompleted: boolean
+  onRead: (result: InvestmentFinancialsResult) => void
 }) {
   const queryClient = useQueryClient()
   const navigation = useCursorNavigation()
@@ -154,6 +161,10 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     },
   })
 
+  React.useEffect(() => {
+    if (page.isSuccess && !page.isPlaceholderData) onRead(page.data)
+  }, [page.isSuccess, page.isPlaceholderData, page.data, onRead])
+
   const refresh = React.useCallback(async () => {
     setReleasing(true)
     setReleaseFailed(false)
@@ -197,19 +208,19 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     <div className="mt-2 min-h-16 text-xs leading-5">
     {updateAvailable ? <p role="status" className="text-muted-foreground">{preparationCompleted
       ? "Updated financial information is ready. Use the refresh icon to open it."
-      : "Financial preparation ended. Use the refresh icon to check saved information."}</p> : null}
-    {releaseFailed ? <p role="alert" className="text-destructive">The previous financial information could not be released. Use the refresh icon to try again.</p>
+      : "The update finished. Refresh to see the available reports."}</p> : null}
+    {releaseFailed ? <p role="alert" className="text-destructive">Could not update this financial view. Try refreshing it again.</p>
       : page.isError ? <div className="flex items-start justify-between gap-3">
       <p role="alert" className="text-destructive">{result
-        ? "This financial information could not be updated. Showing the last checked page; its currentness has not been verified."
+        ? "Could not update financial information. Showing the saved page."
         : "This financial information could not be loaded. Try again."}</p>
       <Button variant="outline" size="sm" disabled={busy} onClick={() => void page.refetch()}>Retry</Button>
-    </div> : busy ? <p role="status" className="text-muted-foreground">{result ? "Updating this financial information… Showing the last checked page." : "Loading this financial information…"}</p> : null}
+    </div> : busy ? <p role="status" className="text-muted-foreground">{result ? "Updating financial information…" : "Loading this financial information…"}</p> : null}
     </div>
     <div className="min-h-[280px]">
     {result ? <>
-      {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="text-xs leading-5 text-muted-foreground">{showingPrior ? "Last checked information through" : "Information through"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{formatProductTimestamp(result.knowledgeAt)}</time>
-        {" · Reporting cutoff "}<time dateTime={result.effectiveOn} title={result.effectiveOn}>{formatCalendarDate(result.effectiveOn)}</time>{" · Latest information known at that date"}</p> : null}
+      {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="text-xs leading-5 text-muted-foreground">{showingPrior ? "Saved information as of" : "Information as of"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{formatProductTimestamp(result.knowledgeAt)}</time>
+        {" · Reports through "}<time dateTime={result.effectiveOn} title={result.effectiveOn}>{formatCalendarDate(result.effectiveOn)}</time></p> : null}
       {result.state !== "reported" ? <p role="status" className="mt-3 text-sm text-muted-foreground">{sectionAvailability(result.state)}</p> : null}
       <FinancialFamilies families={result.families} />
       <FinancialLimitations result={result} />
@@ -305,14 +316,18 @@ function FinancialRatio({ ratio }: { ratio: InvestmentFinancialRatio }) {
   return <tr className="align-top">
     <th scope="row" className="min-w-[180px] px-3 py-3 text-sm font-medium">{ratio.displayName}</th>
     <td className="px-3 py-3 text-right">
-      <p className="whitespace-nowrap font-mono text-sm tabular-nums">{ratio.value === null ? "Unavailable"
-        : ratio.metric === "current_ratio" ? <>{groupDecimal(ratio.value, { maximumFractionDigits: 2 })}<span aria-hidden="true">×</span><span className="sr-only"> times</span></>
-          : groupDecimal(ratio.value, { maximumFractionDigits: 2, style: "percent" })}</p>
-      {ratio.value !== null ? <details className="mt-2 text-xs text-muted-foreground">
-        <summary className="cursor-pointer focus-visible:outline-ring">Exact value</summary>
-        <p className="mt-2 font-mono tabular-nums [overflow-wrap:anywhere]">{ratio.value} {ratio.unit}</p>
-        <p className="mt-1">Display rounded to at most two decimal places.{ratio.metric !== "current_ratio" ? " Margin is shown as a percentage." : ""}</p>
-      </details> : null}
+      {ratio.value === null ? <p className="font-mono text-sm tabular-nums">Unavailable</p> : <Tooltip>
+        <TooltipTrigger asChild>
+          <span tabIndex={0} className="inline-block whitespace-nowrap font-mono text-sm tabular-nums focus-visible:outline-2 focus-visible:outline-ring">
+            {ratio.metric === "current_ratio" ? <>{groupDecimal(ratio.value, { maximumFractionDigits: 2 })}<span aria-hidden="true">×</span><span className="sr-only"> times</span></>
+              : groupDecimal(ratio.value, { maximumFractionDigits: 2, style: "percent" })}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-[min(90vw,32rem)] break-all font-mono">
+          {ratio.metric === "current_ratio" ? `${groupDecimal(ratio.value)}×`
+            : groupDecimal(ratio.value, { maximumFractionDigits: ratio.value.length, style: "percent" })}
+        </TooltipContent>
+      </Tooltip>}
       {ratio.state !== "reported" ? <p className="mt-1 text-xs text-muted-foreground">{reasons[ratio.state]}</p> : null}
     </td>
     <td className="min-w-[180px] px-3 py-3 leading-5">{ratio.envelope ? <FinancialPeriod period={ratio.envelope.period} /> : "A reporting period is not available."}</td>
@@ -351,7 +366,7 @@ function FinancialFiling({ filing }: { filing: InvestmentFinancialFiling }) {
       <ContextValue label="Revision">{revisionLabel(filing.revision)}</ContextValue>
       <ContextValue label="Applies to"><FinancialTime value={filing.effective} /></ContextValue>
       <ContextValue label="Published">{filing.published ? <FinancialTime value={filing.published} /> : "Publication date not reported"}</ContextValue>
-      <ContextValue label="Known at"><FinancialInstant value={filing.knownAt} /></ContextValue>
+      <ContextValue label="Available as of"><FinancialInstant value={filing.knownAt} /></ContextValue>
     </dl>
   </article>
 }
@@ -363,15 +378,15 @@ function FinancialEnvelope({ envelope }: { envelope: InvestmentFinancialEnvelope
   const restatement = { reported_restated: "Reported as restated", reported_not_restated: "Reported as not restated", unavailable: "Restatement status not reported" }
   const amendment = { original: "Original report", amendment: "Amended report", unavailable: "Amendment status not reported" }
   return <dl className="mt-3 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
+    <ContextValue label="Report">{envelope.scope === "company_wide" ? "Company-wide" : "Individual filing"}</ContextValue>
     <ContextValue label="Reporting period"><FinancialPeriod period={envelope.period} /></ContextValue>
     <ContextValue label="Fiscal period">{fiscalPeriods[envelope.fiscalContext.fiscalPeriod]}{envelope.fiscalContext.fiscalYear !== null ? ` ${envelope.fiscalContext.fiscalYear}` : ""} · {cadences[envelope.fiscalContext.cadence]}</ContextValue>
     <ContextValue label="Reporting basis">{consolidation[envelope.reportingContext.consolidation]}</ContextValue>
     <ContextValue label="Report status">{amendment[envelope.reportingContext.amendment]} · {restatement[envelope.reportingContext.restatement]}</ContextValue>
     <ContextValue label="Detail scope">{envelope.reportingContext.dimensionality === "no_dimensions" ? "No segment breakdown reported" : "Segment breakdown not available"}</ContextValue>
-    <ContextValue label="Reported occurrence">{envelope.reportingContext.occurrence}</ContextValue>
     <ContextValue label="Filed on">{envelope.filedOn ? <FinancialDate value={envelope.filedOn} /> : "Filing date not reported"}</ContextValue>
     <ContextValue label="Effective"><FinancialTime value={envelope.effective} /></ContextValue>
-    <ContextValue label="Known at"><FinancialInstant value={envelope.knownAt} /></ContextValue>
+    <ContextValue label="Available as of"><FinancialInstant value={envelope.knownAt} /></ContextValue>
   </dl>
 }
 
@@ -402,17 +417,17 @@ function FinancialInstant({ value }: { value: string }) {
 }
 
 function revisionLabel(revision: InvestmentFinancialFact["revision"]): string {
-  return revision === "current" ? "Current revision at the information date"
-    : revision === "superseded" ? "Superseded revision" : "Revision history cannot be compared"
+  return revision === "current" ? "Latest report as of this date"
+    : revision === "superseded" ? "Earlier report" : "Report versions cannot be compared"
 }
 
 function sectionAvailability(state: InvestmentFinancialsResult["state"]): string {
   switch (state) {
     case "reported": return "Reported information is available."
-    case "preparation_required": return "Saved reports are ready to prepare. Choose Load financial information to open them."
+    case "preparation_required": return "Loading saved reports…"
     case "missing": return "No reported information is available for this section at the information date."
-    case "conflict": return "Conflicting evidence prevents this section from being established."
-    case "unavailable": return "This financial section is unavailable with the current evidence."
+    case "conflict": return "The reports contain conflicting values for this section."
+    case "unavailable": return "The available reports do not contain enough information for this section."
     case "expired": return "This information is no longer open. Use the refresh icon to read current saved information."
   }
 }
@@ -420,7 +435,7 @@ function sectionAvailability(state: InvestmentFinancialsResult["state"]): string
 function FinancialFamilies({ families }: { families: InvestmentFinancialsResult["families"] }) {
   const labels = { company_facts: "Company reports", filing_details: "Detailed filing information", filings: "Filing history" }
   const reasons = {
-    preparation_required: "Saved reports need to be prepared. Choose Load financial information.",
+    preparation_required: "Loading saved reports…",
     identity_missing: "The company relationship has not been established.", identity_ambiguous: "More than one company relationship matches.",
     identity_stale: "The company relationship needs to be checked again.", identity_revoked: "The previous company relationship is no longer valid.",
     revision_conflict: "Reported revisions conflict.", no_records: "No records are available at the information date.",

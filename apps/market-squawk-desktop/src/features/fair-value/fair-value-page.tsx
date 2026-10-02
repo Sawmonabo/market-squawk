@@ -137,7 +137,7 @@ function ValuationFrame({ children }: { children: ReactNode }) {
     <header className="border-b border-border pb-6">
       <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Advanced · Investment research</p>
       <h1 className="mt-2 text-3xl font-semibold tracking-tight">Valuation &amp; targets</h1>
-      <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Review what an investment may be worth, its saved entry and exit ranges, and what could change the outlook. Estimates retain their original information cutoff and are not guaranteed returns.</p>
+      <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Review what an investment may be worth, its saved entry and exit ranges, and what could change the outlook. Estimates use information available as of the analysis date and are not guaranteed returns.</p>
     </header>
     <div className="mt-5">{children}</div>
   </main>

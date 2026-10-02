@@ -216,7 +216,7 @@ function SettingsWorkspace({
       setConfirmation(null)
       setFieldErrors({})
       setDraft({})
-      setAnnouncement(`Settings revision ${next.activeRevision} was durably saved.`)
+      setAnnouncement("Settings saved.")
       await queryClient.invalidateQueries({ queryKey: settingsKey })
       refreshSystem()
     },
@@ -253,7 +253,7 @@ function SettingsWorkspace({
       setRollbackRevision("")
       setDraft({})
       setAnnouncement(
-        `A new durable settings revision ${next.activeRevision} was created from revision ${next.rolledBackFromRevision ?? "the selected retained revision"}.`,
+        "Earlier settings restored.",
       )
       await queryClient.invalidateQueries({ queryKey: settingsKey })
       refreshSystem()
@@ -281,7 +281,7 @@ function SettingsWorkspace({
     onSuccess: async (next) => {
       setSwitchReceipt(next)
       setConfirmation(null)
-      setAnnouncement(`Workspace switch job ${next.jobId} is queued for service generation ${next.generation}.`)
+      setAnnouncement("Workspace change queued. Follow progress in Operations.")
       await queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "job") })
     },
   })
@@ -303,7 +303,7 @@ function SettingsWorkspace({
     settingsPreview.reset()
     if (Object.keys(next.errors).length > 0) return
     if (next.changes.length === 0) {
-      setFieldErrors({ form: "Change at least one locally mutable setting before requesting a preview." })
+      setFieldErrors({ form: "Change at least one editable setting before reviewing changes." })
       return
     }
     settingsPreview.mutate(next.changes)
@@ -338,7 +338,7 @@ function SettingsWorkspace({
   return (
     <SettingsFrame
       action={
-        <RefreshButton label="Refresh facts" refreshing={settings.isFetching || workspaces.isFetching || connections.isFetching} onClick={() => {
+        <RefreshButton label="Refresh settings" refreshing={settings.isFetching || workspaces.isFetching || connections.isFetching} onClick={() => {
             void settings.refetch()
             void workspaces.refetch()
             void connections.refetch()
@@ -351,7 +351,7 @@ function SettingsWorkspace({
       {connections.isError ? <Alert className="mt-5">
         <CircleAlert aria-hidden="true" />
         <AlertTitle>Application lock settings could not be read</AlertTitle>
-        <AlertDescription>{messageFrom(connections.error)} Use Refresh facts to try again.</AlertDescription>
+        <AlertDescription>{messageFrom(connections.error)} Use Refresh settings to try again.</AlertDescription>
       </Alert> : connections.isPending ? <Skeleton className="mt-6 h-44 rounded-xl" /> : (
         <ApplicationLock
           status={connections.data.credentialAccess}
@@ -380,9 +380,9 @@ function SettingsWorkspace({
           <SettingsSummary snapshot={settings.data} />
           <section className="mt-6" aria-labelledby="typed-settings-heading">
             <SectionHeading
-              eyebrow="Validated configuration"
-              title="Typed settings"
-              detail="Every effective value identifies its precedence origin, local mutability, enforced bound, and service impact. Secret values and raw configuration files are never exposed here."
+              eyebrow="Preferences"
+              title="Application settings"
+              detail="Manage storage, data updates, backups, and logs. Review each change before saving."
             />
             <div className="mt-4 grid gap-3 xl:grid-cols-2">
               {settings.data.entries.map((entry) => (
@@ -402,14 +402,14 @@ function SettingsWorkspace({
                 disabled={settingsPreview.isPending || applySettings.isPending || rollbackSettings.isPending}
               >
                 {settingsPreview.isPending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <Save aria-hidden="true" />}
-                Preview settings change
+                Review changes
               </Button>
               <Button
                 variant="outline"
                 onClick={() => setDraft(entriesToDraft(settings.data.entries))}
                 disabled={settingsPreview.isPending || applySettings.isPending}
               >
-                Discard local edits
+                Discard edits
               </Button>
             </div>
           </section>
@@ -470,13 +470,14 @@ function SettingsSummary({ snapshot }: { snapshot: { revision: LosslessInteger; 
   const restart = snapshot.entries.filter((entry) => entry.restartImpact === "service_restart").length
   return (
     <div className="grid gap-3 sm:grid-cols-3">
-      <Fact icon={SlidersHorizontal} label="Active revision" value={snapshot.revision} detail="Monotonic durable settings authority." />
-      <Fact icon={ShieldCheck} label="Locally mutable" value={`${mutable} of 9`} detail="The rest are controlled by their declared origin." />
-      <Fact icon={RefreshCw} label="Restart-sensitive" value={`${restart} settings`} detail="Only previewed changes state their actual combined impact." />
-      <div className="sm:col-span-3 rounded-lg border border-border bg-card/35 p-4">
-        <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Active settings digest</p>
+      <Fact icon={SlidersHorizontal} label="Settings version" value={snapshot.revision} detail="Current saved settings version." />
+      <Fact icon={ShieldCheck} label="Editable settings" value={`${mutable} of 9`} detail="Other settings are managed outside this page." />
+      <Fact icon={RefreshCw} label="May need a restart" value={`${restart} settings`} detail="Review changes to see whether a restart is needed." />
+      <details className="sm:col-span-3 rounded-lg border border-border bg-card/35 p-4">
+        <summary className="cursor-pointer text-xs text-muted-foreground">Settings diagnostics</summary>
+        <p className="mt-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Active settings digest</p>
         <p className="mt-2 break-all font-mono text-xs">{snapshot.digest}</p>
-      </div>
+      </details>
     </div>
   )
 }
@@ -504,11 +505,11 @@ function SettingCard({
           <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>
         </div>
         <span className={mutable ? "rounded-full bg-primary/15 px-2 py-1 text-[10px] font-medium text-primary" : "rounded-full bg-muted px-2 py-1 text-[10px] font-medium text-muted-foreground"}>
-          {mutable ? "Locally editable" : "Managed / read-only"}
+          {mutable ? "Editable" : "Managed / read-only"}
         </span>
       </div>
       <div className="mt-4">
-        <Label htmlFor={inputId}>{title} effective value</Label>
+        <Label htmlFor={inputId}>{title}</Label>
         <SettingInput entry={entry} id={inputId} value={value} disabled={!mutable} onChange={onChange} />
         {error ? <p className="mt-1 text-xs text-destructive">{error}</p> : null}
       </div>
@@ -541,10 +542,10 @@ function SettingInput({ entry, id, value, disabled, onChange }: { entry: Setting
 function RollbackPanel({ activeRevision, targetRevision, error, pending, onTargetChange, onPreview }: { activeRevision: LosslessInteger; targetRevision: string; error?: string; pending: boolean; onTargetChange: (value: string) => void; onPreview: () => void }) {
   return (
     <section className="mt-6 rounded-xl border border-border bg-card/35 p-5" aria-labelledby="settings-rollback-heading">
-      <SectionHeading eyebrow="Retained revisions" title="Preview settings rollback" detail="A retained older revision is validated by the service before any action. Rollback creates a new monotonic revision; it never resurrects or overwrites history." />
+      <SectionHeading eyebrow="Retained revisions" title="Restore earlier settings" detail="Choose a saved settings revision to review before restoring it. Settings history is preserved." />
       <div className="mt-4 flex max-w-xl flex-col gap-3 sm:flex-row sm:items-end">
         <div className="flex-1"><Label htmlFor="rollback-revision">Retained revision</Label><Input id="rollback-revision" className="mt-2 font-mono" inputMode="numeric" value={targetRevision} onChange={(event) => onTargetChange(event.target.value)} placeholder={`Lower than ${activeRevision}`} aria-invalid={Boolean(error)} /></div>
-        <Button variant="outline" onClick={onPreview} disabled={pending}><RotateCcw aria-hidden="true" />{pending ? "Preparing…" : "Preview rollback"}</Button>
+        <Button variant="outline" onClick={onPreview} disabled={pending}><RotateCcw aria-hidden="true" />{pending ? "Preparing…" : "Review restore"}</Button>
       </div>
       {error ? <InlineError>{error}</InlineError> : null}
     </section>
@@ -555,9 +556,9 @@ function SettingsReceiptCard({ receipt }: { receipt: SettingsReceipt }) {
   const rollback = receipt.rolledBackFromRevision !== null
   return (
     <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5" aria-labelledby="settings-receipt-heading">
-      <div className="flex gap-3"><CheckCircle2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div><h2 id="settings-receipt-heading" className="font-semibold">{rollback ? "Rollback outcome recorded" : "Durable save receipt"}</h2><p className="mt-1 text-sm text-muted-foreground">The service persisted the change before publishing this receipt.</p></div></div>
+      <div className="flex gap-3"><CheckCircle2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div><h2 id="settings-receipt-heading" className="font-semibold">{rollback ? "Earlier settings restored" : "Settings saved"}</h2><p className="mt-1 text-sm text-muted-foreground">Your changes have been saved.</p></div></div>
       <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><ReceiptFact label="Previous revision" value={receipt.previousRevision} /><ReceiptFact label="Active revision" value={receipt.activeRevision} /><ReceiptFact label="Service impact" value={restartLabel(receipt.restartImpact)} />{rollback ? <ReceiptFact label="Rolled back from" value={receipt.rolledBackFromRevision ?? "Unavailable"} /> : null}</dl>
-      <p className="mt-4 break-all font-mono text-[11px] text-muted-foreground">Active digest: {receipt.activeDigest}</p>
+      <details className="mt-4 text-xs text-muted-foreground"><summary className="cursor-pointer">Save diagnostics</summary><p className="mt-2 break-all font-mono text-[11px]">Active digest: {receipt.activeDigest}</p></details>
     </section>
   )
 }
@@ -565,9 +566,9 @@ function SettingsReceiptCard({ receipt }: { receipt: SettingsReceipt }) {
 function WorkspaceSection({ page, pending, loading, error, onPreview }: { page?: WorkspacePage; pending: boolean; loading: boolean; error: string | null; onPreview: (workspaceId: string) => void }) {
   return (
     <section className="mt-8" aria-labelledby="workspaces-heading">
-      <SectionHeading eyebrow="One active local workspace" title="Workspace switching" detail="The service owns workspace paths and authority. This bounded inventory is the only data-location descriptor presented to the desktop; no filesystem path or direct workspace mutation is available." />
+      <SectionHeading eyebrow="One active local workspace" title="Choose a workspace" detail="Select the workspace whose saved data you want to use." />
       {loading ? <div className="mt-4 grid gap-3 sm:grid-cols-2"><Skeleton className="h-44" /><Skeleton className="h-44" /></div> : error ? <Unavailable detail={error} /> : page ? <>
-        <div className="mt-4 rounded-lg border border-border bg-card/35 p-4"><p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Active runtime</p><p className="mt-2 font-semibold">Workspace {page.active.workspaceId}</p><p className="mt-1 text-sm text-muted-foreground">Active generation {page.active.generation}. A completed switch forces connected clients to re-sync to the new workspace and generation.</p></div>
+        <div className="mt-4 rounded-lg border border-border bg-card/35 p-4"><p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Active workspace</p><p className="mt-2 font-semibold">{page.workspaces.find((workspace) => workspace.workspaceId === page.active.workspaceId)?.displayName ?? "Current workspace"}</p><details className="mt-2 text-xs text-muted-foreground"><summary className="cursor-pointer">Workspace diagnostics</summary><p className="mt-2 break-all font-mono">{page.active.workspaceId} · generation {page.active.generation}</p></details><p className="mt-1 text-sm text-muted-foreground">Connected clients refresh their data after a completed workspace change.</p></div>
         <div className="mt-4 grid gap-3 xl:grid-cols-2">{page.workspaces.map((workspace) => <WorkspaceCard key={workspace.workspaceId} workspace={workspace} active={workspace.workspaceId === page.active.workspaceId} pending={pending} onPreview={onPreview} />)}</div>
       </> : null}
     </section>
@@ -576,12 +577,12 @@ function WorkspaceSection({ page, pending, loading, error, onPreview }: { page?:
 
 function WorkspaceCard({ workspace, active, pending, onPreview }: { workspace: WorkspacePage["workspaces"][number]; active: boolean; pending: boolean; onPreview: (workspaceId: string) => void }) {
   return (
-    <article className="rounded-xl border border-border bg-card/35 p-4"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">{workspace.displayName}</h3><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{workspace.workspaceId}</p></div><span className={active ? "rounded-full bg-primary/15 px-2 py-1 text-[10px] font-medium text-primary" : "rounded-full bg-muted px-2 py-1 text-[10px] font-medium text-muted-foreground"}>{active ? "Active" : humanize(workspace.health)}</span></div><dl className="mt-4 grid gap-2 text-xs sm:grid-cols-3"><div><dt className="text-muted-foreground">Service descriptor</dt><dd className="mt-0.5 font-medium">Schema {workspace.schemaVersion}</dd></div><div><dt className="text-muted-foreground">Health</dt><dd className="mt-0.5 font-medium">{humanize(workspace.health)}</dd></div><div><dt className="text-muted-foreground">Estimated data</dt><dd className="mt-0.5 font-medium">{formatBytes(workspace.estimatedBytes)}</dd></div></dl>{active ? <p className="mt-4 text-xs text-muted-foreground">This runtime is already active. Its actual local path remains service-owned and is not shown.</p> : <Button className="mt-4" variant="outline" size="sm" disabled={pending} onClick={() => onPreview(workspace.workspaceId)}><SwitchCamera aria-hidden="true" />Preview switch</Button>}</article>
+    <article className="rounded-xl border border-border bg-card/35 p-4"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">{workspace.displayName}</h3><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{workspace.workspaceId}</p></div><span className={active ? "rounded-full bg-primary/15 px-2 py-1 text-[10px] font-medium text-primary" : "rounded-full bg-muted px-2 py-1 text-[10px] font-medium text-muted-foreground"}>{active ? "Active" : humanize(workspace.health)}</span></div><dl className="mt-4 grid gap-2 text-xs sm:grid-cols-3"><div><dt className="text-muted-foreground">Data format</dt><dd className="mt-0.5 font-medium">Schema {workspace.schemaVersion}</dd></div><div><dt className="text-muted-foreground">Health</dt><dd className="mt-0.5 font-medium">{humanize(workspace.health)}</dd></div><div><dt className="text-muted-foreground">Estimated data</dt><dd className="mt-0.5 font-medium">{formatBytes(workspace.estimatedBytes)}</dd></div></dl>{active ? <p className="mt-4 text-xs text-muted-foreground">This workspace is already active.</p> : <Button className="mt-4" variant="outline" size="sm" disabled={pending} onClick={() => onPreview(workspace.workspaceId)}><SwitchCamera aria-hidden="true" />Review change</Button>}</article>
   )
 }
 
 function WorkspaceReceiptCard({ receipt }: { receipt: JobReceipt }) {
-  return <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5"><div className="flex gap-3"><CheckCircle2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div><h2 className="font-semibold">Workspace switch receipt</h2><p className="mt-1 text-sm text-muted-foreground">The service accepted a durable transition job. The active workspace does not change until it drains, reconciles, restarts, and publishes the next generation.</p></div></div><dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><ReceiptFact label="Job" value={receipt.jobId} /><ReceiptFact label="Generation" value={receipt.generation} /><ReceiptFact label="Sequence" value={receipt.sequence} /></dl></section>
+  return <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5"><div className="flex gap-3"><CheckCircle2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div><h2 className="font-semibold">Workspace change queued</h2><p className="mt-1 text-sm text-muted-foreground">The workspace changes after current work finishes, the service restarts, and checks pass. Follow progress in Operations to confirm completion.</p></div></div><details className="mt-4 text-xs text-muted-foreground"><summary className="cursor-pointer">Job details</summary><dl className="mt-3 grid gap-3 sm:grid-cols-3"><ReceiptFact label="Job" value={receipt.jobId} /><ReceiptFact label="Generation" value={receipt.generation} /><ReceiptFact label="Sequence" value={receipt.sequence} /></dl></details></section>
 }
 
 function ConfirmationDialog({ confirmation, settingsPending, rollbackPending, switchPending, error, onDismiss, onConfirm }: { confirmation: Confirmation | null; settingsPending: boolean; rollbackPending: boolean; switchPending: boolean; error: Error | null; onDismiss: () => void; onConfirm: () => void }) {
@@ -592,17 +593,17 @@ function ConfirmationDialog({ confirmation, settingsPending, rollbackPending, sw
 }
 
 function settingsConfirmation(preview: SettingsChangePreview) {
-  return { title: "Apply this settings preview?", description: `This exact preview expires ${formatTimestamp(preview.expiresAt)}. Applying it persists revision ${preview.evidence.currentRevision} changes only after your explicit confirmation.`, action: "Save settings", blocked: false, body: <PreviewFacts facts={[ ["Changes", preview.evidence.changes.map((change) => settingTitle(change.kind)).join(", ")], ["Combined impact", restartLabel(preview.evidence.restartImpact)], ["Preview digest", preview.previewDigest] ]} /> }
+  return { title: "Save these settings?", description: `Review the changes and restart requirements below. This review expires ${formatTimestamp(preview.expiresAt)}.`, action: "Save settings", blocked: false, body: <PreviewFacts facts={[ ["Changes", preview.evidence.changes.map((change) => settingTitle(change.kind)).join(", ")], ["Combined impact", restartLabel(preview.evidence.restartImpact)], ["Preview digest", preview.previewDigest] ]} /> }
 }
 
 function rollbackConfirmation(preview: SettingsRollbackPreview) {
-  return { title: "Create a rollback revision?", description: `This exact preview expires ${formatTimestamp(preview.expiresAt)}. It creates a new revision from retained revision ${preview.evidence.targetRevision}; it does not resurrect historical state.`, action: "Create rollback revision", blocked: false, body: <PreviewFacts facts={[["Current revision", preview.evidence.currentRevision], ["Retained target", preview.evidence.targetRevision], ["Restart required", preview.evidence.restartRequired ? "Yes" : "No"], ["Result digest", preview.evidence.digest]]} /> }
+  return { title: "Restore these earlier settings?", description: `Restore the settings from revision ${preview.evidence.targetRevision}. Settings history is preserved. This review expires ${formatTimestamp(preview.expiresAt)}.`, action: "Restore settings", blocked: false, body: <PreviewFacts facts={[["Current revision", preview.evidence.currentRevision], ["Retained target", preview.evidence.targetRevision], ["Restart required", preview.evidence.restartRequired ? "Yes" : "No"], ["Result digest", preview.evidence.digest]]} /> }
 }
 
 function workspaceConfirmation(preview: WorkspaceSwitchPreview) {
   const activity = preview.evidence.activity
   const blocked = preview.evidence.blockers.length > 0
-  return { title: "Start this workspace switch?", description: blocked ? "The service cannot start this exact transition while its reported blockers remain. Review the blockers, resolve them in their owning workflow, then request a new preview." : `This exact preview expires ${formatTimestamp(preview.expiresAt)}. The service will drain work, preserve reconciliation requirements, restart into the target workspace, and force connected clients to re-sync.`, action: "Start workspace switch", blocked, body: <><PreviewFacts facts={[["Active", `${preview.evidence.active.workspaceId} · generation ${preview.evidence.active.generation}`], ["Exact target", preview.evidence.target], ["Running jobs", String(activity.runningJobs)], ["Active sources", String(activity.activeSources)], ["Connected clients to re-sync", String(activity.connectedClients)], ["Available / required disk", `${formatBytes(activity.availableDiskBytes)} / ${formatBytes(activity.requiredDiskBytes)}`], ["Schema compatible", activity.schemaCompatible ? "Yes" : "No"]]} />{activity.paperExecutionActive || activity.executionReconciliationPending ? <Alert className="mt-3"><CircleAlert aria-hidden="true" /><AlertTitle>Drain and reconciliation are service-owned</AlertTitle><AlertDescription>Paper execution and execution reconciliation are checked before transition. The desktop cannot bypass, kill, or directly alter those workflows.</AlertDescription></Alert> : null}{blocked ? <InlineError>Blockers: {preview.evidence.blockers.map(humanize).join(", ")}.</InlineError> : null}</> }
+  return { title: "Start this workspace switch?", description: blocked ? "Resolve the issues below, then review the workspace change again." : `Current work finishes before the service restarts into the selected workspace. Connected clients refresh their data. This review expires ${formatTimestamp(preview.expiresAt)}.`, action: "Start workspace switch", blocked, body: <><PreviewFacts facts={[["Active", `${preview.evidence.active.workspaceId} · generation ${preview.evidence.active.generation}`], ["Exact target", preview.evidence.target], ["Running jobs", String(activity.runningJobs)], ["Active sources", String(activity.activeSources)], ["Connected clients to re-sync", String(activity.connectedClients)], ["Available / required disk", `${formatBytes(activity.availableDiskBytes)} / ${formatBytes(activity.requiredDiskBytes)}`], ["Schema compatible", activity.schemaCompatible ? "Yes" : "No"]]} />{activity.paperExecutionActive || activity.executionReconciliationPending ? <Alert className="mt-3"><CircleAlert aria-hidden="true" /><AlertTitle>Paper trading needs to finish</AlertTitle><AlertDescription>Stop paper trading and let its accounting checks finish before changing workspaces.</AlertDescription></Alert> : null}{blocked ? <InlineError>Blockers: {preview.evidence.blockers.map(humanize).join(", ")}.</InlineError> : null}</> }
 }
 
 function PreviewFacts({ facts }: { facts: [string, string][] }) { return <dl className="grid gap-2 rounded-lg border border-border bg-muted/30 p-3 text-xs">{facts.map(([label, value]) => <div key={label}><dt className="text-muted-foreground">{label}</dt><dd className="mt-0.5 break-all font-medium">{value}</dd></div>)}</dl> }
@@ -623,7 +624,7 @@ function SecureStorageRecovery({ requiresUnlock, pending, error, onRecover }: { 
   }
   return <section className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-5"><div className="flex gap-3"><KeyRound className="mt-0.5 size-5 text-amber-300" aria-hidden="true" /><div><h2 className="font-semibold">Finish secure startup</h2><p className="mt-1 text-sm leading-6 text-muted-foreground">{requiresUnlock ? "Enter your local security password to unlock saved connection credentials." : "Continue once to let Market Squawk open your saved connections securely."}</p></div></div><form className="mt-5 flex max-w-xl flex-wrap items-end gap-3" onSubmit={recover}>{requiresUnlock ? <div className="min-w-56 flex-1"><Label htmlFor="service-fallback-unlock">Local security password</Label><Input id="service-fallback-unlock" name="unlock" type="password" autoComplete="current-password" spellCheck={false} className="mt-2 font-mono" disabled={pending} /></div> : null}<Button type="submit" disabled={pending}>{pending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : null}{pending ? "Finishing startup…" : requiresUnlock ? "Unlock secure storage" : "Continue secure startup"}</Button></form>{error ? <InlineError>{error}</InlineError> : null}</section>
 }
-function Unavailable({ detail }: { detail: string }) { return <Alert className="mt-5"><CircleAlert aria-hidden="true" /><AlertTitle>Settings service is unavailable</AlertTitle><AlertDescription>{detail} Reconnect to the installed Market Squawk service and retry; no local fallback can edit these authorities.</AlertDescription></Alert> }
+function Unavailable({ detail }: { detail: string }) { return <Alert className="mt-5"><CircleAlert aria-hidden="true" /><AlertTitle>Settings service is unavailable</AlertTitle><AlertDescription>{detail} Reconnect to the installed Market Squawk service and retry; settings cannot be changed until the connection is restored.</AlertDescription></Alert> }
 function SettingsFrame({
   children,
   action,
@@ -673,13 +674,13 @@ function SettingsFrame({
 function SettingsSkeleton() { return <><div className="grid gap-3 sm:grid-cols-3"><Skeleton className="h-32" /><Skeleton className="h-32" /><Skeleton className="h-32" /></div><div className="mt-6 grid gap-3 xl:grid-cols-2"><Skeleton className="h-72" /><Skeleton className="h-72" /></div></> }
 
 function entriesToDraft(entries: SettingEntry[]): DraftValues { return Object.fromEntries(entries.map((entry) => [entry.key, settingValueToText(entry)])) }
-function collectChanges(entries: SettingEntry[], draft: DraftValues): { changes: OperationSettingValue[]; errors: FieldErrors } { const errors: FieldErrors = {}; const changes: OperationSettingValue[] = []; for (const entry of entries) { if (!entry.locallyMutable || !isMatchingSetting(entry)) continue; const next = draft[entry.key] ?? settingValueToText(entry); if (!validateInput(entry, next)) { errors[entry.key] = `Enter ${validationLabel(entry.key).toLowerCase()}.`; continue } const value = asOperationSettingValue(entry, next); if (!value) { errors[entry.key] = "This value is not a valid typed setting."; continue } if (next !== settingValueToText(entry)) changes.push(value) } return { changes, errors } }
+function collectChanges(entries: SettingEntry[], draft: DraftValues): { changes: OperationSettingValue[]; errors: FieldErrors } { const errors: FieldErrors = {}; const changes: OperationSettingValue[] = []; for (const entry of entries) { if (!entry.locallyMutable || !isMatchingSetting(entry)) continue; const next = draft[entry.key] ?? settingValueToText(entry); if (!validateInput(entry, next)) { errors[entry.key] = `Enter ${validationLabel(entry.key).toLowerCase()}.`; continue } const value = asOperationSettingValue(entry, next); if (!value) { errors[entry.key] = "Enter a valid value for this setting."; continue } if (next !== settingValueToText(entry)) changes.push(value) } return { changes, errors } }
 function validateInput(entry: SettingEntry, value: string) { if (entry.key === "automatic_update_checks" || entry.key === "log_minimum_severity" || entry.key === "update_channel") return true; if (!/^\d+$/.test(value)) return false; if (entry.key === "storage_soft_limit_bytes") { try { const bytes = BigInt(value); return bytes >= 1024n ** 3n && bytes <= 16n * 1024n ** 4n } catch { return false } } const number = Number(value); if (!Number.isSafeInteger(number)) return false; switch (entry.key) { case "log_retention_days": return number >= 1 && number <= 365; case "default_query_row_limit": return number >= 100 && number <= 1_000_000; case "maximum_concurrent_jobs": return number >= 1 && number <= 64; case "market_freshness_millis": return number >= 250 && number <= 600_000; case "backup_retention_count": return number >= 1 && number <= 64; default: return false } }
 function isRetainedRevisionCandidate(target: string, active: LosslessInteger) { if (!/^\d+$/.test(target) || target === "0") return false; try { return compareLosslessIntegers(target, active) < 0 } catch { return false } }
 function firstError(...errors: (Error | null)[]) { return errors.find((error) => error !== null) ?? null }
 function confirmationError(confirmation: Confirmation | null, settings: Error | null, rollback: Error | null, workspace: Error | null) { if (!confirmation) return null; if (confirmation.kind === "settings") return settings; if (confirmation.kind === "rollback") return rollback; return workspace }
-function settingTitle(key: string) { const labels: Record<string, string> = { log_retention_days: "Log retention", log_minimum_severity: "Log minimum severity", update_channel: "Update channel", automatic_update_checks: "Automatic update checks", storage_soft_limit_bytes: "Storage soft limit", default_query_row_limit: "Default query row limit", maximum_concurrent_jobs: "Maximum concurrent jobs", market_freshness_millis: "Market freshness", backup_retention_count: "Backup retention" }; return labels[key] ?? humanize(key) }
-function settingDescription(key: string) { const descriptions: Record<string, string> = { log_retention_days: "Bounded retention for redacted structured logs.", log_minimum_severity: "Lowest severity admitted by the service logging policy.", update_channel: "Trusted product release stream, never an arbitrary URL.", automatic_update_checks: "Allows disclosed daily metadata checks after first value.", storage_soft_limit_bytes: "Governance threshold that pauses heavy work before storage pressure causes damage.", default_query_row_limit: "Safe default for bounded product queries.", maximum_concurrent_jobs: "Shared durable-job concurrency across local clients.", market_freshness_millis: "Maximum age allowed before live market facts become stale.", backup_retention_count: "Bounded count of retained local backup generations." }; return descriptions[key] ?? "Typed service-owned configuration." }
+function settingTitle(key: string) { const labels: Record<string, string> = { log_retention_days: "Log retention", log_minimum_severity: "Minimum log level", update_channel: "Update channel", automatic_update_checks: "Automatic update checks", storage_soft_limit_bytes: "Storage soft limit", default_query_row_limit: "Default query row limit", maximum_concurrent_jobs: "Maximum concurrent jobs", market_freshness_millis: "Market freshness", backup_retention_count: "Backup retention" }; return labels[key] ?? humanize(key) }
+function settingDescription(key: string) { const descriptions: Record<string, string> = { log_retention_days: "How long to keep saved logs.", log_minimum_severity: "Lowest log level to save.", update_channel: "Choose stable releases or preview releases.", automatic_update_checks: "Check for program updates once a day.", storage_soft_limit_bytes: "Pause heavy work when saved data reaches this amount.", default_query_row_limit: "Default maximum number of rows to return in a query.", maximum_concurrent_jobs: "Maximum jobs that can run at once across connected clients.", market_freshness_millis: "Maximum age allowed before live market facts become stale.", backup_retention_count: "How many local backups to keep." }; return descriptions[key] ?? "Application preference." }
 function validationLabel(key: string) { const labels: Record<string, string> = { log_retention_days: "1–365 days", log_minimum_severity: "Trace, debug, info, warn, or error", update_channel: "Stable or preview", automatic_update_checks: "Enabled or disabled", storage_soft_limit_bytes: "1 GiB–16 TiB, exact bytes", default_query_row_limit: "100–1,000,000 rows", maximum_concurrent_jobs: "1–64 jobs", market_freshness_millis: "250–600,000 ms", backup_retention_count: "1–64 backups" }; return labels[key] ?? "Service validation" }
-function originLabel(origin: string) { const labels: Record<string, string> = { safe_default: "Safe default", local_persisted: "Local persisted", local_configuration: "Local configuration", environment: "Environment", cli_override: "CLI override", managed_policy: "Managed policy" }; return labels[origin] ?? humanize(origin) }
+function originLabel(origin: string) { const labels: Record<string, string> = { safe_default: "Safe default", local_persisted: "Saved locally", local_configuration: "Local configuration", environment: "Environment", cli_override: "CLI override", managed_policy: "Managed policy" }; return labels[origin] ?? humanize(origin) }
 function restartLabel(impact: string) { const labels: Record<string, string> = { none: "No restart", service_reload: "Service reload", service_restart: "Service restart" }; return labels[impact] ?? humanize(impact) }

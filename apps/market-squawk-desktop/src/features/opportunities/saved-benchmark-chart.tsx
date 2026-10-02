@@ -20,8 +20,8 @@ const WINDOWS = [
 ] as const
 const UNAVAILABLE = {
   selection_unavailable: "The requested comparison could not be used for this saved analysis.",
-  missing_subject: "Price history for this investment was unavailable at the saved cutoff.",
-  missing_selected_comparison: "Price history for the selected comparison was unavailable at the saved cutoff.",
+  missing_subject: "Price history for this investment was unavailable as of the analysis date.",
+  missing_selected_comparison: "Price history for the selected comparison was unavailable as of the analysis date.",
   no_common_observation: "The two investments had no shared session with recorded prices.",
   storage_unavailable: "The original saved comparison data could not be reopened.",
   not_requested: "Open the comparison layer to load its saved observations.",

@@ -155,9 +155,9 @@ const harmonicNames = {
   deep_crab: "Deep Crab", cypher: "Cypher", shark: "Shark",
 } as const
 const harmonicStatus = {
-  unavailable: "Pattern evidence unavailable", confirmed: "Confirmed at the saved cutoff",
+  unavailable: "Pattern evidence unavailable", confirmed: "Confirmed as of the analysis date",
   insufficient_bars: "Too little price history", insufficient_pivots: "Too few confirmed turning points",
-  no_matching_pattern: "No matching pattern", expired: "Expired at the saved cutoff", invalidated: "Invalidated at the saved cutoff",
+  no_matching_pattern: "No matching pattern", expired: "Expired as of the analysis date", invalidated: "Invalidated as of the analysis date",
 } as const
 
 type OriginalChartSelection = { layer: "history" | "benchmark"; timeUnixNanos: string; originalOrdinal: string }
@@ -274,7 +274,7 @@ function SavedInvestmentChart({ chart, currency, onViewportChange, onObservation
       unit={currency}
       cutoffUnixNanos={chart.forecast.state === "available"
         ? chart.forecast.observedThroughUnixNanos : chart.informationCurrentThroughUnixNanos}
-      cutoffLabel={chart.forecast.state === "available" ? "Original forecast cutoff" : "Saved information cutoff"}
+      cutoffLabel={chart.forecast.state === "available" ? "Forecast information as of" : "Saved information as of"}
       observed={chart.history.state === "available" ? chart.history.points.map((point) => ({
         timeUnixNanos: point.coordinate.kind === "timestamp"
           ? point.coordinate.timeUnixNanos : point.coordinate.sessionCloseUnixNanos,
@@ -323,11 +323,11 @@ function SavedInvestmentChart({ chart, currency, onViewportChange, onObservation
     <p className="text-xs leading-5 text-muted-foreground">{chart.forecast.summary} A single forecast point is shown as a point, without an invented path from today's price.</p>
     <p className="text-xs leading-5 text-muted-foreground">{actionRanges.summary}</p>
     {actionRanges.state === "available" ? <details className="rounded-lg border border-border bg-background/25 p-4">
-      <summary className="cursor-pointer text-sm font-medium">Saved action reference evidence</summary>
+      <summary className="cursor-pointer text-sm font-medium">Saved action details</summary>
       <dl className="mt-4 grid gap-3 sm:grid-cols-3">
-        <Fact label="Original information cutoff" value={<span data-time-unix-nanos={actionRanges.informationCurrentThroughUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.informationCurrentThroughUnixNanos)}</span>} />
-        <Fact label="Originally admitted" value={<span data-time-unix-nanos={actionRanges.admittedAtUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.admittedAtUnixNanos)}</span>} />
-        <Fact label="Reference expiry (exclusive)" value={<span data-time-unix-nanos={actionRanges.expiresAtUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.expiresAtUnixNanos)}</span>} />
+        <Fact label="Information as of" value={<span data-time-unix-nanos={actionRanges.informationCurrentThroughUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.informationCurrentThroughUnixNanos)}</span>} />
+        <Fact label="Originally valid from" value={<span data-time-unix-nanos={actionRanges.admittedAtUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.admittedAtUnixNanos)}</span>} />
+        <Fact label="Originally expires at" value={<span data-time-unix-nanos={actionRanges.expiresAtUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.expiresAtUnixNanos)}</span>} />
       </dl>
       <ul className="mt-4 space-y-3 text-xs leading-5">
         {actionRanges.ranges.map((range) => <li key={range.kind}>
@@ -342,7 +342,7 @@ function SavedInvestmentChart({ chart, currency, onViewportChange, onObservation
       <p className="mt-3 text-xs leading-5 text-muted-foreground">{pattern.summary}</p>
       <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Direction" value={pattern.direction === null ? "Unavailable" : pattern.direction === "bullish" ? "Bullish" : "Bearish"} />
-        <Fact label="Original observation cutoff" value={<span data-time-unix-nanos={pattern.observationCutoffUnixNanos ?? undefined}>{formatChartTimestamp(pattern.observationCutoffUnixNanos)}</span>} />
+        <Fact label="Originally observed through" value={<span data-time-unix-nanos={pattern.observationCutoffUnixNanos ?? undefined}>{formatChartTimestamp(pattern.observationCutoffUnixNanos)}</span>} />
         <Fact label="Originally confirmed through" value={<span data-time-unix-nanos={pattern.confirmationCutoffUnixNanos ?? undefined}>{formatChartTimestamp(pattern.confirmationCutoffUnixNanos)}</span>} />
         <Fact label="Pattern expiry" value={<span data-time-unix-nanos={pattern.expiresAtUnixNanos ?? undefined}>{formatChartTimestamp(pattern.expiresAtUnixNanos)}</span>} />
         <Fact label="Completion / reversal zone" value={pattern.reversalZone
@@ -437,12 +437,8 @@ function SavedProbabilities({ analysis }: { analysis: InvestmentAnalysis }) {
             </details>
           </>}
           {event.benchmark ? <details className="mt-4 text-xs leading-5">
-            <summary className="cursor-pointer font-medium">Saved benchmark identity</summary>
-            <p className="mt-2 text-muted-foreground">This forecast retains the selected benchmark's original definition. Its display name was not saved.</p>
-            <dl className="mt-3 space-y-3 break-all">
-              <Fact label="Instrument" value={event.benchmark.instrumentId} />
-              <Fact label="Definition fingerprint" value={`${event.benchmark.definitionAlgorithm}: ${event.benchmark.definitionDigest}`} />
-            </dl>
+            <summary className="cursor-pointer font-medium">Saved comparison</summary>
+            <p className="mt-2 text-muted-foreground">Comparison name unavailable.</p>
           </details> : null}
           {event.assumptions.length ? <ul className="mt-4 list-disc space-y-2 pl-4 text-xs leading-5 text-muted-foreground">
             {event.assumptions.map((text) => <li key={text}>{text}</li>)}
@@ -519,7 +515,7 @@ export function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) 
         {([
           ["Broader research", "broaderResearch"],
           ["Financial model", "financialModel"],
-          ["Governed valuation", "valuation"],
+          ["Valuation", "valuation"],
         ] as const).map(([label, family]) => <Fact key={family} label={label}
           value={analysis.analyticalEvidence[family].summary} />)}
         <Fact label="Price patterns" value={<PricePatternDetails evidence={analysis.analyticalEvidence.pricePattern} />} />
@@ -786,8 +782,8 @@ function SizingSummary({ analysis }: { analysis: InvestmentAnalysis }) {
         <Fact label="Preferred range" value={lotRange(sizing.preferredFeasibleLots)} />
         <Fact label="Mandatory position value" value={notionalRange(sizing.hardFeasibleTargetNotional)} />
         <Fact label="Preferred position value" value={notionalRange(sizing.preferredFeasibleTargetNotional)} />
-        <Fact label="Mandatory binding limits" value={sizing.hardBindingCaps.map((kind) => sizingLabels[kind]).join(", ") || "None"} />
-        <Fact label="Preferred binding limits" value={sizing.preferredBindingCaps.map((kind) => sizingLabels[kind]).join(", ") || "None"} />
+        <Fact label="Required limits" value={sizing.hardBindingCaps.map((kind) => sizingLabels[kind]).join(", ") || "None"} />
+        <Fact label="Preferred limits" value={sizing.preferredBindingCaps.map((kind) => sizingLabels[kind]).join(", ") || "None"} />
         <Fact label="Lower weight rounding excess" value={money(sizing.preferredWeightRounding.lowerRoundUpExcess)} />
         <Fact label="Upper weight rounding remainder" value={money(sizing.preferredWeightRounding.upperRoundDownRemainder)} />
         {sizing.constraintCaps.map((cap) => <Fact key={cap.kind} label={sizingLabels[cap.kind]}

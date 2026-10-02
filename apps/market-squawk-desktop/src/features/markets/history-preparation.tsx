@@ -1,15 +1,20 @@
-import type { DesktopBootstrap } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import { PreparationStatus, type PreparationController } from "./preparation-controls"
 
-import { PreparationControls } from "./preparation-controls"
-
-export function HistoryPreparation({ historyToken, bootstrap, transport, hasSavedHistory, onPrepared }: {
-  historyToken: string
-  bootstrap: DesktopBootstrap
-  transport: ProductTransport
-  hasSavedHistory: boolean
-  onPrepared: () => Promise<void>
+export function HistoryPreparation({ controller, windowDays, onWindowChange }: {
+  controller: PreparationController
+  windowDays: string
+  onWindowChange: (days: string) => void
 }) {
-  return <PreparationControls kind="history" token={historyToken} bootstrap={bootstrap}
-    transport={transport} hasSavedData={hasSavedHistory} onPrepared={onPrepared} />
+  return <div className="min-w-0 flex-1">
+    <label className="flex items-center gap-2 text-xs">History window
+      <select className="rounded-md border border-input bg-background px-2 py-1.5" value={windowDays}
+        disabled={controller.busy || controller.active || controller.unresolved}
+        onChange={(event) => onWindowChange(event.target.value)}>
+        <option value="all">All saved</option><option value="30">30 days</option>
+        <option value="90">90 days</option><option value="365">1 year</option>
+        <option value="3650">10 years</option>
+      </select>
+    </label>
+    <PreparationStatus kind="history" controller={controller} />
+  </div>
 }

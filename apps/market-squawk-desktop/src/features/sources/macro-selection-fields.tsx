@@ -38,7 +38,7 @@ function BeaFields({ id }: { id: number }) {
   return (
     <>
       <TextField name={`${id}-dataset`} label="BEA dataset name" maxLength={128} />
-      <p className="text-xs text-muted-foreground">Enter the parameter names and explicit values published for this dataset. Broad ALL, X and * selections are not admitted.</p>
+      <p className="text-xs text-muted-foreground">Enter the parameter names and explicit values published for this dataset. Choose specific values; broad ALL, X and * selections are not supported.</p>
       <input type="hidden" name={`${id}-parameter-count`} value={parameters} />
       {Array.from({ length: parameters }, (_, index) => (
         <div className="grid gap-3 sm:grid-cols-2" key={index}>

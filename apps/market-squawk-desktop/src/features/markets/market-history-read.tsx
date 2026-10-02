@@ -9,6 +9,7 @@ import type { ProductTransport } from "@/lib/transport"
 import { HistoryPreparation } from "./history-preparation"
 import { MarketHistoryChart } from "./market-history-chart"
 import { parseMarketHistoryResult, sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryResult, type MarketHistoryViewportInput } from "./market-history"
+import { usePreparationController } from "./preparation-controls"
 
 const queryPolicy = { retry: false, refetchOnWindowFocus: false } as const
 
@@ -68,28 +69,52 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     void reset()
   }, [refreshRevision, reset])
   const result = history.data ?? lastChecked.current
+  const preparation = usePreparationController({ kind: "history", token: historyToken, bootstrap, transport, onPrepared: reset })
+  const restoredWindow = React.useRef(false)
+  React.useEffect(() => {
+    if (restoredWindow.current) return
+    const days = preparation.preparation?.lookbackDays
+    if (days === undefined) { restoredWindow.current = true; return }
+    setWindowDays(String(days))
+    if (result === undefined) return
+    restoredWindow.current = true
+    setViewport(recentHistoryWindow(days, result))
+  }, [preparation.preparation, result])
+  const selectWindow = (days: string) => {
+    setWindowDays(days)
+    setSelectedBar(null)
+    setViewport(days === "all" ? { pointLimit: 512 } : recentHistoryWindow(Number(days), result))
+    if (days !== "all") preparation.start(Number(days))
+  }
   const busy = history.isFetching || refreshing
   return <div className="mt-3 min-h-[640px]">
+    <HistoryPreparation controller={preparation} windowDays={windowDays} onWindowChange={selectWindow} />
     {result ? <div className={`[&>section]:mt-0 [&>section]:rounded-none [&>section]:border-0 [&>section]:bg-transparent [&>section]:p-0 ${result.data ? "[&>section>h3]:hidden" : ""}`}>
       <MarketHistoryChart result={result}
-        windowDays={windowDays} onWindowChange={setWindowDays}
+        windowDays={windowDays}
         onViewportChange={(next) => { if (!refreshing) { setViewport(next); setSelectedBar(null) } }} onObservationSelect={setSelectedBar} />
-    </div> : <div className="flex h-[536px] items-center justify-center text-sm text-muted-foreground">{history.isError ? "No checked price history is available." : "Opening saved price history…"}</div>}
-    <div className="mt-4 flex flex-wrap items-start justify-between gap-3 border-t border-border pt-3">
-      <HistoryPreparation historyToken={historyToken} bootstrap={bootstrap} transport={transport}
-        hasSavedHistory={Boolean(result?.data)} onPrepared={reset} />
-    </div>
+    </div> : <div className="flex h-[536px] items-center justify-center text-sm text-muted-foreground">{history.isError ? "No saved price history is available." : "Opening saved price history…"}</div>}
     <div className="mt-2 min-h-10 text-xs leading-5">
       {history.isError ? <div className="flex items-start justify-between gap-3">
         <p role="alert" className="text-destructive">{result?.data
-          ? "Price history could not be updated. Showing the last checked price window; its currentness has not been verified."
+          ? "Price history could not be updated. Showing saved prices, which may be out of date."
           : "Price history could not be loaded. Try again."}</p>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void history.refetch()}>Retry</Button>
-      </div> : busy ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating the requested price window… Showing the last checked prices." : "Loading the requested price window…"}</p> : null}
+      </div> : busy ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating prices… Showing saved prices." : "Loading prices…"}</p> : null}
     </div>
     {selectedBar !== null && result?.data ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${result.data.generationToken}`}
       bar={selectedBar} historyToken={historyToken} generationToken={result.data.generationToken} bootstrap={bootstrap} transport={transport} /> : null}
   </div>
+}
+
+function recentHistoryWindow(days: number, result: MarketHistoryResult | undefined): MarketHistoryViewportInput {
+  const end = Date.now()
+  const start = end - days * 86_400_000
+  const timestamped = result?.data?.bars[0]?.time.precision === "timestamped_period"
+    || result?.data?.viewport.fullEndUnixNanos !== null && result?.data?.viewport.fullEndUnixNanos !== undefined
+  return timestamped
+    ? { startUnixNanos: (BigInt(start) * 1_000_000n).toString(), endUnixNanos: (BigInt(end) * 1_000_000n).toString(), pointLimit: 512 }
+    : { startDate: new Date(start).toISOString().slice(0, 10), endDate: new Date(end).toISOString().slice(0, 10), pointLimit: 512 }
 }
 
 function OriginalMarketBarRead({ bar, historyToken, generationToken, bootstrap, transport }: {

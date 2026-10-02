@@ -188,7 +188,7 @@ function RiskMeasures({ report }: { report: PortfolioRiskReport }) {
   return (
     <Panel
       title="Measured risk"
-      subtitle={`Exact percentages for ${report.horizon}; unavailable measures remain unavailable.`}
+      subtitle={`Risk estimates over ${report.horizon}.`}
     >
       <div className="space-y-3">
         {report.measures.map((measure) => (

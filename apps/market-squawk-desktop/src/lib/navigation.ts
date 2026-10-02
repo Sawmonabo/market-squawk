@@ -63,7 +63,7 @@ export const everydayNavigation: NavigationItem[] = [
 
 export const paperExecutionNavigation: NavigationItem[] = [
   {
-    label: "Paper Execution",
+    label: "Paper Trading",
     path: "/paper-execution",
     icon: FileTerminal,
     capabilities: ["execution_orders", "bot_status"],
@@ -128,7 +128,7 @@ const everydaySection: NavigationSection = {
 
 export const navigationSections: NavigationSection[] = [
   everydaySection,
-  { label: "Simulated execution", items: paperExecutionNavigation },
+  { label: "Paper trading", items: paperExecutionNavigation },
   { label: "Advanced", items: advancedNavigation },
   { label: "Connections & System", items: connectionsSystemNavigation },
 ]

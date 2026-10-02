@@ -54,9 +54,9 @@ export function actionLabel(action: McpClientAction) {
     case "reconnect":
       return "Reconnect"
     case "verify":
-      return "Verify connection"
+      return "Check connection"
     case "repair":
-      return "Repair owned entry"
+      return "Repair connection"
     case "rotateCredential":
       return "Rotate credential"
     case "revokeCredential":
@@ -72,19 +72,19 @@ export function actionDescription(
 ) {
   switch (action) {
     case "connect":
-      return `Create one user-level Market Squawk entry in ${clientLabel} through its supported command interface.`
+      return `Add a Market Squawk connection to ${clientLabel} for your user account.`
     case "reconnect":
-      return `Re-enable ${clientLabel}'s current protected service credential and restore its owned entry.`
+      return `Restore access for ${clientLabel} and its Market Squawk connection.`
     case "verify":
-      return `Initialize a real ${clientLabel} relay session, discover capabilities, and perform one bounded safe read.`
+      return `Check that ${clientLabel} can connect and read workspace information.`
     case "repair":
-      return `Restore only the ${clientLabel} entry proven by Market Squawk's owned receipt.`
+      return `Repair the connection created by Market Squawk in ${clientLabel}.`
     case "rotateCredential":
-      return `Replace ${clientLabel}'s protected service credential, revoke its prior generation, and update the owned receipt.`
+      return `Create a new credential for ${clientLabel}. Its previous credential will stop working.`
     case "revokeCredential":
-      return `Revoke ${clientLabel}'s current service access while retaining its owned entry for an explicit reconnect.`
+      return `Stop ${clientLabel} from accessing the workspace. Keep its configuration so you can reconnect later.`
     case "disconnect":
-      return `Remove only the ${clientLabel} entry proven by Market Squawk's owned receipt, then refresh its access state.`
+      return `Remove the connection created by Market Squawk in ${clientLabel}, then check its access status.`
   }
 }
 
@@ -97,7 +97,7 @@ export function statePresentation(state: McpClientState): {
     case "absent":
       return {
         label: "Not detected",
-        detail: "This client is not installed in a controlled discovery location.",
+        detail: "This client was not found in the supported installation locations.",
         tone: "muted",
       }
     case "unsupported":
@@ -109,31 +109,31 @@ export function statePresentation(state: McpClientState): {
     case "ready":
       return {
         label: "Ready to connect",
-        detail: "The supported client is installed and has no Market Squawk entry.",
+        detail: "This client is installed and ready to connect.",
         tone: "ready",
       }
     case "owned":
       return {
         label: "Connected",
-        detail: "The exact client entry matches Market Squawk's owned receipt.",
+        detail: "The Market Squawk connection is configured.",
         tone: "ready",
       }
     case "repair_required":
       return {
         label: "Repair required",
-        detail: "The owned entry belongs to an earlier service or credential identity.",
+        detail: "The connection configuration needs updating.",
         tone: "attention",
       }
     case "access_revoked":
       return {
         label: "Access revoked",
-        detail: "The shared service rejects this owned client until reconnect is confirmed.",
+        detail: "This client cannot access the workspace until you reconnect it.",
         tone: "attention",
       }
     case "conflict":
       return {
         label: "Name conflict",
-        detail: "A same-name entry is present but is not proven to be owned by Market Squawk.",
+        detail: "A connection with this name already exists. Market Squawk cannot replace it because it did not create it.",
         tone: "attention",
       }
   }
