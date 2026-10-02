@@ -79,8 +79,8 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
               : comparison?.comparisonDescription
                 ?? "Comparison choices are unavailable. Analysis can still start; missing comparison evidence will be reported."}
       </p>
-      <Button type="button" variant="link" size="sm" disabled={options.isFetching || launch.isPending}
-        onClick={() => void options.refetch()}>{options.isError ? "Retry comparisons" : "Refresh comparisons"}</Button>
+      {options.isError ? <Button type="button" variant="link" size="sm" disabled={options.isFetching || launch.isPending}
+        onClick={() => void options.refetch()}>Retry comparisons</Button> : null}
     </div>
     <Button type="button" disabled={!available || launch.isPending}
       onClick={() => launch.mutate()}>

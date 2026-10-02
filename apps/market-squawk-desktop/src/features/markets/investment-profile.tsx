@@ -31,7 +31,6 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment profile">
     <div className="flex items-center justify-between gap-3">
       <h2 className="text-base font-semibold">Profile</h2>
-      <Button variant="outline" size="sm" disabled={profile.isFetching} onClick={() => void profile.refetch()}>Refresh profile</Button>
     </div>
     <div className="mt-1 min-h-5 text-xs leading-5">
     {profile.isError ? <div className="flex items-start justify-between gap-2">
@@ -99,5 +98,5 @@ function profileAvailability(result: Exclude<InvestmentProfileResult, { state: "
   }
   return result.reason === "reference_not_configured"
     ? "Profile information is unavailable. Review your connections in Settings."
-    : "Profile information could not be checked right now. Try refreshing the profile."
+    : "Profile information could not be checked right now. Use the refresh icon to try again."
 }

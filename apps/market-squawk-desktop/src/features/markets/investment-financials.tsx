@@ -27,6 +27,7 @@ import {
 } from "./investment-financials-schema"
 
 type FinancialProps = {
+  refreshRevision?: number
   selectionToken: string
   bootstrap: DesktopBootstrap
   transport: ProductTransport
@@ -79,7 +80,7 @@ function SelectedFinancials(props: FinancialProps) {
   </section>
 }
 
-function FinancialSectionRead({ selectionToken, section, bootstrap, transport, preparedRevision, preparationCompleted }: FinancialProps & {
+function FinancialSectionRead({ selectionToken, section, bootstrap, transport, preparedRevision, preparationCompleted, refreshRevision = 0 }: FinancialProps & {
   section: InvestmentFinancialSection
   preparedRevision: number
   preparationCompleted: boolean
@@ -178,6 +179,12 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     if (navigation.page === 1) void refresh()
     else setUpdateAvailable(true)
   }, [preparedRevision, navigation.page, refresh])
+  const seenRefresh = React.useRef(refreshRevision)
+  React.useEffect(() => {
+    if (seenRefresh.current === refreshRevision) return
+    seenRefresh.current = refreshRevision
+    void refresh()
+  }, [refreshRevision, refresh])
   const result = page.data ?? lastChecked.current
   const busy = page.isFetching || releasing
   const showingPrior = page.isPlaceholderData || page.isError || releasing
@@ -186,13 +193,12 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
   return <section aria-label={sectionLabels[section]}>
     <div className="flex items-start justify-between gap-4">
       <h3 className="text-base font-semibold">{sectionLabels[section]}</h3>
-      <Button variant="outline" size="sm" disabled={busy} onClick={() => void refresh()}>Refresh this section</Button>
     </div>
     <div className="mt-2 min-h-16 text-xs leading-5">
     {updateAvailable ? <p role="status" className="text-muted-foreground">{preparationCompleted
-      ? "Updated financial information is ready. Refresh this section to open it."
-      : "Financial preparation ended. Refresh this section to check for saved information."}</p> : null}
-    {releaseFailed ? <p role="alert" className="text-destructive">The previous financial information could not be released. Try refreshing this section.</p>
+      ? "Updated financial information is ready. Use the refresh icon to open it."
+      : "Financial preparation ended. Use the refresh icon to check saved information."}</p> : null}
+    {releaseFailed ? <p role="alert" className="text-destructive">The previous financial information could not be released. Use the refresh icon to try again.</p>
       : page.isError ? <div className="flex items-start justify-between gap-3">
       <p role="alert" className="text-destructive">{result
         ? "This financial information could not be updated. Showing the last checked page; its currentness has not been verified."
@@ -218,35 +224,75 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
 }
 
 function FinancialItems({ result }: { result: InvestmentFinancialsResult }) {
+  if (result.items.length === 0) return null
   switch (result.section) {
-    case "facts": return <div className="mt-4 divide-y divide-border">{result.items.map((fact, index) => <FinancialFact key={index} fact={fact} />)}</div>
-    case "statements": return <div className="mt-4 divide-y divide-border">{result.items.map((statement, index) => <FinancialStatement key={index} statement={statement} />)}</div>
-    case "ratios": return <div className="mt-4 divide-y divide-border">{result.items.map((ratio, index) => <FinancialRatio key={index} ratio={ratio} />)}</div>
+    case "facts": return <div className="mt-4"><FinancialFactsTable facts={result.items} caption="Reported financial facts on this page" /></div>
+    case "statements": return <div className="mt-4 space-y-5">{result.items.map((statement, index) => <FinancialStatement key={index} statement={statement} />)}</div>
+    case "ratios": return <div className="mt-4"><FinancialTable caption="Financial ratios on this page" firstColumn="Financial ratio">
+      {result.items.map((ratio, index) => <FinancialRatio key={index} ratio={ratio} />)}
+    </FinancialTable></div>
     case "filings": return <div className="mt-4 divide-y divide-border">{result.items.map((filing, index) => <FinancialFiling key={index} filing={filing} />)}</div>
   }
 }
 
+function FinancialTable({ caption, firstColumn, children }: { caption: string; firstColumn: string; children: React.ReactNode }) {
+  return <div className="overflow-x-auto rounded-md border border-border focus-visible:outline-2 focus-visible:outline-ring" role="region" aria-label={caption} tabIndex={0}>
+    <table className="w-full text-left text-xs">
+      <caption className="sr-only">{caption}</caption>
+      <thead className="border-b border-border bg-muted/30 text-muted-foreground">
+        <tr>
+          <th scope="col" className="px-3 py-2 font-medium">{firstColumn}</th>
+          <th scope="col" className="px-3 py-2 text-right font-medium">Reported value</th>
+          <th scope="col" className="px-3 py-2 font-medium">Reporting period</th>
+          <th scope="col" className="px-3 py-2 font-medium">Reporting context</th>
+        </tr>
+      </thead>
+      <tbody className="divide-y divide-border">{children}</tbody>
+    </table>
+  </div>
+}
+
+function FinancialFactsTable({ facts, caption }: { facts: InvestmentFinancialFact[]; caption: string }) {
+  return <FinancialTable caption={caption} firstColumn="Financial fact">
+    {facts.map((fact, index) => <FinancialFact key={index} fact={fact} />)}
+  </FinancialTable>
+}
+
 function FinancialFact({ fact }: { fact: InvestmentFinancialFact }) {
-  return <article className="py-4">
-    <div className="flex flex-wrap items-baseline justify-between gap-2">
-      <h4 className="text-sm font-medium">{fact.displayName}</h4>
-      <p className="break-words font-mono text-sm">{fact.unit.kind === "shares" ? `${groupDecimal(fact.value)} shares`
-        : `${formatMoney({ amount: fact.value, currency: fact.unit.currency })}${fact.unit.kind === "currency_per_share" ? " per share" : ""}`}</p>
-    </div>
-    <p className="mt-2 text-xs text-muted-foreground"><FinancialPeriod period={fact.period} /> · {revisionLabel(fact.revision)} · {fact.scope === "company_wide" ? "Company-wide report" : "Individual filing detail"}</p>
-    <details className="mt-3 border-t border-border pt-2">
-      <summary className="cursor-pointer text-xs focus-visible:outline-ring">Reporting context and dates</summary>
-      <FinancialEnvelope envelope={fact} />
-    </details>
-  </article>
+  return <tr className="align-top">
+    <th scope="row" className="min-w-[180px] px-3 py-3 text-sm font-medium">
+      {fact.displayName}
+      <p className="mt-1 text-xs font-normal text-muted-foreground">{fact.scope === "company_wide" ? "Company-wide report" : "Individual filing detail"}</p>
+    </th>
+    <td className="whitespace-nowrap px-3 py-3 text-right font-mono text-sm tabular-nums"><FinancialFactValue fact={fact} /></td>
+    <td className="min-w-[180px] px-3 py-3 leading-5"><FinancialPeriod period={fact.period} /></td>
+    <td className="min-w-[200px] px-3 py-3">
+      <p className="text-muted-foreground">{revisionLabel(fact.revision)}</p>
+      <details className="mt-2">
+        <summary className="cursor-pointer focus-visible:outline-ring">Reporting context and dates</summary>
+        <FinancialEnvelope envelope={fact} />
+      </details>
+    </td>
+  </tr>
+}
+
+function FinancialFactValue({ fact }: { fact: InvestmentFinancialFact }) {
+  return <>{fact.unit.kind === "shares" ? `${groupDecimal(fact.value)} shares`
+    : `${formatMoney({ amount: fact.value, currency: fact.unit.currency })}${fact.unit.kind === "currency_per_share" ? " per share" : ""}`}</>
 }
 
 function FinancialStatement({ statement }: { statement: InvestmentFinancialStatement }) {
   const labels = { financial_position: "Financial position", operations: "Income and operations", cash_flows: "Cash flows", share_data: "Share information" }
-  return <article className="py-4">
-    <h4 className="text-sm font-semibold">{labels[statement.statement]}</h4>
-    <FinancialEnvelope envelope={statement.envelope} />
-    <div className="mt-3 divide-y divide-border">{statement.items.map((fact, index) => <FinancialFact key={index} fact={fact} />)}</div>
+  return <article>
+    <div className="flex flex-wrap items-baseline justify-between gap-2">
+      <h4 className="text-sm font-semibold">{labels[statement.statement]}</h4>
+      <p className="text-xs text-muted-foreground"><FinancialPeriod period={statement.envelope.period} /></p>
+    </div>
+    <details className="mb-3 mt-2 text-xs">
+      <summary className="cursor-pointer text-muted-foreground focus-visible:outline-ring">Statement reporting context and dates</summary>
+      <FinancialEnvelope envelope={statement.envelope} />
+    </details>
+    <FinancialFactsTable facts={statement.items} caption={`${labels[statement.statement]} reported values`} />
   </article>
 }
 
@@ -256,22 +302,39 @@ function FinancialRatio({ ratio }: { ratio: InvestmentFinancialRatio }) {
     conflicting_input: "The reported values conflict.", incompatible_units: "The reported values use incompatible units.",
     zero_denominator: "The comparison value is zero, so this ratio cannot be calculated.", unavailable: "This ratio is unavailable.",
   }
-  return <article className="py-4">
-    <div className="flex flex-wrap items-baseline justify-between gap-2">
-      <h4 className="text-sm font-medium">{ratio.displayName}</h4>
-      <p className="font-mono text-sm">{ratio.value === null ? "Unavailable" : `${groupDecimal(ratio.value)} ratio`}</p>
-    </div>
-    {ratio.state !== "reported" ? <p className="mt-2 text-xs text-muted-foreground">{reasons[ratio.state]}</p> : null}
-    {ratio.envelope ? <FinancialEnvelope envelope={ratio.envelope} /> : <p className="mt-2 text-xs text-muted-foreground">A reporting period is not available.</p>}
-    <details className="mt-3 border-t border-border pt-2">
-      <summary className="cursor-pointer text-xs focus-visible:outline-ring">Reported values used for this ratio</summary>
-      {ratio.inputs.length === 0 ? <p className="mt-2 text-xs text-muted-foreground">No supporting reported values are available.</p>
-        : <div className="mt-3 space-y-3">{ratio.inputs.map((input, index) => <div key={index}>
-          <p className="mb-1 text-xs text-muted-foreground">{input.role === "numerator" ? "Amount being compared (numerator)" : "Comparison amount (denominator)"}</p>
-          <FinancialFact fact={input.fact} />
-        </div>)}</div>}
+  return <tr className="align-top">
+    <th scope="row" className="min-w-[180px] px-3 py-3 text-sm font-medium">{ratio.displayName}</th>
+    <td className="px-3 py-3 text-right">
+      <p className="whitespace-nowrap font-mono text-sm tabular-nums">{ratio.value === null ? "Unavailable" : `${groupDecimal(ratio.value)} ratio`}</p>
+      {ratio.state !== "reported" ? <p className="mt-1 text-xs text-muted-foreground">{reasons[ratio.state]}</p> : null}
+    </td>
+    <td className="min-w-[180px] px-3 py-3 leading-5">{ratio.envelope ? <FinancialPeriod period={ratio.envelope.period} /> : "A reporting period is not available."}</td>
+    <td className="min-w-[200px] px-3 py-3">
+      {ratio.envelope ? <details>
+        <summary className="cursor-pointer focus-visible:outline-ring">Reporting context and dates</summary>
+        <FinancialEnvelope envelope={ratio.envelope} />
+      </details> : null}
+      <details className="mt-2">
+        <summary className="cursor-pointer focus-visible:outline-ring">Reported values used for this ratio</summary>
+        {ratio.inputs.length === 0 ? <p className="mt-2 text-muted-foreground">No supporting reported values are available.</p>
+          : <div className="mt-3 space-y-3">{ratio.inputs.map((input, index) => <FinancialRatioInput key={index} input={input} />)}</div>}
+      </details>
+    </td>
+  </tr>
+}
+
+function FinancialRatioInput({ input }: { input: InvestmentFinancialRatio["inputs"][number] }) {
+  return <div className="space-y-1 border-t border-border pt-2">
+    <p className="text-muted-foreground">{input.role === "numerator" ? "Amount being compared (numerator)" : "Comparison amount (denominator)"}</p>
+    <p className="font-medium">{input.fact.displayName}</p>
+    <p className="break-words font-mono tabular-nums"><FinancialFactValue fact={input.fact} /></p>
+    <p><FinancialPeriod period={input.fact.period} /></p>
+    <p className="text-muted-foreground">{revisionLabel(input.fact.revision)} · {input.fact.scope === "company_wide" ? "Company-wide report" : "Individual filing detail"}</p>
+    <details className="pt-1">
+      <summary className="cursor-pointer focus-visible:outline-ring">Reporting context and dates</summary>
+      <FinancialEnvelope envelope={input.fact} />
     </details>
-  </article>
+  </div>
 }
 
 function FinancialFiling({ filing }: { filing: InvestmentFinancialFiling }) {
@@ -342,7 +405,7 @@ function sectionAvailability(state: InvestmentFinancialsResult["state"]): string
     case "missing": return "No reported information is available for this section at the information date."
     case "conflict": return "Conflicting evidence prevents this section from being established."
     case "unavailable": return "This financial section is unavailable with the current evidence."
-    case "expired": return "This information is no longer open. Refresh this section to read current saved information."
+    case "expired": return "This information is no longer open. Use the refresh icon to read current saved information."
   }
 }
 
@@ -366,7 +429,7 @@ function FinancialLimitations({ result }: { result: InvestmentFinancialsResult }
   const labels = {
     some_reported_facts_not_supported: "Some reported facts cannot be shown with their available context.",
     item_exceeds_response_limit: "Some information is too large for this page and has not been shown.",
-    read_expired: "Refresh this section to open fresh information.",
+    read_expired: "Use the refresh icon to open fresh information.",
   }
   if (result.omittedItems === 0 && result.limitations.length === 0) return null
   return <div className="mt-3 space-y-1 text-xs text-muted-foreground">

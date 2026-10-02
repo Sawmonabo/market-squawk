@@ -1,5 +1,6 @@
 import { useState } from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, useQueryClient, useIsFetching } from "@tanstack/react-query"
+import { RefreshCw } from "lucide-react"
 import { Link, useParams } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
@@ -37,6 +38,19 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   transport: ProductTransport
 }) {
   const [showHistory, setShowHistory] = useState(true)
+  const [refreshRevision, setRefreshRevision] = useState(0)
+  const queryClient = useQueryClient()
+  const refresh = () => {
+    setRefreshRevision((value) => value + 1)
+    void queryClient.refetchQueries({ type: "active", predicate: (query) => {
+      const key = query.queryKey
+      const input = key[5] as { selectionToken?: string } | undefined
+      return key[1] === bootstrap.productSessionToken
+        && ((["Market.GetInstrument", "Research.GetInvestmentProfile"].includes(String(key[4]))
+          && input?.selectionToken === selectionToken)
+          || key[4] === "Desktop.AnalyticalProfiles")
+    } })
+  }
   const detail = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetInstrument", { selectionToken }),
     gcTime: 0,
@@ -48,6 +62,13 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
       return parseMarketInstrumentResult(result, selectionToken)
     },
   })
+  const pageReads = useIsFetching({ predicate: (query) => {
+    const key = query.queryKey
+    if (key[1] !== bootstrap.productSessionToken) return false
+    const input = key[5] as { selectionToken?: string; historyToken?: string } | undefined
+    return input?.selectionToken === selectionToken
+      || (input?.historyToken !== undefined && input.historyToken === detail.data?.historyToken)
+  } })
   const row = detail.data ?? null
   const title = row === null ? "Investment" : [row.identity.symbol, row.identity.name]
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
@@ -70,7 +91,10 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
           <div className="flex flex-wrap items-center gap-3 sm:justify-end">
             <h2 className="sr-only">Price</h2>
             <p className="font-mono text-2xl tabular-nums">{row?.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
-            <Button variant="outline" size="sm" disabled={detail.isFetching} onClick={() => void detail.refetch()}>Refresh price</Button>
+            <Button variant="ghost" size="icon-sm" className="size-7 text-muted-foreground/60 hover:text-foreground"
+              aria-label="Refresh investment" title="Refresh investment" disabled={pageReads > 0} onClick={refresh}>
+              <RefreshCw className={`size-3.5 ${pageReads > 0 ? "animate-spin" : ""}`} aria-hidden="true" />
+            </Button>
           </div>
           <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row?.changePercent !== null && row?.changePercent !== undefined ? ` · ${row.changePercent}%` : ""}</p>
           <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : "Availability not established"}</p>
@@ -91,7 +115,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
           <Button variant="ghost" size="sm" onClick={() => setShowHistory((shown) => !shown)}>{showHistory ? "Hide price history" : "Show price history"}</Button>
         </div>
         {showHistory ? row?.historyToken ? <MarketHistoryRead key={`${bootstrap.productSessionToken}:${row.historyToken}`}
-          historyToken={row.historyToken} bootstrap={bootstrap} transport={transport} />
+          historyToken={row.historyToken} bootstrap={bootstrap} transport={transport} refreshRevision={refreshRevision} />
           : <div className="mt-3 flex min-h-[640px] items-center justify-center text-sm text-muted-foreground">
             <p role="status">{detail.isFetching && row === null ? "Checking available price history…" : "Price history is unavailable for this investment."}</p>
           </div> : <p className="mt-3 text-xs text-muted-foreground">Price history is hidden. Show it to reopen the chart.</p>}
@@ -104,7 +128,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
         </section>
       </aside>
     </div>
-    <InvestmentFinancials selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
+    <InvestmentFinancials selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} refreshRevision={refreshRevision} />
   </main>
 }
 

@@ -12,7 +12,8 @@ import { parseMarketHistoryResult, sourceInstantUnixNanos, type MarketHistoryBar
 
 const queryPolicy = { retry: false, refetchOnWindowFocus: false } as const
 
-export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
+export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshRevision = 0 }: {
+  refreshRevision?: number
   historyToken: string
   bootstrap: DesktopBootstrap
   transport: ProductTransport
@@ -50,7 +51,7 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
     },
     ...queryPolicy,
   })
-  const reset = async () => {
+  const reset = React.useCallback(async () => {
     setRefreshing(true)
     epoch.current += 1
     await queryClient.cancelQueries({ queryKey, exact: true })
@@ -59,7 +60,13 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
     setSelectedBar(null)
     setRevision((current) => current + 1)
     setRefreshing(false)
-  }
+  }, [queryClient, queryKey])
+  const seenRefresh = React.useRef(refreshRevision)
+  React.useEffect(() => {
+    if (seenRefresh.current === refreshRevision) return
+    seenRefresh.current = refreshRevision
+    void reset()
+  }, [refreshRevision, reset])
   const result = history.data ?? lastChecked.current
   const busy = history.isFetching || refreshing
   return <div className="mt-3 min-h-[640px]">
@@ -71,13 +78,12 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport }: {
     <div className="mt-4 flex flex-wrap items-start justify-between gap-3 border-t border-border pt-3">
       <HistoryPreparation historyToken={historyToken} bootstrap={bootstrap} transport={transport}
         hasSavedHistory={Boolean(result?.data)} onPrepared={reset} />
-      <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void reset()}>Refresh saved history</Button>
     </div>
     <div className="mt-2 min-h-10 text-xs leading-5">
       {history.isError ? <div className="flex items-start justify-between gap-3">
         <p role="alert" className="text-destructive">{result?.data
           ? "Price history could not be updated. Showing the last checked price window; its currentness has not been verified."
-          : "Price history could not be loaded. Refresh saved history to try again."}</p>
+          : "Price history could not be loaded. Try again."}</p>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void history.refetch()}>Retry</Button>
       </div> : busy ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating the requested price window… Showing the last checked prices." : "Loading the requested price window…"}</p> : null}
     </div>

@@ -816,7 +816,7 @@ describe("Market Squawk desktop boundary", () => {
     const profile = within(screen.getByRole("region", { name: "Investment profile" }))
     expect(await profile.findByText("XNAS")).toBeTruthy()
     wrongProfileSelection = true
-    await userEvent.setup().click(profile.getByRole("button", { name: "Refresh profile" }))
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
     expect((await profile.findByRole("alert")).textContent).toContain("The profile could not be refreshed")
     expect(profile.getByText("XNAS")).toBeTruthy()
     expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
@@ -832,7 +832,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(await facts.findByText("USD 123,456.78")).toBeTruthy()
     expect(issuedQueries).toContainEqual({ query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32, cursor: "financial-first" })
     financialMode = "mismatch"
-    await userEvent.setup().click(facts.getByRole("button", { name: "Refresh this section" }))
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
     expect((await facts.findByRole("alert")).textContent).toContain("could not be updated")
     expect(facts.getByText("USD 123,456.78")).toBeTruthy()
     expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
@@ -903,13 +903,13 @@ describe("Market Squawk desktop boundary", () => {
     financialVersion = 1
     financialPreparationState = "completed"
     await act(async () => { publishFinancialJob() })
-    await preparedFacts.findByText("Updated financial information is ready. Refresh this section to open it.")
+    await preparedFacts.findByText("Updated financial information is ready. Use the refresh icon to open it.")
     expect(preparedFacts.getByText("USD 234,567.89")).toBeTruthy()
     expect(preparedFacts.getByText("Page 2")).toBeTruthy()
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(pagedReads)
     financialMode = "pending"
     financialSignal = undefined
-    await userEvent.setup().click(preparedFacts.getByRole("button", { name: "Refresh this section" }))
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
     await waitFor(() => expect(financialSignal).toBeDefined())
     expect(preparedFacts.getByText("USD 234,567.89")).toBeTruthy()
     financialMode = "available"
@@ -1218,11 +1218,9 @@ describe("Market Squawk desktop boundary", () => {
     ])
     expect(screen.getAllByText("68001.123456789 USD").length).toBeGreaterThan(0)
     const historyWindow = screen.getByLabelText("History window")
-    const independentReads = issuedQueries.filter((request) => request.query === "marketHistory" || request.query === "investmentProfile").length
-    await user.click(screen.getByRole("button", { name: "Refresh price" }))
-    await waitFor(() => expect((screen.getByRole("button", { name: "Refresh price" }) as HTMLButtonElement).disabled).toBe(false))
+    expect(screen.getByRole("button", { name: "Refresh investment" }).textContent).toBe("")
+    expect(screen.queryByRole("button", { name: /Refresh (price|profile|saved history|this section)/ })).toBeNull()
     expect(screen.getByLabelText("History window")).toBe(historyWindow)
-    expect(issuedQueries.filter((request) => request.query === "marketHistory" || request.query === "investmentProfile")).toHaveLength(independentReads)
     await user.selectOptions(screen.getByLabelText("History window"), "30")
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
       { query: "marketHistory", historyToken, pointLimit: 512 },
@@ -1238,7 +1236,7 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(screen.getByRole("button", { name: "Show price history" }))
     await screen.findByLabelText("History window")
     expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
-    await user.click(screen.getByRole("button", { name: "Refresh saved history" }))
+    await user.click(screen.getByRole("button", { name: "Refresh investment" }))
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(4))
     expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
 
