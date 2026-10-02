@@ -138,22 +138,21 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
 function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverified: boolean }) {
   const quote = row.quote
   const price = (value: string | null) => value === null || quote === null ? "Unavailable" : formatMoney({ amount: value, currency: quote.currency })
-  const size = (value: string | null, sourceUnits = false) => value === null ? "Unavailable"
-    : `${groupDecimal(value)}${sourceUnits ? " (unit unconfirmed)" : ""}`
+  const size = (value: string | null) => value === null ? "Unavailable" : groupDecimal(value)
   return <section className="border-t border-border pt-3" aria-label="Quote and last trade">
     <h2 className="sr-only">Quote and last trade</h2>
     {quote === null ? <p className="text-sm text-muted-foreground">Bid, ask and trade information is not available for this investment yet.</p> : <>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
         {([
-          ["Bid", price(quote.bidPrice), "Bid size", size(quote.bidSize, quote.quoteSizeBasis === "source_units")],
-          ["Ask", price(quote.askPrice), "Ask size", size(quote.askSize, quote.quoteSizeBasis === "source_units")],
+          ["Bid", price(quote.bidPrice), "Bid size", size(quote.bidSize)],
+          ["Ask", price(quote.askPrice), "Ask size", size(quote.askSize)],
           ["Midpoint", price(quote.midPrice), null, null],
           ["Last trade", price(quote.lastPrice), "Trade size", size(quote.lastSize)],
         ] as const).map(([label, value, sizeLabel, sizeValue]) => <div key={label} className="min-w-0">
           <dt className="text-xs text-muted-foreground">{label}</dt>
           <dd className="mt-1 break-words font-mono text-sm tabular-nums">{value}</dd>
           {sizeLabel !== null ? <>
-            <dt className="mt-1 mr-2 inline-block text-xs text-muted-foreground">{sizeLabel}</dt>
+            <dt className="mt-1 mr-2 inline-block text-xs text-muted-foreground">{sizeLabel}</dt>{" "}
             <dd className="inline break-words font-mono text-xs tabular-nums">{sizeValue}</dd>
           </> : null}
         </div>)}

@@ -2,6 +2,13 @@
 
 ## Current execution — 2026-10-02
 
+Owner correction: ordinary bid/ask size labels must not expose engineering copy such as
+“unit unconfirmed.” Removed that suffix and fixed text spacing; native HMR now shows
+“Bid size 40,” “Ask size 40,” and “Trade size 4” (`msft-quote-clean-copy.json`).
+Original reported values and internal unit provenance/authority are unchanged. No new tests or
+Rust rebuild were needed for this copy-only correction. Filing preparation remains running at
+sequence3; no completion claim or duplicate retry.
+
 Native market correction is live verified after the supervised restart to generation `Dxbarz`
 (service26909, Desktop26961). MSFT now exposes original last trade 517.13 USD, size4, and both
 supplied quote sizes40 with unit uncertainty, retaining their independent Oct2 source timestamps.
