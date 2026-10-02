@@ -343,7 +343,6 @@ impl FinancialPeriodRowReference {
         let identifiers = [
             Some(context.unit()),
             Some(context.accession()),
-            context.filing_form(),
             context.frame(),
             context.fiscal_period(),
             context.xbrl_context_id(),
@@ -356,12 +355,12 @@ impl FinancialPeriodRowReference {
                 } => Some(source_status),
             },
         ];
-        identifiers
-            .into_iter()
-            .flatten()
-            .fold(0_usize, |bytes, value| {
-                bytes.saturating_add(value.retained_bytes())
-            })
+        identifiers.into_iter().flatten().fold(
+            context
+                .filing_form()
+                .map_or(0, |form| form.retained_bytes()),
+            |bytes, value| bytes.saturating_add(value.retained_bytes()),
+        )
     }
     pub const fn row_ordinal(&self) -> u32 {
         self.row_ordinal

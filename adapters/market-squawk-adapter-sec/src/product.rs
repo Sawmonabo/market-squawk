@@ -6,8 +6,8 @@
 use std::fmt::Write as _;
 
 use market_squawk_domain::{
-    CalendarDate, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
-    Timestamp,
+    CalendarDate, DigestAlgorithm, EvidenceDigest, FilingForm, MetadataRevision, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -95,7 +95,7 @@ pub struct SecFilingXbrlCoordinates {
     cik: String,
     accession: SourceIdentifier,
     document: SourceIdentifier,
-    filing_form: SourceIdentifier,
+    filing_form: FilingForm,
     filed_on: CalendarDate,
     report_date: Option<CalendarDate>,
     filing_size_bytes: Option<u64>,
@@ -253,7 +253,7 @@ impl SecFilingXbrlCoordinates {
     }
 
     /// Returns the exact filing form, including an amendment suffix when present.
-    pub const fn filing_form(&self) -> &SourceIdentifier {
+    pub const fn filing_form(&self) -> &FilingForm {
         &self.filing_form
     }
 

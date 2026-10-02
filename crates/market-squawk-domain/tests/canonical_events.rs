@@ -6,7 +6,7 @@ use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
     BookDeltaEvent, BookLevel, BookSnapshotEvent, CalendarDate, CompanyObservationSubject,
     CorporateActionEvent, CorporateActionKind, CorporateActionObservation, CoverageStatus,
-    Currency, DataQuality, DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest,
+    Currency, DataQuality, DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest, FilingForm,
     FilingObservation, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
     FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
     FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
@@ -361,10 +361,46 @@ fn canonical_research_family_has_non_marker_payloads() -> Result<(), Box<dyn Err
     let filing = ResearchObservation::Filing(FilingObservation::new(
         research_context(false)?,
         CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
-        SourceIdentifier::try_from("10-K")?,
+        FilingForm::try_from("SCHEDULE 13G/A")?,
         SourceIdentifier::try_from("0000320193-26-000001")?,
     )?);
     let (fundamental_context, fact_context) = fundamental_fixture()?;
+    let mut context_wire = serde_json::to_value(&fact_context)?;
+    context_wire["filing_form"] = serde_json::json!("SC 13G/A");
+    context_wire["amendment_status"] = serde_json::json!("amendment");
+    let fact_context: FundamentalFactContext = serde_json::from_value(context_wire.clone())?;
+    assert_eq!(
+        fact_context.filing_form().map(FilingForm::as_str),
+        Some("SC 13G/A")
+    );
+    let filing_wire = serde_json::to_value(&filing)?;
+    for invalid in ["", " ", " SC 13G", "SC 13G ", "SC\t13G", "SC 13G\n"] {
+        assert!(FilingForm::try_from(invalid).is_err());
+        assert!(serde_json::from_value::<FilingForm>(serde_json::json!(invalid)).is_err());
+        let mut invalid_context = context_wire.clone();
+        invalid_context["filing_form"] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<FundamentalFactContext>(invalid_context).is_err());
+        let mut invalid_filing = filing_wire.clone();
+        invalid_filing["payload"]["form_type"] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<ResearchObservation>(invalid_filing).is_err());
+    }
+    let longest = "X".repeat(FilingForm::MAX_LENGTH);
+    let bounded_form = FilingForm::try_from(longest.clone())?;
+    assert_eq!(bounded_form.as_str(), longest);
+    assert_eq!(bounded_form.to_string(), longest);
+    assert!(bounded_form.retained_bytes() >= longest.len());
+    assert_eq!(
+        serde_json::to_value(&bounded_form)?,
+        serde_json::json!(longest)
+    );
+    let oversized = "X".repeat(FilingForm::MAX_LENGTH + 1);
+    assert!(FilingForm::try_from(oversized.clone()).is_err());
+    assert!(serde_json::from_value::<FilingForm>(serde_json::json!(oversized)).is_err());
+    assert!(serde_json::from_value::<FilingForm>(serde_json::json!(42)).is_err());
+    assert!(SourceIdentifier::try_from("SCHEDULE 13G").is_err());
+    let mut contradictory = context_wire;
+    contradictory["amendment_status"] = serde_json::json!("original");
+    assert!(serde_json::from_value::<FundamentalFactContext>(contradictory).is_err());
     let fundamental = ResearchObservation::Fundamental(FundamentalObservation::new(
         fundamental_context,
         CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
@@ -497,7 +533,7 @@ fn research_instrument_payloads_reject_missing_identity() -> Result<(), Box<dyn 
         FilingObservation::new(
             research_context(true)?,
             CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
-            SourceIdentifier::try_from("10-K")?,
+            FilingForm::try_from("10-K")?,
             SourceIdentifier::try_from("0000320193-26-000001")?,
         ),
         Err(ResearchError::CompanySubjectMismatch)
@@ -508,7 +544,7 @@ fn research_instrument_payloads_reject_missing_identity() -> Result<(), Box<dyn 
             CompanyObservationSubject::Instrument(InstrumentId::from_str(
                 "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb"
             )?),
-            SourceIdentifier::try_from("10-K")?,
+            FilingForm::try_from("10-K")?,
             SourceIdentifier::try_from("0000320193-26-000001")?,
         ),
         Err(ResearchError::CompanySubjectMismatch)
@@ -683,7 +719,7 @@ fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box
     let filing = FilingObservation::new(
         research_context(false)?,
         CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
-        SourceIdentifier::try_from("10-Q")?,
+        FilingForm::try_from("10-Q")?,
         SourceIdentifier::try_from("accession-1")?,
     )?;
     let (fundamental_context, fact_context) = fundamental_fixture()?;

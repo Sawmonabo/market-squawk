@@ -6,7 +6,7 @@ use std::mem::size_of;
 
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, CompanyObservationSubject, DataQuality, DigestAlgorithm,
-    EvidenceDigest, FilingObservation, FundamentalAmendmentStatus, FundamentalCadence,
+    EvidenceDigest, FilingForm, FilingObservation, FundamentalAmendmentStatus, FundamentalCadence,
     FundamentalConsolidation, FundamentalDimensionContext, FundamentalFactContext,
     FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
     FundamentalRestatementStatus, FundamentalRevisionOrder, MetadataRevision, PayloadHash,
@@ -62,7 +62,7 @@ struct SecFilingXbrlCoordinatesV1<'a> {
     cik: &'a str,
     accession: &'a SourceIdentifier,
     document: &'a SourceIdentifier,
-    filing_form: &'a SourceIdentifier,
+    filing_form: &'a FilingForm,
     filed_on: CalendarDate,
     report_date: Option<CalendarDate>,
     filing_size_bytes: Option<u64>,
@@ -979,7 +979,7 @@ fn same_company_fact_family(left: &CompanyFactOccurrence, right: &CompanyFactOcc
         && left.period() == right.period()
 }
 
-fn amendment_status(form: &SourceIdentifier) -> FundamentalAmendmentStatus {
+fn amendment_status(form: &FilingForm) -> FundamentalAmendmentStatus {
     if form.as_str().ends_with("/A") {
         FundamentalAmendmentStatus::Amendment
     } else {

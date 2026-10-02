@@ -10,8 +10,8 @@ use crate::{
 };
 
 use super::{
-    CorporateActionKind, FundamentalFactContext, PositionSide, QuantityLots, ResearchContext,
-    ResearchError, SourceIdentifier, XbrlFactEvidence, require_instrument,
+    CorporateActionKind, FilingForm, FundamentalFactContext, PositionSide, QuantityLots,
+    ResearchContext, ResearchError, SourceIdentifier, XbrlFactEvidence, require_instrument,
     validate_corporate_action,
 };
 
@@ -64,7 +64,7 @@ impl CompanyObservationSubject {
 pub struct FilingObservation {
     context: ResearchContext,
     subject: CompanyObservationSubject,
-    form_type: SourceIdentifier,
+    form_type: FilingForm,
     accession: SourceIdentifier,
 }
 
@@ -74,7 +74,7 @@ impl FilingObservation {
     pub fn new(
         context: ResearchContext,
         subject: CompanyObservationSubject,
-        form_type: SourceIdentifier,
+        form_type: FilingForm,
         accession: SourceIdentifier,
     ) -> Result<Self, ResearchError> {
         subject.validate_context(&context)?;
@@ -97,7 +97,7 @@ impl FilingObservation {
     }
 
     /// Returns the source-native filing form type.
-    pub const fn form_type(&self) -> &SourceIdentifier {
+    pub const fn form_type(&self) -> &FilingForm {
         &self.form_type
     }
 
@@ -112,7 +112,7 @@ impl FilingObservation {
 struct FilingObservationWire {
     context: ResearchContext,
     subject: CompanyObservationSubject,
-    form_type: SourceIdentifier,
+    form_type: FilingForm,
     accession: SourceIdentifier,
 }
 

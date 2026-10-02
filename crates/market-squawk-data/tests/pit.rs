@@ -12,9 +12,9 @@ use market_squawk_data::{
 use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CompanyObservationSubject,
     CorporateActionKind, CorporateActionObservation, DataQuality, DigestAlgorithm,
-    EffectiveInterval, FilingObservation, FundamentalAmendmentStatus, FundamentalCadence,
-    FundamentalConsolidation, FundamentalDimensionContext, FundamentalFactContext,
-    FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+    EffectiveInterval, FilingForm, FilingObservation, FundamentalAmendmentStatus,
+    FundamentalCadence, FundamentalConsolidation, FundamentalDimensionContext,
+    FundamentalFactContext, FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
     FundamentalRestatementStatus, FundamentalRevisionOrder, InstrumentId, MacroObservation,
     PayloadHash, PayloadReference, PositionObservation, PositionSide, QuantityLots,
     ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
@@ -231,7 +231,7 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
                 base_fact.context().time().clone(),
             )?,
             subject.clone(),
-            SourceIdentifier::try_from("10-K")?,
+            FilingForm::try_from("10-K")?,
             SourceIdentifier::try_from("same-provider-accession")?,
         )?));
         issuer_observations.push(ResearchObservation::Fundamental(
@@ -263,7 +263,7 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
         ResearchObservation::Filing(FilingObservation::new(
             context("filing-record", Some(instrument))?,
             CompanyObservationSubject::Instrument(instrument),
-            SourceIdentifier::try_from("10-K")?,
+            FilingForm::try_from("10-K")?,
             SourceIdentifier::try_from("0000000000-24-000001")?,
         )?),
         base_fundamental,

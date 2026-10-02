@@ -15,9 +15,9 @@ use market_squawk_data::{
     SecResearchReadError, SecResearchReadRequest, SecResearchSelection,
 };
 use market_squawk_domain::{
-    CalendarDate, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, FundamentalPeriod,
-    InstrumentId, ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId,
-    SourceIdentifier, Timestamp,
+    CalendarDate, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, FilingForm,
+    FundamentalPeriod, InstrumentId, ResearchContext, ResearchObservation,
+    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -463,14 +463,14 @@ impl CompanyFundamentalData {
 /// One point-in-time filing event stripped of provider identifiers and raw coordinates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompanyFilingData {
-    form: SourceIdentifier,
+    form: FilingForm,
     effective: ResearchTemporalCoordinate,
     published: Option<ResearchTemporalCoordinate>,
     known_at: Timestamp,
 }
 
 impl CompanyFilingData {
-    pub(crate) const fn form(&self) -> &SourceIdentifier {
+    pub(crate) const fn form(&self) -> &FilingForm {
         &self.form
     }
     pub(crate) const fn effective(&self) -> &ResearchTemporalCoordinate {

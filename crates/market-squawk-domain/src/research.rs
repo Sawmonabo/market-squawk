@@ -21,6 +21,10 @@ pub use corporate_action_source::{
     CorporateActionSourcePayload, CorporateActionSourceQueryContract, CorporateActionSourceScope,
 };
 
+#[path = "research/filing_form.rs"]
+mod filing_form;
+pub use filing_form::{FilingForm, FilingFormError};
+
 #[path = "research/fund_holdings.rs"]
 mod fund_holdings;
 #[path = "research/fund_nav.rs"]

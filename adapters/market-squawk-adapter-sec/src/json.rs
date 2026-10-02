@@ -9,7 +9,7 @@ use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Datelike as _, NaiveDate};
-use market_squawk_domain::{CalendarDate, SourceIdentifier, Timestamp};
+use market_squawk_domain::{CalendarDate, FilingForm, SourceIdentifier, Timestamp};
 use serde::de;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
@@ -201,6 +201,14 @@ pub(crate) fn source_identifier_bounded(
 ) -> Result<SourceIdentifier, SecParserError> {
     admit_string_allocation(value, retained)?;
     SourceIdentifier::try_from(value).map_err(Into::into)
+}
+
+pub(crate) fn filing_form_bounded(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<FilingForm, SecParserError> {
+    admit_string_allocation(value, retained)?;
+    FilingForm::try_from(value).map_err(Into::into)
 }
 
 /// Production parser ceilings applied before canonical construction.
@@ -918,6 +926,7 @@ pub enum SecParserError {
     ConflictingMetadataAssociation,
     Json(serde_json::Error),
     Identity(market_squawk_domain::IdentityError),
+    FilingForm(market_squawk_domain::FilingFormError),
     Time(market_squawk_domain::TimeError),
 }
 
@@ -938,6 +947,12 @@ impl From<serde_json::Error> for SecParserError {
 impl From<market_squawk_domain::IdentityError> for SecParserError {
     fn from(value: market_squawk_domain::IdentityError) -> Self {
         Self::Identity(value)
+    }
+}
+
+impl From<market_squawk_domain::FilingFormError> for SecParserError {
+    fn from(value: market_squawk_domain::FilingFormError) -> Self {
+        Self::FilingForm(value)
     }
 }
 

@@ -34,7 +34,7 @@ pub struct CompanyFactOccurrence {
     source_ordinal: u32,
     value: Decimal,
     accession: SourceIdentifier,
-    form: SourceIdentifier,
+    form: FilingForm,
     filed_on: CalendarDate,
     period: CompanyFactPeriod,
     frame: Option<SourceIdentifier>,
@@ -72,7 +72,7 @@ impl CompanyFactOccurrence {
         self.filed_on
     }
     /// Returns the source filing form, including amendment suffixes.
-    pub const fn form(&self) -> &SourceIdentifier {
+    pub const fn form(&self) -> &FilingForm {
         &self.form
     }
     /// Returns the optional SEC frame identity.
@@ -249,7 +249,7 @@ fn parse_company_fact(
         source_ordinal,
         value,
         accession: super::source_identifier_bounded(required_string(object, "accn")?, retained)?,
-        form: super::source_identifier_bounded(required_string(object, "form")?, retained)?,
+        form: super::filing_form_bounded(required_string(object, "form")?, retained)?,
         filed_on: parse_date(required_string(object, "filed")?)?,
         period: CompanyFactPeriod { start, end },
         frame: optional_string(object, "frame")?

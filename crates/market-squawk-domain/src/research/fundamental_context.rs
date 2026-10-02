@@ -8,7 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{CalendarDate, ResearchContext, RevisionNumber, SchemaVersion, SchemaVersionError};
 
 use super::{
-    MAX_XBRL_DIMENSIONS, SourceIdentifier, XbrlDimensionEvidence, XbrlFactEvidence, XbrlPeriod,
+    FilingForm, MAX_XBRL_DIMENSIONS, SourceIdentifier, XbrlDimensionEvidence, XbrlFactEvidence,
+    XbrlPeriod,
 };
 
 /// Instant or duration semantics reported for one fundamental fact.
@@ -327,7 +328,7 @@ pub struct FundamentalFactContextInput {
     /// Filing accession carrying the fact.
     pub accession: SourceIdentifier,
     /// Exact filing form when supplied.
-    pub filing_form: Option<SourceIdentifier>,
+    pub filing_form: Option<FilingForm>,
     /// Amendment status proven by the filing form, or unavailable.
     pub amendment_status: FundamentalAmendmentStatus,
     /// Exact filing date when supplied.
@@ -360,7 +361,7 @@ pub struct FundamentalFactContext {
     period: FundamentalPeriod,
     unit: SourceIdentifier,
     accession: SourceIdentifier,
-    filing_form: Option<SourceIdentifier>,
+    filing_form: Option<FilingForm>,
     amendment_status: FundamentalAmendmentStatus,
     filed_on: Option<CalendarDate>,
     frame: Option<SourceIdentifier>,
@@ -444,7 +445,7 @@ impl FundamentalFactContext {
     }
 
     /// Returns the exact filing form when supplied.
-    pub const fn filing_form(&self) -> Option<&SourceIdentifier> {
+    pub const fn filing_form(&self) -> Option<&FilingForm> {
         self.filing_form.as_ref()
     }
 
@@ -548,7 +549,7 @@ struct FundamentalFactContextWire {
     period: FundamentalPeriod,
     unit: SourceIdentifier,
     accession: SourceIdentifier,
-    filing_form: RequiredOption<SourceIdentifier>,
+    filing_form: RequiredOption<FilingForm>,
     amendment_status: FundamentalAmendmentStatus,
     filed_on: RequiredOption<CalendarDate>,
     frame: RequiredOption<SourceIdentifier>,

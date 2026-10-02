@@ -8,9 +8,9 @@ use std::io::Read;
 use std::sync::Arc;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, CalendarDate, EvidenceDigest, ExactPayloadEvidence, ResearchObservation,
-    SourceIdentifier, Timestamp, XbrlContextGraph, XbrlDimensionEvidence, XbrlEntity,
-    XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName, XbrlText,
+    AvailabilityEvidence, CalendarDate, EvidenceDigest, ExactPayloadEvidence, FilingForm,
+    ResearchObservation, SourceIdentifier, Timestamp, XbrlContextGraph, XbrlDimensionEvidence,
+    XbrlEntity, XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName, XbrlText,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -37,7 +37,7 @@ impl SecVerifiedFilingXbrl {
     pub const fn document(&self) -> &SourceIdentifier {
         &self.source.filing.document
     }
-    pub const fn filing_form(&self) -> &SourceIdentifier {
+    pub const fn filing_form(&self) -> &FilingForm {
         &self.source.filing.filing_form
     }
     pub const fn filed_on(&self) -> CalendarDate {
@@ -358,7 +358,7 @@ struct FilingCoordinates {
     cik: String,
     accession: SourceIdentifier,
     document: SourceIdentifier,
-    filing_form: SourceIdentifier,
+    filing_form: FilingForm,
     filed_on: CalendarDate,
     report_date: Option<CalendarDate>,
     filing_size_bytes: Option<u64>,

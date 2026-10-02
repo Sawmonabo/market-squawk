@@ -369,7 +369,8 @@ times and must not inherit the outer response time silently.
 **PRESENT:** reuse `ResearchObservation::Filing` and `ResearchObservation::Fundamental`,
 `FilingObservation`, `FundamentalObservation`, `FundamentalContext`, XBRL evidence, exact concept,
 unit, period/context, accession, filing/amendment facts, `ResearchContext`, revisions, and PIT
-selection.
+selection. Filing form labels use `FilingForm`, preserving exact internal spaces and amendment
+suffixes in the existing string representation; identifier whitespace rules do not apply to labels.
 
 **EXTEND:** add typed statement and ratio *derived views* that reference exact fact occurrences,
 context-selection policy, source manifests, and formula/version digests. Do not collapse filings

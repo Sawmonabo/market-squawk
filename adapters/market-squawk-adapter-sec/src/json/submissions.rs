@@ -145,7 +145,7 @@ pub struct SecFiling {
 #[derive(Debug, Eq, PartialEq, Serialize)]
 struct SecFilingInner {
     accession: SourceIdentifier,
-    form: SourceIdentifier,
+    form: FilingForm,
     filed_on: CalendarDate,
     report_date: Option<CalendarDate>,
     accepted_at: Option<Timestamp>,
@@ -161,7 +161,7 @@ impl SecFiling {
         &self.inner.accession
     }
     /// Returns the source form code, including amendment suffixes.
-    pub fn form(&self) -> &SourceIdentifier {
+    pub fn form(&self) -> &FilingForm {
         &self.inner.form
     }
     /// Returns whether the form code denotes an amendment.
@@ -655,7 +655,7 @@ fn parse_filing_columns(
         let filing = SecFiling {
             inner: Arc::new(SecFilingInner {
                 accession,
-                form: SourceIdentifier::try_from(column_string(object, "form", index)?)?,
+                form: FilingForm::try_from(column_string(object, "form", index)?)?,
                 filed_on: parse_date(column_string(object, "filingDate", index)?)?,
                 report_date: nonempty_column_string(object, "reportDate", index)?
                     .map(parse_date)
@@ -917,16 +917,12 @@ pub(crate) fn admit_document_allocations(
 }
 
 fn filing_dynamic_bytes(filing: &SecFiling) -> Result<usize, SecParserError> {
-    [
-        Some(filing.accession()),
-        Some(filing.form()),
-        filing.primary_document(),
-    ]
-    .into_iter()
-    .flatten()
-    .try_fold(0usize, |total, value| {
-        total
-            .checked_add(value.retained_bytes())
-            .ok_or(SecParserError::RetainedOutputLimitExceeded)
-    })
+    [Some(filing.accession()), filing.primary_document()]
+        .into_iter()
+        .flatten()
+        .try_fold(filing.form().retained_bytes(), |total, value| {
+            total
+                .checked_add(value.retained_bytes())
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)
+        })
 }

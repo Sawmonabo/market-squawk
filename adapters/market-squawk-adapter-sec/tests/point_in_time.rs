@@ -6,10 +6,10 @@ use market_squawk_adapter_sec::{
     normalize_company_facts, normalize_filings,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
-    FundamentalPeriod, FundamentalRestatementStatus, PayloadHash, PayloadReference,
-    ResearchObservation, ResearchTemporalCoordinate, ResearchTemporalPrecision, SourceId,
-    SourceIdentifier,
+    AvailabilityEvidence, FilingForm, FundamentalAmendmentStatus, FundamentalCadence,
+    FundamentalConsolidation, FundamentalPeriod, FundamentalRestatementStatus, PayloadHash,
+    PayloadReference, ResearchObservation, ResearchTemporalCoordinate, ResearchTemporalPrecision,
+    SourceId, SourceIdentifier,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -102,20 +102,14 @@ fn issuer_owned_facts_and_filings_preserve_amendments_as_pit_revisions()
                         source.amendment_status(),
                         FundamentalAmendmentStatus::Amendment
                     );
-                    assert_eq!(
-                        source.filing_form().map(SourceIdentifier::as_str),
-                        Some("10-Q/A")
-                    );
+                    assert_eq!(source.filing_form().map(FilingForm::as_str), Some("10-Q/A"));
                     assert!(source.frame().is_none());
                 } else {
                     assert_eq!(
                         source.amendment_status(),
                         FundamentalAmendmentStatus::Original
                     );
-                    assert_eq!(
-                        source.filing_form().map(SourceIdentifier::as_str),
-                        Some("10-Q")
-                    );
+                    assert_eq!(source.filing_form().map(FilingForm::as_str), Some("10-Q"));
                     assert_eq!(
                         source.frame().map(SourceIdentifier::as_str),
                         Some("CY2025Q2I")

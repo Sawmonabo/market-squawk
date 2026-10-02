@@ -1,7 +1,7 @@
 //! Revision-independent exact PIT-v2 observation payloads.
 
 use market_squawk_domain::{
-    CorporateActionKind, DigestAlgorithm, EvidenceDigest, FundamentalFactContext,
+    CorporateActionKind, DigestAlgorithm, EvidenceDigest, FilingForm, FundamentalFactContext,
     MacroMissingValue, PositionSide, QuantityLots, ResearchObservation, SourceIdentifier,
     XbrlFactEvidence,
 };
@@ -28,7 +28,7 @@ pub struct CanonicalObservationPayload {
 impl CanonicalObservationPayload {
     /// Constructs a filing payload from its revision-independent fields.
     pub fn filing(
-        form_type: &SourceIdentifier,
+        form_type: &FilingForm,
         accession: &SourceIdentifier,
     ) -> Result<Self, ObservedRevisionError> {
         Self::encode(&|encoder| {

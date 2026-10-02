@@ -3,8 +3,9 @@ use std::error::Error;
 use cap_std::{ambient_authority, fs::Dir};
 use market_squawk_adapter_sec::{
     CompanyFactsDocument, RawEvidenceStore, RetrievedSubmissions, SecCompositeBounds,
-    SecParserError, SecParserLimits, SubmissionsDocument, reconcile_submissions,
+    SecParserError, SecParserLimits, SubmissionsDocument, normalize_filings, reconcile_submissions,
 };
+use market_squawk_domain::{ResearchObservation, SourceId};
 use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -83,6 +84,73 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
             "primaryDocument":["a10-qq22017412017.htm"]
         }, "files":[]}
     });
+    // One exact retained row for each spaced form in the same official response.
+    let spaced_submissions = serde_json::json!({
+        "cik":"0000320193", "name":"Apple Inc.",
+        "tickers":["AAPL"], "exchanges":["Nasdaq"],
+        "filings":{"recent":{
+            "accessionNumber":[
+                "0002100119-26-000139", "0000102909-26-000630", "0001308179-26-000008",
+                "0001193125-24-036431", "0001193125-22-128361", "0001193125-19-041014",
+                "9999999997-17-000002"
+            ],
+            "form":["SCHEDULE 13G", "SCHEDULE 13G/A", "DEF 14A", "SC 13G/A", "S-8 POS", "SC 13G", "NO ACT"],
+            "filingDate":["2026-04-29", "2026-03-26", "2026-01-08", "2024-02-14", "2022-04-29", "2019-02-14", "2016-12-05"],
+            "reportDate":["", "", "2026-02-24", "", "", "", "2016-10-07"],
+            "acceptanceDateTime":[
+                "2026-04-30T00:40:10.000Z", "2026-03-26T23:43:19.000Z", "2026-01-09T02:31:36.000Z",
+                "2024-02-15T02:47:05.000Z", "2022-04-29T02:59:32.000Z", "2019-02-15T02:42:33.000Z",
+                "2017-01-03T19:49:40.000Z"
+            ],
+            "primaryDocument":[
+                "xslSCHEDULE_13G_X02/primary_doc.xml", "xslSCHEDULE_13G_X02/primary_doc.xml",
+                "aapl014016-def14a.htm", "d751537dsc13ga.htm", "d279200ds8pos.htm",
+                "d667611dsc13g.htm", "9999999997-17-000002.paper"
+            ]
+        }, "files":[]}
+    });
+    let spaced_bytes = serde_json::to_vec(&spaced_submissions)?;
+    let spaced = RetrievedSubmissions::import_exact_bytes(&spaced_bytes, &[], &raw_store, limits)?;
+    let spaced_archive = SubmissionsDocument::parse_archive(
+        &serde_json::to_vec(&spaced_submissions["filings"]["recent"])?,
+        limits,
+    )?;
+    assert_eq!(
+        spaced_archive.filings().len(),
+        spaced.document().filings().len()
+    );
+    for (index, archived) in spaced_archive.filings().iter().enumerate() {
+        assert_eq!(
+            Some(archived),
+            spaced.document().filing(archived.accession().as_str()),
+        );
+        assert_eq!(
+            archived.form().as_str(),
+            spaced_submissions["filings"]["recent"]["form"][index]
+                .as_str()
+                .ok_or("missing exact spaced form")?,
+        );
+    }
+    let spaced_observations = normalize_filings(
+        &SourceId::try_from("sec-edgar")?,
+        &spaced,
+        spaced.raw().received_at().checked_add_nanos(1)?,
+    )?;
+    assert_eq!(spaced_observations.len(), 7);
+    for observation in &spaced_observations {
+        let ResearchObservation::Filing(filing) = observation else {
+            return Err("expected spaced-form filing".into());
+        };
+        let source = spaced
+            .document()
+            .filing(filing.accession().as_str())
+            .ok_or("missing spaced-form source filing")?;
+        assert_eq!(filing.form_type(), source.form());
+        assert_eq!(filing.subject().issuer_id(), Some(spaced.document().cik()));
+        let reopened: ResearchObservation =
+            serde_json::from_slice(&serde_json::to_vec(observation)?)?;
+        assert_eq!(&reopened, observation);
+    }
     let agent_recent = SubmissionsDocument::parse(&serde_json::to_vec(&agent_submission)?, limits)?;
     assert_eq!(agent_recent.cik().as_str(), "0000320193");
     let agent_filing = agent_recent
@@ -199,12 +267,13 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
         "entityName":"APPLE INC",
         "facts":{"us-gaap":{"ExactRatio":{"units":{"pure":[{
             "val":0.1234567890123456789012345678,
-            "accn":"0001628280-25-000079","form":"10-Q",
+            "accn":"0001628280-25-000079","form":"SC 13G/A",
             "filed":"2025-08-01","end":"2025-06-28"
         }]}}}}
     }"#;
     let exact = CompanyFactsDocument::parse(high_precision, limits)?;
     assert_eq!(exact.cik().as_str(), "0000320193");
+    assert_eq!(exact.occurrences()[0].form().as_str(), "SC 13G/A");
     assert_eq!(
         exact.occurrences()[0].accession().as_str(),
         "0001628280-25-000079"

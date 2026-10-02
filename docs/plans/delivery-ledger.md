@@ -2,10 +2,14 @@
 
 ## Current execution — 2026-10-02
 
-Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop49116,
-service49078, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
-The two queued application builds finished sequentially. Shared-service rerun3350 is terminal0;
-no compiler is active at this checkpoint.
+Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop57572,
+service57524, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
+The previous queued application builds finished sequentially. Shared-service rerun3350 is terminal0;
+its empty-collection/MCP correction is pushed as `56412314` (PASS1/1, 47.06s). Lead inspected and
+applied the complete canonical FilingForm candidate after verifying all19 base hashes. The serialized watcher
+build54381 passed (8m01s), followed by domain1/1, SEC parser2/2 and PIT1/1 critical checks.
+Evidence: `.agents/tmp/v1-first-stock/filing-form-{domain,parser,pit}-critical.log`.
+The first live activation retry returned service unavailable; live financial loading remains unproved.
 Original runtime roots and recovery history remain preserved.
 
 Check78271 compiled in7m45s, then failed on an outdated MCP discovery assertion excluding all
@@ -22,8 +26,9 @@ parser checks PASS2/2 (0.05s). PR #43 records both checkpoints. Neither proves l
 
 | Active lane | Exclusive ownership / dependency | Finish boundary |
 | --- | --- | --- |
-| Astra sec_automatic_resolution | Candidate files only under `.agents/tmp/v1-first-stock/filing-form-candidate/`; manifest records exact live-source base hashes. Canonical FilingForm and its SEC/domain/data/application consumers; no live edits/builds/Git. | Preserve legitimate spaced filing names through normalization and retained roundtrip; lead inspects and applies the complete batch after the running check finishes. |
-| Astra startup_read_diagnosis — bounded read-only follow-up | Current `Market.GetCollection` retained/previous-close read chain and financial-visible-dev.log; report only `.agents/tmp/v1-first-stock/collection-deadline-diagnosis.md`. No source edits, builds, runtime changes or Git. | Identify the source-supported reason a nine-symbol read reaches its deadline and the smallest producer-to-consumer correction; distinguish measured facts from hypotheses. |
+| Astra sec_automatic_resolution | Complete/frozen; lead applied all19 candidate files after exact-base inspection. Canonical FilingForm and SEC/domain/data/application consumers. | Implemented exact spaced form preservation; native build and four critical cases pass; live verification remains pending. |
+| Astra startup_read_diagnosis — close-page candidate | Candidate-only `.agents/tmp/v1-first-stock/close-page-candidate/`: application `paper/market/durable_product.rs`, `research/market_history/previous_close.rs`; data `catalog/chart_projection.rs`, `analytical_read.rs`, `manifest/catalog.rs` and existing selected-history module only if its borrowed reader requires it. No live edits/builds/Git. | Batch exact selected close reads and reuse one verified projection snapshot/union-parent authorization; preserve every receipt/rights/cutoff check. Lead owns integration and shared-service fixture; separate retained-event timeout remains open. |
+| Sol financial_detail_ui — active owner correction | Desktop `features/markets/{investment-page,investment-financials,investment-profile,market-history-read}.tsx` only. Reuse existing chart/query APIs; no transport/schema/backend edits, builds or Git. | Chart and quote visible near top, useful default financial section with tabs, stable refresh layout and preserved selection. Lead owns existing journey/type checks and native verification; this does not conceal missing data. |
 | Sol dev_launcher — complete, source unchanged | Read-only launcher/Vite/capability inspection | Existing advertised read/close guard handles unsupported new commands; no speculative global HMR/version framework. |
 | Lead | Empty collection early-return fix and existing shared-service fixture; shared contracts, runtime/build scheduling, integration, ledger/Git | Check3350 passed: empty selected stock pages no longer become wildcard registry reads. Commit this coherent checkpoint, then apply canonical form correction and verify actual financial acquisition. |
 
@@ -34,8 +39,8 @@ contract and all consumers together, preserving exact text and the existing byte
 than rewriting labels or relaxing unrelated identifiers. Candidate preparation is isolated only
 to keep the watcher from compiling half-applied producer/consumer edits; it is inside this worktree.
 
-Dependency: passed empty-collection checkpoint → coherent FilingForm application →
-one watcher build → serialized parser/domain checks → live SEC and selected financial reads.
+Dependency: pushed empty-collection checkpoint → applied FilingForm contract → passed watcher
+build54381 and four parser/domain/PIT checks → live SEC and selected financial reads.
 MSFT profile and previous close are independently observed; positive financial rendering,
 complete startup and installed restart remain unproved. Current live collection reads also show
 retained/previous-close deadline failures; the empty-page fix does not claim to solve those.

@@ -95,6 +95,10 @@ which can belong to a filing agent rather than the subject company, as the
 explains (reviewed 2026-10-02). Issuer attribution uses the exact submissions response CIK and
 retained filing context. Companion pages retain their declared company-CIK filename, count and
 filing-date bounds; accepting agent-submitted accessions does not relax those checks.
+Form labels use the canonical `FilingForm` exact-text value through submissions, Company Facts,
+normalization and retained reads. Meaningful spaces such as `SCHEDULE 13G` and `DEF 14A` are
+preserved; empty/control-bearing labels remain invalid. Accession and other identifier contracts
+are unchanged.
 
 ## Official limits, application budgets, and scheduling
 
