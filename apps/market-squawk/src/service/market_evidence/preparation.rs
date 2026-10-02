@@ -346,6 +346,9 @@ impl InstalledInvestmentSourcePreparation {
             .market_runtime
             .acquire_option_chain(demand, context.deadline(), context.cancellation())
             .await
+            .inspect_err(|error| {
+                tracing::warn!(error = %error, "investment option acquisition failed");
+            })
             .map_err(|error| match error {
                 crate::application::OptionChainDemandError::Cancelled => ServiceError::Cancelled,
                 crate::application::OptionChainDemandError::Deadline => {

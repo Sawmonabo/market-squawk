@@ -14,6 +14,7 @@ use market_squawk_domain::{
     ExternalIdentifierRecordInput, IdentifierRightsPolicyReference, OccOptionIdentity,
     SourceIdentifier, VersionPinnedSourceLocator,
 };
+use market_squawk_sources::{AuthorizationMode, SourceClass, SourceProtocolProfile};
 
 use sha2::{Digest as _, Sha256};
 
@@ -32,7 +33,7 @@ pub struct AlpacaOptionReferenceAdmission {
     pub contracts: Arc<AlpacaOptionContractReferenceSet>,
     /// Exact current non-execution underlying definition selected by the ordinary caller.
     pub underlying: MarketDataInstrumentRecord,
-    /// Exact registered IEX source whose authenticated asset UUID assertion owns the underlying.
+    /// Exact registered asset-reference source whose authenticated UUID owns the underlying.
     pub underlying_asset_namespace: SourceId,
 }
 
@@ -115,8 +116,16 @@ impl CatalogAuthority {
                 return Err(Error::SourceIdentityConflict);
             };
             if asset_source.provider().as_str() != "alpaca-market-data"
-                || !asset_source.capabilities().live()
+                || asset_source.source_class() != SourceClass::Broker
+                || asset_source.authorization().mode() != AuthorizationMode::UserAuthorized
+                || asset_source.capabilities().live()
+                || !asset_source.capabilities().extraction()
+                || asset_source.protocol_profile() != &SourceProtocolProfile::NotLive
                 || asset_venue.as_str() != "iex"
+                || !asset_source
+                    .coverage()
+                    .asset_classes()
+                    .contains(&input.underlying.definition().asset_class())
             {
                 return Err(Error::SourceIdentityConflict);
             }

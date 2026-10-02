@@ -2,6 +2,41 @@
 
 ## Current execution — 2026-10-02
 
+Options source correction is critically verified. The existing authenticated asset-reference case
+now publishes an option from retained originals, rejects mismatched namespace/underlying, reopens
+the option after restart and replays idempotently: PASS (1 case, 0.86s; single Cargo job).
+The initial fixture run exposed initialization ordering; establishing the empty catalog/root before
+reference publication corrected the fixture without weakening product checks. Lead inspected the
+producer, reference admission, diagnostics and affected fixture. Astra releases file ownership.
+Next: matched supervisor rebuild and resume `workflow_96bca8b553dd5278afa3e9a2a4040af5`.
+This is critical fixture proof, not yet live option publication or a completed Investment Brief.
+
+
+Lead adds a safe typed options-acquisition diagnostic in `service/market_evidence/preparation.rs`
+before its existing public error mapping. It logs only the fixed `OptionChainDemandError` display
+variant, never raw response/credential data, so a resumed failure can be distinguished without
+another speculative change. No admission behavior changes in this diagnostic.
+Build hygiene: with no Cargo/rustc active, removed145 ignored app artifacts older than Oct2
+(16.84GiB); preserved all today's builds, dependency caches, staged running binaries, source,
+sessions and backups. Free disk increased37→54GiB. Exact inventory/result retained locally.
+
+
+Options admission correction (first-stock dependency): current catalog proves MSFT's authenticated
+asset UUID belongs to `alpaca-basic-asset-reference-v1`, provider Alpaca, IEX reference topology,
+`live=false/extraction=true`. Option-reference admission wrongly requires that source to be live.
+The exact 2,852-contract request has three retained original pages; no option references published.
+Astra stock_workflow_trace now owns `crates/market-squawk-data/src/catalog/market_data_instruments/option_reference.rs`
+and the existing asset-reference critical case in `crates/market-squawk-data/tests/catalog.rs`.
+Correct the source-capability contract and extend that real authenticated-reference fixture through
+option-reference admission/restart; preserve originals, assigned UUID/ticker, rights and currentness.
+No migration, disabled validation, arbitrary bound increase or replacement workflow. Lead retains
+service/runtime diagnostics if actual resumed evidence requires them, all shared files/builds/Git.
+Watchexec is temporarily stopped for this bounded Rust batch; current app/service stay running.
+After focused verification lead resumes the single matched supervisor build, then resumes the
+original workflow and checks the next receipt. Setup-guidance checkpoint `441c8caf` is pushed;
+PR43 comment5963071760 records its scoped evidence.
+
+
 First-stock execution update: the existing native controls created one $100,000 USD virtual
 portfolio with 0.25% modeled costs, then saved the owner's 2–5% position range, $10,000 cash
 reserve, 1% downside limit and 365-day horizon. `Portfolio.GetRecommendationSetup` is now

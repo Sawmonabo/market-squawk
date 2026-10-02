@@ -2425,8 +2425,8 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     Ok(())
 }
 
-#[test]
-fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() -> TestResult {
+#[tokio::test]
+async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() -> TestResult {
     let _tls = market_squawk_platform::install_ring_tls_provider()?;
     use bytes::Bytes;
     use chrono::{DateTime, Utc};
@@ -2471,6 +2471,13 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         CatalogLimit::new(32)?,
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
+    // Establish the catalog/root authority while empty, before any reference or raw publication.
+    drop(AnalyticalDataService::initialize(
+        CatalogAuthority::open(config.clone())?,
+        AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(8 * 1024 * 1024, 32, Duration::from_secs(10))?,
+    )?);
     let catalog = CatalogAuthority::open(config.clone())?;
     let listing_source = listing_reference_source()?;
     catalog.register_source(&listing_source, Timestamp::from_unix_nanos(10))?;
@@ -2836,7 +2843,7 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     drop(listing_reader);
     drop(listing_publisher);
     drop(authority);
-    let reopened = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
+    let reopened = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
     let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&reopened));
     let reader = MarketDataInstrumentReadCapability::new(
         Arc::clone(&reopened),
@@ -2854,7 +2861,7 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     assert_eq!(replay, created);
     assert_eq!(
         reader.latest(canonical, deadline(), &cancellation)?,
-        Some(created)
+        Some(created.clone())
     );
     let fund_replay = publisher.publish_alpaca_asset_reference(
         admission(
@@ -2868,8 +2875,235 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     assert_eq!(fund_replay, fund);
     assert_eq!(
         reader.latest(fund.definition().instrument_id(), deadline(), &cancellation)?,
-        Some(fund)
+        Some(fund.clone())
     );
+    drop(reader);
+    drop(publisher);
+    drop(reopened);
+
+    // The option consumer must accept the authenticated extraction namespace that actually
+    // owns the underlying UUID. A live quote source cannot substitute for that identity.
+    use market_squawk_adapter_alpaca::{
+        ALPACA_OPTION_CONTRACT_REFERENCE_ENDPOINT, AlpacaOptionContractReferenceRequest,
+        AlpacaOptionContractReferenceSet, AlpacaPendingOptionContractReferencePage,
+    };
+    use market_squawk_data::{AlpacaOptionReferenceAdmission, DatasetId};
+    use market_squawk_domain::CalendarDate;
+    let reopen = || -> TestResult<AnalyticalDataService> {
+        Ok(AnalyticalDataService::open(
+            CatalogAuthority::open(config.clone())?,
+            AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+            paths.artifacts()?.clone(),
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 32, Duration::from_secs(10))?,
+        )?)
+    };
+    let service = reopen()?;
+    let option_source = SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        SourceId::try_from("alpaca-basic-indicative-option-chain-v1")?,
+        RevisionBoundPayloadEvidence::new(
+            MetadataRevision::new(SourceIdentifier::try_from(
+                "alpaca-option-reference-test-v1",
+            )?),
+            ExactPayloadEvidence::from_content_digest(digest(153)),
+        ),
+        SourceClass::Broker,
+        source.provider().clone(),
+        source.authorization().clone(),
+        SourceCoverage::try_instrument(
+            ExactPayloadEvidence::from_content_digest(digest(154)),
+            effective,
+            vec![AssetClass::Option],
+            CoverageTopology::single_venue(VenueId::try_from("alpaca-indicative-options")?),
+            InstrumentCoverage::partial(),
+            None,
+            CoverageDelay::Delayed(900_000_000_000),
+            DeliveryEvidence::Indirect,
+        )?,
+        DataQuality::DirectUnverified,
+        NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_from_api_rules(
+            vec![ApiEndpointRule::try_new(
+                ALPACA_OPTION_CONTRACT_REFERENCE_ENDPOINT,
+                PathScope::Exact,
+                vec![],
+                1,
+                128,
+            )?],
+            bounds,
+        )?),
+        source.freshness_policy(),
+        source.budget_policy().cloned(),
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::None,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))?;
+    let option_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let expiration = CalendarDate::new(2027, 1, 15)?;
+    let option_request =
+        AlpacaOptionContractReferenceRequest::try_new("AAPL".to_owned(), expiration, expiration)?;
+    let body = Bytes::from(serde_json::to_vec(&serde_json::json!({
+        "option_contracts": [{
+            "id": uuid::Uuid::from_u128(706), "symbol": "AAPL270115C00200000",
+            "name": "AAPL January 2027 200 Call", "status": "active", "tradable": true,
+            "expiration_date": "2027-01-15", "root_symbol": "AAPL",
+            "underlying_symbol": "AAPL", "underlying_asset_id": native_id,
+            "type": "call", "style": "american", "strike_price": "200",
+            "multiplier": "100", "size": "100",
+            "deliverables": [{"type": "equity", "symbol": "AAPL", "asset_id": native_id,
+                "amount": "100", "allocation_percentage": "100", "settlement_type": "T+1",
+                "settlement_method": "CCC", "delayed_settlement": false}]
+        }], "next_page_token": null
+    }))?);
+    let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
+    let request_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(
+        format!("{ALPACA_OPTION_CONTRACT_REFERENCE_ENDPOINT}?underlying_symbols=AAPL&expiration_date_gte=2027-01-15&expiration_date_lte=2027-01-15&status=active&show_deliverables=true&limit=1000").as_bytes(),
+    ).into());
+    let capture = ProviderCaptureSetReceipt::try_new(
+        option_source.source_id().clone(),
+        option_source.revision().clone(),
+        SourceIdentifier::try_from("alpaca:option-contract-reference:AAPL:2027-01-15:2027-01-15")?,
+        request_digest,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![ProviderCapturePageReceipt::try_new(
+            0,
+            request_digest,
+            None,
+            None,
+            200,
+            u64::try_from(body.len())?,
+            body_digest,
+            option_at,
+        )?],
+    )?;
+    let connection = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        &capture.observation_digest().bytes(),
+    );
+    let record = RawCaptureRecord::try_new_live(
+        uuid::Uuid::new_v5(&connection, &body_digest.bytes()),
+        Arc::from(option_source.source_id().as_str()),
+        connection,
+        Some(0),
+        None,
+        DateTime::<Utc>::from_timestamp_nanos(option_at.unix_nanos()),
+        body,
+    )?;
+    let material = ProviderCaptureMaterial::try_new(capture, vec![record])?;
+    let mut option_rights = test_rights_input(
+        option_source.source_id().clone(),
+        material.receipt().observation_digest(),
+        i64::MAX,
+    )?;
+    option_rights.retrieved_at = option_at;
+    option_rights
+        .permitted_operations
+        .push(SourceOperation::Display);
+    let context = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "source": option_source.source_id(), "revision": option_source.revision(),
+        "request": option_request, "request_token": null, "received_at": option_at,
+    }))?;
+    let lease = service
+        .acquire_provider_capture_original_lease(deadline(), &cancellation)
+        .await?;
+    let (expectation, seal) = material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal.seal(&raw_store)?)?
+        .try_into_whole()?;
+    let originals = service.retain_option_contract_reference_originals(
+        &option_source,
+        digest(155),
+        &DatasetId::try_from("market_squawk.option_snapshots")?,
+        &context,
+        vec![(option_at, token, option_rights.clone())],
+        &raw_store,
+        deadline(),
+        &cancellation,
+    )?;
+    let original = service.reopen_provider_capture_original(
+        &originals[0],
+        &raw_store,
+        deadline(),
+        &cancellation,
+    )?;
+    let pending = AlpacaPendingOptionContractReferencePage::restore_original(
+        &context,
+        original.original().capture(),
+        original.records(),
+    )?;
+    let (rejoin, seal) = pending.into_seal_parts()?;
+    let contracts = Arc::new(AlpacaOptionContractReferenceSet::try_from_pages(vec![
+        rejoin.try_rejoin(seal.seal(&raw_store)?)?,
+    ])?);
+    drop(lease);
+    let option_admission = |underlying, namespace| AlpacaOptionReferenceAdmission {
+        source: option_source.clone(),
+        rights: vec![option_rights.clone()],
+        originals: originals.clone(),
+        contracts: Arc::clone(&contracts),
+        underlying,
+        underlying_asset_namespace: namespace,
+    };
+    let publisher = service.market_data_instrument_synchronization();
+    assert!(matches!(
+        publisher.publish_alpaca_option_references(
+            option_admission(created.clone(), listing_source.source_id().clone()),
+            &allowed,
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
+    ));
+    assert!(matches!(
+        publisher.publish_alpaca_option_references(
+            option_admission(fund, source.source_id().clone()),
+            &allowed,
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
+    ));
+    let published = publisher.publish_alpaca_option_references(
+        option_admission(created.clone(), source.source_id().clone()),
+        &allowed,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(published.inserted(), 1);
+    let reader = service.market_data_instruments();
+    let matched = reader.search("AAPL270115C00200000", 2, deadline(), &cancellation)?;
+    assert_eq!(matched.matches().len(), 1);
+    let option = matched.matches()[0].record().clone();
+    assert_eq!(option.definition().asset_class(), AssetClass::Option);
+    drop(reader);
+    drop(publisher);
+    drop(service);
+    let service = reopen()?;
+    assert_eq!(
+        service.market_data_instruments().latest(
+            option.definition().instrument_id(),
+            deadline(),
+            &cancellation,
+        )?,
+        Some(option)
+    );
+    let replayed = service
+        .market_data_instrument_synchronization()
+        .publish_alpaca_option_references(
+            option_admission(created, source.source_id().clone()),
+            &allowed,
+            deadline(),
+            &cancellation,
+        )?;
+    assert_eq!(replayed.inserted(), 0);
+    assert_eq!(replayed.replayed(), 1);
     Ok(())
 }
 
