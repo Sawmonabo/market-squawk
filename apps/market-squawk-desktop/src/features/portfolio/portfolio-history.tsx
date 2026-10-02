@@ -1,5 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { CircleAlert } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -63,9 +64,7 @@ function HistoryRead({ account, bootstrap, transport, refresh }: HistoryProps & 
           Saved versions are listed newest first. The selected version stays fixed while you browse.
           Refresh history to use the latest saved version and clear the comparison.
         </p>
-        <Button variant="outline" onClick={refresh}>
-          <RefreshCw aria-hidden="true" /> Refresh history
-        </Button>
+        <RefreshButton label="Refresh history" onClick={refresh} />
       </div>
       {history.query.isPending ? (
         <Skeleton className="h-48 rounded-xl" aria-label="Loading saved portfolio versions" />

@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { Link } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -226,15 +227,8 @@ function ReadyLifecycle({
   return (
     <LifecycleFrame
       action={
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={status.isFetching || !supportsUpdateStatus}
-          onClick={() => void status.refetch()}
-        >
-          <RefreshCw className={cn(status.isFetching && "animate-spin")} aria-hidden="true" />
-          Refresh evidence
-        </Button>
+        <RefreshButton label="Refresh evidence" refreshing={status.isFetching} disabled={status.isFetching || !supportsUpdateStatus}
+          onClick={() => void status.refetch()} />
       }
     >
       {!supportsUpdateStatus ? (

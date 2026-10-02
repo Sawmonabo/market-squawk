@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useQueries, useQuery, useQueryClient, type QueryFunctionContext } from "@tanstack/react-query"
 import {
@@ -5,7 +6,6 @@ import {
   CircleAlert,
   DatabaseZap,
   KeyRound,
-  RefreshCw,
   ShieldCheck,
 } from "lucide-react"
 
@@ -295,10 +295,7 @@ export function ConnectionsWorkspace({
   return (
     <ConnectionsFrame
       action={
-        <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
-          <RefreshCw className={refreshing ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh evidence
-        </Button>
+        <RefreshButton label="Refresh evidence" refreshing={refreshing} onClick={refresh} disabled={refreshing} />
       }
     >
       <div className="mb-5 flex flex-wrap gap-2" role="group" aria-label="Connections views">

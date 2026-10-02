@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useSearchParams } from "react-router-dom"
 import { admittedAnalysisActionToken } from "@/features/opportunities/contracts"
@@ -7,7 +8,6 @@ import {
   CircleAlert,
   DatabaseZap,
   ReceiptText,
-  RefreshCw,
   ShieldCheck,
   WalletCards,
 } from "lucide-react"
@@ -183,15 +183,8 @@ function ReadyPaperExecution({
   return (
     <PageFrame
       action={
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={refresh}
-          disabled={refreshing || advertisedReadCount === 0}
-        >
-          <RefreshCw className={refreshing ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh
-        </Button>
+        <RefreshButton label="Refresh" refreshing={refreshing} onClick={refresh}
+          disabled={refreshing || advertisedReadCount === 0} />
       }
     >
       <CreatePaperAccountControls

@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { Link } from "react-router-dom"
 import { useMutation, useQuery } from "@tanstack/react-query"
@@ -206,7 +207,7 @@ export function CreatePaperAccountControls({ transport, scope, enabled, onCreate
     {prepare.isError || create.isError ? <p className="mt-3 text-sm text-rose-200" role="alert">
       The account could not be confirmed. Refresh its current state, then review the choices again.
     </p> : null}
-    <Button className="mt-3" variant="ghost" disabled={busy} onClick={() => { setPreview(null); void options.refetch() }}>Refresh account</Button>
+    <RefreshButton label="Refresh account" className="mt-3" disabled={busy} onClick={() => { setPreview(null); void options.refetch() }} />
     <Dialog open={preview !== null && ready !== undefined && !options.isError} onOpenChange={(open) => { if (!open && !create.isPending) setPreview(null) }}>
       <DialogContent showCloseButton={!create.isPending}>
         <DialogHeader>

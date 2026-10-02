@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { Link } from "react-router-dom"
 import { useMutation, useQuery } from "@tanstack/react-query"
@@ -97,11 +98,11 @@ export function RecommendationSetup({ transport, scope }: { transport: ProductTr
           Choose the account and allocation limits to use when analyzing investments. Review the saved choices before confirming them.
         </p>
       </div>
-      <Button variant="outline" disabled={busy} onClick={() => {
+      <RefreshButton label="Refresh preferences" disabled={busy} onClick={() => {
         setPreview(null)
         setError(null)
         void status.refetch()
-      }}>Refresh preferences</Button>
+      }} />
     </div>
     {status.isPending ? <p className="mt-4 text-sm" role="status">Loading saved preferences…</p>
       : status.isError ? <p className="mt-4 text-sm text-destructive" role="alert">

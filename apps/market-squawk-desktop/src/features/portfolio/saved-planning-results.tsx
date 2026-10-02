@@ -1,5 +1,5 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { RefreshCw } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -49,7 +49,7 @@ function SavedPlanningRead({ account, bootstrap, transport, refresh }: SavedPlan
   return <div className="space-y-4">
     <div className="flex flex-wrap items-center justify-between gap-3">
       <p className="text-xs text-muted-foreground">Refresh to include newly saved calculations and clear the open result.</p>
-      <Button type="button" variant="outline" onClick={refresh}><RefreshCw aria-hidden="true" /> Refresh saved planning results</Button>
+      <RefreshButton label="Refresh saved planning results" onClick={refresh} />
     </div>
     {results.query.isPending ? <Skeleton className="h-32 rounded-xl" aria-label="Loading saved planning results" />
       : results.query.isError ? <div className="space-y-3">

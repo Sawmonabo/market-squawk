@@ -1,15 +1,13 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import {
   Activity,
   Clock3,
   Database,
   HardDrive,
   LoaderCircle,
-  RefreshCw,
   Server,
 } from "lucide-react"
 
-import { Button } from "@/components/ui/button"
-import { cn } from "@/lib/utils"
 
 import type { RuntimeStatus } from "./contracts"
 
@@ -68,10 +66,7 @@ export function OperationalHealth({
             Fresh, bounded facts from the shared installed service and active workspace.
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
-          <RefreshCw className={cn(refreshing && "animate-spin")} aria-hidden="true" />
-          Refresh health
-        </Button>
+        <RefreshButton label="Refresh health" refreshing={refreshing} onClick={onRefresh} disabled={refreshing} />
       </div>
       {pending ? (
         <div className="mt-4 flex items-center gap-3 rounded-xl border border-border bg-card/30 p-5 text-sm text-muted-foreground" role="status">

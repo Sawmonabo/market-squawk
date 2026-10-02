@@ -1,5 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
-import { CircleAlert, Play, RefreshCw, Square } from "lucide-react"
+import { CircleAlert, Play, Square } from "lucide-react"
 import { useEffect, useRef } from "react"
 import type { AnalyticalControllerResponse, MissingInvestmentEvidence, WorkflowCoverageCursor } from "@/features/advanced/analytical-profile-contracts"
 import { Link, useSearchParams } from "react-router-dom"
@@ -51,8 +52,8 @@ export function AnalysisActivity({ transport, scope }: {
   return <section className="mt-6" aria-labelledby="analysis-activity-heading">
     <div className="flex items-center justify-between gap-3">
       <h2 id="analysis-activity-heading" className="text-lg font-semibold">Analysis activity</h2>
-      <Button variant="outline" size="sm" disabled={activity.isFetching}
-        onClick={() => void activity.refetch()}><RefreshCw aria-hidden="true" /> Refresh activity</Button>
+      <RefreshButton label="Refresh activity" refreshing={activity.isFetching} disabled={activity.isFetching}
+        onClick={() => void activity.refetch()} />
     </div>
     {cancel.isError || resume.isError || activity.isError ? <Alert className="mt-4" variant="destructive">
       <CircleAlert aria-hidden="true" /><AlertTitle>Analysis progress could not be updated</AlertTitle>

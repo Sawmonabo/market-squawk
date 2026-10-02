@@ -1,6 +1,7 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { CircleAlert, RefreshCw, ShieldCheck } from "lucide-react"
+import { CircleAlert, ShieldCheck } from "lucide-react"
 
 import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
@@ -88,15 +89,8 @@ function McpWorkspace({
   return (
     <McpFrame
       action={
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void status.refetch()}
-          disabled={status.isFetching || control.isPending}
-        >
-          <RefreshCw className={status.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh discovery
-        </Button>
+        <RefreshButton label="Refresh discovery" refreshing={status.isFetching} onClick={() => void status.refetch()}
+          disabled={status.isFetching || control.isPending} />
       }
     >
       <p className="sr-only" aria-live="polite">{announcement}</p>

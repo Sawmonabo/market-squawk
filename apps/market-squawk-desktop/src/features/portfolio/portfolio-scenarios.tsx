@@ -1,5 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { CircleAlert } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -100,7 +101,7 @@ function StressRead({ account, bootstrap, transport, refresh }: ScenarioProps & 
           Browse positions one page at a time. The saved observation stays fixed while you choose
           investments. Refresh to use the latest observation and clear all assumptions and results.
         </p>
-        <Button variant="outline" onClick={refresh}><RefreshCw aria-hidden="true" /> Refresh stress positions</Button>
+        <RefreshButton label="Refresh stress positions" onClick={refresh} />
       </div>
       {selection ? <dl className="grid gap-3 text-xs sm:grid-cols-2">
         <div><dt className="text-muted-foreground">Selected portfolio observation</dt>

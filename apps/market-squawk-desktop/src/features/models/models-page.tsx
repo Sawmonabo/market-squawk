@@ -1,16 +1,15 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
   Activity,
   Boxes,
   ChartNoAxesCombined,
-  RefreshCw,
   ShieldAlert,
 } from "lucide-react"
 
 import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
-import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
@@ -165,19 +164,10 @@ function ModelsWorkspace({
             guaranteed outcomes.
           </p>
         </div>
-        <Button
-          variant="outline"
-          onClick={refresh}
+        <RefreshButton label="Refresh evidence" refreshing={refreshing} onClick={refresh}
           disabled={
             refreshing || (!modelsAvailable && !forecastsAvailable)
-          }
-        >
-          <RefreshCw
-            className={refreshing ? "animate-spin" : ""}
-            aria-hidden="true"
-          />
-          Refresh evidence
-        </Button>
+          } />
       </header>
 
       <section

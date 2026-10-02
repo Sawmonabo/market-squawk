@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { CircleAlert, RefreshCw } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -48,11 +49,8 @@ export function AccountPerformance({ account, bootstrap, transport }: {
     <div className="space-y-4" aria-label={`Cash and performance for ${account.displayName}`}>
       <PerformancePanel performance={performance.query.data} />
       <ReconciliationPanel performance={performance.query.data} />
-      <Button variant="outline" onClick={() => void performance.query.refetch()}
-        disabled={performance.query.isFetching}>
-        <RefreshCw className={performance.query.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-        Refresh cash and performance
-      </Button>
+      <RefreshButton label="Refresh cash and performance" refreshing={performance.query.isFetching} onClick={() => void performance.query.refetch()}
+        disabled={performance.query.isFetching} />
     </div>
   )
 }

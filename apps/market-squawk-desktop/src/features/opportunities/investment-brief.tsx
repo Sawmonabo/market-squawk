@@ -1,4 +1,5 @@
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { RefreshButton } from "@/components/ui/refresh-button"
+import { CircleAlert } from "lucide-react"
 import { useRef, useState, type ReactNode } from "react"
 import { Link } from "react-router-dom"
 
@@ -74,19 +75,8 @@ export function InvestmentBrief({
               </Link>
             </Button>
           ) : null}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={onRefresh}
-            disabled={refreshing}
-          >
-            <RefreshCw
-              className={refreshing ? "animate-spin" : undefined}
-              aria-hidden="true"
-            />
-            Refresh brief
-          </Button>
+          <RefreshButton label="Refresh brief" refreshing={refreshing} onClick={onRefresh}
+            disabled={refreshing} />
         </div>
       </div>
 

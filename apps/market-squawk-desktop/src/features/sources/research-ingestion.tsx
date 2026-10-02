@@ -1,6 +1,7 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { DatabaseZap, LoaderCircle, RefreshCw } from "lucide-react"
+import { DatabaseZap, LoaderCircle } from "lucide-react"
 
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -168,23 +169,11 @@ export function ResearchIngestion({
               query is accepted.
             </p>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
+          <RefreshButton label="Refresh inputs" refreshing={sources.isFetching || objects.isFetching} onClick={() => {
               void sources.refetch()
               if (source) void objects.refetch()
             }}
-            disabled={sources.isFetching || objects.isFetching}
-          >
-            <RefreshCw
-              className={
-                sources.isFetching || objects.isFetching ? "animate-spin" : ""
-              }
-              aria-hidden="true"
-            />
-            Refresh inputs
-          </Button>
+            disabled={sources.isFetching || objects.isFetching} />
         </div>
 
         {sources.isPending ? (

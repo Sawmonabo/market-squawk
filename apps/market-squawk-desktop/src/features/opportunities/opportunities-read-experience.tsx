@@ -1,9 +1,9 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { useQuery } from "@tanstack/react-query"
 import {
   ChevronRight,
   CircleAlert,
   History,
-  RefreshCw,
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 
@@ -375,19 +375,8 @@ export function SavedAnalysisHistory({ analyses, navigation, selectedActionToken
             quality score or recommendation ranking.
           </p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => void analyses.refetch()}
-          disabled={analyses.isFetching}
-        >
-          <RefreshCw
-            className={analyses.isFetching ? "animate-spin" : undefined}
-            aria-hidden="true"
-          />
-          Refresh history
-        </Button>
+        <RefreshButton label="Refresh history" refreshing={analyses.isFetching} onClick={() => void analyses.refetch()}
+          disabled={analyses.isFetching} />
       </div>
 
       {analyses.isPending ? (

@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { Link } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -217,10 +218,7 @@ function ReadyBackupRecovery({
   return (
     <BackupFrame
       action={
-        <Button variant="outline" size="sm" onClick={refresh} disabled={inventory.isFetching}>
-          <RefreshCw className={inventory.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh evidence
-        </Button>
+        <RefreshButton label="Refresh evidence" refreshing={inventory.isFetching} onClick={refresh} disabled={inventory.isFetching} />
       }
     >
       <p className="sr-only" aria-live="polite">{announcement}</p>

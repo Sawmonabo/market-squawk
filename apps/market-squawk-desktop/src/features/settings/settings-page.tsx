@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { NavLink } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -337,19 +338,12 @@ function SettingsWorkspace({
   return (
     <SettingsFrame
       action={
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
+        <RefreshButton label="Refresh facts" refreshing={settings.isFetching || workspaces.isFetching || connections.isFetching} onClick={() => {
             void settings.refetch()
             void workspaces.refetch()
             void connections.refetch()
           }}
-          disabled={settings.isFetching || workspaces.isFetching || connections.isFetching}
-        >
-          <RefreshCw className={settings.isFetching || workspaces.isFetching || connections.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh facts
-        </Button>
+          disabled={settings.isFetching || workspaces.isFetching || connections.isFetching} />
       }
     >
       <p className="sr-only" aria-live="polite">{announcement}</p>

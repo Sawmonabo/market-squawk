@@ -1,11 +1,11 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { RefreshCw, ShieldAlert } from "lucide-react"
+import { ShieldAlert } from "lucide-react"
 
 import { CursorNavigation } from "../shared/cursor-navigation"
 import { usePortfolioAccounts } from "../portfolio/use-portfolio"
 
 import { useProduct } from "@/app/product-context"
-import { Button } from "@/components/ui/button"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -51,15 +51,8 @@ function ReadyRiskPage({
   return (
     <PageFrame
       action={
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void accounts.refetch()}
-          disabled={accounts.isFetching}
-        >
-          <RefreshCw className={accounts.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh
-        </Button>
+        <RefreshButton label="Refresh" refreshing={accounts.isFetching} onClick={() => void accounts.refetch()}
+          disabled={accounts.isFetching} />
       }
     >
       <RiskBoundary />

@@ -1,5 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { CircleAlert } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -44,9 +45,7 @@ function TransactionsRead({ account, bootstrap, transport, refresh }: Transactio
           Recorded transactions are shown one page at a time from the same saved portfolio
           observation. Refresh transactions to use the latest available observation.
         </p>
-        <Button variant="outline" onClick={refresh} disabled={transactions.query.isFetching}>
-          <RefreshCw aria-hidden="true" /> Refresh transactions
-        </Button>
+        <RefreshButton label="Refresh transactions" refreshing={transactions.query.isFetching} onClick={refresh} disabled={transactions.query.isFetching} />
       </div>
       {transactions.query.isPending ? (
         <Skeleton className="h-64 rounded-xl" aria-label={`Loading transactions for ${account.displayName}`} />

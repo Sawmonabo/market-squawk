@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 import { DemandPanel } from "../shared/demand-panel"
 import * as React from "react"
@@ -10,7 +11,6 @@ import {
   FlaskConical,
   GitCompareArrows,
   Play,
-  RefreshCw,
   ShieldCheck,
 } from "lucide-react"
 
@@ -85,7 +85,7 @@ function RecommendationStudyRead({ actionToken, transport, scope }: {
     queryFn: async ({ signal }) => parseRecommendationBacktest(await transport.backtestProducts({ action: "recommendationStudy", actionToken }, { signal })),
   })
   return <>
-    <Button type="button" size="sm" variant="outline" disabled={study.isFetching} onClick={() => void study.refetch()}>Refresh saved study</Button>
+    <RefreshButton label="Refresh saved study" refreshing={study.isFetching} disabled={study.isFetching} onClick={() => void study.refetch()} />
     {study.isPending ? <Loading label="Opening the saved study…" /> : null}
     {study.isError ? <Unavailable title="This saved study could not be opened" detail="Its complete historical evidence could not be retrieved. Try refreshing the saved study." /> : null}
     {study.isSuccess ? <RecommendationStudyReport report={study.data} /> : null}
@@ -384,18 +384,8 @@ function BacktestsWorkspace({
                 Review progress and compare completed investment research.
               </p>
             </div>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={activitiesQuery.isFetching || !activityAvailable}
-              onClick={() => void activitiesQuery.refetch()}
-            >
-              <RefreshCw
-                className={cn(activitiesQuery.isFetching && "animate-spin")}
-                aria-hidden="true"
-              />
-              Refresh
-            </Button>
+            <RefreshButton label="Refresh" refreshing={activitiesQuery.isFetching} disabled={activitiesQuery.isFetching || !activityAvailable}
+              onClick={() => void activitiesQuery.refetch()} />
           </div>
 
           {!activityAvailable ? (

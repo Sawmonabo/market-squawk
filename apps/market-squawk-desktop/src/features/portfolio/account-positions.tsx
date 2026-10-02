@@ -1,4 +1,5 @@
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { RefreshButton } from "@/components/ui/refresh-button"
+import { CircleAlert } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -38,10 +39,7 @@ export function AccountPositions({ account, bootstrap, transport, mode }: {
             : "Positions are shown one page at a time from the same recorded portfolio observation."}
           {` Refresh ${detail} to start again with the latest available observation.`}
         </p>
-        <Button variant="outline" onClick={positions.refresh} disabled={positions.query.isFetching}>
-          <RefreshCw className={positions.query.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh {detail}
-        </Button>
+        <RefreshButton label={`Refresh ${detail}`} refreshing={positions.query.isFetching} onClick={positions.refresh} disabled={positions.query.isFetching} />
       </div>
       {positions.query.isPending ? (
         <div aria-label={`Loading ${detail} for ${account.displayName}`}>

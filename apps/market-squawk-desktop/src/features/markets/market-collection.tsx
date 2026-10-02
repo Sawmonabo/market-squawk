@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Activity, CircleAlert } from "lucide-react"
 import { Link } from "react-router-dom"
@@ -160,11 +161,11 @@ export function MarketCollection({
     {choice.isPending ? <p role="status" className="mt-3 text-xs text-muted-foreground">Saving your watchlist…</p> : null}
     {choice.isError ? <p role="alert" className="mt-3 text-xs text-destructive">Your choice could not be saved. Check the refreshed watchlist and try again.</p> : null}
     <div className="mt-4 flex flex-wrap gap-2">
-      <Button type="button" size="sm" variant="outline" disabled={collection.isFetching || choice.isPending}
+      <RefreshButton label="Refresh watchlist" refreshing={refreshing} disabled={collection.isFetching || choice.isPending}
         onClick={() => {
           void collection.refetch()
           if (savedCollection !== undefined) void marketInformation.refetch()
-        }}>Refresh watchlist</Button>
+        }} />
       <Button asChild size="sm" variant="outline"><Link to="/markets">Explore markets</Link></Button>
     </div>
   </section>

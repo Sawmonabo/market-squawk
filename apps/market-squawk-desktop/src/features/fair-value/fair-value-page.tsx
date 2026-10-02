@@ -1,4 +1,5 @@
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { RefreshButton } from "@/components/ui/refresh-button"
+import { CircleAlert } from "lucide-react"
 import type { ReactNode } from "react"
 import { Link, useSearchParams } from "react-router-dom"
 
@@ -108,9 +109,7 @@ function SavedValuation({ analysis, refreshing, onRefresh }: {
       </div>
       <div className="flex flex-wrap gap-2">
         <Button asChild variant="outline" size="sm"><Link to={`/opportunities?analysis=${encodeURIComponent(analysis.actionToken)}`}>Open Investment Brief</Link></Button>
-        <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
-          <RefreshCw className={refreshing ? "animate-spin" : undefined} aria-hidden="true" />Refresh valuation
-        </Button>
+        <RefreshButton label="Refresh valuation" refreshing={refreshing} onClick={onRefresh} disabled={refreshing} />
       </div>
     </div>
     <p className="mt-4 text-sm leading-6 text-muted-foreground">{analysis.recommendation.summary}</p>

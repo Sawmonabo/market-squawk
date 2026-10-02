@@ -1,10 +1,10 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import {
   Activity,
   CheckCircle2,
   CircleAlert,
   LoaderCircle,
-  RefreshCw,
   ShieldAlert,
 } from "lucide-react"
 import {
@@ -29,7 +29,6 @@ import { humanize } from "@/lib/formatters"
 import { type LosslessInteger } from "@/lib/lossless-integer"
 import { formatTimestamp } from "@/lib/time"
 import type { JobControlRequest, SystemTransport } from "@/lib/transport"
-import { cn } from "@/lib/utils"
 
 import {
   digestHex,
@@ -176,18 +175,8 @@ function ReadyOperations({
               The current first page follows service updates.
             </p>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void jobsQuery.refetch()}
-            disabled={jobsQuery.isFetching}
-          >
-            <RefreshCw
-              className={cn(jobsQuery.isFetching && "animate-spin")}
-              aria-hidden="true"
-            />
-            Refresh
-          </Button>
+          <RefreshButton label="Refresh" refreshing={jobsQuery.isFetching} onClick={() => void jobsQuery.refetch()}
+            disabled={jobsQuery.isFetching} />
         </div>
 
         {jobsQuery.isPending ? (

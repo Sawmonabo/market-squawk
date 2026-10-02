@@ -1,5 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { CircleAlert, RefreshCw } from "lucide-react"
+import { CircleAlert } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -91,7 +92,7 @@ function RebalanceRead({ account, bootstrap, transport, refresh }: RebalanceProp
         Browse investments one page at a time. Entered targets stay with this saved observation.
         Refresh to use the latest observation and clear all inputs and results.
       </p>
-      <Button variant="outline" onClick={refresh}><RefreshCw aria-hidden="true" /> Refresh rebalance positions</Button>
+      <RefreshButton label="Refresh rebalance positions" onClick={refresh} />
     </div>
     {selection ? <dl className="grid gap-3 text-xs sm:grid-cols-2">
       <Fact label="Selected portfolio observation" value={formatUnixNanos(selection.effectiveAtUnixNanos)} />

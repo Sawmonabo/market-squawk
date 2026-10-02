@@ -1,6 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { useState } from "react"
 import { useQuery, useQueryClient, useIsFetching } from "@tanstack/react-query"
-import { RefreshCw } from "lucide-react"
 import { Link, useParams } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
@@ -91,10 +91,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
           <div className="flex flex-wrap items-center gap-3 sm:justify-end">
             <h2 className="sr-only">Price</h2>
             <p className="font-mono text-2xl tabular-nums">{row?.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
-            <Button variant="ghost" size="icon-sm" className="size-7 text-muted-foreground/60 hover:text-foreground"
-              aria-label="Refresh investment" title="Refresh investment" disabled={pageReads > 0} onClick={refresh}>
-              <RefreshCw className={`size-3.5 ${pageReads > 0 ? "animate-spin" : ""}`} aria-hidden="true" />
-            </Button>
+            <RefreshButton label="Refresh investment" refreshing={pageReads > 0} onClick={refresh} />
           </div>
           <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row?.changePercent !== null && row?.changePercent !== undefined ? ` · ${row.changePercent}%` : ""}</p>
           <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : "Availability not established"}</p>

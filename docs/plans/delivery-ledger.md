@@ -2,6 +2,18 @@
 
 ## Current execution — 2026-10-02
 
+Owner clarification applied across Desktop: all 32 routine refresh controls in 31 feature files
+now use one shared faint 28px icon component, preserving scoped labels, handlers, loading and
+unavailable states. No new tests: existing market/watchlist and demand-loaded portfolio journeys
+PASS2/2 (5.25s); Desktop typecheck PASS. Background native inspection of 11 routes found every
+rendered refresh control icon-only, 28×28, with an accessible label and no Vite error overlay.
+Evidence: `.agents/tmp/v1-first-stock/global-refresh-{types.log,critical.log,native.json}`.
+This verifies refresh presentation/interaction, not financial availability. Lead owns the current
+prepared-source/display application integration; data compile passed, application check exposed
+one exhaustive fair-value error mapping, now corrected and being rechecked. Watcher27555 remains
+paused so the still-running older service is not replaced by an incomplete integration.
+
+
 Pushed `58a87822`: one faint28px icon refreshes the investment page; financial values/periods render in visible tables. Desktop types PASS and existing two affected product journeys PASS. Actual native window confirms exactly one refresh control with empty text, accessible Refresh investment label,28×28dimensions. This does not prove unavailable source data is fixed.
 Pushed `f236d8d4`: immutable PIT admission coordinates with unchanged pure/disk audit semantics; focused existing critical PASS1/1. Durable financial source/display and preparation-job integration remains incomplete in preserved candidate packets; agents hit usage limits, lead continues. Current source preparation packet requires controlled publication/reopen and backup/recovery integration before acceptance. Watcher resumes after the completed lead checks; one coordinated compiler remains the only build owner.
 

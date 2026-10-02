@@ -1,5 +1,6 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
-import { AlertCircle, BriefcaseBusiness, RefreshCw } from "lucide-react"
+import { AlertCircle, BriefcaseBusiness } from "lucide-react"
 
 import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -86,17 +87,8 @@ function PortfolioWorkspace({
             separate accounts or currencies.
           </p>
         </div>
-        <Button
-          variant="outline"
-          onClick={() => void accounts.query.refetch()}
-          disabled={accounts.query.isFetching}
-        >
-          <RefreshCw
-            className={accounts.query.isFetching ? "animate-spin" : ""}
-            aria-hidden="true"
-          />
-          Refresh
-        </Button>
+        <RefreshButton label="Refresh" refreshing={accounts.query.isFetching} onClick={() => void accounts.query.refetch()}
+          disabled={accounts.query.isFetching} />
       </header>
 
       <RecommendationSetup key={bootstrap.productSessionToken} transport={transport} scope={bootstrap.productSessionToken} />

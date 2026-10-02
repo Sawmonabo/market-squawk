@@ -1,3 +1,4 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import {
@@ -8,7 +9,6 @@ import {
   FileCheck2,
   Filter,
   LoaderCircle,
-  RefreshCw,
   ShieldCheck,
 } from "lucide-react"
 
@@ -136,15 +136,8 @@ function LogsWorkspace({
   return (
     <LogsFrame
       action={
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => { navigation.restart(); setSelected(null); if (cursor === undefined) void logs.refetch() }}
-          disabled={logs.isFetching}
-        >
-          <RefreshCw className={cn(logs.isFetching && "animate-spin")} aria-hidden="true" />
-          Restart query
-        </Button>
+        <RefreshButton label="Restart query" refreshing={logs.isFetching} onClick={() => { navigation.restart(); setSelected(null); if (cursor === undefined) void logs.refetch() }}
+          disabled={logs.isFetching} />
       }
     >
       <p className="sr-only" aria-live="polite">{announcement}</p>

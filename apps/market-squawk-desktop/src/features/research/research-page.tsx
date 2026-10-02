@@ -1,6 +1,7 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { AlertCircle, Database, RefreshCw, Rows3, Search } from "lucide-react"
+import { AlertCircle, Database, Rows3, Search } from "lucide-react"
 import { Link } from "react-router-dom"
 
 import { productKeys } from "@/app/query-client"
@@ -120,19 +121,10 @@ function ResearchWorkspace({
             longer work.
           </p>
         </div>
-        <Button
-          variant="outline"
-          onClick={() => {
+        <RefreshButton label="Refresh" refreshing={refreshing} onClick={() => {
             void collections.refetch()
           }}
-          disabled={refreshing}
-        >
-          <RefreshCw
-            className={refreshing ? "animate-spin" : ""}
-            aria-hidden="true"
-          />
-          Refresh
-        </Button>
+          disabled={refreshing} />
       </header>
 
       <div className="mt-6">

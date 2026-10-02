@@ -1,6 +1,7 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { CircleAlert, Copy, History, RefreshCw } from "lucide-react"
+import { CircleAlert, Copy, History } from "lucide-react"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -70,10 +71,8 @@ export function ProfileControls({ transport, scope }: {
             brief keeps the profile used to create it.
           </p>
         </div>
-        <Button variant="outline" size="sm" disabled={profiles.isFetching}
-          onClick={() => void profiles.refetch()}>
-          <RefreshCw aria-hidden="true" /> Refresh settings
-        </Button>
+        <RefreshButton label="Refresh settings" refreshing={profiles.isFetching} disabled={profiles.isFetching}
+          onClick={() => void profiles.refetch()} />
       </div>
       {profiles.isPending ? <Skeleton className="mt-4 h-36 w-full" />
         : profiles.isError ? <ProfileError />
