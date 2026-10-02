@@ -728,36 +728,45 @@ impl AccountMarketRuntimeGroup {
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
         self.begin_shutdown();
-        if let AccountMarketRuntime::Alpaca(runtime) = &self.runtime {
-            let original = runtime.historical.retirement_capability();
-            let parent = source
-                .parent_for_runtime(&original)
-                .map_err(|_| ServiceError::InvalidResult)?;
-            let receipt = source
-                .drain_exact(parent, deadline, cancellation)
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, "retained account history drain failed");
-                    if cancellation.is_cancelled() {
-                        ServiceError::Cancelled
-                    } else if Instant::now() >= deadline {
-                        ServiceError::DeadlineExceeded
-                    } else {
-                        ServiceError::Unavailable
-                    }
-                })?;
-            receipt
-                .validate_retired_runtime(&original)
-                .map_err(|_| ServiceError::InvalidResult)?;
+        let history = async {
+            if let AccountMarketRuntime::Alpaca(runtime) = &self.runtime {
+                let original = runtime.historical.retirement_capability();
+                let parent = source
+                    .parent_for_runtime(&original)
+                    .map_err(|_| ServiceError::InvalidResult)?;
+                let receipt = source
+                    .drain_exact(parent, deadline, cancellation)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(%error, "retained account history drain failed");
+                        if cancellation.is_cancelled() {
+                            ServiceError::Cancelled
+                        } else if Instant::now() >= deadline {
+                            ServiceError::DeadlineExceeded
+                        } else {
+                            ServiceError::Unavailable
+                        }
+                    })?;
+                receipt
+                    .validate_retired_runtime(&original)
+                    .map_err(|_| ServiceError::InvalidResult)?;
+            }
+            Ok::<_, ServiceError>(())
         }
-        let mut failure = join_retained_monitor_before(
-            &mut self.currentness_monitor,
-            &mut self.monitor_result,
-            deadline,
-            cancellation,
-        )
-        .await
-        .err();
+        .await;
+        // A failed original drain remains a failed stop, but every retained child still
+        // reaches its own cleanup barrier. No replacement allocation is touched here.
+        let mut failure = history.err();
+        retain_shutdown_error(
+            &mut failure,
+            join_retained_monitor_before(
+                &mut self.currentness_monitor,
+                &mut self.monitor_result,
+                deadline,
+                cancellation,
+            )
+            .await,
+        );
         retain_shutdown_error(
             &mut failure,
             self.runtime
@@ -934,7 +943,7 @@ impl AlpacaRuntimeGroup {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
-        // The published caller already holds the exact coordinator drain receipt.
+        // The published caller retains any original drain failure while joining every child.
         self.begin_shutdown();
         let mut failure = await_before(deadline, cancellation, self.historical.finish_shutdown())
             .await

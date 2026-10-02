@@ -330,6 +330,10 @@ enum AlpacaHistoricalDrainEvidence {
         admission: ResearchProviderAdmission,
     },
     NoInstallation,
+    NoInstallationAfterStopped {
+        parent: AlpacaHistoricalParentGeneration,
+        admission: ResearchProviderAdmission,
+    },
 }
 
 /// Non-cloneable proof that one exact Alpaca history parent can be retired.
@@ -347,6 +351,10 @@ pub(crate) struct AlpacaHistoricalSuccessorDrainReceipt {
 enum AlpacaHistoricalDrainProof {
     Installed(ResearchProviderAdmission),
     NoInstallation,
+    NoInstallationAfterStopped {
+        parent: AlpacaHistoricalParentGeneration,
+        admission: ResearchProviderAdmission,
+    },
 }
 
 impl AlpacaHistoricalSuccessorDrainReceipt {
@@ -367,6 +375,15 @@ impl AlpacaHistoricalSuccessorDrainReceipt {
             AlpacaHistoricalDrainEvidence::NoInstallation => {
                 AlpacaHistoricalDrainProof::NoInstallation
             }
+            AlpacaHistoricalDrainEvidence::NoInstallationAfterStopped { parent, admission } => {
+                if parent.group_generation() == retired_parent.group_generation() {
+                    return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+                }
+                if !admission.revocation_drained() {
+                    return Err(AlpacaHistoricalSourceSlotError::DrainIncomplete);
+                }
+                AlpacaHistoricalDrainProof::NoInstallationAfterStopped { parent, admission }
+            }
         };
         Ok(Self {
             retired_parent,
@@ -381,12 +398,27 @@ impl AlpacaHistoricalSuccessorDrainReceipt {
         runtime: &AlpacaHistoricalRuntimeCapability,
     ) -> Result<(), AlpacaHistoricalSourceSlotError> {
         let current = AlpacaHistoricalParentGeneration::try_from_runtime(runtime)?;
+        self.validate_retired_parent(current)
+    }
+
+    fn validate_retired_parent(
+        &self,
+        current: AlpacaHistoricalParentGeneration,
+    ) -> Result<(), AlpacaHistoricalSourceSlotError> {
         if current != self.retired_parent {
             return Err(AlpacaHistoricalSourceSlotError::StaleParent);
         }
-        if let AlpacaHistoricalDrainProof::Installed(admission) = &self.proof
-            && !admission.revocation_drained()
-        {
+        let admission = match &self.proof {
+            AlpacaHistoricalDrainProof::Installed(admission) => Some(admission),
+            AlpacaHistoricalDrainProof::NoInstallation => None,
+            AlpacaHistoricalDrainProof::NoInstallationAfterStopped { parent, admission } => {
+                if parent.group_generation() == current.group_generation() {
+                    return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+                }
+                Some(admission)
+            }
+        };
+        if admission.is_some_and(|admission| !admission.revocation_drained()) {
             return Err(AlpacaHistoricalSourceSlotError::DrainIncomplete);
         }
         Ok(())
@@ -885,15 +917,11 @@ async fn drain_slot(
                 AlpacaHistoricalSourceSlot::Installing {
                     parent, completion, ..
                 } => {
-                    if expected_parent.is_some_and(|expected| expected != *parent) {
-                        return Err(AlpacaHistoricalSourceSlotError::StaleParent);
-                    }
+                    require_drain_parent(expected_parent, *parent, "installing")?;
                     Action::WaitInstall(Arc::clone(completion))
                 }
                 AlpacaHistoricalSourceSlot::Active(stable) => {
-                    if expected_parent.is_some_and(|expected| expected != stable.parent) {
-                        return Err(AlpacaHistoricalSourceSlotError::StaleParent);
-                    }
+                    require_drain_parent(expected_parent, stable.parent, "active")?;
                     let stable = stable.clone();
                     stable.admission.revoke();
                     authority
@@ -907,15 +935,15 @@ async fn drain_slot(
                     Action::StartDrain(stable, completion)
                 }
                 AlpacaHistoricalSourceSlot::Draining { stable, completion } => {
-                    if expected_parent.is_some_and(|expected| expected != stable.parent) {
-                        return Err(AlpacaHistoricalSourceSlotError::StaleParent);
-                    }
+                    require_drain_parent(expected_parent, stable.parent, "draining")?;
                     Action::WaitDrain(Arc::clone(completion))
                 }
                 AlpacaHistoricalSourceSlot::ReconciliationRequired(stable) => {
-                    if expected_parent.is_some_and(|expected| expected != stable.parent) {
-                        return Err(AlpacaHistoricalSourceSlotError::StaleParent);
-                    }
+                    require_drain_parent(
+                        expected_parent,
+                        stable.parent,
+                        "reconciliation-required",
+                    )?;
                     let stable = stable.clone();
                     stable.admission.revoke();
                     let completion = AlpacaHistoricalDrainCompletion::new();
@@ -926,16 +954,28 @@ async fn drain_slot(
                     Action::StartDrain(stable, completion)
                 }
                 AlpacaHistoricalSourceSlot::Stopped(stable) => {
-                    if expected_parent.is_some_and(|expected| expected != stable.parent) {
-                        return Err(AlpacaHistoricalSourceSlotError::StaleParent);
-                    }
                     if !stable.admission.revocation_drained() {
                         return Err(AlpacaHistoricalSourceSlotError::DrainIncomplete);
                     }
-                    Action::Done(AlpacaHistoricalDrainEvidence::Installed {
-                        parent: stable.parent,
-                        admission: stable.admission.clone(),
-                    })
+                    if let Some(expected) =
+                        expected_parent.filter(|expected| *expected != stable.parent)
+                    {
+                        // History installation is lazy. Another fully stopped generation
+                        // proves that this owner has no installed history to drain. Retain
+                        // the exact terminal admission; never apply this to a live slot.
+                        if expected.group_generation() == stable.parent.group_generation() {
+                            require_drain_parent(Some(expected), stable.parent, "stopped")?;
+                        }
+                        Action::Done(AlpacaHistoricalDrainEvidence::NoInstallationAfterStopped {
+                            parent: stable.parent,
+                            admission: stable.admission.clone(),
+                        })
+                    } else {
+                        Action::Done(AlpacaHistoricalDrainEvidence::Installed {
+                            parent: stable.parent,
+                            admission: stable.admission.clone(),
+                        })
+                    }
                 }
             }
         };
@@ -962,6 +1002,23 @@ async fn drain_slot(
             }
         }
     }
+}
+
+fn require_drain_parent(
+    expected: Option<AlpacaHistoricalParentGeneration>,
+    actual: AlpacaHistoricalParentGeneration,
+    slot_state: &'static str,
+) -> Result<(), AlpacaHistoricalSourceSlotError> {
+    if let Some(expected) = expected.filter(|expected| *expected != actual) {
+        tracing::warn!(
+            ?expected,
+            ?actual,
+            slot_state,
+            "historical retirement rejected a different parent"
+        );
+        return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+    }
+    Ok(())
 }
 
 fn spawn_drain_worker(
@@ -2494,6 +2551,17 @@ mod tests {
             Err(AlpacaHistoricalSourceSlotError::StaleParent)
         ));
 
+        assert!(matches!(
+            mutation
+                .drain_exact(
+                    successor_parent,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(AlpacaHistoricalSourceSlotError::StaleParent)
+        ));
+
         first_cancel.cancel();
         assert!(matches!(
             first_waiter.await?,
@@ -2546,6 +2614,30 @@ mod tests {
             "alpaca.test-history"
         );
 
+        // A different retiring owner cannot revoke an active installation, and an
+        // admission is not absence evidence until its actual publication barrier drains.
+        assert!(matches!(
+            mutation
+                .drain_exact(
+                    successor_parent,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(AlpacaHistoricalSourceSlotError::StaleParent)
+        ));
+        first_authorized.validate_current()?;
+        assert!(matches!(
+            AlpacaHistoricalSuccessorDrainReceipt::try_from_evidence(
+                successor_parent,
+                AlpacaHistoricalDrainEvidence::NoInstallationAfterStopped {
+                    parent: first_parent,
+                    admission: first_receipt.admission.clone(),
+                },
+            ),
+            Err(AlpacaHistoricalSourceSlotError::DrainIncomplete)
+        ));
+
         let abandoned_drain_waiter = {
             let mutation = Arc::clone(&mutation);
             tokio::spawn(async move {
@@ -2566,6 +2658,17 @@ mod tests {
                 .is_err_and(|error| error.is_cancelled())
         );
         assert_slot_draining(&coordinator, first_parent)?;
+        assert!(matches!(
+            mutation
+                .drain_exact(
+                    successor_parent,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(AlpacaHistoricalSourceSlotError::StaleParent)
+        ));
+        assert!(!first_receipt.admission.revocation_drained());
         drop(first_authorized);
         mutation
             .drain_exact_for_test(
@@ -2591,6 +2694,42 @@ mod tests {
                 &CancellationToken::new(),
             ),
             Err(AlpacaHistoricalSourceSlotError::StaleLease)
+        ));
+
+        // The successor may have opened no lazy history yet. A stopped predecessor
+        // proves absence without revoking, replacing or relabelling that original slot.
+        let no_successor_installation = mutation
+            .drain_exact(
+                successor_parent,
+                Instant::now() + Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
+            .await?;
+        no_successor_installation.validate_retired_parent(successor_parent)?;
+        assert!(matches!(
+            no_successor_installation.validate_retired_parent(first_parent),
+            Err(AlpacaHistoricalSourceSlotError::StaleParent)
+        ));
+        assert!(matches!(
+            &no_successor_installation.proof,
+            AlpacaHistoricalDrainProof::NoInstallationAfterStopped { parent, admission }
+                if *parent == first_parent && admission.matches(&first_receipt.admission)
+                    && admission.revocation_drained()
+        ));
+        assert_slot_stopped(&coordinator, first_parent)?;
+        let conflicting_binding = AlpacaHistoricalParentGeneration::try_from_test_digests(
+            first_parent.group_generation().digest(),
+            successor_parent.binding_digest(),
+        )?;
+        assert!(matches!(
+            mutation
+                .drain_exact(
+                    conflicting_binding,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(AlpacaHistoricalSourceSlotError::StaleParent)
         ));
 
         let successor_candidate_metadata = metadata.clone();
@@ -2645,6 +2784,19 @@ mod tests {
             successor_authorized.provider_dataset().as_str(),
             "alpaca:test-history"
         );
+        // The old receipt and parent cannot retire the now-active replacement.
+        assert!(matches!(
+            mutation
+                .drain_exact(
+                    first_parent,
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(AlpacaHistoricalSourceSlotError::StaleParent)
+        ));
+        successor_authorized.validate_current()?;
+        successor_receipt.admission.ensure_live()?;
         drop(successor_authorized);
         assert!(matches!(
             mutation.validate_plan_receipt(

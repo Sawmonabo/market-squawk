@@ -273,6 +273,29 @@ impl ProviderAccountRuntimeCurrentness {
         };
         authority.require_current_now().is_ok()
     }
+
+    /// Cheap temporal rejection for pure computation over an already admitted account.
+    ///
+    /// This does not validate durable currentness or replace publication authority. The caller
+    /// must perform full admission and exit validation: a credential's independent expiry or a
+    /// durable revocation can invalidate the lease even when this retained time window is open.
+    pub(crate) fn retained_time_window_contains(
+        &self,
+        at: market_squawk_domain::Timestamp,
+    ) -> bool {
+        let Some(authority) = self.authority.upgrade() else {
+            return false;
+        };
+        let lease = &authority.lease;
+        at >= lease.issued_at()
+            && at >= lease.authority_effective_at()
+            && lease
+                .verification_expires_at()
+                .is_none_or(|expires_at| at < expires_at)
+            && lease
+                .runtime_verification_evidence()
+                .admits_activation_at(at)
+    }
 }
 
 /// Exact account owner and its existing onboarding read guard held through publication.

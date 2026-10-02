@@ -431,6 +431,23 @@ impl AlpacaHistoricalRuntimeCapability {
         }
         self.inner.ensure_usable()
     }
+
+    /// Rejects revoked/expired pure batch work without replaying durable activation per row.
+    /// Full currentness still gates extraction boundaries and every sealed-capture rejoin.
+    pub(super) fn validate_normalization_at(
+        &self,
+        at: market_squawk_domain::Timestamp,
+    ) -> Result<(), AlpacaHistoricalCapabilityError> {
+        self.inner.ensure_usable()?;
+        if !self
+            .inner
+            .account_currentness
+            .retained_time_window_contains(at)
+        {
+            return Err(AlpacaHistoricalCapabilityError::Stale);
+        }
+        self.inner.ensure_usable()
+    }
 }
 
 impl fmt::Debug for AlpacaHistoricalRuntimeCapability {

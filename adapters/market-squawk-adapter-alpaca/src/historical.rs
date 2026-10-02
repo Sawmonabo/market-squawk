@@ -342,6 +342,21 @@ pub trait AlpacaHistoricalBarTimeAuthority: Send + Sync + 'static {
         &self,
         request: &AlpacaHistoricalBarTimeRequest,
     ) -> Result<BarTimeSemantics, AlpacaError>;
+
+    /// Resolves one row inside a batch with full currentness checks at both boundaries.
+    ///
+    /// An override may use cheap revocation/time checks over immutable admitted coordinates.
+    /// This method grants no publication authority: extraction and sealed rejoin retain the
+    /// original authority and must call `validate_current` before returning their results.
+    fn resolve_in_validated_batch(
+        &self,
+        request: &AlpacaHistoricalBarTimeRequest,
+    ) -> Result<BarTimeSemantics, AlpacaError> {
+        self.validate_current()?;
+        let resolved = self.resolve(request)?;
+        self.validate_current()?;
+        Ok(resolved)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -964,6 +979,9 @@ impl AlpacaHistoricalEquitySource {
             return Err(ExtractionSourceError::Cancelled);
         }
         self.validate_authority(&authority)?;
+        self.bar_time_authority
+            .validate_current()
+            .map_err(map_adapter_error)?;
         if request.object().source_id() != self.config.metadata().source_id()
             || request.object().metadata_revision() != self.config.metadata().revision()
         {
@@ -1040,6 +1058,15 @@ impl AlpacaHistoricalEquitySource {
                 return Err(SourceError::GenerationResynchronizationRequired.into());
             }
             for bar in parsed.bars {
+                // Keep retained-byte processing cooperative without extending the admitted
+                // operation or borrowing publication/activation ownership across the batch.
+                if returned_index.is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
+                if cancellation.is_cancelled() {
+                    return Err(ExtractionSourceError::Cancelled);
+                }
+                ensure_wall_deadline(request.deadline()).map_err(map_adapter_error)?;
                 let returned =
                     parse_returned_bar_time(&bar.timestamp).map_err(map_adapter_error)?;
                 if self.preflight.returned_bar_times.get(returned_index) != Some(&returned) {
@@ -1411,9 +1438,7 @@ fn normalize_bar(
         timeframe.clone(),
         effective_at,
     );
-    bar_time_authority.validate_current()?;
-    let time_semantics = bar_time_authority.resolve(&request)?;
-    bar_time_authority.validate_current()?;
+    let time_semantics = bar_time_authority.resolve_in_validated_batch(&request)?;
     let period = time_semantics
         .timestamped_period()
         .ok_or(AlpacaError::Protocol)?;
@@ -2919,10 +2944,22 @@ mod capture_tests {
             SourceIdentifier::try_from("iex-history-test-session-v1")?,
             EvidenceDigest::new(DigestAlgorithm::Sha256, [51; 32]),
         )?;
-        struct TimeAuthority(MarketBarSessionEvidence);
+        struct TimeAuthority {
+            session: MarketBarSessionEvidence,
+            full_checks: AtomicUsize,
+            rows: AtomicUsize,
+            cancelled_row: std::sync::Mutex<Option<CancellationToken>>,
+            revoke_during_row: AtomicBool,
+            revoked: AtomicBool,
+        }
         impl AlpacaHistoricalBarTimeAuthority for TimeAuthority {
             fn validate_current(&self) -> Result<(), AlpacaError> {
-                Ok(())
+                self.full_checks.fetch_add(1, AtomicOrdering::SeqCst);
+                if self.revoked.load(AtomicOrdering::SeqCst) {
+                    Err(AlpacaError::Protocol)
+                } else {
+                    Ok(())
+                }
             }
             fn resolve(
                 &self,
@@ -2935,9 +2972,28 @@ mod capture_tests {
                         .checked_add_nanos(86_400_000_000_000)
                         .map_err(|_| AlpacaError::Protocol)?,
                     BarTimestampBasis::PeriodStart,
-                    self.0.clone(),
+                    self.session.clone(),
                 )
                 .map_err(|_| AlpacaError::Protocol)
+            }
+
+            fn resolve_in_validated_batch(
+                &self,
+                request: &AlpacaHistoricalBarTimeRequest,
+            ) -> Result<BarTimeSemantics, AlpacaError> {
+                self.rows.fetch_add(1, AtomicOrdering::SeqCst);
+                if let Some(cancellation) = self
+                    .cancelled_row
+                    .lock()
+                    .map_err(|_| AlpacaError::Protocol)?
+                    .take()
+                {
+                    cancellation.cancel();
+                }
+                if self.revoke_during_row.load(AtomicOrdering::SeqCst) {
+                    self.revoked.store(true, AtomicOrdering::SeqCst);
+                }
+                self.resolve(request)
             }
         }
         let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
@@ -3029,10 +3085,18 @@ mod capture_tests {
         let calendar_body = Bytes::from(serde_json::to_vec(&preflight.returned_bar_times.iter().map(|value| {
             serde_json::json!({"date": value.calendar_date().to_string(), "open": "09:30", "close": "16:00"})
         }).collect::<Vec<_>>())?);
+        let time_authority = Arc::new(TimeAuthority {
+            session,
+            full_checks: AtomicUsize::new(0),
+            rows: AtomicUsize::new(0),
+            cancelled_row: std::sync::Mutex::new(None),
+            revoke_during_row: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+        });
         let source = AlpacaHistoricalEquitySource::try_from_preflight(
             config.clone(),
             vec![definition],
-            Arc::new(TimeAuthority(session)),
+            time_authority.clone(),
             Arc::new(preflight),
             vec![identity.clone()],
         )?;
@@ -3111,6 +3175,8 @@ mod capture_tests {
                 )?],
             )?)
         };
+        let checks_before = time_authority.full_checks.load(AtomicOrdering::SeqCst);
+        let rows_before = time_authority.rows.load(AtomicOrdering::SeqCst);
         let (pending, seal_request) = source
             .extract_for_sealing(
                 authority.clone(),
@@ -3120,6 +3186,15 @@ mod capture_tests {
                 semantic.clone(),
             )
             .await?;
+        assert_eq!(
+            time_authority.rows.load(AtomicOrdering::SeqCst) - rows_before,
+            2
+        );
+        assert_eq!(
+            time_authority.full_checks.load(AtomicOrdering::SeqCst) - checks_before,
+            3,
+            "full checks belong to extraction admission, exit and seal preparation, not each row"
+        );
         struct TemporaryRoot(std::path::PathBuf);
         impl Drop for TemporaryRoot {
             fn drop(&mut self) {
@@ -3132,6 +3207,11 @@ mod capture_tests {
         let paths = market_squawk_platform::LocalPaths::prepare(&root.0)?;
         let store = paths.sealed_research_journal_store()?;
         let (binding, revisions) = pending.try_rejoin(seal_request.seal(&store)?)?;
+        assert_eq!(
+            time_authority.full_checks.load(AtomicOrdering::SeqCst) - checks_before,
+            5,
+            "sealed rejoin must retain both full checks on the original time authority"
+        );
         binding.validate()?;
         assert!(revisions.native_lineage_required());
         assert_eq!(binding.record_count(), 2);
@@ -3163,6 +3243,48 @@ mod capture_tests {
                 exact_evidence(&original_bodies[index]).content_digest()
             );
         }
+        let cancelled = CancellationToken::new();
+        *time_authority
+            .cancelled_row
+            .lock()
+            .map_err(|_| "cancel fixture lock")? = Some(cancelled.clone());
+        let rows_before = time_authority.rows.load(AtomicOrdering::SeqCst);
+        assert!(matches!(
+            source
+                .extract_for_sealing(
+                    authority.clone(),
+                    request.clone(),
+                    cancelled,
+                    calendar()?,
+                    semantic.clone(),
+                )
+                .await,
+            Err(ExtractionSourceError::Cancelled)
+        ));
+        assert_eq!(
+            time_authority.rows.load(AtomicOrdering::SeqCst) - rows_before,
+            1,
+            "cancellation during a row must stop before normalizing the next row"
+        );
+        time_authority
+            .revoke_during_row
+            .store(true, AtomicOrdering::SeqCst);
+        assert!(
+            source
+                .extract_for_sealing(
+                    authority.clone(),
+                    request.clone(),
+                    CancellationToken::new(),
+                    calendar()?,
+                    semantic.clone(),
+                )
+                .await
+                .is_err()
+        );
+        time_authority
+            .revoke_during_row
+            .store(false, AtomicOrdering::SeqCst);
+        time_authority.revoked.store(false, AtomicOrdering::SeqCst);
         // Same logical graph sealed by a different request cannot satisfy this continuation.
         let (first, _first_request) = source
             .extract_for_sealing(

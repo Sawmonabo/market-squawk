@@ -98,6 +98,41 @@ pub(crate) struct AlpacaHistoricalCompositeCalendarAuthority {
 }
 
 impl AlpacaHistoricalCompositeCalendarAuthority {
+    fn resolve_exact_fragment(
+        &self,
+        request: &AlpacaHistoricalBarTimeRequest,
+    ) -> Result<BarTimeSemantics, AlpacaError> {
+        if request.instrument_id() != self.instrument_id
+            || request.provider_instrument_id() != &self.provider_instrument_id
+            || request.venue_id() != &self.venue_id
+            || request.timeframe() != &self.timeframe
+        {
+            return Err(AlpacaError::Protocol);
+        }
+        let index = self
+            .fragments
+            .binary_search_by_key(&request.provider_timestamp(), |fragment| {
+                fragment.returned.provider_timestamp()
+            })
+            .map_err(|_| AlpacaError::Protocol)?;
+        let fragment = self.fragments.get(index).ok_or(AlpacaError::Protocol)?;
+        let resolved = fragment.authority.resolve(request)?;
+        if resolved != fragment.original_semantics
+            || resolved.provider_timestamp() != Some(fragment.returned.provider_timestamp())
+            || resolved.timestamp_basis() != Some(self.series_semantics.timestamp_basis())
+        {
+            return Err(AlpacaError::Protocol);
+        }
+        let resolved = resolved.timestamped_period().ok_or(AlpacaError::Protocol)?;
+        BarTimeSemantics::try_new(
+            resolved.period_start(),
+            resolved.period_end_exclusive(),
+            resolved.timestamp_basis(),
+            self.series_semantics.session().clone(),
+        )
+        .map_err(|_| AlpacaError::Protocol)
+    }
+
     pub(crate) const fn series_semantics(&self) -> &AlpacaHistoricalSeriesSemantics {
         &self.series_semantics
     }
@@ -246,37 +281,30 @@ impl AlpacaHistoricalBarTimeAuthority for AlpacaHistoricalCompositeCalendarAutho
         request: &AlpacaHistoricalBarTimeRequest,
     ) -> Result<BarTimeSemantics, AlpacaError> {
         self.validate_current()?;
-        if request.instrument_id() != self.instrument_id
-            || request.provider_instrument_id() != &self.provider_instrument_id
-            || request.venue_id() != &self.venue_id
-            || request.timeframe() != &self.timeframe
-        {
-            return Err(AlpacaError::Protocol);
-        }
-        let index = self
-            .fragments
-            .binary_search_by_key(&request.provider_timestamp(), |fragment| {
-                fragment.returned.provider_timestamp()
-            })
-            .map_err(|_| AlpacaError::Protocol)?;
-        let fragment = self.fragments.get(index).ok_or(AlpacaError::Protocol)?;
-        let resolved = fragment.authority.resolve(request)?;
-        if resolved != fragment.original_semantics
-            || resolved.provider_timestamp() != Some(fragment.returned.provider_timestamp())
-            || resolved.timestamp_basis() != Some(self.series_semantics.timestamp_basis())
-        {
-            return Err(AlpacaError::Protocol);
-        }
-        let resolved = resolved.timestamped_period().ok_or(AlpacaError::Protocol)?;
-        let rebound = BarTimeSemantics::try_new(
-            resolved.period_start(),
-            resolved.period_end_exclusive(),
-            resolved.timestamp_basis(),
-            self.series_semantics.session().clone(),
-        )
-        .map_err(|_| AlpacaError::Protocol)?;
+        let rebound = self.resolve_exact_fragment(request)?;
         self.validate_current()?;
         Ok(rebound)
+    }
+
+    fn resolve_in_validated_batch(
+        &self,
+        request: &AlpacaHistoricalBarTimeRequest,
+    ) -> Result<BarTimeSemantics, AlpacaError> {
+        let check = || {
+            self.runtime
+                .validate_normalization_at(
+                    SystemMarketCalendarClock
+                        .now()
+                        .map_err(|_| AlpacaError::Protocol)?,
+                )
+                .map_err(|_| AlpacaError::Protocol)
+        };
+        check()?;
+        // Each selected calendar still checks its own revocation and exact temporal validity.
+        // All sessions and durable account state are validated at extraction boundaries.
+        let resolved = self.resolve_exact_fragment(request)?;
+        check()?;
+        Ok(resolved)
     }
 }
 
