@@ -66,6 +66,8 @@ if (mode === 'build') {
   } });
   try {
     assert.equal(changeMask("apps/market-squawk-desktop/src/pages/home.tsx"), 0);
+    assert.equal(changeMask("apps/market-squawk/tests/production_mcp_composition.rs"), 0);
+    assert.equal(changeMask("adapters/market-squawk-adapter-sec/tests/official_fixtures.rs"), 0);
     assert.equal(changeMask("vendor/kernel.rs"), SERVICE | NATIVE);
     supervisor.request(SERVICE);
     await supervisor.flush();

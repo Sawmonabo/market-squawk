@@ -19,6 +19,7 @@ export function changeMask(relative) {
   const name = relative.split(path.sep).join("/");
   if (name.startsWith("../") || name === ".." || name.split("/").some((part) => IGNORED.has(part))) return 0;
   if (name.startsWith("python/")) return 0; // The model-runtime refresh workflow owns these inputs.
+  if (/^(?:apps|adapters|crates)\/[^/]+\/tests(?:\/|$)/.test(name)) return 0;
   if (name.startsWith("apps/market-squawk-desktop/src-tauri/")) return NATIVE;
   if (name.startsWith("apps/market-squawk-desktop/")) return 0; // Vite owns frontend HMR.
   if (name === "apps/market-squawk/src/bin/market-squawk-service.rs"
