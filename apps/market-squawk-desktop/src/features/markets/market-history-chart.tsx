@@ -60,6 +60,8 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
   const chartRef = useRef<IChartApi | null>(null)
   const candlesRef = useRef<ISeriesApi<"Candlestick"> | null>(null)
   const closeRef = useRef<ISeriesApi<"Line">[]>([])
+  const originalByTime = useRef(new Map<string, string>())
+  const viewportBounds = useRef(history.viewport)
   const layerVisibility = useRef({ candles: false, close: true })
   const lastRange = useRef<{ from: Time; to: Time } | null>(null)
   const interacting = useRef(false)
@@ -90,37 +92,20 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
     }
   }
   const selectedOriginal = selectedCoordinate === null ? null : visibleBars.find((bar) => coordinate(bar) === selectedCoordinate) ?? null
-  useDebouncedChartCallback(selectedOriginal === null ? null : `${coordinate(selectedOriginal)}:${selectedOriginal.originalOrdinal}`, selectedOriginal, onObservationSelect)
+  useDebouncedChartCallback(selectedOriginal === null ? null : `${history.generationToken}:${coordinate(selectedOriginal)}:${selectedOriginal.originalOrdinal}`, selectedOriginal, onObservationSelect)
   const selectedIndex = visibleBars.findIndex((bar) => coordinate(bar) === selectedCoordinate)
   const index = selectedIndex >= 0 ? selectedIndex : visibleBars.length - 1
   const selected = visibleBars[index]
+  useEffect(() => {
+    viewportBounds.current = history.viewport
+  }, [history.viewport])
   useEffect(() => {
     layerVisibility.current = { candles: showCandles, close: showClose }
     candlesRef.current?.applyOptions({ visible: showCandles })
     closeRef.current.forEach((series) => series.applyOptions({ visible: showClose }))
   }, [showCandles, showClose])
   useEffect(() => {
-    if (!container.current || !visibleBars.length) return
-    setDrawingIssue(null)
-    const data: CandlestickData<Time>[] = []
-    const originalByTime = new Map<string, string>()
-    for (const bar of visibleBars) {
-      const open = Number(bar.open), high = Number(bar.high), low = Number(bar.low), close = Number(bar.close)
-      // Decimal conversion is only for drawing. Hover and keyboard readouts retain source amounts.
-      if (![open, high, low, close].every(Number.isFinite)) { setDrawingIssue("These original amounts exceed chart drawing precision. Inspect their exact values below."); return }
-      let time: Time
-      if (bar.time.precision === "nominal_date") {
-        const [year, month, day] = bar.time.date.split("-").map(Number)
-        time = { year: year!, month: month!, day: day! } satisfies BusinessDay
-      } else {
-        const seconds = Number(sourceInstantUnixNanos(bar.time.startsAt)) / 1_000_000_000
-        if (!Number.isFinite(seconds)) return
-        time = seconds as UTCTimestamp
-      }
-      if (originalByTime.has(timeKey(time))) { setDrawingIssue("These original periods are closer than chart drawing precision. Inspect their exact dates and values below."); return }
-      data.push({ time, open, high, low, close })
-      originalByTime.set(timeKey(time), coordinate(bar))
-    }
+    if (!container.current) return
     const chart = createChart(container.current, {
       autoSize: true, height: 330,
       layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: "#94a3b8" },
@@ -132,33 +117,19 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
       upColor: "#34d399", downColor: "#fb7185", borderVisible: false,
       wickUpColor: "#34d399", wickDownColor: "#fb7185", visible: layerVisibility.current.candles,
     })
-    const segments: { time: Time; value: number }[][] = []
-    let segment: { time: Time; value: number }[] = []
-    data.forEach((bar, index) => {
-      if (visibleBars[index]!.breakBefore[2] && segment.length > 0) { segments.push(segment); segment = [] }
-      segment.push({ time: bar.time, value: bar.close })
-    })
-    if (segment.length > 0) segments.push(segment)
-    const close = segments.map((points) => {
-      const series = chart.addSeries(LineSeries, { color: "#e2e8f0", lineWidth: 2, visible: layerVisibility.current.close })
-      series.setData(points)
-      return series
-    })
     chartRef.current = chart
     candlesRef.current = candles
-    closeRef.current = close
-    candles.setData(data)
     chart.subscribeCrosshairMove((event) => {
       if (event.time === undefined) return
-      const original = originalByTime.get(timeKey(event.time))
+      const original = originalByTime.current.get(timeKey(event.time))
       if (original !== undefined) setSelectedCoordinate(original)
     })
     interacting.current = false
-    if (lastRange.current) chart.timeScale().setVisibleRange(lastRange.current)
-    else chart.timeScale().fitContent()
+    // A precision change owns a new time scale; routine refresh keeps this chart.
+    lastRange.current = null
     chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
       if (!range || !interacting.current) return
-      const bounds = history.viewport
+      const bounds = viewportBounds.current
       const request: MarketHistoryViewportInput = { pointLimit: 512 }
       if (nominal) {
         if (bounds.fullStartDate === null || bounds.fullEndDate === null) return
@@ -181,11 +152,75 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
       setSelectedCoordinate(null)
     })
     return () => {
-      if (chartRef.current === chart) chartRef.current = null
-      if (candlesRef.current === candles) candlesRef.current = null
-      if (closeRef.current === close) closeRef.current = []
+      if (chartRef.current === chart) {
+        chartRef.current = null
+        candlesRef.current = null
+        closeRef.current = []
+        originalByTime.current.clear()
+      }
       chart.remove()
     }
+  }, [nominal])
+  useEffect(() => {
+    const chart = chartRef.current
+    const candles = candlesRef.current
+    if (!chart || !candles) return
+    setDrawingIssue(null)
+    interacting.current = false
+    const clearDrawing = () => {
+      originalByTime.current.clear()
+      candles.setData([])
+      closeRef.current.forEach((series) => series.setData([]))
+    }
+    const data: CandlestickData<Time>[] = []
+    const coordinates = new Map<string, string>()
+    for (const bar of visibleBars) {
+      const open = Number(bar.open), high = Number(bar.high), low = Number(bar.low), close = Number(bar.close)
+      // Decimal conversion is only for drawing. Hover and keyboard readouts retain source amounts.
+      if (![open, high, low, close].every(Number.isFinite)) {
+        clearDrawing()
+        setDrawingIssue("These original amounts exceed chart drawing precision. Inspect their exact values below.")
+        return
+      }
+      let time: Time
+      if (bar.time.precision === "nominal_date") {
+        const [year, month, day] = bar.time.date.split("-").map(Number)
+        time = { year: year!, month: month!, day: day! } satisfies BusinessDay
+      } else {
+        const seconds = Number(sourceInstantUnixNanos(bar.time.startsAt)) / 1_000_000_000
+        if (!Number.isFinite(seconds)) { clearDrawing(); return }
+        time = seconds as UTCTimestamp
+      }
+      if (coordinates.has(timeKey(time))) {
+        clearDrawing()
+        setDrawingIssue("These original periods are closer than chart drawing precision. Inspect their exact dates and values below.")
+        return
+      }
+      data.push({ time, open, high, low, close })
+      coordinates.set(timeKey(time), coordinate(bar))
+    }
+    const segments: { time: Time; value: number }[][] = []
+    let segment: { time: Time; value: number }[] = []
+    data.forEach((bar, index) => {
+      if (visibleBars[index]!.breakBefore[2] && segment.length > 0) { segments.push(segment); segment = [] }
+      segment.push({ time: bar.time, value: bar.close })
+    })
+    if (segment.length > 0) segments.push(segment)
+    // Reuse each existing segment series. Gap changes own only the necessary
+    // additions/removals, so the canvas, layers and selected range remain intact.
+    while (closeRef.current.length > segments.length) chart.removeSeries(closeRef.current.pop()!)
+    segments.forEach((points, index) => {
+      let series = closeRef.current[index]
+      if (!series) {
+        series = chart.addSeries(LineSeries, { color: "#e2e8f0", lineWidth: 2, visible: layerVisibility.current.close })
+        closeRef.current.push(series)
+      }
+      series.setData(points)
+    })
+    originalByTime.current = coordinates
+    candles.setData(data)
+    if (lastRange.current) chart.timeScale().setVisibleRange(lastRange.current)
+    else chart.timeScale().fitContent()
   }, [visibleBars, nominal])
   return <figure className="mt-4">
     <div className="flex flex-wrap items-center gap-4 text-xs">
