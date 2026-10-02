@@ -22,6 +22,7 @@ struct WriterState {
     schema: SchemaRef,
     active_limit: usize,
     page_bytes: usize,
+    row_group_bytes: usize,
     metadata_bytes: usize,
     memory: Option<QueryArtifactMemoryLease>,
     memory_limit: u64,
@@ -159,25 +160,21 @@ impl ParquetObjectStore {
             .checked_div(schema.fields().len().max(1))
             .ok_or(ParquetStoreError::SizeOverflow)?
             .clamp(1, QUERY_WRITER_PAGE_BYTES);
+        // Use the existing budget-derived byte target for every streaming writer. Waiting
+        // only for a row-count boundary can leave no room for the next bounded input batch
+        // beside the accumulated encoder and its flush workspace.
+        let row_group_bytes = usize::try_from(memory_limit / 16)
+            .map_err(|_| ParquetStoreError::SizeOverflow)?
+            .max(1);
         let properties = WriterProperties::builder()
             .set_max_row_group_row_count(Some(self.config.max_row_group_rows))
+            .set_max_row_group_bytes(Some(row_group_bytes))
             .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
             .set_write_page_header_statistics(false)
             .set_data_page_size_limit(page_bytes)
             .set_write_batch_size((page_bytes / size_of::<u64>()).clamp(1, 1024));
-        // Leave decoder headroom for one already-admitted large row crossing the soft group
-        // target. The ordinary leased writers retain their existing properties.
-        let properties = if scratch.is_some() {
-            properties.set_max_row_group_bytes(Some(
-                usize::try_from(memory_limit / 16)
-                    .map_err(|_| ParquetStoreError::SizeOverflow)?
-                    .max(1),
-            ))
-        } else {
-            properties
-        };
         let writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties.build()))?;
         Ok(StreamingParquetWriter {
             state: Some(WriterState {
@@ -189,6 +186,7 @@ impl ParquetObjectStore {
                 schema,
                 active_limit: 0,
                 page_bytes,
+                row_group_bytes,
                 metadata_bytes: 0,
                 memory,
                 memory_limit,
@@ -355,6 +353,13 @@ impl WriterState {
             .ok_or(ParquetStoreError::SizeOverflow)?;
         if u64::try_from(working).map_err(|_| ParquetStoreError::SizeOverflow)? > self.memory_limit
         {
+            self.report_memory_rejection(
+                "flush_admission",
+                working,
+                batch.get_array_memory_size(),
+                self.metadata_bytes,
+                self.active_limit,
+            );
             return Err(ParquetStoreError::WriterMemoryLimitExceeded {
                 limit: self.memory_limit,
             });
@@ -389,8 +394,24 @@ impl WriterState {
             .len()
             .checked_add(usize::from(self.writer.in_progress_rows() > 0))
             .ok_or(ParquetStoreError::SizeOverflow)?;
+        // Byte-triggered groups can outnumber the row-count groups in the original
+        // admission. Parquet 58.3 flushes at the byte target, or when average-row rounding
+        // leaves no row that fits. In that early case current_bytes > target / 2.
+        // The existing uncompressed encoder bound plus the current encoded group therefore
+        // bounds those extra groups by ceil(2 * encoded_bytes / target). A nonempty group
+        // also consumes a row, so incoming row count is an independent upper bound. Existing
+        // row-count/partial-group accounting below covers groups below the half-target.
+        let byte_groups = self
+            .writer
+            .in_progress_size()
+            .checked_add(admission.active_writer_bytes)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add(self.row_group_bytes - 1))
+            .map(|bytes| (bytes / self.row_group_bytes).min(batch.num_rows()))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
         let metadata_bytes = retained_groups
-            .checked_mul(per_group)
+            .checked_add(byte_groups)
+            .and_then(|groups| groups.checked_mul(per_group))
             .and_then(|bytes| bytes.checked_add(admission.metadata_bytes))
             .ok_or(ParquetStoreError::SizeOverflow)?;
         let active_limit = admission
@@ -409,6 +430,13 @@ impl WriterState {
             .ok_or(ParquetStoreError::SizeOverflow)?;
         if u64::try_from(working).map_err(|_| ParquetStoreError::SizeOverflow)? > self.memory_limit
         {
+            self.report_memory_rejection(
+                "batch_admission",
+                working,
+                batch.get_array_memory_size(),
+                metadata_bytes,
+                active_limit,
+            );
             return Err(ParquetStoreError::WriterMemoryLimitExceeded {
                 limit: self.memory_limit,
             });
@@ -442,6 +470,13 @@ impl WriterState {
                 .min(batch.num_rows() - offset);
             self.writer.write(&batch.slice(offset, rows))?;
             if self.writer.memory_size() > self.active_limit {
+                self.report_memory_rejection(
+                    "encoded_writer_growth",
+                    self.writer.memory_size(),
+                    batch.get_array_memory_size(),
+                    self.metadata_bytes,
+                    self.active_limit,
+                );
                 return Err(ParquetStoreError::WriterMemoryLimitExceeded {
                     limit: self.memory_limit,
                 });
@@ -460,6 +495,29 @@ impl WriterState {
             )
             .ok_or(ParquetStoreError::SizeOverflow)?;
         Ok(())
+    }
+
+    fn report_memory_rejection(
+        &self,
+        stage: &'static str,
+        required_bytes: usize,
+        input_bytes: usize,
+        metadata_bytes: usize,
+        active_bytes: usize,
+    ) {
+        // Only code-owned stage names and resource counters; never source payloads or paths.
+        tracing::warn!(
+            stage,
+            limit_bytes = self.memory_limit,
+            required_bytes,
+            writer_bytes = self.writer.memory_size(),
+            input_bytes,
+            metadata_bytes,
+            active_bytes,
+            buffered_rows = self.writer.in_progress_rows(),
+            flushed_groups = self.writer.flushed_row_groups().len(),
+            "Parquet writer memory admission rejected"
+        );
     }
 
     fn finish(self, cancellation: &CancellationToken) -> Result<StagedObject, ParquetStoreError> {

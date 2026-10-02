@@ -746,9 +746,18 @@ async fn query_artifact_writer_memory_is_pre_admitted_by_the_object_store() -> T
     let (service, committed) = initialized_service_with_dataset(
         &paths,
         test_catalog_config(location.clone())?,
-        ObjectStoreConfig::try_new(1024 * 1024, 100_000, Duration::from_secs(60))?,
+        ObjectStoreConfig::try_new(512 * 1024, 100_000, Duration::from_secs(60))?,
     )
     .await?;
+    // The input is the existing single-row canonical Macro fixture, not the expanded query.
+    assert_eq!(committed.pinned().plan().row_count(), 1);
+    assert!(
+        committed
+            .pinned()
+            .objects()
+            .iter()
+            .all(|object| object.object().size_bytes() < 512 * 1024)
+    );
     let limits = QueryLimits::try_new(
         100_000,
         4 * 1024 * 1024,
@@ -758,39 +767,124 @@ async fn query_artifact_writer_memory_is_pre_admitted_by_the_object_store() -> T
         512,
         Duration::from_secs(5),
     )?;
-    let request = QueryRequest::try_new(committed.manifest().clone(), ARTIFACT_QUERY)?;
+    let request = QueryRequest::try_new(
+        committed.manifest().clone(),
+        format!("{ARTIFACT_QUERY} WHERE a.value < 5"),
+    )?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let owner = SourceIdentifier::try_from("writer-memory-owner")?;
+    let expires_at = Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?;
     let reservation = service
         .reserve_query_artifact(
             QueryArtifactReservationInput::try_new(
-                SourceIdentifier::try_from("writer-memory-owner")?,
+                owner.clone(),
                 request.artifact_identity(&limits),
                 limits.max_bytes(),
-                Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+                expires_at,
             )?,
             &CancellationToken::new(),
         )
         .await?;
-    let result = ResearchQueryEngine::from_pinned_dataset(
+    let engine = ResearchQueryEngine::from_pinned_dataset(
         committed.pinned().clone(),
         "observations",
         service.object_store(),
         CancellationToken::new(),
     )
     .await?
-    .with_artifact_publication(service.query_artifact_publication())?
-    .query(
-        request.with_artifact_reservation(reservation),
-        limits,
-        CancellationToken::new(),
-    )
-    .await;
-    assert!(matches!(
-        result,
-        Err(QueryError::Artifact(
-            ParquetStoreError::StagingLimitExceeded
-        ))
-    ));
+    .with_artifact_publication(service.query_artifact_publication())?;
+    let result = engine
+        .query(
+            request.with_artifact_reservation(reservation),
+            limits,
+            CancellationToken::new(),
+        )
+        .await?;
+    // A bounded writer must admit a complete artifact that actually fits. The original
+    // filtered one-column query produces about 400 KB, below the 512 KiB staging ceiling.
+    let QueryResult::Artifact {
+        object,
+        artifact,
+        ownership,
+    } = result
+    else {
+        return Err("expected the fitting query to publish its complete artifact".into());
+    };
+    assert_eq!(object.row_count(), 50_000);
+    assert!(object.size_bytes() < 512 * 1024);
+    assert_eq!(ownership.owner(), &owner);
+    assert_eq!(ownership.expires_at(), expires_at);
+    assert_eq!(ownership.artifact_id(), artifact.artifact_id());
+    let bytes = service
+        .query_artifact_publication()
+        .read_verified_bytes(
+            &object,
+            &artifact,
+            &ownership,
+            512 * 1024,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
+    let reader =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?
+            .build()?;
+    let mut rows = 0usize;
+    let mut counts = [0usize; 10];
+    for batch in reader {
+        let batch = batch?;
+        rows += batch.num_rows();
+        let values = batch
+            .column_by_name("value")
+            .and_then(|array| array.as_any().downcast_ref::<arrow::array::Int64Array>())
+            .ok_or("fitting artifact lost its integer values")?;
+        for value in values.iter() {
+            let value = usize::try_from(value.ok_or("null value in fitting artifact")?)?;
+            *counts
+                .get_mut(value)
+                .ok_or("unexpected value in fitting artifact")? += 1;
+        }
+    }
+    assert_eq!(rows, 50_000);
+    assert_eq!(
+        counts,
+        [10_000, 10_000, 10_000, 10_000, 10_000, 0, 0, 0, 0, 0]
+    );
+
+    // The original one-column query produces about 800 KB for 100,000 rows. Keep its
+    // proven 4 MiB query-output allowance and the 64 MiB memory/5-second limits; only the
+    // fixture's 512 KiB physical staging boundary must reject this larger complete result.
+    let before = count_published_objects(paths.artifacts()?.root())?;
+    let oversized = QueryRequest::try_new(committed.manifest().clone(), ARTIFACT_QUERY)?;
+    let reservation = service
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                owner,
+                oversized.artifact_identity(&limits),
+                limits.max_bytes(),
+                expires_at,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let result = engine
+        .query(
+            oversized.with_artifact_reservation(reservation),
+            limits,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(QueryError::Artifact(
+                ParquetStoreError::StagingLimitExceeded
+            ))
+        ),
+        "unexpected writer admission result: {result:?}"
+    );
+    assert_eq!(count_published_objects(paths.artifacts()?.root())?, before);
+    assert!(service.object_store().verify(&object)?);
     Ok(())
 }
 
