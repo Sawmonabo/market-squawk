@@ -46,6 +46,10 @@ impl fmt::Debug for CatalogReadSnapshot {
 }
 
 impl Catalog {
+    pub(crate) const fn read_location(&self) -> &CatalogLocation {
+        &self.location
+    }
+
     pub(crate) const fn read_result_limits(&self) -> CatalogResultLimits {
         self.result_bytes
     }

@@ -106,6 +106,7 @@ pub(crate) enum ProductCapability {
     GovernancePrincipals,
     InstallationStatus,
     InvestmentLookup,
+    InvestmentProfile,
     JobList,
     JobWatch,
     MacroContext,
@@ -263,6 +264,7 @@ impl ProductCapability {
             "Research.CommitStagedFile" => Self::ResearchFileCommit,
             "Research.DiscardStagedFile" => Self::ResearchFileDiscard,
             "Research.GetManifest" => Self::ResearchManifest,
+            "Research.GetInvestmentProfile" => Self::InvestmentProfile,
             "Research.ListDatasets" => Self::ResearchDatasetList,
             "Research.PreviewStagedFile" => Self::ResearchFilePreview,
             "Research.StartExport" => Self::ResearchExport,
@@ -431,6 +433,9 @@ pub(crate) enum DashboardQueryCommand {
         page_token: Option<String>,
     },
     MarketInstrument {
+        selection_token: String,
+    },
+    InvestmentProfile {
         selection_token: String,
     },
     MarketHistory {

@@ -758,6 +758,15 @@ Every contributing retained coordinate receives Display authorization. Same-even
 remain integrity errors. Coinbase's [market-trades contract](https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/market-trades)
 explicitly batches trades; batching alone supplies no unique last trade (reviewed 2026-10-01).
 
+Investment detail loads its reference profile independently of prices and history through
+`Research.GetInvestmentProfile` (`market profile --selection-token` in CLI). The shared service
+resolves the selected canonical identity and official listing at one current knowledge/effective
+cutoff, returning name, symbol, asset class, currency, venue, ETF classification, trading lot and
+reference dates. Missing, ambiguous and unavailable reference evidence are explicit section states;
+they neither substitute another identity nor hide available prices. Reference publications invalidate
+the existing Research domain. This reference profile does not establish company financials, fund
+holdings, valuation or an Investment Brief; those require their own governed evidence and consumers.
+
 
 The logical local layout is:
 

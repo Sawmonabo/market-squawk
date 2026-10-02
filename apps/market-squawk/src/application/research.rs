@@ -67,6 +67,8 @@ mod fund_product;
 mod h15_installed_acceptance;
 mod ingest;
 mod instrument_context;
+mod investment_profile;
+use investment_profile::{INVESTMENT_PROFILE_READ_OPERATION, InvestmentProfileReadCapability};
 mod macro_context;
 mod macro_features;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -438,6 +440,14 @@ impl ResearchApplicationServices {
                 listings,
             ))
         });
+        let investment_profile = InvestmentProfileReadCapability::new(
+            Arc::clone(&service),
+            super::market_selection::product::MarketProductSelectionReadCapability::new(
+                Arc::clone(&service),
+                service.market_data_instruments(),
+            ),
+            product_identity.as_deref().cloned(),
+        );
         let product_research =
             ResearchProductReadCapability::new(company_research.clone(), product_identity);
         let options_context = OptionsContextReadCapability::new(
@@ -464,6 +474,7 @@ impl ResearchApplicationServices {
                 instrument_identity,
                 company_research,
                 product_research,
+                investment_profile,
                 fred_latest_known,
                 macro_context,
                 options_context,
@@ -650,8 +661,31 @@ impl ApplicationDomainService for ResearchDomainService {
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
-        let limits = effective_service_limits(&request, &context)?;
+        let limits = if request.name() == INVESTMENT_PROFILE_READ_OPERATION {
+            context.limits()
+        } else {
+            effective_service_limits(&request, &context)?
+        };
         match request.name() {
+            INVESTMENT_PROFILE_READ_OPERATION => {
+                let token = request
+                    .arguments()
+                    .get("selectionToken")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let profile = self
+                    .controller
+                    .investment_profile
+                    .read(token, context.deadline(), context.cancellation())
+                    .await?;
+                TypedToolResult::try_new(
+                    serde_json::to_value(profile).map_err(|_| ServiceError::InvalidResult)?,
+                    1,
+                    ToolResultMetadata::complete_not_applicable(),
+                    limits,
+                )
+                .map_err(Into::into)
+            }
             RESEARCH_LIST_DATASETS => self.controller.datasets(&request, &context, limits).await,
             RESEARCH_GET_MANIFEST => self.controller.manifest(&request, &context, limits),
             RESEARCH_GET_HISTORY => {
@@ -842,6 +876,7 @@ struct ResearchController {
     instrument_identity: InstrumentIdentityReadCapability,
     company_research: CompanyResearchReadCapability,
     product_research: ResearchProductReadCapability,
+    investment_profile: InvestmentProfileReadCapability,
     fred_latest_known: FredLatestKnownOperation,
     macro_context: MacroContextOperation,
     options_context: OptionsContextReadCapability,

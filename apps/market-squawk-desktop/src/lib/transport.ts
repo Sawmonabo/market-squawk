@@ -78,6 +78,7 @@ export type ProductQuery =
   | ({ query: "marketSessionContext"; confirmed: boolean } & MarketSessionRequest)
   | { query: "marketSessionRead"; reference: MarketSessionReference }
   | { query: "analysisSettings" }
+  | { query: "investmentProfile"; selectionToken: string }
   | { query: "marketUniverse"; text: string; pageToken?: string }
   | {
       query: "marketInstrument"

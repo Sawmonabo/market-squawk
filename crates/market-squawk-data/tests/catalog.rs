@@ -877,6 +877,7 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
         source_id.clone(),
         source_payload_set_digest,
     )?)?;
+    let reader = ListingReferenceReadCapability::new(&catalog, dataset.clone(), source_id.clone());
     drop(catalog);
     let publisher = ListingReferencePublicationCapability::try_new(
         Arc::clone(&authority),
@@ -884,11 +885,6 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
         source_id.clone(),
         rights,
     )?;
-    let reader = ListingReferenceReadCapability::new(
-        Arc::clone(&authority),
-        dataset.clone(),
-        source_id.clone(),
-    );
     let cancellation = CancellationToken::new();
     let deadline = || Instant::now() + Duration::from_secs(2);
 
@@ -900,6 +896,14 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
     assert_eq!(inserted.generation().generation_sequence(), 1);
     assert_eq!(inserted.generation().record_count(), 2);
 
+    // Ordinary reads must remain available while the publication owner holds the writer.
+    let writer_guard = authority
+        .try_lock()
+        .map_err(|_| CatalogError::AuthorityLockPoisoned)?;
+    assert_eq!(
+        reader.current(deadline(), &cancellation)?.as_ref(),
+        Some(inserted.generation())
+    );
     let page = reader.search("p", 1, deadline(), &cancellation)?;
     assert_eq!(page.matches().len(), 1);
     assert!(page.has_more());
@@ -907,6 +911,17 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
     assert_eq!(exact.matches().len(), 1);
     assert_eq!(exact.matches()[0].record().provider_symbol(), "SPY");
     assert!(exact.matches()[0].record().is_etf());
+    assert_eq!(
+        reader
+            .exact_current(
+                "SPY",
+                &VenueId::try_from("ARCX")?,
+                deadline(),
+                &cancellation
+            )?
+            .as_ref(),
+        Some(exact.matches()[0].record())
+    );
 
     let first_membership_page = reader.memberships(
         ListingReferenceGenerationSelection::Current,
@@ -1038,6 +1053,17 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
         ),
         Err(ListingReferenceError::Cancelled)
     ));
+    assert!(matches!(
+        reader.memberships(
+            ListingReferenceGenerationSelection::Current,
+            None,
+            2,
+            Instant::now(),
+            &cancellation,
+        ),
+        Err(ListingReferenceError::DeadlineExceeded)
+    ));
+    drop(writer_guard);
 
     let replay = publisher.publish(
         listing_reference_generation(source.clone(), None, 30, 101)?,
@@ -1062,12 +1088,8 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
         source_id.clone(),
         source_payload_set_digest,
     )?)?;
+    let reader = ListingReferenceReadCapability::new(&reopened, dataset.clone(), source_id.clone());
     let authority = Arc::new(Mutex::new(reopened));
-    let reader = ListingReferenceReadCapability::new(
-        Arc::clone(&authority),
-        dataset.clone(),
-        source_id.clone(),
-    );
     let current = reader
         .current(deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
@@ -1077,6 +1099,18 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
     );
     assert_eq!(current.generation_sequence(), 1);
     assert_eq!(current.record_count(), 2);
+    let reopened_memberships = reader.memberships(
+        ListingReferenceGenerationSelection::AsOf(inserted.generation().published_at()),
+        None,
+        2,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(reopened_memberships.records(), exact_as_of.records());
+    assert_eq!(
+        reopened_memberships.receipt().ordered_rows_digest(),
+        exact_as_of.receipt().ordered_rows_digest()
+    );
     let exact = reader.search("AAPL", 2, deadline(), &cancellation)?;
     assert_eq!(exact.matches().len(), 1);
     let retained = exact.matches()[0].record();
@@ -2002,6 +2036,11 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         listing_source.source_id().clone(),
         generation.source_payload_set_digest(),
     )?)?;
+    let listing_reader = ListingReferenceReadCapability::new(
+        &catalog,
+        SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?,
+        listing_source.source_id().clone(),
+    );
     let authority = Arc::new(Mutex::new(catalog));
     let deadline = || Instant::now() + Duration::from_secs(10);
     let cancellation = CancellationToken::new();
@@ -2012,11 +2051,6 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         rights,
     )?;
     listing_publisher.publish(generation, deadline(), &cancellation)?;
-    let listing_reader = ListingReferenceReadCapability::new(
-        Arc::clone(&authority),
-        SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?,
-        listing_source.source_id().clone(),
-    );
     let listing = listing_reader
         .exact_current(
             "AAPL",

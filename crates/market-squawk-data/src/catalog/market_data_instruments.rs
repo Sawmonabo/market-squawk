@@ -1528,21 +1528,22 @@ impl MarketDataInstrumentSynchronizationCapability {
         precommit
             .validate_precommit()
             .map_err(reference_precommit_error)?;
+        let authority = self
+            .authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?;
         let listing = ListingReferenceReadCapability::new(
-            Arc::clone(&self.authority),
+            &authority,
             input.official_listing.generation().dataset().clone(),
             input.official_listing.generation().source_id().clone(),
         );
-        self.authority
-            .try_lock()
-            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
-            .publish_market_data_source_reference(
-                input,
-                &listing,
-                precommit,
-                deadline,
-                cancellation,
-            )
+        authority.publish_market_data_source_reference(
+            input,
+            &listing,
+            precommit,
+            deadline,
+            cancellation,
+        )
     }
 
     /// Atomically publishes complete authoritative definitions and no-ops exact-current replays.

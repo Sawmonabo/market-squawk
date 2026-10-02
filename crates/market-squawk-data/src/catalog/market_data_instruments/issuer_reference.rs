@@ -171,22 +171,23 @@ impl MarketDataInstrumentSynchronizationCapability {
         cancellation: &CancellationToken,
     ) -> Result<MarketDataInstrumentRecord, Error> {
         check_operation(deadline, cancellation)?;
+        let authority = self
+            .authority
+            .try_lock()
+            .map_err(|_| Error::AuthorityUnavailable)?;
         let reader = ListingReferenceReadCapability::new(
-            Arc::clone(&self.authority),
+            &authority,
             listing.generation().dataset().clone(),
             listing.generation().source_id().clone(),
         );
-        self.authority
-            .try_lock()
-            .map_err(|_| Error::AuthorityUnavailable)?
-            .publish_market_data_issuer_reference(
-                issuer,
-                listing,
-                expected_current,
-                &reader,
-                deadline,
-                cancellation,
-            )
+        authority.publish_market_data_issuer_reference(
+            issuer,
+            listing,
+            expected_current,
+            &reader,
+            deadline,
+            cancellation,
+        )
     }
 }
 

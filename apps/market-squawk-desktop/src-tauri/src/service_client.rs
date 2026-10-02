@@ -126,6 +126,11 @@ pub(crate) async fn dashboard_query(
             arguments.insert("selectionToken".to_owned(), json!(selection_token));
             ("Market.GetInstrument", arguments)
         }
+        DashboardQueryCommand::InvestmentProfile { selection_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("selectionToken".to_owned(), json!(selection_token));
+            ("Research.GetInvestmentProfile", arguments)
+        }
         DashboardQueryCommand::MarketHistory {
             history_token,
             start_unix_nanos,

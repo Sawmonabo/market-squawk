@@ -229,6 +229,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         }
         "Market.GetHistory" => market_history_result(),
         "Market.SearchUniverse" => market_search_page(),
+        "Research.GetInvestmentProfile" => investment_profile(),
         "Research.ListDatasets" => nullable(page(generation())),
         "Research.GetManifest" => generation(),
         "Research.GetHistory" | "Research.GetAlternativeData" => observation_page(),
@@ -2389,6 +2390,64 @@ fn market_product_current_price() -> Value {
         ("observedAt", nullable(canonical_market_timestamp())),
         ("currentThrough", nullable(canonical_market_timestamp())),
     ])
+}
+
+fn investment_profile() -> Value {
+    let profile = closed_complete(vec![
+        ("displayName", text()),
+        ("symbol", text()),
+        (
+            "assetClass",
+            enumeration(&[
+                "equity",
+                "fixed_income",
+                "option",
+                "future",
+                "foreign_exchange",
+                "crypto",
+                "commodity",
+                "fund",
+                "index",
+                "cash",
+            ]),
+        ),
+        ("currency", investment_analysis_currency()),
+        ("listingVenue", text()),
+        ("exchangeTradedFund", boolean()),
+        ("roundLotSize", bounded_unsigned(u64::from(u32::MAX))),
+        ("effectiveFrom", canonical_market_timestamp()),
+        ("effectiveUntil", nullable(canonical_market_timestamp())),
+        ("knownAt", canonical_market_timestamp()),
+        ("referenceUpdatedAt", canonical_market_timestamp()),
+        (
+            "lifecycle",
+            constant("successor_and_delisting_not_established"),
+        ),
+    ]);
+    let states = [
+        ("available", Value::Null, profile),
+        (
+            "missing",
+            enumeration(&[
+                "canonical_definition",
+                "official_directory",
+                "official_membership",
+            ]),
+            Value::Null,
+        ),
+        ("ambiguous", Value::Null, Value::Null),
+        (
+            "unavailable",
+            enumeration(&["directory_read_bound", "reference_not_configured"]),
+            Value::Null,
+        ),
+    ];
+    json!({"oneOf": states.into_iter().map(|(state, reason, profile)| closed_complete(vec![
+        ("selectionToken", opaque_product_token()), ("knowledgeAt", canonical_market_timestamp()),
+        ("state", constant(state)),
+        ("reason", if reason.is_null() { json!({"type": "null"}) } else { reason }),
+        ("profile", if profile.is_null() { json!({"type": "null"}) } else { profile }),
+    ])).collect::<Vec<_>>()})
 }
 
 fn market_product_quote() -> Value {

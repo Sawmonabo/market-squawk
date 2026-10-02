@@ -54,6 +54,7 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Market.GetSessionContext"
             | "Market.ReadSessionContext"
             | "Market.GetInstrument"
+            | "Research.GetInvestmentProfile"
             | "Market.PrepareInvestmentEvidence"
             | "Market.SelectInvestmentEvidence"
             | "Market.ReadInvestmentEvidence"
@@ -2033,6 +2034,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Analysis,
         LOCAL_SCOPE,
         RECOMMENDATION_BACKTEST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Research.GetInvestmentProfile",
+        "Read the selected investment's reference profile and listing information.",
+        ServiceDomain::Research,
+        JOB_SCOPE,
+        MARKET_INSTRUMENT_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(

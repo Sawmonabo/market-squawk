@@ -44,6 +44,7 @@ const productCapabilities = [
   "forecast_prepared_start",
   "fundamental_facts",
   "investment_lookup",
+  "investment_profile",
   "macro_context",
   "macro_revisions",
   "market_history",

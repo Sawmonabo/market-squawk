@@ -11,6 +11,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { MarketHistoryRead } from "./market-history-read"
+import { InvestmentProfile } from "./investment-profile"
 import { marketAvailabilityLabel, marketPriceBasisLabel, marketSelectionTokenSchema, parseMarketInstrumentResult, type MarketProductRow } from "./market-product"
 
 export function InvestmentPage() {
@@ -76,6 +77,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
       </> : null}
     </section>
     {row !== null ? <InvestmentQuote row={row} unverified={detail.isError} /> : null}
+    <InvestmentProfile selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
     {row !== null ? <section className="rounded-xl border border-border p-5" aria-label="Investment analysis">
       <h2 className="mb-4 text-lg font-semibold">Investment analysis</h2>
       <AnalysisLaunch transport={transport} scope={bootstrap.productSessionToken} selectionToken={row.selectionToken} />

@@ -558,6 +558,11 @@ pub enum MarketCommand {
         #[arg(long)]
         selection_token: String,
     },
+    /// Return the selected investment's reference profile and listing information.
+    Profile {
+        #[arg(long)]
+        selection_token: String,
+    },
     /// Return immutable daily history for one opaque investment selection.
     History {
         #[arg(long)]

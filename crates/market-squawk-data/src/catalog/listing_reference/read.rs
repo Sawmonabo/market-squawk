@@ -17,8 +17,6 @@ use super::{
 };
 use crate::catalog::storage::{ResultBudget, now_timestamp, sha256};
 
-const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
-
 impl CatalogAuthority {
     pub(super) fn current_listing_reference_generation(
         &self,
@@ -27,122 +25,137 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ListingReferenceGenerationReceipt>, ListingReferenceError> {
-        canonical::check_operation(deadline, cancellation)?;
-        let connection = &self.catalog().connection;
-        let digest: Option<Vec<u8>> = connection
-            .query_row(
-                "SELECT generation_digest FROM listing_reference_generations
-                 WHERE dataset_id=?1 ORDER BY generation_sequence DESC LIMIT 1",
-                [dataset.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(digest) = digest else {
-            return Ok(None);
-        };
-        let digest: [u8; 32] = digest
-            .try_into()
-            .map_err(|_| ListingReferenceError::CorruptCatalog)?;
-        let receipt = load_generation_receipt(connection, digest)?
-            .ok_or(ListingReferenceError::CorruptCatalog)?;
-        if receipt.dataset() != dataset || receipt.source_id() != source_id {
-            return Err(ListingReferenceError::CorruptCatalog);
-        }
-        require_current_display_authority(connection, &receipt)?;
-        canonical::check_operation(deadline, cancellation)?;
-        Ok(Some(receipt))
+        current_listing_reference_generation(
+            &self.catalog().connection,
+            dataset,
+            source_id,
+            deadline,
+            cancellation,
+        )
     }
+}
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "bounded read coordinates stay explicit"
-    )]
-    pub(super) fn search_listing_references(
-        &self,
-        dataset: &SourceIdentifier,
-        source_id: &SourceId,
-        query: &str,
-        maximum_rows: usize,
-        exact_venue: Option<&VenueId>,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<ListingReferenceSearchPage, ListingReferenceError> {
-        let Some(generation) =
-            self.current_listing_reference_generation(dataset, source_id, deadline, cancellation)?
-        else {
-            return Ok(ListingReferenceSearchPage {
-                matches: Box::new([]),
-                has_more: false,
-            });
-        };
-        let connection = &self.catalog().connection;
-        let token = cancellation.clone();
-        connection.progress_handler(
-            SQLITE_PROGRESS_OPERATIONS,
-            Some(move || token.is_cancelled() || Instant::now() >= deadline),
-        )?;
-        let result = (|| {
-            let retrieval_limit = i64::try_from(maximum_rows.saturating_add(1))
-                .map_err(|_| ListingReferenceError::InvalidLimit)?;
-            let symbol_query = if exact_venue.is_some() { query.to_owned() } else { canonical::normalize_symbol(query) };
-            let name_query = canonical::normalize_name(query);
-            let mut statement = connection.prepare(CURRENT_LISTING_SEARCH_SQL)?;
-            let rows = statement.query_map(
-                params![
-                    generation.generation_digest().bytes(),
-                    symbol_query,
-                    name_query,
-                    retrieval_limit,
-                    exact_venue.map(VenueId::as_str),
-                ],
-                decode_row,
-            )?;
-            let mut budget = ResultBudget::new(self.catalog().result_bytes);
-            let mut matches = Vec::new();
-            matches
-                .try_reserve_exact(maximum_rows.saturating_add(1))
-                .map_err(|_| ListingReferenceError::MemoryLimitExceeded)?;
-            for row in rows {
-                canonical::check_operation(deadline, cancellation)?;
-                let row = row?;
-                budget
-                    .charge([
-                        size_of::<ListingReferenceSearchMatch>(),
-                        row.file_kind.len(),
-                        row.source_object_id.len(),
-                        row.source_reference.len(),
-                        row.file_creation_time.len(),
-                        row.file_locator_reference.as_ref().map_or(0, String::len),
-                        row.file_locator_version.as_ref().map_or(0, String::len),
-                        row.provider_symbol.len(),
-                        row.security_name.len(),
-                        row.listing_venue.len(),
-                        row.exchange_code.as_ref().map_or(0, String::len),
-                        row.cqs_symbol.as_ref().map_or(0, String::len),
-                        row.nasdaq_symbol.as_ref().map_or(0, String::len),
-                        row.market_category.as_ref().map_or(0, String::len),
-                        row.financial_status.as_ref().map_or(0, String::len),
-                        row.directory_presence.len(),
-                        row.data_quality.len(),
-                        row.authority_class.len(),
-                        row.record_revision.len(),
-                        row.record_locator_reference.as_ref().map_or(0, String::len),
-                        row.record_locator_version.as_ref().map_or(0, String::len),
-                        row.match_kind.len(),
-                    ])
-                    .map_err(|_| ListingReferenceError::MemoryLimitExceeded)?;
-                matches.push(rebuild_match(&generation, row)?);
-            }
-            let has_more = matches.len() > maximum_rows;
-            matches.truncate(maximum_rows);
-            Ok(ListingReferenceSearchPage {
-                matches: matches.into_boxed_slice(),
-                has_more,
-            })
-        })();
-        connection.progress_handler::<fn() -> bool>(0, None)?;
-        classify_operation(result, deadline, cancellation)
+pub(super) fn current_listing_reference_generation(
+    connection: &rusqlite::Connection,
+    dataset: &SourceIdentifier,
+    source_id: &SourceId,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Option<ListingReferenceGenerationReceipt>, ListingReferenceError> {
+    canonical::check_operation(deadline, cancellation)?;
+    let digest: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT generation_digest FROM listing_reference_generations
+             WHERE dataset_id=?1 ORDER BY generation_sequence DESC LIMIT 1",
+            [dataset.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(digest) = digest else {
+        return Ok(None);
+    };
+    let digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| ListingReferenceError::CorruptCatalog)?;
+    let receipt = load_generation_receipt(connection, digest)?
+        .ok_or(ListingReferenceError::CorruptCatalog)?;
+    if receipt.dataset() != dataset || receipt.source_id() != source_id {
+        return Err(ListingReferenceError::CorruptCatalog);
     }
+    require_current_display_authority(connection, &receipt)?;
+    canonical::check_operation(deadline, cancellation)?;
+    Ok(Some(receipt))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded read coordinates stay explicit"
+)]
+pub(super) fn search_listing_references(
+    connection: &rusqlite::Connection,
+    result_limits: crate::CatalogResultLimits,
+    dataset: &SourceIdentifier,
+    source_id: &SourceId,
+    query: &str,
+    maximum_rows: usize,
+    exact_venue: Option<&VenueId>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ListingReferenceSearchPage, ListingReferenceError> {
+    let Some(generation) = current_listing_reference_generation(
+        connection,
+        dataset,
+        source_id,
+        deadline,
+        cancellation,
+    )?
+    else {
+        return Ok(ListingReferenceSearchPage {
+            matches: Box::new([]),
+            has_more: false,
+        });
+    };
+    let retrieval_limit = i64::try_from(maximum_rows.saturating_add(1))
+        .map_err(|_| ListingReferenceError::InvalidLimit)?;
+    let symbol_query = if exact_venue.is_some() {
+        query.to_owned()
+    } else {
+        canonical::normalize_symbol(query)
+    };
+    let name_query = canonical::normalize_name(query);
+    let mut statement = connection.prepare(CURRENT_LISTING_SEARCH_SQL)?;
+    let rows = statement.query_map(
+        params![
+            generation.generation_digest().bytes(),
+            symbol_query,
+            name_query,
+            retrieval_limit,
+            exact_venue.map(VenueId::as_str),
+        ],
+        decode_row,
+    )?;
+    let mut budget = ResultBudget::new(result_limits);
+    let mut matches = Vec::new();
+    matches
+        .try_reserve_exact(maximum_rows.saturating_add(1))
+        .map_err(|_| ListingReferenceError::MemoryLimitExceeded)?;
+    for row in rows {
+        canonical::check_operation(deadline, cancellation)?;
+        let row = row?;
+        budget
+            .charge([
+                size_of::<ListingReferenceSearchMatch>(),
+                row.file_kind.len(),
+                row.source_object_id.len(),
+                row.source_reference.len(),
+                row.file_creation_time.len(),
+                row.file_locator_reference.as_ref().map_or(0, String::len),
+                row.file_locator_version.as_ref().map_or(0, String::len),
+                row.provider_symbol.len(),
+                row.security_name.len(),
+                row.listing_venue.len(),
+                row.exchange_code.as_ref().map_or(0, String::len),
+                row.cqs_symbol.as_ref().map_or(0, String::len),
+                row.nasdaq_symbol.as_ref().map_or(0, String::len),
+                row.market_category.as_ref().map_or(0, String::len),
+                row.financial_status.as_ref().map_or(0, String::len),
+                row.directory_presence.len(),
+                row.data_quality.len(),
+                row.authority_class.len(),
+                row.record_revision.len(),
+                row.record_locator_reference.as_ref().map_or(0, String::len),
+                row.record_locator_version.as_ref().map_or(0, String::len),
+                row.match_kind.len(),
+            ])
+            .map_err(|_| ListingReferenceError::MemoryLimitExceeded)?;
+        matches.push(rebuild_match(&generation, row)?);
+    }
+    let has_more = matches.len() > maximum_rows;
+    matches.truncate(maximum_rows);
+    Ok(ListingReferenceSearchPage {
+        matches: matches.into_boxed_slice(),
+        has_more,
+    })
 }
 
 fn require_current_display_authority(
@@ -440,20 +453,6 @@ fn parse_bool(value: i64) -> Result<bool, ListingReferenceError> {
 
 fn parse_optional_bool(value: Option<i64>) -> Result<Option<bool>, ListingReferenceError> {
     value.map(parse_bool).transpose()
-}
-
-fn classify_operation<T>(
-    result: Result<T, ListingReferenceError>,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<T, ListingReferenceError> {
-    if cancellation.is_cancelled() {
-        Err(ListingReferenceError::Cancelled)
-    } else if Instant::now() >= deadline {
-        Err(ListingReferenceError::DeadlineExceeded)
-    } else {
-        result
-    }
 }
 
 const CURRENT_LISTING_SEARCH_SQL: &str = r#"

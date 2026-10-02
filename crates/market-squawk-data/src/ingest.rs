@@ -1796,6 +1796,8 @@ pub struct AnalyticalDataService {
     authority: Arc<Mutex<CatalogAuthority>>,
     catalog_id: uuid::Uuid,
     catalog_read_limits: crate::CatalogResultLimits,
+    catalog_read_location: market_squawk_platform::CatalogLocation,
+    catalog_read_binding: [u8; 32],
     market_data_instrument_reader: crate::MarketDataInstrumentReadCapability,
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
@@ -2159,6 +2161,7 @@ fn verify_persisted_provider_capture_binding_inner(
 #[derive(Clone)]
 pub struct ListingReferenceAdmissionCapability {
     authority: Arc<Mutex<CatalogAuthority>>,
+    reader: ListingReferenceReadCapability,
     dataset: SourceIdentifier,
     source: SourceMetadata,
     registered_at: Timestamp,
@@ -2191,11 +2194,7 @@ impl ListingReferenceAdmissionCapability {
 
     /// Returns a source-bound reader that cannot register rights or publish a generation.
     pub fn reader(&self) -> ListingReferenceReadCapability {
-        ListingReferenceReadCapability::new(
-            Arc::clone(&self.authority),
-            self.dataset.clone(),
-            self.source.source_id().clone(),
-        )
+        self.reader.clone()
     }
 
     /// Admits explicitly evidenced internal cohort uses beneath the exact source-rights grant.
@@ -2914,12 +2913,16 @@ impl AnalyticalDataService {
         let catalog_id = authority.session_id();
         manifests.publication_observer = authority.catalog().publication_observer.clone();
         let catalog_read_limits = authority.catalog().read_result_limits();
+        let catalog_read_location = authority.catalog().read_location().clone();
+        let catalog_read_binding = authority.artifact_root_binding();
         let (authority, market_data_instrument_reader) =
             crate::MarketDataInstrumentReadCapability::from_active_catalog(authority);
         Self {
             authority,
             catalog_id,
             catalog_read_limits,
+            catalog_read_location,
+            catalog_read_binding,
             market_data_instrument_reader,
             manifests: Arc::new(manifests),
             objects: Arc::new(objects),
@@ -3526,6 +3529,13 @@ impl AnalyticalDataService {
     ) -> ListingReferenceAdmissionCapability {
         ListingReferenceAdmissionCapability {
             authority: Arc::clone(&self.authority),
+            reader: ListingReferenceReadCapability::from_endpoint(
+                self.catalog_read_location.clone(),
+                self.catalog_read_binding,
+                self.catalog_read_limits,
+                dataset.clone(),
+                source.source_id().clone(),
+            ),
             dataset,
             source,
             registered_at,

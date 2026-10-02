@@ -23,8 +23,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::CatalogAuthority;
 use super::storage::{ResultBudget, now_timestamp, sha256};
+use super::{CatalogAuthority, CatalogError, CatalogReadSnapshot, CatalogResultLimits};
 use crate::RegisteredRightsGrant;
 
 pub use persistence::ListingReferencePublicationDisposition;
@@ -997,7 +997,9 @@ impl ListingReferencePublicationCapability {
 /// Cloneable least-authority reader bound to one dataset and source.
 #[derive(Clone)]
 pub struct ListingReferenceReadCapability {
-    authority: Arc<Mutex<CatalogAuthority>>,
+    location: market_squawk_platform::CatalogLocation,
+    catalog_binding: [u8; 32],
+    result_limits: CatalogResultLimits,
     dataset: SourceIdentifier,
     source_id: SourceId,
 }
@@ -1014,17 +1016,56 @@ impl fmt::Debug for ListingReferenceReadCapability {
 }
 
 impl ListingReferenceReadCapability {
-    /// Binds bounded reference reads to one catalog, dataset, and source.
+    /// Captures the exact endpoint and configured limits under already owned catalog authority.
     pub fn new(
-        authority: Arc<Mutex<CatalogAuthority>>,
+        authority: &CatalogAuthority,
+        dataset: SourceIdentifier,
+        source_id: SourceId,
+    ) -> Self {
+        Self::from_endpoint(
+            authority.catalog().location.clone(),
+            authority.catalog().artifact_root_binding,
+            authority.catalog().result_bytes,
+            dataset,
+            source_id,
+        )
+    }
+
+    /// Reuses endpoint coordinates captured by service composition before sharing its writer.
+    pub(crate) fn from_endpoint(
+        location: market_squawk_platform::CatalogLocation,
+        catalog_binding: [u8; 32],
+        result_limits: CatalogResultLimits,
         dataset: SourceIdentifier,
         source_id: SourceId,
     ) -> Self {
         Self {
-            authority,
+            location,
+            catalog_binding,
+            result_limits,
             dataset,
             source_id,
         }
+    }
+
+    fn read_snapshot<T>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(&rusqlite::Connection) -> Result<T, ListingReferenceError>,
+    ) -> Result<T, ListingReferenceError> {
+        canonical::check_operation(deadline, cancellation)?;
+        let result = (|| {
+            let snapshot = CatalogReadSnapshot::open(
+                &self.location,
+                self.catalog_binding,
+                self.result_limits,
+                deadline,
+                cancellation,
+            )?;
+            snapshot.read(|snapshot| operation(snapshot.connection()))
+        })();
+        classify_read_operation(result, deadline, cancellation)
     }
 
     /// Returns the current immutable generation, if one exists and remains display-authorized.
@@ -1033,16 +1074,15 @@ impl ListingReferenceReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ListingReferenceGenerationReceipt>, ListingReferenceError> {
-        canonical::check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| ListingReferenceError::AuthorityUnavailable)?
-            .current_listing_reference_generation(
+        self.read_snapshot(deadline, cancellation, |connection| {
+            read::current_listing_reference_generation(
+                connection,
                 &self.dataset,
                 &self.source_id,
                 deadline,
                 cancellation,
             )
+        })
     }
 
     /// Requires the exact retained generation to remain current in the publication catalog.
@@ -1109,11 +1149,10 @@ impl ListingReferenceReadCapability {
         {
             return Err(ListingReferenceError::InvalidInput);
         }
-        canonical::check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| ListingReferenceError::AuthorityUnavailable)?
-            .search_listing_references(
+        self.read_snapshot(deadline, cancellation, |connection| {
+            read::search_listing_references(
+                connection,
+                self.result_limits,
                 &self.dataset,
                 &self.source_id,
                 query,
@@ -1122,6 +1161,7 @@ impl ListingReferenceReadCapability {
                 deadline,
                 cancellation,
             )
+        })
     }
 
     /// Selects one exact native symbol and venue in the current authorized directory.
@@ -1133,16 +1173,28 @@ impl ListingReferenceReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ListingReferenceRecord>, ListingReferenceError> {
-        if symbol.is_empty() || symbol.len() > MAX_SEARCH_QUERY_BYTES || symbol.chars().any(char::is_control) {
+        if symbol.is_empty()
+            || symbol.len() > MAX_SEARCH_QUERY_BYTES
+            || symbol.chars().any(char::is_control)
+        {
             return Err(ListingReferenceError::InvalidInput);
         }
-        canonical::check_operation(deadline, cancellation)?;
-        let page = self.authority.try_lock()
-            .map_err(|_| ListingReferenceError::AuthorityUnavailable)?
-            .search_listing_references(
-                &self.dataset, &self.source_id, symbol, 1, Some(venue), deadline, cancellation,
-            )?;
-        if page.has_more() { return Err(ListingReferenceError::CorruptCatalog); }
+        let page = self.read_snapshot(deadline, cancellation, |connection| {
+            read::search_listing_references(
+                connection,
+                self.result_limits,
+                &self.dataset,
+                &self.source_id,
+                symbol,
+                1,
+                Some(venue),
+                deadline,
+                cancellation,
+            )
+        })?;
+        if page.has_more() {
+            return Err(ListingReferenceError::CorruptCatalog);
+        }
         Ok(page.matches.into_vec().pop().map(|matched| matched.record))
     }
 
@@ -1163,21 +1215,19 @@ impl ListingReferenceReadCapability {
         if maximum_rows == 0 || maximum_rows > MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS {
             return Err(ListingReferenceError::InvalidLimit);
         }
-        canonical::check_operation(deadline, cancellation)?;
-        let authority = self
-            .authority
-            .try_lock()
-            .map_err(|_| ListingReferenceError::AuthorityUnavailable)?;
-        read_listing_reference_memberships(
-            &authority,
-            &self.dataset,
-            &self.source_id,
-            selection,
-            after,
-            maximum_rows,
-            deadline,
-            cancellation,
-        )
+        self.read_snapshot(deadline, cancellation, |connection| {
+            read_listing_reference_memberships(
+                connection,
+                self.result_limits,
+                &self.dataset,
+                &self.source_id,
+                selection,
+                after,
+                maximum_rows,
+                deadline,
+                cancellation,
+            )
+        })
     }
 }
 
@@ -1186,7 +1236,8 @@ impl ListingReferenceReadCapability {
     reason = "bounded read coordinates and authority evidence stay explicit"
 )]
 fn read_listing_reference_memberships(
-    authority: &CatalogAuthority,
+    connection: &rusqlite::Connection,
+    result_limits: CatalogResultLimits,
     dataset: &SourceIdentifier,
     source_id: &SourceId,
     selection: ListingReferenceGenerationSelection,
@@ -1196,58 +1247,14 @@ fn read_listing_reference_memberships(
     cancellation: &CancellationToken,
 ) -> Result<ListingReferenceMembershipPage, ListingReferenceError> {
     canonical::check_operation(deadline, cancellation)?;
-    let connection = &authority.catalog().connection;
-    let busy: u32 = connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-    connection.busy_timeout(std::time::Duration::ZERO)?;
-    let token = cancellation.clone();
-    let install = connection.progress_handler(
-        SQLITE_PROGRESS_OPERATIONS,
-        Some(move || token.is_cancelled() || Instant::now() >= deadline),
-    );
-    let result = (|| {
-        install?;
-        read_listing_reference_memberships_inner(
-            authority,
-            dataset,
-            source_id,
-            selection,
-            after,
-            maximum_rows,
-            deadline,
-            cancellation,
-        )
-    })();
-    let progress_cleanup = connection.progress_handler::<fn() -> bool>(0, None);
-    let busy_cleanup = connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy)));
-    canonical::check_operation(deadline, cancellation)?;
-    progress_cleanup?;
-    busy_cleanup?;
-    classify_membership_operation(result, deadline, cancellation)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "same bounded listing read parameters"
-)]
-fn read_listing_reference_memberships_inner(
-    authority: &CatalogAuthority,
-    dataset: &SourceIdentifier,
-    source_id: &SourceId,
-    selection: ListingReferenceGenerationSelection,
-    after: Option<&ListingReferenceMembershipCursor>,
-    maximum_rows: usize,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<ListingReferenceMembershipPage, ListingReferenceError> {
-    canonical::check_operation(deadline, cancellation)?;
-    let connection = &authority.catalog().connection;
-    let authorization_checked_at =
-        now_timestamp().map_err(|_| ListingReferenceError::CorruptCatalog)?;
     let durable_clock: i64 = connection.query_row(
         "SELECT last_timestamp_ns FROM catalog_authority_clock WHERE singleton=1",
         [],
         |row| row.get(0),
     )?;
+    // The first SELECT pins the WAL snapshot before sampling its authorization clock.
+    let authorization_checked_at =
+        now_timestamp().map_err(|_| ListingReferenceError::CorruptCatalog)?;
     if authorization_checked_at.unix_nanos() < durable_clock {
         return Err(ListingReferenceError::CorruptCatalog);
     }
@@ -1336,7 +1343,7 @@ fn read_listing_reference_memberships_inner(
             ],
             decode_membership_row,
         )?;
-        let mut budget = ResultBudget::new(authority.catalog().result_bytes);
+        let mut budget = ResultBudget::new(result_limits);
         let retained_capacity = maximum_rows
             .checked_add(1)
             .ok_or(ListingReferenceError::InvalidLimit)?;
@@ -1473,7 +1480,7 @@ fn require_exact_membership_cursor(
     }
 }
 
-fn classify_membership_operation<T>(
+fn classify_read_operation<T>(
     result: Result<T, ListingReferenceError>,
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -2024,6 +2031,22 @@ pub enum ListingReferenceError {
     Storage(#[from] rusqlite::Error),
     #[error("listing-reference source metadata serialization failed")]
     Serialization(#[from] serde_json::Error),
+}
+
+impl From<CatalogError> for ListingReferenceError {
+    fn from(error: CatalogError) -> Self {
+        match error {
+            CatalogError::MarketRecoveryReadCancelled => Self::Cancelled,
+            CatalogError::MarketRecoveryReadDeadlineExceeded => Self::DeadlineExceeded,
+            CatalogError::ResultByteLimitExceeded | CatalogError::Allocation => {
+                Self::MemoryLimitExceeded
+            }
+            CatalogError::Sqlite(error) => Self::Storage(error),
+            CatalogError::Serialization(error) => Self::Serialization(error),
+            CatalogError::Io(_) => Self::AuthorityUnavailable,
+            _ => Self::CorruptCatalog,
+        }
+    }
 }
 
 impl CatalogAuthority {

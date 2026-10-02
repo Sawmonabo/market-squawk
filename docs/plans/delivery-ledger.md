@@ -3,25 +3,110 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed checkpoint
+`49b96e5a` removes redundant credential-buffer wiping without changing key derivation;
 `6ba236c9` preserves independent quote/trade evidence and unresolved same-time trade batches;
-`1ae2704a` separates Overview watchlist, discovery and exact investment navigation. These checkpoints
-do not establish complete rich detail, live streaming coverage or installed acceptance.
+`1ae2704a` separates Overview watchlist, discovery and exact investment navigation.
+The current selected-profile checkpoint adds independent reference metadata across shared clients
+and removes ordinary listing reads from the catalog writer. Its critical/live evidence is below;
+its commit identity is recorded in Git and PR #43. These checkpoints do not establish complete
+rich detail, live streaming coverage or installed acceptance.
 One worktree and three local/origin branches; recovery history remains untouched.
 
-| Active owner / outcome | Exact ownership and dependency | Critical evidence / finish boundary |
+| Current owner / outcome | Exact ownership and dependency | Critical evidence / finish boundary |
 | --- | --- | --- |
-| Lead — credential startup cleanup | `crates/market-squawk-platform/src/secrets/crypto.rs`, shared ledger/Git/builds. Astra diagnosis complete; boxed initialized Argon2 buffer preserves cleanup without redundant Vec capacity wipe. | Existing optional-access/rotation and encrypted-store integrity cases, then observed same-root startup. No KDF weakening, vault-format change or authentication bypass. |
-| Sol investment_navigation — selected reference profile | New `application/research/investment_profile.rs` only. Reuse canonical token resolver and InstrumentContextReadCapability; return provider-neutral profile with exact identity, clocks and explicit missing/ambiguous states. | Send result contract first. Lead owns operation registration, shared schema/transport/CLI, module composition and integration. No builds/Git; no company facts falsely joined by ticker. |
-| Sol investment_profile_ui — profile detail presentation | New Desktop `src/features/markets/investment-profile.tsx` and `investment-profile-schema.ts` only. Start on frozen `Research.GetInvestmentProfile` DTO; root owns parent page, transport types, shared critical fixture. | Independent profile loading/error/retry; provider-neutral reference metadata, exact selected token validation. No builds/Git or routine tests. |
-| Lead — profile clients and remaining financial identity | Shared contracts/registration/transports plus Desktop consumer after profile DTO freezes. SEC financial production still stamps CIK-derived IDs; canonical issuer binding/publication is a subsequent required producer checkpoint. | Detail profile independently loads/retries without hiding quote/history. Existing critical journey covers selected identity and failure isolation. Financial reports and movers remain incomplete. |
+| Lead — selected profile checkpoint | Frozen Sol profile leaf/UI, shared Research/native/CLI contracts, Astra listing snapshot correction, lead constructor integrations, docs/Git. All writers released. | TypeScript PASS; existing Desktop2/2; held-writer listing regression1/1; rebuilt real MSFT/SPY profiles both available with exact selection; unknown selection rejected. Integrated checkpoint; native profile rendering and full rich detail remain unverified/incomplete. |
+| Lead — next financial dependency | Astra source-qualified SEC design complete, no implementation dispatched. New exact relationship basis must join issuer-owned facts to selected security without invented stock identity or unconditional manual setup. | Full scope recorded below; refresh against the profile checkpoint before disjoint producer/authority/financial/UI assignment. |
+| Astra startup_latency — read-only next correction | `.agents/tmp/v1-first-stock/listing-startup.sample.txt`, `listing-startup-observation.json` and directly implicated startup source; no edits/builds/runtime actions. | Longer sample has393 main-thread samples; observed Ready29.845s. Identify the measured dominant path before choosing a code change; do not attribute all latency to earlier hypotheses. |
 
-Credential cleanup correction critically verified: four existing platform secret-store cases PASS4/4
-(19.40s; compile8.33s), including managed restart/optional explicit locking, generation identity,
-redaction, tamper rejection and rotation. `credential-buffer-critical.log`. The initialized allocation
-becomes `Zeroizing<Box<[Block]>>` before Argon2 writes secrets, preserving RAII cleanup and identical
-KDF/cipher parameters. Installed dependency source zeroize1.9.0 confirms boxed slices wipe every
-initialized block, while Vec additionally wipes its full capacity. Argon2's supported caller-owned
-memory API is retained. Live startup improvement awaits the next coordinated build; no timing claim.
+Overview owns the editable watchlist; it does not represent holdings. Markets owns broader discovery,
+Portfolio owns actual holdings with practice accounts distinguished, and every selected ticker opens
+its dedicated detail. The current Overview already mounts the independent Watchlist component;
+market snapshot, portfolio summary and complete signals remain required product work.
+
+Credential cleanup checkpoint `49b96e5a` passed four existing platform secret-store cases (19.40s;
+compile8.33s), preserving managed restart, optional explicit locking, identity, redaction, tamper
+rejection and rotation. `credential-buffer-critical.log`. The initialized Argon2 allocation becomes
+`Zeroizing<Box<[Block]>>` before secrets are written; KDF/cipher parameters are unchanged. Observed
+backend Ready37.129s after replacement detection versus39.234s earlier does not establish the
+remaining dominant delay or acceptable startup performance. The previous sample contains only two
+samples. The longer replacement observation reached Ready29.845s, with393 samples inside runtime composition
+(`listing-startup-{observation.json,sample.txt}`). Timing varies and is still unacceptable; this is
+startup diagnosis, not whole-app memory acceptance.
+
+Reference-profile contract: backend-frozen cutoff, exact selection token and provider-neutral listing
+metadata; independently loaded/retried in detail without hiding quote/history. Existing Desktop
+checks PASS2/2 (3.59s), including mismatched refresh rejection with the prior valid profile retained;
+TypeScript passes. Artifacts: `investment-profile-{critical,typecheck}.log`. Earlier application build
+PASS9m15s; CLI build PASS6m28s. Fresh overview returned10 entries with9 prices. The first MSFT/SPY
+reads failed InvalidRequest because Research dispatch required a `resultLimits` argument absent from
+this single-profile contract. Dispatch now uses request-context limits for this operation; paged
+operations retain explicit limits. Failure evidence remains in `profile-initial-{MSFT,SPY}.log`.
+
+The corrected application build PASS5m26s; real MSFT profile succeeded. SPY initially returned
+Unavailable, then succeeded unchanged on immediate recheck. Ordinary listing reads still competed
+for the catalog writer. The correction reuses endpoint-bound WAL snapshots for current/search/exact
+and membership reads, while publication validation retains its borrowed writer. The existing test
+now holds writer authority through those reads and verifies cancellation, deadlines, as-of pagination
+and identical membership rows/digest after reopen. No new retries, raised limits or fallback identity.
+The initial compile caught two internal market-event reader constructors missing the newly captured
+endpoint fields; both are updated. Final critical result: `listing-snapshot-critical-final.log`.
+Coordinated rebuild PASS6m05s; service38030/native38075 replaced the previous processes normally.
+Real MSFT/XNAS profile available in0.636s and SPY/ARCX in0.453s; both preserve the exact selected
+token. Unknown selection rejected (exit1). `profile-live-{MSFT,SPY,rejected,results}.json`.
+Fresh shared-service Overview still returns10 investments with9 prices
+(`profile-final-overview.json`). The service and visible Desktop remain alive. Native profile
+rendering remains unverified. This is listing metadata, not completed financial reports. No full gate or RAM run occurred.
+
+Manual verification builds must reuse the launcher's `MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT`
+exact file bytes and Tauri configuration as well as its package/features. Omitting that compile-time
+foundation input previously invalidated modeling/application dependencies unnecessarily. Keep the
+watcher paused during focused Cargo checks and preserve the current visible Desktop/service.
+
+Next financial checkpoint — Astra design complete (source anchor `49b96e5a` plus frozen profile
+changes; refresh after this checkpoint, no financial implementation yet):
+
+- SEC CIK identifies an issuer. Publish Company Facts/submissions/XBRL as issuer-owned evidence with
+  `instrument_id: None`, preserving exact CIK/company parent/source/clocks and the independent fund
+  registry. Remove invented CIK-stock IDs and one-to-one company registry requirements.
+- Ordinary exact relationships can be automatic: add an explicit source-qualified listing basis to
+  the existing company/security authority. Retain and atomically revalidate exact submissions,
+  official listing row/generation, canonical definition, venue/symbol form, classification evidence
+  and rule identity. Do not disguise this as operator confirmation or a strong-identifier crosswalk.
+- Separate issuer association from common-equity suitability. Two share classes may share an issuer;
+  ETF=false or generic Equity classification alone does not establish common stock. Require explicit
+  official class evidence; ambiguous/missing/contradictory evidence stays unresolved. Do not infer
+  historical inception from filing or fiscal dates: automated authority starts only when complete
+  supporting evidence is observed/published. Retain historical receipts through refresh/revocation.
+- Carry the full relationship receipt through company readers, fiscal normalization and saved fiscal
+  epochs. Validate exact selected instrument, issuer/company parent, source and cutoff; never admit
+  every raw row with absent instrument identity. Issuer totals do not authorize per-share economics
+  for a particular class without the required shares/class evidence.
+- The SEC status selector currently accepts only direct strong-identifier links and can call multiple
+  valid share classes a conflict. The actual fiscal route uses instrument_company_as_of, which admits
+  operator relationships, but its consumers require raw Some(selected InstrumentId). Correct both
+  contracts together. The earlier preview/confirm-only recommendation is not the complete design.
+- Reuse existing acquisition for missing issuer data, then freeze the result cutoff after publication;
+  display independently loaded financial facts/filings with current Display authorization. Preserve
+  LocalAnalysis/Train separately. Narrow company/security reads reuse the snapshot mechanism rather
+  than writer try_lock. Do not make provider/CIK setup part of ordinary investment detail.
+
+Proposed next ownership after refresh: lead reserves domain relationship contract, existing schema
+constraint/checksum, application composition and shared transports; Sol SEC adapter normalization/
+client/extraction; Astra data company-security authority and SEC fiscal/epoch readers; Sol Desktop
+financial section after DTO freeze. Before any canonical schema change, explicitly account for the
+current development root and preserve its original evidence; do not introduce migration machinery
+or silently discard data. Existing parent/PIT/restart and SEC origin/epoch cases are the critical
+checks, extended for multiple share classes, preferred-class rejection, exact receipts and reads
+under writer ownership. No new general manual-confirmation prerequisite.
+
+Primary-source basis reviewed2026-10-01:
+[SEC entity APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces),
+[SEC directory limitations](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data),
+[Nasdaq symbol/class definitions](https://www.nasdaqtrader.com/Trader.aspx?id=SymbolDirDefs), and
+[Alphabet class evidence](https://www.sec.gov/Archives/edgar/data/1652044/000165204426000071/goog-20260630.htm).
+Ticker directories discover candidates; retained submissions plus exact listing/class evidence must
+corroborate the actual issuer/security relationship. Explicit user resolution is exceptional and
+cannot invent missing evidence or historical validity.
 
 Dependency order: finish/push quote checkpoint (done), prepare profile leaf concurrently with
 credential-buffer correction, verify/commit startup correction, then integrate profile producer and

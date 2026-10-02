@@ -37,21 +37,22 @@ impl MarketDataInstrumentSynchronizationCapability {
         precommit
             .validate_precommit()
             .map_err(reference_precommit_error)?;
+        let authority = self
+            .authority
+            .try_lock()
+            .map_err(|_| Error::AuthorityUnavailable)?;
         let listing_reader = ListingReferenceReadCapability::new(
-            Arc::clone(&self.authority),
+            &authority,
             input.official_listing.generation().dataset().clone(),
             input.official_listing.generation().source_id().clone(),
         );
-        self.authority
-            .try_lock()
-            .map_err(|_| Error::AuthorityUnavailable)?
-            .publish_alpaca_asset_reference(
-                input,
-                &listing_reader,
-                precommit,
-                deadline,
-                cancellation,
-            )
+        authority.publish_alpaca_asset_reference(
+            input,
+            &listing_reader,
+            precommit,
+            deadline,
+            cancellation,
+        )
     }
 }
 

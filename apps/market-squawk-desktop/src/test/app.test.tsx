@@ -639,6 +639,21 @@ describe("Market Squawk desktop boundary", () => {
       ...marketOverviewRow,
       identity: { symbol: "MSQ", name: "Requested investment", assetClass: "equity" },
     }
+    let wrongProfileSelection = false
+    const profileResult = (): ApplicationResult => ({
+      data: {
+        selectionToken: wrongProfileSelection ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
+        knowledgeAt: marketObservedAt, state: "available", reason: null,
+        profile: {
+          displayName: "Requested investment", symbol: "MSQ", assetClass: "equity", currency: "USD",
+          listingVenue: "XNAS", exchangeTradedFund: false, roundLotSize: 100,
+          effectiveFrom: "2026-08-01T00:00:00.000000000Z", effectiveUntil: null,
+          knownAt: marketObservedAt, referenceUpdatedAt: "2026-08-09T12:00:00.000000000Z",
+          lifecycle: "successor_and_delisting_not_established",
+        },
+      },
+      metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
+    })
     const openInvestment = (route: string) => render(
       <MemoryRouter initialEntries={[route]}>
         <App transport={transport(
@@ -647,6 +662,7 @@ describe("Market Squawk desktop boundary", () => {
           async (request) => {
             issuedQueries.push(request)
             if (request.query === "marketOverview") return marketOverviewResult
+            if (request.query === "investmentProfile" && request.selectionToken === marketSelectionToken) return profileResult()
             if (request.query === "marketInstrument" && request.selectionToken === marketSelectionToken) {
               return marketResult(requestedRow)
             }
@@ -658,11 +674,18 @@ describe("Market Squawk desktop boundary", () => {
     const investment = openInvestment(lookupRoute(parsed.matches[0]!))
     expect(await screen.findByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: marketSelectionToken })
+    const profile = within(screen.getByRole("region", { name: "Investment profile" }))
+    expect(await profile.findByText("XNAS")).toBeTruthy()
+    wrongProfileSelection = true
+    await userEvent.setup().click(profile.getByRole("button", { name: "Refresh profile" }))
+    expect((await profile.findByRole("alert")).textContent).toContain("The profile could not be refreshed")
+    expect(profile.getByText("XNAS")).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     investment.unmount()
 
     const staleToken = "market_ffffffffffffffffffffffffffffffff"
     openInvestment(`/investments/${staleToken}`)
-    expect((await screen.findByRole("alert")).textContent).toContain("This investment could not be opened")
+    await waitFor(() => expect(screen.getAllByRole("alert").some((alert) => alert.textContent?.includes("This investment could not be opened"))).toBe(true))
     expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: staleToken })
     expect(screen.queryByRole("heading", { name: "MSQ · Requested investment" })).toBeNull()
     // A rejected detail route must not select another investment as fallback.
@@ -731,6 +754,11 @@ describe("Market Squawk desktop boundary", () => {
                 data: { revision: collectionRevision.toString(), choices: collectionChoices },
                 metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
               }
+            }
+            if (request.query === "investmentProfile") return {
+              data: { selectionToken: request.selectionToken, knowledgeAt: marketObservedAt,
+                state: "missing", reason: "official_membership", profile: null },
+              metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
             }
             if (request.query === "marketOverview") return marketOverviewResult
             if (request.query === "marketInstrument") return marketResult({

@@ -620,6 +620,15 @@ async fn market(
             )
             .await
         }
+        MarketCommand::Profile { selection_token } => {
+            invoke_without_result_limits(
+                authority,
+                "Research.GetInvestmentProfile",
+                json!({"selectionToken": selection_token}),
+                "investment profile read",
+            )
+            .await
+        }
         MarketCommand::History {
             history_token,
             start_unix_nanos,
