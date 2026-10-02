@@ -10,7 +10,7 @@ import { MarketPriceChart, type ChartViewport, type ObservedPricePoint } from "@
 import { productKeys } from "@/app/query-client"
 import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
-import { formatTimestamp } from "@/lib/time"
+import { formatCalendarDate, formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
@@ -404,7 +404,7 @@ function ForecastDetail({
               const outcome = point.targetAtUnixNanos === null ? undefined : outcomeByTarget.get(point.targetAtUnixNanos)
               return (
                 <tr key={`${point.targetAtUnixNanos ?? point.financialTarget?.ordinal}:${index}`} className="border-t border-border">
-                  <td className="px-3 py-2 text-muted-foreground"><button type="button" className="text-left underline" onClick={() => onEstimateSelect(point)}>{formatForecastCoordinate(point)}</button></td>
+                  <td className="px-3 py-2 text-muted-foreground"><button type="button" className="text-left underline" data-time-unix-nanos={point.targetAtUnixNanos ?? undefined} data-financial-period={point.financialTarget?.period ? JSON.stringify(point.financialTarget.period) : undefined} onClick={() => onEstimateSelect(point)}>{formatForecastCoordinate(point)}</button></td>
                   <td className="px-3 py-2 font-mono">{point.central.formatted}</td>
                   {detail.target.valueKind !== "probability" ? <>
                     <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.likely)}</td>
@@ -507,7 +507,7 @@ function CalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
           </div>
         ))}
       </div>
-      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+      <p className="mt-3 text-xs leading-5 text-muted-foreground" data-calibration-window={JSON.stringify(calibration.window)}>
         Calibration window: {formatCalibrationWindow(calibration.window)}.
       </p>
       <p className="mt-3 text-xs leading-5 text-muted-foreground">
@@ -644,7 +644,7 @@ function targetKindLabel(
 function formatObservedThrough(value: string | null): string {
   return value === null ? "Reporting period; no exact observation time" : formatTimestamp(value)
 }
-function formatCalendarDate(value: { year: number; month: number; day: number }): string {
+function calendarCoordinate(value: { year: number; month: number; day: number }): string {
   return `${String(value.year).padStart(4, "0")}-${String(value.month).padStart(2, "0")}-${String(value.day).padStart(2, "0")}`
 }
 function formatForecastCoordinate(point: ForecastChart["estimates"][number]): string {
@@ -653,12 +653,12 @@ function formatForecastCoordinate(point: ForecastChart["estimates"][number]): st
   if (!target) return "Reporting period unavailable"
   const period = target.period
   if (!period) return `Reporting period ${target.ordinal}; exact dates unavailable`
-  return period.kind === "instant" ? formatCalendarDate(period.instant)
-    : `${formatCalendarDate(period.start)} – ${formatCalendarDate(period.end)}`
+  return period.kind === "instant" ? formatCalendarDate(calendarCoordinate(period.instant))
+    : `${formatCalendarDate(calendarCoordinate(period.start))} – ${formatCalendarDate(calendarCoordinate(period.end))}`
 }
 function formatCalibrationWindow(window: NonNullable<ForecastVintage["calibration"]>["window"]): string {
   return window.kind === "exact_time" ? `${formatTimestamp(window.start)} – ${formatTimestamp(window.end)}`
-    : `${formatCalendarDate(window.start)} – ${formatCalendarDate(window.end)} (reporting dates)`
+    : `${formatCalendarDate(calendarCoordinate(window.start))} – ${formatCalendarDate(calendarCoordinate(window.end))} (reporting dates)`
 }
 
 function ProbabilityEventEvidence({ vintage, estimates }: { vintage: ForecastVintage; estimates: ForecastChart["estimates"] }) {

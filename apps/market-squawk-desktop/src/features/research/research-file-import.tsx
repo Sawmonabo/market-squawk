@@ -23,6 +23,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
+import { formatProductTimestamp } from "@/lib/time"
 
 import {
   parseResearchFileCommit,
@@ -670,7 +671,7 @@ export function ResearchFileImport({
                   .map((field) => `${field.field} (${field.source})`)
                   .join(", ")}
               />
-              <Summary label="Fallback data time" value={mappingResult.mapping.effectiveAt} />
+              <Summary label="Fallback data time" value={<time dateTime={mappingResult.mapping.effectiveAt} title={mappingResult.mapping.effectiveAt}>{formatProductTimestamp(mappingResult.mapping.effectiveAt)}</time>} />
               <Summary
                 label="Investment link"
                 value={mappingResult.mapping.instrumentId ? "Linked" : "Not linked"}
@@ -806,7 +807,7 @@ function OptionalRowField({ label, value, columns, onChange }: { label: string; 
   )
 }
 
-function Summary({ label, value }: { label: string; value: string }) {
+function Summary({ label, value }: { label: string; value: React.ReactNode }) {
   return <p><span className="font-semibold">{label}:</span> <span className="break-all">{value}</span></p>
 }
 

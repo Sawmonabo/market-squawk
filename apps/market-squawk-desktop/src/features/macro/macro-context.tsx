@@ -11,6 +11,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
+import { formatCalendarDate, formatProductTimestamp } from "@/lib/time"
 
 import {
   macroContextCutoffsSchema,
@@ -251,13 +252,13 @@ function AvailabilitySummary({ data }: { data: MacroContextData }) {
       <dl className="mt-4 grid gap-3 border-t border-border pt-4 sm:grid-cols-3">
         <MacroEvidenceFact
           label="What was known by"
-          value={data.selection.knowledgeCutoff}
+          value={<time dateTime={data.selection.knowledgeCutoff} title={data.selection.knowledgeCutoff}>{formatProductTimestamp(data.selection.knowledgeCutoff)}</time>}
         />
         <MacroEvidenceFact
           label="Use data through"
-          value={data.selection.effectiveDateCutoff}
+          value={<time dateTime={data.selection.effectiveDateCutoff} title={data.selection.effectiveDateCutoff}>{formatCalendarDate(data.selection.effectiveDateCutoff)}</time>}
         />
-        <MacroEvidenceFact label="Checked" value={data.selection.evaluatedAt} />
+        <MacroEvidenceFact label="Checked" value={<time dateTime={data.selection.evaluatedAt} title={data.selection.evaluatedAt}>{formatProductTimestamp(data.selection.evaluatedAt)}</time>} />
       </dl>
     </section>
   )
@@ -313,19 +314,19 @@ function IndicatorCard({ observation }: { observation: MacroContextObservation }
             : observation.frequency === "quarterly" ? "Effective quarter"
               : observation.frequency === "monthly" && observation.effectiveDate === null
                 ? "Effective month" : "Effective date"}
-          value={observation.effectivePeriod ?? observation.effectiveDate ?? "Not available"}
+          value={observation.effectivePeriod ?? (observation.effectiveDate === null ? "Not available" : <time dateTime={observation.effectiveDate} title={observation.effectiveDate}>{formatCalendarDate(observation.effectiveDate)}</time>)}
         />
         <MacroEvidenceFact
           label="Recorded date"
           value={
             observation.recorded.state === "known"
-              ? observation.recorded.date
+              ? <time dateTime={observation.recorded.date} title={observation.recorded.date}>{formatCalendarDate(observation.recorded.date)}</time>
               : "Not supplied"
           }
         />
         <MacroEvidenceFact
           label="Available from"
-          value={observation.availableAt ?? "Not available"}
+          value={observation.availableAt === null ? "Not available" : <time dateTime={observation.availableAt} title={observation.availableAt}>{formatProductTimestamp(observation.availableAt)}</time>}
         />
       </dl>
       <p className="mt-3 text-[10px] leading-4 text-muted-foreground">

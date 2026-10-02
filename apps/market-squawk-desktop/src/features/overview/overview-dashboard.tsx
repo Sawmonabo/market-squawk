@@ -25,10 +25,10 @@ import {
   EvidenceReliabilityDetails,
   PricePatternDetails,
   StudyQualificationDetails,
-  formatProductTimestamp,
 } from "@/features/opportunities/investment-brief"
 import { formatMoney } from "@/lib/formatters"
 import type { ProductTransport } from "@/lib/transport"
+import { formatProductTimestamp } from "@/lib/time"
 
 import { useOverviewQueries } from "./use-overview"
 
@@ -171,8 +171,8 @@ function DecisionCard({
         {displayed.recommendation.summary}
       </p>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-2">
-        <Fact label="Horizon ends" value={formatProductTimestamp(displayed.horizon.endsAt)} />
-        <Fact label="Review by" value={formatProductTimestamp(displayed.horizon.expiresAt)} />
+        <Fact label="Horizon ends" value={<time dateTime={displayed.horizon.endsAt} title={displayed.horizon.endsAt}>{formatProductTimestamp(displayed.horizon.endsAt)}</time>} />
+        <Fact label="Review by" value={<time dateTime={displayed.horizon.expiresAt} title={displayed.horizon.expiresAt}>{formatProductTimestamp(displayed.horizon.expiresAt)}</time>} />
       </dl>
 
       <DemandPanel title="Open supporting evidence" className="mt-4 rounded-lg border p-3">
@@ -270,7 +270,7 @@ function DecisionEvidence({ analysis }: { analysis: InvestmentAnalysis }) {
           />
           <Fact
             label="Information current through"
-            value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)}
+            value={<time dateTime={analysis.horizon.informationCurrentThrough} title={analysis.horizon.informationCurrentThrough}>{formatProductTimestamp(analysis.horizon.informationCurrentThrough)}</time>}
           />
         </dl>
       </details>
@@ -323,7 +323,7 @@ function PriceContext({ analysis }: { analysis: InvestmentAnalysis }) {
             <Fact label="Upside range" value={formatRange(scenarios.upside)} />
             <Fact
               label="Range horizon"
-              value={formatProductTimestamp(scenarios.endsAt)}
+              value={<time dateTime={scenarios.endsAt} title={scenarios.endsAt}>{formatProductTimestamp(scenarios.endsAt)}</time>}
             />
           </>
         ) : null}

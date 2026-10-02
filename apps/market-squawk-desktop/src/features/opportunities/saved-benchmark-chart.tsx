@@ -1,4 +1,5 @@
 import * as React from "react"
+import { formatCalendarDate } from "@/lib/time"
 
 import { formatChartTimestamp, useDebouncedChartCallback, type ChartViewport } from "@/components/charts/market-price-chart"
 
@@ -42,7 +43,7 @@ export function SavedBenchmarkChart({ benchmark, currency, onViewportChange, onO
   return <section className="rounded-xl border border-border bg-card/35" aria-label="Saved price comparison">
     <div className="p-4">
       <h4 className="text-sm font-semibold">{benchmark.state === "available"
-        ? `Price change since ${benchmark.baseline.date}` : "Comparison data unavailable"}</h4>
+        ? <>Price change since <time dateTime={benchmark.baseline.date} title={benchmark.baseline.date}>{formatCalendarDate(benchmark.baseline.date)}</time></> : "Comparison data unavailable"}</h4>
       <p className="mt-2 text-xs leading-5 text-muted-foreground">
         {subject.label}{selected ? ` compared with ${selected.label}` : " has no saved comparison investment"}
         {selected && accompanying && !duplicateAccompanying ? `, with ${accompanying.label} alongside` : ""}.
@@ -155,7 +156,7 @@ function AvailableChart({ benchmark, currency, onViewportChange, onObservationSe
     else next.add(memberIndex)
     return next
   })
-  const coordinateLabel = `${chosen.coordinate.date} · regular session close ${formatChartTimestamp(chosenTime)}`
+  const coordinateLabel = `${formatCalendarDate(chosen.coordinate.date)} · regular session close ${formatChartTimestamp(chosenTime)}`
   const missingMembers = React.useMemo(() => displayMembers.filter(({ index }) =>
     benchmark.points.every((point) => point.observations[index] === null)), [benchmark.points, displayMembers])
   return <>
@@ -207,8 +208,8 @@ function AvailableChart({ benchmark, currency, onViewportChange, onObservationSe
         <line x1={PAD.left} x2={WIDTH - PAD.right} y1={plot.y(100)} y2={plot.y(100)} stroke="#fbbf24" strokeDasharray="3 5" opacity="0.65" />
         {seriesElements}
         <line x1={plot.x(chosenTime)} x2={plot.x(chosenTime)} y1={PAD.top} y2={HEIGHT - PAD.bottom} stroke="#e2e8f0" opacity="0.5" />
-        <text x={PAD.left} y={HEIGHT - 15} className="fill-muted-foreground text-[11px]">{rows[0]!.coordinate.date}</text>
-        <text x={WIDTH - PAD.right} y={HEIGHT - 15} textAnchor="end" className="fill-muted-foreground text-[11px]">{rows.at(-1)!.coordinate.date}</text>
+        <text x={PAD.left} y={HEIGHT - 15} className="fill-muted-foreground text-[11px]">{formatCalendarDate(rows[0]!.coordinate.date)}</text>
+        <text x={WIDTH - PAD.right} y={HEIGHT - 15} textAnchor="end" className="fill-muted-foreground text-[11px]">{formatCalendarDate(rows.at(-1)!.coordinate.date)}</text>
       </svg>
     </div>
     <div className="border-t border-border p-4">
@@ -220,7 +221,7 @@ function AvailableChart({ benchmark, currency, onViewportChange, onObservationSe
             if (nextTime !== undefined && nextTime !== chosenTime) setSelectedTime(nextTime)
           }} />
       </label>
-      <p className="mt-3 break-all font-mono text-xs">{coordinateLabel}</p>
+      <p className="mt-3 text-xs" data-session-date={chosen.coordinate.date} data-session-close-unix-nanos={chosenTime}>{coordinateLabel}</p>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-live="polite" aria-atomic="true">
         {displayMembers.map(({ member, index }) => hidden.has(index) ? null : <div key={member.role}>
           <dt className="text-xs text-muted-foreground">{member.label}</dt>

@@ -2,7 +2,45 @@
 
 ## Current execution — 2026-10-02
 
-XBRL occurrence correction is implemented and critically verified: detailed filing facts use
+Readable date presentation is implemented and live verified on the existing native MSFT page:
+the selected history period now displays Aug 24/25, 2026 with local EDT times, financial reporting
+dates remain their original calendar dates, and no raw nanosecond strings appear in those labels.
+The shared formatters also cover saved briefs, forecasts, portfolio/backtests, valuation and macro
+context. Typecheck PASS; native DOM/screenshot `readable-msft-dates-native.{json,png}` inspected.
+This is presentation evidence, not resolution of the independent missing market/filing fields.
+Sol formatting ownership is released. No new routine tests were added.
+
+Owner timestamp-formatting correction: ordinary frontend surfaces must render readable local
+dates/times/ranges; exact ISO/nanosecond values belong only in machine attributes or deliberate
+evidence inspection. Sol financial_display_fixes owns `src/lib/time.ts`, market
+`market-history-chart.tsx`, `investment-financials.tsx`, `investment-profile.tsx`,
+`opportunities/{investment-brief,opportunities-read-experience}.tsx`,
+`overview/overview-dashboard.tsx`, `fair-value/fair-value-page.tsx`, and
+`research/research-file-import.tsx`, `components/charts/market-price-chart.tsx`, `features/opportunities/saved-benchmark-chart.tsx`,
+`features/models/{forecast-review,bundle-evidence}.tsx`, `features/opportunities/format.ts`
+and `features/macro/{macro-context,presentation}.tsx`
+for shared presentation formatting. Audit all rendered
+surfaces read-only and report additional exact file needs before editing. Preserve date-only
+calendar semantics and exact financial/source data. Lead reserves other market product/schema
+files and all checks/Git. This frontend-only correction can use normal HMR while Rust compiles.
+No new routine formatting tests; typecheck and existing affected critical UI checks suffice.
+
+
+Market-field implementation is frozen for the lead's serialized critical check. The existing Alpaca
+capture/publication case now proves the cross-generation quote/trade path with original metadata
+and retained-use permissions; the existing product case covers exact change arithmetic and
+incompatible/stale suppression. All three critical cases pass: retained quote/trade (1/1, 0.86s),
+product change/selection (1/1, 1.23s), native quote units/freshness (1/1, <0.01s).
+The latter two reuse the same compiled test binary; one compile took 9m21s. Logs
+`market-{components,change,quote}-critical.log` retain the outcomes. Shared native descriptors and quote
+source-unit projection are aligned in Rust. The matching Desktop parser/presentation edits are
+prepared locally and held until matched backend/native binaries are ready, avoiding frontend HMR
+against the old protocol. Visible service59743/Desktop59788 remain on generation6Ru5WP; watcher
+99703 remains stopped. The one matching development-binary build is active under
+`market-display-production-build.log`; no duplicate build or new runtime was started.
+
+
+XBRL occurrence correction is pushed as `5d38ac57` and critically verified: detailed filing facts use
 source + issuer + accession + occurrence ID for both revision assignment and PIT. Ordinary
 CompanyFacts economic grouping and generic ambiguous-revision rejection remain unchanged.
 The existing captured-filing publication/restart check passes (1/1, 2.19s), now preserving three
@@ -21,7 +59,7 @@ source integration; the visible current service/Desktop remain running. No compe
 
 | Owner | Exact file ownership | Dependency / smallest critical evidence |
 | --- | --- | --- |
-| Astra market_component_display | `apps/market-squawk/src/application/paper/market.rs` | Preserve independently timed quote/trade components with original retained authority and current display permits; keep execution/book coherence. Existing assembly critical case extended for cross-generation retained trade. |
+| Astra market_component_display | `apps/market-squawk/src/application/paper/market.rs` plus the existing `queued_alpaca_capture_survives_session_end_and_successor_publishes` case in `research/ingest/alpaca_historical.rs`; lead owns parent test-only export | Preserve independently timed quote/trade components with original retained authority and current display permits; keep execution/book coherence. Existing assembly critical case extended for cross-generation retained trade. |
 | Astra market_price_change | `apps/market-squawk/src/application/paper/market/{durable_product.rs,product.rs}` | Compute exact backend change only with eligible price and admitted earlier completed close, preserving null when unqualified. Existing product projection critical case. Shared output changes proposed to lead before edits. |
 | Astra sec_transform_diagnosis | `adapters/market-squawk-adapter-sec/src/xbrl/model.rs` existing critical fixture only | Extend repeated economic occurrences through publication/PIT/restart and optional real-body observed-batch hook; depends on lead occurrence-family correction. No builds. |
 | Sol financial_display_fixes | Read-only Alpaca unit contract research; report `.agents/tmp/v1-first-stock/alpaca-quote-unit-contract.md` | Establish documented bs/as units for actual feed/API and pinned decoder before canonical producer change; no guessed multiplier. |

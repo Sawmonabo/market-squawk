@@ -36,7 +36,7 @@ export function MacroEvidenceFact({
   mono = false,
 }: {
   label: string
-  value: string
+  value: ReactNode
   mono?: boolean
 }) {
   return (

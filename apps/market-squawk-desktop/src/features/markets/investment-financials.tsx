@@ -8,7 +8,7 @@ import { CursorNavigation, useCursorNavigation } from "@/features/shared/cursor-
 import { formatMoney, groupDecimal } from "@/lib/formatters"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
-import { formatTimestamp } from "@/lib/time"
+import { formatCalendarDate, formatProductTimestamp, formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import { FinancialPreparation } from "./financial-preparation"
@@ -208,8 +208,8 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     </div>
     <div className="min-h-[280px]">
     {result ? <>
-      {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="text-xs leading-5 text-muted-foreground">{showingPrior ? "Last checked information through" : "Information through"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{new Date(result.knowledgeAt).toLocaleString()}</time>
-        {" · Reporting cutoff "}<time dateTime={result.effectiveOn}>{result.effectiveOn}</time>{" · Latest information known at that date"}</p> : null}
+      {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="text-xs leading-5 text-muted-foreground">{showingPrior ? "Last checked information through" : "Information through"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{formatProductTimestamp(result.knowledgeAt)}</time>
+        {" · Reporting cutoff "}<time dateTime={result.effectiveOn} title={result.effectiveOn}>{formatCalendarDate(result.effectiveOn)}</time>{" · Latest information known at that date"}</p> : null}
       {result.state !== "reported" ? <p role="status" className="mt-3 text-sm text-muted-foreground">{sectionAvailability(result.state)}</p> : null}
       <FinancialFamilies families={result.families} />
       <FinancialLimitations result={result} />
@@ -386,7 +386,7 @@ function FinancialPeriod({ period }: { period: InvestmentFinancialEnvelope["peri
 
 function FinancialDate({ value }: { value: InvestmentFinancialDate }) {
   const date = `${String(value.year).padStart(4, "0")}-${String(value.month).padStart(2, "0")}-${String(value.day).padStart(2, "0")}`
-  return <time dateTime={date}>{date}</time>
+  return <time dateTime={date} title={date}>{formatCalendarDate(date)}</time>
 }
 
 function FinancialTime({ value }: { value: InvestmentFinancialTime }) {

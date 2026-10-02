@@ -5,11 +5,10 @@ import { currentDisplayQueryOptions, productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { groupDecimal } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
-import { formatTimestamp } from "@/lib/time"
+import { formatProductTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import { parseInvestmentProfileResult, type InvestmentProfileResult, type InvestmentReferenceProfile } from "./investment-profile-schema"
-import { sourceInstantUnixNanos } from "./market-history"
 
 export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
   selectionToken: string
@@ -89,7 +88,7 @@ function ReferenceProfile({ profile }: { profile: InvestmentReferenceProfile }) 
 }
 
 function ProfileTime({ value }: { value: string }) {
-  return <time className="font-mono" dateTime={value} title={value}>{formatTimestamp(sourceInstantUnixNanos(value))}</time>
+  return <time dateTime={value} title={value}>{formatProductTimestamp(value)}</time>
 }
 
 function profileAvailability(result: Exclude<InvestmentProfileResult, { state: "available" }>): string {

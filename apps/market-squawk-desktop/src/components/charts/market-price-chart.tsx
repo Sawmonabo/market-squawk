@@ -1,4 +1,5 @@
 import * as React from "react"
+import { formatCalendarDate, formatTimestamp, timestampFromUnixNanos } from "@/lib/time"
 
 export type ChartTime = number | string | bigint
 // Number conversion is confined to drawing; the supplied decimal remains the displayed value.
@@ -217,9 +218,9 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
   const selectedForecast = forecastPoints.find(({ plot }) => plot.time === selected)
   const selectedSessionDate = selectedHistory?.source.sessionDate ?? selectedGap?.source.sessionDate
   const selectedDate = selectedSessionDate
-    ? `Trading date ${selectedSessionDate} · recorded session close ${formatChartTimestamp(selected!)}`
+    ? `Trading date ${formatCalendarDate(selectedSessionDate)} · recorded session close ${formatChartTimestamp(selected!)}`
     : selected === null ? "No date selected" : formatChartTimestamp(selected)
-  const readout: { label: string; value: string; unit?: string }[] = []
+  const readout: { label: string; value: string; unit?: string; sourceTime?: ChartTime }[] = []
   if (visible("history") && selectedHistory) readout.push({ label: "Observed", value: selectedHistory.plot.exact })
   if (visible("history") && selectedGap) readout.push({ label: "Observed", value: "Missing source session", unit: "" })
   if (visible("history") && selectedObservation?.quality) readout.push({ label: "Source quality", value: selectedObservation.quality, unit: "" })
@@ -238,8 +239,8 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
   if (visible("pattern")) for (const entry of patternPoints) {
     if (entry.plot.time === selected) {
       readout.push({ label: `${entry.source.name} pivot`, value: entry.plot.exact })
-      readout.push({ label: `${entry.source.name} available`, value: formatChartTimestamp(entry.source.availableAtUnixNanos), unit: "" })
-      readout.push({ label: `${entry.source.name} confirmed`, value: formatChartTimestamp(entry.source.confirmedAtUnixNanos), unit: "" })
+      readout.push({ label: `${entry.source.name} available`, value: formatChartTimestamp(entry.source.availableAtUnixNanos), unit: "", sourceTime: entry.source.availableAtUnixNanos })
+      readout.push({ label: `${entry.source.name} confirmed`, value: formatChartTimestamp(entry.source.confirmedAtUnixNanos), unit: "", sourceTime: entry.source.confirmedAtUnixNanos })
     }
   }
   const selectedWithin = (layer: { fromUnixNanos?: ChartTime; throughUnixNanos?: ChartTime; throughExclusiveUnixNanos?: ChartTime }) => selected !== null
@@ -248,6 +249,8 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
     && (layer.throughExclusiveUnixNanos === undefined || selected < (parseTime(layer.throughExclusiveUnixNanos) ?? selected))
   for (const range of ranges) if (visible(`range:${range.id}`) && selectedWithin(range)) readout.push({ label: range.label, value: `${range.lower} – ${range.upper}` })
   for (const target of targets) if (visible(`target:${target.id}`) && selectedWithin(target)) readout.push({ label: target.label, value: String(target.value) })
+  const firstSessionDate = historyRows.find((entry) => entry.time === minTime)?.source.sessionDate
+  const lastSessionDate = historyRows.find((entry) => entry.time === maxTime)?.source.sessionDate
   return <figure className={`overflow-hidden rounded-xl border border-border bg-card/35 ${className ?? ""}`}>
     <figcaption className="flex flex-wrap items-center justify-between gap-3 p-4">
       <span className="text-sm font-semibold">{title} · {unit}</span>
@@ -310,7 +313,7 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
             ? <circle key={index} cx={x(segment[0]!.time)} cy={y(segment[0]!.value)} r="4" fill="#e2e8f0" />
             : <path key={index} d={linePath(segment, x, y)} fill="none" stroke="#e2e8f0" strokeWidth="2.25" />)}
           {observedRows.filter(({ source }) => source.value === null).map(({ time }) =>
-            <line key={`gap-${time}`} x1={x(time)} x2={x(time)} y1={PAD.top} y2={HEIGHT - PAD.bottom}
+            <line key={`gap-${time}`} data-time-unix-nanos={String(time)} x1={x(time)} x2={x(time)} y1={PAD.top} y2={HEIGHT - PAD.bottom}
               stroke="#94a3b8" strokeDasharray="2 6" opacity="0.45">
               <title>Missing source session · {formatChartTimestamp(time)}</title>
             </line>)}
@@ -322,7 +325,7 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
         {visible("actual") ? forecastPoints.map(({ source, plot }) => source.actual === undefined || !Number.isFinite(Number(source.actual)) ? null : <circle key={plot.time.toString()} cx={x(plot.time)} cy={y(Number(source.actual))} r="4" fill="#34d399" />) : null}
         {visible("pattern") && patternPoints.length ? <g>
           <path d={linePath(patternPoints.map(({ plot }) => plot), x, y)} fill="none" stroke="#c084fc" strokeWidth="2" />
-          {patternPoints.map(({ source, plot }) => <g key={source.name}
+          {patternPoints.map(({ source, plot }) => <g key={source.name} data-time-unix-nanos={String(source.timeUnixNanos)} data-available-at-unix-nanos={String(source.availableAtUnixNanos)} data-confirmed-at-unix-nanos={String(source.confirmedAtUnixNanos)}
             role={onPatternSelect ? "button" : undefined}
             tabIndex={onPatternSelect ? 0 : undefined}
             aria-label={onPatternSelect ? `Open ${pattern!.label} evidence for ${source.name} pivot, observed ${formatChartTimestamp(plot.time)}, ${plot.exact} ${unit}` : undefined}
@@ -343,21 +346,21 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
           </g>)}
         </g> : null}
         {selected !== null ? <line x1={x(selected)} x2={x(selected)} y1={PAD.top} y2={HEIGHT - PAD.bottom} stroke="#e2e8f0" opacity="0.5" pointerEvents="none" /> : null}
-        <text x={PAD.left} y={HEIGHT - 15} className="fill-muted-foreground text-[11px]">{shortDate(minTime)}</text>
-        <text x={WIDTH - PAD.right} y={HEIGHT - 15} textAnchor="end" className="fill-muted-foreground text-[11px]">{shortDate(maxTime)}</text>
+        <text x={PAD.left} y={HEIGHT - 15} className="fill-muted-foreground text-[11px]">{firstSessionDate ? formatCalendarDate(firstSessionDate) : shortDate(minTime)}</text>
+        <text x={WIDTH - PAD.right} y={HEIGHT - 15} textAnchor="end" className="fill-muted-foreground text-[11px]">{lastSessionDate ? formatCalendarDate(lastSessionDate) : shortDate(maxTime)}</text>
       </svg>
     </div>
     <div className="border-t border-border p-4">
-      <label className="grid gap-2 text-xs">Inspect a date · UTC
+      <label className="grid gap-2 text-xs">Inspect a recorded date
         <input type="range" min={0} max={times.length - 1} step={1} value={selected === null ? 0 : times.indexOf(selected)}
           aria-valuetext={selectedDate} onChange={(event) => setSelectedTime(times[Number(event.target.value)] ?? null)} />
       </label>
-      <p className="mt-3 break-all font-mono text-xs">{selectedDate}</p>
+      <p className="mt-3 text-xs" data-session-date={selectedSessionDate} data-time-unix-nanos={selected === null ? undefined : String(selected)}>{selectedDate}</p>
       {displayResolution?.reduced ? <p className="mt-2 text-xs text-muted-foreground">
         Showing {displayResolution.returnedPointCount.toLocaleString()} original recorded dates from {displayResolution.visibleOriginalPointCount} in this window. Change the history window for more detail.
       </p> : null}
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-live="polite" aria-atomic="true">
-        {readout.map((entry) => <div key={entry.label}><dt className="text-xs text-muted-foreground">{entry.label}</dt><dd className="mt-1 break-all font-mono text-xs">{entry.value} {entry.unit ?? unit}</dd></div>)}
+        {readout.map((entry) => <div key={entry.label}><dt className="text-xs text-muted-foreground">{entry.label}</dt><dd className="mt-1 break-all font-mono text-xs" data-time-unix-nanos={entry.sourceTime === undefined ? undefined : String(entry.sourceTime)}>{entry.value} {entry.unit ?? unit}</dd></div>)}
       </dl>
       {!readout.length ? <p className="mt-3 text-xs text-muted-foreground">No visible series has an observation at this date.</p> : null}
       <p className="mt-3 text-[11px] leading-5 text-muted-foreground">Solid: observed. Dashed blue: central forecast. Blue shading: calibrated uncertainty. Amber: saved reference ranges or levels. Purple: recorded pattern geometry where supplied. Pivot positions mark when prices occurred; availability and confirmation show when the evidence became known. Observed lines stop at missing source sessions. Hovering shows the nearest recorded date without estimating a value between points. The history window changes only the view; the saved forecast horizon stays fixed.</p>
@@ -413,10 +416,6 @@ function axisValue(value: number) { return new Intl.NumberFormat(undefined, { ma
 export function formatChartTimestamp(coordinate: ChartTime | null): string {
   const value = parseTime(coordinate)
   if (value === null) return "Unavailable"
-  const seconds = value >= 0n ? value / 1_000_000_000n : (value - 999_999_999n) / 1_000_000_000n
-  const milliseconds = Number(seconds * 1_000n)
-  const date = new Date(milliseconds)
-  if (!Number.isSafeInteger(milliseconds) || Number.isNaN(date.valueOf())) return `${value} ns since Unix epoch`
-  return `${date.toISOString().replace(/\.\d{3}Z$/, "")}.${(value - seconds * 1_000_000_000n).toString().padStart(9, "0")}Z`
+  return formatTimestamp(value)
 }
-function shortDate(value: bigint) { return formatChartTimestamp(value).slice(0, 10) }
+function shortDate(value: bigint) { return timestampFromUnixNanos(value)?.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) ?? "Unavailable" }

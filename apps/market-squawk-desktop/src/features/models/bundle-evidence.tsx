@@ -1,6 +1,6 @@
 import { Box, Database, ShieldCheck } from "lucide-react"
 
-import { formatTimestamp } from "@/lib/time"
+import { formatCalendarDate, formatTimestamp } from "@/lib/time"
 
 import type { ModelEvidence } from "./models-contracts"
 
@@ -79,6 +79,7 @@ export function BundleEvidence({
           <Fact
             label="Training period"
             value={formatTrainingPeriod(model.training.period)}
+            sourcePeriod={model.training.period}
           />
           {model.training.studyBasis ? (
             <Fact
@@ -180,7 +181,7 @@ function formatTrainingPeriod(period: ModelEvidence["training"]["period"]): stri
     return `${formatTimestamp(period.startUnixNanos)} through ${formatTimestamp(period.endUnixNanos)}`
   }
   const calendar = (value: typeof period.start) =>
-    `${value.year.toString().padStart(4, "0")}-${value.month.toString().padStart(2, "0")}-${value.day.toString().padStart(2, "0")}`
+    formatCalendarDate(`${value.year.toString().padStart(4, "0")}-${value.month.toString().padStart(2, "0")}-${value.day.toString().padStart(2, "0")}`)
   return `${calendar(period.start)} through ${calendar(period.end)} (fiscal dates)`
 }
 
@@ -212,13 +213,13 @@ function MiniFact({
   )
 }
 
-function Fact({ label, value }: { label: string; value: string }) {
+function Fact({ label, value, sourcePeriod }: { label: string; value: string; sourcePeriod?: ModelEvidence["training"]["period"] }) {
   return (
     <div>
       <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">
         {label}
       </dt>
-      <dd className="mt-1 text-xs">{value}</dd>
+      <dd className="mt-1 text-xs" data-source-period={sourcePeriod === undefined ? undefined : JSON.stringify(sourcePeriod)}>{value}</dd>
     </div>
   )
 }

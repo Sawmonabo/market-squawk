@@ -1,3 +1,4 @@
+import type { ReactNode } from "react"
 import { RefreshButton } from "@/components/ui/refresh-button"
 import { useQuery } from "@tanstack/react-query"
 import {
@@ -14,6 +15,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { ProductTransport } from "@/lib/transport"
+import { formatProductTimestamp } from "@/lib/time"
 
 import {
   admittedAnalysisActionToken,
@@ -26,7 +28,6 @@ import {
   BriefError,
   BriefLoading,
   InvestmentBrief,
-  formatProductTimestamp,
   locatorOutcomeLabel,
 } from "./investment-brief"
 import { AnalysisActivity } from "./analysis-activity"
@@ -283,10 +284,10 @@ function AnalysisHistoryCard({
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-3">
         <CardFact
           label="Information current through"
-          value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)}
+          value={<time dateTime={analysis.horizon.informationCurrentThrough} title={analysis.horizon.informationCurrentThrough}>{formatProductTimestamp(analysis.horizon.informationCurrentThrough)}</time>}
         />
-        <CardFact label="Horizon" value={formatProductTimestamp(analysis.horizon.endsAt)} />
-        <CardFact label="Expires" value={formatProductTimestamp(analysis.horizon.expiresAt)} />
+        <CardFact label="Horizon" value={<time dateTime={analysis.horizon.endsAt} title={analysis.horizon.endsAt}>{formatProductTimestamp(analysis.horizon.endsAt)}</time>} />
+        <CardFact label="Expires" value={<time dateTime={analysis.horizon.expiresAt} title={analysis.horizon.expiresAt}>{formatProductTimestamp(analysis.horizon.expiresAt)}</time>} />
       </dl>
       <div className="mt-4 flex items-center justify-end gap-1 text-xs font-medium text-primary">
         {openLabel}
@@ -296,7 +297,7 @@ function AnalysisHistoryCard({
   )
 }
 
-function CardFact({ label, value }: { label: string; value: string }) {
+function CardFact({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div>
       <dt className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</dt>

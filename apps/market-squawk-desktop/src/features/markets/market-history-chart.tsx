@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { CandlestickSeries, LineSeries, ColorType, createChart, type BusinessDay, type CandlestickData, type IChartApi, type ISeriesApi, type Time, type UTCTimestamp } from "lightweight-charts"
 
-import { formatTimestamp } from "@/lib/time"
+import { formatCalendarDate, formatProductTimestamp, formatTimestamp } from "@/lib/time"
 
 import { useDebouncedChartCallback } from "@/components/charts/market-price-chart"
 
@@ -21,9 +21,9 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
   const history = result.data
   return <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
     <h3 className="text-base font-semibold">Price history</h3>
-    <p className="mt-2 text-xs leading-5 text-muted-foreground">
-      Saved range: {history.viewport.fullStartDate ?? (history.viewport.fullStartUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullStartUnixNanos))}
-      {" – "}{history.viewport.fullEndDate ?? (history.viewport.fullEndUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullEndUnixNanos))}.
+    <p className="mt-2 text-xs leading-5 text-muted-foreground" title={`${history.viewport.fullStartDate ?? history.viewport.fullStartUnixNanos ?? "Unavailable"} – ${history.viewport.fullEndDate ?? history.viewport.fullEndUnixNanos ?? "Unavailable"}`}>
+      Saved range: {history.viewport.fullStartDate !== null ? formatCalendarDate(history.viewport.fullStartDate) : (history.viewport.fullStartUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullStartUnixNanos))}
+      {" – "}{history.viewport.fullEndDate !== null ? formatCalendarDate(history.viewport.fullEndDate) : (history.viewport.fullEndUnixNanos === null ? "Unavailable" : formatTimestamp(history.viewport.fullEndUnixNanos))}.
       {" "}Prices in {history.currency}.{history.partial ? " Partial saved history." : ""}
     </p>
     {history.bars.length > 0 ? <PriceSeries history={history} nominal={history.bars[0]!.time.precision === "nominal_date"} onViewportChange={onViewportChange} onObservationSelect={onObservationSelect} windowDays={windowDays} onWindowChange={onWindowChange} />
@@ -38,7 +38,7 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
         {history.bars.slice(-30).map((bar) => {
           const coordinate = bar.time.precision === "nominal_date" ? bar.time.date : bar.time.startsAt
           return <li key={`${bar.time.precision}:${coordinate}`} className="flex justify-between gap-4 py-2 text-xs">
-            <time dateTime={coordinate}>{coordinate}</time>
+            <time dateTime={coordinate} title={coordinate}>{bar.time.precision === "nominal_date" ? formatCalendarDate(coordinate) : formatProductTimestamp(coordinate)}</time>
             <span className="font-mono">{bar.close} {history.currency}</span>
           </li>
         })}
@@ -250,7 +250,7 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
             if (bar) setSelectedCoordinate(coordinate(bar))
           }} />
       </label>
-      <p className="mt-3 break-all font-mono text-xs">{periodLabel(selected)}</p>
+      <p className="mt-3 text-xs" title={selected.time.precision === "nominal_date" ? selected.time.date : `${selected.time.startsAt} – ${selected.time.endsAt}`}>{periodLabel(selected)}</p>
       <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4" aria-live="polite" aria-atomic="true">
         {([['Open', selected.open], ['High', selected.high], ['Low', selected.low], ['Close', selected.close]] as const).map(([label, value]) => <div key={label}>
           <dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 break-all font-mono text-xs">{value} {currency}</dd>
@@ -261,7 +261,7 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
 }
 function coordinate(bar: MarketHistoryBar): string { return bar.time.precision === "nominal_date" ? bar.time.date : bar.time.startsAt }
 function periodLabel(bar: MarketHistoryBar): string {
-  return bar.time.precision === "nominal_date" ? `${bar.time.date} · trading date` : `${bar.time.startsAt} – ${bar.time.endsAt}`
+  return bar.time.precision === "nominal_date" ? `${formatCalendarDate(bar.time.date)} · trading date` : `${formatProductTimestamp(bar.time.startsAt)} – ${formatProductTimestamp(bar.time.endsAt)}`
 }
 function timeKey(time: Time): string {
   return typeof time === "object" ? `${time.year}-${String(time.month).padStart(2, "0")}-${String(time.day).padStart(2, "0")}` : String(time)

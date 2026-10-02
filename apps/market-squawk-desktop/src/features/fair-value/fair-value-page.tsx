@@ -13,7 +13,6 @@ import {
   EvidenceSummary,
   PriceRanges,
   ProductLists,
-  formatProductTimestamp,
 } from "@/features/opportunities/investment-brief"
 import { SavedAnalysisHistory } from "@/features/opportunities/opportunities-read-experience"
 import { formatMoney as money } from "@/features/opportunities/format"
@@ -21,6 +20,7 @@ import { useSavedInvestmentAnalyses, useSavedInvestmentAnalysis } from "@/featur
 import { useCursorNavigation } from "@/features/shared/cursor-navigation"
 import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { ProductTransport } from "@/lib/transport"
+import { formatProductTimestamp } from "@/lib/time"
 
 import { ValuationEvidence } from "./valuation-evidence"
 
@@ -114,9 +114,9 @@ function SavedValuation({ analysis, refreshing, onRefresh }: {
     </div>
     <p className="mt-4 text-sm leading-6 text-muted-foreground">{analysis.recommendation.summary}</p>
     <dl className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-      <ValuationFact label="Information current through" value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)} />
-      <ValuationFact label="Analysis horizon" value={formatProductTimestamp(analysis.horizon.endsAt)} />
-      <ValuationFact label="Analysis expires" value={formatProductTimestamp(analysis.horizon.expiresAt)} />
+      <ValuationFact label="Information current through" value={<time dateTime={analysis.horizon.informationCurrentThrough} title={analysis.horizon.informationCurrentThrough}>{formatProductTimestamp(analysis.horizon.informationCurrentThrough)}</time>} />
+      <ValuationFact label="Analysis horizon" value={<time dateTime={analysis.horizon.endsAt} title={analysis.horizon.endsAt}>{formatProductTimestamp(analysis.horizon.endsAt)}</time>} />
+      <ValuationFact label="Analysis expires" value={<time dateTime={analysis.horizon.expiresAt} title={analysis.horizon.expiresAt}>{formatProductTimestamp(analysis.horizon.expiresAt)}</time>} />
       <ValuationFact label="Saved current price per instrument unit" value={analysis.priceSummary.current ? money(analysis.priceSummary.current) : "Unavailable"} />
       <ValuationFact label="Saved fair value per instrument unit" value={analysis.priceSummary.fairValue ? money(analysis.priceSummary.fairValue) : "Unavailable"} />
       <ValuationFact label="Reporting currency" value={analysis.currency} />
@@ -128,7 +128,7 @@ function SavedValuation({ analysis, refreshing, onRefresh }: {
   </section>
 }
 
-function ValuationFact({ label, value }: { label: string; value: string }) {
+function ValuationFact({ label, value }: { label: string; value: ReactNode }) {
   return <div><dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt><dd className="mt-1 text-xs leading-5">{value}</dd></div>
 }
 

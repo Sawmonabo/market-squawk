@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { RecommendationStudyPanel } from "@/features/backtests/backtests-page"
 import type { ProductTransport } from "@/lib/transport"
+import { formatProductTimestamp } from "@/lib/time"
 
 import type {
   InvestmentAnalysis,
@@ -96,10 +97,10 @@ export function InvestmentBrief({
       <dl className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <Fact
           label="Information current through"
-          value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)}
+          value={<time dateTime={analysis.horizon.informationCurrentThrough} title={analysis.horizon.informationCurrentThrough}>{formatProductTimestamp(analysis.horizon.informationCurrentThrough)}</time>}
         />
-        <Fact label="Analysis horizon" value={formatProductTimestamp(analysis.horizon.endsAt)} />
-        <Fact label="Brief expires" value={formatProductTimestamp(analysis.horizon.expiresAt)} />
+        <Fact label="Analysis horizon" value={<time dateTime={analysis.horizon.endsAt} title={analysis.horizon.endsAt}>{formatProductTimestamp(analysis.horizon.endsAt)}</time>} />
+        <Fact label="Brief expires" value={<time dateTime={analysis.horizon.expiresAt} title={analysis.horizon.expiresAt}>{formatProductTimestamp(analysis.horizon.expiresAt)}</time>} />
         <Fact
           label="Current price"
           value={nullableMoney(analysis.priceSummary.current)}
@@ -231,7 +232,7 @@ function OriginalChartObservationRead({ point, actionToken, currency, transport,
     },
   })
   return <div className="rounded-lg border border-border bg-background/25 p-3 text-xs">
-    <p className="font-medium">Original saved observation · {formatChartTimestamp(time)}</p>
+    <p className="font-medium" data-time-unix-nanos={time}>Original saved observation · {formatChartTimestamp(time)}</p>
     {read.isPending ? <p role="status" className="mt-2 text-muted-foreground">Checking the exact original evidence…</p>
       : read.isError ? <p role="alert" className="mt-2 text-destructive">The original observation could not be verified. <Button size="xs" variant="outline" onClick={() => void read.refetch()}>Retry</Button></p>
         : "observations" in read.data ? <dl className="mt-2 grid gap-2 sm:grid-cols-3">{read.data.observations.map((entry, index) => <div key={index}>
@@ -324,9 +325,9 @@ function SavedInvestmentChart({ chart, currency, onViewportChange, onObservation
     {actionRanges.state === "available" ? <details className="rounded-lg border border-border bg-background/25 p-4">
       <summary className="cursor-pointer text-sm font-medium">Saved action reference evidence</summary>
       <dl className="mt-4 grid gap-3 sm:grid-cols-3">
-        <Fact label="Original information cutoff" value={formatChartTimestamp(actionRanges.informationCurrentThroughUnixNanos)} />
-        <Fact label="Originally admitted" value={formatChartTimestamp(actionRanges.admittedAtUnixNanos)} />
-        <Fact label="Reference expiry (exclusive)" value={formatChartTimestamp(actionRanges.expiresAtUnixNanos)} />
+        <Fact label="Original information cutoff" value={<span data-time-unix-nanos={actionRanges.informationCurrentThroughUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.informationCurrentThroughUnixNanos)}</span>} />
+        <Fact label="Originally admitted" value={<span data-time-unix-nanos={actionRanges.admittedAtUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.admittedAtUnixNanos)}</span>} />
+        <Fact label="Reference expiry (exclusive)" value={<span data-time-unix-nanos={actionRanges.expiresAtUnixNanos ?? undefined}>{formatChartTimestamp(actionRanges.expiresAtUnixNanos)}</span>} />
       </dl>
       <ul className="mt-4 space-y-3 text-xs leading-5">
         {actionRanges.ranges.map((range) => <li key={range.kind}>
@@ -341,9 +342,9 @@ function SavedInvestmentChart({ chart, currency, onViewportChange, onObservation
       <p className="mt-3 text-xs leading-5 text-muted-foreground">{pattern.summary}</p>
       <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Direction" value={pattern.direction === null ? "Unavailable" : pattern.direction === "bullish" ? "Bullish" : "Bearish"} />
-        <Fact label="Original observation cutoff" value={formatChartTimestamp(pattern.observationCutoffUnixNanos)} />
-        <Fact label="Originally confirmed through" value={formatChartTimestamp(pattern.confirmationCutoffUnixNanos)} />
-        <Fact label="Pattern expiry" value={formatChartTimestamp(pattern.expiresAtUnixNanos)} />
+        <Fact label="Original observation cutoff" value={<span data-time-unix-nanos={pattern.observationCutoffUnixNanos ?? undefined}>{formatChartTimestamp(pattern.observationCutoffUnixNanos)}</span>} />
+        <Fact label="Originally confirmed through" value={<span data-time-unix-nanos={pattern.confirmationCutoffUnixNanos ?? undefined}>{formatChartTimestamp(pattern.confirmationCutoffUnixNanos)}</span>} />
+        <Fact label="Pattern expiry" value={<span data-time-unix-nanos={pattern.expiresAtUnixNanos ?? undefined}>{formatChartTimestamp(pattern.expiresAtUnixNanos)}</span>} />
         <Fact label="Completion / reversal zone" value={pattern.reversalZone
           ? `${pattern.reversalZone.lower} – ${pattern.reversalZone.upper} ${currency}` : "Unavailable"} />
         <Fact label="Invalidation level" value={pattern.invalidation === null
@@ -358,8 +359,8 @@ function SavedInvestmentChart({ chart, currency, onViewportChange, onObservation
           <tbody>{pattern.pivots.map((pivot) => <tr key={pivot.name} aria-current={pivot.name === selectedPivot ? "true" : undefined}
             className={`border-t border-border ${pivot.name === selectedPivot ? "bg-primary/10" : ""}`}>
             <td className="p-2">{pivot.name} · {pivot.kind}</td><td className="p-2 font-mono">{pivot.value} {currency}</td>
-            <td className="p-2">{formatChartTimestamp(pivot.observedAtUnixNanos)}</td><td className="p-2">{formatChartTimestamp(pivot.availableAtUnixNanos)}</td>
-            <td className="p-2">{formatChartTimestamp(pivot.confirmedAtUnixNanos)}</td>
+            <td className="p-2" data-time-unix-nanos={pivot.observedAtUnixNanos}>{formatChartTimestamp(pivot.observedAtUnixNanos)}</td><td className="p-2" data-time-unix-nanos={pivot.availableAtUnixNanos}>{formatChartTimestamp(pivot.availableAtUnixNanos)}</td>
+            <td className="p-2" data-time-unix-nanos={pivot.confirmedAtUnixNanos}>{formatChartTimestamp(pivot.confirmedAtUnixNanos)}</td>
           </tr>)}</tbody>
         </table>
       </div> : null}
@@ -419,17 +420,17 @@ function SavedProbabilities({ analysis }: { analysis: InvestmentAnalysis }) {
           <p className="mt-2 font-mono text-lg">{event.state === "available" ? formatPercent(event.probabilityPercent) : "Unavailable"}</p>
           {event.state === "unavailable" ? <p className="mt-2 text-xs leading-5 text-muted-foreground">{event.summary}</p> : <>
             <dl className="mt-3 space-y-3">
-              <Fact label="Starting observation" value={formatProductTimestamp(event.observedAt)} />
-              <Fact label="Forecast ends" value={formatProductTimestamp(event.endsAt)} />
-              <Fact label="Original forecast expires" value={formatProductTimestamp(event.expiresAt)} />
+              <Fact label="Starting observation" value={<time dateTime={event.observedAt} title={event.observedAt}>{formatProductTimestamp(event.observedAt)}</time>} />
+              <Fact label="Forecast ends" value={<time dateTime={event.endsAt} title={event.endsAt}>{formatProductTimestamp(event.endsAt)}</time>} />
+              <Fact label="Original forecast expires" value={<time dateTime={event.expiresAt} title={event.expiresAt}>{formatProductTimestamp(event.expiresAt)}</time>} />
             </dl>
             <details className="mt-4 text-xs leading-5">
               <summary className="cursor-pointer font-medium">Held-out calibration evidence</summary>
               <p className="mt-2 text-muted-foreground">Evaluated on observations kept separate from training and calibration. Lower error scores indicate better predictions on those observations; they are not confidence percentages.</p>
               <dl className="mt-3 space-y-3">
                 <Fact label="Completed outcomes" value={event.calibration.completedOutcomes.toLocaleString("en-US")} />
-                <Fact label="Evaluated from" value={formatProductTimestamp(event.calibration.evaluatedFrom)} />
-                <Fact label="Evaluated through" value={formatProductTimestamp(event.calibration.evaluatedThrough)} />
+                <Fact label="Evaluated from" value={<time dateTime={event.calibration.evaluatedFrom} title={event.calibration.evaluatedFrom}>{formatProductTimestamp(event.calibration.evaluatedFrom)}</time>} />
+                <Fact label="Evaluated through" value={<time dateTime={event.calibration.evaluatedThrough} title={event.calibration.evaluatedThrough}>{formatProductTimestamp(event.calibration.evaluatedThrough)}</time>} />
                 <Fact label="Brier score" value={event.calibration.brierScore.toString()} />
                 <Fact label="Log loss" value={event.calibration.logLoss.toString()} />
               </dl>
@@ -544,8 +545,8 @@ export function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) 
         <Fact label="All held-out signals" value={evidence.outOfSample.totalSignals.toLocaleString("en-US")} />
         <Fact label="Historical evaluation windows" value={evidence.outOfSample.folds.toLocaleString("en-US")} />
         <Fact label="Held-out completion coverage" value={formatPercent(evidence.outOfSample.completionCoveragePercent)} />
-        <Fact label="Evaluated from" value={formatProductTimestamp(evidence.outOfSample.evaluatedFrom)} />
-        <Fact label="Evaluated through" value={formatProductTimestamp(evidence.outOfSample.evaluatedThrough)} />
+        <Fact label="Evaluated from" value={<time dateTime={evidence.outOfSample.evaluatedFrom} title={evidence.outOfSample.evaluatedFrom}>{formatProductTimestamp(evidence.outOfSample.evaluatedFrom)}</time>} />
+        <Fact label="Evaluated through" value={<time dateTime={evidence.outOfSample.evaluatedThrough} title={evidence.outOfSample.evaluatedThrough}>{formatProductTimestamp(evidence.outOfSample.evaluatedThrough)}</time>} />
       </dl> : null}
       {historical ? (
         <section className="mt-4 border-t border-border pt-4" aria-label="Historical test">
@@ -568,7 +569,7 @@ export function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) 
           <Fact label="Stability" value={formatPercent(historical.stabilityPercent)} />
           <Fact
             label="Historical information through"
-            value={formatProductTimestamp(historical.evaluatedThrough)}
+            value={<time dateTime={historical.evaluatedThrough} title={historical.evaluatedThrough}>{formatProductTimestamp(historical.evaluatedThrough)}</time>}
           />
         </dl>
         </section>
@@ -709,7 +710,7 @@ function OutcomeProjection({ analysis }: { analysis: InvestmentAnalysis }) {
       </p> : null}
       <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Starting price" value={money(projection.startingPrice)} />
-        <Fact label="Projection horizon" value={formatProductTimestamp(projection.endsAt)} />
+        <Fact label="Projection horizon" value={<time dateTime={projection.endsAt} title={projection.endsAt}>{formatProductTimestamp(projection.endsAt)}</time>} />
         <Fact label="Downside range" value={priceRange(projection.downside.priceRange)} />
         <Fact label="Base range" value={priceRange(projection.base.priceRange)} />
         <Fact label="Upside range" value={priceRange(projection.upside.priceRange)} />
@@ -775,7 +776,7 @@ function SizingSummary({ analysis }: { analysis: InvestmentAnalysis }) {
     <Disclosure title="Research sizing range">
       <p className="text-xs leading-5 text-muted-foreground">{sizing.summary}</p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-3">
-        <Fact label="Evaluated" value={formatProductTimestamp(sizing.evaluatedAt)} />
+        <Fact label="Evaluated" value={<time dateTime={sizing.evaluatedAt} title={sizing.evaluatedAt}>{formatProductTimestamp(sizing.evaluatedAt)}</time>} />
         <Fact label="Marked portfolio value" value={money(sizing.markedEquity)} />
         <Fact label="Cash available for settlement" value={sizing.settlementAvailableCash === null ? "Unavailable" : money(sizing.settlementAvailableCash)} />
         <Fact label="Value per lot" value={money(sizing.perLotNotional)} />
@@ -810,8 +811,8 @@ function RealizedOutcome({ analysis }: { analysis: InvestmentAnalysis }) {
             label="Gross price return"
             value={formatPercent(result.grossPriceReturnPercent)}
           />
-          <Fact label="Observed" value={formatProductTimestamp(result.observedAt)} />
-          <Fact label="Available" value={formatProductTimestamp(result.availableAt)} />
+          <Fact label="Observed" value={<time dateTime={result.observedAt} title={result.observedAt}>{formatProductTimestamp(result.observedAt)}</time>} />
+          <Fact label="Available" value={<time dateTime={result.availableAt} title={result.availableAt}>{formatProductTimestamp(result.availableAt)}</time>} />
         </dl>
       ) : (
         <p className="text-xs leading-5 text-muted-foreground">{result.summary}</p>
@@ -864,7 +865,7 @@ function TrackRecord({
     <div>
       <p className="text-xs leading-5 text-muted-foreground">{record.summary}</p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Fact label="Evaluated through" value={formatProductTimestamp(record.evaluatedAt)} />
+        <Fact label="Evaluated through" value={<time dateTime={record.evaluatedAt} title={record.evaluatedAt}>{formatProductTimestamp(record.evaluatedAt)}</time>} />
         <Fact
           label="Minimum completed outcomes"
           value={record.minimumCompletedSamples.toLocaleString("en-US")}
@@ -1019,12 +1020,6 @@ function investmentTitle(analysis: InvestmentAnalysis): string {
 
 function formatPercent(value: string): string {
   return `${value}%`
-}
-
-export function formatProductTimestamp(value: string): string {
-  const date = value.slice(0, 10)
-  const time = value.slice(11, -1)
-  return `${date} ${time} UTC`
 }
 
 function negativePercent(value: string): string {
