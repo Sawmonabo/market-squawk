@@ -2,6 +2,27 @@
 
 ## Current execution — 2026-10-02
 
+SEC number-word correction critically verified: full recognized grammar uses checked integer
+normalization and preserves lexical text/context/scale/sign. Existing captured-taxonomy test plus
+exact retained8,585,609-byte MSFT FY2026 body PASS1/1 (4.67s), checking three zero occurrences and
+`three`→3 segment value. Initial Cargo invocation compiled successfully (1m19s) and passed fixture
+assertions, then its relative optional-body path failed from the crate working directory. Rerunning
+the unchanged executable with the absolute retained path passed; no assertion was weakened.
+Evidence `sec-number-words-{critical,retained-critical}.log`. This proves parser/restart behavior;
+the installed/live financial preparation retry awaits the coordinated backend rebuild. Do not
+claim the old failed job or current displayed unavailable data is resolved yet.
+
+Ratio diagnosis completed: retained first page has11reported +21inapplicable unavailable rows
+(share-only groups×4, margins on instant groups, current ratios on duration groups). No evidence
+justifies weakening exact filing/period/publication matching. Astra ratio_availability_diagnosis
+now owns **only** `apps/market-squawk/src/application/research/company_product.rs` for shared
+statement/period applicability and the existing exact-envelope critical regression. Instant
+financial-position groups owe current ratio; duration operations groups owe three margins;
+share/cashflow-only groups owe no ratios. Applicable groups keep genuine missing/conflict/zero/
+unit failures. Lead owns page-consumer inspection, serialized checks and native value verification.
+No new schema/UI filter/dependencies/builds/Git by agent. Presentation checkpoint4a2bfac8 is pushed;
+its two UI checks/typecheck passed. Detailed SEC fixture is the sole compiler.
+
 Financial presentation checkpoint: reviewed shared signed change display, exact-decimal percentage/
 ratio formatting (original precision remains inspectable), persistent Markets label, contained
 benchmark selector and wrapping log operations. Desktop typecheck PASS; existing market/financial

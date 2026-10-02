@@ -513,18 +513,12 @@ pub(super) fn transform_numeric(
                 Ok(transformed)
             }
         }
-        // SEC's numwordsen registry defines these exact lexical zero forms.
-        // Other English-number forms remain unsupported until their full grammar is admitted.
         Some(format)
             if format.namespace_uri().map(XbrlText::as_str)
                 == Some("http://www.sec.gov/inlineXBRL/transformation/2015-08-31")
-                && format.local_name().as_str() == "numwordsen"
-                && matches!(
-                    value.trim_matches([' ', '\t', '\r', '\n']),
-                    "no" | "No" | "none" | "None" | "nil" | "Nil" | "zero" | "Zero"
-                ) =>
+                && format.local_name().as_str() == "numwordsen" =>
         {
-            Ok("0".to_owned())
+            super::number_words::transform(value)
         }
         Some(_) => Err(SecXbrlError::UnsupportedTransform),
     }

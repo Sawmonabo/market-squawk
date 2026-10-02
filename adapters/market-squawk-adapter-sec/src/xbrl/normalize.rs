@@ -38,8 +38,15 @@ impl NormalizedDraft {
         let occurrence_id = SourceIdentifier::try_from(fact.occurrence_id.clone())?;
         let source_concept = fact.concept.source_qname().clone();
         let context_id = SourceIdentifier::try_from(fact.context_id)?;
-        let exact_text = XbrlText::try_from(fact.text.trim().to_owned())?;
-        if fact.nil || fact.explicitly_nonnumeric || fact.unit_id.is_none() {
+        let nonnumeric = fact.nil || fact.explicitly_nonnumeric || fact.unit_id.is_none();
+        // Numeric transforms validate their own lexical whitespace. Trimming first can turn
+        // an invalid SEC word-number into an admitted value and would lose source evidence.
+        let exact_text = XbrlText::try_from(if nonnumeric {
+            fact.text.trim().to_owned()
+        } else {
+            fact.text
+        })?;
+        if nonnumeric {
             // The source context lives once in the disk index. Only this occurrence's
             // view is owned while normalizing; complete materialization interns these views.
             let shared_context = context.occurrence_context()?;

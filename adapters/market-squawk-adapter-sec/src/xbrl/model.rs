@@ -3455,12 +3455,17 @@ mod tests {
         // retaining one decoded occurrence at a time rather than building a diagnostic sidecar.
         if let Ok(path) = std::env::var("SEC_SOURCE_BUDGET_FILING") {
             let bytes = std::fs::read(path)?;
+            assert_eq!(
+                super::super::hex_prefix(&Sha256::digest(&bytes), 32),
+                "6db62640d2908a510d91c9e13f5d6bdab6e373137bdec161a52510be08c49b41",
+                "SEC_SOURCE_BUDGET_FILING must identify the retained MSFT FY2026 body",
+            );
             let parser_cancellation = CancellationToken::new();
             let parsed = crate::XbrlDocumentParser::parse_indexed_in_with_cancellation(
                 &bytes,
                 crate::SecParserLimits::production_defaults(),
                 crate::XbrlDocumentContext::new(
-                    SourceIdentifier::try_from("0000950170-25-100235")?,
+                    SourceIdentifier::try_from("0001193125-26-323660")?,
                     market_squawk_domain::XbrlTaxonomySet::declared(
                         EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
                         SourceIdentifier::try_from("original-msft-filing-regression")?,
@@ -3477,26 +3482,46 @@ mod tests {
             assert!(parsed.numeric_count > 0);
             assert!(parsed.nonnumeric_count > 0);
             assert!(parsed.context_count()? > 0);
-            let mut lowercase_zero = 0usize;
             let mut capitalized_zero = 0usize;
+            let mut reportable_segments = 0usize;
             for ordinal in 0..parsed.numeric_count {
                 let fact = parsed
                     .numeric_at(ordinal)?
                     .ok_or("missing indexed MSFT fact")?;
-                match fact.evidence().lexical_value().as_str().trim() {
-                    "no" => {
-                        assert_eq!(fact.value(), Decimal::ZERO);
-                        lowercase_zero += 1;
-                    }
+                match fact.evidence().lexical_value().as_str() {
                     "No" => {
                         assert_eq!(fact.value(), Decimal::ZERO);
                         capitalized_zero += 1;
                     }
+                    "three" => {
+                        assert_eq!(fact.value(), Decimal::from(3));
+                        assert_eq!(
+                            fact.concept().as_str(),
+                            "us-gaap:NumberOfReportableSegments"
+                        );
+                        assert_eq!(
+                            fact.evidence().occurrence_id().as_str(),
+                            "F_7d649a3c-20aa-439f-96c6-6da56efffa7c"
+                        );
+                        assert_eq!(
+                            fact.evidence().context_id().as_str(),
+                            "C_29985a27-1d12-4b7e-9a06-156523f6e71e"
+                        );
+                        assert_eq!(
+                            fact.evidence().unit().source_identifier()?.as_str(),
+                            "msft:Segment"
+                        );
+                        assert_eq!(
+                            serde_json::to_value(fact.evidence())?["transformed_lexeme"],
+                            "3"
+                        );
+                        reportable_segments += 1;
+                    }
                     _ => {}
                 }
             }
-            assert!(lowercase_zero > 0);
-            assert!(capitalized_zero > 0);
+            assert_eq!(capitalized_zero, 3);
+            assert_eq!(reportable_segments, 1);
             parser_cancellation.cancel();
             assert!(matches!(
                 parsed.numeric_at(0),
@@ -3925,6 +3950,7 @@ mod tests {
         assert_eq!(parsed.nonnumeric_occurrences().len(), 3);
         assert_eq!(parsed.footnotes().len(), 1);
         super::super::exercise_nested_continuations(parser_context())?;
+        super::super::exercise_number_word_transforms(parser_context())?;
         exercise_normalized_filing_physical_restart(
             temporary.path(),
             Arc::clone(&store),

@@ -3,6 +3,7 @@
 mod acquisition;
 mod model;
 mod normalize;
+mod number_words;
 mod staging;
 mod support;
 mod wire;
@@ -1947,15 +1948,6 @@ fn exercise_nested_continuations(document: XbrlDocumentContext) -> Result<(), Se
         indexed.nonnumeric_at(0),
         Err(SecXbrlError::Cancelled)
     ));
-    let zero_format = XbrlQualifiedName::try_new(
-        "sec:numwordsen",
-        "http://www.sec.gov/inlineXBRL/transformation/2015-08-31",
-    )?;
-    assert_eq!(transform_numeric("No", Some(&zero_format))?, "0");
-    assert!(matches!(
-        transform_numeric("not a number", Some(&zero_format)),
-        Err(SecXbrlError::UnsupportedTransform)
-    ));
     let values = parsed
         .nonnumeric_occurrences()
         .iter()
@@ -1979,5 +1971,169 @@ fn exercise_nested_continuations(document: XbrlDocumentContext) -> Result<(), Se
         ),
         Err(SecXbrlError::NestedContinuation)
     ));
+    Ok(())
+}
+
+/// The existing captured-taxonomy fixture owns this grammar and numeric-evidence regression.
+#[cfg(test)]
+fn exercise_number_word_transforms(document: XbrlDocumentContext) -> Result<(), SecXbrlError> {
+    let format = XbrlQualifiedName::try_new(
+        "sec:numwordsen",
+        "http://www.sec.gov/inlineXBRL/transformation/2015-08-31",
+    )?;
+    // SEC registry examples plus the magnitude, separator and zero alternatives. Values are
+    // independent decimal literals; the arithmetic must never bypass the lexical grammar.
+    for (lexical, expected) in [
+        ("No", "0"),
+        ("nil", "0"),
+        (" Zero ", "0"),
+        ("three", "3"),
+        (" One Hundred and Twenty One ", "121"),
+        ("nineteen hundred forty-four", "1944"),
+        ("Seventy Thousand and one", "70001"),
+        (
+            "eighteen million three hundred thousand and fifty-one",
+            "18300051",
+        ),
+        ("one\u{a0}hundred", "100"),
+        ("one million, \tthree", "1000003"),
+        ("one million\u{a0}", "1000000"),
+        (
+            "one quintillion two quadrillion three trillion four billion five million six thousand seven",
+            "1002003004005006007",
+        ),
+        ("nineteen hundred quintillion", "1900000000000000000000"),
+    ] {
+        assert_eq!(
+            transform_numeric(lexical, Some(&format))?,
+            expected,
+            "{lexical}"
+        );
+    }
+    // The registry lists these exact dashes, not every Unicode dash or minus character.
+    for dash in
+        "-\u{058a}\u{05be}\u{2010}\u{2011}\u{2012}\u{2013}\u{2014}\u{2015}\u{fe58}\u{fe63}\u{ff0d}"
+            .chars()
+    {
+        assert_eq!(
+            transform_numeric(&format!("fifty{dash}one"), Some(&format))?,
+            "51"
+        );
+    }
+    for lexical in [
+        "",
+        "   ",
+        "\u{a0}three",
+        "three\u{a0}",
+        "THREE",
+        "tHree",
+        "one one",
+        "fiftyone",
+        "fifty_one",
+        "fifty−one",
+        "zero hundred",
+        "twenty hundred",
+        "one hundred And one",
+        "one million and one",
+        "one thousand one million",
+        "one thousand,",
+        "one million,",
+        "one million, \u{a0}",
+        "four gazillion",
+        "one sextillion",
+        "one and 01/100",
+        "two-thirds",
+        "3",
+        "negative three",
+    ] {
+        assert!(
+            matches!(
+                transform_numeric(lexical, Some(&format)),
+                Err(SecXbrlError::InvalidNumericFact)
+            ),
+            "invalid lexical input: {lexical:?}",
+        );
+    }
+    let unrelated = XbrlQualifiedName::try_new("sec:numwordsen", "https://unrelated.test")?;
+    assert!(matches!(
+        transform_numeric("three", Some(&unrelated)),
+        Err(SecXbrlError::UnsupportedTransform)
+    ));
+
+    let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"
+        xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+        xmlns:xbrli="http://www.xbrl.org/2003/instance"
+        xmlns:us-gaap="http://fasb.org/us-gaap/2026"
+        xmlns:msft="http://www.microsoft.com/20260630"
+        xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+        xmlns:sec="http://www.sec.gov/inlineXBRL/transformation/2015-08-31"><body>
+        <xbrli:context id="annual"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000789019</xbrli:identifier></xbrli:entity><xbrli:period><xbrli:startDate>2025-07-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period></xbrli:context>
+        <xbrli:unit id="segments"><xbrli:measure>msft:Segment</xbrli:measure></xbrli:unit>
+        <xbrli:unit id="dollars"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>
+        <ix:nonFraction id="segments-fact" name="us-gaap:NumberOfReportableSegments" contextRef="annual" unitRef="segments" decimals="0" format="sec:numwordsen">three</ix:nonFraction>
+        <ix:nonFraction id="scaled-fact" name="us-gaap:NetIncomeLoss" contextRef="annual" unitRef="dollars" decimals="2" format="sec:numwordsen" scale="-2" sign="-"> nineteen hundred forty-four </ix:nonFraction>
+        </body></html>"#;
+    let parsed = XbrlDocumentParser::parse_with_cancellation(
+        xml.as_bytes(),
+        SecParserLimits::production_defaults(),
+        document.clone(),
+        &CancellationToken::new(),
+    )?;
+    let indexed = XbrlDocumentParser::parse_indexed_with_cancellation(
+        xml.as_bytes(),
+        SecParserLimits::production_defaults(),
+        document.clone(),
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(parsed.numeric_facts().len(), 2);
+    assert_eq!(indexed.numeric_count, 2);
+    for (ordinal, expected) in parsed.numeric_facts().iter().enumerate() {
+        assert_eq!(indexed.numeric_at(ordinal)?.as_ref(), Some(expected));
+    }
+    let segments = &parsed.numeric_facts()[0];
+    assert_eq!(segments.value(), Decimal::from(3));
+    assert_eq!(segments.evidence().lexical_value().as_str(), "three");
+    assert_eq!(segments.evidence().context_id().as_str(), "annual");
+    assert_eq!(
+        segments.evidence().unit().source_identifier()?.as_str(),
+        "msft:Segment"
+    );
+    assert_eq!(segments.evidence().entity().value().as_str(), "0000789019");
+    assert_eq!(
+        segments.evidence().period(),
+        XbrlPeriod::duration(parse_date("2025-07-01")?, parse_date("2026-06-30")?,)?
+    );
+    assert_eq!(
+        serde_json::to_value(segments.evidence())?["transformed_lexeme"],
+        "3"
+    );
+    let scaled = &parsed.numeric_facts()[1];
+    assert_eq!(scaled.value(), Decimal::new(-1944, 2));
+    assert_eq!(
+        scaled.evidence().lexical_value().as_str(),
+        " nineteen hundred forty-four "
+    );
+    assert_eq!(scaled.evidence().inline_scale(), Some(-2));
+    assert_eq!(scaled.evidence().inline_sign(), Some(XbrlSign::Negative));
+    assert_eq!(
+        serde_json::to_value(scaled.evidence())?["transformed_lexeme"],
+        "1944"
+    );
+    assert_eq!(scaled.evidence().normalized_value()?, scaled.value());
+    // The caller must not trim away invalid boundary NBSP before validating the transform.
+    for invalid in [
+        xml.replace(">three<", ">\u{a0}three<"),
+        xml.replace("scale=\"-2\"", "scale=\"28\""),
+    ] {
+        assert!(matches!(
+            XbrlDocumentParser::parse_with_cancellation(
+                invalid.as_bytes(),
+                SecParserLimits::production_defaults(),
+                document.clone(),
+                &CancellationToken::new(),
+            ),
+            Err(SecXbrlError::InvalidNumericFact)
+        ));
+    }
     Ok(())
 }
