@@ -1,3 +1,4 @@
+import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { Link, useParams } from "react-router-dom"
 
@@ -5,7 +6,6 @@ import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { AnalysisLaunch } from "@/features/opportunities/analysis-launch"
-import { DemandPanel } from "@/features/shared/demand-panel"
 import { formatMoney, groupDecimal } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
@@ -36,6 +36,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
+  const [showHistory, setShowHistory] = useState(true)
   const detail = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetInstrument", { selectionToken }),
     gcTime: 0,
@@ -52,41 +53,55 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
 
   return <main className="mx-auto w-full max-w-[1180px] space-y-5 p-5 lg:p-7">
-    <header className="border-b border-border pb-5">
+    <header className="border-b border-border pb-4">
       <Link className="text-xs text-primary underline-offset-4 hover:underline" to="/markets">Back to Markets</Link>
-      <h1 className="mt-3 text-3xl font-semibold">{title}</h1>
-      <p className="mt-2 text-sm text-muted-foreground">Review available prices, history and investment analysis.</p>
-    </header>
-    <section className="rounded-xl border border-border p-5" aria-label="Investment price">
-      <div className="flex items-start justify-between gap-4">
-        <h2 className="text-lg font-semibold">Price</h2>
-        <Button variant="outline" size="sm" disabled={detail.isFetching} onClick={() => void detail.refetch()}>Refresh price</Button>
+      <div className="mt-3 grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">Price, company information and investment analysis</p>
+        </div>
+        <section aria-label="Investment price" className="min-w-0 sm:text-right">
+          <div className="flex items-center gap-3 sm:justify-end">
+            <h2 className="sr-only">Price</h2>
+            <p className="font-mono text-2xl tabular-nums">{row?.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
+            <Button variant="outline" size="sm" disabled={detail.isFetching} onClick={() => void detail.refetch()}>Refresh price</Button>
+          </div>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row ? marketPriceBasisLabel(row) : "Checking price information"}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row ? <>{detail.isError && row.price !== null
+            ? "Saved price · Freshness not checked"
+            : detail.isFetching ? `${marketAvailabilityLabel(row)} at last check` : marketAvailabilityLabel(row)}{row.changePercent !== null ? ` · ${row.changePercent}%` : ""}</> : "Availability not established"}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : null}</p>
+        </section>
       </div>
-      {detail.isPending ? <p role="status" className="mt-3 text-sm text-muted-foreground">Opening the selected investment…</p> : null}
-      {detail.isError ? <p role="alert" className="mt-3 text-sm text-destructive">
-        {row === null ? "This investment could not be opened. Try again, or search Markets to choose a fresh selection."
-          : "The price could not be refreshed. Showing the last checked information; its freshness is unverified."}
-      </p> : null}
-      {row !== null ? <>
-        <p className="mt-3 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p>
-        <p className="mt-1 font-mono text-2xl">{row.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
-        <p className="mt-2 text-sm text-muted-foreground">{detail.isError && row.price !== null
-          ? "Saved price · Freshness not checked"
-          : detail.isFetching ? `${marketAvailabilityLabel(row)} at last check` : marketAvailabilityLabel(row)}{row.changePercent !== null ? ` · ${row.changePercent}%` : ""}</p>
-        {row.asOf ? <time className="mt-2 block text-xs text-muted-foreground" dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : null}
-        {detail.isFetching ? <p role="status" className="mt-2 text-xs text-muted-foreground">Updating price information…</p> : null}
-      </> : null}
-    </section>
-    {row !== null ? <InvestmentQuote row={row} unverified={detail.isError} /> : null}
-    <InvestmentProfile selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
+      <div className="mt-2 min-h-10 text-xs leading-5">
+        {detail.isError ? <p role="alert" className="text-destructive">{row === null
+          ? "This investment could not be opened. Try again, or search Markets to choose a fresh selection."
+          : "The price could not be refreshed. Showing the last checked information; its freshness is unverified."}</p>
+          : detail.isFetching ? <p role="status" className="text-muted-foreground">{row ? "Updating price information…" : "Opening the selected investment…"}</p> : null}
+      </div>
+      {row !== null ? <InvestmentQuote row={row} unverified={detail.isError} /> : null}
+    </header>
+    <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <section className="min-w-0 rounded-xl border border-border bg-card/30 p-4" aria-label="Investment price history">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold">Price history</h2>
+          <Button variant="ghost" size="sm" onClick={() => setShowHistory((shown) => !shown)}>{showHistory ? "Hide price history" : "Show price history"}</Button>
+        </div>
+        {showHistory ? row?.historyToken ? <MarketHistoryRead key={`${bootstrap.productSessionToken}:${row.historyToken}`}
+          historyToken={row.historyToken} bootstrap={bootstrap} transport={transport} />
+          : <div className="mt-3 flex min-h-[640px] items-center justify-center text-sm text-muted-foreground">
+            <p role="status">{detail.isFetching && row === null ? "Checking available price history…" : "Price history is unavailable for this investment."}</p>
+          </div> : <p className="mt-3 text-xs text-muted-foreground">Price history is hidden. Show it to reopen the chart.</p>}
+      </section>
+      <aside className="min-w-0 space-y-5" aria-label="Investment details and analysis">
+        <InvestmentProfile selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
+        <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment analysis">
+          <h2 className="mb-3 text-base font-semibold">Investment analysis</h2>
+          <AnalysisLaunch transport={transport} scope={bootstrap.productSessionToken} selectionToken={selectionToken} />
+        </section>
+      </aside>
+    </div>
     <InvestmentFinancials selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} />
-    <section className="rounded-xl border border-border p-5" aria-label="Investment analysis">
-      <h2 className="mb-4 text-lg font-semibold">Investment analysis</h2>
-      <AnalysisLaunch transport={transport} scope={bootstrap.productSessionToken} selectionToken={selectionToken} />
-    </section>
-    {row?.historyToken ? <DemandPanel key={row.historyToken} title="Open price history" className="rounded-xl border border-border p-5">
-      <MarketHistoryRead historyToken={row.historyToken} bootstrap={bootstrap} transport={transport} />
-    </DemandPanel> : row !== null ? <p className="text-sm text-muted-foreground">Price history is unavailable for this investment.</p> : null}
   </main>
 }
 
@@ -94,21 +109,26 @@ function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverifie
   const quote = row.quote
   const price = (value: string | null) => value === null || quote === null ? "Unavailable" : formatMoney({ amount: value, currency: quote.currency })
   const size = (value: string | null) => value === null ? "Unavailable" : groupDecimal(value)
-  return <section className="rounded-xl border border-border p-5" aria-label="Quote and last trade">
-    <h2 className="text-lg font-semibold">Quote and last trade</h2>
+  return <section className="border-t border-border pt-3" aria-label="Quote and last trade">
+    <h2 className="sr-only">Quote and last trade</h2>
     {quote === null ? <p className="mt-3 text-sm text-muted-foreground">Bid, ask and trade information is not available for this investment yet.</p> : <>
-      <dl className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3">
+      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {([
           ["Bid", price(quote.bidPrice)], ["Ask", price(quote.askPrice)], ["Midpoint", price(quote.midPrice)],
-          ["Bid size", size(quote.bidSize)], ["Ask size", size(quote.askSize)],
-          ["Last trade", price(quote.lastPrice)], ["Trade size", size(quote.lastSize)],
-        ] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 font-mono text-sm">{value}</dd></div>)}
+          ["Last trade", price(quote.lastPrice)],
+        ] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 font-mono text-sm tabular-nums">{value}</dd></div>)}
       </dl>
-      {quote.tradeStatus === "ambiguous" ? <p role="status" className="mt-4 text-sm text-muted-foreground">Several trades share the latest timestamp, so a single last trade cannot be established. Bid and ask are shown separately when available.</p> : null}
-      <p className="mt-4 text-xs text-muted-foreground">Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
+      {quote.tradeStatus === "ambiguous" ? <p role="status" className="mt-3 text-xs text-muted-foreground">Several trades share the latest timestamp, so a single last trade cannot be established. Bid and ask are shown separately when available.</p> : null}
+      <details className="mt-3 text-xs">
+        <summary className="cursor-pointer text-muted-foreground focus-visible:outline-ring">Quote sizes and dates</summary>
+        <dl className="mt-3 grid grid-cols-3 gap-3">{([["Bid size", size(quote.bidSize)], ["Ask size", size(quote.askSize)], ["Trade size", size(quote.lastSize)]] as const).map(([label, value]) => <div key={label}>
+          <dt className="text-muted-foreground">{label}</dt><dd className="mt-1 font-mono">{value}</dd>
+        </div>)}</dl>
+      <p className="mt-3 text-xs text-muted-foreground">Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
         {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{new Date(quote.quoteObservedAt).toLocaleString()}</time></> : null}</p>
       <p className="mt-2 text-xs text-muted-foreground">Last trade: {unverified ? "freshness not checked" : quote.lastFresh ? "current at last check" : "not current"}
         {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{new Date(quote.lastObservedAt).toLocaleString()}</time></> : null}</p>
+      </details>
     </>}
   </section>
 }

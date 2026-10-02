@@ -28,23 +28,26 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
   })
   const result = profile.data
 
-  return <section className="rounded-xl border border-border p-5" aria-label="Investment profile">
-    <div className="flex items-start justify-between gap-4">
-      <h2 className="text-lg font-semibold">Profile</h2>
+  return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment profile">
+    <div className="flex items-start justify-between gap-3">
+      <h2 className="text-base font-semibold">Profile</h2>
       <Button variant="outline" size="sm" disabled={profile.isFetching} onClick={() => void profile.refetch()}>Refresh profile</Button>
     </div>
-    {profile.isFetching ? <p role="status" className="mt-3 text-sm text-muted-foreground">{result ? "Updating profile information…" : "Loading profile information…"}</p> : null}
-    {profile.isError ? <div className="mt-3 space-y-2">
-      <p role="alert" className="text-sm text-destructive">{result
+    <div className="mt-2 min-h-16 text-xs leading-5">
+    {profile.isError ? <div className="flex items-start justify-between gap-2">
+      <p role="alert" className="text-destructive">{result
         ? "The profile could not be refreshed. Showing the last checked information."
         : "The profile could not be loaded. Try again, or search Markets to choose a fresh selection."}</p>
       <Button variant="outline" size="sm" disabled={profile.isFetching} onClick={() => void profile.refetch()}>Retry</Button>
-    </div> : null}
+    </div> : profile.isFetching ? <p role="status" className="text-muted-foreground">{result ? "Updating profile information…" : "Loading profile information…"}</p> : null}
+    </div>
+    <div className="min-h-[200px]">
     {result ? <>
       {result.state === "available" ? <ReferenceProfile profile={result.profile} />
         : <p role="status" className="mt-3 text-sm text-muted-foreground">{profileAvailability(result)}</p>}
       <p className="mt-4 text-xs text-muted-foreground">{profile.isError || profile.isFetching ? "Last checked information through" : "Information through"} <ProfileTime value={result.knowledgeAt} /></p>
     </> : null}
+    </div>
   </section>
 }
 
@@ -54,7 +57,7 @@ function ReferenceProfile({ profile }: { profile: InvestmentReferenceProfile }) 
     foreign_exchange: "Currency", crypto: "Crypto", commodity: "Commodity", fund: "Fund", index: "Index", cash: "Cash",
   }
   return <>
-    <dl className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3">
+    <dl className="grid grid-cols-2 gap-4">
       {([
         ["Name", profile.displayName], ["Symbol", profile.symbol],
         ["Investment type", profile.exchangeTradedFund ? "Exchange-traded fund" : assetLabels[profile.assetClass]],

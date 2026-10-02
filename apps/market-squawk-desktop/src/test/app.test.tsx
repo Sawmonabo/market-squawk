@@ -688,9 +688,12 @@ describe("Market Squawk desktop boundary", () => {
             issuedQueries.push(request)
             if (request.query === "closeInvestmentFinancials") return { data: { released: true }, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } }
             if (request.query === "investmentFinancials") {
-              if (financialMode === "pending") {
+              if (financialMode === "pending" && request.section === "facts") {
                 financialSignal = options?.signal
                 return new Promise<ApplicationResult>((resolve) => { finishFinancial = resolve })
+              }
+              if (request.section !== "facts") return {
+                ...financialResult(), data: { ...financialResult().data as object, section: request.section, items: [] },
               }
               return financialResult(request.cursor)
             }
@@ -715,9 +718,8 @@ describe("Market Squawk desktop boundary", () => {
     expect(profile.getByText("XNAS")).toBeTruthy()
     expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     // Financial demand reads are independent of quotes/profile and retain exact page identity.
-    expect(issuedQueries.some((request) => request.query === "investmentFinancials")).toBe(false)
-    const financialToggle = screen.getByText("Open reported financial facts")
-    await userEvent.setup().click(financialToggle)
+    expect(screen.getByRole("tab", { name: "Facts" }).getAttribute("aria-selected")).toBe("true")
+    expect(issuedQueries.filter((request) => request.query === "investmentFinancials").every((request) => request.section === "facts")).toBe(true)
     const facts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
     expect(await facts.findByText("USD 123,456.78")).toBeTruthy()
     await userEvent.setup().click(facts.getByRole("button", { name: "Next" }))
@@ -734,7 +736,7 @@ describe("Market Squawk desktop boundary", () => {
     financialMode = "pending"
     await userEvent.setup().click(facts.getByRole("button", { name: "Retry" }))
     await waitFor(() => expect(financialSignal).toBeDefined())
-    await userEvent.setup().click(financialToggle)
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Filings" }))
     await waitFor(() => expect(financialSignal?.aborted).toBe(true))
     financialMode = "available"
     finishFinancial?.(financialResult())
@@ -747,7 +749,7 @@ describe("Market Squawk desktop boundary", () => {
     const unsupported = openInvestment(lookupRoute(parsed.matches[0]!), false)
     expect(await screen.findByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     expect(screen.getByText("Financial details are not available in this app session.")).toBeTruthy()
-    expect(screen.queryByText("Open reported financial facts")).toBeNull()
+    expect(screen.queryByRole("tab", { name: "Facts" })).toBeNull()
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(financialQueriesBefore)
     unsupported.unmount()
 
@@ -934,27 +936,30 @@ describe("Market Squawk desktop boundary", () => {
       ),
     ).toBe(false)
 
-    expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(0)
-    const historyToggle = screen.getByText("Open price history")
-    await user.click(historyToggle)
     await screen.findByLabelText("History window")
     expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
       { query: "marketHistory", historyToken, pointLimit: 512 },
     ])
     expect(screen.getAllByText("68001.123456789 USD").length).toBeGreaterThan(0)
+    const historyWindow = screen.getByLabelText("History window")
+    const independentReads = issuedQueries.filter((request) => request.query === "marketHistory" || request.query === "investmentProfile").length
+    await user.click(screen.getByRole("button", { name: "Refresh price" }))
+    await waitFor(() => expect((screen.getByRole("button", { name: "Refresh price" }) as HTMLButtonElement).disabled).toBe(false))
+    expect(screen.getByLabelText("History window")).toBe(historyWindow)
+    expect(issuedQueries.filter((request) => request.query === "marketHistory" || request.query === "investmentProfile")).toHaveLength(independentReads)
     await user.selectOptions(screen.getByLabelText("History window"), "30")
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
       { query: "marketHistory", historyToken, pointLimit: 512 },
       { query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512, generationToken },
     ]))
     expect(viewportSignal?.aborted).toBe(false)
-    await user.click(historyToggle)
+    await user.click(screen.getByRole("button", { name: "Hide price history" }))
     await waitFor(() => expect(viewportSignal?.aborted).toBe(true))
     expect(screen.queryByLabelText("History window")).toBeNull()
     // A late cancelled response cannot repopulate a closed panel or pin a new
     // reader to the old window. Reopening starts from unpinned saved history.
     resolveViewport?.(historyResult)
-    await user.click(historyToggle)
+    await user.click(screen.getByRole("button", { name: "Show price history" }))
     await screen.findByLabelText("History window")
     expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
     await user.click(screen.getByRole("button", { name: "Refresh saved history" }))

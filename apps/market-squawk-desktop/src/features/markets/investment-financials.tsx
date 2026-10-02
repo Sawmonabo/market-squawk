@@ -1,10 +1,10 @@
 import * as React from "react"
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
+import { Tabs } from "radix-ui"
 
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { CursorNavigation, useCursorNavigation } from "@/features/shared/cursor-navigation"
-import { DemandPanel } from "@/features/shared/demand-panel"
 import { formatMoney, groupDecimal } from "@/lib/formatters"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
@@ -46,16 +46,20 @@ export function InvestmentFinancials(props: FinancialProps) {
       <p role="status" className="text-sm text-muted-foreground">Financial details are not available in this app session.</p>
     </section>
   }
-  return <section className="space-y-3" aria-label="Investment financial information">
-    <h2 className="text-lg font-semibold">Financial information</h2>
-    <p className="text-sm text-muted-foreground">Open the company information you want to review. Each section shows its own reporting dates and available evidence.</p>
-    {(["facts", "statements", "ratios", "filings"] as const).map((section) => <DemandPanel
-      key={`${props.bootstrap.productSessionToken}:${props.selectionToken}:${section}`}
-      title={`Open ${sectionLabels[section].toLowerCase()}`}
-      className="rounded-xl border border-border p-5"
-    >
-      <FinancialSectionRead {...props} section={section} />
-    </DemandPanel>)}
+  return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment financial information">
+    <h2 className="text-base font-semibold">Financial information</h2>
+    <p className="mt-1 text-xs text-muted-foreground">Reported company values, with their reporting periods and source context.</p>
+    <Tabs.Root key={`${props.bootstrap.productSessionToken}:${props.selectionToken}`} defaultValue="facts" activationMode="manual" className="mt-4">
+      <Tabs.List aria-label="Financial sections" className="flex flex-wrap gap-1 border-b border-border pb-2">
+        {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Trigger key={section} value={section}
+          className="rounded-md px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring data-[state=active]:bg-primary/10 data-[state=active]:text-primary">
+          {{ facts: "Facts", statements: "Statements", ratios: "Ratios", filings: "Filings" }[section]}
+        </Tabs.Trigger>)}
+      </Tabs.List>
+      {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Content key={section} value={section} className="pt-4 focus-visible:outline-ring">
+        <FinancialSectionRead {...props} section={section} />
+      </Tabs.Content>)}
+    </Tabs.Root>
   </section>
 }
 
@@ -154,18 +158,19 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
       <h3 className="text-base font-semibold">{sectionLabels[section]}</h3>
       <Button variant="outline" size="sm" disabled={busy} onClick={() => void refresh()}>Refresh this section</Button>
     </div>
-    {busy ? <p role="status" className="mt-3 text-sm text-muted-foreground">{result ? "Updating this financial information…" : "Loading this financial information…"}</p> : null}
-    {page.isError ? <div className="mt-3 space-y-2">
-      <p role="alert" className="text-sm text-destructive">{result
+    <div className="mt-2 min-h-16 text-xs leading-5">
+    {releaseFailed ? <p role="alert" className="text-destructive">The previous financial information could not be released. Try refreshing this section.</p>
+      : page.isError ? <div className="flex items-start justify-between gap-3">
+      <p role="alert" className="text-destructive">{result
         ? "This financial information could not be updated. Showing the last checked page; its currentness has not been verified."
         : "This financial information could not be loaded. Try again."}</p>
       <Button variant="outline" size="sm" disabled={busy} onClick={() => void page.refetch()}>Retry</Button>
-    </div> : null}
-    {releaseFailed ? <p role="alert" className="mt-3 text-sm text-destructive">The previous financial information could not be released. Try refreshing this section.</p> : null}
+    </div> : busy ? <p role="status" className="text-muted-foreground">{result ? "Updating this financial information… Showing the last checked page." : "Loading this financial information…"}</p> : null}
+    </div>
+    <div className="min-h-[280px]">
     {result ? <>
-      {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="mt-3 text-xs text-muted-foreground">{showingPrior ? "Last checked information through" : "Information through"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{new Date(result.knowledgeAt).toLocaleString()}</time>
+      {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="text-xs leading-5 text-muted-foreground">{showingPrior ? "Last checked information through" : "Information through"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{new Date(result.knowledgeAt).toLocaleString()}</time>
         {" · Reporting cutoff "}<time dateTime={result.effectiveOn}>{result.effectiveOn}</time>{" · Latest information known at that date"}</p> : null}
-      {showingPrior ? <p role="status" className="mt-2 text-xs text-muted-foreground">The displayed page is from the previous check.</p> : null}
       {result.state !== "reported" ? <p role="status" className="mt-3 text-sm text-muted-foreground">{sectionAvailability(result.state)}</p> : null}
       <FinancialFamilies families={result.families} />
       <FinancialLimitations result={result} />
@@ -175,20 +180,21 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
         onRestart={() => void refresh()} /> : null}
       {result.state === "expired" ? <Button variant="outline" size="sm" className="mt-3" disabled={busy} onClick={() => void refresh()}>Open fresh information</Button> : null}
     </> : null}
+    </div>
   </section>
 }
 
 function FinancialItems({ result }: { result: InvestmentFinancialsResult }) {
   switch (result.section) {
-    case "facts": return <div className="mt-4 space-y-3">{result.items.map((fact, index) => <FinancialFact key={index} fact={fact} />)}</div>
-    case "statements": return <div className="mt-4 space-y-4">{result.items.map((statement, index) => <FinancialStatement key={index} statement={statement} />)}</div>
-    case "ratios": return <div className="mt-4 space-y-3">{result.items.map((ratio, index) => <FinancialRatio key={index} ratio={ratio} />)}</div>
-    case "filings": return <div className="mt-4 space-y-3">{result.items.map((filing, index) => <FinancialFiling key={index} filing={filing} />)}</div>
+    case "facts": return <div className="mt-4 divide-y divide-border">{result.items.map((fact, index) => <FinancialFact key={index} fact={fact} />)}</div>
+    case "statements": return <div className="mt-4 divide-y divide-border">{result.items.map((statement, index) => <FinancialStatement key={index} statement={statement} />)}</div>
+    case "ratios": return <div className="mt-4 divide-y divide-border">{result.items.map((ratio, index) => <FinancialRatio key={index} ratio={ratio} />)}</div>
+    case "filings": return <div className="mt-4 divide-y divide-border">{result.items.map((filing, index) => <FinancialFiling key={index} filing={filing} />)}</div>
   }
 }
 
 function FinancialFact({ fact }: { fact: InvestmentFinancialFact }) {
-  return <article className="rounded-lg border border-border p-3">
+  return <article className="py-4">
     <div className="flex flex-wrap items-baseline justify-between gap-2">
       <h4 className="text-sm font-medium">{fact.displayName}</h4>
       <p className="break-words font-mono text-sm">{fact.unit.kind === "shares" ? `${groupDecimal(fact.value)} shares`
@@ -204,10 +210,10 @@ function FinancialFact({ fact }: { fact: InvestmentFinancialFact }) {
 
 function FinancialStatement({ statement }: { statement: InvestmentFinancialStatement }) {
   const labels = { financial_position: "Financial position", operations: "Income and operations", cash_flows: "Cash flows", share_data: "Share information" }
-  return <article className="rounded-lg border border-border p-3">
+  return <article className="py-4">
     <h4 className="text-sm font-semibold">{labels[statement.statement]}</h4>
     <FinancialEnvelope envelope={statement.envelope} />
-    <div className="mt-3 space-y-2">{statement.items.map((fact, index) => <FinancialFact key={index} fact={fact} />)}</div>
+    <div className="mt-3 divide-y divide-border">{statement.items.map((fact, index) => <FinancialFact key={index} fact={fact} />)}</div>
   </article>
 }
 
@@ -217,7 +223,7 @@ function FinancialRatio({ ratio }: { ratio: InvestmentFinancialRatio }) {
     conflicting_input: "The reported values conflict.", incompatible_units: "The reported values use incompatible units.",
     zero_denominator: "The comparison value is zero, so this ratio cannot be calculated.", unavailable: "This ratio is unavailable.",
   }
-  return <article className="rounded-lg border border-border p-3">
+  return <article className="py-4">
     <div className="flex flex-wrap items-baseline justify-between gap-2">
       <h4 className="text-sm font-medium">{ratio.displayName}</h4>
       <p className="font-mono text-sm">{ratio.value === null ? "Unavailable" : `${groupDecimal(ratio.value)} ratio`}</p>
@@ -236,7 +242,7 @@ function FinancialRatio({ ratio }: { ratio: InvestmentFinancialRatio }) {
 }
 
 function FinancialFiling({ filing }: { filing: InvestmentFinancialFiling }) {
-  return <article className="rounded-lg border border-border p-3">
+  return <article className="py-4">
     <h4 className="text-sm font-medium">Form {filing.form}</h4>
     <dl className="mt-3 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
       <ContextValue label="Revision">{revisionLabel(filing.revision)}</ContextValue>
