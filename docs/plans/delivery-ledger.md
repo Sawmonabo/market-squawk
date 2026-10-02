@@ -2,6 +2,20 @@
 
 ## Current execution — 2026-10-02
 
+Live verification after supervisor generation `generation-6Ru5WP`: MSFT Ratios first page returns
+32/32 reported values, no inapplicable unavailable rows. Current ratio 1.230327…, annual gross
+margin 0.679440…, operating margin 0.467808…, net margin 0.403053… retain their exact source
+periods. Native screenshot inspected: `ratios-after-applicability.{json,png}`. This proves this
+page, not all financial coverage. Warm return displays the retained MSFT price by the 166ms
+observation while its fresh read is still running (`current-display-native-warm-return.json`);
+this is an observation bound for this run, not a global performance claim.
+
+Detailed filing retry `7e67a364-0eee-4218-83f5-42f8847bdda4` is terminal failed at sequence 4. It advanced beyond the corrected lexical
+transform but encountered `RevisionAuthority(AmbiguousProviderOrder)` during publication. No
+retry loop or reset is authorized; inspect the retained revision identity before another attempt.
+Astra sec_transform_diagnosis owns read-only diagnosis of that exact failure, source/retained
+metadata only; no code/build/runtime/provider/Git actions. Lead retains publication authority.
+
 Active next dependency wave (same worktree):
 
 | Owner | Outcome / exclusive files | Dependency and critical evidence |
