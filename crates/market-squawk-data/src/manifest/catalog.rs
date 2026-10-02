@@ -2134,17 +2134,58 @@ impl AnalyticalManifestCatalog {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ManifestCatalogError> {
+        self.select_latest_canonical_market_bar_history_windows(
+            std::slice::from_ref(request),
+            result_limits,
+            deadline,
+            cancellation,
+        )?
+        .into_iter()
+        .next()
+        .ok_or(ManifestCatalogError::CorruptCatalog)?
+    }
+
+    /// Resolves a selected page in input order against one immutable catalog snapshot.
+    /// Per-item failures remain separate; snapshot/control failures invalidate the page.
+    #[allow(
+        clippy::type_complexity,
+        reason = "page items preserve independent selection failures"
+    )]
+    pub fn select_latest_canonical_market_bar_history_windows(
+        &self,
+        requests: &[LatestCanonicalMarketBarHistoryWindowRequest],
+        result_limits: CatalogResultLimits,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Vec<Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ManifestCatalogError>>,
+        ManifestCatalogError,
+    > {
+        check_read_operation(deadline, cancellation)?;
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
         self.read_snapshot(result_limits, deadline, cancellation)
             .map_err(ManifestCatalogError::from)
             .and_then(|snapshot| {
                 snapshot.read(|snapshot| {
-                    select_latest_canonical_market_bar_history_window(
-                        snapshot.connection(),
-                        self.max_objects_per_generation,
-                        request,
-                        deadline,
-                        cancellation,
-                    )
+                    let mut selections = Vec::with_capacity(requests.len());
+                    for request in requests {
+                        check_read_operation(deadline, cancellation)?;
+                        selections.push(
+                            select_latest_canonical_market_bar_history_window(
+                                snapshot.connection(),
+                                self.max_objects_per_generation,
+                                request,
+                                deadline,
+                                cancellation,
+                            )
+                            .map_err(|error| {
+                                classify_sqlite_interrupt(error, deadline, cancellation)
+                            }),
+                        );
+                    }
+                    Ok(selections)
                 })
             })
             .map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))

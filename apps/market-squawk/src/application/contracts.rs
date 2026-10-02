@@ -1959,7 +1959,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Market,
         JOB_SCOPE,
         MARKET_HISTORY_ARGUMENTS,
-        SourceEvidencePolicy::NotApplicable,
+        SourceEvidencePolicy::Required,
     ),
     OperationSpec {
         name: "Market.GetSessionContext",

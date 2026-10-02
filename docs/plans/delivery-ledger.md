@@ -2,8 +2,8 @@
 
 ## Current execution — 2026-10-02
 
-Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop57572,
-service57524, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
+Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop64107,
+service64054, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
 The previous queued application builds finished sequentially. Shared-service rerun3350 is terminal0;
 its empty-collection/MCP correction is pushed as `56412314` (PASS1/1, 47.06s). Lead inspected and
 applied the complete canonical FilingForm candidate (now pushed as `bd15961c`) after verifying all19 base hashes. The serialized watcher
@@ -11,6 +11,37 @@ build54381 passed (8m01s), followed by domain1/1, SEC parser2/2 and PIT1/1 criti
 Evidence: `.agents/tmp/v1-first-stock/filing-form-{domain,parser,pit}-critical.log`.
 The first live activation retry returned service unavailable; live financial loading remains unproved.
 Original runtime roots and recovery history remain preserved.
+
+Pushed `ba7679b6` implements the selected-detail layout/refresh correction; Desktop types and the
+two existing critical journeys pass. Lead has now applied the five-file close-page candidate after
+exact-base/diff inspection together with the confirmed Market.GetHistory evidence-policy alignment
+and its existing descriptor regression. Watcher Cargo61296 passed (6m26s); queue65302 ran projection-integrity PASS1/1 (0.54s)
+and descriptor/result validation PASS1/1 (1.23s). Queue65302 is terminal0; no compiler remains from this checkpoint. No live-data completion yet.
+The history endpoint declared NotApplicable while both of its actual producers return Required;
+strict validation therefore rejected both valid bars and valid unavailable states. The closed
+schema and actual coverage/quality metadata remain intact.
+Live current-runtime MSFT detail returns the actual512.71 USD prior close; its history request now
+returns a valid not_available result instead of InvalidResult (`msft-{detail,history-contract}-live.json`).
+Nine-symbol collection still exhausts30s in retained_routes_and_events before close projection,
+so the batch is not a whole-page latency fix. That separate exact-stage diagnosis remains active.
+A temporary hidden native check could not admit a second workspace client (generic bootstrap
+failure); its process65422/session was stopped and the visible Desktop64107 remained running.
+No native screenshot or visual-completion claim is made from that attempt.
+
+
+Further confirmed chart gap: startup acquires raw daily bars/close projections, while the selected
+chart requests FullyAdjusted and has no acquisition step. Astra sec_automatic_resolution owns only
+`.agents/tmp/v1-first-stock/selected-history-candidate/` preparation for the existing preflight
+history/display_history modules; lead owns shared operation/composition/native workflow integration.
+Sol dev_launcher is read-only on existing asynchronous preparation patterns. The 15-second ordinary
+read budget cannot be assumed sufficient for first provider acquisition. Do not fake adjusted bars,
+call a graceful missing result chart completion, or silently restrict required history coverage.
+
+Astra startup_read_diagnosis owns candidate-only SEC extraction safe category/stage diagnostics.
+Current live activation reaches extraction and fails InvalidProtocolState; CLI collapses that to
+Unavailable. It is not evidence for changing provider locks. Lead owns manifests/lockfile and exact
+integration after the current frozen compile/check barrier.
+
 
 Check78271 compiled in7m45s, then failed on an outdated MCP discovery assertion excluding all
 Research operations. The current product policy intentionally exposes exactly the investment

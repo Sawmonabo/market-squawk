@@ -10514,6 +10514,32 @@ mod tests {
             )?
             .validate_for(descriptor)?;
         }
+        // History returns native coverage/quality evidence even when no bars are available.
+        // Validate full results, not just JSON shapes: a mismatched evidence policy hid every chart.
+        let history = capabilities.find("Market.GetHistory").ok_or("missing market history")?;
+        let digest = "a".repeat(64);
+        for (content, count, coverage, quality) in [
+            (json!({"data":null,"unavailableReason":"not_available"}), 0,
+             json!({"availability":"unavailable"}), json!({"quality":"unavailable"})),
+            (json!({"data": {
+                "historyToken":"history_0123456789abcdef0123456789abcdef",
+                "currency":"USD", "generationToken":digest, "partial":false,
+                "bars":[{"time":{"precision":"nominal_date","date":"2026-10-01"},
+                    "open":"100","high":"102","low":"99","close":"101","volume":"1234",
+                    "originalOrdinal":"0","breakBefore":[false,false,false]}],
+                "display":{"method":"first_last_min_max","originalPointCount":"1",
+                    "visibleOriginalPointCount":"1","returnedPointCount":1,"firstTimeUnixNanos":null,
+                    "lastTimeUnixNanos":null,"projectionDigest":digest,"reduced":false},
+                "viewport":{"startUnixNanos":null,"endUnixNanos":null,"startDate":null,"endDate":null,
+                    "pointLimit":512,"fullStartUnixNanos":null,"fullEndUnixNanos":null,
+                    "fullStartDate":"2026-10-01","fullEndDate":"2026-10-01"}
+             },"unavailableReason":null}), 1,
+             json!({"availability":"available","generationToken":digest,"projectionDigest":digest}),
+             json!({"quality":"verified","originalBarsRetained":true,"displayOnly":true})),
+        ] {
+            TypedToolResult::try_new(content, count, ToolResultMetadata::try_complete(coverage, quality)?, limits)?
+                .validate_for(history)?;
+        }
         Ok(())
     }
 

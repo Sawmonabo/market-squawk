@@ -9,9 +9,9 @@ use crate::{
     },
 };
 use market_squawk_data::{
-    AnalyticalReadError, ChartProjectionError, ChartProjectionRow,
-    CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
-    LatestCanonicalMarketBarHistoryWindowSelection, MarketHistorySelectionPolicy,
+    AnalyticalReadError, ChartProjectionRow, CompleteMarketBarHistorySelection,
+    LatestCanonicalMarketBarHistoryWindowRequest, LatestCanonicalMarketBarHistoryWindowSelection,
+    MarketHistorySelectionPolicy,
 };
 use market_squawk_domain::{
     CalendarDate, Currency, DataQuality, InstrumentId, MarketBarAdjustment, Money, Timestamp,
@@ -34,14 +34,18 @@ pub(crate) struct PreviousClose {
 /// One bounded lookup stage; Drop also attributes errors and abandoned request futures.
 struct CloseReadStage<'a> {
     context: &'a RequestContext,
-    instrument_id: InstrumentId,
+    instrument_id: Option<InstrumentId>,
     stage: &'static str,
     started: Instant,
     completed: bool,
 }
 
 impl<'a> CloseReadStage<'a> {
-    fn new(context: &'a RequestContext, instrument_id: InstrumentId, stage: &'static str) -> Self {
+    fn new(
+        context: &'a RequestContext,
+        instrument_id: Option<InstrumentId>,
+        stage: &'static str,
+    ) -> Self {
         Self {
             context,
             instrument_id,
@@ -60,7 +64,7 @@ impl Drop for CloseReadStage<'_> {
     fn drop(&mut self) {
         tracing::debug!(
             request_id = ?self.context.request_id(),
-            instrument_id = %self.instrument_id,
+            instrument_id = ?self.instrument_id,
             stage = self.stage,
             completed = self.completed,
             elapsed_ms = %self.started.elapsed().as_millis(),
@@ -134,22 +138,51 @@ impl PreviousClose {
 }
 
 impl MarketHistoryReadCapability {
-    /// Screen reads never reconstruct history or replay raw captures. A miss belongs to the
-    /// existing generation-owned preparation worker.
-    pub(crate) async fn read_latest_previous_close(
+    /// Reads a selected page without reconstructing history or replaying raw captures.
+    /// Absence or denied source use stays local to its instrument; integrity failures do not.
+    pub(crate) async fn read_latest_previous_closes(
         &self,
         research: &ResearchService,
-        instrument_id: InstrumentId,
+        instruments: &[InstrumentId],
         knowledge_cutoff: Timestamp,
         context: &RequestContext,
-    ) -> Result<Option<PreviousClose>, ServiceError> {
-        let Some(selection) = self
-            .select_previous_close(research, instrument_id, knowledge_cutoff, context)
-            .await?
-        else {
-            return Ok(None);
-        };
-        read_projection(research, selection.selection(), knowledge_cutoff, context).await
+    ) -> Result<Vec<Option<PreviousClose>>, ServiceError> {
+        check(context)?;
+        let selections = self
+            .select_previous_closes(research, instruments, knowledge_cutoff, context)
+            .await?;
+        if selections.len() != instruments.len() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let mut selected = Vec::new();
+        let mut positions = Vec::new();
+        let mut closes: Vec<_> = instruments.iter().map(|_| None).collect();
+        for (index, selection) in selections.into_iter().enumerate() {
+            match selection {
+                Ok(Some(selection)) => {
+                    if selection.selection().receipt().instrument_id() != instruments[index] {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                    positions.push(index);
+                    selected.push(selection.selection().clone());
+                }
+                Ok(None) | Err(ServiceError::Unavailable | ServiceError::Unauthorized) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let projected = read_projections(research, &selected, knowledge_cutoff, context).await?;
+        if projected.len() != positions.len() {
+            return Err(ServiceError::InvalidResult);
+        }
+        for (index, close) in positions.into_iter().zip(projected) {
+            closes[index] = match close {
+                Ok(close) => close,
+                Err(ServiceError::Unavailable | ServiceError::Unauthorized) => None,
+                Err(error) => return Err(error),
+            };
+        }
+        check(context)?;
+        Ok(closes)
     }
 
     async fn select_previous_close(
@@ -159,33 +192,66 @@ impl MarketHistoryReadCapability {
         knowledge_cutoff: Timestamp,
         context: &RequestContext,
     ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ServiceError> {
+        self.select_previous_closes(research, &[instrument_id], knowledge_cutoff, context)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(ServiceError::InvalidResult)?
+    }
+
+    async fn select_previous_closes(
+        &self,
+        research: &ResearchService,
+        instruments: &[InstrumentId],
+        knowledge_cutoff: Timestamp,
+        context: &RequestContext,
+    ) -> Result<
+        Vec<Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ServiceError>>,
+        ServiceError,
+    > {
         check(context)?;
-        let request = LatestCanonicalMarketBarHistoryWindowRequest::try_new(
-            instrument_id,
-            MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
-            knowledge_cutoff,
-        )
-        .map_err(|_| ServiceError::InvalidRequest)?;
+        if instruments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = instruments
+            .iter()
+            .map(|instrument| {
+                LatestCanonicalMarketBarHistoryWindowRequest::try_new(
+                    *instrument,
+                    MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+                    knowledge_cutoff,
+                )
+                .map_err(|_| ServiceError::InvalidRequest)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let reader = self.reader.clone();
         let deadline = context.deadline();
-        let timing = CloseReadStage::new(context, instrument_id, "selection");
-        let selection = research
+        let timing = CloseReadStage::new(context, None, "page_selection");
+        let selections = research
             .run_owned_research_read(deadline, context.cancellation(), move |cancellation| {
-                reader.select_latest_canonical_market_bar_history_window(
-                    request,
+                reader.select_latest_canonical_market_bar_history_windows(
+                    &requests,
                     deadline,
                     &cancellation,
                 )
             })
             .await
             .map_err(map_research_error)?
-            .map_err(read_error)
-            .inspect_err(|error| {
-                trace_close_read_failure(instrument_id, "latest-window-selection", error)
-            })?;
+            .map_err(read_error)?;
         timing.complete();
         check(context)?;
-        Ok(selection)
+        if selections.len() != instruments.len() {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(selections
+            .into_iter()
+            .zip(instruments)
+            .map(|(selection, instrument)| {
+                selection.map_err(read_error).inspect_err(|error| {
+                    trace_close_read_failure(*instrument, "latest-window-selection", error)
+                })
+            })
+            .collect())
     }
 
     /// Validates the entire original history and calendar once, then commits its terminal close.
@@ -428,88 +494,145 @@ async fn read_projection(
     cutoff: Timestamp,
     context: &RequestContext,
 ) -> Result<Option<PreviousClose>, ServiceError> {
+    read_projections(research, std::slice::from_ref(selection), cutoff, context)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(ServiceError::InvalidResult)?
+}
+
+fn projection_parents(
+    selection: &CompleteMarketBarHistorySelection,
+) -> Vec<market_squawk_data::DatasetManifestRef> {
+    let mut parents = vec![selection.pinned().manifest().clone()];
+    if !parents.contains(selection.receipt().origin_manifest()) {
+        parents.push(selection.receipt().origin_manifest().clone());
+    }
+    parents
+}
+
+async fn read_projections(
+    research: &ResearchService,
+    selections: &[CompleteMarketBarHistorySelection],
+    cutoff: Timestamp,
+    context: &RequestContext,
+) -> Result<Vec<Result<Option<PreviousClose>, ServiceError>>, ServiceError> {
     check(context)?;
+    if selections.is_empty() {
+        return Ok(Vec::new());
+    }
     let projections = research.chart_projections();
-    let source = projection_source(selection);
+    let sources: Vec<_> = selections.iter().map(projection_source).collect();
     let deadline = context.deadline();
-    let timing = CloseReadStage::new(
-        context,
-        selection.receipt().instrument_id(),
-        "stored_projection",
-    );
+    let timing = CloseReadStage::new(context, None, "stored_projection_page");
     let stored = research
         .run_owned_research_read(deadline, context.cancellation(), move |cancellation| {
-            let Some(reference) = projections.reference(source, deadline, &cancellation)? else {
-                return Ok(None);
-            };
-            if reference.row_count != 1 || reference.series_count != 1 {
-                return Err(ChartProjectionError::Invalid);
-            }
-            projections.verify(&reference, deadline, &cancellation)?;
-            let metadata: CloseMetadata = serde_json::from_slice(&projections.metadata(
-                &reference,
-                deadline,
-                &cancellation,
-            )?)
-            .map_err(|_| ChartProjectionError::Invalid)?;
-            let mut point = None;
-            let count = projections.scan(
-                &reference,
-                i64::MIN,
-                i64::MAX,
-                deadline,
-                &cancellation,
-                |ordinal, row| {
-                    let close: ClosePoint = serde_json::from_value(row.point)
-                        .map_err(|_| ChartProjectionError::Invalid)?;
-                    if ordinal != 0
-                        || point.is_some()
-                        || row.time_nanos != close.session_close.unix_nanos()
-                        || row.values != vec![Some(close.close.amount().into())]
-                    {
-                        return Err(ChartProjectionError::Invalid);
-                    }
-                    point = Some(close);
-                    Ok(())
-                },
-            )?;
-            if count != 1 {
-                return Err(ChartProjectionError::Invalid);
-            }
-            Ok(Some((
-                metadata,
-                point.ok_or(ChartProjectionError::Invalid)?,
-            )))
+            projections.read_verified_single_rows(&sources, deadline, &cancellation)
         })
         .await
         .map_err(map_research_error)?
         .map_err(chart_storage_error)?;
     timing.complete();
-    let Some((metadata, close)) = stored else {
-        return Ok(None);
-    };
-    validate_projection(selection, &metadata, &close, cutoff)?;
-    let mut parents = vec![selection.pinned().manifest().clone()];
-    if !parents.contains(selection.receipt().origin_manifest()) {
-        parents.push(selection.receipt().origin_manifest().clone());
+    if stored.len() != selections.len() {
+        return Err(ServiceError::InvalidResult);
     }
-    let timing = CloseReadStage::new(
-        context,
-        selection.receipt().instrument_id(),
-        "rights_authorization",
-    );
-    let permit = authorize_projection_parents(research, &parents, cutoff, context).await?;
-    timing.complete();
+    let mut points = Vec::with_capacity(stored.len());
+    let mut parents = Vec::new();
+    for (selection, stored) in selections.iter().zip(stored) {
+        check(context)?;
+        let point = (|| {
+            let Some((metadata, row)) = stored.map_err(chart_storage_error)? else {
+                return Ok(None);
+            };
+            let metadata: CloseMetadata =
+                serde_json::from_slice(&metadata).map_err(|_| ServiceError::InvalidResult)?;
+            let close: ClosePoint =
+                serde_json::from_value(row.point).map_err(|_| ServiceError::InvalidResult)?;
+            if row.time_nanos != close.session_close.unix_nanos()
+                || row.values != vec![Some(close.close.amount().into())]
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            validate_projection(selection, &metadata, &close, cutoff)?;
+            Ok(Some(close))
+        })();
+        let point = match point {
+            Ok(Some(close)) => {
+                for parent in projection_parents(selection) {
+                    if !parents.contains(&parent) {
+                        parents.push(parent);
+                    }
+                }
+                Ok(Some(close))
+            }
+            Ok(None) => Ok(None),
+            Err(error @ (ServiceError::Unavailable | ServiceError::Unauthorized)) => Err(error),
+            Err(error) => return Err(error),
+        };
+        points.push(point);
+    }
+    let mut expiries = vec![None; points.len()];
+    if !parents.is_empty() {
+        let timing = CloseReadStage::new(context, None, "page_rights_authorization");
+        match authorize_projection_parents(research, &parents, cutoff, context).await {
+            Ok(permit) => {
+                for (index, point) in points.iter().enumerate() {
+                    if matches!(point, Ok(Some(_))) {
+                        expiries[index] = Some(permit.expires_at());
+                    }
+                }
+            }
+            Err(ServiceError::Unauthorized | ServiceError::Unavailable) => {
+                // One denied source must not suppress other instruments. Recheck the original
+                // exact per-close roots; this path grants no authority from the failed union.
+                for (index, selection) in selections.iter().enumerate() {
+                    if !matches!(&points[index], Ok(Some(_))) {
+                        continue;
+                    }
+                    check(context)?;
+                    match authorize_projection_parents(
+                        research,
+                        &projection_parents(selection),
+                        cutoff,
+                        context,
+                    )
+                    .await
+                    {
+                        Ok(permit) => expiries[index] = Some(permit.expires_at()),
+                        Err(error @ (ServiceError::Unauthorized | ServiceError::Unavailable)) => {
+                            points[index] = Err(error)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        timing.complete();
+    }
     check(context)?;
-    if wall_now()? >= permit.expires_at() {
-        return Err(ServiceError::Unauthorized);
-    }
-    Ok(Some(PreviousClose {
-        instrument_id: close.instrument_id,
-        close: close.close,
-        native_date: close.native_date,
-        session_close: close.session_close,
-    }))
+    let now = wall_now()?;
+    points
+        .into_iter()
+        .zip(expiries)
+        .map(|(point, expires)| match point {
+            Ok(Some(close)) => {
+                let expires = expires.ok_or(ServiceError::InvalidResult)?;
+                Ok(if now >= expires {
+                    Err(ServiceError::Unauthorized)
+                } else {
+                    Ok(Some(PreviousClose {
+                        instrument_id: close.instrument_id,
+                        close: close.close,
+                        native_date: close.native_date,
+                        session_close: close.session_close,
+                    }))
+                })
+            }
+            Ok(None) => Ok(Ok(None)),
+            Err(error) => Ok(Err(error)),
+        })
+        .collect()
 }
 
 fn validate_projection(

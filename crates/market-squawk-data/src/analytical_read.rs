@@ -2679,6 +2679,37 @@ impl AnalyticalReadCapability {
             .map_err(Into::into)
     }
 
+    /// Selects a page of exact daily history windows using one catalog snapshot.
+    /// Results preserve the requested order, including absence and per-instrument failures.
+    #[allow(
+        clippy::type_complexity,
+        reason = "page items preserve independent selection failures"
+    )]
+    pub fn select_latest_canonical_market_bar_history_windows(
+        &self,
+        requests: &[LatestCanonicalMarketBarHistoryWindowRequest],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Vec<Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, AnalyticalReadError>>,
+        AnalyticalReadError,
+    > {
+        self.manifests
+            .select_latest_canonical_market_bar_history_windows(
+                requests,
+                self.catalog_read_limits,
+                deadline,
+                cancellation,
+            )
+            .map(|selections| {
+                selections
+                    .into_iter()
+                    .map(|selection| selection.map_err(Into::into))
+                    .collect()
+            })
+            .map_err(Into::into)
+    }
+
     /// Resolves and reads canonical durable daily history without provider coordinates or mapping.
     ///
     /// The catalog resolves the sole eligible provider series from immutable publication evidence.

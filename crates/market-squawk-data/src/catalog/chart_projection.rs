@@ -272,52 +272,69 @@ impl ChartProjectionCatalogCapability {
     ) -> Result<(), ChartProjectionError> {
         self.read(deadline, cancellation, |connection| {
             let metadata = projection_metadata(connection, reference)?;
-            if reference.source_sha256 == [0; 32]
-                || metadata.is_empty()
-                || metadata.len() > 64 * 1024
-                || !(1..=3).contains(&reference.series_count)
-            {
-                return Err(ChartProjectionError::Invalid);
-            }
-            let mut hash = Sha256::new();
-            hash.update(b"market-squawk/chart-projection/v1\0");
-            hash.update(reference.source_sha256);
-            hash.update((reference.series_count as u64).to_be_bytes());
-            hash.update((metadata.len() as u64).to_be_bytes());
-            hash.update(&metadata);
-            let mut count = 0_u64;
-            let mut first = None;
-            let mut last = None;
-            scan_projection_rows(
+            verify_projection_rows(
                 connection,
                 reference,
-                i64::MIN,
-                i64::MAX,
+                &metadata,
                 deadline,
                 cancellation,
-                |ordinal, row, bytes| {
-                    if ordinal != count {
+                |_, _| Ok(()),
+            )
+        })
+    }
+
+    /// Reads complete one-row, one-series projections in input order using one snapshot.
+    /// Metadata and the decoded row are returned only after the complete commitment verifies.
+    #[allow(
+        clippy::type_complexity,
+        reason = "page items preserve independent storage failures"
+    )]
+    pub fn read_verified_single_rows(
+        &self,
+        sources: &[[u8; 32]],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Vec<Result<Option<(Vec<u8>, ChartProjectionRow)>, ChartProjectionError>>,
+        ChartProjectionError,
+    > {
+        check(deadline, cancellation)?;
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.read(deadline, cancellation, |connection| {
+            let mut results = Vec::with_capacity(sources.len());
+            for source in sources {
+                check(deadline, cancellation)?;
+                results.push((|| {
+                    let Some((reference, metadata)) = header(connection, source)? else {
+                        return Ok(None);
+                    };
+                    if reference.row_count != 1 || reference.series_count != 1 {
                         return Err(ChartProjectionError::Invalid);
                     }
-                    hash.update(ordinal.to_be_bytes());
-                    hash.update((bytes.len() as u64).to_be_bytes());
-                    hash.update(bytes);
-                    first.get_or_insert(row.time_nanos);
-                    last = Some(row.time_nanos);
-                    count = count.checked_add(1).ok_or(ChartProjectionError::Invalid)?;
-                    Ok(())
-                },
-            )?;
-            hash.update(count.to_be_bytes());
-            let digest: [u8; 32] = hash.finalize().into();
-            if count != reference.row_count
-                || first != reference.first_time
-                || last != reference.last_time
-                || digest != reference.projection_sha256
-            {
-                return Err(ChartProjectionError::Invalid);
+                    let mut point = None;
+                    verify_projection_rows(
+                        connection,
+                        &reference,
+                        &metadata,
+                        deadline,
+                        cancellation,
+                        |ordinal, row| {
+                            if ordinal != 0 || point.is_some() {
+                                return Err(ChartProjectionError::Invalid);
+                            }
+                            point = Some(row);
+                            Ok(())
+                        },
+                    )?;
+                    Ok(Some((
+                        metadata,
+                        point.ok_or(ChartProjectionError::Invalid)?,
+                    )))
+                })());
             }
-            check(deadline, cancellation)
+            Ok(results)
         })
     }
 
@@ -367,6 +384,62 @@ impl ChartProjectionCatalogCapability {
             )
         })
     }
+}
+
+fn verify_projection_rows(
+    connection: &rusqlite::Connection,
+    reference: &ChartProjectionReference,
+    metadata: &[u8],
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    mut visit: impl FnMut(u64, ChartProjectionRow) -> Result<(), ChartProjectionError>,
+) -> Result<(), ChartProjectionError> {
+    if reference.source_sha256 == [0; 32]
+        || metadata.is_empty()
+        || metadata.len() > 64 * 1024
+        || !(1..=3).contains(&reference.series_count)
+    {
+        return Err(ChartProjectionError::Invalid);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/chart-projection/v1\0");
+    hash.update(reference.source_sha256);
+    hash.update((reference.series_count as u64).to_be_bytes());
+    hash.update((metadata.len() as u64).to_be_bytes());
+    hash.update(metadata);
+    let mut count = 0_u64;
+    let mut first = None;
+    let mut last = None;
+    scan_projection_rows(
+        connection,
+        reference,
+        i64::MIN,
+        i64::MAX,
+        deadline,
+        cancellation,
+        |ordinal, row, bytes| {
+            if ordinal != count {
+                return Err(ChartProjectionError::Invalid);
+            }
+            hash.update(ordinal.to_be_bytes());
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+            first.get_or_insert(row.time_nanos);
+            last = Some(row.time_nanos);
+            count = count.checked_add(1).ok_or(ChartProjectionError::Invalid)?;
+            visit(ordinal, row)
+        },
+    )?;
+    hash.update(count.to_be_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    if count != reference.row_count
+        || first != reference.first_time
+        || last != reference.last_time
+        || digest != reference.projection_sha256
+    {
+        return Err(ChartProjectionError::Invalid);
+    }
+    check(deadline, cancellation)
 }
 
 fn projection_metadata(
@@ -582,6 +655,27 @@ mod tests {
             Arc::new(AnalyticalManifestCatalog::open(paths.catalog()?, 8)?),
             result_limits,
         );
+        let compact_row = |value| ChartProjectionRow {
+            time_nanos: 200,
+            values: vec![Some(rust_decimal::Decimal::from(value).into())],
+            point: serde_json::json!({"value": value}),
+        };
+        let compact_first = capability.publish(
+            [4; 32],
+            b"{\"close\":1}",
+            1,
+            [Ok(compact_row(11))],
+            deadline,
+            &cancellation,
+        )?;
+        capability.publish(
+            [5; 32],
+            b"{\"close\":2}",
+            1,
+            [Ok(compact_row(22))],
+            deadline,
+            &cancellation,
+        )?;
         // Reopening original values must remain available during an unrelated publication.
         // Hold both the capability's exact writer mutex and a real SQLite write transaction.
         let authority = capability.authority.lock().map_err(|_| "catalog lock")?;
@@ -621,6 +715,40 @@ mod tests {
         );
         assert!(selected[1].2.is_none());
         capability.verify(&reference, deadline, &cancellation)?;
+        // One snapshot preserves requested order, misses and repeated immutable identities,
+        // while retaining complete verification under the exact writer held above.
+        let mut compact = capability
+            .read_verified_single_rows(
+                &[[5; 32], [2; 32], [4; 32], [5; 32]],
+                deadline,
+                &cancellation,
+            )?
+            .into_iter();
+        let (metadata, row) = compact
+            .next()
+            .ok_or("missing compact result")??
+            .ok_or("missing close")?;
+        assert_eq!(metadata, b"{\"close\":2}");
+        assert_eq!(row.point, serde_json::json!({"value":22}));
+        assert!(compact.next().ok_or("missing absent result")??.is_none());
+        let (metadata, row) = compact
+            .next()
+            .ok_or("missing compact result")??
+            .ok_or("missing close")?;
+        assert_eq!(metadata, b"{\"close\":1}");
+        assert_eq!(row.point, serde_json::json!({"value":11}));
+        let (_, row) = compact
+            .next()
+            .ok_or("missing duplicate result")??
+            .ok_or("missing close")?;
+        assert_eq!(row.point, serde_json::json!({"value":22}));
+        assert!(compact.next().is_none());
+        assert!(matches!(
+            capability
+                .read_verified_single_rows(&[reference.source_sha256], deadline, &cancellation)?
+                .remove(0),
+            Err(ChartProjectionError::Invalid)
+        ));
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
@@ -629,6 +757,14 @@ mod tests {
         ));
         assert!(matches!(
             capability.metadata(&reference, Instant::now(), &cancellation),
+            Err(ChartProjectionError::DeadlineExceeded)
+        ));
+        assert!(matches!(
+            capability.read_verified_single_rows(&[[4; 32]], deadline, &cancelled),
+            Err(ChartProjectionError::Cancelled)
+        ));
+        assert!(matches!(
+            capability.read_verified_single_rows(&[[4; 32]], Instant::now(), &cancellation),
             Err(ChartProjectionError::DeadlineExceeded)
         ));
         transaction.rollback()?;
@@ -662,7 +798,41 @@ mod tests {
             )?,
             1
         );
+        assert_eq!(
+            authority.catalog().connection.execute(
+                "DELETE FROM chart_projection_rows WHERE source_sha256=?1",
+                [compact_first.source_sha256.as_slice()],
+            )?,
+            1
+        );
         drop(authority);
+        let mut compact = capability
+            .read_verified_single_rows(&[[4; 32], [5; 32]], deadline, &cancellation)?
+            .into_iter();
+        assert!(matches!(
+            compact.next(),
+            Some(Err(ChartProjectionError::Invalid))
+        ));
+        assert!(matches!(compact.next(), Some(Ok(Some(_)))));
+        // A coherent row payload/hash is insufficient if it contradicts the complete commitment.
+        let authority = capability.authority.lock().map_err(|_| "catalog lock")?;
+        authority
+            .catalog()
+            .connection
+            .execute_batch("DROP TRIGGER chart_projection_rows_immutable_update")?;
+        let altered = serde_json::to_vec(&compact_row(33))?;
+        let altered_digest: [u8; 32] = Sha256::digest(&altered).into();
+        assert_eq!(authority.catalog().connection.execute(
+            "UPDATE chart_projection_rows SET payload=?1,payload_sha256=?2 WHERE source_sha256=?3",
+            params![altered, altered_digest.as_slice(), [5_u8; 32].as_slice()],
+        )?, 1);
+        drop(authority);
+        assert!(matches!(
+            capability
+                .read_verified_single_rows(&[[5; 32]], deadline, &cancellation)?
+                .remove(0),
+            Err(ChartProjectionError::Invalid)
+        ));
         assert!(matches!(
             capability.verify(&reference, deadline, &cancellation),
             Err(ChartProjectionError::Invalid)
