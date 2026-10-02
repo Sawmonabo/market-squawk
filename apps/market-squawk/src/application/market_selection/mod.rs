@@ -22,8 +22,9 @@ pub(crate) use investment::{
     LiveMarketInvestmentSource, MarketFeatureEvidence, MarketFeatureUnavailableReason,
     MarketInvestmentMarkBasis, MarketInvestmentObservation, MarketInvestmentRead,
     MarketInvestmentReadCapability, MarketInvestmentReadError, MarketInvestmentReadReceipt,
-    MarketInvestmentUnavailableReason, SelectedMarketInvestmentSource, map_market_event_read_error,
-    read_market_investment_observation, selected_generation_matches, validate_native_reference,
+    MarketInvestmentUnavailableReason, NativeReferenceUse, SelectedMarketInvestmentSource,
+    map_market_event_read_error, read_market_investment_observation, selected_generation_matches,
+    validate_native_reference,
 };
 pub(crate) use receipt::{
     AdmittedDowngrade, DowngradeDimension, MarketSelectionError, MarketSelectionReceipt,

@@ -443,11 +443,16 @@ mod tests {
         MarketDataInstrumentSynchronizationCapability,
     };
     use market_squawk_domain::{
-        AssetClass, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-        IdentifierEntitlement, IdentifierRightsPolicyReference, MarketDataDisplayName,
-        MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MetadataRevision,
-        RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId, VenueMapping,
-        VenueSymbol,
+        AssetClass, AssignmentVerification, AuthorizationBasis, CanonicalStateDigest,
+        CanonicalizationRule, ConnectionGeneration, CoverageStatus, DataQuality,
+        DecodedLiveProvenanceInput, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+        ExactPayloadEvidence, ExternalIdentifier, ExternalIdentifierRecord,
+        ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
+        LiveEventClass, LiveEvidenceBinding, LiveProvenance, MarketDataDisplayName,
+        MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MarketDataReference,
+        MetadataRevision, PayloadReference, ProviderChannel, ProviderInstrumentId, ProviderProduct,
+        RevisionBoundPayloadEvidence, RuleVersion, SourceId, SourceIdentifier, Ticker, Timestamp,
+        VenueId, VenueMapping, VenueSymbol,
     };
     use market_squawk_platform::LocalPaths;
     use std::{
@@ -512,7 +517,7 @@ mod tests {
                         evidence.clone(),
                     ),
                     effective_interval: EffectiveInterval::new(
-                        Timestamp::from_unix_nanos(1),
+                        Timestamp::from_unix_nanos(100),
                         None,
                     )?,
                     asset_class: if name.is_some() {
@@ -534,7 +539,25 @@ mod tests {
                     quote_currency_evidence: evidence.clone(),
                     venue_mappings,
                     provider_identities: Vec::new(),
-                    identifiers: Vec::new(),
+                    identifiers: if symbol == "SPY" {
+                        vec![ExternalIdentifierRecord::new(
+                            ExternalIdentifierRecordInput {
+                                identifier: ExternalIdentifier::Ticker(Ticker::try_from(symbol)?),
+                                assignment_verification: AssignmentVerification::VerifiedAssigned,
+                                source_id: name_source.clone(),
+                                source_evidence: evidence.clone(),
+                                source_timestamp: Some(Timestamp::from_unix_nanos(100)),
+                                observed_at: Timestamp::from_unix_nanos(100),
+                                validity: EffectiveInterval::new(
+                                    Timestamp::from_unix_nanos(100),
+                                    None,
+                                )?,
+                                rights_policy: name_rights.clone(),
+                            },
+                        )]
+                    } else {
+                        Vec::new()
+                    },
                 },
             )?);
         }
@@ -561,6 +584,117 @@ mod tests {
             .map(|record| record.published_at())
             .max()
             .ok_or("missing cutoff")?;
+        // A retained closing quote can predate registration of its exact reference. The
+        // shared production validator must still reject that quote as a current financial mark.
+        use crate::application::market_selection::{NativeReferenceUse, validate_native_reference};
+        let definition = &records[0];
+        let reference = MarketDataReference::try_from_assigned_identifier(
+            definition.definition(),
+            definition.revision_digest(),
+            &definition.definition().identifiers()[0],
+            ProviderInstrumentId::try_from("SPY")?,
+            Timestamp::from_unix_nanos(110),
+        )?;
+        let provenance = |instrument,
+                          source_at,
+                          received_at|
+         -> Result<LiveProvenance, Box<dyn std::error::Error>> {
+            let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]);
+            let binding = LiveEvidenceBinding::new(
+                SourceId::try_from("retained-quote")?,
+                SourceIdentifier::try_from("session-1")?,
+                MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
+                AuthorizationBasis::new(SourceIdentifier::try_from("quote-authority")?),
+                VenueId::try_from("ARCX")?,
+                instrument,
+                ConnectionGeneration::new(1)?,
+                ProviderProduct::new(SourceIdentifier::try_from("SPY")?),
+                ProviderChannel::new(SourceIdentifier::try_from("quotes")?),
+                LiveEventClass::Quote,
+                SourceIdentifier::try_from("SPY")?,
+                digest,
+                CanonicalStateDigest::new(
+                    digest,
+                    CanonicalizationRule::new(
+                        SourceIdentifier::try_from("quote-v1")?,
+                        RuleVersion::new(1)?,
+                    ),
+                ),
+                None,
+            )?;
+            Ok(LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+                binding,
+                Some(Timestamp::from_unix_nanos(source_at)),
+                Timestamp::from_unix_nanos(received_at),
+                Timestamp::from_unix_nanos(received_at),
+                Timestamp::from_unix_nanos(received_at + 1),
+                DataQuality::DirectUnverified,
+                CoverageStatus::Sufficient,
+                PayloadReference::SourceReference(SourceIdentifier::try_from("frame-1")?),
+            ))?)
+        };
+        let closing_quote = provenance(reference.instrument_id(), 90, 110)?;
+        validate_native_reference(
+            &reference,
+            definition,
+            &closing_quote,
+            cutoff,
+            NativeReferenceUse::RetainedDisplay,
+        )?;
+        assert_eq!(
+            closing_quote.source_timestamp(),
+            Some(Timestamp::from_unix_nanos(90))
+        );
+        assert!(matches!(
+            validate_native_reference(
+                &reference,
+                definition,
+                &closing_quote,
+                cutoff,
+                NativeReferenceUse::CurrentMark
+            ),
+            Err(ServiceError::InvalidResult)
+        ));
+        let current_quote = provenance(reference.instrument_id(), 110, 110)?;
+        validate_native_reference(
+            &reference,
+            definition,
+            &current_quote,
+            cutoff,
+            NativeReferenceUse::CurrentMark,
+        )?;
+        let wrong_digest = MarketDataReference::try_from_assigned_identifier(
+            definition.definition(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
+            &definition.definition().identifiers()[0],
+            ProviderInstrumentId::try_from("SPY")?,
+            Timestamp::from_unix_nanos(110),
+        )?;
+        let wrong_instrument = provenance(records[1].definition().instrument_id(), 110, 110)?;
+        let early_receipt = provenance(reference.instrument_id(), 90, 99)?;
+        for reference_use in [
+            NativeReferenceUse::RetainedDisplay,
+            NativeReferenceUse::CurrentMark,
+        ] {
+            for (candidate, observation, knowledge_at) in [
+                (&wrong_digest, &current_quote, cutoff),
+                (&reference, &wrong_instrument, cutoff),
+                (&reference, &early_receipt, cutoff),
+                (&reference, &current_quote, Timestamp::from_unix_nanos(110)),
+            ] {
+                assert!(matches!(
+                    validate_native_reference(
+                        candidate,
+                        definition,
+                        observation,
+                        knowledge_at,
+                        reference_use
+                    ),
+                    Err(ServiceError::InvalidResult)
+                ));
+            }
+        }
+
         let crypto = product_market_identities(&records, cutoff, Some("BTC"))?;
         let (crypto_page, count, _) = product_search_page(&crypto, "BTC", 100, None)?;
         assert_eq!(count, 1);
@@ -652,6 +786,12 @@ mod tests {
         assert_eq!(closed["availability"], "previous_close");
         assert_eq!(closed["priceBasis"], "previous_close");
         assert_eq!(closed["quote"], projected["quote"]);
+        quote_row["quote"]["quoteFresh"] = json!(false);
+        let retained = product_row(identity, &quote_row)?;
+        assert_eq!(retained["priceBasis"], "previous_close");
+        assert_eq!(retained["quote"]["bidPrice"], "68000.1");
+        assert_eq!(retained["quote"]["quoteObservedAt"], observed);
+        assert_eq!(retained["quote"]["quoteFresh"], false);
 
         let all = product_market_identities(&records, cutoff, Some("etf"))?;
         let (first, count, more) = product_search_page(&all, "etf", 1, None)?;

@@ -908,6 +908,7 @@ impl MarketInvestmentReadCapability {
                             definition,
                             provenance,
                             as_of,
+                            NativeReferenceUse::CurrentMark,
                         )?;
                         true
                     }
@@ -917,6 +918,7 @@ impl MarketInvestmentReadCapability {
                             definition,
                             provenance,
                             as_of,
+                            NativeReferenceUse::CurrentMark,
                         )?;
                         true
                     }
@@ -1334,11 +1336,21 @@ fn market_provenance(event: &MarketEvent) -> &LiveProvenance {
     }
 }
 
+/// Identity clock requirements for the two native market-data consumers.
+#[derive(Clone, Copy)]
+pub(crate) enum NativeReferenceUse {
+    /// Retained observations require identity at retrieval and read time.
+    RetainedDisplay,
+    /// Financial marks additionally require identity at the observation's source time.
+    CurrentMark,
+}
+
 pub(crate) fn validate_native_reference(
     reference: &market_squawk_domain::MarketDataReference,
     definition: &market_squawk_data::MarketDataInstrumentRecord,
     provenance: &LiveProvenance,
     knowledge_at: Timestamp,
+    reference_use: NativeReferenceUse,
 ) -> Result<(), ServiceError> {
     if reference.definition_digest() != definition.revision_digest()
         || provenance.instrument_id() != Some(reference.instrument_id())
@@ -1346,13 +1358,15 @@ pub(crate) fn validate_native_reference(
     {
         return Err(ServiceError::InvalidResult);
     }
-    for at in [
-        provenance
-            .source_timestamp()
-            .ok_or(ServiceError::InvalidResult)?,
-        provenance.received_at(),
-        knowledge_at,
-    ] {
+    let source_at = provenance
+        .source_timestamp()
+        .ok_or(ServiceError::InvalidResult)?;
+    if matches!(reference_use, NativeReferenceUse::CurrentMark) {
+        reference
+            .validate_definition_at(definition.definition(), source_at)
+            .map_err(|_| ServiceError::InvalidResult)?;
+    }
+    for at in [provenance.received_at(), knowledge_at] {
         reference
             .validate_definition_at(definition.definition(), at)
             .map_err(|_| ServiceError::InvalidResult)?;

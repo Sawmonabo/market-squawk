@@ -114,24 +114,29 @@ function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverifie
   const size = (value: string | null) => value === null ? "Unavailable" : groupDecimal(value)
   return <section className="border-t border-border pt-3" aria-label="Quote and last trade">
     <h2 className="sr-only">Quote and last trade</h2>
-    {quote === null ? <p className="mt-3 text-sm text-muted-foreground">Bid, ask and trade information is not available for this investment yet.</p> : <>
-      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+    {quote === null ? <p className="text-sm text-muted-foreground">Bid, ask and trade information is not available for this investment yet.</p> : <>
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
         {([
-          ["Bid", price(quote.bidPrice)], ["Ask", price(quote.askPrice)], ["Midpoint", price(quote.midPrice)],
-          ["Last trade", price(quote.lastPrice)],
-        ] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 font-mono text-sm tabular-nums">{value}</dd></div>)}
+          ["Bid", price(quote.bidPrice), "Bid size", size(quote.bidSize)],
+          ["Ask", price(quote.askPrice), "Ask size", size(quote.askSize)],
+          ["Midpoint", price(quote.midPrice), null, null],
+          ["Last trade", price(quote.lastPrice), "Trade size", size(quote.lastSize)],
+        ] as const).map(([label, value, sizeLabel, sizeValue]) => <div key={label} className="min-w-0">
+          <dt className="text-xs text-muted-foreground">{label}</dt>
+          <dd className="mt-1 break-words font-mono text-sm tabular-nums">{value}</dd>
+          {sizeLabel !== null ? <>
+            <dt className="mt-1 mr-2 inline-block text-xs text-muted-foreground">{sizeLabel}</dt>
+            <dd className="inline break-words font-mono text-xs tabular-nums">{sizeValue}</dd>
+          </> : null}
+        </div>)}
       </dl>
       {quote.tradeStatus === "ambiguous" ? <p role="status" className="mt-3 text-xs text-muted-foreground">Several trades share the latest timestamp, so a single last trade cannot be established. Bid and ask are shown separately when available.</p> : null}
-      <details className="mt-3 text-xs">
-        <summary className="cursor-pointer text-muted-foreground focus-visible:outline-ring">Quote sizes and dates</summary>
-        <dl className="mt-3 grid grid-cols-3 gap-3">{([["Bid size", size(quote.bidSize)], ["Ask size", size(quote.askSize)], ["Trade size", size(quote.lastSize)]] as const).map(([label, value]) => <div key={label}>
-          <dt className="text-muted-foreground">{label}</dt><dd className="mt-1 font-mono">{value}</dd>
-        </div>)}</dl>
-      <p className="mt-3 text-xs text-muted-foreground">Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
-        {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{new Date(quote.quoteObservedAt).toLocaleString()}</time></> : null}</p>
-      <p className="mt-2 text-xs text-muted-foreground">Last trade: {unverified ? "freshness not checked" : quote.lastFresh ? "current at last check" : "not current"}
-        {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{new Date(quote.lastObservedAt).toLocaleString()}</time></> : null}</p>
-      </details>
+      <div className="mt-2 grid gap-x-4 gap-y-1 text-xs leading-5 text-muted-foreground sm:grid-cols-2">
+        <p>Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
+          {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{new Date(quote.quoteObservedAt).toLocaleString()}</time></> : null}</p>
+        <p>Last trade: {unverified ? "freshness not checked" : quote.lastFresh ? "current at last check" : "not current"}
+          {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{new Date(quote.lastObservedAt).toLocaleString()}</time></> : null}</p>
+      </div>
     </>}
   </section>
 }

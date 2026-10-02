@@ -1337,11 +1337,9 @@ async fn load_retained_display_evidence(
         for receipt in &evidence.selections {
             for candidate in receipt.selection().sources()[0].tied_candidates() {
                 let provenance = market_event_provenance(candidate.event());
-                if !evidence.metadata.is_effective_at(
-                    provenance
-                        .source_timestamp()
-                        .unwrap_or(provenance.received_at()),
-                ) {
+                // Retrieval authority applies at receipt; a retained closing quote may
+                // describe an observation from before this authorization began.
+                if !evidence.metadata.is_effective_at(provenance.received_at()) {
                     denied = true;
                     break;
                 }
@@ -1360,6 +1358,7 @@ async fn load_retained_display_evidence(
                         record,
                         provenance,
                         reference_at,
+                        crate::application::market_selection::NativeReferenceUse::RetainedDisplay,
                     )?;
                 }
             }
