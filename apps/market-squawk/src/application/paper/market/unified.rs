@@ -1404,9 +1404,13 @@ fn display_source_candidate(
     let depth = display_candidate_depth(definition.asset_class(), provenance)?;
     let timing = display_timing(coverage.delay());
     let market_coverage = display_coverage(definition.asset_class(), coverage.consolidation());
-    if policy.timing != timing || policy.depth != depth || policy.coverage != market_coverage {
-        return Err(ServiceError::InvalidResult);
-    }
+    let capabilities = display_candidate_capabilities(
+        policy,
+        timing,
+        depth,
+        display_current_quality(observation),
+        market_coverage,
+    )?;
     let timestamps = CandidateTimestamps::try_new(
         provenance.effective_at(),
         provenance.source_at(),
@@ -1438,17 +1442,42 @@ fn display_source_candidate(
             snapshot.surface_id().clone(),
             Some(definition_revision_digest),
         ),
-        CandidateCapabilities::try_new(
-            definition.asset_class(),
-            policy.operations,
-            timing,
-            depth,
-            display_current_quality(observation),
-            market_coverage,
-        )
-        .map_err(selection_error)?,
+        capabilities,
         timestamps,
         admission,
+    )
+    .map_err(selection_error)
+}
+
+fn display_candidate_capabilities(
+    policy: &MarketSurfaceSelectionPolicy,
+    timing: ObservationTiming,
+    depth: Option<MarketDepth>,
+    quality: DataQuality,
+    coverage: MarketCoverage,
+) -> Result<CandidateCapabilities, ServiceError> {
+    // A trade or status carries no book depth even when its source also supplies quotes.
+    // Preserve that observation's actual depth; any claimed depth must still match the policy.
+    if policy.timing != timing
+        || depth.is_some_and(|depth| policy.depth != Some(depth))
+        || policy.coverage != coverage
+    {
+        tracing::warn!(
+            surface = %policy.surface_id,
+            policy_timing = ?policy.timing, observation_timing = ?timing,
+            policy_depth = ?policy.depth, observation_depth = ?depth,
+            policy_coverage = ?policy.coverage, observation_coverage = ?coverage,
+            "display observation does not match source capabilities"
+        );
+        return Err(ServiceError::InvalidResult);
+    }
+    CandidateCapabilities::try_new(
+        policy.asset_class,
+        policy.operations,
+        timing,
+        depth,
+        quality,
+        coverage,
     )
     .map_err(selection_error)
 }
@@ -2413,6 +2442,63 @@ mod product_quote_tests {
     #[test]
     fn native_money_display_preserves_precision_currency_and_component_freshness()
     -> Result<(), Box<dyn std::error::Error>> {
+        let policy = MarketSurfaceSelectionPolicy::try_new(
+            SourceIdentifier::try_from("display-fixture")?,
+            SourceId::try_from("display-fixture")?,
+            SourceIdentifier::try_from("provider-fixture")?,
+            AssetClass::Equity,
+            MarketOperationSet::try_new(&[MarketOperation::SnapshotDisplay])?,
+            ObservationTiming::RealTime,
+            Some(MarketDepth::TopOfBook),
+            MarketCoverage::SingleVenue,
+            MarketSurfaceRightsPolicy::unavailable(
+                SourceIdentifier::try_from("rights-fixture")?,
+                RightsState::Unknown,
+                Timestamp::from_unix_nanos(90),
+            )?,
+        )?;
+        let capabilities = |timing, depth, coverage| {
+            display_candidate_capabilities(
+                &policy,
+                timing,
+                depth,
+                DataQuality::DirectUnverified,
+                coverage,
+            )
+        };
+        // The source can provide quotes, but a selected trade/status never gains book depth.
+        assert_eq!(
+            capabilities(ObservationTiming::RealTime, None, MarketCoverage::SingleVenue)?
+                .depth(),
+            None,
+        );
+        assert_eq!(
+            capabilities(
+                ObservationTiming::RealTime,
+                Some(MarketDepth::TopOfBook),
+                MarketCoverage::SingleVenue,
+            )?
+            .depth(),
+            Some(MarketDepth::TopOfBook),
+        );
+        for depth in [MarketDepth::PriceLevel, MarketDepth::OrderLevel] {
+            assert_eq!(
+                capabilities(
+                    ObservationTiming::RealTime,
+                    Some(depth),
+                    MarketCoverage::SingleVenue,
+                ),
+                Err(ServiceError::InvalidResult),
+            );
+        }
+        assert_eq!(
+            capabilities(ObservationTiming::Delayed, None, MarketCoverage::SingleVenue),
+            Err(ServiceError::InvalidResult),
+        );
+        assert_eq!(
+            capabilities(ObservationTiming::RealTime, None, MarketCoverage::Consolidated),
+            Err(ServiceError::InvalidResult),
+        );
         let usd = Currency::try_from("USD")?;
         let eur = Currency::try_from("EUR")?;
         let value = "123.4567890123456789".parse::<Decimal>()?;

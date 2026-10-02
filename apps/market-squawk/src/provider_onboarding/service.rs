@@ -4090,6 +4090,8 @@ const fn map_alpaca_doctor_error(error: AlpacaError) -> ProviderOnboardingError 
         AlpacaError::Serialization
         | AlpacaError::Protocol
         | AlpacaError::CaptureMaterial
+        | AlpacaError::PublicationSessionNotCurrent
+        | AlpacaError::CaptureRejoin { .. }
         | AlpacaError::Allocation
         | AlpacaError::Network
         | AlpacaError::BodyTooLarge => ProviderOnboardingError::ProbeUnavailable,

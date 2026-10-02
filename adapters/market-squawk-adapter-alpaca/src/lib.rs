@@ -77,7 +77,7 @@ pub use doctor::{
     AlpacaDoctorRateEvidence, AlpacaDoctorRetryAfter, AlpacaDoctorStreamObservation,
     AlpacaPaperIexDoctor, AlpacaPaperIexDoctorObservation,
 };
-pub use error::AlpacaError;
+pub use error::{AlpacaCaptureRejoinStage, AlpacaError};
 pub use historical::{
     AlpacaHistoricalPendingExtractionSeal,
     alpaca_history_symbol_asof,

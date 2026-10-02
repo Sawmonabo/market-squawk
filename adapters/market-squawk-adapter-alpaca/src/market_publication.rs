@@ -33,6 +33,7 @@ use sha2::{Digest as _, Sha256};
 use crate::AlpacaError;
 use crate::boot_snapshot::AlpacaIexBootSnapshotEvidence;
 use crate::config::{ALPACA_PROVIDER, IEX_VENUE, INDICATIVE_OPTIONS_VENUE};
+use crate::error::AlpacaCaptureRejoinStage;
 
 const IEX_DATASET_PREFIX: &str = "alpaca:iex-market-events:v1:";
 const INDICATIVE_OPTIONS_DATASET_PREFIX: &str = "alpaca:indicative-option-market-events:v1:";
@@ -406,14 +407,20 @@ impl AlpacaPreparedMarketEventPublication {
             native_rows,
             Some(native_sidecar),
         )
-        .map_err(|_| AlpacaError::CaptureMaterial)?;
+        .map_err(|source| AlpacaError::CaptureRejoin {
+            stage: AlpacaCaptureRejoinStage::ResponseNativeLineage,
+            source,
+        })?;
         SealedProviderResponseMarketEventBinding::try_new(
             authority,
             batch,
             native,
             capture_ordinals,
         )
-        .map_err(|_| AlpacaError::CaptureMaterial)
+        .map_err(|source| AlpacaError::CaptureRejoin {
+            stage: AlpacaCaptureRejoinStage::ResponseBinding,
+            source,
+        })
     }
 
     /// Consumes a sealed IEX or indicative-options frame into the common stream binding.
@@ -449,9 +456,15 @@ impl AlpacaPreparedMarketEventPublication {
             native_rows,
             Some(native_sidecar),
         )
-        .map_err(|_| AlpacaError::CaptureMaterial)?;
+        .map_err(|source| AlpacaError::CaptureRejoin {
+            stage: AlpacaCaptureRejoinStage::StreamNativeLineage,
+            source,
+        })?;
         SealedProviderEventMicrobatchBinding::try_new(authority, batch, native, capture_ordinals)
-            .map_err(|_| AlpacaError::CaptureMaterial)
+            .map_err(|source| AlpacaError::CaptureRejoin {
+                stage: AlpacaCaptureRejoinStage::StreamBinding,
+                source,
+            })
     }
 }
 
@@ -520,13 +533,16 @@ impl AlpacaMarketSealRejoin {
             .evidence
             .currentness_lease()
             .validate_current()
-            .map_err(|_| AlpacaError::CaptureMaterial)?;
+            .map_err(|_| AlpacaError::PublicationSessionNotCurrent)?;
         match self.expectation {
             AlpacaMarketSealExpectation::Response(expectation) => {
                 let authority = expectation
                     .try_rejoin(sealed)
                     .and_then(market_squawk_sources::RejoinedProviderCapture::try_into_whole)
-                    .map_err(|_| AlpacaError::CaptureMaterial)?;
+                    .map_err(|source| AlpacaError::CaptureRejoin {
+                        stage: AlpacaCaptureRejoinStage::ResponseSeal,
+                        source,
+                    })?;
                 self.publication
                     .try_into_response_binding(authority)
                     .map(Into::into)
@@ -534,7 +550,10 @@ impl AlpacaMarketSealRejoin {
             AlpacaMarketSealExpectation::Stream(expectation) => {
                 let authority = expectation
                     .try_rejoin(sealed)
-                    .map_err(|_| AlpacaError::CaptureMaterial)?;
+                    .map_err(|source| AlpacaError::CaptureRejoin {
+                        stage: AlpacaCaptureRejoinStage::StreamSeal,
+                        source,
+                    })?;
                 self.publication
                     .try_into_event_microbatch_binding(authority)
                     .map(Into::into)
@@ -593,7 +612,10 @@ impl AlpacaQueuedCanonicalBatch {
             })
             .collect::<Result<Vec<_>, _>>()?;
         ProviderMarketEventBatch::try_new(self.source, self.revision, self.dataset, events)
-            .map_err(|_| AlpacaError::CaptureMaterial)
+            .map_err(|source| AlpacaError::CaptureRejoin {
+                stage: AlpacaCaptureRejoinStage::CanonicalBatch,
+                source,
+            })
     }
     fn dynamic_retained_bytes(&self) -> Option<usize> {
         let slots = std::mem::size_of::<Box<[u8]>>().checked_mul(self.events.len())?;

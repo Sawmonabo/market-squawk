@@ -442,9 +442,13 @@ pub(super) async fn run_market_event_archive(
         }
         match result {
             Ok(turn) => cursor = turn.next_dataset().cloned(),
-            Err(_) => {
+            Err(error) => {
                 // Archive failure leaves active rows authoritative and does not stop a source.
-                tracing::warn!("market event archive turn could not complete");
+                tracing::warn!(
+                    error = %error,
+                    cause = ?std::error::Error::source(&error).map(ToString::to_string),
+                    "market event archive turn could not complete"
+                );
                 cursor = None;
             }
         }

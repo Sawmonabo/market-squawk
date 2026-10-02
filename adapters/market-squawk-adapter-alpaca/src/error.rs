@@ -44,6 +44,18 @@ pub enum AlpacaError {
     /// Exact raw provider responses could not satisfy the shared durable-capture contract.
     #[error("Alpaca provider response capture material is invalid")]
     CaptureMaterial,
+    /// The decoder session ended before its sealed publication could rejoin.
+    #[error("Alpaca capture rejoin failed at session currentness: session is not current")]
+    PublicationSessionNotCurrent,
+    /// A sealed publication failed one exact capture or lineage check.
+    #[error("Alpaca capture rejoin failed at {stage:?}: {source}")]
+    CaptureRejoin {
+        /// Static boundary that rejected the publication.
+        stage: AlpacaCaptureRejoinStage,
+        /// Closed capture invariant error; contains no raw payload or credentials.
+        #[source]
+        source: market_squawk_sources::ProviderCaptureError,
+    },
     /// A bounded allocation failed.
     #[error("Alpaca bounded allocation failed")]
     Allocation,
@@ -59,4 +71,23 @@ pub enum AlpacaError {
     /// Cancellation interrupted the operation.
     #[error("Alpaca operation was cancelled")]
     Cancelled,
+}
+
+/// Static stages of the exact sealed Alpaca publication continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlpacaCaptureRejoinStage {
+    /// Rejoin the exact sealed bootstrap response receipt.
+    ResponseSeal,
+    /// Rejoin the exact sealed stream frame receipt.
+    StreamSeal,
+    /// Restore the admitted canonical event batch.
+    CanonicalBatch,
+    /// Bind response native rows to their canonical events.
+    ResponseNativeLineage,
+    /// Bind stream native rows to their canonical events.
+    StreamNativeLineage,
+    /// Bind response capture ordinals and native lineage to the sealed receipt.
+    ResponseBinding,
+    /// Bind stream capture ordinals and native lineage to the sealed receipt.
+    StreamBinding,
 }
