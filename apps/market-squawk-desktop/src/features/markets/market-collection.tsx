@@ -12,7 +12,7 @@ import { formatMoney } from "@/lib/formatters"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-import { marketAvailabilityLabel, marketProductRowSchema, type MarketProductRow } from "./market-product"
+import { marketAvailabilityLabel, marketPriceBasisLabel, marketProductRowSchema, type MarketProductRow } from "./market-product"
 
 const revisionSchema = z.string().max(20).regex(/^[1-9][0-9]*$/)
   .pipe(z.string().refine((value) => BigInt(value) <= 18_446_744_073_709_551_615n))
@@ -183,6 +183,7 @@ function CollectionInvestment({ symbol, market, unverified, refreshing }: {
       : <Link className="block underline-offset-4 hover:underline" to={`/investments/${encodeURIComponent(market.selectionToken)}`}>{label}</Link>}
     {market === null ? <p className="mt-2 text-[10px] text-muted-foreground">Investment details are not available yet.</p>
       : <div className="mt-2 text-[10px] text-muted-foreground">
+        <p>{marketPriceBasisLabel(market)}</p>
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
         <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : refreshing
           ? `${marketAvailabilityLabel(market)} at last check · Updating`

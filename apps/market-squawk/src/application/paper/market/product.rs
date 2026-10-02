@@ -248,6 +248,22 @@ pub(super) fn product_row(
         Some("stale" | "unavailable") => "unavailable",
         _ => return Err(ServiceError::InvalidResult),
     };
+    let availability = if price.is_none() {
+        "unavailable"
+    } else {
+        availability
+    };
+    let price_basis = current_price
+        .map(|price| match exact_text(price, "basis")? {
+            basis @ ("last_trade" | "bid_ask_midpoint" | "previous_close") => Ok(basis),
+            _ => Err(ServiceError::InvalidResult),
+        })
+        .transpose()?;
+    let price_current_through = current_price
+        .and_then(|price| price.get("currentThrough").filter(|value| !value.is_null()))
+        .map(canonical_time)
+        .transpose()?;
+    let quote = product_quote(row)?;
     Ok(json!({
         "selectionToken": identity.selection_token(),
         "historyToken": identity.history_token(),
@@ -257,10 +273,80 @@ pub(super) fn product_row(
             "assetClass": identity.asset_class(),
         },
         "price": price,
+        "priceBasis": price_basis,
+        "priceCurrentThrough": price_current_through,
+        "quote": quote,
         "changePercent": Value::Null,
         "asOf": as_of,
         "availability": availability,
     }))
+}
+
+/// Carries independently timed quote and trade evidence through the closed product boundary.
+fn product_quote(row: &serde_json::Map<String, Value>) -> Result<Value, ServiceError> {
+    let Some(native) = row.get("quote").filter(|value| !value.is_null()) else {
+        return Ok(Value::Null);
+    };
+    let native = native.as_object().ok_or(ServiceError::InvalidResult)?;
+    let mut quote = serde_json::Map::new();
+    quote.insert("currency".into(), json!(currency_text(row, "currency")?));
+    for field in [
+        "bidPrice",
+        "bidSize",
+        "askPrice",
+        "askSize",
+        "midPrice",
+        "lastPrice",
+        "lastSize",
+    ] {
+        let value = native.get(field).ok_or(ServiceError::InvalidResult)?;
+        quote.insert(
+            field.into(),
+            if value.is_null() {
+                Value::Null
+            } else {
+                json!(exact_decimal_text(native, field)?)
+            },
+        );
+    }
+    for field in [
+        "quoteObservedAt",
+        "lastObservedAt",
+        "quoteCurrentThrough",
+        "lastCurrentThrough",
+    ] {
+        let value = native.get(field).ok_or(ServiceError::InvalidResult)?;
+        quote.insert(
+            field.into(),
+            if value.is_null() {
+                Value::Null
+            } else {
+                json!(canonical_time(value)?)
+            },
+        );
+    }
+    for field in ["quoteFresh", "lastFresh"] {
+        quote.insert(
+            field.into(),
+            json!(
+                native
+                    .get(field)
+                    .and_then(Value::as_bool)
+                    .ok_or(ServiceError::InvalidResult)?
+            ),
+        );
+    }
+    let status = exact_text(native, "tradeStatus")?;
+    if !matches!(status, "available" | "ambiguous" | "unavailable")
+        || (status != "available"
+            && (!native["lastPrice"].is_null()
+                || !native["lastSize"].is_null()
+                || native["lastFresh"] == true))
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    quote.insert("tradeStatus".into(), json!(status));
+    Ok(Value::Object(quote))
 }
 
 fn page_token(last: &ProductMarketIdentity, query: &str) -> Result<Box<str>, ServiceError> {
@@ -533,6 +619,39 @@ mod tests {
         assert!(unavailable["price"].is_null());
         assert!(unavailable["asOf"].is_null());
         assert_eq!(unavailable_page["page"]["hasMore"], false);
+
+        // The product boundary must preserve exact quote evidence and ambiguity rather than
+        // relabeling a midpoint as the last trade or dropping the independent quote.
+        let observed = "2026-08-09T14:30:00.000000000Z";
+        let through = "2026-08-09T14:30:05.000000000Z";
+        let mut quote_row = json!({
+            "instrumentId": selected.to_string(), "availability": "live", "currency": "USD",
+            "currentPrice": {"value": "68000.15", "currency": "USD", "basis": "bid_ask_midpoint",
+                "observedAt": observed, "currentThrough": through},
+            "quote": {"bidPrice": "68000.1", "bidSize": "2", "askPrice": "68000.2", "askSize": "3",
+                "midPrice": "68000.15", "lastPrice": null, "lastSize": null,
+                "quoteObservedAt": observed, "quoteCurrentThrough": through,
+                "lastObservedAt": null, "lastCurrentThrough": null,
+                "quoteFresh": true, "lastFresh": false, "tradeStatus": "ambiguous"},
+        });
+        let projected = product_row(identity, &quote_row)?;
+        assert_eq!(projected["priceBasis"], "bid_ask_midpoint");
+        assert_eq!(projected["quote"]["tradeStatus"], "ambiguous");
+        assert_eq!(projected["quote"]["bidPrice"], "68000.1");
+        assert_eq!(projected["quote"]["quoteCurrentThrough"], through);
+        assert!(projected["quote"]["lastPrice"].is_null());
+        quote_row["quote"]["lastPrice"] = json!("68000.15");
+        assert!(matches!(
+            product_row(identity, &quote_row),
+            Err(ServiceError::InvalidResult)
+        ));
+        quote_row["quote"]["lastPrice"] = Value::Null;
+        quote_row["currentPrice"]["basis"] = json!("previous_close");
+        quote_row["availability"] = json!("end_of_day");
+        let closed = product_row(identity, &quote_row)?;
+        assert_eq!(closed["availability"], "previous_close");
+        assert_eq!(closed["priceBasis"], "previous_close");
+        assert_eq!(closed["quote"], projected["quote"]);
 
         let all = product_market_identities(&records, cutoff, Some("etf"))?;
         let (first, count, more) = product_search_page(&all, "etf", 1, None)?;

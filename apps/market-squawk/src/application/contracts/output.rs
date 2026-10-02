@@ -2188,6 +2188,19 @@ fn market_product_row() -> Value {
                 ("currency", investment_analysis_currency()),
             ])),
         ),
+        (
+            "priceBasis",
+            nullable(enumeration(&[
+                "last_trade",
+                "bid_ask_midpoint",
+                "previous_close",
+            ])),
+        ),
+        (
+            "priceCurrentThrough",
+            nullable(canonical_market_timestamp()),
+        ),
+        ("quote", nullable(market_product_quote())),
         ("changePercent", nullable(canonical_decimal_text())),
         ("asOf", nullable(canonical_market_timestamp())),
         (
@@ -2380,6 +2393,7 @@ fn market_product_current_price() -> Value {
 
 fn market_product_quote() -> Value {
     closed_complete(vec![
+        ("currency", investment_analysis_currency()),
         ("bidPrice", nullable(canonical_decimal_text())),
         ("bidSize", nullable(canonical_decimal_text())),
         ("askPrice", nullable(canonical_decimal_text())),
@@ -2389,6 +2403,17 @@ fn market_product_quote() -> Value {
         ("lastSize", nullable(canonical_decimal_text())),
         ("quoteObservedAt", nullable(canonical_market_timestamp())),
         ("lastObservedAt", nullable(canonical_market_timestamp())),
+        (
+            "quoteCurrentThrough",
+            nullable(canonical_market_timestamp()),
+        ),
+        ("lastCurrentThrough", nullable(canonical_market_timestamp())),
+        ("quoteFresh", boolean()),
+        ("lastFresh", boolean()),
+        (
+            "tradeStatus",
+            enumeration(&["available", "ambiguous", "unavailable"]),
+        ),
     ])
 }
 

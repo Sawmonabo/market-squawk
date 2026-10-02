@@ -728,7 +728,8 @@ observed instrument can therefore acquire older bars without backdating its refe
 claiming that today's reference was known historically. Daily acquisition ends before the current
 incomplete provider day, using the existing data-delay policy.
 
-Home and Markets share the persisted, editable starter collection. Source activation admits finite
+Overview owns the persisted, editable starter watchlist. Markets discovery uses the admitted
+instrument population independently of watchlist choices; Portfolio represents actual holdings. Source activation admits finite
 completed-history preparation to the existing service task owner and returns without awaiting it.
 Preparation uses the exact activated generation; replacement, revocation and shutdown cancel and
 drain it before successor work starts. Preparation validates the complete original history cursor
@@ -749,6 +750,14 @@ their original currency and precision without requiring executable tick/lot defi
 events still require their actual conversion terms. Component freshness is checked before a price
 is returned, and the card's observation time is distinct from its freshness expiry. A completed
 close may supply the card price without replacing retained quote or market-state evidence.
+The product contract carries an explicit last-trade, bid/ask-midpoint or previous-close price basis,
+plus independent quote/trade values, sizes, observation times and freshness expiries. Tied distinct
+trades remain original evidence without inventing a last-trade ordering; the last-trade field is
+explicitly ambiguous, while independently established quotes and other investments remain usable.
+Every contributing retained coordinate receives Display authorization. Same-event contradictions
+remain integrity errors. Coinbase's [market-trades contract](https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/market-trades)
+explicitly batches trades; batching alone supplies no unique last trade (reviewed 2026-10-01).
+
 
 The logical local layout is:
 

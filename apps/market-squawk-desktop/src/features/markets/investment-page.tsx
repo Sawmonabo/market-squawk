@@ -6,12 +6,12 @@ import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { AnalysisLaunch } from "@/features/opportunities/analysis-launch"
 import { DemandPanel } from "@/features/shared/demand-panel"
-import { formatMoney } from "@/lib/formatters"
+import { formatMoney, groupDecimal } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { MarketHistoryRead } from "./market-history-read"
-import { marketAvailabilityLabel, marketSelectionTokenSchema, parseMarketInstrumentResult } from "./market-product"
+import { marketAvailabilityLabel, marketPriceBasisLabel, marketSelectionTokenSchema, parseMarketInstrumentResult, type MarketProductRow } from "./market-product"
 
 export function InvestmentPage() {
   const product = useProduct()
@@ -66,7 +66,8 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
           : "The price could not be refreshed. Showing the last checked information; its freshness is unverified."}
       </p> : null}
       {row !== null ? <>
-        <p className="mt-3 font-mono text-2xl">{row.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
+        <p className="mt-3 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p>
+        <p className="mt-1 font-mono text-2xl">{row.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
         <p className="mt-2 text-sm text-muted-foreground">{detail.isError && row.price !== null
           ? "Saved price · Freshness not checked"
           : detail.isFetching ? `${marketAvailabilityLabel(row)} at last check` : marketAvailabilityLabel(row)}{row.changePercent !== null ? ` · ${row.changePercent}%` : ""}</p>
@@ -74,6 +75,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
         {detail.isFetching ? <p role="status" className="mt-2 text-xs text-muted-foreground">Updating price information…</p> : null}
       </> : null}
     </section>
+    {row !== null ? <InvestmentQuote row={row} unverified={detail.isError} /> : null}
     {row !== null ? <section className="rounded-xl border border-border p-5" aria-label="Investment analysis">
       <h2 className="mb-4 text-lg font-semibold">Investment analysis</h2>
       <AnalysisLaunch transport={transport} scope={bootstrap.productSessionToken} selectionToken={row.selectionToken} />
@@ -82,6 +84,29 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
       <MarketHistoryRead historyToken={row.historyToken} bootstrap={bootstrap} transport={transport} />
     </DemandPanel> : row !== null ? <p className="text-sm text-muted-foreground">Price history is unavailable for this investment.</p> : null}
   </main>
+}
+
+function InvestmentQuote({ row, unverified }: { row: MarketProductRow; unverified: boolean }) {
+  const quote = row.quote
+  const price = (value: string | null) => value === null || quote === null ? "Unavailable" : formatMoney({ amount: value, currency: quote.currency })
+  const size = (value: string | null) => value === null ? "Unavailable" : groupDecimal(value)
+  return <section className="rounded-xl border border-border p-5" aria-label="Quote and last trade">
+    <h2 className="text-lg font-semibold">Quote and last trade</h2>
+    {quote === null ? <p className="mt-3 text-sm text-muted-foreground">Bid, ask and trade information is not available for this investment yet.</p> : <>
+      <dl className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3">
+        {([
+          ["Bid", price(quote.bidPrice)], ["Ask", price(quote.askPrice)], ["Midpoint", price(quote.midPrice)],
+          ["Bid size", size(quote.bidSize)], ["Ask size", size(quote.askSize)],
+          ["Last trade", price(quote.lastPrice)], ["Trade size", size(quote.lastSize)],
+        ] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 font-mono text-sm">{value}</dd></div>)}
+      </dl>
+      {quote.tradeStatus === "ambiguous" ? <p role="status" className="mt-4 text-sm text-muted-foreground">Several trades share the latest timestamp, so a single last trade cannot be established. Bid and ask are shown separately when available.</p> : null}
+      <p className="mt-4 text-xs text-muted-foreground">Quote: {unverified ? "freshness not checked" : quote.quoteFresh ? "current at last check" : "not current"}
+        {quote.quoteObservedAt ? <> · <time dateTime={quote.quoteObservedAt}>{new Date(quote.quoteObservedAt).toLocaleString()}</time></> : null}</p>
+      <p className="mt-2 text-xs text-muted-foreground">Last trade: {unverified ? "freshness not checked" : quote.lastFresh ? "current at last check" : "not current"}
+        {quote.lastObservedAt ? <> · <time dateTime={quote.lastObservedAt}>{new Date(quote.lastObservedAt).toLocaleString()}</time></> : null}</p>
+    </>}
+  </section>
 }
 
 function InvestmentUnavailable({ message }: { message: string }) {

@@ -399,6 +399,15 @@ const marketOverviewRow = {
     value: "68000.15",
     currency: "USD",
   },
+  priceBasis: "last_trade",
+  priceCurrentThrough: "2026-08-09T14:30:05.000000000Z",
+  quote: {
+    currency: "USD", bidPrice: "68000.1", bidSize: "2", askPrice: "68000.2", askSize: "3",
+    midPrice: "68000.15", lastPrice: "68000.15", lastSize: "0.5", tradeStatus: "available",
+    quoteObservedAt: marketObservedAt, lastObservedAt: marketObservedAt,
+    quoteCurrentThrough: "2026-08-09T14:30:05.000000000Z", lastCurrentThrough: "2026-08-09T14:30:05.000000000Z",
+    quoteFresh: true, lastFresh: true,
+  },
   changePercent: "1.25",
   asOf: marketObservedAt,
   availability: "current",
@@ -724,7 +733,11 @@ describe("Market Squawk desktop boundary", () => {
               }
             }
             if (request.query === "marketOverview") return marketOverviewResult
-            if (request.query === "marketInstrument") return marketResult({ ...marketOverviewRow, historyToken })
+            if (request.query === "marketInstrument") return marketResult({
+              ...marketOverviewRow, historyToken, priceBasis: "bid_ask_midpoint",
+              quote: { ...marketOverviewRow.quote, tradeStatus: "ambiguous", lastPrice: null, lastSize: null,
+                lastObservedAt: null, lastCurrentThrough: null, lastFresh: false },
+            })
             if (request.query === "marketHistory") {
               if (request.startDate !== undefined) {
                 viewportSignal = options?.signal
@@ -802,6 +815,12 @@ describe("Market Squawk desktop boundary", () => {
       ])
     })
     expect(screen.getAllByRole("heading", { name: "BTC-USD · Bitcoin" })).toHaveLength(1)
+    const quote = within(screen.getByRole("region", { name: "Quote and last trade" }))
+    expect(quote.getByText("USD 68,000.1")).toBeTruthy()
+    expect(quote.getByText("USD 68,000.2")).toBeTruthy()
+    expect(quote.getByText(/Several trades share the latest timestamp/)).toBeTruthy()
+    expect(quote.queryByText("0.5")).toBeNull()
+    expect(screen.getByText("Bid/ask midpoint")).toBeTruthy()
     expect(
       issuedQueries.some((request) => request.query === "marketOverview"),
     ).toBe(true)

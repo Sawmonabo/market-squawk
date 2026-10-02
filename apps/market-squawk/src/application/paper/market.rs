@@ -150,7 +150,62 @@ struct DurableMarketRouteEvidence {
     instrument_id: InstrumentId,
     venue_id: VenueId,
     selections: Vec<MarketEventPointInTimeReceipt>,
+    trade_status: TradeStatus,
     display_authorizations: Vec<market_squawk_data::AuthorizedMarketEventUse>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TradeStatus {
+    Available,
+    Ambiguous,
+    Unavailable,
+}
+
+impl TradeStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Ambiguous => "ambiguous",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// A source/receive-time tie can contain distinct trades without establishing a last trade.
+/// Conflicting evidence for the same native event remains invalid, as do non-trade ties.
+fn retained_event_status<'event>(
+    event_kind: LiveEventClass,
+    events: impl Iterator<Item = (&'event MarketEvent, EvidenceDigest)> + Clone,
+) -> Result<TradeStatus, ServiceError> {
+    let Some((first, _)) = events.clone().next() else {
+        return Ok(TradeStatus::Unavailable);
+    };
+    let first_provenance = market_event_provenance(first);
+    let mut status = TradeStatus::Available;
+    for (event, digest) in events.clone() {
+        let provenance = market_event_provenance(event);
+        if market_event_class(event) != event_kind
+            || !same_durable_cohort(provenance.binding(), first_provenance.binding())
+            || provenance.source_timestamp() != first_provenance.source_timestamp()
+            || provenance.received_at() != first_provenance.received_at()
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        for (other, other_digest) in events.clone() {
+            let event_id = |event: &'event MarketEvent| match event {
+                MarketEvent::MarketDataTrade(trade) => trade.provider_trade_id(),
+                _ => market_event_provenance(event).source_identifier(),
+            };
+            if event_id(event) == event_id(other) || event_kind != LiveEventClass::Trade {
+                if digest != other_digest || event != other {
+                    return Err(ServiceError::InvalidResult);
+                }
+            } else {
+                status = TradeStatus::Ambiguous;
+            }
+        }
+    }
+    Ok(status)
 }
 
 impl DurableMarketRouteEvidence {
@@ -198,27 +253,44 @@ impl DurableMarketRouteEvidence {
                 .sources()
                 .first()
                 .ok_or_else(|| invalid("selected_source_missing"))?;
-            let candidate = source
-                .tied_candidates()
-                .first()
-                .ok_or_else(|| invalid("selected_candidate_missing"))?;
-            if selection.sources().len() != 1
-                || source.source_surface() != &source_id
-                || source.tied_candidates().iter().skip(1).any(|tied| {
-                    tied.coordinate().canonical_event_digest()
-                        != candidate.coordinate().canonical_event_digest()
-                        || tied.event() != candidate.event()
-                })
-            {
-                return Err(invalid("ambiguous_source_or_event"));
+            if selection.sources().len() != 1 || source.source_surface() != &source_id {
+                return Err(invalid("ambiguous_source"));
             }
-            if candidate.coordinate().instrument_id() != Some(instrument_id)
-                || candidate.coordinate().venue_id() != &venue_id
-                || candidate.coordinate().event_kind() != request.event_kind()
-                || market_event_class(candidate.event()) != request.event_kind()
-            {
-                return Err(invalid("candidate_identity_or_kind"));
+            if source.tied_candidates().is_empty() {
+                return Err(invalid("selected_candidate_missing"));
             }
+            for candidate in source.tied_candidates() {
+                let coordinate = candidate.coordinate();
+                let provenance = market_event_provenance(candidate.event());
+                if coordinate.source_surface() != &source_id
+                    || coordinate.instrument_id() != Some(instrument_id)
+                    || coordinate.venue_id() != &venue_id
+                    || coordinate.event_kind() != request.event_kind()
+                    || market_event_class(candidate.event()) != request.event_kind()
+                    || provenance.source_id() != &source_id
+                    || provenance.instrument_id() != Some(instrument_id)
+                    || provenance.venue_id() != Some(&venue_id)
+                    || provenance.source_identifier() != coordinate.provider_event_id()
+                    || provenance.source_timestamp() != coordinate.source_timestamp()
+                    || provenance.received_at() != coordinate.received_at()
+                    || provenance.available_at() != coordinate.available_at()
+                    || provenance.ingested_at() != coordinate.ingested_at()
+                    || provenance.connection_generation().get()
+                        != coordinate.connection_generation()
+                {
+                    return Err(invalid("candidate_identity_or_provenance"));
+                }
+            }
+            retained_event_status(
+                request.event_kind(),
+                source.tied_candidates().iter().map(|candidate| {
+                    (
+                        candidate.event(),
+                        candidate.coordinate().canonical_event_digest(),
+                    )
+                }),
+            )
+            .map_err(|_| invalid("conflicting_tied_evidence"))?;
         }
         selections.retain(|receipt| !receipt.selection().sources().is_empty());
         let mut selected_cohort: Option<(
@@ -228,7 +300,7 @@ impl DurableMarketRouteEvidence {
         for candidate in selections
             .iter()
             .flat_map(|receipt| receipt.selection().sources())
-            .flat_map(|source| source.tied_candidates().first())
+            .flat_map(|source| source.tied_candidates())
         {
             let key = durable_cohort_recency_key(candidate);
             let binding = market_event_provenance(candidate.event()).binding();
@@ -277,14 +349,35 @@ impl DurableMarketRouteEvidence {
             }
         }
         selections.retain(|receipt| {
-            same_durable_cohort(
-                market_event_provenance(
-                    receipt.selection().sources()[0].tied_candidates()[0].event(),
-                )
-                .binding(),
-                &cohort_binding,
-            )
+            receipt.selection().sources()[0]
+                .tied_candidates()
+                .iter()
+                .all(|candidate| {
+                    same_durable_cohort(
+                        market_event_provenance(candidate.event()).binding(),
+                        &cohort_binding,
+                    )
+                })
         });
+        let trade_status = selections
+            .iter()
+            .find(|receipt| receipt.selection().request().event_kind() == LiveEventClass::Trade)
+            .map(|receipt| {
+                retained_event_status(
+                    LiveEventClass::Trade,
+                    receipt.selection().sources()[0]
+                        .tied_candidates()
+                        .iter()
+                        .map(|candidate| {
+                            (
+                                candidate.event(),
+                                candidate.coordinate().canonical_event_digest(),
+                            )
+                        }),
+                )
+            })
+            .transpose()?
+            .unwrap_or(TradeStatus::Unavailable);
         let route = Self {
             surface_id,
             metadata,
@@ -292,9 +385,10 @@ impl DurableMarketRouteEvidence {
             instrument_id,
             venue_id,
             selections,
+            trade_status,
             display_authorizations: Vec::new(),
         };
-        if route.presentation_candidate().is_some() {
+        if route.evidence_candidate().is_some() {
             Ok(Some(route))
         } else {
             Ok(None)
@@ -305,6 +399,9 @@ impl DurableMarketRouteEvidence {
         &self,
         event_kind: LiveEventClass,
     ) -> Option<&ProviderMarketEventSelectedCandidate> {
+        if event_kind == LiveEventClass::Trade && self.trade_status == TradeStatus::Ambiguous {
+            return None;
+        }
         self.selections
             .iter()
             .find(|receipt| receipt.selection().request().event_kind() == event_kind)
@@ -320,8 +417,23 @@ impl DurableMarketRouteEvidence {
     }
 
     fn primary_effective_at(&self) -> Option<Timestamp> {
-        self.presentation_candidate()
+        self.evidence_candidate()
             .map(durable_candidate_effective_at)
+    }
+
+    /// Supplies route identity and clocks only, never an arbitrary last-trade price or size.
+    fn evidence_candidate(&self) -> Option<&ProviderMarketEventSelectedCandidate> {
+        self.presentation_candidate().or_else(|| {
+            self.selections
+                .iter()
+                .find(|receipt| receipt.selection().request().event_kind() == LiveEventClass::Trade)
+                .and_then(|receipt| {
+                    receipt.selection().sources()[0]
+                        .tied_candidates()
+                        .iter()
+                        .max_by_key(|candidate| durable_cohort_recency_key(candidate))
+                })
+        })
     }
 
     fn event(&self, event_kind: LiveEventClass) -> Option<&MarketEvent> {
@@ -1194,52 +1306,49 @@ async fn load_retained_display_evidence(
                 };
                 let mut denied = false;
                 for receipt in &evidence.selections {
-                    let candidate = &receipt.selection().sources()[0].tied_candidates()[0];
-                    let provenance = market_event_provenance(candidate.event());
-                    if !evidence.metadata.is_effective_at(
-                        provenance
-                            .source_timestamp()
-                            .unwrap_or(provenance.received_at()),
-                    ) {
-                        denied = true;
-                        break;
-                    }
-                    let native_reference = match candidate.event() {
-                        MarketEvent::MarketDataQuote(quote) => Some(quote.reference()),
-                        MarketEvent::MarketDataTrade(trade) => Some(trade.reference()),
-                        _ => None,
-                    };
-                    if native_reference.is_some_and(|reference| {
-                        reference.definition_digest() != record.revision_digest()
-                    }) {
-                        denied = true;
-                        break;
-                    }
-                    match candidate.event() {
-                        MarketEvent::MarketDataQuote(quote) => {
+                    let candidates = receipt.selection().sources()[0].tied_candidates();
+                    let mut coordinates = Vec::new();
+                    coordinates
+                        .try_reserve_exact(candidates.len())
+                        .map_err(|_| ServiceError::ResourceExhausted)?;
+                    for candidate in candidates {
+                        let provenance = market_event_provenance(candidate.event());
+                        if !evidence.metadata.is_effective_at(
+                            provenance
+                                .source_timestamp()
+                                .unwrap_or(provenance.received_at()),
+                        ) {
+                            denied = true;
+                            break;
+                        }
+                        let native_reference = match candidate.event() {
+                            MarketEvent::MarketDataQuote(quote) => Some(quote.reference()),
+                            MarketEvent::MarketDataTrade(trade) => Some(trade.reference()),
+                            _ => None,
+                        };
+                        if let Some(reference) = native_reference {
+                            if reference.definition_digest() != record.revision_digest() {
+                                denied = true;
+                                break;
+                            }
                             crate::application::market_selection::validate_native_reference(
-                                quote.reference(),
+                                reference,
                                 record,
                                 provenance,
                                 reference_at,
-                            )?
+                            )?;
                         }
-                        MarketEvent::MarketDataTrade(trade) => {
-                            crate::application::market_selection::validate_native_reference(
-                                trade.reference(),
-                                record,
-                                provenance,
-                                reference_at,
-                            )?
-                        }
-                        _ => {}
+                        coordinates.push(candidate.coordinate().clone());
+                    }
+                    if denied {
+                        break;
                     }
                     let remaining = context.deadline().saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(ServiceError::DeadlineExceeded);
                     }
                     let use_limits = ResearchUseLimits::try_new(
-                        1,
+                        coordinates.len(),
                         market_squawk_data::MAX_RESEARCH_USE_GRAPH_NODES,
                         market_squawk_data::MAX_RESEARCH_USE_EDGES,
                         market_squawk_data::MAX_RESEARCH_USE_SOURCES,
@@ -1256,7 +1365,7 @@ async fn load_retained_display_evidence(
                         .authorize_market_event_use(
                             MarketEventUseRequest::try_new(
                                 receipt.selection().commit().clone(),
-                                vec![candidate.coordinate().clone()],
+                                coordinates,
                                 ResearchUse::Display,
                                 use_limits,
                             )

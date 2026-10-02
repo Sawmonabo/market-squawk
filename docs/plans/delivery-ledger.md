@@ -3,16 +3,17 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Current checkpoint
-(this commit): Overview watchlist, dedicated investment navigation and isolation of compact retained
-reads from bulk generation reopening. Previous pushed checkpoint `2552f8e4` delivers the coordinated
+`1ae2704a` (pushed): Overview watchlist, dedicated investment navigation and isolation of compact retained
+reads from bulk generation reopening. Current working checkpoint carries independent quote/trade fields
+and valid tied-trade uncertainty into the shared product result. Previous pushed checkpoint `2552f8e4` delivers the coordinated
 development watcher; `aba0af19` delivers committed data-to-screen updates. These checkpoints do not
 establish complete rich investment details, live streaming coverage or installed-workflow acceptance.
 One worktree, three local and three origin branches; protected recovery history remains untouched.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — navigation/read-isolation integration | Astra worker and Sol navigation handoffs integrated; both agents released their files. Lead owns final critical checks, Git and shared contracts. | Commit/push this checkpoint; visible development session remains running. |
-| Astra startup_read_diagnosis — completed diagnosis | Read-only evidence identifies valid distinct Coinbase trades with tied timestamps; current code rejects the entire market result. No ordering guarantee supports picking an arbitrary trade. | Lead coordinates field-specific ambiguity, all-candidate authorization and independent quote/instrument availability in the next checkpoint. |
+| Lead — quote/trade integration | Navigation/read-isolation pushed as `1ae2704a`; tied-trade Astra handoff frozen and inspected. Lead owns shared output schema, projection, Desktop consumers and critical verification. | Focused Rust market checks PASS2/2; Desktop two critical journeys and typecheck pass. Integrated watcher build and real overview/watchlist/exact MSFT reads pass; ready for commit/push. |
+| Astra startup_read_diagnosis — completed implementation | Full tied-candidate validation, all-coordinate Display authorization, explicit ambiguous trade and independent quote projection implemented; files released to lead. | Existing quote precision/freshness regression extended; lead owns check and live integration. |
 | Lead — rich investment and Overview integration | Dedicated route preserves existing price, history and analysis behavior. Rich quote/profile/financial projections, backend movers and Overview portfolio summary remain incomplete. | Extend existing producer-to-consumer contracts without fabricating data or conflating watchlist with holdings. |
 
 Navigation critical evidence: existing market journey passes with watchlist mutation and failed-refresh
@@ -29,6 +30,50 @@ resource limits were relaxed. Live rebuilt service86361/native86415 run the inte
 reached Ready32.582s after the observer detected replacement (`next-startup-observation.json`). This
 is not acceptable startup completion or proof every screen loads; the tied-trade failure remains.
 The visible window is preserved while subsequent fixes are prepared. No CI or whole-app RAM gate ran.
+
+
+Next dependency wave (base `1ae2704a`, pushed):
+
+| Owner | Finishable outcome / exclusive files | Dependencies and critical evidence |
+| --- | --- | --- |
+| Astra — tied retained trades | `application/paper/market.rs` and `market/unified.rs` only. Preserve every tied candidate, reject malformed identity/contradictory same-event evidence, authorize all contributing coordinates, expose unresolved last trade without failing independent quote/instrument display. | Lead owns product DTO/schema/UI. Agree `quote.tradeStatus` (`available`, `ambiguous`, `unavailable`) and no arbitrary ordering. Extend one existing application critical case. No builds/Git. |
+| Lead — rich quote projection and consumers | `market/product.rs`, `market/durable_product.rs`, Desktop market contract/detail/watchlist and existing critical fixtures. Carry quote/bid/ask/sizes/clocks and explicit price basis/ambiguity through real product results. | Integrate Astra producer first; serialize one critical Rust check plus affected Desktop checks, then commit/push. |
+| Sol investment_navigation — next rich-detail dependency, read-only | Trace existing company/fund product readers into the smallest exact-identity detail operation; no edits/builds. | Return concrete selectors, result shapes and missing caller seams for the next checkpoint. Current quote integration is not held for this report. |
+| Astra startup_read_diagnosis — observed startup crypto, read-only | New in-phase sample shows runtime_secret_store → managed fallback restore → Argon2 derivation/zeroization. Inspect only the startup secret-store path; no edits/runtime actions/secrets. | Distinguish mandatory password derivation from redundant auto-access work. Return evidence and smallest correction; root owns any subsequent integration. |
+
+Quote projection validation: TypeScript and the two existing Desktop critical journeys PASS2/2,
+including an ambiguous last trade with independent bid/ask and explicit midpoint basis. Shared
+application output schema and prior-close producer updated in place. A real pre-replacement CLI read
+returned ten investments and nine saved closes; the tied-trade failure is data-dependent, not every
+request. `tied-trade-before-live.json` captures that baseline; it is not evidence for new code.
+
+Startup diagnosis: previous process sample captured only dyld and missed RuntimeComposition.
+Source shows complete signed model-runtime verification before ordinary transport readiness; its
+share of the observed25.56s composition interval is unmeasured. A next-replacement observer now
+samples inside RuntimeComposition. Provider restoration already runs in retained background work.
+No model-verification bypass or arbitrary timeout change is authorized by that diagnosis.
+
+Quote integration evidence: Rust market precision/freshness/tied-identity and exact-selection
+cases PASS2/2 (0.40s), Desktop existing journeys PASS2/2 (3.39s), TypeScript PASS. The final
+single-job watcher build PASS5m32s includes two later projection refinements: null prices are
+unavailable and missing expiry preserves the source freshness assessment. The earlier Rust test
+run is not unchanged-final-candidate approval. Current service6184/native6245 remain running.
+Real shared-service overview returns10 entries with9 prices and10 quote objects; Overview watchlist
+returns9 entries with9 prices and9 quote objects. Exact MSFT selection returns its selected token,
+quote object and correctly labeled previous close in1.149s. The initial MSFT probe had a CLI
+argument error; corrected `--selection-token` invocation succeeds. Artifacts:
+`quote-live-{overview,watchlist,msft,results}.json`, `tied-trade-projection-critical.log`,
+`quote-projection-{critical,typecheck}.log`. No live ambiguous batch occurred in these reads;
+the critical regression exercises that case. CLI timings include client startup, and these reads
+do not establish native rendering or complete streaming coverage.
+
+Startup observer captured Ready39.234s after replacement detection, with sampled execution inside
+credential restore and Argon2 buffer cleanup (`quote-startup-observation.json`,
+`quote-startup.sample.txt`). Astra source inspection finds Zeroizing<Vec<Block>> clears each block
+then its entire capacity again; a boxed initialized slice can preserve guaranteed wiping without
+the redundant byte pass. This is a concrete next correction, not attribution of the whole delay.
+The watcher is resumed; rich profile, fundamentals, market movers and Overview account summary
+remain required producer-to-consumer work. No CI or whole-app RAM measurement ran.
 
 
 
@@ -73,9 +118,9 @@ the saved collection as personal holdings. Portfolio represents actual holdings;
 are a watchlist. Ticker selection must open a detailed investment page, retaining available quote,
 profile, chart, financial and analytical sections independently when another section is unavailable.
 The watchlist belongs on Overview; no separate watchlist screen is required. Markets must not
-hide tracked symbols simply because they also appear in the watchlist. Current backend detail
-projection drops bid/ask/depth clocks and emits no change; company/fund product readers have no
-application callers. These remain explicit producer-to-screen integration requirements, not solved
+hide tracked symbols simply because they also appear in the watchlist. The route checkpoint still dropped richer quote/depth clocks and emitted no change; the current
+working checkpoint repairs quote projection. Company/fund product readers still lack application
+callers, and depth/movers remain open. These remain explicit producer-to-screen integration requirements, not solved
 by the first route extraction. Market-wide movers require backend ranking over a comparable universe,
 not sorting one fetched page in React.
 

@@ -313,6 +313,21 @@ impl MarketDomainService {
         // Keep its observation details, but never return an expired observation as current.
         let projected_at = system_timestamp()?;
         for row in &mut rows {
+            if let Some(quote) = row.get_mut("quote").and_then(Value::as_object_mut) {
+                for (fresh, through) in [
+                    ("quoteFresh", "quoteCurrentThrough"),
+                    ("lastFresh", "lastCurrentThrough"),
+                ] {
+                    let still_current = quote.get(fresh).and_then(Value::as_bool) == Some(true)
+                        && quote
+                            .get(through)
+                            .and_then(Value::as_str)
+                            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                            .and_then(|value| value.timestamp_nanos_opt())
+                            .is_none_or(|until| projected_at.unix_nanos() <= until);
+                    quote.insert(fresh.into(), json!(still_current));
+                }
+            }
             if row.get("availability").and_then(Value::as_str) != Some("end_of_day")
                 && row["currentPrice"]["currentThrough"]
                     .as_str()
@@ -402,6 +417,7 @@ impl MarketDomainService {
         Ok(Some(json!({
             "instrumentId": instrument_id.to_string(), "availability": "end_of_day",
             "currentPrice": {"value": close.close().amount().normalize().to_string(),
+                "basis": "previous_close",
                 "currency": close.currency().as_str(),
                 "observedAt": timestamp_value(close.session_close()),
                 "currentThrough": timestamp_value(close.session_close())},

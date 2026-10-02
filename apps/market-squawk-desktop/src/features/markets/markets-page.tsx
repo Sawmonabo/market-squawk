@@ -13,7 +13,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  marketSessionRequestSchema, parseMarketProductResult,
+  marketPriceBasisLabel, marketSessionRequestSchema, parseMarketProductResult,
   parseMarketSessionContext, type MarketProductRow, type MarketSessionContext,
   type MarketSessionReference, type MarketSessionRequest,
 } from "./market-product"
@@ -191,7 +191,7 @@ function MarketSessionPanel({ bootstrap, transport }: { bootstrap: DesktopBootst
 }
 
 function MarketCard({ row, onSelect }: { row: MarketProductRow; onSelect: () => void }) {
-  return <button type="button" onClick={onSelect} className="rounded-xl border p-4 text-left"><h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2><p className="mt-2 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p>{row.changePercent ? <p className="text-sm">{row.changePercent}%</p> : null}</button>
+  return <button type="button" onClick={onSelect} className="rounded-xl border p-4 text-left"><h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2><p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p><p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p>{row.changePercent ? <p className="text-sm">{row.changePercent}%</p> : null}</button>
 }
 
 function Page({ children, message }: { children?: React.ReactNode; message?: string }) {

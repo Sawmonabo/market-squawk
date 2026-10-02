@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use super::results::bounded_result;
 use super::serialization::{QualitySummary, timestamp_value, with_availability};
 use super::{
-    DurableMarketEvidenceSet, DurableMarketRouteEvidence, MarketFilters, StreamView,
+    DurableMarketEvidenceSet, DurableMarketRouteEvidence, MarketFilters, StreamView, TradeStatus,
     durable_candidate_effective_at, ensure_live,
 };
 use crate::application::domain_support::encode_hex;
@@ -1254,7 +1254,7 @@ fn durable_source_candidate(
     definition_revision_digest: Option<EvidenceDigest>,
 ) -> Result<SourceCandidate, ServiceError> {
     let primary = evidence
-        .presentation_candidate()
+        .evidence_candidate()
         .ok_or(ServiceError::Unavailable)?;
     let provenance = market_event_provenance(primary.event());
     let live = evidence
@@ -1894,6 +1894,7 @@ fn instrument_row(
 const MAXIMUM_PRODUCT_DEPTH_LEVELS: usize = 64;
 
 struct ProductQuote {
+    trade_status: TradeStatus,
     bid_price: Option<String>,
     bid_size: Option<String>,
     ask_price: Option<String>,
@@ -1911,21 +1912,28 @@ struct ProductQuote {
 
 impl ProductQuote {
     fn value(&self) -> Value {
+        let trade_available = self.trade_status == TradeStatus::Available;
         json!({
+            "tradeStatus": self.trade_status.as_str(),
             "bidPrice": self.bid_price,
             "bidSize": self.bid_size,
             "askPrice": self.ask_price,
             "askSize": self.ask_size,
             "midPrice": self.midpoint,
-            "lastPrice": self.last_price,
-            "lastSize": self.last_size,
+            "lastPrice": self.last_price.as_ref().filter(|_| trade_available),
+            "lastSize": self.last_size.as_ref().filter(|_| trade_available),
             "quoteObservedAt": self.quote_observed_at.map(timestamp_value),
-            "lastObservedAt": self.last_observed_at.map(timestamp_value),
+            "lastObservedAt": self.last_observed_at.filter(|_| trade_available).map(timestamp_value),
+            "quoteCurrentThrough": self.quote_current_through.map(timestamp_value),
+            "lastCurrentThrough": self.last_current_through.filter(|_| trade_available).map(timestamp_value),
+            "quoteFresh": self.quote_fresh,
+            "lastFresh": trade_available && self.last_fresh,
         })
     }
 
     fn current_price(&self, currency: Currency) -> Value {
-        if self.last_fresh
+        if self.trade_status == TradeStatus::Available
+            && self.last_fresh
             && let Some(value) = self.last_price.as_ref()
         {
             return json!({
@@ -2042,6 +2050,7 @@ fn product_display_symbol(
 
 fn empty_product_quote() -> ProductQuote {
     ProductQuote {
+        trade_status: TradeStatus::Unavailable,
         bid_price: None,
         bid_size: None,
         ask_price: None,
@@ -2090,6 +2099,11 @@ fn product_quote(
                 .transpose()?;
             let trade = view.stream.last_trade();
             Ok(ProductQuote {
+                trade_status: if trade.is_some() {
+                    TradeStatus::Available
+                } else {
+                    TradeStatus::Unavailable
+                },
                 bid_price: bid_price.map(|value| value.normalize().to_string()),
                 bid_size: bid
                     .map(|level| decimal_quantity(level.quantity(), executable))
@@ -2141,6 +2155,11 @@ fn product_quote(
             let bid_price = bid.map(|value| value.price().value());
             let ask_price = ask.map(|value| value.price().value());
             Ok(ProductQuote {
+                trade_status: if trade.is_some() {
+                    TradeStatus::Available
+                } else {
+                    TradeStatus::Unavailable
+                },
                 bid_price: bid_price.map(|value| value.normalize().to_string()),
                 bid_size: bid.map(|value| display_decimal_string(value.quantity())),
                 ask_price: ask_price.map(|value| value.normalize().to_string()),
@@ -2194,6 +2213,7 @@ fn product_quote(
                 .map(|level| decimal_price_with_terms(level.price(), terms))
                 .transpose()?;
             Ok(ProductQuote {
+                trade_status: TradeStatus::Unavailable,
                 bid_price: bid_price.map(|value| value.normalize().to_string()),
                 bid_size: bid
                     .map(|level| decimal_quantity_with_terms(level.quantity(), terms))
@@ -2222,6 +2242,7 @@ fn durable_product_quote(
     selected_at: Timestamp,
 ) -> Result<ProductQuote, ServiceError> {
     let mut result = empty_product_quote();
+    result.trade_status = evidence.trade_status;
     let quote_candidate = evidence.best_quote_candidate();
     let mut bid_price = None;
     let mut ask_price = None;
@@ -2338,7 +2359,56 @@ fn native_money_price(
 
 #[cfg(test)]
 mod product_quote_tests {
+    use super::super::retained_event_status;
     use super::*;
+    use market_squawk_domain::{
+        AggressorSide, AuthorizationBasis, CanonicalStateDigest, CanonicalizationRule,
+        ConnectionGeneration, DecodedLiveProvenanceInput, LiveEvidenceBinding, LiveProvenance,
+        MetadataRevision, PayloadReference, PriceTicks, QuantityLots, RuleVersion, TradeEvent,
+        VenueId,
+    };
+
+    fn trade_event(id: &str, price: i64) -> Result<MarketEvent, Box<dyn std::error::Error>> {
+        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]);
+        let binding = LiveEvidenceBinding::new(
+            SourceId::try_from("trade-projection")?,
+            SourceIdentifier::try_from("session-1")?,
+            MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
+            AuthorizationBasis::new(SourceIdentifier::try_from("public-market-data")?),
+            VenueId::try_from("venue")?,
+            InstrumentId::try_from(uuid::Uuid::from_u128(1))?,
+            ConnectionGeneration::new(1)?,
+            ProviderProduct::new(SourceIdentifier::try_from("BTC-USD")?),
+            ProviderChannel::new(SourceIdentifier::try_from("trades")?),
+            LiveEventClass::Trade,
+            SourceIdentifier::try_from(id)?,
+            digest,
+            CanonicalStateDigest::new(
+                digest,
+                CanonicalizationRule::new(
+                    SourceIdentifier::try_from("trade-projection-v1")?,
+                    RuleVersion::new(1)?,
+                ),
+            ),
+            None,
+        )?;
+        Ok(MarketEvent::Trade(TradeEvent::new(
+            LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+                binding,
+                Some(Timestamp::from_unix_nanos(90)),
+                Timestamp::from_unix_nanos(91),
+                Timestamp::from_unix_nanos(91),
+                Timestamp::from_unix_nanos(92),
+                DataQuality::DirectUnverified,
+                CoverageStatus::Sufficient,
+                PayloadReference::SourceReference(SourceIdentifier::try_from("frame-1")?),
+            ))?,
+            PriceTicks::new(price),
+            QuantityLots::new(2)?,
+            AggressorSide::Buy,
+            None,
+        )?))
+    }
 
     #[test]
     fn native_money_display_preserves_precision_currency_and_component_freshness()
@@ -2353,6 +2423,7 @@ mod product_quote_tests {
             Err(ServiceError::InvalidResult)
         );
         let mut quote = empty_product_quote();
+        quote.trade_status = TradeStatus::Available;
         quote.midpoint = Some(value.normalize().to_string());
         quote.last_price = Some("125".to_owned());
         quote.quote_fresh = true;
@@ -2367,6 +2438,59 @@ mod product_quote_tests {
         quote.last_fresh = false;
         assert!(quote.current_price(usd).is_null());
         assert_eq!(quote.value()["lastPrice"], "125");
+
+        let first = trade_event("trade-1", 100)?;
+        let second = trade_event("trade-2", 101)?;
+        let conflicting = trade_event("trade-1", 102)?;
+        let digest = |event: &MarketEvent| -> Result<EvidenceDigest, serde_json::Error> {
+            use sha2::Digest as _;
+            Ok(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                sha2::Sha256::digest(serde_json::to_vec(event)?).into(),
+            ))
+        };
+        let first_digest = digest(&first)?;
+        assert_eq!(
+            retained_event_status(
+                LiveEventClass::Trade,
+                [(&first, first_digest), (&first, first_digest)].into_iter(),
+            )?,
+            TradeStatus::Available,
+        );
+        quote.trade_status = retained_event_status(
+            LiveEventClass::Trade,
+            [(&first, first_digest), (&second, digest(&second)?)].into_iter(),
+        )?;
+        assert_eq!(quote.trade_status, TradeStatus::Ambiguous);
+        // Even retained scalar fields cannot promote one member of an unresolved trade set.
+        quote.last_fresh = true;
+        quote.quote_fresh = true;
+        quote.quote_observed_at = Some(Timestamp::from_unix_nanos(90));
+        quote.quote_current_through = Some(Timestamp::from_unix_nanos(110));
+        let projected = quote.value();
+        assert_eq!(projected["tradeStatus"], "ambiguous");
+        assert!(projected["lastPrice"].is_null());
+        assert!(projected["lastSize"].is_null());
+        assert_eq!(projected["lastFresh"], false);
+        assert_eq!(projected["quoteFresh"], true);
+        assert_eq!(
+            projected["quoteCurrentThrough"],
+            timestamp_value(Timestamp::from_unix_nanos(110)),
+        );
+        assert_eq!(quote.current_price(usd)["basis"], "bid_ask_midpoint");
+        quote.quote_fresh = false;
+        assert!(quote.current_price(usd).is_null());
+        assert_eq!(
+            retained_event_status(
+                LiveEventClass::Trade,
+                [
+                    (&first, first_digest),
+                    (&conflicting, digest(&conflicting)?)
+                ]
+                .into_iter(),
+            ),
+            Err(ServiceError::InvalidResult),
+        );
         Ok(())
     }
 }
@@ -2780,7 +2904,7 @@ fn exact_selected_durable<'snapshot>(
     let identity = selected.candidate().identity();
     let generation = selected.candidate().admission().integrity().generation();
     let mut matches = durable_market.routes.iter().filter(|evidence| {
-        let Some(primary) = evidence.presentation_candidate() else {
+        let Some(primary) = evidence.evidence_candidate() else {
             return false;
         };
         let Some(live) = evidence.metadata.coverage().live() else {

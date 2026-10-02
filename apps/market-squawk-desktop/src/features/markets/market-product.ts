@@ -24,15 +24,47 @@ const moneySchema = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/),
 }).strict()
 
+const marketQuoteSchema = z.object({
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  bidPrice: exactDecimalSchema.nullable(),
+  bidSize: exactDecimalSchema.nullable(),
+  askPrice: exactDecimalSchema.nullable(),
+  askSize: exactDecimalSchema.nullable(),
+  midPrice: exactDecimalSchema.nullable(),
+  lastPrice: exactDecimalSchema.nullable(),
+  lastSize: exactDecimalSchema.nullable(),
+  quoteObservedAt: productInstantSchema.nullable(),
+  lastObservedAt: productInstantSchema.nullable(),
+  quoteCurrentThrough: productInstantSchema.nullable(),
+  lastCurrentThrough: productInstantSchema.nullable(),
+  quoteFresh: z.boolean(),
+  lastFresh: z.boolean(),
+  tradeStatus: z.enum(["available", "ambiguous", "unavailable"]),
+}).strict().superRefine((quote, context) => {
+  if (quote.tradeStatus !== "available" && (quote.lastPrice !== null || quote.lastSize !== null || quote.lastFresh)) {
+    context.addIssue({ code: "custom", message: "An unresolved trade cannot supply a last price or size." })
+  }
+  if ((quote.quoteFresh && quote.quoteObservedAt === null)
+    || (quote.lastFresh && (quote.lastObservedAt === null || quote.lastPrice === null))) {
+    context.addIssue({ code: "custom", message: "Current quote and trade values require their own observation clocks." })
+  }
+})
+
 export const marketProductRowSchema = z.object({
   selectionToken: marketSelectionTokenSchema,
   historyToken: marketHistoryTokenSchema.nullable(),
   identity: identitySchema,
   price: moneySchema.nullable(),
+  priceBasis: z.enum(["last_trade", "bid_ask_midpoint", "previous_close"]).nullable(),
+  priceCurrentThrough: productInstantSchema.nullable(),
+  quote: marketQuoteSchema.nullable(),
   changePercent: exactDecimalSchema.nullable(),
   asOf: productInstantSchema.nullable(),
   availability: z.enum(["current", "delayed", "previous_close", "unavailable"]),
 }).strict().superRefine((row, context) => {
+  if ((row.price === null) !== (row.priceBasis === null)) {
+    context.addIssue({ code: "custom", message: "A displayed price requires its basis." })
+  }
   if ((row.price === null) !== (row.asOf === null)) {
     context.addIssue({ code: "custom", message: "Price and time must be available together." })
   }
@@ -145,5 +177,14 @@ export function marketAvailabilityLabel(row: MarketProductRow): string {
     case "delayed": return "Delayed"
     case "previous_close": return "Previous close"
     case "unavailable": return "Unavailable"
+  }
+}
+
+export function marketPriceBasisLabel(row: MarketProductRow): string | null {
+  switch (row.priceBasis) {
+    case "last_trade": return "Last trade"
+    case "bid_ask_midpoint": return "Bid/ask midpoint"
+    case "previous_close": return "Previous close"
+    case null: return null
   }
 }
