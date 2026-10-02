@@ -335,6 +335,19 @@ On macOS 14+, this explicit automation mode also disables WebKit background thro
 has not painted. Ordinary launches keep the platform scheduling policy; automation screenshots
 and instrumented resource use are separate from final installed acceptance.
 
+Do not infer a rendering failure or a visual pass from a hidden-window snapshot alone. In the
+2026-10-02 native check, `document.visibilityState` remained `hidden` and a newly mounted chart
+retained blank, default-sized canvas buffers despite automation throttling being disabled.
+[WebKit documents that inactive pages can stop animation frames](https://webkit.org/blog/8970/how-web-content-can-affect-power-usage/).
+The locked Lightweight Charts5.2.0 implementation schedules drawing on animation frames; its
+[public `takeScreenshot()` API](https://tradingview.github.io/lightweight-charts/docs/api/interfaces/IChartApi#takescreenshot)
+flushes pending drawing synchronously. Invoking that API on the existing chart produced the
+actual retained MSFT price line and axes without taking focus or changing data. This distinguishes
+loaded/drawable chart data from unattended compositor paint; it does not prove ordinary visible
+first-paint timing, gestures or every chart layer. Record the capture method and visibility state,
+and separately verify visible rendering when the app is naturally visible. Do not disable normal
+power-saving behavior or replace charts with images to make an audit pass.
+
 For coordinated development, pass both options to the existing `scripts/develop.mjs` invocation
 instead of starting an additional Desktop. An already running process without a port has no
 WebDriver endpoint to attach to; the lead must replace that single supervised instance before

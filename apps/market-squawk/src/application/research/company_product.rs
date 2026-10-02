@@ -1315,17 +1315,26 @@ fn project_ratios(
     candidates
         .try_reserve_exact(facts.len())
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
-    for fact in facts.iter().filter(|fact| ratio_metric(fact.metric)) {
+    // Statement meaning establishes applicability even when both required operands are
+    // absent. Share-only and cash-flow-only envelopes must not manufacture ratio rows.
+    for fact in facts.iter().filter(|fact| {
+        matches!(
+            (fact.period, statement_for_metric(fact.metric)),
+            (
+                FundamentalPeriod::Instant { .. },
+                CompanyStatementKind::FinancialPosition
+            ) | (
+                FundamentalPeriod::Duration { .. },
+                CompanyStatementKind::Operations
+            )
+        )
+    }) {
         candidates.push(EnvelopeFactRef {
             key: fact_envelope_key(fact),
             fact,
         });
     }
     candidates.sort_unstable_by_key(|candidate| candidate.key);
-    if candidates.is_empty() {
-        return unavailable_ratio_set(CompanyProductSectionState::Unavailable, budget);
-    }
-
     let mut ratios = Vec::new();
     let mut start = 0_usize;
     while start < candidates.len() {
@@ -1335,41 +1344,45 @@ fn project_ratios(
             end += 1;
         }
         let group = &candidates[start..end];
-        append_ratio(
-            &mut ratios,
-            group,
-            CompanyRatioMetric::CurrentRatio,
-            &[CompanyFinancialMetric::CurrentAssets],
-            &[CompanyFinancialMetric::CurrentLiabilities],
-            budget,
-        )?;
-        append_ratio(
-            &mut ratios,
-            group,
-            CompanyRatioMetric::GrossMargin,
-            &[CompanyFinancialMetric::GrossProfit],
-            revenue_metrics(),
-            budget,
-        )?;
-        append_ratio(
-            &mut ratios,
-            group,
-            CompanyRatioMetric::OperatingMargin,
-            &[CompanyFinancialMetric::OperatingIncome],
-            revenue_metrics(),
-            budget,
-        )?;
-        append_ratio(
-            &mut ratios,
-            group,
-            CompanyRatioMetric::NetMargin,
-            &[
-                CompanyFinancialMetric::NetIncome,
-                CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests,
-            ],
-            revenue_metrics(),
-            budget,
-        )?;
+        match group[0].fact.period {
+            FundamentalPeriod::Instant { .. } => append_ratio(
+                &mut ratios,
+                group,
+                CompanyRatioMetric::CurrentRatio,
+                &[CompanyFinancialMetric::CurrentAssets],
+                &[CompanyFinancialMetric::CurrentLiabilities],
+                budget,
+            )?,
+            FundamentalPeriod::Duration { .. } => {
+                append_ratio(
+                    &mut ratios,
+                    group,
+                    CompanyRatioMetric::GrossMargin,
+                    &[CompanyFinancialMetric::GrossProfit],
+                    revenue_metrics(),
+                    budget,
+                )?;
+                append_ratio(
+                    &mut ratios,
+                    group,
+                    CompanyRatioMetric::OperatingMargin,
+                    &[CompanyFinancialMetric::OperatingIncome],
+                    revenue_metrics(),
+                    budget,
+                )?;
+                append_ratio(
+                    &mut ratios,
+                    group,
+                    CompanyRatioMetric::NetMargin,
+                    &[
+                        CompanyFinancialMetric::NetIncome,
+                        CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests,
+                    ],
+                    revenue_metrics(),
+                    budget,
+                )?;
+            }
+        }
         start = end;
     }
     let state = if ratios
@@ -1424,21 +1437,6 @@ const fn revenue_metrics() -> &'static [CompanyFinancialMetric] {
         CompanyFinancialMetric::Revenue,
         CompanyFinancialMetric::NetSales,
     ]
-}
-
-const fn ratio_metric(metric: CompanyFinancialMetric) -> bool {
-    matches!(
-        metric,
-        CompanyFinancialMetric::CurrentAssets
-            | CompanyFinancialMetric::CurrentLiabilities
-            | CompanyFinancialMetric::Revenue
-            | CompanyFinancialMetric::NetSales
-            | CompanyFinancialMetric::CustomerRevenueExcludingAssessedTax
-            | CompanyFinancialMetric::GrossProfit
-            | CompanyFinancialMetric::OperatingIncome
-            | CompanyFinancialMetric::NetIncome
-            | CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests
-    )
 }
 
 fn append_ratio(
@@ -2035,7 +2033,20 @@ mod tests {
 
         let ratios = project_ratios(&facts, CompanyProductSectionState::Reported, &mut budget)?;
         assert_eq!(ratios.state(), CompanyProductSectionState::Reported);
-        assert_eq!(ratios.items().len(), 8);
+        assert_eq!(ratios.items().len(), 4);
+        assert_eq!(
+            ratios
+                .items()
+                .iter()
+                .map(CompanyRatioProduct::metric)
+                .collect::<Vec<_>>(),
+            vec![
+                CompanyRatioMetric::CurrentRatio,
+                CompanyRatioMetric::GrossMargin,
+                CompanyRatioMetric::OperatingMargin,
+                CompanyRatioMetric::NetMargin,
+            ]
+        );
         assert_eq!(
             ratios
                 .items()
@@ -2047,11 +2058,16 @@ mod tests {
                 .map(CompanyRatioProduct::value),
             Some(Some(Decimal::from(2_u8)))
         );
-        for ratio in ratios
-            .items()
-            .iter()
-            .filter(|ratio| ratio.state() == CompanyRatioState::Reported)
-        {
+        for ratio in ratios.items() {
+            assert_eq!(ratio.state(), CompanyRatioState::Reported);
+            assert_eq!(
+                ratio.envelope().map(|envelope| envelope.period),
+                Some(if ratio.metric() == CompanyRatioMetric::CurrentRatio {
+                    instant
+                } else {
+                    duration
+                })
+            );
             assert_eq!(ratio.inputs().len(), 2);
             assert_eq!(ratio.inputs()[0].role(), CompanyRatioInputRole::Numerator);
             assert_eq!(ratio.inputs()[1].role(), CompanyRatioInputRole::Denominator);
@@ -2103,12 +2119,81 @@ mod tests {
             fact_envelope_bytes(&instant_envelope[1])?
         );
         let projected = project_financial_envelope(instant_envelope, true)?;
+        assert_eq!(projected.len(), 1);
         assert!(projected.iter().any(|ratio| {
             ratio["metric"] == "current_ratio"
                 && ratio["state"] == "reported"
                 && ratio["inputs"]
                     .as_array()
                     .is_some_and(|inputs| inputs.len() == 2)
+        }));
+
+        // Share and cash-flow contexts do not create unsupported ratio-period rows.
+        for (metric, period) in [
+            (
+                CompanyFinancialMetric::EntityCommonSharesOutstanding,
+                instant,
+            ),
+            (CompanyFinancialMetric::WeightedAverageBasicShares, duration),
+            (CompanyFinancialMetric::OperatingCashFlow, duration),
+        ] {
+            let mut unrelated = fact(metric, 100, usd, period, year_end, known_at, "filing-a", 1)?;
+            if metric.expected_unit() == CompanyMetricUnit::Shares {
+                unrelated.unit = CompanyFactUnit::Shares;
+            }
+            assert!(project_financial_envelope(&[unrelated], true)?.is_empty());
+        }
+
+        // An applicable statement still reports missing ratios even when neither operand
+        // exists. Eligibility is statement meaning, not the presence of ratio inputs.
+        for (metric, period, expected_metrics) in [
+            (
+                CompanyFinancialMetric::TotalAssets,
+                instant,
+                vec![CompanyRatioMetric::CurrentRatio],
+            ),
+            (
+                CompanyFinancialMetric::OperatingExpenses,
+                duration,
+                vec![
+                    CompanyRatioMetric::GrossMargin,
+                    CompanyRatioMetric::OperatingMargin,
+                    CompanyRatioMetric::NetMargin,
+                ],
+            ),
+        ] {
+            let without_operands =
+                fact(metric, 100, usd, period, year_end, known_at, "filing-a", 1)?;
+            let missing = project_ratios(
+                &[without_operands],
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new(),
+            )?;
+            assert_eq!(missing.state(), CompanyProductSectionState::Unavailable);
+            assert_eq!(
+                missing
+                    .items()
+                    .iter()
+                    .map(CompanyRatioProduct::metric)
+                    .collect::<Vec<_>>(),
+                expected_metrics
+            );
+            assert!(missing.items().iter().all(|ratio| {
+                ratio.state() == CompanyRatioState::MissingInput
+                    && ratio.value().is_none()
+                    && ratio.inputs().is_empty()
+                    && ratio
+                        .envelope()
+                        .is_some_and(|envelope| envelope.period == period)
+            }));
+        }
+        let missing_margins = project_financial_envelope(&facts[2..3], true)?;
+        assert_eq!(missing_margins.len(), 3);
+        assert!(missing_margins.iter().all(|ratio| {
+            ratio["state"] == "missing_input"
+                && ratio["inputs"]
+                    .as_array()
+                    .is_some_and(|inputs| inputs.len() == 1 && inputs[0]["role"] == "denominator")
         }));
 
         let distinct_ratios = project_ratios(

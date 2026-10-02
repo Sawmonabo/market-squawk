@@ -10,6 +10,15 @@ Initial source inventory: 19 concrete routes (17 sidebar destinations, additiona
 
 Evidence: `.agents/tmp/desktop-product-audit/source-inventory.json`. Desktop source paths below are relative to `apps/market-squawk-desktop/src/`, unless explicitly native/backend. Every DP finding is **Open**; Important and Minor are both existing-contract remediation, not approval.
 
+## Automatic-data coverage correction
+
+The [all-screen automatic-data supplement](2026-10-02-desktop-automatic-data-audit.md) inventories
+all19routes and their nested read panels, preparation/refresh controls, cache ownership and recovery.
+The original screenshot survey did **not** establish automatic preparation, semantic completeness or
+every populated workflow. Seven grouped supplemental findings track those gaps; successful queries,
+32returned items or an error-free empty screen are not sufficient acceptance. Follow the delivery
+ledger for current remediation rather than treating either audit as a completed product.
+
 ## Route coverage matrix
 
 Every listed route exists in `apps/market-squawk-desktop/src/app/routes.tsx:101`. Every route was opened in the real background native WebView and its heading checked before capture. Named subflows with no saved rows or requiring mutation remain explicitly unexercised.

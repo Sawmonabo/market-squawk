@@ -2,26 +2,35 @@
 
 ## Current execution — 2026-10-02
 
-SEC number-word correction critically verified: full recognized grammar uses checked integer
-normalization and preserves lexical text/context/scale/sign. Existing captured-taxonomy test plus
-exact retained8,585,609-byte MSFT FY2026 body PASS1/1 (4.67s), checking three zero occurrences and
-`three`→3 segment value. Initial Cargo invocation compiled successfully (1m19s) and passed fixture
-assertions, then its relative optional-body path failed from the crate working directory. Rerunning
-the unchanged executable with the absolute retained path passed; no assertion was weakened.
-Evidence `sec-number-words-{critical,retained-critical}.log`. This proves parser/restart behavior;
-the installed/live financial preparation retry awaits the coordinated backend rebuild. Do not
-claim the old failed job or current displayed unavailable data is resolved yet.
+Current integration: SEC number-word normalization is pushed as `2a819049`. Ratio applicability
+is critically verified and ready for the supervised backend rebuild. The exact-envelope case
+passes (1/1), as does the existing snapshot/cursor case (1/1); logs are
+`.agents/tmp/v1-first-stock/ratio-{applicability,cursor}-critical.log`. The correction removes
+inapplicable period/share-only rows while preserving genuine missing inputs, exact evidence
+matching and arithmetic. Native corrected values remain unverified. Astra's ratio and SEC
+assignments are finished and ownership has returned to the lead.
 
-Ratio diagnosis completed: retained first page has11reported +21inapplicable unavailable rows
-(share-only groups×4, margins on instant groups, current ratios on duration groups). No evidence
-justifies weakening exact filing/period/publication matching. Astra ratio_availability_diagnosis
-now owns **only** `apps/market-squawk/src/application/research/company_product.rs` for shared
-statement/period applicability and the existing exact-envelope critical regression. Instant
-financial-position groups owe current ratio; duration operations groups owe three margins;
-share/cashflow-only groups owe no ratios. Applicable groups keep genuine missing/conflict/zero/
-unit failures. Lead owns page-consumer inspection, serialized checks and native value verification.
-No new schema/UI filter/dependencies/builds/Git by agent. Presentation checkpoint4a2bfac8 is pushed;
-its two UI checks/typecheck passed. Detailed SEC fixture is the sole compiler.
+The [automatic-data audit](../reports/2026-10-02-desktop-automatic-data-audit.md) is complete:
+19 routes and nested read surfaces, seven grouped findings (five Important, two Minor), with
+source inspection distinguished from prior native evidence. AD-04 extends DP-03; AD-06 corrects
+semantic acceptance across existing data-consumer findings. Automatic preparation, latest versus
+frozen editions, transient recovery, redundant Open controls and dependent-read recovery remain
+open. No new native all-state proof or extra review round is claimed. The background chart
+capture limitation is documented in troubleshooting; successful public-API capture is not ordinary
+visible paint acceptance.
+
+DP-03 current-display work is frozen by the Sol agent and owned by the lead for integration:
+`src/app/query-client.ts` and `src/features/markets/{investment-page.tsx,investment-profile.tsx,
+markets-page.tsx,market-collection.tsx}`. It reuses the existing five-minute session display cache,
+revalidates on mount and qualifies cached prices until checked. Existing UI checks and typecheck
+passed; the lead is extending that same critical market journey to prove warm-return freshness
+with a delayed response. It does not retain released financial/history handles or implement
+source preparation. Remaining snapshot-cache and automatic-data findings stay open.
+
+The visible service/Desktop and Vite remain available while Watchexec PID99703 is deliberately
+stopped during serialized integration. Next: commit the verified slices, resume the single
+supervisor, then verify actual ratio values and retry the failed detailed filing on the corrected
+backend. No second app/runtime or competing Cargo build is authorized.
 
 Financial presentation checkpoint: reviewed shared signed change display, exact-decimal percentage/
 ratio formatting (original precision remains inspectable), persistent Markets label, contained
