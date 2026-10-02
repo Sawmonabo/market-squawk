@@ -1,7 +1,9 @@
 use std::mem::size_of;
 use std::time::Instant;
 
-use market_squawk_domain::{SourceId, SourceIdentifier, Timestamp, VenueId};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp, VenueId,
+};
 use market_squawk_sources::SourceMetadata;
 use rusqlite::{OptionalExtension as _, params};
 use tokio_util::sync::CancellationToken;
@@ -16,6 +18,88 @@ use super::{
     ListingReferenceSearchPage,
 };
 use crate::catalog::storage::{ResultBudget, now_timestamp, sha256};
+
+/// Revalidates one exact retained source row in the caller's connection scope.
+/// `require_current` enforces the current generation and its display authorization.
+/// Otherwise this is immutable identity validation only: it grants no display, local-analysis
+/// or training authority; the consuming operation must check its own current authorization.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exact retained parent coordinates and operation controls stay explicit"
+)]
+pub(crate) fn source_qualified_listing_record(
+    connection: &rusqlite::Connection,
+    result_limits: crate::CatalogResultLimits,
+    dataset: &SourceIdentifier,
+    source_id: &SourceId,
+    generation_digest: EvidenceDigest,
+    file_kind: &str,
+    provider_row_number: u32,
+    record_digest: EvidenceDigest,
+    require_current: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ListingReferenceRecord, ListingReferenceError> {
+    canonical::check_operation(deadline, cancellation)?;
+    if generation_digest.algorithm() != DigestAlgorithm::Sha256
+        || generation_digest.bytes() == [0; 32]
+        || record_digest.algorithm() != DigestAlgorithm::Sha256
+        || record_digest.bytes() == [0; 32]
+        || !(2..=32_769).contains(&provider_row_number)
+    {
+        return Err(ListingReferenceError::InvalidInput);
+    }
+    let kind = ListingReferenceFileKind::from_database(file_kind)?;
+    let result = (|| {
+        let generation = load_generation_receipt(connection, generation_digest.bytes())?
+            .ok_or(ListingReferenceError::PositionConflict)?;
+        if generation.dataset() != dataset || generation.source_id() != source_id {
+            return Err(ListingReferenceError::CorruptCatalog);
+        }
+        if require_current {
+            require_current_display_authority(connection, &generation)?;
+            let current: Vec<u8> = connection.query_row(
+                "SELECT generation_digest FROM listing_reference_generations
+                 WHERE dataset_id=?1 ORDER BY generation_sequence DESC LIMIT 1",
+                [dataset.as_str()],
+                |row| row.get(0),
+            )?;
+            if current.as_slice() != generation_digest.bytes().as_slice() {
+                return Err(ListingReferenceError::SupersededGeneration);
+            }
+        } else {
+            load_exact_source_revision(connection, &generation)?;
+        }
+        canonical::check_operation(deadline, cancellation)?;
+        let sql = format!(
+            "{LISTING_ROW_COLUMNS_SQL}, 'provider_symbol' AS match_kind\n\
+             {LISTING_ROW_JOIN_SQL}\n\
+             WHERE memberships.generation_digest=?1 AND memberships.file_kind=?2\n\
+               AND memberships.provider_row_number=?3 AND memberships.record_digest=?4"
+        );
+        let row = connection
+            .query_row(
+                &sql,
+                params![
+                    generation_digest.bytes(),
+                    kind.database_name(),
+                    i64::from(provider_row_number),
+                    record_digest.bytes(),
+                ],
+                decode_row,
+            )
+            .optional()?
+            .ok_or(ListingReferenceError::PositionConflict)?;
+        let mut budget = ResultBudget::new(result_limits);
+        charge_listing_row_budget(&mut budget, &generation, &row)?;
+        let record = rebuild_match(&generation, row)?.record;
+        if record.record_digest() != record_digest {
+            return Err(ListingReferenceError::CorruptCatalog);
+        }
+        Ok(record)
+    })();
+    super::classify_read_operation(result, deadline, cancellation)
+}
 
 impl CatalogAuthority {
     pub(super) fn current_listing_reference_generation(
@@ -103,7 +187,11 @@ pub(super) fn search_listing_references(
         canonical::normalize_symbol(query)
     };
     let name_query = canonical::normalize_name(query);
-    let mut statement = connection.prepare(CURRENT_LISTING_SEARCH_SQL)?;
+    let sql = format!(
+        "{LISTING_ROW_COLUMNS_SQL}, {CURRENT_LISTING_MATCH_SQL}\n\
+         {LISTING_ROW_JOIN_SQL}\n{CURRENT_LISTING_SEARCH_SQL}"
+    );
+    let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(
         params![
             generation.generation_digest().bytes(),
@@ -122,32 +210,7 @@ pub(super) fn search_listing_references(
     for row in rows {
         canonical::check_operation(deadline, cancellation)?;
         let row = row?;
-        budget
-            .charge([
-                size_of::<ListingReferenceSearchMatch>(),
-                row.file_kind.len(),
-                row.source_object_id.len(),
-                row.source_reference.len(),
-                row.file_creation_time.len(),
-                row.file_locator_reference.as_ref().map_or(0, String::len),
-                row.file_locator_version.as_ref().map_or(0, String::len),
-                row.provider_symbol.len(),
-                row.security_name.len(),
-                row.listing_venue.len(),
-                row.exchange_code.as_ref().map_or(0, String::len),
-                row.cqs_symbol.as_ref().map_or(0, String::len),
-                row.nasdaq_symbol.as_ref().map_or(0, String::len),
-                row.market_category.as_ref().map_or(0, String::len),
-                row.financial_status.as_ref().map_or(0, String::len),
-                row.directory_presence.len(),
-                row.data_quality.len(),
-                row.authority_class.len(),
-                row.record_revision.len(),
-                row.record_locator_reference.as_ref().map_or(0, String::len),
-                row.record_locator_version.as_ref().map_or(0, String::len),
-                row.match_kind.len(),
-            ])
-            .map_err(|_| ListingReferenceError::MemoryLimitExceeded)?;
+        charge_listing_row_budget(&mut budget, &generation, &row)?;
         matches.push(rebuild_match(&generation, row)?);
     }
     let has_more = matches.len() > maximum_rows;
@@ -189,6 +252,17 @@ fn require_current_display_authority(
     if !authorized {
         return Err(ListingReferenceError::RightsUnavailable);
     }
+    let metadata = load_exact_source_revision(connection, receipt)?;
+    if !metadata.is_effective_at(now) {
+        return Err(ListingReferenceError::RightsUnavailable);
+    }
+    Ok(())
+}
+
+fn load_exact_source_revision(
+    connection: &rusqlite::Connection,
+    receipt: &ListingReferenceGenerationReceipt,
+) -> Result<SourceMetadata, ListingReferenceError> {
     let metadata_json: Option<String> = connection
         .query_row(
             "SELECT metadata_json FROM source_revisions
@@ -208,11 +282,10 @@ fn require_current_display_authority(
         serde_json::from_str(&metadata_json).map_err(|_| ListingReferenceError::CorruptCatalog)?;
     if metadata.source_id() != receipt.source_id()
         || metadata.revision().as_source_identifier() != receipt.source_revision()
-        || !metadata.is_effective_at(now)
     {
         return Err(ListingReferenceError::RightsUnavailable);
     }
-    Ok(())
+    Ok(metadata)
 }
 
 #[derive(Debug)]
@@ -296,6 +369,42 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredListingRow> {
         record_digest: row.get(35)?,
         match_kind: row.get(36)?,
     })
+}
+
+fn charge_listing_row_budget(
+    budget: &mut ResultBudget,
+    generation: &ListingReferenceGenerationReceipt,
+    row: &StoredListingRow,
+) -> Result<(), ListingReferenceError> {
+    budget
+        .charge([
+            size_of::<ListingReferenceSearchMatch>(),
+            generation.dataset().as_str().len(),
+            generation.source_id().as_str().len(),
+            generation.source_revision().as_str().len(),
+            row.file_kind.len(),
+            row.source_object_id.len(),
+            row.source_reference.len(),
+            row.file_creation_time.len(),
+            row.file_locator_reference.as_ref().map_or(0, String::len),
+            row.file_locator_version.as_ref().map_or(0, String::len),
+            row.provider_symbol.len(),
+            row.security_name.len(),
+            row.listing_venue.len(),
+            row.exchange_code.as_ref().map_or(0, String::len),
+            row.cqs_symbol.as_ref().map_or(0, String::len),
+            row.nasdaq_symbol.as_ref().map_or(0, String::len),
+            row.market_category.as_ref().map_or(0, String::len),
+            row.financial_status.as_ref().map_or(0, String::len),
+            row.directory_presence.len(),
+            row.data_quality.len(),
+            row.authority_class.len(),
+            row.record_revision.len(),
+            row.record_locator_reference.as_ref().map_or(0, String::len),
+            row.record_locator_version.as_ref().map_or(0, String::len),
+            row.match_kind.len(),
+        ])
+        .map_err(|_| ListingReferenceError::MemoryLimitExceeded)
 }
 
 fn rebuild_match(
@@ -417,6 +526,7 @@ fn rebuild_match(
     let record = ListingReferenceRecord {
         generation: generation.clone(),
         source_file,
+        record_digest: canonical::digest(record_digest),
         provider_row_number: record.provider_row_number,
         provider_symbol: record.provider_symbol,
         security_name: record.security_name,
@@ -455,7 +565,7 @@ fn parse_optional_bool(value: Option<i64>) -> Result<Option<bool>, ListingRefere
     value.map(parse_bool).transpose()
 }
 
-const CURRENT_LISTING_SEARCH_SQL: &str = r#"
+const LISTING_ROW_COLUMNS_SQL: &str = r#"
 SELECT files.file_kind,
        files.source_object_id,
        files.source_reference,
@@ -491,7 +601,10 @@ SELECT files.file_kind,
        memberships.record_locator_reference,
        memberships.record_locator_version,
        memberships.value_digest,
-       memberships.record_digest,
+       memberships.record_digest
+"#;
+
+const CURRENT_LISTING_MATCH_SQL: &str = r#"
        CASE
            WHEN ?5 IS NOT NULL THEN 'provider_symbol'
            WHEN instr(values_.normalized_provider_symbol, ?2)>0 THEN 'provider_symbol'
@@ -501,11 +614,17 @@ SELECT files.file_kind,
                THEN 'nasdaq_symbol'
            ELSE 'security_name'
        END AS match_kind
+"#;
+
+const LISTING_ROW_JOIN_SQL: &str = r#"
 FROM listing_reference_memberships AS memberships
 JOIN listing_reference_values AS values_ ON values_.value_digest=memberships.value_digest
 JOIN listing_reference_files AS files
   ON files.generation_digest=memberships.generation_digest
  AND files.file_kind=memberships.file_kind
+"#;
+
+const CURRENT_LISTING_SEARCH_SQL: &str = r#"
 WHERE memberships.generation_digest=?1
   AND (
       (?5 IS NOT NULL AND values_.provider_symbol=?2 AND values_.listing_venue=?5)

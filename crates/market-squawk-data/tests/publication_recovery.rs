@@ -1405,6 +1405,7 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
 
     exercise_staged_macro_terminal_and_finalization_restart().await?;
     exercise_sec_exact_origin_point_in_time_restart().await?;
+    exercise_sec_fiscal_epoch_restart().await?;
 
     Ok(())
 }
@@ -1659,9 +1660,14 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     )?;
     let raw_store = paths.sealed_research_journal_store()?;
     let base_ns = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
-    let fixture = sec_research_capture_fixture(base_ns)?;
+    let fixture = sec_research_capture_fixture(base_ns, false)?;
     let payload_digest = extraction_provider_payload_digest(&fixture.batch);
-    let company = sec_research_company_identity(payload_digest, base_ns)?;
+    let company = sec_research_company_identity(
+        payload_digest,
+        base_ns,
+        CompanyIdentitySurface::SecSubmissions,
+        digest(218),
+    )?;
     let company_json = serde_json::to_string(&company)?;
     let company_digest = EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -1723,7 +1729,8 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
                 .with_company_identity(company),
             cancellation,
         )
-        .await?;
+        .await
+        .map_err(|error| format!("SEC submissions issuer publication: {error:?}"))?;
     let binding_digests =
         service.provider_capture_binding_digests(committed.manifest(), None, 2)?;
     assert_eq!(binding_digests.len(), 1);
@@ -1781,6 +1788,30 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     assert!(matches!(
         binding_conflict,
         Err(SecResearchReadError::OriginMismatch | SecResearchReadError::ProviderBindingMismatch)
+    ));
+    // An actual submissions origin can never stand in for filing XBRL, even for the same CIK.
+    let wrong_family = service
+        .sec_research_reader()
+        .select(
+            SecResearchReadRequest::try_new(
+                committed.manifest().clone(),
+                SecResearchFamily::FilingXbrl,
+                binding_digests[0],
+                company_digest,
+                knowledge_at,
+                ResearchTemporalCoordinate::exact(knowledge_at),
+                PointInTimeRevisionMode::LatestKnown,
+                limits,
+                64 * 1024 * 1024,
+            )?,
+            &raw_store,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        wrong_family,
+        Err(SecResearchReadError::OriginMismatch)
     ));
     let request = SecResearchReadRequest::try_new(
         committed.manifest().clone(),
@@ -1925,6 +1956,504 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     assert_eq!(replay.exclusions(), expected_exclusions.as_slice());
     assert_eq!(replay.conflicts(), expected_conflicts.as_slice());
     assert_eq!(replay.receipt(), expected_receipt);
+    Ok(())
+}
+
+// The existing SEC recovery journey also proves selected-security attribution survives fiscal
+// publication without adding an instrument to issuer-owned source observations.
+async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
+    use market_squawk_data::{
+        DatasetBuildPurpose, DatasetStudyPolicy, DatasetTargetHorizon, FinancialAmountBasis,
+        FinancialAmountRole, FinancialAmountSelection, FinancialSeriesLimits, PythonDatasetRow,
+        PythonDatasetValue, SecResearchIdentityOutcome, SecResearchIdentityReadRequest,
+    };
+    use market_squawk_domain::{
+        CommonEquitySuitability, CompanySecurityIdentityLink, CompanySecurityIdentityLinkInput,
+        CompanySecurityKind, CompanySecurityLinkTransition, CompanySecurityRelationshipKind,
+        CompanySecurityResolutionBasis, FundamentalCadence, HistoricalStudyBasis,
+        IdentifierEntitlement, IdentifierRightsPolicyReference,
+    };
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("sec-fiscal-restart"))?;
+    let location = paths.catalog()?.clone();
+    let config = test_catalog_config(location.clone())?;
+    let store_config = ObjectStoreConfig::try_new(64 * 1024 * 1024, 64, Duration::from_secs(60))?;
+    let authority = CatalogAuthority::open(config.clone())?;
+    let source = sec_research_source()?;
+    let membership_source = local_source()?;
+    for metadata in [
+        &source,
+        &membership_source,
+        &local_source_for("market-squawk.derived")?,
+    ] {
+        authority.register_source(metadata, Timestamp::from_unix_nanos(10))?;
+    }
+    let now = || -> Result<Timestamp, Box<dyn Error>> {
+        Ok(Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?))
+    };
+    let base = now()?;
+    let fixture = sec_research_capture_fixture(base.unix_nanos(), true)?;
+    let raw_digest = fixture.capture_material.receipt().pages()[0].body_digest();
+    let payload_digest = extraction_provider_payload_digest(&fixture.batch);
+    let company = sec_research_company_identity(
+        payload_digest,
+        base.unix_nanos(),
+        CompanyIdentitySurface::SecCompanyFacts,
+        raw_digest,
+    )?;
+    let company_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(serde_json::to_vec(&company)?).into(),
+    );
+    let membership_batch = dataset_extraction_batch()?;
+    let reserve = |metadata: &SourceMetadata, payload, key: &str| -> Result<_, Box<dyn Error>> {
+        let rights = authority.admit_source_rights(RightsDecisionInput {
+            source_id: metadata.source_id().clone(),
+            payload_digest: payload,
+            retrieved_at: base,
+            basis: RightsBasis::reviewed_terms(
+                "https://www.sec.gov/os/accessing-edgar-data",
+                digest(221),
+            )?,
+            authorization_evidence: digest(222),
+            authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+            permitted_operations: vec![SourceOperation::Persist],
+        })?;
+        authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+            rights.rights_id(),
+            ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+            digest(223),
+            Some(Timestamp::from_unix_nanos(i64::MAX)),
+        )?)?;
+        Ok(authority.reserve_ingest(
+            &IngestIdentity::try_new(
+                metadata.source_id().clone(),
+                payload,
+                SourceOperation::Persist,
+                key,
+            )?,
+            &rights,
+        )?)
+    };
+    let facts_reservation = reserve(&source, payload_digest, "sec:companyfacts:fiscal-restart")?;
+    let membership_reservation = reserve(
+        &membership_source,
+        extraction_provider_payload_digest(&membership_batch),
+        "sec-fiscal:population",
+    )?;
+    let (composition, onboarding) = AnalyticalDataService::initialize_with_provider_onboarding(
+        authority,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let (service, publisher) = composition.into_parts();
+    let membership = service
+        .ingest(
+            membership_reservation,
+            DatasetId::try_from(membership_batch.request().object().dataset().as_str())?,
+            membership_batch,
+            CancellationToken::new(),
+        )
+        .await?;
+    let raw_store = paths.sealed_research_journal_store()?;
+    let SecResearchCaptureFixture {
+        batch,
+        capture_material,
+        revision_plan,
+        native_rows,
+    } = fixture;
+    let dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
+    let (expected, capture) = capture_material.into_whole_seal_parts();
+    let seal = expected
+        .try_rejoin(capture.seal(&raw_store)?)?
+        .try_into_whole()?;
+    let mut native = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::SecEdgarV1,
+        &batch,
+    )?;
+    for row in &native_rows {
+        native.try_push(row)?;
+    }
+    let native = native.finish()?;
+    let binding =
+        SealedProviderCaptureBinding::try_whole(seal, batch, native, vec![0; native_rows.len()])?;
+    let facts = service
+        .ingest_provider_publication(
+            facts_reservation,
+            dataset,
+            ProviderPublicationInput::try_new(binding, revision_plan)?
+                .with_company_identity(company.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| format!("SEC Company Facts issuer publication: {error:?}"))?;
+    let instrument = dataset_membership_instrument()?;
+    let deadline = || Instant::now() + Duration::from_secs(30);
+    let cancellation = CancellationToken::new();
+    service
+        .market_data_instrument_synchronization()
+        .synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![complete_history_market_data_definition(instrument)?],
+                1,
+            )?,
+            deadline(),
+            &cancellation,
+        )?;
+    let market = service
+        .market_data_instruments()
+        .latest(instrument, deadline(), &cancellation)?
+        .ok_or("missing selected SEC fiscal market definition")?;
+    let authorized_at = now()?;
+    let relationship = service.company_security_link_publication().publish(
+        CompanySecurityIdentityLink::try_new(CompanySecurityIdentityLinkInput {
+            schema_version: SchemaVersion::CURRENT,
+            company_source_id: source.source_id().clone(),
+            provider_company_id: company.provider_company_id().clone(),
+            company_surface: CompanyIdentitySurface::SecCompanyFacts,
+            company_observation_digest: company_digest,
+            instrument_id: instrument,
+            market_instrument_revision_digest: market.revision_digest(),
+            security_kind: CompanySecurityKind::CommonEquity,
+            relationship_kind: CompanySecurityRelationshipKind::Issuer,
+            common_equity_suitability: CommonEquitySuitability::SuitableIssuerCommonEquity,
+            resolution_basis: CompanySecurityResolutionBasis::OperatorAuthorizedResolution {
+                receipt_id: SourceIdentifier::try_from("sec-fiscal-fixture-resolution")?,
+                operator_id: SourceIdentifier::try_from("fixture-owner")?,
+                evidence: ExactPayloadEvidence::from_content_digest(digest(224)),
+                authorized_at,
+            },
+            relationship_evidence_rights: IdentifierRightsPolicyReference::new(
+                SourceIdentifier::try_from("sec-fiscal-fixture-rights")?,
+                IdentifierEntitlement::UserOwned,
+                SourceIdentifier::try_from("sec-fiscal-fixture-reviewed-evidence")?,
+            ),
+            effective_interval: EffectiveInterval::new(authorized_at, None)?,
+            available_at: authorized_at,
+            ingested_at: authorized_at,
+            transition: CompanySecurityLinkTransition::Initial,
+        })?,
+        deadline(),
+        &cancellation,
+    )?;
+    let known = relationship.record().published_at();
+    let pit_limits = PointInTimeLimits::try_new(32, 32, 8, 32, 8 * 1024 * 1024)?;
+    let source_request = SecResearchIdentityReadRequest::try_new(
+        instrument,
+        SecResearchFamily::CompanyFacts,
+        known,
+        ResearchTemporalCoordinate::calendar_date(known.utc_calendar_date()?),
+        PointInTimeRevisionMode::LatestKnown,
+        pit_limits,
+        16 * 1024 * 1024,
+    )?;
+    let selected = service
+        .sec_research_reader()
+        .select_by_identity(
+            source_request.clone(),
+            &raw_store,
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    let SecResearchIdentityOutcome::Exact(exact) = selected.outcome() else {
+        return Err("issuer relationship did not resolve fiscal source".into());
+    };
+    let original_fact = match exact.decoded_rows().get(0)? {
+        Some(ResearchObservation::Fundamental(fact)) => fact,
+        _ => return Err("issuer publication has no fundamental observation".into()),
+    };
+    assert_eq!(original_fact.context().provenance().instrument_id(), None);
+    assert_eq!(
+        original_fact.subject().issuer_id(),
+        Some(exact.company_identity().observation().provider_company_id())
+    );
+    let identity_receipt = selected.identity().receipt().canonical_bytes()?;
+    let selection_receipt = exact.receipt();
+    let series = service.dataset_builder().financial_series(
+        selected,
+        FinancialAmountSelection {
+            role: FinancialAmountRole::ParentNetIncome,
+            basis: FinancialAmountBasis::ReportingEntityTotal,
+            share_convention: None,
+        },
+        FundamentalCadence::Annual,
+        FinancialSeriesLimits::try_new(8, 8, 1024 * 1024)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(series.len(), 1);
+    let study = DatasetStudyPolicy::try_new(
+        HistoricalStudyBasis::HistoricalAsKnown,
+        DatasetBuildPurpose::StudyInputs,
+        known,
+        None,
+        DatasetTargetHorizon::FiscalPeriods {
+            cadence: FundamentalCadence::Annual,
+            periods_ahead: NonZeroU16::MIN,
+        },
+    )?;
+    let example = series.try_example(
+        "sec-fiscal-current",
+        0,
+        &study,
+        known,
+        None,
+        ResearchTemporalCoordinate::exact(known),
+    )?;
+    let specs = example
+        .components()
+        .iter()
+        .map(|value| value.spec().clone())
+        .collect();
+    let inputs = DatasetBuildInputs::try_new(
+        vec![facts.manifest().clone(), membership.manifest().clone()],
+        UniverseId::try_from("us-equities.historical")?,
+        vec![UniverseMembership::new(
+            instrument,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+            DomainAvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(1),
+                SourceIdentifier::try_from("constituent-publication")?,
+            ),
+            membership.manifest().clone(),
+            CanonicalObservationPayload::try_from_observation(&universe_membership_observation()?)?
+                .identity(),
+        )],
+        specs,
+        vec![example],
+    )?;
+    let contract = FeatureDatasetProductContract::FinancialAmountFiscalPeriodsStudyInputsV1;
+    let research_limits = ResearchUseLimits::try_new(
+        8,
+        64,
+        64,
+        16,
+        8 * 1024 * 1024,
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+    )?;
+    // Local analysis permission does not manufacture training permission for the same source.
+    assert!(
+        service
+            .dataset_builder()
+            .preflight_research_use(
+                ResearchUseRequest::try_new(
+                    vec![facts.manifest().clone()],
+                    ResearchUse::Train,
+                    research_limits
+                )?,
+                &cancellation,
+            )
+            .is_err()
+    );
+    let request = DatasetBuildRequest::try_new(
+        DatasetId::try_from("derived.sec-fiscal-study-inputs")?,
+        inputs,
+        DatasetBuildPolicy::new(
+            ChronologicalSplitPolicy::try_new(
+                known.checked_sub_nanos(2_000_000_000)?,
+                known.checked_sub_nanos(1_000_000_000)?,
+                known.checked_add_nanos(1_000_000_000)?,
+            )?,
+            PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)?,
+            CorporateActionPolicy::new(CorporateActionAdjustment::Raw, NonZeroU32::MIN),
+            MissingValuePolicy::Reject,
+            SourceIdentifier::try_from(contract.implementation_revision())?,
+            Some(study),
+        ),
+        ResearchUse::LocalAnalysis,
+        research_limits,
+        DatasetOutputAuthorization::try_new(
+            SourceId::try_from("market-squawk.derived")?,
+            RightsBasis::reviewed_terms("https://example.test/local-derived/v1", digest(225))?,
+            digest(226),
+            None,
+        )?,
+        DatasetBuildLimits::try_new(
+            32,
+            1,
+            1,
+            1,
+            16 * 1024 * 1024,
+            Duration::from_secs(20),
+            pit_limits,
+            UniverseLimits::try_new(8, 1024 * 1024)?,
+            CorporateActionLimits::try_new(
+                NonZeroUsize::new(8).ok_or("nonzero action count")?,
+                NonZeroUsize::new(1024 * 1024).ok_or("nonzero action bytes")?,
+            )?,
+        )?,
+    )?;
+    let built = service
+        .dataset_builder()
+        .build(request.clone(), cancellation.clone())
+        .await
+        .map_err(|error| format!("SEC fiscal dataset construction: {error:?}"))?;
+    let attested_at = now()?;
+    let publication = publisher.publish(
+        &service,
+        contract,
+        &request,
+        &built,
+        FeatureDatasetProductionProofV1::try_from_financial_request(
+            &request,
+            attested_at,
+            attested_at.checked_add_nanos(120_000_000_000)?,
+        )?,
+        &cancellation,
+    )?;
+    let product_receipt = publication.receipt().canonical_json().to_vec();
+    let query_limits = QueryLimits::try_new_with_inline_bytes(
+        8,
+        4 * 1024 * 1024,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        1,
+        256,
+        256,
+        Duration::from_secs(30),
+    )?;
+    let epochs = service
+        .analytical_reader()
+        .feature_dataset_input_epochs(
+            contract,
+            built.manifest(),
+            query_limits,
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(epochs.epochs().len(), 1);
+    let epoch = epochs.epochs()[0].clone();
+    assert_eq!(epoch.instrument_id(), instrument);
+    assert_eq!(epoch.financial_current_fact(), Some(&original_fact));
+    assert_eq!(epoch.current_financial_amount()?, Decimal::from(1_000_000));
+    assert_eq!(epoch.source_selection_as_of(), known);
+    let epoch_bytes = epoch.canonical_bytes()?;
+    let mut wire: serde_json::Value = serde_json::from_slice(&epoch_bytes)?;
+    assert_eq!(
+        wire["input"]["identity_receipt"],
+        serde_json::to_value(&identity_receipt)?
+    );
+    let row = |bytes: &[u8]| {
+        PythonDatasetRow::try_new(
+            epoch.example_id(),
+            instrument.as_uuid().into_bytes(),
+            known,
+            None,
+            epoch.decision_coordinate().clone(),
+            None,
+            None,
+            4,
+            3,
+            1,
+            "research.reported-financial-amount",
+            1,
+            PythonDatasetValue::Decimal {
+                mantissa: 1_000_000,
+                scale: 0,
+            },
+            Some("msq.income.parent"),
+            Some("USD"),
+            [1; 32],
+            Some(bytes),
+        )
+    };
+    assert!(row(&epoch_bytes).is_ok());
+    let later = service
+        .sec_research_reader()
+        .select_by_identity(
+            SecResearchIdentityReadRequest::try_new(
+                instrument,
+                SecResearchFamily::CompanyFacts,
+                known.checked_add_nanos(1)?,
+                source_request.effective_cutoff().clone(),
+                PointInTimeRevisionMode::LatestKnown,
+                pit_limits,
+                16 * 1024 * 1024,
+            )?,
+            &raw_store,
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    let substituted = later.identity().receipt();
+    assert_ne!(substituted.canonical_bytes()?, identity_receipt);
+    wire["input"]["identity_receipt"] = serde_json::to_value(substituted.canonical_bytes()?)?;
+    assert!(matches!(
+        row(&serde_json::to_vec(&wire)?),
+        Err(PythonDatasetCatalogError::CorruptAdmission)
+    ));
+    // Matching the substituted digest cannot conceal its different selection cutoff.
+    wire["input"]["period"]["identity_receipt_digest"] =
+        serde_json::to_value(substituted.receipt_digest())?;
+    assert!(matches!(
+        row(&serde_json::to_vec(&wire)?),
+        Err(PythonDatasetCatalogError::CorruptAdmission)
+    ));
+    let saved_manifest = built.manifest().clone();
+    drop(later);
+    drop(epochs);
+    drop(publication);
+    drop(publisher);
+    drop(onboarding);
+    drop(service);
+    drop(raw_store);
+    let (reopened_composition, reopened_onboarding) =
+        AnalyticalDataService::open_with_provider_onboarding(
+            CatalogAuthority::open(config)?,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
+    let (reopened, reopened_publisher) = reopened_composition.into_parts();
+    let reopened_raw = paths.sealed_research_journal_store()?;
+    let replay = reopened
+        .sec_research_reader()
+        .select_by_identity(
+            source_request,
+            &reopened_raw,
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(
+        replay.identity().receipt().canonical_bytes()?,
+        identity_receipt
+    );
+    let SecResearchIdentityOutcome::Exact(replayed_facts) = replay.outcome() else {
+        return Err("reopened issuer source lost its exact relationship".into());
+    };
+    assert_eq!(replayed_facts.receipt(), selection_receipt);
+    let saved = reopened
+        .analytical_reader()
+        .feature_dataset(
+            contract,
+            saved_manifest.dataset_id(),
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or("saved fiscal product was not reopened")?;
+    assert_eq!(saved.generation().manifest(), &saved_manifest);
+    assert_eq!(saved.production_receipt().canonical_json(), product_receipt);
+    let reopened_epochs = reopened
+        .analytical_reader()
+        .feature_dataset_input_epochs(
+            contract,
+            &saved_manifest,
+            query_limits,
+            deadline(),
+            cancellation,
+        )
+        .await?;
+    assert_eq!(reopened_epochs.epochs(), &[epoch]);
+    assert_eq!(reopened_epochs.epochs()[0].canonical_bytes()?, epoch_bytes);
+    drop(reopened_publisher);
+    drop(reopened_onboarding);
     Ok(())
 }
 
@@ -6646,15 +7175,24 @@ struct SecResearchCaptureFixture {
     native_rows: Vec<serde_json::Value>,
 }
 
-fn sec_research_capture_fixture(base_ns: i64) -> Result<SecResearchCaptureFixture, Box<dyn Error>> {
+fn sec_research_capture_fixture(
+    base_ns: i64,
+    company_facts: bool,
+) -> Result<SecResearchCaptureFixture, Box<dyn Error>> {
     let source_id = SourceId::try_from("sec-edgar")?;
     let metadata_revision =
         MetadataRevision::new(SourceIdentifier::try_from("sec-edgar-contract-v1")?);
-    let dataset = SourceIdentifier::try_from("sec-submissions-exact-restart")?;
+    let dataset = SourceIdentifier::try_from(if company_facts {
+        "sec-company-facts-fiscal-restart"
+    } else {
+        "sec-submissions-exact-restart"
+    })?;
     let received_at = Timestamp::from_unix_nanos(base_ns);
-    let body = Bytes::from_static(
-        b"{\"cik\":\"0000320193\",\"filings\":{\"recent\":\"bounded-fixture\"}}",
-    );
+    let body = if company_facts {
+        Bytes::from_static(br#"{"cik":320193,"entityName":"Apple Inc.","facts":{"us-gaap":{"NetIncomeLoss":{"units":{"USD":[{"start":"2025-01-01","end":"2025-12-31","val":1000000,"accn":"0000320193-26-000001","fy":2025,"fp":"FY","form":"10-K","filed":"2026-01-30","frame":"CY2025"}]}}}}}"#)
+    } else {
+        Bytes::from_static(b"{\"cik\":\"0000320193\",\"filings\":{\"recent\":\"bounded-fixture\"}}")
+    };
     let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
     let capture = ProviderCaptureSetReceipt::try_new(
         source_id.clone(),
@@ -6778,7 +7316,10 @@ fn sec_research_capture_fixture(base_ns: i64) -> Result<SecResearchCaptureFixtur
     for (ordinal, (accession, form, effective, available, received, ingested, source_version)) in
         rows.into_iter().enumerate()
     {
-        let observation = sec_filing_observation(
+        if company_facts && ordinal != 0 {
+            break;
+        }
+        let filing = sec_filing_observation(
             accession,
             form,
             effective,
@@ -6788,6 +7329,64 @@ fn sec_research_capture_fixture(base_ns: i64) -> Result<SecResearchCaptureFixtur
             body_digest,
             source_version,
         )?;
+        let ResearchObservation::Filing(filing) = filing else {
+            return Err("SEC filing fixture has the wrong family".into());
+        };
+        let observation = if company_facts {
+            use market_squawk_domain::{
+                CalendarDate, FundamentalAmendmentStatus, FundamentalCadence,
+                FundamentalConsolidation, FundamentalDimensionContext, FundamentalFactContext,
+                FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+                FundamentalRestatementStatus, FundamentalRevisionOrder,
+            };
+            let start = CalendarDate::new(2025, 1, 1)?;
+            let end = CalendarDate::new(2025, 12, 31)?;
+            let filed_on = CalendarDate::new(2026, 1, 30)?;
+            ResearchObservation::Fundamental(FundamentalObservation::new(
+                ResearchContext::new(
+                    filing.context().provenance().clone(),
+                    ResearchTime::try_new_with_coordinates(
+                        ResearchTemporalCoordinate::calendar_date(end),
+                        Some(ResearchTemporalCoordinate::calendar_date(filed_on)),
+                        RevisionNumber::new(1)?,
+                        None,
+                    )?,
+                )?,
+                market_squawk_domain::CompanyObservationSubject::Issuer(
+                    SourceIdentifier::try_from("0000320193")?,
+                ),
+                SourceIdentifier::try_from("us-gaap:NetIncomeLoss")?,
+                Decimal::from(1_000_000),
+                FundamentalFactContext::try_new(FundamentalFactContextInput {
+                    schema_version: SchemaVersion::CURRENT,
+                    period: FundamentalPeriod::duration(start, end)?,
+                    unit: SourceIdentifier::try_from("USD")?,
+                    accession: SourceIdentifier::try_from(accession)?,
+                    filing_form: Some(SourceIdentifier::try_from("10-K")?),
+                    amendment_status: FundamentalAmendmentStatus::Original,
+                    filed_on: Some(filed_on),
+                    frame: Some(SourceIdentifier::try_from("CY2025")?),
+                    fiscal_year: Some(2025),
+                    fiscal_period: Some(SourceIdentifier::try_from("FY")?),
+                    cadence: FundamentalCadence::Annual,
+                    xbrl_context_id: None,
+                    dimensions: FundamentalDimensionContext::unavailable(),
+                    consolidation: FundamentalConsolidation::Unavailable,
+                    revision_order: FundamentalRevisionOrder::new(
+                        RevisionNumber::new(1)?,
+                        SourceIdentifier::try_from("sec-company-facts-order-v1")?,
+                    ),
+                    restatement_status: FundamentalRestatementStatus::Unavailable,
+                })?,
+            )?)
+        } else {
+            ResearchObservation::Filing(filing)
+        };
+        let context = match &observation {
+            ResearchObservation::Fundamental(value) => value.context(),
+            ResearchObservation::Filing(value) => value.context(),
+            _ => return Err("unexpected SEC fixture family".into()),
+        };
         let payload = serde_json::to_vec(&observation)?;
         records.push(ExtractionRecord::try_new_with_time(
             &request,
@@ -6796,10 +7395,8 @@ fn sec_research_capture_fixture(base_ns: i64) -> Result<SecResearchCaptureFixtur
                 DigestAlgorithm::Sha256,
                 Sha256::digest(&payload).into(),
             )),
-            ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(effective)),
-            Some(ResearchTemporalCoordinate::exact(
-                Timestamp::from_unix_nanos(available),
-            )),
+            context.time().effective().clone(),
+            context.time().published().cloned(),
             SourceAvailabilityEvidence::Observed {
                 available_at: Timestamp::from_unix_nanos(available),
                 evidence: SourceIdentifier::try_from("sec-filing-publication-clock")?,
@@ -6854,7 +7451,7 @@ fn sec_filing_observation(
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("sec-edgar")?,
-            instrument_id: Some(dataset_membership_instrument()?),
+            instrument_id: None,
             venue_id: None,
             source_identifier: SourceIdentifier::try_from(source_record)?,
             source_timestamp: None,
@@ -6881,6 +7478,9 @@ fn sec_filing_observation(
     )?;
     Ok(ResearchObservation::Filing(FilingObservation::new(
         context,
+        market_squawk_domain::CompanyObservationSubject::Issuer(SourceIdentifier::try_from(
+            "0000320193",
+        )?),
         SourceIdentifier::try_from(form)?,
         SourceIdentifier::try_from(accession)?,
     )?))
@@ -9572,13 +10172,15 @@ fn sec_research_source() -> Result<SourceMetadata, Box<dyn Error>> {
 fn sec_research_company_identity(
     parent_digest: EvidenceDigest,
     base_ns: i64,
+    surface: CompanyIdentitySurface,
+    identity_digest: EvidenceDigest,
 ) -> Result<CompanyIdentityObservation, Box<dyn Error>> {
     Ok(CompanyIdentityObservation::try_new(
         CompanyIdentityObservationInput {
             schema_version: SchemaVersion::CURRENT,
             source_id: SourceId::try_from("sec-edgar")?,
             provider_company_id: SourceIdentifier::try_from("0000320193")?,
-            surface: CompanyIdentitySurface::SecSubmissions,
+            surface,
             conformed_name: "Apple Inc.".to_owned(),
             former_names: Vec::new(),
             entity_type: Some("operating".to_owned()),
@@ -9588,7 +10190,7 @@ fn sec_research_company_identity(
             parent_ingest_payload_evidence: ExactPayloadEvidence::from_content_digest(
                 parent_digest,
             ),
-            identity_payload_evidence: ExactPayloadEvidence::from_content_digest(digest(218)),
+            identity_payload_evidence: ExactPayloadEvidence::from_content_digest(identity_digest),
             received_at: Timestamp::from_unix_nanos(base_ns),
             availability: DomainAvailabilityEvidence::evidenced(
                 Timestamp::from_unix_nanos(base_ns),

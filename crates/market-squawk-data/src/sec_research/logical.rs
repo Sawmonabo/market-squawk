@@ -64,11 +64,12 @@ impl SecResearchReadCapability {
             return Err(mismatch());
         }
         let binding = self
-            .authority
-            .try_lock()
-            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
-            .catalog()
-            .provider_logical_publication_binding(request.provider_binding_digest())?
+            .identities
+            .logical_publication_binding(
+                request.provider_binding_digest(),
+                deadline,
+                &cancellation,
+            )?
             .ok_or_else(mismatch)?;
         if binding.binding_digest() != request.provider_binding_digest()
             || binding.terminal().source_id() != &source_id
@@ -330,7 +331,15 @@ impl SecResearchReadCapability {
                     || coordinate.canonical_row_ordinal < expected.row_range().first_ordinal()
                     || coordinate.canonical_row_ordinal >= end
                     || !request.family().accepts(&observation)
+                    || !observation_has_issuer(
+                        &observation,
+                        company_identity.observation().provider_company_id(),
+                    )
                     || observation_context(&observation).provenance().source_id() != &source_id
+                    || observation_context(&observation)
+                        .provenance()
+                        .instrument_id()
+                        .is_some()
                 {
                     return Err(mismatch());
                 }

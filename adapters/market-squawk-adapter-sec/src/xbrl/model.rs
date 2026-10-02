@@ -2310,9 +2310,8 @@ mod tests {
         use market_squawk_domain::{
             AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
             EffectiveInterval, InstrumentId, ProviderIdentityEvidence, ProviderIdentityRecord,
-            ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderInstrumentId,
-            ResearchTemporalCoordinate, RevisionBoundPayloadEvidence, SchemaVersion,
-            SequenceCapability,
+            ProviderIdentityRecordInput, ProviderInstrumentId, ResearchTemporalCoordinate,
+            RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
         };
         use market_squawk_sources::{
             AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
@@ -2364,19 +2363,6 @@ mod tests {
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
         let instrument: InstrumentId = "0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1".parse()?;
-        let identities = Arc::new(ProviderIdentityRegistry::try_from_records(vec![
-            ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-                instrument_id: instrument,
-                source_id: source_id.clone(),
-                provider_instrument_id: ProviderInstrumentId::try_from("0000320193")?,
-                evidence: ProviderIdentityEvidence::from_content_digest(filing.evidence()),
-                source_timestamp: None,
-                observed_at: at,
-                metadata_revision: revision.clone(),
-                validity,
-                supersedes: None,
-            }),
-        ])?);
         let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
             SchemaVersion::CURRENT,
             source_id.clone(),
@@ -2466,7 +2452,6 @@ mod tests {
         )?;
         let handoff = crate::extraction::prepare_filing_xbrl_capture_from_admitted_root(
             store,
-            identities,
             source_id.clone(),
             revision,
             SecParserLimits::production_defaults(),
@@ -2488,6 +2473,10 @@ mod tests {
         )?;
         assert_eq!(stream.total_records(), 2);
         let company = stream.company_identity().clone();
+        assert_eq!(
+            company.surface(),
+            market_squawk_domain::CompanyIdentitySurface::SecFilingXbrl
+        );
         let company_json = serde_json::to_vec(&company)?;
         let company_digest =
             EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(company_json).into());
@@ -2595,6 +2584,17 @@ mod tests {
         while let Some(chunk) = stream.next_chunk(&cancellation)? {
             assert_eq!(chunk.batch().records().len(), 1);
             assert_eq!(chunk.row_capture_page_ordinals(), &[1]);
+            let observation: market_squawk_domain::ResearchObservation =
+                serde_json::from_slice(chunk.batch().records()[0].payload())?;
+            let market_squawk_domain::ResearchObservation::Fundamental(fact) = observation else {
+                return Err("unexpected filing canonical observation".into());
+            };
+            assert_eq!(fact.context().provenance().instrument_id(), None);
+            assert_eq!(fact.context().provenance().source_id(), company.source_id());
+            assert_eq!(
+                fact.subject().issuer_id(),
+                Some(company.provider_company_id())
+            );
             let start = stream.emitted_records() - chunk.batch().records().len();
             let (batch, _, native, page_ordinals) = chunk.into_parts();
             let batch = batch.try_bind_provider_capture(receipt.capture())?;
@@ -2968,6 +2968,108 @@ mod tests {
             market_squawk_domain::CalendarDate::new(2025, 7, 24)?
         );
         assert_eq!(common_shares.knowledge_at(), knowledge_at);
+        let market_squawk_data::SecResearchIdentityOutcome::Exact(identity_facts) =
+            identity_selected.outcome()
+        else {
+            return Err("selected filing identity missing".into());
+        };
+        let mut eps_row = None;
+        for row in identity_facts.selected() {
+            if let Some(market_squawk_domain::ResearchObservation::Fundamental(fact)) =
+                identity_facts
+                    .decoded_rows()
+                    .get(usize::try_from(row.row().row_ordinal())?)?
+                && fact.xbrl_evidence().is_some_and(|xbrl| {
+                    xbrl.concept().local_name().as_str() == "EarningsPerShareDiluted"
+                })
+            {
+                eps_row = Some(row.row().row_ordinal());
+            }
+        }
+        let eps_row = eps_row.ok_or("selected filing EPS missing")?;
+        let eps = market_squawk_valuation::ValuationInput::from_selected_fundamental(
+            &identity_selected,
+            eps_row,
+            market_squawk_valuation::InputSignificance::Significant,
+        )?;
+        assert_eq!(eps.subject_instrument_id(), instrument);
+        assert_eq!(
+            eps.amount().money().amount(),
+            rust_decimal::Decimal::new(650, 2)
+        );
+        assert_eq!(
+            eps.amount().basis(),
+            market_squawk_valuation::ValuationAmountBasis::PerInstrumentUnit
+        );
+        assert!(
+            market_squawk_valuation::ValuationInput::from_selected_fundamental(
+                &identity_selected,
+                u32::MAX,
+                market_squawk_valuation::InputSignificance::Significant,
+            )
+            .is_err()
+        );
+        assert!(
+            identity_selected
+                .identity()
+                .receipt()
+                .validate_selected_company(
+                    "11111111-1111-4111-8111-111111111111".parse()?,
+                    &company,
+                    company_digest,
+                    knowledge_at,
+                )
+                .is_err()
+        );
+        assert!(
+            identity_selected
+                .identity()
+                .receipt()
+                .validate_selected_company(
+                    instrument,
+                    &company,
+                    EvidenceDigest::new(DigestAlgorithm::Sha256, [9; 32]),
+                    knowledge_at,
+                )
+                .is_err()
+        );
+        let valuation_limits = market_squawk_valuation::FairValueLimits::try_new(
+            market_squawk_valuation::FairValueLimitInput {
+                max_measurements: 2,
+                max_inputs_per_measurement: 2,
+                max_records_per_family: 4,
+                max_query_results: 4,
+                max_retained_bytes: 2 * 1024 * 1024,
+            },
+        )?;
+        // Exercise retained financial evidence, without treating the reported EPS as a quote.
+        let measurement = market_squawk_valuation::ValuationMeasurement::try_new(
+            market_squawk_valuation::ValuationMeasurementSpec {
+                account_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse()?,
+                instrument_id: instrument,
+                amount: eps.amount(),
+                measurement_at: knowledge_at,
+                prepared_at: knowledge_at,
+                prepared_by: market_squawk_valuation::ActorId::try_from(
+                    "filing-evidence-preparer",
+                )?,
+                method: market_squawk_valuation::ValuationMethod::MarketApproach,
+                inputs: vec![eps.clone()],
+            },
+        )?;
+        let mut valuation = market_squawk_valuation::FairValueService::open(
+            service.fair_value_catalog(),
+            valuation_limits,
+        )?;
+        let decision = valuation.classify(
+            measurement.clone(),
+            market_squawk_valuation::ClassificationRuleset::current(1_000_000_000)?,
+        )?;
+        assert_ne!(
+            decision.hierarchy(),
+            market_squawk_domain::FairValueHierarchy::Level1
+        );
+        drop(valuation);
         let expected_request = selected.request().clone();
         let expected_receipt = selected.receipt();
         let identity_request = identity_selected.request().clone();
@@ -2975,6 +3077,9 @@ mod tests {
         drop(selected);
         drop(committed);
         drop(service);
+        // The physical capture receipt pins the original journal owner through its segment.
+        // Its persisted evidence is already bound into the publication and expected read receipt.
+        drop(receipt);
         drop(raw_store);
         let reopened = AnalyticalDataService::open(
             CatalogAuthority::open(catalog_config)?,
@@ -2983,6 +3088,19 @@ mod tests {
             store_config,
         )?;
         let reopened_raw = paths.sealed_research_journal_store()?;
+        let valuation_replay = market_squawk_valuation::FairValueService::open(
+            reopened.fair_value_catalog(),
+            valuation_limits,
+        )?;
+        assert_eq!(
+            valuation_replay.measurement(measurement.id()).as_deref(),
+            Some(&measurement),
+        );
+        assert_eq!(
+            valuation_replay.decision(decision.id()).as_deref(),
+            Some(decision.as_ref())
+        );
+        drop(valuation_replay);
         let replay = reopened
             .sec_research_reader()
             .select(
@@ -2993,6 +3111,16 @@ mod tests {
             )
             .await?;
         assert_eq!(replay.receipt(), expected_receipt);
+        for observation in replay.decoded_rows().iter() {
+            let market_squawk_domain::ResearchObservation::Fundamental(fact) = observation? else {
+                return Err("unexpected reopened filing observation".into());
+            };
+            assert_eq!(fact.context().provenance().instrument_id(), None);
+            assert_eq!(
+                fact.subject().issuer_id(),
+                Some(company.provider_company_id())
+            );
+        }
         assert_eq!(
             replay
                 .filing_xbrl()
@@ -3020,6 +3148,14 @@ mod tests {
         assert_eq!(
             market_squawk_valuation::CommonShareFilingEvidence::try_from_filing(&identity_replay)?,
             common_shares
+        );
+        assert_eq!(
+            market_squawk_valuation::ValuationInput::from_selected_fundamental(
+                &identity_replay,
+                eps_row,
+                market_squawk_valuation::InputSignificance::Significant,
+            )?,
+            eps
         );
         eprintln!("physical filing and financial identity/restart assertions passed");
         // Optional original-filing regression; this exercises the production indexed parser,

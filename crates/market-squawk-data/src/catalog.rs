@@ -78,7 +78,7 @@ pub use self::company_security::{
     IndustryClassificationVersion, IndustryCohortCompleteness, IndustryCohortExclusion,
     IndustryCohortSelection, IndustryCohortSelectionReceipt, MAX_COMPANY_SECURITY_SELECTION_ROWS,
     SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery,
-    SecFundamentalIdentitySelection,
+    SecFundamentalIdentitySelection, sec_listing_exchange_matches_venue,
 };
 pub use self::diagnostics::{CatalogDiagnosticSnapshot, ProviderOnboardingDiagnostic};
 pub use self::fair_value::{

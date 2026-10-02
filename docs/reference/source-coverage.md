@@ -444,7 +444,8 @@ At the reviewed commit, release and rights gates have concrete consequences:
 
 - SEC EDGAR and unregistered BLS v1 are available under their exact no-key public-profile
   constraints and digest-bound authority decisions. SEC activation still requires a truthful
-  declared contact and the exact CIK-to-instrument mapping consumed by normalization.
+  declared contact and selected ten-digit issuer CIKs. Company facts and filings retain issuer
+  ownership; selected-security use requires a separately verified company/security relationship.
 - Registered BLS v2 remains a distinct `refresh_required`, provider-keyed surface; BLS v1
   availability does not authorize or activate v2.
 - FRED revision 5 is rights-limited. The shipping `Source.Inspect` boundary performs bounded

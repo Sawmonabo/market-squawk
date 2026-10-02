@@ -221,13 +221,9 @@ impl SecLiveFundSource {
     pub(crate) async fn publish_company_research(
         &self,
         cik: &str,
-        instrument_id: InstrumentId,
         deadline: std::time::Instant,
         cancellation: CancellationToken,
     ) -> Result<(), SecLiveFundApplicationError> {
-        use super::super::company_research::{
-            CompanyResearchReadCapability, CompanyResearchRequest, ResearchRevisionPolicy,
-        };
         use std::num::{NonZeroU32, NonZeroU64};
         self.validate_current()?;
         let started_at = system_timestamp()?;
@@ -286,31 +282,8 @@ impl SecLiveFundSource {
                 )
                 .await?;
             precommit.validate_precommit()?;
-            let knowledge_at = system_timestamp()?;
-            use chrono::Datelike as _;
-            let date = chrono::DateTime::from_timestamp_nanos(knowledge_at.unix_nanos());
-            let date = market_squawk_domain::CalendarDate::new(
-                u16::try_from(date.year())
-                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
-                u8::try_from(date.month())
-                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
-                u8::try_from(date.day())
-                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
-            )
-            .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?;
-            let request = CompanyResearchRequest::try_new(
-                instrument_id,
-                knowledge_at,
-                market_squawk_domain::ResearchTemporalCoordinate::calendar_date(date),
-                ResearchRevisionPolicy::LatestKnown,
-            )?;
-            let reader = CompanyResearchReadCapability::new(Arc::clone(&self.research));
-            let read = reader
-                .read_company(request, deadline, cancellation.child_token())
-                .await?;
-            reader
-                .verify_company_restart(&read, deadline, cancellation.child_token())
-                .await?;
+            // Publication retains exact issuer evidence. Security attribution belongs to the
+            // selected financial reader and must not gate successful company acquisition.
             self.validate_current()?;
             Ok(())
         }

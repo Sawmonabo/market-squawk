@@ -277,8 +277,9 @@ Nullability is structural, never shorthand for zero or an empty string:
 ## 6. Closed logical schema families
 
 The names below are stable logical/registry families. Physical columns, dictionary encodings, and
-partition layouts are added only through `DatasetSchemaRegistry` and a migration that binds exact
-name, nonzero version, and fingerprint.
+partition layouts bind exact name, nonzero version and fingerprint through `DatasetSchemaRegistry`.
+Greenfield V1 changes update the active schema and affected consumers in place; they do not add a
+compatibility stack or migration program.
 
 ### 6.1 `market_squawk.instrument_lifecycle`
 
@@ -298,8 +299,9 @@ company/security link events.
   renamed, successor/predecessor, and contract expiration where supported;
 - source revision, effective interval, observed/available/ingested/published chronology, and raw
   lineage;
-- mapping confidence is not sufficient by itself: direct crosswalk and operator-authorized
-  resolution remain distinct evidence.
+- mapping confidence is not sufficient by itself: corroborated source-qualified listing, direct
+  crosswalk and operator-authorized resolution remain distinct evidence. Automatic listing
+  resolution retains exact submissions, listing row/classification, venue and parent revisions.
 
 **Natural family:** stable canonical identity plus definition/lifecycle facet and effective-start
 coordinate. A successor appends a contiguous revision and advances a current pointer atomically.
@@ -373,8 +375,13 @@ selection.
 context-selection policy, source manifests, and formula/version digests. Do not collapse filings
 into a rigid preselected statement or overwrite reported facts with derived values.
 
-**Natural families:** retain the existing PIT keys: filing source + instrument + accession;
-fundamental source + instrument + concept + unit + exact fundamental period/context family.
+**Natural families:** filing source + explicit subject + accession; fundamental source +
+explicit subject + concept + unit + exact fundamental period/context family. The subject is a
+source-native issuer or a source-attributed canonical instrument. SEC observations carry the actual
+CIK as their issuer subject, with no invented instrument. Revision selection includes that subject,
+so identical concepts and periods from different issuers remain distinct. Selected-security use
+requires the exact retained company/security relationship receipt; issuer facts do not establish
+share-class economics.
 
 ### 6.6 Macro and rate observations
 

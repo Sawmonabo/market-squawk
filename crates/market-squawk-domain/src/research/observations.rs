@@ -5,8 +5,8 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    CalendarDate, Currency, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, Money,
-    PayloadReference, ProviderInstrumentId, ResearchTemporalCoordinate, Timestamp,
+    CalendarDate, Currency, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId,
+    Money, PayloadReference, ProviderInstrumentId, ResearchTemporalCoordinate, Timestamp,
 };
 
 use super::{
@@ -15,27 +15,80 @@ use super::{
     validate_corporate_action,
 };
 
+/// Explicit owner of a filing or fundamental fact.
+///
+/// An issuer identifier is qualified by the observation's provenance source. It is not a
+/// tradable security identity; selected-security use requires a separately verified relationship.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum CompanyObservationSubject {
+    /// Source-native issuer identity, such as an SEC CIK.
+    Issuer(SourceIdentifier),
+    /// Source-authored attribution to one canonical security.
+    Instrument(InstrumentId),
+}
+
+impl CompanyObservationSubject {
+    /// Returns security attribution only when explicitly carried by this observation.
+    pub const fn instrument_id(&self) -> Option<InstrumentId> {
+        match self {
+            Self::Instrument(instrument) => Some(*instrument),
+            Self::Issuer(_) => None,
+        }
+    }
+
+    /// Returns the source-qualified issuer coordinate, without inferring a security.
+    pub const fn issuer_id(&self) -> Option<&SourceIdentifier> {
+        match self {
+            Self::Issuer(issuer) => Some(issuer),
+            Self::Instrument(_) => None,
+        }
+    }
+
+    fn validate_context(&self, context: &ResearchContext) -> Result<(), ResearchError> {
+        if self.instrument_id() == context.provenance().instrument_id() {
+            Ok(())
+        } else {
+            Err(ResearchError::CompanySubjectMismatch)
+        }
+    }
+}
+
 /// Regulatory or issuer filing identity and point-in-time context.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FilingObservation {
     context: ResearchContext,
+    subject: CompanyObservationSubject,
     form_type: SourceIdentifier,
     accession: SourceIdentifier,
 }
 
 impl FilingObservation {
-    /// Constructs an instrument-scoped filing observation.
+    /// Constructs a filing observation with its explicit issuer or security owner.
+    /// Issuer-owned filings acquire security attribution only through a verified relationship.
     pub fn new(
         context: ResearchContext,
+        subject: CompanyObservationSubject,
         form_type: SourceIdentifier,
         accession: SourceIdentifier,
     ) -> Result<Self, ResearchError> {
-        require_instrument(&context)?;
+        subject.validate_context(&context)?;
         Ok(Self {
             context,
+            subject,
             form_type,
             accession,
         })
+    }
+
+    /// Returns the explicit source-qualified owner.
+    pub const fn subject(&self) -> &CompanyObservationSubject {
+        &self.subject
     }
 
     /// Returns point-in-time context and provenance.
@@ -58,6 +111,7 @@ impl FilingObservation {
 #[serde(deny_unknown_fields)]
 struct FilingObservationWire {
     context: ResearchContext,
+    subject: CompanyObservationSubject,
     form_type: SourceIdentifier,
     accession: SourceIdentifier,
 }
@@ -68,7 +122,8 @@ impl<'de> Deserialize<'de> for FilingObservation {
         D: Deserializer<'de>,
     {
         let wire = FilingObservationWire::deserialize(deserializer)?;
-        Self::new(wire.context, wire.form_type, wire.accession).map_err(serde::de::Error::custom)
+        Self::new(wire.context, wire.subject, wire.form_type, wire.accession)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -76,6 +131,7 @@ impl<'de> Deserialize<'de> for FilingObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FundamentalObservation {
     context: ResearchContext,
+    subject: CompanyObservationSubject,
     concept: SourceIdentifier,
     value: Decimal,
     fact_context: FundamentalFactContext,
@@ -83,17 +139,20 @@ pub struct FundamentalObservation {
 }
 
 impl FundamentalObservation {
-    /// Constructs an instrument-scoped exact fundamental observation.
+    /// Constructs an exact fundamental fact with its explicit issuer or security owner.
+    /// Issuer-owned facts require a verified relationship before use for a selected security.
     pub fn new(
         context: ResearchContext,
+        subject: CompanyObservationSubject,
         concept: SourceIdentifier,
         value: Decimal,
         fact_context: FundamentalFactContext,
     ) -> Result<Self, ResearchError> {
-        require_instrument(&context)?;
         fact_context.validate_research_context(&context)?;
+        subject.validate_context(&context)?;
         Ok(Self {
             context,
+            subject,
             concept,
             value: value.normalize(),
             fact_context,
@@ -105,21 +164,23 @@ impl FundamentalObservation {
     ///
     /// # Errors
     ///
-    /// Rejects missing instrument identity or evidence that does not produce `value` after its
+    /// Rejects evidence that does not produce `value` after its
     /// retained Inline-XBRL scale and sign transforms.
     pub fn new_with_xbrl_evidence(
         context: ResearchContext,
+        subject: CompanyObservationSubject,
         concept: SourceIdentifier,
         value: Decimal,
         fact_context: FundamentalFactContext,
         xbrl_evidence: XbrlFactEvidence,
     ) -> Result<Self, ResearchError> {
-        require_instrument(&context)?;
         fact_context.validate_research_context(&context)?;
         fact_context.validate_xbrl_evidence(&xbrl_evidence)?;
         xbrl_evidence.validate_observation(&concept, fact_context.unit(), value)?;
+        subject.validate_context(&context)?;
         Ok(Self {
             context,
+            subject,
             concept,
             value: value.normalize(),
             fact_context,
@@ -130,6 +191,11 @@ impl FundamentalObservation {
     /// Returns the exact decimal value.
     pub const fn value(&self) -> Decimal {
         self.value
+    }
+
+    /// Returns the explicit source-qualified owner.
+    pub const fn subject(&self) -> &CompanyObservationSubject {
+        &self.subject
     }
 
     /// Returns point-in-time context and provenance.
@@ -162,6 +228,7 @@ impl FundamentalObservation {
 #[serde(deny_unknown_fields)]
 struct FundamentalObservationWire {
     context: ResearchContext,
+    subject: CompanyObservationSubject,
     concept: SourceIdentifier,
     value: Decimal,
     fact_context: FundamentalFactContext,
@@ -181,12 +248,19 @@ impl<'de> Deserialize<'de> for FundamentalObservation {
         match wire.xbrl_evidence.0 {
             Some(evidence) => Self::new_with_xbrl_evidence(
                 wire.context,
+                wire.subject,
                 wire.concept,
                 wire.value,
                 wire.fact_context,
                 evidence,
             ),
-            None => Self::new(wire.context, wire.concept, wire.value, wire.fact_context),
+            None => Self::new(
+                wire.context,
+                wire.subject,
+                wire.concept,
+                wire.value,
+                wire.fact_context,
+            ),
         }
         .map_err(serde::de::Error::custom)
     }

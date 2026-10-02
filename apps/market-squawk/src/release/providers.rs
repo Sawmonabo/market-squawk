@@ -198,7 +198,6 @@ struct ResearchPublicationEvidence {
 #[serde(deny_unknown_fields)]
 struct SecPublicationEvidence {
     cik: String,
-    instrument_id: String,
     observation_kind: String,
     quality: String,
     query_operation: String,
@@ -1586,7 +1585,6 @@ async fn verify_sec_publication(
     if row_count != publication.row_count {
         bail!("SEC query did not return the exact published row set");
     }
-    let mut instruments = BTreeSet::new();
     for row in rows {
         let row = row
             .as_object()
@@ -1613,7 +1611,8 @@ async fn verify_sec_publication(
                 };
                 (
                     context,
-                    value.accession() == provenance.source_identifier()
+                    value.subject().issuer_id().map(SourceIdentifier::as_str) == Some(cik)
+                        && value.accession() == provenance.source_identifier()
                         && !value.form_type().as_str().is_empty()
                         && context.time().effective().calendar_date_value().is_some()
                         && published_matches,
@@ -1625,7 +1624,8 @@ async fn verify_sec_publication(
                 let fact_context = value.fact_context();
                 (
                     context,
-                    provenance.source_timestamp().is_none()
+                    value.subject().issuer_id().map(SourceIdentifier::as_str) == Some(cik)
+                        && provenance.source_timestamp().is_none()
                         && fact_context.filing_form().is_some()
                         && fact_context.period().end()
                             == context
@@ -1653,10 +1653,6 @@ async fn verify_sec_publication(
             _ => bail!("SEC query returned the wrong canonical observation family"),
         };
         let provenance = context.provenance();
-        let instrument_id = provenance
-            .instrument_id()
-            .ok_or_else(|| anyhow!("SEC observation omitted stable instrument identity"))?
-            .to_string();
         let payload_matches = matches!(
             provenance.payload_reference(),
             PayloadReference::ContentHash(hash)
@@ -1670,6 +1666,7 @@ async fn verify_sec_publication(
         );
         if !source_specific_valid
             || provenance.source_id().as_str() != SEC_EDGAR_SOURCE_ID
+            || provenance.instrument_id().is_some()
             || provenance.venue_id().is_some()
             || provenance.quality() != DataQuality::OfficialDelayed
             || provenance.ingested_at() < provenance.received_at()
@@ -1677,7 +1674,7 @@ async fn verify_sec_publication(
             || !availability_matches
             || row.get("observation_kind").and_then(Value::as_str) != Some(observation_kind)
             || row.get("source_id").and_then(Value::as_str) != Some(SEC_EDGAR_SOURCE_ID)
-            || row.get("instrument_id").and_then(Value::as_str) != Some(instrument_id.as_str())
+            || !row.get("instrument_id").is_some_and(Value::is_null)
             || row.get("venue_id").is_some_and(|value| !value.is_null())
             || row.get("source_identifier").and_then(Value::as_str)
                 != Some(provenance.source_identifier().as_str())
@@ -1690,18 +1687,9 @@ async fn verify_sec_publication(
         {
             bail!("SEC canonical row lost direct source, time, quality, or payload provenance");
         }
-        instruments.insert(instrument_id);
     }
-    if instruments.len() != 1 {
-        bail!("SEC publication does not bind one stable instrument identity");
-    }
-    let instrument_id = instruments
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("SEC publication does not bind one stable instrument identity"))?;
     Ok(SecPublicationEvidence {
         cik: cik.to_owned(),
-        instrument_id,
         observation_kind: observation_kind.to_owned(),
         quality: "official_delayed".to_owned(),
         query_operation: operation.to_owned(),
@@ -2184,11 +2172,14 @@ async fn create_release_paper_account(
         choice.pointer("/amount/amount").and_then(Value::as_str)
             == Some(fixture.virtual_cash_amount)
     })?;
-    let cash = preparation.get("virtualCashChoices")
+    let cash = preparation
+        .get("virtualCashChoices")
         .and_then(Value::as_array)
-        .and_then(|choices| choices.iter().find(|choice| {
-            choice.get("choiceToken").and_then(Value::as_str) == Some(cash_choice.as_str())
-        }))
+        .and_then(|choices| {
+            choices.iter().find(|choice| {
+                choice.get("choiceToken").and_then(Value::as_str) == Some(cash_choice.as_str())
+            })
+        })
         .ok_or_else(|| anyhow!("release virtual-cash choice is absent"))?;
     let currency = required_text(cash.pointer("/amount/currency"), "virtual-cash currency")?;
     let currency_choice = exact_release_choice_token(&preparation, "currencyChoices", |choice| {
@@ -2210,9 +2201,13 @@ async fn create_release_paper_account(
         origin,
     )
     .await?;
-    if preview.pointer("/virtualCash/amount").and_then(Value::as_str)
+    if preview
+        .pointer("/virtualCash/amount")
+        .and_then(Value::as_str)
         != Some(fixture.virtual_cash_amount)
-        || preview.pointer("/virtualCash/currency").and_then(Value::as_str)
+        || preview
+            .pointer("/virtualCash/currency")
+            .and_then(Value::as_str)
             != Some(currency.as_str())
         || preview.get("estimatedTradingCost").and_then(Value::as_str)
             != Some(fixture.estimated_trading_cost)
@@ -2222,7 +2217,8 @@ async fn create_release_paper_account(
         bail!("virtual account preview does not match the explicit release fixture");
     }
     let confirmation_token = required_text(
-        preview.get("confirmationToken"), "virtual account confirmationToken",
+        preview.get("confirmationToken"),
+        "virtual account confirmationToken",
     )?;
     let created = invoke_with_origin(
         application,

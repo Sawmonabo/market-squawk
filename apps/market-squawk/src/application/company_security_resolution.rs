@@ -1,10 +1,11 @@
-//! Desktop-consumer operator workflow for evidence-authorized company/security relationships.
+//! Application workflow for evidence-authorized company/security relationships.
 //!
 //! This module composes pure catalog capabilities without teaching the catalog, service, or MCP
-//! layer a Desktop workflow. Ticker, name, and exchange associations are absent from every
-//! authority-bearing input. A preview is process-local, bounded, immutable, and one-use; final
+//! layer a Desktop workflow. Automatic resolution corroborates retained issuer and listing evidence.
+//! An operator preview is process-local, bounded, immutable, and one-use; final
 //! publication is still revalidated atomically by the catalog authority.
 
+mod automatic;
 mod digest;
 mod model;
 
@@ -98,12 +99,13 @@ struct CurrentRelationshipState {
     selection_knowledge_at: Timestamp,
 }
 
-/// Least-authority application coordinator for explicit operator resolution.
+/// Application coordinator for corroborated automatic and explicit operator resolution.
 pub struct CompanySecurityResolutionAuthority {
     company_identities: CompanyIdentityReadCapability,
     market_instruments: MarketDataInstrumentReadCapability,
     relationships: CompanySecurityIdentityReadCapability,
     publisher: CompanySecurityLinkPublicationCapability,
+    listings: market_squawk_data::ListingReferenceReadCapability,
     previews: Mutex<PreviewRegistry>,
 }
 
@@ -113,6 +115,7 @@ impl CompanySecurityResolutionAuthority {
         company_identities: CompanyIdentityReadCapability,
         market_instruments: MarketDataInstrumentReadCapability,
         publisher: CompanySecurityLinkPublicationCapability,
+        listings: market_squawk_data::ListingReferenceReadCapability,
     ) -> Self {
         let relationships = company_identities.security_relationships();
         Self {
@@ -120,6 +123,7 @@ impl CompanySecurityResolutionAuthority {
             market_instruments,
             relationships,
             publisher,
+            listings,
             previews: Mutex::new(PreviewRegistry::default()),
         }
     }

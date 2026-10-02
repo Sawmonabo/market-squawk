@@ -1177,6 +1177,13 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         "AAPL",
         100,
     )?;
+    let mut company_value = serde_json::to_value(&company)?;
+    company_value["associations"] = serde_json::json!([
+        {"ticker":"AAPL","exchange":"XNAS"},
+        {"ticker":"AAPLB","exchange":"XNAS"},
+        {"ticker":"AAPLP","exchange":"XNAS"}
+    ]);
+    let company: CompanyIdentityObservation = serde_json::from_value(company_value)?;
     let company_json = serde_json::to_string(&company)?;
     let company_digest = EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -1225,6 +1232,70 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         company_manifest.manifest_id(),
     )?;
 
+    // The same issuer retains independent company-facts and filing-acquisition parents.
+    // A newer filing companion must not replace the actual submissions corroboration.
+    let mut financial_parents = Vec::new();
+    for (surface, byte) in [
+        (CompanyIdentitySurface::SecCompanyFacts, 101),
+        (CompanyIdentitySurface::SecFilingXbrl, 102),
+    ] {
+        let catalog = CatalogAuthority::open(config.clone())?;
+        let payload = digest(byte);
+        let rights = catalog.admit_source_rights(test_rights_input(
+            company_source.source_id().clone(),
+            payload,
+            i64::MAX,
+        )?)?;
+        let reservation = catalog.reserve_ingest(
+            &IngestIdentity::try_new(
+                company_source.source_id().clone(),
+                payload,
+                SourceOperation::Persist,
+                surface.database_name(),
+            )?,
+            &rights,
+        )?;
+        let artifact = ArtifactRecord::try_new(
+            format!(
+                "company/apple/{}/part-0001.parquet",
+                surface.database_name()
+            ),
+            digest(byte + 10),
+            128,
+            shift_timestamp(reservation.requested_at(), 1)?,
+        )?;
+        let manifest = DatasetManifestRecord::try_new(
+            SourceIdentifier::try_from(format!("sec-apple-{}", surface.database_name()))?,
+            SchemaVersion::CURRENT,
+            artifact.artifact_id(),
+            digest(byte + 20),
+            shift_timestamp(reservation.requested_at(), 2)?,
+        );
+        catalog.publish_artifact_manifest(
+            &reservation,
+            std::slice::from_ref(&artifact),
+            &manifest,
+        )?;
+        catalog.complete_ingest(&reservation, ContractCompletion::Succeeded)?;
+        drop(catalog);
+        let mut value = serde_json::to_value(&company)?;
+        value["surface"] = serde_json::to_value(surface)?;
+        value["parent_ingest_payload_evidence"] =
+            serde_json::to_value(ExactPayloadEvidence::from_content_digest(payload))?;
+        let parent: CompanyIdentityObservation = serde_json::from_value(value)?;
+        let parent_digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(serde_json::to_vec(&parent)?).into(),
+        );
+        seed_company_identity_observation(
+            &database,
+            &parent,
+            reservation.run_id(),
+            manifest.manifest_id(),
+        )?;
+        financial_parents.push((parent, parent_digest));
+    }
+
     let authority = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
     let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
     let reader = MarketDataInstrumentReadCapability::new(
@@ -1234,7 +1305,11 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     )?;
     let relationship_publisher =
         CompanySecurityLinkPublicationCapability::new(Arc::clone(&authority));
-    let relationship_reader = CompanySecurityIdentityReadCapability::new(Arc::clone(&authority));
+    let relationship_reader = CompanySecurityIdentityReadCapability::new(
+        &*authority
+            .try_lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)?,
+    );
     let cancellation = CancellationToken::new();
     let deadline = || Instant::now() + Duration::from_secs(2);
     assert!(
@@ -1852,6 +1927,338 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             .instrument_id(),
         instrument_id
     );
+    // Automatic issuer authority retains exact submissions/listing/class evidence. Two
+    // common share classes may share an issuer; preferred stock must never be promoted.
+    let listing_source = listing_reference_source()?;
+    let listing_dataset = SourceIdentifier::try_from("company-security-listing-fixture")?;
+    let seed = listing_reference_generation(listing_source.clone(), None, 200, 91)?;
+    let mut listing_rows = seed.records().to_vec();
+    for (row_number, symbol, name, byte) in [
+        (3, "AAPLB", "Apple Inc. - Class B Common Stock", 94),
+        (4, "AAPLP", "Apple Inc. - Preferred Stock", 95),
+    ] {
+        listing_rows.push((
+            ListingReferenceFileKind::NasdaqListed,
+            ListingReferenceRecordInput::try_nasdaq_listed(
+                row_number,
+                symbol,
+                name,
+                VenueId::try_from("XNAS")?,
+                ListingReferenceMarketCategory::GlobalSelect,
+                ListingReferenceFinancialStatus::Normal,
+                false,
+                false,
+                100,
+                false,
+                SourceIdentifier::try_from(format!("row-{row_number}"))?,
+                ExactPayloadEvidence::from_content_digest(digest(byte)),
+                "0808202621:31",
+                Timestamp::from_unix_nanos(19),
+                Timestamp::from_unix_nanos(200),
+                seed.files()[0].payload_evidence().clone(),
+            )?,
+        ));
+    }
+    let listing_input = ListingReferenceGenerationInput::try_new(
+        listing_source.clone(),
+        None,
+        seed.files().to_vec(),
+        listing_rows,
+    )?;
+    let guard = authority
+        .try_lock()
+        .map_err(|_| CatalogError::AuthorityLockPoisoned)?;
+    guard.register_source(&listing_source, Timestamp::from_unix_nanos(10))?;
+    let listing_rights = guard.admit_source_rights(listing_reference_rights(
+        listing_source.source_id().clone(),
+        listing_input.source_payload_set_digest(),
+    )?)?;
+    let listing_reader = ListingReferenceReadCapability::new(
+        &guard,
+        listing_dataset.clone(),
+        listing_source.source_id().clone(),
+    );
+    drop(guard);
+    let listing_publisher = ListingReferencePublicationCapability::try_new(
+        Arc::clone(&authority),
+        listing_dataset.clone(),
+        listing_source.source_id().clone(),
+        listing_rights,
+    )?;
+    listing_publisher.publish(listing_input, deadline(), &cancellation)?;
+    let mut automatic_queries = Vec::new();
+    let mut automatic_selections = Vec::new();
+    let mut financial_queries = Vec::new();
+    let mut financial_selections = Vec::new();
+    for (id, symbol, is_preferred, byte) in [
+        ("00000000-0000-0000-0000-000000000103", "AAPL", false, 61),
+        ("00000000-0000-0000-0000-000000000104", "AAPLB", false, 71),
+        ("00000000-0000-0000-0000-000000000105", "AAPLP", true, 81),
+    ] {
+        let id: InstrumentId = id.parse()?;
+        let mut definition =
+            serde_json::to_value(market_data_definition(id, 10, None, "Apple", symbol, byte)?)?;
+        definition["venue_mappings"][0]["venue_symbol"] = serde_json::json!(symbol);
+        publisher.synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![serde_json::from_value(definition)?],
+                1,
+            )?,
+            deadline(),
+            &cancellation,
+        )?;
+        let market = reader
+            .latest(id, deadline(), &cancellation)?
+            .ok_or(CatalogError::InvalidRecord)?;
+        let listing = listing_reader
+            .exact_current(
+                symbol,
+                &VenueId::try_from("XNAS")?,
+                deadline(),
+                &cancellation,
+            )?
+            .ok_or(CatalogError::InvalidRecord)?;
+        let observed_at = market
+            .published_at()
+            .max(listing.generation().published_at());
+        let automatic = CompanySecurityIdentityLink::try_new(CompanySecurityIdentityLinkInput {
+            schema_version: SchemaVersion::CURRENT,
+            company_source_id: company.source_id().clone(),
+            provider_company_id: company.provider_company_id().clone(),
+            company_surface: company.surface(),
+            company_observation_digest: company_digest,
+            instrument_id: id,
+            market_instrument_revision_digest: market.revision_digest(),
+            security_kind: CompanySecurityKind::CommonEquity,
+            relationship_kind: CompanySecurityRelationshipKind::Issuer,
+            common_equity_suitability: CommonEquitySuitability::SuitableIssuerCommonEquity,
+            resolution_basis: CompanySecurityResolutionBasis::SourceQualifiedListing {
+                submissions_observation_digest: company_digest,
+                listing_source_id: listing_source.source_id().clone(),
+                listing_dataset_id: listing_dataset.clone(),
+                listing_generation_digest: listing.generation().generation_digest(),
+                listing_file_kind: SourceIdentifier::try_from("nasdaq_listed")?,
+                listing_row_number: listing.provider_row_number(),
+                listing_record_digest: listing.record_digest(),
+                listing_venue: listing.listing_venue().clone(),
+                listing_symbol: SourceIdentifier::try_from(symbol)?,
+                sec_ticker: SourceIdentifier::try_from(symbol)?,
+                sec_exchange: SourceIdentifier::try_from("XNAS")?,
+                classification_evidence: listing.record_payload_evidence().clone(),
+                ruleset: SourceIdentifier::try_from("sec-submissions-official-common-stock-v1")?,
+            },
+            relationship_evidence_rights: IdentifierRightsPolicyReference::new(
+                SourceIdentifier::try_from("source-qualified-personal-use")?,
+                IdentifierEntitlement::LicensedInternalUse,
+                SourceIdentifier::try_from(
+                    "https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs",
+                )?,
+            ),
+            effective_interval: EffectiveInterval::new(observed_at, None)?,
+            available_at: observed_at,
+            ingested_at: observed_at,
+            transition: CompanySecurityLinkTransition::Initial,
+        })?;
+        if is_preferred {
+            assert!(matches!(relationship_publisher.publish(automatic, deadline(), &cancellation),
+                Err(market_squawk_data::CompanySecurityIdentityCatalogError::UnverifiedIdentityAuthority)));
+            continue;
+        }
+        // An exact listing row from a different class cannot substitute for the selected one.
+        let mut wrong_class = serde_json::to_value(&automatic)?;
+        wrong_class["resolution_basis"]["sec_ticker"] = serde_json::json!("WRONG");
+        assert!(
+            relationship_publisher
+                .publish(
+                    serde_json::from_value(wrong_class)?,
+                    deadline(),
+                    &cancellation
+                )
+                .is_err()
+        );
+        let automatic_template = serde_json::to_value(&automatic)?;
+        let published = relationship_publisher.publish(automatic, deadline(), &cancellation)?;
+        let selected_query = SecFundamentalIdentityQuery::try_new(
+            company.source_id().clone(),
+            company.provider_company_id().clone(),
+            company.surface(),
+            company_digest,
+            published.record().published_at(),
+            published.record().published_at(),
+        )?
+        .for_instrument(id);
+        let guard = authority
+            .try_lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)?;
+        let selected = relationship_reader.sec_fundamental_identity_as_of(
+            &selected_query,
+            deadline(),
+            &cancellation,
+        )?;
+        assert_eq!(
+            selected.availability(),
+            SecFundamentalIdentityAvailability::Available
+        );
+        assert_eq!(selected.instrument_id(), Some(id));
+        assert_eq!(
+            relationship_reader
+                .exact(published.record().link_digest(), deadline(), &cancellation)?
+                .as_ref(),
+            Some(published.record())
+        );
+        assert_eq!(
+            relationship_reader
+                .exact_company_identity_by_digest(company_digest, deadline(), &cancellation)?
+                .ok_or(CatalogError::InvalidRecord)?
+                .observation(),
+            &company
+        );
+        let historical = SecFundamentalIdentityQuery::try_new(
+            company.source_id().clone(),
+            company.provider_company_id().clone(),
+            company.surface(),
+            company_digest,
+            Timestamp::from_unix_nanos(100),
+            published.record().published_at(),
+        )?
+        .for_instrument(id);
+        assert_ne!(
+            relationship_reader
+                .sec_fundamental_identity_as_of(&historical, deadline(), &cancellation)?
+                .availability(),
+            SecFundamentalIdentityAvailability::Available
+        );
+        drop(guard);
+        automatic_queries.push(selected_query);
+        automatic_selections.push(selected);
+        if symbol == "AAPL" {
+            for (parent, parent_digest) in &financial_parents {
+                let mut value = automatic_template.clone();
+                value["company_surface"] = serde_json::to_value(parent.surface())?;
+                value["company_observation_digest"] = serde_json::to_value(parent_digest)?;
+                let published = relationship_publisher.publish(
+                    serde_json::from_value(value)?,
+                    deadline(),
+                    &cancellation,
+                )?;
+                let query = SecFundamentalIdentityQuery::try_new(
+                    company.source_id().clone(),
+                    company.provider_company_id().clone(),
+                    parent.surface(),
+                    *parent_digest,
+                    published.record().published_at(),
+                    published.record().published_at(),
+                )?
+                .for_instrument(id);
+                let selected = relationship_reader.sec_fundamental_identity_as_of(
+                    &query,
+                    deadline(),
+                    &cancellation,
+                )?;
+                assert_eq!(
+                    selected.availability(),
+                    SecFundamentalIdentityAvailability::Available
+                );
+                assert_eq!(selected.instrument_id(), Some(id));
+                assert_eq!(selected.company_observation_digest(), *parent_digest);
+                assert!(matches!(
+                    published.record().link().resolution_basis(),
+                    CompanySecurityResolutionBasis::SourceQualifiedListing {
+                        submissions_observation_digest, ..
+                    } if *submissions_observation_digest == company_digest
+                ));
+                financial_queries.push(query);
+                financial_selections.push(selected);
+            }
+            // All three family parents remain available together at the newest cutoff.
+            for (surface, expected) in std::iter::once((company.surface(), company_digest)).chain(
+                financial_parents
+                    .iter()
+                    .map(|(parent, digest)| (parent.surface(), *digest)),
+            ) {
+                let selected = relationship_reader.instrument_company_as_of(
+                    id,
+                    company.source_id(),
+                    surface,
+                    financial_queries[1].knowledge_at(),
+                    CommonEquitySuitability::SuitableIssuerCommonEquity,
+                    deadline(),
+                    &cancellation,
+                )?;
+                assert_eq!(
+                    selected.disposition(),
+                    CompanySecurityIdentityDisposition::Complete
+                );
+                assert_eq!(
+                    selected.candidates()[0].link().company_observation_digest(),
+                    expected
+                );
+                assert_eq!(
+                    market_squawk_data::CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(
+                        &selected.receipt().canonical_bytes()?
+                    )?,
+                    *selected.receipt()
+                );
+            }
+        }
+    }
+    let issuer_only = SecFundamentalIdentityQuery::try_new(
+        company.source_id().clone(),
+        company.provider_company_id().clone(),
+        company.surface(),
+        company_digest,
+        automatic_queries[1].knowledge_at(),
+        automatic_queries[1].knowledge_at(),
+    )?;
+    assert_eq!(
+        relationship_reader
+            .sec_fundamental_identity_as_of(&issuer_only, deadline(), &cancellation)?
+            .availability(),
+        SecFundamentalIdentityAvailability::IdentityPending
+    );
+    // A refreshed directory invalidates current automatic authority, but never rewrites
+    // an earlier receipt or silently backdates the replacement relationship.
+    let previous_listing = listing_reader
+        .current(deadline(), &cancellation)?
+        .ok_or(CatalogError::InvalidRecord)?;
+    listing_publisher.publish(
+        listing_reference_generation(
+            listing_source.clone(),
+            Some(previous_listing.generation_digest()),
+            201,
+            96,
+        )?,
+        deadline(),
+        &cancellation,
+    )?;
+    let stale_automatic = relationship_reader.current(
+        &CompanySecurityIdentityQuery::new(
+            company.source_id().clone(),
+            company.provider_company_id().clone(),
+            company.surface(),
+            automatic_queries[0].instrument_id(),
+            true,
+        ),
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        stale_automatic.disposition(),
+        CompanySecurityIdentityDisposition::Stale
+    );
+    assert_eq!(
+        stale_automatic.exclusions()[0].reason(),
+        CompanySecurityIdentityExclusionReason::StaleResolutionParent
+    );
+    let stale_bytes = stale_automatic.receipt().canonical_bytes()?;
+    assert_eq!(
+        market_squawk_data::CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(
+            &stale_bytes
+        )?,
+        *stale_automatic.receipt()
+    );
+    drop(listing_reader);
+    drop(listing_publisher);
     drop(reader);
     drop(publisher);
     drop(relationship_reader);
@@ -1864,7 +2271,31 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         Instant::now() + Duration::from_secs(2),
         &CancellationToken::new(),
     )?;
-    let relationship_reader = CompanySecurityIdentityReadCapability::new(authority);
+    let relationship_reader = CompanySecurityIdentityReadCapability::new(
+        &*authority
+            .try_lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)?,
+    );
+    for (query, expected) in automatic_queries.iter().zip(&automatic_selections) {
+        assert_eq!(
+            &relationship_reader.sec_fundamental_identity_as_of(
+                query,
+                deadline(),
+                &cancellation
+            )?,
+            expected
+        );
+    }
+    for (query, expected) in financial_queries.iter().zip(&financial_selections) {
+        assert_eq!(
+            &relationship_reader.sec_fundamental_identity_as_of(
+                query,
+                deadline(),
+                &cancellation
+            )?,
+            expected
+        );
+    }
     let reopened = reader
         .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;

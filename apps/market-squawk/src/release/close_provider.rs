@@ -871,7 +871,6 @@ fn validate_sec_publications(runtime: &Value) -> Result<()> {
     let mut source_payloads = BTreeSet::new();
     let mut manifest_hashes = BTreeSet::new();
     let mut common_cik = None;
-    let mut common_instrument = None;
     for publication in publications {
         let family = publication
             .get("family")
@@ -891,19 +890,6 @@ fn validate_sec_publications(runtime: &Value) -> Result<()> {
             .is_some_and(|expected| expected != cik)
         {
             bail!("SEC publications do not use one exact CIK");
-        }
-        let instrument = sec
-            .get("instrument_id")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                uuid::Uuid::parse_str(value).is_ok_and(|instrument| !instrument.is_nil())
-            })
-            .ok_or_else(|| anyhow::anyhow!("SEC publication instrument identity is invalid"))?;
-        if common_instrument
-            .replace(instrument)
-            .is_some_and(|expected| expected != instrument)
-        {
-            bail!("SEC publications do not bind one stable instrument identity");
         }
         let (expected_dataset, expected_object, expected_operation, expected_kind) = match family {
             SEC_SUBMISSIONS_FAMILY => (

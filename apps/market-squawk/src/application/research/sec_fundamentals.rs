@@ -841,7 +841,7 @@ fn resolve_identity(
     let expected_surface = match selection.request().family() {
         SecResearchFamily::Submissions => CompanyIdentitySurface::SecSubmissions,
         SecResearchFamily::CompanyFacts => CompanyIdentitySurface::SecCompanyFacts,
-        SecResearchFamily::FilingXbrl => CompanyIdentitySurface::SecSubmissions,
+        SecResearchFamily::FilingXbrl => CompanyIdentitySurface::SecFilingXbrl,
     };
     let provider_binding = match selection.request().family() {
         SecResearchFamily::FilingXbrl => company.provider_logical_binding_digest(),
@@ -881,7 +881,18 @@ fn validate_selected_instrument(
     let instrument = identity
         .instrument_id()
         .ok_or(SecFundamentalsResearchError::IdentityMismatch)?;
-    if identity.market_instrument_revision_digest().is_none() || identity.relationship().is_none() {
+    let relationship = identity
+        .relationship()
+        .ok_or(SecFundamentalsResearchError::IdentityMismatch)?;
+    let company = selection.company_identity().observation();
+    if identity.market_instrument_revision_digest().is_none()
+        || relationship.link().instrument_id() != instrument
+        || relationship.link().company_observation_digest()
+            != selection.company_identity().observation_digest()
+        || relationship.link().company_source_id() != company.source_id()
+        || relationship.link().provider_company_id() != company.provider_company_id()
+        || relationship.link().company_surface() != company.surface()
+    {
         return Err(SecFundamentalsResearchError::IdentityMismatch);
     }
     for selected in selection.selected() {
@@ -892,10 +903,15 @@ fn validate_selected_instrument(
                     .map_err(|_| SecFundamentalsResearchError::IdentityMismatch)?,
             )?
             .ok_or(SecFundamentalsResearchError::IdentityMismatch)?;
-        if observation_context(&observation)
-            .provenance()
-            .instrument_id()
-            != Some(instrument)
+        let subject = match &observation {
+            ResearchObservation::Filing(value) => value.subject(),
+            ResearchObservation::Fundamental(value) => value.subject(),
+            _ => return Err(SecFundamentalsResearchError::IdentityMismatch),
+        };
+        let provenance = observation_context(&observation).provenance();
+        if subject.issuer_id() != Some(company.provider_company_id())
+            || provenance.instrument_id().is_some()
+            || provenance.source_id() != company.source_id()
         {
             return Err(SecFundamentalsResearchError::IdentityMismatch);
         }

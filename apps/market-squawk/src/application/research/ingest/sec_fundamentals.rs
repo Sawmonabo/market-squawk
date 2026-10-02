@@ -1009,7 +1009,7 @@ fn validate_company_identity(
     let expected_surface = match family {
         SecFundamentalsFamily::Submissions => Some(CompanyIdentitySurface::SecSubmissions),
         SecFundamentalsFamily::CompanyFacts => Some(CompanyIdentitySurface::SecCompanyFacts),
-        SecFundamentalsFamily::FilingXbrl => Some(CompanyIdentitySurface::SecSubmissions),
+        SecFundamentalsFamily::FilingXbrl => Some(CompanyIdentitySurface::SecFilingXbrl),
     };
     match (expected_surface, company_identity) {
         (Some(expected_surface), Some(identity))
@@ -1586,7 +1586,7 @@ fn expected_company_surface(family: SecFundamentalsFamily) -> Option<CompanyIden
     match family {
         SecFundamentalsFamily::Submissions => Some(CompanyIdentitySurface::SecSubmissions),
         SecFundamentalsFamily::CompanyFacts => Some(CompanyIdentitySurface::SecCompanyFacts),
-        SecFundamentalsFamily::FilingXbrl => Some(CompanyIdentitySurface::SecSubmissions),
+        SecFundamentalsFamily::FilingXbrl => Some(CompanyIdentitySurface::SecFilingXbrl),
     }
 }
 

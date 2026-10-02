@@ -96,7 +96,7 @@ pub(super) fn map_parquet_error(error: ParquetStoreError) -> ServiceError {
     }
 }
 
-fn map_listing_error(error: ListingReferenceError) -> ServiceError {
+pub(crate) fn map_listing_error(error: ListingReferenceError) -> ServiceError {
     match error {
         ListingReferenceError::Cancelled => ServiceError::Cancelled,
         ListingReferenceError::DeadlineExceeded => ServiceError::DeadlineExceeded,

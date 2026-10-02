@@ -87,9 +87,9 @@ pub(crate) use bls::{
     MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
     MacroProviderPeriodOperationError,
 };
-pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
 pub use census::CensusAdapterActivation;
 pub use census_configuration::CensusRequestConfiguration;
+pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
 pub use eia::EiaAdapterActivation;
 pub(crate) use fred::{
     FredPublicationActivationError, publish_fred_latest_known, reopen_fred_latest_known,
@@ -119,7 +119,9 @@ pub(crate) use schwab::{
     PreparedSchwabMarketRuntimeStart, SchwabMarketRuntimeStartError, SchwabQuoteReferencePrecommit,
 };
 pub use schwab::{SchwabMarketDataAccountActivation, SchwabMarketDataActivationError};
-pub(crate) use schwab_quote_binding::{SchwabQuotePublicationSelection, SchwabQuoteReferenceBinding};
+pub(crate) use schwab_quote_binding::{
+    SchwabQuotePublicationSelection, SchwabQuoteReferenceBinding,
+};
 pub(crate) use schwab_quote_metadata::schwab_streamer_selections;
 pub(crate) use schwab_streamer::PreparedSchwabStreamerMarketRuntimeStart;
 pub use specs::{
@@ -294,7 +296,7 @@ struct SecFundProductActivation {
     source: Arc<SecEdgarSource>,
     generation: ResearchProviderRuntimeGeneration,
     operation: Arc<SecLiveFundSource>,
-    selected_companies: Vec<(SourceIdentifier, market_squawk_domain::InstrumentId)>,
+    selected_companies: Vec<SourceIdentifier>,
 }
 
 impl SecFundProductActivation {
@@ -326,6 +328,12 @@ pub(crate) enum SecFundProductError {
     Unavailable,
     #[error(transparent)]
     Application(#[from] SecLiveFundApplicationError),
+    #[error("SEC company/security relationship publication failed")]
+    CompanyResolution(
+        #[from] crate::application::company_security_resolution::CompanySecurityResolutionError,
+    ),
+    #[error("SEC company/security publication worker failed")]
+    Worker(#[from] crate::ResearchServiceError),
 }
 
 /// Application-owned activation authority shared by CLI, MCP, and local onboarding transports.
@@ -336,6 +344,8 @@ pub struct ProviderAdapterActivation {
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_control_root: PathBuf,
+    company_security_resolution:
+        Arc<crate::application::company_security_resolution::CompanySecurityResolutionAuthority>,
     bea: RwLock<Option<Arc<bea::BeaProductActivation>>>,
     bls: RwLock<Option<Arc<bls::BlsProductActivation>>>,
     census: RwLock<Option<Arc<census::CensusProductActivation>>>,
@@ -388,7 +398,9 @@ impl ProviderAdapterActivation {
         self.research.research_service()
     }
 
-    pub(crate) fn provider_capture_store(&self) -> Arc<market_squawk_platform::SealedResearchJournalStore> {
+    pub(crate) fn provider_capture_store(
+        &self,
+    ) -> Arc<market_squawk_platform::SealedResearchJournalStore> {
         self.research.provider_capture_store()
     }
 
@@ -397,9 +409,13 @@ impl ProviderAdapterActivation {
         generation: &crate::application::ResearchProviderRuntimeGeneration,
         cancellation: CancellationToken,
         deadline: Instant,
-    ) -> Result<crate::application::ResearchProviderPublicationOperation,
-              crate::application::ResearchIngestCompositionError> {
-        self.research.acquire_provider_publication_operation(generation, cancellation, deadline).await
+    ) -> Result<
+        crate::application::ResearchProviderPublicationOperation,
+        crate::application::ResearchIngestCompositionError,
+    > {
+        self.research
+            .acquire_provider_publication_operation(generation, cancellation, deadline)
+            .await
     }
 
     /// Sole installed writer used by official native reference acquisition.
@@ -614,6 +630,9 @@ impl ProviderAdapterActivation {
         app_config: AppConfig,
         provider_rate: ProviderRateAuthority,
         provider_control_root: PathBuf,
+        company_security_resolution: Arc<
+            crate::application::company_security_resolution::CompanySecurityResolutionAuthority,
+        >,
     ) -> Self {
         Self {
             onboarding,
@@ -622,6 +641,7 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            company_security_resolution,
             bea: RwLock::new(None),
             bls: RwLock::new(None),
             census: RwLock::new(None),
@@ -643,6 +663,9 @@ impl ProviderAdapterActivation {
         app_config: AppConfig,
         provider_rate: ProviderRateAuthority,
         provider_control_root: PathBuf,
+        company_security_resolution: Arc<
+            crate::application::company_security_resolution::CompanySecurityResolutionAuthority,
+        >,
         board_source_factory: BoardScriptedTransportFactory,
     ) -> Self {
         Self {
@@ -652,6 +675,7 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            company_security_resolution,
             bea: RwLock::new(None),
             bls: RwLock::new(None),
             census: RwLock::new(None),
@@ -842,7 +866,8 @@ impl ProviderAdapterActivation {
                 _ = tokio::time::sleep_until(deadline.into()) => return Err(ProviderAdapterActivationError::SourceBinding),
                 result = self.revoke_research_runtime_owned(&generation, true) => result?,
             }
-            self.research_mutation.release_suspended_provider_generation(&generation)?;
+            self.research_mutation
+                .release_suspended_provider_generation(&generation)?;
         }
         Ok(())
     }
@@ -892,16 +917,25 @@ impl ProviderAdapterActivation {
         {
             return Err(SecFundProductError::Unavailable);
         }
-        for (cik, instrument_id) in &activation.selected_companies {
+        for cik in &activation.selected_companies {
             activation
                 .operation
-                .publish_company_research(
-                    cik.as_str(),
-                    *instrument_id,
-                    deadline,
-                    cancellation.child_token(),
-                )
+                .publish_company_research(cik.as_str(), deadline, cancellation.child_token())
                 .await?;
+            let resolution = Arc::clone(&self.company_security_resolution);
+            let source = activation.source.metadata().source_id().clone();
+            let cik = cik.clone();
+            self.research
+                .research_service()
+                .run_owned_research_io(deadline, &cancellation, move |owned_cancellation| {
+                    resolution.ensure_company_listing_relationships(
+                        &source,
+                        &cik,
+                        deadline,
+                        &owned_cancellation,
+                    )
+                })
+                .await??;
         }
         Ok(())
     }
@@ -996,7 +1030,11 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
-                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                    if require_exclusive
+                        && retained
+                            .as_ref()
+                            .is_some_and(|current| Arc::strong_count(current) != 1)
+                    {
                         return Err(ProviderAdapterActivationError::SourceBinding);
                     }
                     retained.take();
@@ -1011,7 +1049,11 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
-                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                    if require_exclusive
+                        && retained
+                            .as_ref()
+                            .is_some_and(|current| Arc::strong_count(current) != 1)
+                    {
                         return Err(ProviderAdapterActivationError::SourceBinding);
                     }
                     retained.take();
@@ -1026,7 +1068,11 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
-                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                    if require_exclusive
+                        && retained
+                            .as_ref()
+                            .is_some_and(|current| Arc::strong_count(current) != 1)
+                    {
                         return Err(ProviderAdapterActivationError::SourceBinding);
                     }
                     retained.take();
@@ -1041,7 +1087,11 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
-                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                    if require_exclusive
+                        && retained
+                            .as_ref()
+                            .is_some_and(|current| Arc::strong_count(current) != 1)
+                    {
                         return Err(ProviderAdapterActivationError::SourceBinding);
                     }
                     retained.take();
@@ -1059,7 +1109,11 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
-                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                    if require_exclusive
+                        && retained
+                            .as_ref()
+                            .is_some_and(|current| Arc::strong_count(current) != 1)
+                    {
                         return Err(ProviderAdapterActivationError::SourceBinding);
                     }
                     retained.take();
@@ -1074,7 +1128,11 @@ impl ProviderAdapterActivation {
                     .as_ref()
                     .is_some_and(|current| current.generation() == expected)
                 {
-                    if require_exclusive && retained.as_ref().is_some_and(|current| Arc::strong_count(current) != 1) {
+                    if require_exclusive
+                        && retained
+                            .as_ref()
+                            .is_some_and(|current| Arc::strong_count(current) != 1)
+                    {
                         return Err(ProviderAdapterActivationError::SourceBinding);
                     }
                     retained.take();
@@ -1290,9 +1348,9 @@ impl ProviderAdapterActivation {
             Some(SpecializedReplacementKind::Bls(activation)) => {
                 Some(SpecializedReplacementAuthority::Bls(Arc::clone(activation)))
             }
-            Some(SpecializedReplacementKind::Census(activation)) => {
-                Some(SpecializedReplacementAuthority::Census(Arc::clone(activation)))
-            }
+            Some(SpecializedReplacementKind::Census(activation)) => Some(
+                SpecializedReplacementAuthority::Census(Arc::clone(activation)),
+            ),
             Some(SpecializedReplacementKind::Eia(activation)) => {
                 Some(SpecializedReplacementAuthority::Eia(Arc::clone(activation)))
             }

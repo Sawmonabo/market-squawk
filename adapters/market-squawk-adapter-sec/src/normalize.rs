@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
-    FilingObservation, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
-    FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
-    FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
-    FundamentalRevisionOrder, InstrumentId, MetadataRevision, PayloadHash, PayloadReference,
-    ProviderIdentityRegistry, ProviderInstrumentId, ResearchContext, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
-    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, XbrlPeriod,
+    AvailabilityEvidence, CalendarDate, CompanyObservationSubject, DataQuality, DigestAlgorithm,
+    EvidenceDigest, FilingObservation, FundamentalAmendmentStatus, FundamentalCadence,
+    FundamentalConsolidation, FundamentalDimensionContext, FundamentalFactContext,
+    FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+    FundamentalRestatementStatus, FundamentalRevisionOrder, MetadataRevision, PayloadHash,
+    PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, XbrlPeriod,
 };
 use market_squawk_sources::{
     ExtractionBatch, ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
@@ -392,7 +392,6 @@ impl Serialize for IndexedFootnotes<'_> {
 #[derive(Debug)]
 pub(crate) struct SecFilingXbrlNormalization {
     source_id: SourceId,
-    instrument_id: InstrumentId,
     dataset: SourceIdentifier,
     filing: SecFilingXbrlCoordinates,
     taxonomy: SecValidatedXbrlTaxonomySet,
@@ -437,7 +436,7 @@ impl SecFilingXbrlNormalization {
             filing_fact_source_identifier(&self.dataset, evidence.occurrence_id())?;
         let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: self.source_id.clone(),
-            instrument_id: Some(self.instrument_id),
+            instrument_id: None,
             venue_id: None,
             source_identifier,
             source_timestamp: self.source_timestamp,
@@ -482,6 +481,7 @@ impl SecFilingXbrlNormalization {
         Ok(Some(ResearchObservation::Fundamental(
             FundamentalObservation::new_with_xbrl_evidence(
                 ResearchContext::new(provenance, research_time)?,
+                CompanyObservationSubject::Issuer(provider_cik(&self.filing)?),
                 concept,
                 value,
                 fact_context,
@@ -590,7 +590,6 @@ impl SecFilingXbrlNormalization {
 /// Maps one exact parsed filing into canonical numeric facts plus mandatory native text lineage.
 pub(crate) fn normalize_filing_xbrl_with_cancellation(
     source_id: &SourceId,
-    identities: &ProviderIdentityRegistry,
     dataset: SecResearchDataset,
     document: IndexedXbrlDocument,
     payload_digest: EvidenceDigest,
@@ -643,11 +642,6 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
             AvailabilityEvidence::local_first_observed(received_at),
         ),
     };
-    let provider_id = ProviderInstrumentId::try_from(filing.cik())?;
-    let instrument_id = identities
-        .provider_identity_at(source_id, &provider_id, received_at)
-        .ok_or(SecNormalizationError::InstrumentUnresolved)?
-        .instrument_id();
     // Only one indexed record and its canonical serialization are live at a time.
     let working_set_retained_bytes = document
         .peak_retained_bytes
@@ -669,7 +663,6 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
     Ok(SecFilingXbrlNormalization {
         source_id: source_id.clone(),
-        instrument_id,
         dataset,
         filing,
         taxonomy,
@@ -727,16 +720,14 @@ fn hash_identifier_field(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-/// Normalizes complete SEC submissions into canonical point-in-time filing observations.
+/// Normalizes complete SEC submissions into issuer-owned point-in-time filing observations.
 pub fn normalize_filings(
     source_id: &SourceId,
-    identities: &ProviderIdentityRegistry,
     retrieved: &RetrievedSubmissions,
     ingested_at: Timestamp,
 ) -> Result<Vec<ResearchObservation>, SecNormalizationError> {
     normalize_filings_with_cancellation(
         source_id,
-        identities,
         retrieved,
         ingested_at,
         &CancellationToken::new(),
@@ -746,7 +737,6 @@ pub fn normalize_filings(
 /// Normalizes complete filings with cooperative observation cancellation.
 pub fn normalize_filings_with_cancellation(
     source_id: &SourceId,
-    identities: &ProviderIdentityRegistry,
     retrieved: &RetrievedSubmissions,
     ingested_at: Timestamp,
     cancellation: &CancellationToken,
@@ -756,11 +746,6 @@ pub fn normalize_filings_with_cancellation(
     if ingested_at < received_at {
         return Err(SecNormalizationError::IngestedBeforeReceived);
     }
-    let provider_id = ProviderInstrumentId::try_from(retrieved.document().cik().as_str())?;
-    let instrument_id = identities
-        .provider_identity_at(source_id, &provider_id, received_at)
-        .ok_or(SecNormalizationError::InstrumentUnresolved)?
-        .instrument_id();
     let mut ordered = Vec::new();
     ordered
         .try_reserve(retrieved.document().filings().len())
@@ -787,7 +772,7 @@ pub fn normalize_filings_with_cancellation(
             .ok_or(SecNormalizationError::RevisionOverflow)?;
         let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: source_id.clone(),
-            instrument_id: Some(instrument_id),
+            instrument_id: None,
             venue_id: None,
             source_identifier: filing.accession().clone(),
             source_timestamp: filing.accepted_at(),
@@ -813,6 +798,7 @@ pub fn normalize_filings_with_cancellation(
         )?;
         observations.push(ResearchObservation::Filing(FilingObservation::new(
             ResearchContext::new(provenance, time)?,
+            CompanyObservationSubject::Issuer(retrieved.document().cik().clone()),
             filing.form().clone(),
             filing.accession().clone(),
         )?));
@@ -835,7 +821,7 @@ fn filing_family(filing: &SecFiling) -> (String, String) {
     )
 }
 
-/// Normalizes every numeric Company Facts occurrence with conservative availability semantics.
+/// Normalizes every numeric issuer-owned Company Facts occurrence with conservative availability.
 ///
 /// SEC acceptance and filing dates are retained by their source records but are not silently
 /// promoted to first-public-availability evidence. The raw response's first local observation is
@@ -844,13 +830,11 @@ fn filing_family(filing: &SecFiling) -> (String, String) {
 /// increasing revision numbers and are never overwritten.
 pub fn normalize_company_facts(
     source_id: &SourceId,
-    identities: &ProviderIdentityRegistry,
     retrieved: &RetrievedCompanyFacts,
     ingested_at: Timestamp,
 ) -> Result<Vec<ResearchObservation>, SecNormalizationError> {
     normalize_company_facts_with_cancellation(
         source_id,
-        identities,
         retrieved,
         ingested_at,
         &CancellationToken::new(),
@@ -860,7 +844,6 @@ pub fn normalize_company_facts(
 /// Normalizes Company Facts with cooperative occurrence cancellation.
 pub fn normalize_company_facts_with_cancellation(
     source_id: &SourceId,
-    identities: &ProviderIdentityRegistry,
     retrieved: &RetrievedCompanyFacts,
     ingested_at: Timestamp,
     cancellation: &CancellationToken,
@@ -870,11 +853,6 @@ pub fn normalize_company_facts_with_cancellation(
     if ingested_at < received_at {
         return Err(SecNormalizationError::IngestedBeforeReceived);
     }
-    let provider_id = ProviderInstrumentId::try_from(retrieved.document().cik().as_str())?;
-    let instrument_id = identities
-        .provider_identity_at(source_id, &provider_id, received_at)
-        .ok_or(SecNormalizationError::InstrumentUnresolved)?
-        .instrument_id();
     let mut ordered = Vec::new();
     ordered
         .try_reserve(retrieved.document().occurrences().len())
@@ -912,7 +890,7 @@ pub fn normalize_company_facts_with_cancellation(
         ))?;
         let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: source_id.clone(),
-            instrument_id: Some(instrument_id),
+            instrument_id: None,
             venue_id: None,
             source_identifier,
             source_timestamp: None,
@@ -958,6 +936,7 @@ pub fn normalize_company_facts_with_cancellation(
         observations.push(ResearchObservation::Fundamental(
             FundamentalObservation::new(
                 ResearchContext::new(provenance, research_time)?,
+                CompanyObservationSubject::Issuer(retrieved.document().cik().clone()),
                 occurrence.concept().clone(),
                 occurrence.value(),
                 fact_context,
@@ -1032,8 +1011,6 @@ pub enum SecNormalizationError {
     Xbrl(#[from] crate::SecXbrlError),
     #[error("SEC canonical normalization was cancelled")]
     Cancelled,
-    #[error("Company Facts instrument identity is unresolved or quarantined")]
-    InstrumentUnresolved,
     #[error("ingestion time precedes local receipt")]
     IngestedBeforeReceived,
     #[error("filing XBRL normalization requires exact filing-XBRL dataset coordinates")]

@@ -77,11 +77,11 @@ pub use market_calendar::{
     MarketCalendarScope, MarketCalendarSessionPresence, MarketCalendarSessionRole,
 };
 pub use observations::{
-    AlternativeDataObservation, BarTimeSemantics, BarTimestampBasis, CorporateActionObservation,
-    FilingObservation, FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue,
-    MarketBarAdjustment, MarketBarObservation, MarketBarSessionEvidence, MarketBarSessionKind,
-    NominalDailyDate, PositionObservation, TimestampedBarPeriod, TransactionObservation,
-    UniverseMembershipObservation,
+    AlternativeDataObservation, BarTimeSemantics, BarTimestampBasis, CompanyObservationSubject,
+    CorporateActionObservation, FilingObservation, FundamentalObservation, MacroMissingValue,
+    MacroObservation, MacroValue, MarketBarAdjustment, MarketBarObservation,
+    MarketBarSessionEvidence, MarketBarSessionKind, NominalDailyDate, PositionObservation,
+    TimestampedBarPeriod, TransactionObservation, UniverseMembershipObservation,
 };
 pub use portfolio_transactions::{
     NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
@@ -183,6 +183,7 @@ impl ResearchObservation {
         match self {
             Self::Filing(value) => FilingObservation::new(
                 value.context().with_revision(revision),
+                value.subject().clone(),
                 value.form_type().clone(),
                 value.accession().clone(),
             )
@@ -190,6 +191,7 @@ impl ResearchObservation {
             Self::Fundamental(value) => match value.xbrl_evidence() {
                 Some(evidence) => FundamentalObservation::new_with_xbrl_evidence(
                     value.context().with_revision(revision),
+                    value.subject().clone(),
                     value.concept().clone(),
                     value.value(),
                     value.fact_context().clone(),
@@ -197,6 +199,7 @@ impl ResearchObservation {
                 ),
                 None => FundamentalObservation::new(
                     value.context().with_revision(revision),
+                    value.subject().clone(),
                     value.concept().clone(),
                     value.value(),
                     value.fact_context().clone(),
@@ -298,6 +301,8 @@ impl ResearchObservation {
 /// A canonical research-payload invariant failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResearchError {
+    /// Explicit company subject disagrees with provenance security attribution.
+    CompanySubjectMismatch,
     /// Instrument-scoped research data lacks stable instrument identity.
     MissingInstrument,
     /// A venue-scoped research observation lacks venue identity.
@@ -365,6 +370,9 @@ pub enum ResearchError {
 impl fmt::Display for ResearchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CompanySubjectMismatch => {
+                formatter.write_str("company observation subject disagrees with provenance")
+            }
             Self::MissingInstrument => {
                 formatter.write_str("research observation requires an instrument")
             }

@@ -19,8 +19,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::CatalogAuthority;
 use super::storage::{ResultBudget, append_audit, trusted_catalog_now};
+use super::{CatalogAuthority, CatalogError, CatalogReadSnapshot, CatalogResultLimits};
 
 /// Maximum current relationship keys evaluated by one selection.
 pub const MAX_COMPANY_SECURITY_SELECTION_ROWS: usize = 256;
@@ -108,6 +108,7 @@ pub struct SecFundamentalIdentityQuery {
     cik: SourceIdentifier,
     company_surface: CompanyIdentitySurface,
     company_observation_digest: EvidenceDigest,
+    instrument_id: Option<InstrumentId>,
     effective_at: Timestamp,
     knowledge_at: Timestamp,
 }
@@ -133,9 +134,21 @@ impl SecFundamentalIdentityQuery {
             cik,
             company_surface,
             company_observation_digest,
+            instrument_id: None,
             effective_at,
             knowledge_at,
         })
+    }
+
+    /// Restricts the issuer query to one exact selected security, including a share class.
+    pub const fn for_instrument(mut self, instrument_id: InstrumentId) -> Self {
+        self.instrument_id = Some(instrument_id);
+        self
+    }
+
+    /// Returns the exact selected security restriction, when supplied.
+    pub const fn instrument_id(&self) -> Option<InstrumentId> {
+        self.instrument_id
     }
 
     /// Returns the exact SEC source namespace.
@@ -215,7 +228,7 @@ impl SecFundamentalIdentitySelection {
     pub const fn relationship_selection(&self) -> &CompanySecurityIdentitySelection {
         &self.relationship_selection
     }
-    /// Returns the digest of the exact CIK/company/effective/knowledge query.
+    /// Returns the digest of the exact CIK/company/selected-instrument/effective/knowledge query.
     pub const fn query_digest(&self) -> EvidenceDigest {
         self.query_digest
     }
@@ -280,6 +293,7 @@ pub enum CompanySecurityIdentityExclusionReason {
     AmbiguousCompanyParent,
     StaleCompanyParent,
     StaleMarketInstrumentParent,
+    StaleResolutionParent,
     Revoked,
 }
 
@@ -517,6 +531,54 @@ struct StoredCompanySecuritySelectionReceipt {
 }
 
 impl CompanySecurityIdentitySelectionReceipt {
+    /// Checks an exact SEC issuer parent against the selected common-equity security.
+    ///
+    /// This validates retained evidence only; it neither selects new catalog authority nor
+    /// establishes share-class economics for an issuer's reported amounts.
+    pub fn validate_selected_company(
+        &self,
+        instrument: InstrumentId,
+        company: &CompanyIdentityObservation,
+        company_digest: EvidenceDigest,
+        selected_at: Timestamp,
+    ) -> Result<(), CompanySecurityIdentityCatalogError> {
+        self.validate_value()?;
+        let [entry] = self.ordered_candidates() else {
+            return Err(CompanySecurityIdentityCatalogError::InvalidInput);
+        };
+        let digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(serde_json::to_vec(company)?).into(),
+        );
+        let cik = company.provider_company_id().as_str();
+        if self.disposition() != CompanySecurityIdentityDisposition::Complete
+            || self.knowledge_at() != selected_at
+            || self.effective_at() != selected_at
+            || entry.instrument_id() != instrument
+            || entry.common_equity_suitability()
+                != CommonEquitySuitability::SuitableIssuerCommonEquity
+            || company.source_id().as_str() != "sec-edgar"
+            || cik.len() != 10
+            || !cik.bytes().all(|byte| byte.is_ascii_digit())
+            || !cik.bytes().any(|byte| byte != b'0')
+            || entry.company_source_id() != company.source_id()
+            || entry.company_surface() != company.surface()
+            || entry.provider_company_id() != company.provider_company_id()
+            || entry.linked_company_observation_digest() != company_digest
+            || entry.current_company_observation_digest() != Some(company_digest)
+            || digest != company_digest
+            || company
+                .availability()
+                .conservative_available_at()
+                .is_none_or(|at| at > selected_at)
+            || company.received_at() > selected_at
+            || company.ingested_at() > selected_at
+        {
+            return Err(CompanySecurityIdentityCatalogError::InvalidInput);
+        }
+        Ok(())
+    }
+
     /// Serializes the complete bounded receipt value, including its existing canonical digest.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CompanySecurityIdentityCatalogError> {
         self.validate_value()?;
@@ -634,6 +696,7 @@ impl CompanySecurityIdentitySelectionReceipt {
                         && entry.current_market_revision_digest
                             != Some(entry.linked_market_revision_digest)
                 }
+                CompanySecurityIdentityExclusionReason::StaleResolutionParent => early.is_none(),
                 CompanySecurityIdentityExclusionReason::Revoked => {
                     early.is_none() && entry.previous_link_digest.is_some()
                 }
@@ -1069,7 +1132,9 @@ impl CompanySecurityLinkPublicationCapability {
 /// Cloneable least-authority exact/current/as-of relationship reader.
 #[derive(Clone)]
 pub struct CompanySecurityIdentityReadCapability {
-    authority: Arc<Mutex<CatalogAuthority>>,
+    location: market_squawk_platform::CatalogLocation,
+    catalog_binding: [u8; 32],
+    result_limits: CatalogResultLimits,
 }
 
 impl fmt::Debug for CompanySecurityIdentityReadCapability {
@@ -1082,9 +1147,131 @@ impl fmt::Debug for CompanySecurityIdentityReadCapability {
 }
 
 impl CompanySecurityIdentityReadCapability {
-    /// Binds reads to the sole catalog writer session.
-    pub const fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
-        Self { authority }
+    /// Captures the endpoint under already owned authority; reads never lock the writer.
+    pub fn new(authority: &CatalogAuthority) -> Self {
+        Self::from_endpoint(
+            authority.catalog().location.clone(),
+            authority.catalog().artifact_root_binding,
+            authority.catalog().result_bytes,
+        )
+    }
+
+    pub(crate) fn from_endpoint(
+        location: market_squawk_platform::CatalogLocation,
+        catalog_binding: [u8; 32],
+        result_limits: CatalogResultLimits,
+    ) -> Self {
+        Self {
+            location,
+            catalog_binding,
+            result_limits,
+        }
+    }
+
+    fn read_snapshot<T>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(
+            &CompanySecuritySnapshot<'_>,
+        ) -> Result<T, CompanySecurityIdentityCatalogError>,
+    ) -> Result<T, CompanySecurityIdentityCatalogError> {
+        check_operation(deadline, cancellation)?;
+        let result = (|| {
+            let snapshot = CatalogReadSnapshot::open(
+                &self.location,
+                self.catalog_binding,
+                self.result_limits,
+                deadline,
+                cancellation,
+            )?;
+            snapshot.read(|snapshot| {
+                operation(&CompanySecuritySnapshot {
+                    connection: snapshot.connection(),
+                    result_limits: self.result_limits,
+                })
+            })
+        })();
+        classify_operation(result, deadline, cancellation)
+    }
+
+    /// Reads the exact immutable company parent without writer contention.
+    pub fn exact_company_identity_by_digest(
+        &self,
+        digest: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<super::CompanyIdentityExactRecord>, CompanySecurityIdentityCatalogError>
+    {
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            super::company_identity::exact_company_identity_by_digest(
+                snapshot.connection,
+                snapshot.result_limits,
+                digest,
+                deadline,
+                cancellation,
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    pub(crate) fn capture_binding_evidence(
+        &self,
+        digest: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<super::provider_capture::PersistedProviderCaptureBindingEvidence>,
+        CompanySecurityIdentityCatalogError,
+    > {
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            super::provider_capture::load_provider_capture_binding_evidence(
+                snapshot.connection,
+                digest,
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    pub(crate) fn logical_publication_binding(
+        &self,
+        digest: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<super::provider_logical::PersistedProviderLogicalPublicationBinding>,
+        CompanySecurityIdentityCatalogError,
+    > {
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            super::provider_logical::load_provider_logical_publication_binding(
+                snapshot.connection,
+                digest,
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    /// Reads the current exact issuer observation from one endpoint-bound snapshot.
+    pub fn exact_current_company_identity(
+        &self,
+        source_id: &SourceId,
+        provider_company_id: &SourceIdentifier,
+        surface: CompanyIdentitySurface,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(CompanyIdentityObservation, EvidenceDigest, Timestamp)>,
+        CompanySecurityIdentityCatalogError,
+    > {
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.exact_current_company_identity(
+                source_id,
+                provider_company_id,
+                surface,
+                deadline,
+                cancellation,
+            )
+        })
     }
     /// Reads one exact immutable event revision.
     pub fn exact(
@@ -1094,10 +1281,9 @@ impl CompanySecurityIdentityReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<Option<CompanySecurityIdentityRecord>, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .exact_company_security_link(digest, deadline, cancellation)
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.exact_company_security_link(digest, deadline, cancellation)
+        })
     }
     /// Selects against the catalog's trusted current time.
     pub fn current(
@@ -1107,10 +1293,9 @@ impl CompanySecurityIdentityReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityIdentitySelection, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .current_company_security_links(query, deadline, cancellation)
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.current_company_security_links(query, deadline, cancellation)
+        })
     }
     /// Selects only relationship and parent facts knowable at the exact cutoff.
     pub fn as_of(
@@ -1121,17 +1306,15 @@ impl CompanySecurityIdentityReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityIdentitySelection, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .as_of_company_security_links(query, knowledge_at, deadline, cancellation)
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.as_of_company_security_links(query, knowledge_at, deadline, cancellation)
+        })
     }
 
     /// Resolves one exact SEC company generation to authoritative tradable-security identity.
     ///
-    /// Only a direct crosswalk backed by a verified, non-ticker external identifier in the exact
-    /// immutable market-definition generation can return [`SecFundamentalIdentityAvailability::Available`].
-    /// Operator resolutions and SEC ticker/name associations remain identity-pending.
+    /// Uses retained source-qualified listing, direct crosswalk, or explicit operator authority.
+    /// A selected instrument prevents other valid share classes from creating a false conflict.
     pub fn sec_fundamental_identity_as_of(
         &self,
         query: &SecFundamentalIdentityQuery,
@@ -1139,10 +1322,9 @@ impl CompanySecurityIdentityReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<SecFundamentalIdentitySelection, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .sec_fundamental_identity_as_of(query, deadline, cancellation)
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.sec_fundamental_identity_as_of(query, deadline, cancellation)
+        })
     }
 
     /// Resolves an exact instrument to its source-qualified issuer company at a knowledge cutoff.
@@ -1164,10 +1346,8 @@ impl CompanySecurityIdentityReadCapability {
         if required_suitability != CommonEquitySuitability::SuitableIssuerCommonEquity {
             return Err(CompanySecurityIdentityCatalogError::InvalidInput);
         }
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .instrument_company_security_links_as_of(
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.instrument_company_security_links_as_of(
                 instrument_id,
                 company_source_id,
                 company_surface,
@@ -1176,6 +1356,7 @@ impl CompanySecurityIdentityReadCapability {
                 deadline,
                 cancellation,
             )
+        })
     }
 
     /// Selects one exact source-qualified SEC SIC classification at a caller cutoff.
@@ -1194,10 +1375,8 @@ impl CompanySecurityIdentityReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<IndustryClassificationSelection, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .select_industry_classification_as_of(
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.select_industry_classification_as_of(
                 company_observation_digest,
                 company_source_id,
                 company_surface,
@@ -1207,6 +1386,7 @@ impl CompanySecurityIdentityReadCapability {
                 deadline,
                 cancellation,
             )
+        })
     }
 
     /// Selects a bounded exact SEC SIC reverse-membership cohort at a caller cutoff.
@@ -1227,10 +1407,8 @@ impl CompanySecurityIdentityReadCapability {
         if maximum_members == 0 || maximum_members > MAX_INDUSTRY_COHORT_MEMBERS {
             return Err(CompanySecurityIdentityCatalogError::InvalidInput);
         }
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .select_industry_cohort_as_of(
+        self.read_snapshot(deadline, cancellation, |snapshot| {
+            snapshot.select_industry_cohort_as_of(
                 company_source_id,
                 company_surface,
                 knowledge_at,
@@ -1241,6 +1419,7 @@ impl CompanySecurityIdentityReadCapability {
                 deadline,
                 cancellation,
             )
+        })
     }
 }
 
@@ -1271,6 +1450,10 @@ pub enum CompanySecurityIdentityCatalogError {
     CorruptCatalog,
     #[error("company/security serialization failed")]
     Serialization(#[from] serde_json::Error),
+    #[error("company/security listing parent read failed")]
+    Listing(#[from] super::listing_reference::ListingReferenceError),
+    #[error("company/security catalog read failed")]
+    Catalog(#[from] CatalogError),
     #[error("company/security storage operation failed")]
     Storage(#[from] rusqlite::Error),
 }
@@ -1358,52 +1541,17 @@ impl CatalogAuthority {
         Option<(CompanyIdentityObservation, EvidenceDigest, Timestamp)>,
         CompanySecurityIdentityCatalogError,
     > {
-        check_operation(deadline, cancellation)?;
-        let connection = &self.catalog().connection;
-        install_progress_handler(connection, deadline, cancellation)?;
-        let result = (|| {
-            let transaction = connection.unchecked_transaction()?;
-            let knowledge_at = trusted_catalog_now(&transaction)
-                .map_err(|_| CompanySecurityIdentityCatalogError::CorruptCatalog)?;
-            let Some(parent) = current_company_parent(
-                &transaction,
-                source_id,
-                provider_company_id,
-                surface,
-                knowledge_at,
-            )?
-            else {
-                transaction.commit()?;
-                return Ok(None);
-            };
-            let json: String = transaction.query_row(
-                "SELECT record_json FROM company_identity_observations
-                 WHERE record_digest=?1 AND source_id=?2 AND provider_company_id=?3
-                   AND source_surface=?4",
-                params![
-                    parent.digest.bytes(),
-                    source_id.as_str(),
-                    provider_company_id.as_str(),
-                    surface.database_name(),
-                ],
-                |row| row.get(0),
-            )?;
-            let observation: CompanyIdentityObservation = serde_json::from_str(&json)?;
-            if sha256(json.as_bytes()) != parent.digest.bytes()
-                || serde_json::to_string(&observation)? != json
-                || observation.source_id() != source_id
-                || observation.provider_company_id() != provider_company_id
-                || observation.surface() != surface
-                || observation.availability().conservative_available_at() != parent.available_at
-                || observation.ingested_at() != parent.ingested_at
-            {
-                return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
-            }
-            transaction.commit()?;
-            Ok(Some((observation, parent.digest, parent.completed_at)))
-        })();
-        clear_progress_handler(connection)?;
-        classify_operation(result, deadline, cancellation)
+        CompanySecuritySnapshot {
+            connection: &self.catalog().connection,
+            result_limits: self.catalog().result_bytes,
+        }
+        .exact_current_company_identity(
+            source_id,
+            provider_company_id,
+            surface,
+            deadline,
+            cancellation,
+        )
     }
 
     fn publish_company_security_link(
@@ -1470,6 +1618,16 @@ impl CatalogAuthority {
                 return Err(CompanySecurityIdentityCatalogError::UnverifiedIdentityAuthority);
             }
             if !link.transition().is_revocation() {
+                validate_source_qualified_listing(
+                    &transaction,
+                    self.catalog().result_bytes,
+                    &link,
+                    &company_parent,
+                    &market_parent,
+                    true,
+                    deadline,
+                    cancellation,
+                )?;
                 let current_company = current_company_parent(
                     &transaction,
                     link.company_source_id(),
@@ -1590,6 +1748,68 @@ impl CatalogAuthority {
         clear_progress_handler(connection)?;
         classify_operation(result, deadline, cancellation)
     }
+}
+
+struct CompanySecuritySnapshot<'a> {
+    connection: &'a Connection,
+    result_limits: CatalogResultLimits,
+}
+
+impl CompanySecuritySnapshot<'_> {
+    fn exact_current_company_identity(
+        &self,
+        source_id: &SourceId,
+        provider_company_id: &SourceIdentifier,
+        surface: CompanyIdentitySurface,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(CompanyIdentityObservation, EvidenceDigest, Timestamp)>,
+        CompanySecurityIdentityCatalogError,
+    > {
+        check_operation(deadline, cancellation)?;
+        let connection = self.connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            let knowledge_at = read_catalog_now(connection)?;
+            let Some(parent) = current_company_parent(
+                connection,
+                source_id,
+                provider_company_id,
+                surface,
+                knowledge_at,
+            )?
+            else {
+                return Ok(None);
+            };
+            let json: String = connection.query_row(
+                "SELECT record_json FROM company_identity_observations
+                 WHERE record_digest=?1 AND source_id=?2 AND provider_company_id=?3
+                   AND source_surface=?4",
+                params![
+                    parent.digest.bytes(),
+                    source_id.as_str(),
+                    provider_company_id.as_str(),
+                    surface.database_name(),
+                ],
+                |row| row.get(0),
+            )?;
+            let observation: CompanyIdentityObservation = serde_json::from_str(&json)?;
+            if sha256(json.as_bytes()) != parent.digest.bytes()
+                || serde_json::to_string(&observation)? != json
+                || observation.source_id() != source_id
+                || observation.provider_company_id() != provider_company_id
+                || observation.surface() != surface
+                || observation.availability().conservative_available_at() != parent.available_at
+                || observation.ingested_at() != parent.ingested_at
+            {
+                return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+            }
+            Ok(Some((observation, parent.digest, parent.completed_at)))
+        })();
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
 
     fn exact_company_security_link(
         &self,
@@ -1600,7 +1820,7 @@ impl CatalogAuthority {
         if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
             return Err(CompanySecurityIdentityCatalogError::InvalidInput);
         }
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = load_link_by_digest(connection, digest.bytes());
         clear_progress_handler(connection)?;
@@ -1613,15 +1833,13 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityIdentitySelection, CompanySecurityIdentityCatalogError> {
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = (|| {
-            let transaction = connection.unchecked_transaction()?;
-            let now = trusted_catalog_now(&transaction)
-                .map_err(|_| CompanySecurityIdentityCatalogError::CorruptCatalog)?;
+            let now = read_catalog_now(connection)?;
             let selection = select_links(
-                &transaction,
-                self.catalog().result_bytes,
+                connection,
+                self.result_limits,
                 query,
                 now,
                 now,
@@ -1629,7 +1847,6 @@ impl CatalogAuthority {
                 deadline,
                 cancellation,
             )?;
-            transaction.commit()?;
             Ok(selection)
         })();
         clear_progress_handler(connection)?;
@@ -1643,11 +1860,11 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityIdentitySelection, CompanySecurityIdentityCatalogError> {
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = select_links(
             connection,
-            self.catalog().result_bytes,
+            self.result_limits,
             query,
             knowledge_at,
             knowledge_at,
@@ -1665,19 +1882,19 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<SecFundamentalIdentitySelection, CompanySecurityIdentityCatalogError> {
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = (|| {
             let relationship_query = CompanySecurityIdentityQuery::new(
                 query.company_source_id().clone(),
                 query.cik().clone(),
                 query.company_surface(),
-                None,
+                query.instrument_id(),
                 true,
             );
             let relationship_selection = select_links(
                 connection,
-                self.catalog().result_bytes,
+                self.result_limits,
                 &relationship_query,
                 query.effective_at(),
                 query.knowledge_at(),
@@ -1724,8 +1941,8 @@ impl CatalogAuthority {
                     if !direct_crosswalk_is_reference_backed(record.link(), &parent.definition) {
                         return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
                     }
-                    authoritative.push(record.clone());
                 }
+                authoritative.push(record.clone());
             }
 
             let company_knowable = exact_company.is_some_and(|parent| {
@@ -1738,9 +1955,10 @@ impl CatalogAuthority {
             let company_generation_current = current_company.map(|parent| parent.digest)
                 == Some(query.company_observation_digest());
             let availability = if company_parent_ambiguous
-                || relationship_selection.disposition()
-                    == CompanySecurityIdentityDisposition::Conflict
-                || authoritative.len() > 1
+                || (query.instrument_id().is_some()
+                    && (relationship_selection.disposition()
+                        == CompanySecurityIdentityDisposition::Conflict
+                        || authoritative.len() > 1))
             {
                 SecFundamentalIdentityAvailability::Conflict
             } else if exact_company.is_none() {
@@ -1784,11 +2002,11 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityIdentitySelection, CompanySecurityIdentityCatalogError> {
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = select_instrument_company_links(
             connection,
-            self.catalog().result_bytes,
+            self.result_limits,
             instrument_id,
             company_source_id,
             company_surface,
@@ -1812,11 +2030,11 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<IndustryClassificationSelection, CompanySecurityIdentityCatalogError> {
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = select_industry_classification(
             connection,
-            self.catalog().result_bytes,
+            self.result_limits,
             company_observation_digest,
             company_source_id,
             company_surface,
@@ -1842,11 +2060,11 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<IndustryCohortSelection, CompanySecurityIdentityCatalogError> {
-        let connection = &self.catalog().connection;
+        let connection = self.connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = select_industry_cohort(
             connection,
-            self.catalog().result_bytes,
+            self.result_limits,
             company_source_id,
             company_surface,
             knowledge_at,
@@ -2343,6 +2561,18 @@ fn select_instrument_company_links(
             knowledge_at,
             knowledge_at,
         )?;
+        if !record.link().transition().is_revocation() {
+            validate_source_qualified_listing(
+                connection,
+                result_limits,
+                record.link(),
+                &linked_company,
+                &linked_market,
+                false,
+                deadline,
+                cancellation,
+            )?;
+        }
         let receipt_entry = receipt_entry(
             &record,
             linked_company,
@@ -2350,7 +2580,7 @@ fn select_instrument_company_links(
             &linked_market,
             current_market.as_ref(),
         );
-        let reason = exclusion_reason(
+        let mut reason = exclusion_reason(
             &record,
             required_suitability == CommonEquitySuitability::SuitableIssuerCommonEquity,
             knowledge_at,
@@ -2361,6 +2591,11 @@ fn select_instrument_company_links(
             &linked_market,
             current_market.as_ref(),
         );
+        if reason.is_none()
+            && source_qualified_listing_is_stale(connection, record.link(), knowledge_at)?
+        {
+            reason = Some(CompanySecurityIdentityExclusionReason::StaleResolutionParent);
+        }
         if let Some(reason) = reason {
             exclusion_receipts.push((receipt_entry, reason));
             exclusions.push(CompanySecurityIdentityExclusion { record, reason });
@@ -2545,6 +2780,18 @@ fn select_links(
             knowledge_at,
             effective_at,
         )?;
+        if !record.link().transition().is_revocation() {
+            validate_source_qualified_listing(
+                connection,
+                result_limits,
+                record.link(),
+                &linked_company,
+                &linked_market,
+                false,
+                deadline,
+                cancellation,
+            )?;
+        }
         let receipt_entry = receipt_entry(
             &record,
             linked_company,
@@ -2552,7 +2799,7 @@ fn select_links(
             &linked_market,
             current_market.as_ref(),
         );
-        let reason = exclusion_reason(
+        let mut reason = exclusion_reason(
             &record,
             query.require_suitable_common_equity(),
             effective_at,
@@ -2563,6 +2810,11 @@ fn select_links(
             &linked_market,
             current_market.as_ref(),
         );
+        if reason.is_none()
+            && source_qualified_listing_is_stale(connection, record.link(), knowledge_at)?
+        {
+            reason = Some(CompanySecurityIdentityExclusionReason::StaleResolutionParent);
+        }
         if let Some(reason) = reason {
             exclusion_receipts.push((receipt_entry, reason));
             exclusions.push(CompanySecurityIdentityExclusion { record, reason });
@@ -2648,7 +2900,9 @@ fn selection_disposition(
     } else if reasons.clone().any(|reason| {
         matches!(
             reason,
-            Reason::StaleCompanyParent | Reason::StaleMarketInstrumentParent
+            Reason::StaleCompanyParent
+                | Reason::StaleMarketInstrumentParent
+                | Reason::StaleResolutionParent
         )
     }) {
         CompanySecurityIdentityDisposition::Stale
@@ -2884,6 +3138,214 @@ fn market_interval_covers(
         (Some(_), None) => false,
         (Some(market_end), Some(relationship_end)) => relationship_end <= market_end,
     }
+}
+
+/// Validates every automatic-resolution parent under the same publication/read transaction.
+fn validate_source_qualified_listing(
+    connection: &Connection,
+    result_limits: CatalogResultLimits,
+    link: &CompanySecurityIdentityLink,
+    company: &CompanyParent,
+    market: &MarketParent,
+    require_current: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), CompanySecurityIdentityCatalogError> {
+    let CompanySecurityResolutionBasis::SourceQualifiedListing {
+        submissions_observation_digest,
+        listing_source_id,
+        listing_dataset_id,
+        listing_generation_digest,
+        listing_file_kind,
+        listing_row_number,
+        listing_record_digest,
+        listing_venue,
+        listing_symbol,
+        sec_ticker,
+        sec_exchange,
+        classification_evidence,
+        ruleset,
+    } = link.resolution_basis()
+    else {
+        return Ok(());
+    };
+    if !valid_sec_cik(link.provider_company_id().as_str())
+        || ruleset.as_str() != "sec-submissions-official-common-stock-v1"
+        || link.security_kind() != CompanySecurityKind::CommonEquity
+        || link.relationship_kind() != CompanySecurityRelationshipKind::Issuer
+        || link.common_equity_suitability() != CommonEquitySuitability::SuitableIssuerCommonEquity
+        || market.definition.asset_class() != market_squawk_domain::AssetClass::Equity
+        || !market.definition.venue_mappings().iter().any(|mapping| {
+            mapping.venue_id() == listing_venue
+                && mapping.venue_symbol().as_str() == listing_symbol.as_str()
+        })
+        || sec_ticker != listing_symbol
+        || !sec_listing_exchange_matches_venue(sec_exchange.as_str(), listing_venue.as_str())
+    {
+        return Err(CompanySecurityIdentityCatalogError::UnverifiedIdentityAuthority);
+    }
+    let mut budget = ResultBudget::new(result_limits);
+    let company_observation = load_exact_company_observation(
+        connection,
+        link.company_observation_digest(),
+        link.company_source_id(),
+        link.company_surface(),
+        &mut budget,
+    )?
+    .ok_or(CompanySecurityIdentityCatalogError::ParentUnavailable)?;
+    let submissions = load_exact_company_observation(
+        connection,
+        *submissions_observation_digest,
+        link.company_source_id(),
+        CompanyIdentitySurface::SecSubmissions,
+        &mut budget,
+    )?
+    .ok_or(CompanySecurityIdentityCatalogError::ParentUnavailable)?;
+    if company_observation.observation.provider_company_id() != link.provider_company_id()
+        || submissions.observation.provider_company_id() != link.provider_company_id()
+        || !submissions
+            .observation
+            .associations()
+            .iter()
+            .any(|association| {
+                association.ticker() == sec_ticker.as_str()
+                    && association.exchange() == sec_exchange.as_str()
+            })
+        || !company_observation_is_knowable(&submissions, link.available_at())
+        || !company_observation_is_knowable(&company_observation, link.available_at())
+        || company.completed_at > link.available_at()
+        || market.published_at > link.available_at()
+        || link.effective_interval().starts_at() < link.available_at()
+    {
+        return Err(CompanySecurityIdentityCatalogError::UnverifiedIdentityAuthority);
+    }
+    let listing = super::listing_reference::source_qualified_listing_record(
+        connection,
+        result_limits,
+        listing_dataset_id,
+        listing_source_id,
+        *listing_generation_digest,
+        listing_file_kind.as_str(),
+        *listing_row_number,
+        *listing_record_digest,
+        require_current,
+        deadline,
+        cancellation,
+    )
+    .map_err(|error| match error {
+        super::listing_reference::ListingReferenceError::CorruptCatalog => {
+            CompanySecurityIdentityCatalogError::CorruptCatalog
+        }
+        super::listing_reference::ListingReferenceError::Cancelled => {
+            CompanySecurityIdentityCatalogError::Cancelled
+        }
+        super::listing_reference::ListingReferenceError::DeadlineExceeded => {
+            CompanySecurityIdentityCatalogError::DeadlineExceeded
+        }
+        error => CompanySecurityIdentityCatalogError::Listing(error),
+    })?;
+    if listing.listing_venue() != listing_venue
+        || listing.provider_symbol() != listing_symbol.as_str()
+        || listing.record_payload_evidence() != classification_evidence
+        || listing.is_etf()
+        || listing.is_test_issue()
+        || listing.is_next_shares() == Some(true)
+        || !explicit_common_stock_class(listing.security_name())
+        || listing.generation().published_at() > link.available_at()
+        || listing.source_file().available_at() > link.available_at()
+        || listing.source_file().received_at() > link.available_at()
+        || listing.source_file().ingested_at() > link.available_at()
+    {
+        return Err(CompanySecurityIdentityCatalogError::UnverifiedIdentityAuthority);
+    }
+    if require_current
+        && source_qualified_listing_is_stale(connection, link, read_catalog_now(connection)?)?
+    {
+        return Err(CompanySecurityIdentityCatalogError::ParentUnavailable);
+    }
+    Ok(())
+}
+
+fn source_qualified_listing_is_stale(
+    connection: &Connection,
+    link: &CompanySecurityIdentityLink,
+    knowledge_at: Timestamp,
+) -> Result<bool, CompanySecurityIdentityCatalogError> {
+    let CompanySecurityResolutionBasis::SourceQualifiedListing {
+        submissions_observation_digest,
+        listing_source_id,
+        listing_dataset_id,
+        listing_generation_digest,
+        ..
+    } = link.resolution_basis()
+    else {
+        return Ok(false);
+    };
+    let submissions = match current_company_parent(
+        connection,
+        link.company_source_id(),
+        link.provider_company_id(),
+        CompanyIdentitySurface::SecSubmissions,
+        knowledge_at,
+    ) {
+        Ok(parent) => parent,
+        Err(CompanySecurityIdentityCatalogError::AmbiguousParent) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let listing: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT generation_digest FROM listing_reference_generations
+         WHERE dataset_id=?1 AND source_id=?2 AND published_at_ns<=?3
+         ORDER BY generation_sequence DESC LIMIT 1",
+            params![
+                listing_dataset_id.as_str(),
+                listing_source_id.as_str(),
+                knowledge_at.unix_nanos()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(
+        submissions.map(|parent| parent.digest) != Some(*submissions_observation_digest)
+            || listing.as_deref() != Some(listing_generation_digest.bytes().as_slice()),
+    )
+}
+
+/// Matches the closed SEC exchange labels used by retained official-listing resolution.
+/// This comparison discovers candidates and grants no identity or data-use authority.
+pub fn sec_listing_exchange_matches_venue(exchange: &str, venue: &str) -> bool {
+    matches!(
+        (exchange, venue),
+        ("Nasdaq" | "NASDAQ" | "XNAS", "XNAS")
+            | ("NYSE" | "XNYS", "XNYS")
+            | ("NYSE American" | "XASE", "XASE")
+            | ("NYSE Arca" | "ARCX", "ARCX")
+            | ("Cboe BZX" | "BATS", "BATS")
+    )
+}
+
+fn explicit_common_stock_class(name: &str) -> bool {
+    // Security-form text comes from the exact official row, never an issuer-name join.
+    let lower = name.to_ascii_lowercase();
+    if [
+        "preferred",
+        "preference",
+        "depositary",
+        "depository",
+        "warrant",
+        "rights",
+        "units",
+        "etf",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        return false;
+    }
+    lower.ends_with("common stock")
+        || lower.ends_with("common shares")
+        || lower.ends_with("ordinary shares")
+        || (lower.contains(" - class ") && lower.ends_with("capital stock"))
 }
 
 fn direct_crosswalk_is_reference_backed(
@@ -3796,6 +4258,13 @@ fn sec_fundamental_identity_query_digest(query: &SecFundamentalIdentityQuery) ->
     hash_text(&mut hasher, query.cik().as_str());
     hasher.update([company_surface_tag(query.company_surface())]);
     hash_digest(&mut hasher, query.company_observation_digest());
+    match query.instrument_id() {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.as_uuid().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
     hasher.update(query.effective_at().unix_nanos().to_be_bytes());
     hasher.update(query.knowledge_at().unix_nanos().to_be_bytes());
     evidence_digest(hasher.finalize().into())
@@ -4039,6 +4508,7 @@ fn resolution_kind_name(value: &CompanySecurityResolutionBasis) -> &'static str 
         CompanySecurityResolutionBasis::OperatorAuthorizedResolution { .. } => {
             "operator_authorized_resolution"
         }
+        CompanySecurityResolutionBasis::SourceQualifiedListing { .. } => "source_qualified_listing",
     }
 }
 fn entitlement_name(value: IdentifierEntitlement) -> &'static str {
@@ -4063,6 +4533,7 @@ const fn company_surface_tag(value: CompanyIdentitySurface) -> u8 {
     match value {
         CompanyIdentitySurface::SecSubmissions => 1,
         CompanyIdentitySurface::SecCompanyFacts => 2,
+        CompanyIdentitySurface::SecFilingXbrl => 3,
     }
 }
 const fn industry_scheme_tag(value: IndustryClassificationScheme) -> u8 {
@@ -4128,6 +4599,7 @@ const fn exclusion_tag(value: CompanySecurityIdentityExclusionReason) -> u8 {
         CompanySecurityIdentityExclusionReason::StaleCompanyParent => 6,
         CompanySecurityIdentityExclusionReason::StaleMarketInstrumentParent => 7,
         CompanySecurityIdentityExclusionReason::Revoked => 8,
+        CompanySecurityIdentityExclusionReason::StaleResolutionParent => 9,
     }
 }
 const fn algorithm_code(value: DigestAlgorithm) -> i64 {
@@ -4312,3 +4784,18 @@ SELECT link_digest, company_source_id, provider_company_id, company_surface,
 FROM ranked WHERE as_of_rank=1
 ORDER BY instrument_id, hex(link_digest)
 LIMIT ?7";
+
+fn read_catalog_now(
+    connection: &Connection,
+) -> Result<Timestamp, CompanySecurityIdentityCatalogError> {
+    let now = super::storage::now_timestamp()?;
+    let durable: i64 = connection.query_row(
+        "SELECT last_timestamp_ns FROM catalog_authority_clock WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if now.unix_nanos() < durable {
+        return Err(CatalogError::AuthorityClockRollback.into());
+    }
+    Ok(now)
+}

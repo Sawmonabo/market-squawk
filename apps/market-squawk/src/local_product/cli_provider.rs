@@ -45,10 +45,8 @@ use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    InstrumentId, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityLocator,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
-    ProviderInstrumentId, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
-    SourceId, SourceIdentifier, Timestamp,
+    MetadataRevision, ProviderIdentityRegistry, RevisionBoundPayloadEvidence, SchemaVersion,
+    SequenceCapability, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{LocalPaths, LocalSecretStoreError};
 use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
@@ -109,13 +107,11 @@ const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
 const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
-const MAXIMUM_SEC_IDENTITIES: usize = 16;
+const MAXIMUM_SEC_COMPANIES: usize = 16;
 const MAXIMUM_BLS_SERIES: usize = 1_000;
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
-const SEC_IDENTITY_NAMESPACE_V1: &str =
-    "https://market-squawk.local/identity/sec-cik-instrument/v1";
 const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
 const BLS_REGISTERED_SURFACE: &str = "bls.v2-registered";
 const COINBASE_DIRECT_SURFACE: &str = "coinbase.exchange-direct-market-data";
@@ -3412,7 +3408,7 @@ fn build_research_activation(
                 provider_dataset,
             ))
         }
-        ProviderRequest::Sec { identities } => {
+        ProviderRequest::Sec { companies } => {
             let metadata = metadata_with_source_id(
                 lease,
                 activation_evidence,
@@ -3435,29 +3431,24 @@ fn build_research_activation(
                     .budget_policy()
                     .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
-            let mut selected_companies = identities
+            if companies.is_empty() || companies.len() > MAXIMUM_SEC_COMPANIES {
+                return Err(CliProviderActivationError::ProviderConfiguration);
+            }
+            let mut selected_companies = companies
                 .iter()
-                .map(|mapping| {
-                    SourceIdentifier::try_from(mapping.cik.as_str())
-                        .map(|cik| (cik, mapping.instrument_id))
+                .map(|cik| {
+                    SourceIdentifier::try_from(cik.as_str())
                         .map_err(|_| CliProviderActivationError::ProviderConfiguration)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             selected_companies.sort_unstable();
             selected_companies.dedup();
-            let identities = sec_identity_registry(
-                &metadata,
-                identities,
-                activation_evidence,
-                metadata_effective,
-                lease.issued_at(),
-            )?;
             let (raw_store, representations) = sec_state(paths, activation_evidence)?;
             ProviderAdapterActivationRequest::Sec(SecAdapterActivation::new(
                 metadata,
                 raw_store,
                 representations,
-                identities,
+                ProviderIdentityRegistry::new(),
                 SecParserLimits::production_defaults(),
                 selected_companies,
             ))
@@ -3754,7 +3745,7 @@ enum ProviderRequest {
         provider_dataset: SourceIdentifier,
     },
     Sec {
-        identities: Vec<SecIdentityMappingRequest>,
+        companies: Vec<SecCikInput>,
     },
     Bls {
         series_metadata: Vec<ExactInputReference>,
@@ -3794,13 +3785,6 @@ pub(crate) struct ControlledLocalFileRequest {
     pub(crate) workspace_receipt_evidence_sha256: String,
     pub(crate) import_receipt_evidence_sha256: String,
     pub(crate) admitted_at_unix_nanos: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SecIdentityMappingRequest {
-    cik: SecCikInput,
-    instrument_id: InstrumentId,
 }
 
 impl ProviderRequest {
@@ -3888,10 +3872,7 @@ fn portal_provider_request(
             require_surface(lease, ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID))?;
             Ok((
                 ProviderRequest::Sec {
-                    identities: vec![SecIdentityMappingRequest {
-                        instrument_id: sec_instrument_id(&cik)?,
-                        cik,
-                    }],
+                    companies: vec![cik],
                 },
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
@@ -3976,74 +3957,6 @@ fn portal_provider_request(
             fred_portal_request(lease, provider_dataset)
         }
     }
-}
-
-fn sec_instrument_id(cik: &SecCikInput) -> Result<InstrumentId, CliProviderActivationError> {
-    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, SEC_IDENTITY_NAMESPACE_V1.as_bytes());
-    InstrumentId::try_from(Uuid::new_v5(&namespace, cik.as_str().as_bytes()))
-        .map_err(|_| CliProviderActivationError::ProviderConfiguration)
-}
-
-fn sec_identity_registry(
-    metadata: &SourceMetadata,
-    mappings: Vec<SecIdentityMappingRequest>,
-    activation_evidence: EvidenceDigest,
-    validity: EffectiveInterval,
-    observed_at: Timestamp,
-) -> Result<ProviderIdentityRegistry, CliProviderActivationError> {
-    if mappings.is_empty() || mappings.len() > MAXIMUM_SEC_IDENTITIES {
-        return Err(CliProviderActivationError::ProviderConfiguration);
-    }
-    let digest = lower_hex(&activation_evidence.bytes());
-    let short = digest
-        .get(..24)
-        .ok_or(CliProviderActivationError::InvalidMetadata)?;
-    let revision = MetadataRevision::new(
-        SourceIdentifier::try_from(format!("sec-cik-mapping-v1-{short}"))
-            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-    );
-    let mut ciks = BTreeSet::new();
-    let mut instruments = BTreeSet::new();
-    let mut records = Vec::new();
-    records
-        .try_reserve_exact(mappings.len())
-        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-    for mapping in mappings {
-        let expected = sec_instrument_id(&mapping.cik)?;
-        if expected != mapping.instrument_id
-            || !ciks.insert(mapping.cik.clone())
-            || !instruments.insert(mapping.instrument_id)
-        {
-            return Err(CliProviderActivationError::ProviderConfiguration);
-        }
-        let provider_instrument_id =
-            ProviderInstrumentId::try_from(mapping.cik.as_str().to_owned())
-                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-        let locator = ProviderIdentityLocator::new(
-            SourceIdentifier::try_from(format!(
-                "market-squawk:onboarding:sec-cik:{}",
-                mapping.cik.as_str()
-            ))
-            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-            revision.as_source_identifier().clone(),
-        );
-        records.push(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-            instrument_id: mapping.instrument_id,
-            source_id: metadata.source_id().clone(),
-            provider_instrument_id,
-            evidence: ProviderIdentityEvidence::with_version_pinned_locator(
-                activation_evidence,
-                locator,
-            ),
-            source_timestamp: None,
-            observed_at,
-            metadata_revision: revision.clone(),
-            validity,
-            supersedes: None,
-        }));
-    }
-    ProviderIdentityRegistry::try_from_records(records)
-        .map_err(|_| CliProviderActivationError::ProviderConfiguration)
 }
 
 fn fred_portal_request(
@@ -4305,8 +4218,8 @@ fn evidence_references(
 ) -> Result<Vec<BoundedExactReference<'_>>, CliProviderActivationError> {
     let mut references = Vec::new();
     match &request.provider {
-        ProviderRequest::Sec { identities } => {
-            if identities.is_empty() || identities.len() > MAXIMUM_SEC_IDENTITIES {
+        ProviderRequest::Sec { companies } => {
+            if companies.is_empty() || companies.len() > MAXIMUM_SEC_COMPANIES {
                 return Err(CliProviderActivationError::ProviderConfiguration);
             }
         }
@@ -6098,7 +6011,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sec_identity_recipe_is_stable_evidence_bound_and_legacy_fail_closed() -> TestResult {
+    async fn sec_company_recipe_retains_issuer_selection_and_rejects_invalid_requests() -> TestResult
+    {
         let temporary = tempfile::tempdir()?;
         let config = AppConfig::load(ConfigSources::new(
             None,
@@ -6111,7 +6025,6 @@ mod tests {
         let product = crate::LocalProduct::try_new(config).await?;
         let lease = prepared_sec_lease(&product, "sec-identity-recipe").await?;
         let cik = SecCikInput::try_new("0000320193".to_owned())?;
-        let expected_instrument = sec_instrument_id(&cik)?;
         let (provider, evidence) =
             portal_provider_request(&lease, ProviderPortalActivationRequest::Sec { cik })?;
         let request = ActivationRequest {
@@ -6123,10 +6036,9 @@ mod tests {
         let recovered = decode_request(&request_bytes)?;
         assert!(matches!(
             &recovered.provider,
-            ProviderRequest::Sec { identities }
-                if identities.len() == 1
-                    && identities[0].cik.as_str() == "0000320193"
-                    && identities[0].instrument_id == expected_instrument
+            ProviderRequest::Sec { companies }
+                if companies.len() == 1
+                    && companies[0].as_str() == "0000320193"
         ));
         let activation = build_research_activation(
             product.paths(),

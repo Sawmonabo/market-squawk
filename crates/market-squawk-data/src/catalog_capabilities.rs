@@ -51,6 +51,7 @@ use crate::{
 #[derive(Clone)]
 pub struct CompanyIdentityReadCapability {
     authority: Arc<Mutex<CatalogAuthority>>,
+    relationships: crate::CompanySecurityIdentityReadCapability,
 }
 
 impl fmt::Debug for CompanyIdentityReadCapability {
@@ -63,8 +64,14 @@ impl fmt::Debug for CompanyIdentityReadCapability {
 }
 
 impl CompanyIdentityReadCapability {
-    pub(crate) fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
-        Self { authority }
+    pub(crate) fn new(
+        authority: Arc<Mutex<CatalogAuthority>>,
+        relationships: crate::CompanySecurityIdentityReadCapability,
+    ) -> Self {
+        Self {
+            authority,
+            relationships,
+        }
     }
 
     /// Searches current digest-verified company observations under hard bounds.
@@ -97,16 +104,13 @@ impl CompanyIdentityReadCapability {
         Option<(CompanyIdentityObservation, EvidenceDigest, Timestamp)>,
         crate::CompanySecurityIdentityCatalogError,
     > {
-        self.authority
-            .try_lock()
-            .map_err(|_| crate::CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .exact_current_company_identity(
-                source_id,
-                provider_company_id,
-                surface,
-                deadline,
-                cancellation,
-            )
+        self.relationships.exact_current_company_identity(
+            source_id,
+            provider_company_id,
+            surface,
+            deadline,
+            cancellation,
+        )
     }
 
     /// Narrows this company reader to exact company/security relationship reads.
@@ -114,7 +118,7 @@ impl CompanyIdentityReadCapability {
     /// The derived capability retains no company publication, market publication, rights, or
     /// execution authority.
     pub fn security_relationships(&self) -> crate::CompanySecurityIdentityReadCapability {
-        crate::CompanySecurityIdentityReadCapability::new(Arc::clone(&self.authority))
+        self.relationships.clone()
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {

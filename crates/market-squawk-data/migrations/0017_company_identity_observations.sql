@@ -4,7 +4,7 @@ CREATE TABLE company_identity_observations (
     manifest_id TEXT NOT NULL REFERENCES dataset_manifests(manifest_id),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
     source_surface TEXT NOT NULL CHECK (
-        source_surface IN ('sec_submissions', 'sec_company_facts')
+        source_surface IN ('sec_submissions', 'sec_company_facts', 'sec_filing_xbrl')
     ),
     provider_company_id TEXT NOT NULL CHECK (
         length(CAST(provider_company_id AS BLOB)) BETWEEN 1 AND 512

@@ -6,38 +6,17 @@ use market_squawk_adapter_sec::{
     normalize_company_facts, normalize_filings,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, EffectiveInterval, EvidenceDigest, FundamentalAmendmentStatus,
-    FundamentalCadence, FundamentalConsolidation, FundamentalPeriod, FundamentalRestatementStatus,
-    InstrumentId, MetadataRevision, PayloadHashAlgorithm, ProviderIdentityEvidence,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
-    ProviderInstrumentId, ResearchObservation, ResearchTemporalCoordinate,
-    ResearchTemporalPrecision, SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
+    FundamentalPeriod, FundamentalRestatementStatus, PayloadHash, PayloadReference,
+    ResearchObservation, ResearchTemporalCoordinate, ResearchTemporalPrecision, SourceId,
+    SourceIdentifier,
 };
 use sha2::{Digest as _, Sha256};
-use uuid::Uuid;
 
 #[test]
-fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Result<(), Box<dyn Error>>
-{
+fn issuer_owned_facts_and_filings_preserve_amendments_as_pit_revisions()
+-> Result<(), Box<dyn Error>> {
     let source_id = SourceId::try_from("sec-edgar")?;
-    let instrument_id = InstrumentId::try_from(Uuid::from_u128(7))?;
-    let identities =
-        ProviderIdentityRegistry::try_from_records(vec![ProviderIdentityRecord::new(
-            ProviderIdentityRecordInput {
-                instrument_id,
-                source_id: source_id.clone(),
-                provider_instrument_id: ProviderInstrumentId::try_from("0000320193")?,
-                evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
-                    PayloadHashAlgorithm::Sha256,
-                    [9; 32],
-                )),
-                source_timestamp: None,
-                observed_at: Timestamp::from_unix_nanos(1),
-                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("sec-id-v1")?),
-                validity: EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
-                supersedes: None,
-            },
-        )])?;
     let temporary = tempfile::tempdir()?;
     let store = RawEvidenceStore::new(Dir::open_ambient_dir(
         temporary.path(),
@@ -49,19 +28,37 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
         SecParserLimits::production_defaults(),
     )?;
     let ingested_at = retrieved.raw().received_at().checked_add_nanos(1)?;
-    let observations = normalize_company_facts(&source_id, &identities, &retrieved, ingested_at)?;
+    let observations = normalize_company_facts(&source_id, &retrieved, ingested_at)?;
 
     assert_eq!(observations.len(), 3);
+    assert_eq!(retrieved.document().cik().as_str(), "0000320193");
+    for observation in &observations {
+        let ResearchObservation::Fundamental(fact) = observation else {
+            return Err("unexpected Company Facts observation".into());
+        };
+        let provenance = fact.context().provenance();
+        assert_eq!(provenance.instrument_id(), None);
+        assert_eq!(fact.subject().issuer_id(), Some(retrieved.document().cik()));
+        assert_eq!(provenance.source_id(), &source_id);
+        assert_eq!(provenance.received_at(), retrieved.raw().received_at());
+        assert_eq!(provenance.ingested_at(), ingested_at);
+        assert_eq!(
+            provenance.payload_reference(),
+            &PayloadReference::ContentHash(PayloadHash::new(
+                retrieved.raw().evidence().algorithm(),
+                retrieved.raw().evidence().bytes(),
+            ))
+        );
+        let reopened: ResearchObservation =
+            serde_json::from_slice(&serde_json::to_vec(observation)?)?;
+        assert_eq!(&reopened, observation);
+    }
     let mut asset_revisions = observations
         .iter()
         .filter_map(|observation| match observation {
             ResearchObservation::Fundamental(fact)
                 if fact.concept().as_str() == "us-gaap:Assets" =>
             {
-                assert_eq!(
-                    fact.context().provenance().instrument_id(),
-                    Some(instrument_id)
-                );
                 assert!(matches!(
                     fact.context().provenance().availability(),
                     AvailabilityEvidence::Unknown
@@ -137,7 +134,7 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
         "facts":{"us-gaap":{"Assets":{"units":{"USD":[
             {"end":"2025-06-28","val":331495000000,"accn":"0000320193-25-000079","fy":2025,"fp":"Q3","form":"10-Q","filed":"2025-07-31","frame":"CY2025Q2I"},
             {"end":"2025-06-28","val":331495000000,"accn":"0000320193-25-000079","fy":2025,"fp":"Q3","form":"10-Q","filed":"2025-07-31","frame":"CY2025Q2I"}
-        ]}}}}}
+        ]}}}}
     }"#;
     let colliding = RetrievedCompanyFacts::import_exact_bytes(
         colliding_facts,
@@ -145,8 +142,7 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
         SecParserLimits::production_defaults(),
     )?;
     let colliding_ingested_at = colliding.raw().received_at().checked_add_nanos(1)?;
-    let canonical =
-        normalize_company_facts(&source_id, &identities, &colliding, colliding_ingested_at)?;
+    let canonical = normalize_company_facts(&source_id, &colliding, colliding_ingested_at)?;
     let canonical_ids: Vec<_> = canonical
         .iter()
         .filter_map(|observation| match observation {
@@ -176,8 +172,33 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
         SecParserLimits::production_defaults(),
     )?;
     let filing_ingested_at = submissions.raw().received_at().checked_add_nanos(1)?;
-    let filings = normalize_filings(&source_id, &identities, &submissions, filing_ingested_at)?;
+    let filings = normalize_filings(&source_id, &submissions, filing_ingested_at)?;
     assert_eq!(filings.len(), 3);
+    assert_eq!(submissions.document().cik().as_str(), "0000320193");
+    for observation in &filings {
+        let ResearchObservation::Filing(filing) = observation else {
+            return Err("unexpected submissions observation".into());
+        };
+        let provenance = filing.context().provenance();
+        assert_eq!(provenance.instrument_id(), None);
+        assert_eq!(
+            filing.subject().issuer_id(),
+            Some(submissions.document().cik())
+        );
+        assert_eq!(provenance.source_id(), &source_id);
+        assert_eq!(provenance.received_at(), submissions.raw().received_at());
+        assert_eq!(provenance.ingested_at(), filing_ingested_at);
+        assert_eq!(
+            provenance.payload_reference(),
+            &PayloadReference::ContentHash(PayloadHash::new(
+                submissions.raw().evidence().algorithm(),
+                submissions.raw().evidence().bytes(),
+            ))
+        );
+        let reopened: ResearchObservation =
+            serde_json::from_slice(&serde_json::to_vec(observation)?)?;
+        assert_eq!(&reopened, observation);
+    }
     let amendment = filings
         .iter()
         .find_map(|observation| match observation {

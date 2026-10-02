@@ -18,10 +18,11 @@ use market_squawk_data::{
     UniverseMembership,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, BarTimestampBasis, CalendarDate, Currency, DigestAlgorithm,
-    EffectiveInterval, EvidenceDigest, FundamentalPeriod, HistoricalStudyBasis, InstrumentId,
-    MarketBarAdjustment, MarketBarSessionEvidence, ProviderInstrumentId, ResearchPeriod,
-    ResearchTemporalCoordinate, SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AvailabilityEvidence, BarTimestampBasis, CalendarDate, CompanyObservationSubject, Currency,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, FundamentalPeriod, HistoricalStudyBasis,
+    InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence, ProviderInstrumentId,
+    ResearchPeriod, ResearchTemporalCoordinate, SchemaVersion, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_platform::UserOwnedInputEvidence;
 use rust_decimal::Decimal;
@@ -414,12 +415,12 @@ impl AdjustmentEvidenceDto {
 enum ObservationFamilyDto {
     Filing {
         source_id: SourceId,
-        instrument_id: InstrumentId,
+        subject: CompanyObservationSubject,
         accession: SourceIdentifier,
     },
     Fundamental {
         source_id: SourceId,
-        instrument_id: InstrumentId,
+        subject: CompanyObservationSubject,
         concept: SourceIdentifier,
         unit: SourceIdentifier,
         period: FundamentalPeriod,
@@ -483,22 +484,22 @@ impl ObservationFamilyDto {
         Ok(match self {
             Self::Filing {
                 source_id,
-                instrument_id,
+                subject,
                 accession,
             } => ObservationFamilyKey::Filing {
                 source_id,
-                instrument_id,
+                subject,
                 accession,
             },
             Self::Fundamental {
                 source_id,
-                instrument_id,
+                subject,
                 concept,
                 unit,
                 period,
             } => ObservationFamilyKey::Fundamental {
                 source_id,
-                instrument_id,
+                subject,
                 concept,
                 unit,
                 period,

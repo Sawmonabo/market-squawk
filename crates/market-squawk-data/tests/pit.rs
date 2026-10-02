@@ -10,17 +10,17 @@ use market_squawk_data::{
     Sha256Digest,
 };
 use market_squawk_domain::{
-    AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CorporateActionKind,
-    CorporateActionObservation, DataQuality, DigestAlgorithm, EffectiveInterval, FilingObservation,
-    FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
-    FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
-    FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
-    FundamentalRevisionOrder, InstrumentId, MacroObservation, PayloadHash, PayloadReference,
-    PositionObservation, PositionSide, QuantityLots, ResearchContext, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
-    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, TransactionObservation,
-    UniverseMembershipObservation, XbrlDimensionEvidence, XbrlDimensionLocation,
-    XbrlDimensionMember, XbrlQualifiedName,
+    AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CompanyObservationSubject,
+    CorporateActionKind, CorporateActionObservation, DataQuality, DigestAlgorithm,
+    EffectiveInterval, FilingObservation, FundamentalAmendmentStatus, FundamentalCadence,
+    FundamentalConsolidation, FundamentalDimensionContext, FundamentalFactContext,
+    FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+    FundamentalRestatementStatus, FundamentalRevisionOrder, InstrumentId, MacroObservation,
+    PayloadHash, PayloadReference, PositionObservation, PositionSide, QuantityLots,
+    ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
+    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SchemaVersion, SourceId,
+    SourceIdentifier, Timestamp, TransactionObservation, UniverseMembershipObservation,
+    XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember, XbrlQualifiedName,
 };
 use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use rust_decimal::Decimal;
@@ -140,6 +140,7 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
         Ok(ResearchObservation::Fundamental(
             FundamentalObservation::new(
                 fundamental_context,
+                CompanyObservationSubject::Instrument(instrument),
                 SourceIdentifier::try_from("us-gaap:Assets")?,
                 value,
                 fact_context,
@@ -215,9 +216,53 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
         CanonicalObservationFamily::try_from_observation(&nonconsolidated_fundamental)?,
         "consolidation scope must remain in a fundamental family"
     );
-    let observations = vec![
+    // Identical concepts, periods and accession text from different issuers must not
+    // become revisions of one another merely because both have no instrument.
+    // Keep their native effective coordinates in the calendar-date domain selected below.
+    let ResearchObservation::Fundamental(base_fact) = &base_fundamental else {
+        return Err("expected fundamental fixture".into());
+    };
+    let mut issuer_observations = Vec::new();
+    for issuer in ["0000320193", "0000789019"] {
+        let subject = CompanyObservationSubject::Issuer(SourceIdentifier::try_from(issuer)?);
+        issuer_observations.push(ResearchObservation::Filing(FilingObservation::new(
+            ResearchContext::new(
+                context("issuer-filing", None)?.provenance().clone(),
+                base_fact.context().time().clone(),
+            )?,
+            subject.clone(),
+            SourceIdentifier::try_from("10-K")?,
+            SourceIdentifier::try_from("same-provider-accession")?,
+        )?));
+        issuer_observations.push(ResearchObservation::Fundamental(
+            FundamentalObservation::new(
+                ResearchContext::new(
+                    context("issuer-fundamental", None)?.provenance().clone(),
+                    base_fact.context().time().clone(),
+                )?,
+                subject,
+                base_fact.concept().clone(),
+                base_fact.value(),
+                base_fact.fact_context().clone(),
+            )?,
+        ));
+    }
+    for (first, second) in [(0, 2), (1, 3)] {
+        assert_ne!(
+            CanonicalObservationFamily::try_from_observation(&issuer_observations[first])?,
+            CanonicalObservationFamily::try_from_observation(&issuer_observations[second])?,
+        );
+        assert_ne!(
+            PointInTimeCandidate::new(issuer_observations[first].clone(), manifest(1, 1)?)
+                .family_key()?,
+            PointInTimeCandidate::new(issuer_observations[second].clone(), manifest(1, 1)?)
+                .family_key()?,
+        );
+    }
+    let mut observations = vec![
         ResearchObservation::Filing(FilingObservation::new(
             context("filing-record", Some(instrument))?,
+            CompanyObservationSubject::Instrument(instrument),
             SourceIdentifier::try_from("10-K")?,
             SourceIdentifier::try_from("0000000000-24-000001")?,
         )?),
@@ -260,6 +305,7 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
             None,
         )),
     ];
+    observations.extend(issuer_observations);
     let candidates = observations
         .into_iter()
         .enumerate()
@@ -275,9 +321,9 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
         &PointInTimeService::new(),
         &request(
             policy(PointInTimeRevisionMode::LatestKnown)?,
-            timestamp(100),
+            timestamp(1_800_000_000_000_000_000),
             None,
-            exact(100),
+            ResearchTemporalCoordinate::calendar_date(fundamental_end),
             None,
             limits(16, 16, 4, 16, 1 << 20)?,
         )?,
@@ -285,6 +331,19 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
     )
     .await?;
 
+    assert_eq!(
+        selection
+            .records()
+            .iter()
+            .filter(|record| match record.candidate().observation() {
+                ResearchObservation::Filing(value) => value.subject().issuer_id().is_some(),
+                ResearchObservation::Fundamental(value) => value.subject().issuer_id().is_some(),
+                _ => false,
+            })
+            .count(),
+        4,
+        "each issuer's filing and fact must survive selection"
+    );
     assert_eq!(
         selection.records().len() + selection.exclusions().len(),
         candidates.len()

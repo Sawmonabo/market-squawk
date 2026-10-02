@@ -12,12 +12,13 @@ pub use indexed::SecResearchRows;
 use std::fmt;
 use std::mem::size_of;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use market_squawk_domain::{
     CommonEquitySuitability, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, InstrumentId,
-    ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId, Timestamp,
+    ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
@@ -34,11 +35,10 @@ use crate::catalog::{
     CompanySecurityIdentityReadCapability, CompanySecurityIdentitySelection,
 };
 use crate::{
-    AnalyticalManifestCatalog, ArrowConversionError, CatalogAuthority, CatalogError,
-    DatasetManifestRef, ManifestCatalogError, ParquetObjectStore, ParquetStoreError,
-    PointInTimeError, PointInTimeExclusionReason, PointInTimeExclusionReasons, PointInTimeLimits,
-    PointInTimePolicy, PointInTimeRequest, PointInTimeRevisionMode, PointInTimeRevisionState,
-    Sha256Digest,
+    AnalyticalManifestCatalog, ArrowConversionError, CatalogError, DatasetManifestRef,
+    ManifestCatalogError, ParquetObjectStore, ParquetStoreError, PointInTimeError,
+    PointInTimeExclusionReason, PointInTimeExclusionReasons, PointInTimeLimits, PointInTimePolicy,
+    PointInTimeRequest, PointInTimeRevisionMode, PointInTimeRevisionState, Sha256Digest,
 };
 
 const SEC_SOURCE_ID: &str = "sec-edgar";
@@ -69,7 +69,7 @@ impl SecResearchFamily {
         match self {
             Self::Submissions => CompanyIdentitySurface::SecSubmissions,
             Self::CompanyFacts => CompanyIdentitySurface::SecCompanyFacts,
-            Self::FilingXbrl => CompanyIdentitySurface::SecSubmissions,
+            Self::FilingXbrl => CompanyIdentitySurface::SecFilingXbrl,
         }
     }
 
@@ -627,7 +627,7 @@ impl SecResearchSelection {
 /// Cloneable least-authority exact SEC research reader.
 #[derive(Clone)]
 pub struct SecResearchReadCapability {
-    authority: Arc<Mutex<CatalogAuthority>>,
+    identities: CompanySecurityIdentityReadCapability,
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
 }
@@ -665,12 +665,12 @@ impl ResearchObjectControl for SecResearchOperationControl<'_> {
 
 impl SecResearchReadCapability {
     pub(crate) fn new(
-        authority: Arc<Mutex<CatalogAuthority>>,
         manifests: Arc<AnalyticalManifestCatalog>,
         objects: Arc<ParquetObjectStore>,
+        identities: CompanySecurityIdentityReadCapability,
     ) -> Self {
         Self {
-            authority,
+            identities,
             manifests,
             objects,
         }
@@ -679,7 +679,7 @@ impl SecResearchReadCapability {
     /// Resolves canonical security identity to one exact SEC generation, then performs the read.
     ///
     /// Missing, ambiguous, stale, and revoked issuer mappings remain explicit outcomes. Only an
-    /// exact direct common-equity relationship can supply the privately derived company, provider
+    /// exact admitted common-equity relationship can supply the privately derived company, provider
     /// binding, and immutable manifest coordinates consumed by [`Self::select`].
     pub async fn select_by_identity(
         &self,
@@ -691,16 +691,15 @@ impl SecResearchReadCapability {
         check_operation(deadline, &cancellation)?;
         let source_id =
             SourceId::try_from(SEC_SOURCE_ID).map_err(|_| SecResearchReadError::InvalidRequest)?;
-        let identity = CompanySecurityIdentityReadCapability::new(Arc::clone(&self.authority))
-            .instrument_company_as_of(
-                request.instrument_id(),
-                &source_id,
-                request.family().company_surface(),
-                request.knowledge_at(),
-                CommonEquitySuitability::SuitableIssuerCommonEquity,
-                deadline,
-                &cancellation,
-            )?;
+        let identity = self.identities.instrument_company_as_of(
+            request.instrument_id(),
+            &source_id,
+            request.family().company_surface(),
+            request.knowledge_at(),
+            CommonEquitySuitability::SuitableIssuerCommonEquity,
+            deadline,
+            &cancellation,
+        )?;
         let closed = match identity.disposition() {
             CompanySecurityIdentityDisposition::Unavailable => {
                 Some(SecResearchIdentityOutcome::Missing)
@@ -735,10 +734,7 @@ impl SecResearchReadCapability {
             return Err(SecResearchReadError::OriginMismatch);
         }
         let company = self
-            .authority
-            .try_lock()
-            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
-            .catalog()
+            .identities
             .exact_company_identity_by_digest(
                 link.company_observation_digest(),
                 deadline,
@@ -840,10 +836,7 @@ impl SecResearchReadCapability {
         }
 
         let company_identity = self
-            .authority
-            .try_lock()
-            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
-            .catalog()
+            .identities
             .exact_company_identity_by_digest(
                 request.company_observation_digest(),
                 deadline,
@@ -888,10 +881,8 @@ impl SecResearchReadCapability {
             return Err(SecResearchReadError::ProviderBindingMismatch);
         }
         let binding = self
-            .authority
-            .try_lock()
-            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
-            .provider_capture_binding_evidence(request.provider_binding_digest())?
+            .identities
+            .capture_binding_evidence(request.provider_binding_digest(), deadline, &cancellation)?
             .ok_or(SecResearchReadError::ProviderBindingMismatch)?;
         binding.verify_integrity()?;
         if binding.binding_digest() != request.provider_binding_digest()
@@ -958,6 +949,7 @@ impl SecResearchReadCapability {
         validate_rows(
             request.family(),
             &source_id,
+            company_identity.observation().provider_company_id(),
             &coordinates,
             &observations,
             &binding,
@@ -1314,9 +1306,19 @@ fn exact_origin_object_ordinal(
     Ok(ordinal)
 }
 
+fn observation_has_issuer(observation: &ResearchObservation, issuer: &SourceIdentifier) -> bool {
+    match observation {
+        ResearchObservation::Filing(value) => value.subject().issuer_id() == Some(issuer),
+        ResearchObservation::Fundamental(value) => value.subject().issuer_id() == Some(issuer),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_rows(
     family: SecResearchFamily,
     source_id: &SourceId,
+    issuer: &SourceIdentifier,
     coordinates: &[ProviderCaptureRowCoordinate],
     observations: &SecResearchRows<ResearchObservation>,
     binding: &crate::PersistedProviderCaptureBindingEvidence,
@@ -1340,6 +1342,11 @@ fn validate_rows(
             u32::try_from(ordinal).map_err(|_| SecResearchReadError::OriginMismatch)?;
         if !family.accepts(&observation)
             || observation_context(&observation).provenance().source_id() != source_id
+            || observation_context(&observation)
+                .provenance()
+                .instrument_id()
+                .is_some()
+            || !observation_has_issuer(&observation, issuer)
             || coordinate.binding_digest != binding.binding_digest()
             || coordinate.capture_observation_digest != binding.capture().observation_digest()
             || coordinate.canonical_row_ordinal != expected_ordinal

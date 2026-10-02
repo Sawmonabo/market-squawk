@@ -16,7 +16,7 @@ use market_squawk_data::{
     PointInTimeRevisionMode, ResearchUse, ResearchUseCatalogError, ResearchUseDecisionDigest,
     ResearchUseGraphDigest, ResearchUseLimits, ResearchUseRequest, SecResearchDisposition,
     SecResearchFamily, SecResearchIdentityOutcome, SecResearchIdentityReadRequest,
-    SecResearchIdentitySelection, SecResearchReadError, SecResearchSelection,
+    SecResearchIdentitySelection, SecResearchReadError,
 };
 use market_squawk_domain::{
     CalendarDate, Currency, DataQuality, DigestAlgorithm, EvidenceDigest, FundamentalCadence,
@@ -291,14 +291,11 @@ pub(crate) async fn read_financial_target_history(
         cancellation,
     )
     .await?;
-    let SecResearchIdentityOutcome::Exact(selected) = source.outcome() else {
-        return Err(ServiceError::InvalidResult);
-    };
     let authorization_expires_at = authorization.expires_at();
     let authorization_decision = authorization.decision_digest();
     let authorization_graph = authorization.graph().digest();
     let (facts, frames, source_identity, projection_retained_bytes) = normalize_selection(
-        selected,
+        &source,
         instrument_id,
         source_selection_as_of,
         effective_date,
@@ -498,7 +495,7 @@ fn map_financial_series_error(error: DatasetBuildError) -> ServiceError {
 }
 
 fn normalize_selection(
-    source: &SecResearchSelection,
+    selection: &SecResearchIdentitySelection,
     instrument_id: InstrumentId,
     source_selection_as_of: Timestamp,
     effective_date: CalendarDate,
@@ -513,6 +510,28 @@ fn normalize_selection(
     ),
     ServiceError,
 > {
+    if selection.request().instrument_id() != instrument_id
+        || selection.request().knowledge_at() != source_selection_as_of
+        || selection.identity().disposition() != CompanySecurityIdentityDisposition::Complete
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    let SecResearchIdentityOutcome::Exact(source) = selection.outcome() else {
+        return Err(ServiceError::InvalidResult);
+    };
+    let [relationship] = selection.identity().candidates() else {
+        return Err(ServiceError::InvalidResult);
+    };
+    let company = source.company_identity().observation();
+    let link = relationship.link();
+    if link.instrument_id() != instrument_id
+        || link.company_source_id() != company.source_id()
+        || link.provider_company_id() != company.provider_company_id()
+        || link.company_surface() != company.surface()
+        || link.company_observation_digest() != source.receipt().company_observation_digest()
+    {
+        return Err(ServiceError::InvalidResult);
+    }
     let mut facts = Vec::new();
     facts
         .try_reserve_exact(MAXIMUM_FACTS)
@@ -551,7 +570,8 @@ fn normalize_selection(
             .availability()
             .conservative_available_at()
             .ok_or(ServiceError::InvalidResult)?;
-        if context.provenance().instrument_id() != Some(instrument_id)
+        if observation.subject().issuer_id() != Some(company.provider_company_id())
+            || context.provenance().instrument_id().is_some()
             || context.provenance().source_id() != source.origin().source_id()
             || available > source_selection_as_of
             || period.end() > effective_date

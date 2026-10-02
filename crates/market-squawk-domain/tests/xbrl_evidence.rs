@@ -1,12 +1,11 @@
 use std::error::Error;
-use std::str::FromStr;
 
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
     ExactPayloadEvidence, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
     FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
     FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
-    FundamentalRevisionOrder, InstrumentId, PayloadReference, ResearchContext, ResearchProvenance,
+    FundamentalRevisionOrder, PayloadReference, ResearchContext, ResearchProvenance,
     ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
     SchemaVersion, SourceId, SourceIdentifier, Timestamp, XbrlAccuracy, XbrlAccuracyValue,
     XbrlContextGraph, XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember,
@@ -21,9 +20,7 @@ fn research_context() -> Result<ResearchContext, Box<dyn Error>> {
     Ok(ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("sec-edgar")?,
-            instrument_id: Some(InstrumentId::from_str(
-                "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
-            )?),
+            instrument_id: None,
             venue_id: None,
             source_identifier: SourceIdentifier::try_from("0000320193-25-000079")?,
             source_timestamp: None,
@@ -174,6 +171,9 @@ fn xbrl_evidence_round_trips_and_binds_the_exact_normalized_value() -> Result<()
     })?;
     let observation = FundamentalObservation::new_with_xbrl_evidence(
         context,
+        market_squawk_domain::CompanyObservationSubject::Issuer(SourceIdentifier::try_from(
+            "0000320193",
+        )?),
         SourceIdentifier::try_from("us-gaap:NetIncomeLoss")?,
         Decimal::from(-23_434_000_000_i64),
         fact_context,

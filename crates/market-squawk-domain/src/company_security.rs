@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{
     CompanyIdentitySurface, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
     ExactPayloadEvidence, IdentifierEntitlement, IdentifierRightsPolicyReference, InstrumentId,
-    SchemaVersion, SchemaVersionError, SourceId, SourceIdentifier, Timestamp,
+    SchemaVersion, SchemaVersionError, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 
 /// The security form attached to a company identity.
@@ -56,11 +56,40 @@ pub enum CommonEquitySuitability {
 
 /// The only authorities permitted to resolve a company-to-security relationship.
 ///
-/// Ticker, name, exchange, and display-text associations are deliberately absent. They cannot be
-/// deserialized or promoted into relationship authority.
+/// Automatic associations require retained, corroborating company and listing evidence validated
+/// by the catalog. A ticker or display name alone cannot establish relationship authority.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompanySecurityResolutionBasis {
+    /// Exact company submissions corroborated by an official venue-qualified security listing.
+    SourceQualifiedListing {
+        /// Retained SEC submissions company observation for the same issuer.
+        submissions_observation_digest: EvidenceDigest,
+        /// Source namespace responsible for the official listing.
+        listing_source_id: SourceId,
+        /// Exact listing dataset.
+        listing_dataset_id: SourceIdentifier,
+        /// Retained listing generation identity.
+        listing_generation_digest: EvidenceDigest,
+        /// Official listing file family.
+        listing_file_kind: SourceIdentifier,
+        /// One-based row in the retained listing file.
+        listing_row_number: u32,
+        /// Exact canonical listing-row identity.
+        listing_record_digest: EvidenceDigest,
+        /// Venue of the selected canonical security.
+        listing_venue: VenueId,
+        /// Exact official symbol form for the selected security.
+        listing_symbol: SourceIdentifier,
+        /// Corroborating ticker from the retained SEC submissions.
+        sec_ticker: SourceIdentifier,
+        /// Corroborating exchange from the retained SEC submissions.
+        sec_exchange: SourceIdentifier,
+        /// Retained official evidence establishing security classification.
+        classification_evidence: ExactPayloadEvidence,
+        /// Code-owned matching and classification rule identity.
+        ruleset: SourceIdentifier,
+    },
     /// A responsible source directly published the company/security crosswalk.
     DirectAuthoritativeCrosswalk {
         /// Source namespace responsible for the crosswalk.
@@ -87,6 +116,10 @@ impl CompanySecurityResolutionBasis {
     /// Returns the exact evidence establishing the resolution.
     pub const fn evidence(&self) -> &ExactPayloadEvidence {
         match self {
+            Self::SourceQualifiedListing {
+                classification_evidence,
+                ..
+            } => classification_evidence,
             Self::DirectAuthoritativeCrosswalk { evidence, .. }
             | Self::OperatorAuthorizedResolution { evidence, .. } => evidence,
         }
@@ -158,7 +191,7 @@ pub struct CompanySecurityIdentityLinkInput {
     pub relationship_kind: CompanySecurityRelationshipKind,
     /// Explicit suitability for direct common-equity analysis.
     pub common_equity_suitability: CommonEquitySuitability,
-    /// Direct source authority or an explicit operator authorization receipt.
+    /// Corroborated source authority or an explicit operator authorization receipt.
     pub resolution_basis: CompanySecurityResolutionBasis,
     /// Rights decision for retaining and using only the relationship evidence.
     pub relationship_evidence_rights: IdentifierRightsPolicyReference,
@@ -225,6 +258,40 @@ impl CompanySecurityIdentityLink {
         }
         if input.available_at > input.ingested_at {
             return Err(CompanySecurityIdentityError::InvalidTime);
+        }
+        if let CompanySecurityResolutionBasis::SourceQualifiedListing {
+            submissions_observation_digest,
+            listing_generation_digest,
+            listing_record_digest,
+            classification_evidence,
+            listing_file_kind,
+            listing_row_number,
+            ruleset,
+            ..
+        } = &input.resolution_basis
+        {
+            for digest in [
+                *submissions_observation_digest,
+                *listing_generation_digest,
+                *listing_record_digest,
+                classification_evidence.content_digest(),
+            ] {
+                if digest_is_empty(digest) {
+                    return Err(CompanySecurityIdentityError::EmptyEvidenceDigest);
+                }
+                if digest.algorithm() != DigestAlgorithm::Sha256 {
+                    return Err(CompanySecurityIdentityError::InvalidParentDigestAlgorithm);
+                }
+            }
+            if *listing_row_number == 0
+                || !matches!(listing_file_kind.as_str(), "nasdaq_listed" | "other_listed")
+                || ruleset.as_str() != "sec-submissions-official-common-stock-v1"
+            {
+                return Err(CompanySecurityIdentityError::InvalidListingEvidence);
+            }
+            if input.effective_interval.starts_at() < input.available_at {
+                return Err(CompanySecurityIdentityError::InvalidTime);
+            }
         }
         if input.relationship_evidence_rights.entitlement()
             == IdentifierEntitlement::UnknownOrRestricted
@@ -306,7 +373,7 @@ impl CompanySecurityIdentityLink {
     pub const fn common_equity_suitability(&self) -> CommonEquitySuitability {
         self.common_equity_suitability
     }
-    /// Returns direct crosswalk or operator authorization authority.
+    /// Returns the evidence authority for the relationship.
     pub const fn resolution_basis(&self) -> &CompanySecurityResolutionBasis {
         &self.resolution_basis
     }
@@ -345,6 +412,8 @@ impl<'de> Deserialize<'de> for CompanySecurityIdentityLink {
 /// Company/security relationship construction failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompanySecurityIdentityError {
+    /// Automatic listing evidence does not identify a supported row and matching rule.
+    InvalidListingEvidence,
     /// A required authority or parent digest was all zeroes.
     EmptyEvidenceDigest,
     /// Availability, authorization, and ingestion times were inconsistent.
@@ -362,6 +431,9 @@ pub enum CompanySecurityIdentityError {
 impl fmt::Display for CompanySecurityIdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidListingEvidence => {
+                formatter.write_str("company/security listing evidence is invalid")
+            }
             Self::EmptyEvidenceDigest => {
                 formatter.write_str("company/security evidence digest is empty")
             }

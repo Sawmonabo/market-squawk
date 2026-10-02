@@ -151,6 +151,33 @@ PIT selection uses evidence available at the decision cutoff, including acceptan
 amendment lineage. A later amended filing, corrected bulk archive, or new taxonomy creates a new
 generation; it cannot rewrite an earlier model, backtest, valuation, or recommendation input.
 
+## Issuer ownership and selected-security use
+
+Company submissions, Company Facts and filing XBRL retain an explicit issuer subject with the
+validated CIK and `instrument_id: None` in their original observations. The source-qualified subject
+participates in revision and point-in-time family identity, keeping different issuers' facts distinct.
+Their exact company parent, raw capture, context, revisions and knowledge clocks
+remain authoritative. Acquisition does not manufacture a stock identifier from a CIK or require
+one security per company. Governed fund/share-class identity remains a separate contract.
+
+The catalog keeps three distinct company-parent surfaces: `SecSubmissions`, `SecCompanyFacts`,
+and `SecFilingXbrl`. Filing acquisition retains the issuer metadata accompanying that exact
+filing publication without replacing the ordinary submissions parent. Each financial family
+selects its own retained parent; official listing corroboration uses actual submissions.
+
+After publication, application composition can associate retained submissions with an admitted
+canonical security and the exact official listing row. Catalog publication revalidates source,
+venue, symbol, explicit common-stock classification, parent revisions and rights atomically.
+Multiple common share classes can belong to one issuer; a ticker match or non-ETF flag alone is
+insufficient. Automatic relationships begin when all supporting evidence is available, refresh
+through explicit successors and never replace an operator decision or resurrect a revocation.
+
+Selected fiscal reads and valuation inputs retain the full relationship receipt and immutable
+issuer observation in saved evidence. Reopening verifies the original facts and cutoffs. This association grants no
+extra Display, LocalAnalysis or Train permission, and issuer totals do not establish a particular
+share class's per-share economics. Current implementation and verification status are recorded in
+the [delivery ledger](../../plans/delivery-ledger.md).
+
 ## Repository integration status and seams
 
 Repository evidence at the audit basis shows:
@@ -186,7 +213,8 @@ SEC becomes Available for each exact workflow only after:
    range and proves CIK, accession uniqueness, requested/returned filing counts, clocks, and
    terminal completeness.
 3. Company Facts and selected filing XBRL parse under frozen schemas, retain every context/unit/
-   period/accession coordinate, and publish no unresolved mandatory instrument identity.
+   period/accession coordinate, and preserve issuer ownership. A selected-security consumer must
+   resolve an independently evidenced company/security relationship before attribution.
 4. Broad bootstrap and reconciliation prove complete archive bytes, safe extraction, exact
    manifests, and row/page/archive closure under the shared `2 requests/second` target.
 5. N-PORT/N-CEN jobs bind the exact quarter, readme/layout/XSD generation, underlying filing, and

@@ -17,6 +17,7 @@ use market_squawk_domain::{
     Timestamp,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::num::NonZeroU32;
 
 pub(crate) const MAX_INPUT_EPOCH_BYTES: usize = 64 * 1024;
@@ -58,12 +59,29 @@ struct FinancialEpochWire {
     selection: super::FinancialAmountSelection,
     source_manifest: EpochManifest,
     source_evidence: [u8; 32],
+    identity_receipt: Box<[u8]>,
+    company_identity: market_squawk_domain::CompanyIdentityObservation,
+    company_observation_digest: EvidenceDigest,
     point_in_time_content: [u8; 32],
     point_in_time_audit: [u8; 32],
     universe_content: [u8; 32],
     universe_audit: [u8; 32],
     population_basis: super::DatasetPopulationBasis,
     period: serde_json::Value,
+}
+fn financial_observation_matches(
+    fact: &market_squawk_domain::FundamentalObservation,
+    reference: &super::FinancialPeriodRowReference,
+) -> Result<bool, DatasetBuildError> {
+    let bytes = serde_json::to_vec(&market_squawk_domain::ResearchObservation::Fundamental(
+        fact.clone(),
+    ))
+    .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
+    Ok(reference.observation_digest()
+        == EvidenceDigest::new(
+            market_squawk_domain::DigestAlgorithm::Sha256,
+            Sha256::digest(bytes).into(),
+        ))
 }
 impl Eq for FinancialEpochWire {}
 #[derive(Serialize, Deserialize)]
@@ -175,6 +193,9 @@ impl FeatureDatasetInputEpoch {
             },
             source_manifest: EpochManifest::from_manifest(&source.manifest),
             source_evidence: source.source_receipt.result_digest().bytes(),
+            identity_receipt: source.identity_receipt.clone(),
+            company_identity: source.company_identity.clone(),
+            company_observation_digest: source.source_receipt.company_observation_digest(),
             point_in_time_content: source
                 .source_receipt
                 .point_in_time_content_identity()
@@ -191,6 +212,20 @@ impl FeatureDatasetInputEpoch {
     }
     fn financial_from_wire(wire: FinancialEpochWire) -> Result<Self, DatasetBuildError> {
         let binding = super::FinancialFiscalTargetBinding::decode(wire.period.clone())?;
+        let identity = crate::CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(
+            &wire.identity_receipt,
+        )
+        .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
+        if identity.receipt_digest() != binding.identity_receipt_digest() {
+            return Err(DatasetBuildError::ComponentEvidenceMismatch);
+        }
+        super::financial::validate_identity_receipt(
+            &identity,
+            wire.instrument_id,
+            &wire.company_identity,
+            wire.company_observation_digest,
+            wire.source_selection_as_of,
+        )?;
         let policy = super::DatasetStudyPolicy::try_new(
             wire.basis,
             wire.purpose,
@@ -224,8 +259,13 @@ impl FeatureDatasetInputEpoch {
             .iter()
             .zip(binding.observed_source_rows())
         {
-            super::financial::validate_fact(fact, wire.instrument_id, wire.source_selection_as_of)?;
-            if fact.fact_context() != reference.fact_context()
+            super::financial::validate_fact(
+                fact,
+                &wire.company_identity,
+                wire.source_selection_as_of,
+            )?;
+            if !financial_observation_matches(fact, reference)?
+                || fact.fact_context() != reference.fact_context()
                 || fact.context().provenance().ingested_at() > wire.snapshot_as_of
             {
                 return Err(DatasetBuildError::ComponentEvidenceMismatch);
@@ -233,7 +273,7 @@ impl FeatureDatasetInputEpoch {
         }
         super::financial::validate_fact(
             &wire.current_anchor,
-            wire.instrument_id,
+            &wire.company_identity,
             wire.source_selection_as_of,
         )?;
         if wire.example_id.is_empty()
@@ -241,6 +281,7 @@ impl FeatureDatasetInputEpoch {
             || wire.source_selection_as_of > wire.snapshot_as_of
             || wire.snapshot_as_of > wire.calculated_at
             || wire.current_anchor.context().provenance().ingested_at() > wire.snapshot_as_of
+            || !financial_observation_matches(&wire.current_anchor, &binding.duration_chain()[0])?
             || wire.current_anchor.fact_context() != binding.duration_chain()[0].fact_context()
             || !super::financial::same_scope(primary, &wire.current_anchor)
             || !super::financial::anchor_matches(

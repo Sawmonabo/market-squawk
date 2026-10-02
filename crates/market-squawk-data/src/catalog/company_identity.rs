@@ -197,6 +197,157 @@ impl CompanyIdentitySearchPage {
     }
 }
 
+/// Reads an exact retained company parent within the caller's catalog connection scope.
+/// The caller owns SQLite progress-handler installation for its operation.
+pub(crate) fn exact_company_identity_by_digest(
+    connection: &rusqlite::Connection,
+    result_limits: super::CatalogResultLimits,
+    digest: EvidenceDigest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Option<CompanyIdentityExactRecord>, CatalogError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+        return Err(CatalogError::InvalidRecord);
+    }
+    check_search(deadline, cancellation)?;
+    let result = (|| {
+        let row = connection
+            .query_row(EXACT_COMPANY_IDENTITY_SQL, params![digest.bytes()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Vec<u8>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Vec<u8>>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, Option<Vec<u8>>>(20)?,
+                    row.get::<_, i64>(21)?,
+                ))
+            })
+            .optional()?;
+        let Some((
+            json,
+            record_digest,
+            run_id,
+            manifest_id,
+            source_id,
+            provider_company_id,
+            source_surface,
+            available_at,
+            received_at,
+            ingested_at,
+            artifact_id,
+            relative_reference,
+            artifact_algorithm,
+            artifact_digest,
+            artifact_size,
+            manifest_algorithm,
+            manifest_digest,
+            binding_digest,
+            binding_count,
+            completed_at,
+            logical_binding_digest,
+            publication_count,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        check_search(deadline, cancellation)?;
+        let mut budget = ResultBudget::new(result_limits);
+        budget.charge([
+            run_id.len(),
+            manifest_id.len(),
+            source_id.len(),
+            provider_company_id.len(),
+            source_surface.len(),
+            artifact_id.len(),
+            relative_reference.len(),
+            artifact_digest.len(),
+            manifest_digest.len(),
+            binding_digest.as_ref().map_or(0, Vec::len),
+            logical_binding_digest.as_ref().map_or(0, Vec::len),
+        ])?;
+        let observation: CompanyIdentityObservation =
+            super::records::deserialize_verified(&json, &record_digest, &mut budget)?;
+        let observation_digest = parse_digest(1, &record_digest)?;
+        let run_id = Uuid::parse_str(&run_id).map_err(|_| CatalogError::CorruptCatalog)?;
+        let manifest_id =
+            Uuid::parse_str(&manifest_id).map_err(|_| CatalogError::CorruptCatalog)?;
+        let artifact_id =
+            Uuid::parse_str(&artifact_id).map_err(|_| CatalogError::CorruptCatalog)?;
+        let artifact_size_bytes =
+            u64::try_from(artifact_size).map_err(|_| CatalogError::CorruptCatalog)?;
+        let provider_binding_digest = match (binding_count, binding_digest) {
+            (0, None) => None,
+            (1, Some(value)) => Some(parse_digest(1, &value)?),
+            _ => return Err(CatalogError::ProviderCaptureConflict),
+        };
+        let provider_logical_binding_digest = match (publication_count, logical_binding_digest)
+        {
+            (0, None) => None,
+            (1, Some(value)) if provider_binding_digest.is_none() => {
+                let digest = parse_digest(1, &value)?;
+                let binding =
+                    super::provider_logical::load_provider_logical_publication_binding(
+                        connection,
+                        digest,
+                    )?
+                    .ok_or(CatalogError::ProviderLogicalMismatch)?;
+                if binding.terminal().source_id().as_str() != source_id {
+                    return Err(CatalogError::ProviderLogicalMismatch);
+                }
+                Some(digest)
+            }
+            _ => return Err(CatalogError::ProviderLogicalConflict),
+        };
+        if observation_digest != digest
+            || observation.source_id().as_str() != source_id
+            || observation.provider_company_id().as_str() != provider_company_id
+            || observation.surface().database_name() != source_surface
+            || observation.received_at().unix_nanos() != received_at
+            || observation
+                .availability()
+                .conservative_available_at()
+                .map(Timestamp::unix_nanos)
+                != available_at
+            || observation.ingested_at().unix_nanos() != ingested_at
+            || artifact_size_bytes == 0
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        Ok(Some(CompanyIdentityExactRecord {
+            observation,
+            observation_digest,
+            run_id,
+            manifest_id,
+            artifact_id,
+            artifact_relative_reference: relative_reference.into_boxed_str(),
+            artifact_content_digest: parse_digest(artifact_algorithm, &artifact_digest)?,
+            artifact_size_bytes,
+            manifest_content_digest: parse_digest(manifest_algorithm, &manifest_digest)?,
+            completed_at: Timestamp::from_unix_nanos(completed_at),
+            provider_binding_digest,
+            provider_logical_binding_digest,
+        }))
+    })();
+    check_search(deadline, cancellation)?;
+    result.map_err(|error| classify_search_error(error, deadline, cancellation))
+}
+
 impl Catalog {
     /// Reads one exact company observation by its retained canonical SHA-256 digest.
     pub fn exact_company_identity_by_digest(
@@ -214,141 +365,13 @@ impl Catalog {
             SQLITE_PROGRESS_OPERATIONS,
             Some(move || token.is_cancelled() || Instant::now() >= deadline),
         )?;
-        let result = (|| {
-            let row = self
-                .connection
-                .query_row(EXACT_COMPANY_IDENTITY_SQL, params![digest.bytes()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, String>(11)?,
-                        row.get::<_, i64>(12)?,
-                        row.get::<_, Vec<u8>>(13)?,
-                        row.get::<_, i64>(14)?,
-                        row.get::<_, i64>(15)?,
-                        row.get::<_, Vec<u8>>(16)?,
-                        row.get::<_, Option<Vec<u8>>>(17)?,
-                        row.get::<_, i64>(18)?,
-                        row.get::<_, i64>(19)?,
-                        row.get::<_, Option<Vec<u8>>>(20)?,
-                        row.get::<_, i64>(21)?,
-                    ))
-                })
-                .optional()?;
-            let Some((
-                json,
-                record_digest,
-                run_id,
-                manifest_id,
-                source_id,
-                provider_company_id,
-                source_surface,
-                available_at,
-                received_at,
-                ingested_at,
-                artifact_id,
-                relative_reference,
-                artifact_algorithm,
-                artifact_digest,
-                artifact_size,
-                manifest_algorithm,
-                manifest_digest,
-                binding_digest,
-                binding_count,
-                completed_at,
-                logical_binding_digest,
-                publication_count,
-            )) = row
-            else {
-                return Ok(None);
-            };
-            check_search(deadline, cancellation)?;
-            let mut budget = ResultBudget::new(self.result_bytes);
-            budget.charge([
-                run_id.len(),
-                manifest_id.len(),
-                source_id.len(),
-                provider_company_id.len(),
-                source_surface.len(),
-                artifact_id.len(),
-                relative_reference.len(),
-                artifact_digest.len(),
-                manifest_digest.len(),
-                binding_digest.as_ref().map_or(0, Vec::len),
-                logical_binding_digest.as_ref().map_or(0, Vec::len),
-            ])?;
-            let observation: CompanyIdentityObservation =
-                super::records::deserialize_verified(&json, &record_digest, &mut budget)?;
-            let observation_digest = parse_digest(1, &record_digest)?;
-            let run_id = Uuid::parse_str(&run_id).map_err(|_| CatalogError::CorruptCatalog)?;
-            let manifest_id =
-                Uuid::parse_str(&manifest_id).map_err(|_| CatalogError::CorruptCatalog)?;
-            let artifact_id =
-                Uuid::parse_str(&artifact_id).map_err(|_| CatalogError::CorruptCatalog)?;
-            let artifact_size_bytes =
-                u64::try_from(artifact_size).map_err(|_| CatalogError::CorruptCatalog)?;
-            let provider_binding_digest = match (binding_count, binding_digest) {
-                (0, None) => None,
-                (1, Some(value)) => Some(parse_digest(1, &value)?),
-                _ => return Err(CatalogError::ProviderCaptureConflict),
-            };
-            let provider_logical_binding_digest = match (publication_count, logical_binding_digest)
-            {
-                (0, None) => None,
-                (1, Some(value)) if provider_binding_digest.is_none() => {
-                    let digest = parse_digest(1, &value)?;
-                    let binding =
-                        super::provider_logical::load_provider_logical_publication_binding(
-                            &self.connection,
-                            digest,
-                        )?
-                        .ok_or(CatalogError::ProviderLogicalMismatch)?;
-                    if binding.terminal().source_id().as_str() != source_id {
-                        return Err(CatalogError::ProviderLogicalMismatch);
-                    }
-                    Some(digest)
-                }
-                _ => return Err(CatalogError::ProviderLogicalConflict),
-            };
-            if observation_digest != digest
-                || observation.source_id().as_str() != source_id
-                || observation.provider_company_id().as_str() != provider_company_id
-                || observation.surface().database_name() != source_surface
-                || observation.received_at().unix_nanos() != received_at
-                || observation
-                    .availability()
-                    .conservative_available_at()
-                    .map(Timestamp::unix_nanos)
-                    != available_at
-                || observation.ingested_at().unix_nanos() != ingested_at
-                || artifact_size_bytes == 0
-            {
-                return Err(CatalogError::CorruptCatalog);
-            }
-            Ok(Some(CompanyIdentityExactRecord {
-                observation,
-                observation_digest,
-                run_id,
-                manifest_id,
-                artifact_id,
-                artifact_relative_reference: relative_reference.into_boxed_str(),
-                artifact_content_digest: parse_digest(artifact_algorithm, &artifact_digest)?,
-                artifact_size_bytes,
-                manifest_content_digest: parse_digest(manifest_algorithm, &manifest_digest)?,
-                completed_at: Timestamp::from_unix_nanos(completed_at),
-                provider_binding_digest,
-                provider_logical_binding_digest,
-            }))
-        })();
+        let result = exact_company_identity_by_digest(
+            &self.connection,
+            self.result_bytes,
+            digest,
+            deadline,
+            cancellation,
+        );
         self.connection.progress_handler::<fn() -> bool>(0, None)?;
         result.map_err(|error| classify_search_error(error, deadline, cancellation))
     }

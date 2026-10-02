@@ -29,6 +29,8 @@ pub enum CompanyIdentitySurface {
     SecSubmissions,
     /// SEC Company Facts entity metadata.
     SecCompanyFacts,
+    /// Issuer metadata retained with one SEC filing-XBRL acquisition.
+    SecFilingXbrl,
 }
 
 impl CompanyIdentitySurface {
@@ -37,6 +39,7 @@ impl CompanyIdentitySurface {
         match self {
             Self::SecSubmissions => "sec_submissions",
             Self::SecCompanyFacts => "sec_company_facts",
+            Self::SecFilingXbrl => "sec_filing_xbrl",
         }
     }
 }

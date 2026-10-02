@@ -208,7 +208,7 @@ CREATE TABLE company_security_link_events (
         length(CAST(provider_company_id AS BLOB)) BETWEEN 1 AND 512
     ),
     company_surface TEXT NOT NULL CHECK (
-        company_surface IN ('sec_submissions', 'sec_company_facts')
+        company_surface IN ('sec_submissions', 'sec_company_facts', 'sec_filing_xbrl')
     ),
     company_observation_digest BLOB NOT NULL
         REFERENCES company_identity_observations(record_digest),
@@ -238,7 +238,7 @@ CREATE TABLE company_security_link_events (
     effective_start_ns INTEGER NOT NULL,
     effective_end_ns INTEGER,
     resolution_kind TEXT NOT NULL CHECK (
-        resolution_kind IN ('direct_authoritative_crosswalk', 'operator_authorized_resolution')
+        resolution_kind IN ('direct_authoritative_crosswalk', 'operator_authorized_resolution', 'source_qualified_listing')
     ),
     resolution_evidence_algorithm INTEGER NOT NULL CHECK (
         resolution_evidence_algorithm IN (1, 2)

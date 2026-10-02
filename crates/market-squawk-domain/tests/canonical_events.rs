@@ -4,10 +4,10 @@ use std::str::FromStr;
 
 use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
-    BookDeltaEvent, BookLevel, BookSnapshotEvent, CalendarDate, CorporateActionEvent,
-    CorporateActionKind, CorporateActionObservation, CoverageStatus, Currency, DataQuality,
-    DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest, FilingObservation,
-    FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
+    BookDeltaEvent, BookLevel, BookSnapshotEvent, CalendarDate, CompanyObservationSubject,
+    CorporateActionEvent, CorporateActionKind, CorporateActionObservation, CoverageStatus,
+    Currency, DataQuality, DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest,
+    FilingObservation, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
     FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
     FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
     FundamentalRevisionOrder, HaltTransition, InstrumentId, InstrumentStatusEvent, LiveEventClass,
@@ -81,7 +81,7 @@ fn fundamental_fixture() -> Result<(ResearchContext, FundamentalFactContext), Bo
     let end = CalendarDate::new(2025, 12, 31)?;
     let revision = RevisionNumber::new(1)?;
     let context = ResearchContext::new(
-        research_context(true)?.provenance().clone(),
+        research_context(false)?.provenance().clone(),
         ResearchTime::try_new_with_coordinates(
             ResearchTemporalCoordinate::calendar_date(end),
             None,
@@ -359,13 +359,15 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
 #[test]
 fn canonical_research_family_has_non_marker_payloads() -> Result<(), Box<dyn Error>> {
     let filing = ResearchObservation::Filing(FilingObservation::new(
-        research_context(true)?,
+        research_context(false)?,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
         SourceIdentifier::try_from("10-K")?,
         SourceIdentifier::try_from("0000320193-26-000001")?,
     )?);
     let (fundamental_context, fact_context) = fundamental_fixture()?;
     let fundamental = ResearchObservation::Fundamental(FundamentalObservation::new(
         fundamental_context,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
         SourceIdentifier::try_from("Revenue")?,
         Decimal::new(1_234, 0),
         fact_context,
@@ -493,11 +495,23 @@ fn normalized_portfolio_transaction_evidence_binds_raw_lineage_and_economic_scal
 fn research_instrument_payloads_reject_missing_identity() -> Result<(), Box<dyn Error>> {
     assert!(matches!(
         FilingObservation::new(
-            research_context(false)?,
+            research_context(true)?,
+            CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
             SourceIdentifier::try_from("10-K")?,
             SourceIdentifier::try_from("0000320193-26-000001")?,
         ),
-        Err(ResearchError::MissingInstrument)
+        Err(ResearchError::CompanySubjectMismatch)
+    ));
+    assert!(matches!(
+        FilingObservation::new(
+            research_context(false)?,
+            CompanyObservationSubject::Instrument(InstrumentId::from_str(
+                "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb"
+            )?),
+            SourceIdentifier::try_from("10-K")?,
+            SourceIdentifier::try_from("0000320193-26-000001")?,
+        ),
+        Err(ResearchError::CompanySubjectMismatch)
     ));
     assert!(matches!(
         PositionObservation::new(
@@ -667,13 +681,15 @@ fn corporate_action_economic_terms_are_exact_and_validated() -> Result<(), Box<d
 #[test]
 fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box<dyn Error>> {
     let filing = FilingObservation::new(
-        research_context(true)?,
+        research_context(false)?,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
         SourceIdentifier::try_from("10-Q")?,
         SourceIdentifier::try_from("accession-1")?,
     )?;
     let (fundamental_context, fact_context) = fundamental_fixture()?;
     let fundamental = FundamentalObservation::new(
         fundamental_context,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
         SourceIdentifier::try_from("Assets")?,
         Decimal::new(42, 0),
         fact_context,

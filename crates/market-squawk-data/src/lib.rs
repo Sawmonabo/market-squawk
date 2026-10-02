@@ -140,6 +140,7 @@ pub use catalog::{
     SecFundPointInTimeReadOutcome, SecFundPointInTimeReadRequest,
     SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery,
     SecFundamentalIdentitySelection, SourceCursor, StoredObservedRevision,
+    sec_listing_exchange_matches_venue,
 };
 pub use catalog::{AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission};
 pub use catalog::{

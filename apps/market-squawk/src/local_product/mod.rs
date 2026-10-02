@@ -603,7 +603,7 @@ impl LocalProduct {
         .await
     }
 
-    async fn try_new_with_paths_and_prepublished_research_sources<I>(
+    fn try_new_with_paths_and_prepublished_research_sources<I>(
         config: AppConfig,
         paths: LocalPaths,
         registrations: I,
@@ -612,783 +612,804 @@ impl LocalProduct {
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
-    ) -> Result<Self, LocalProductError>
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Self, LocalProductError>>>>
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
-        // Reject code-owned contract or shutdown-budget defects before marking source authority
-        // in-use. Final composition consumes this exact registry without rebuilding descriptors.
-        let application_preparation = Application::prepare_composition(config.source_shutdown())?;
-        let cancellation = CancellationToken::new();
-        let _startup_cancellation = cancellation.clone().drop_guard();
-        // Each finite recovery operation owns its deadline. Catalog integrity and executable
-        // identity work must not consume a later operation's lifetime before it starts.
-        let recovery_deadline = || {
-            Instant::now()
-                .checked_add(LOCAL_RECOVERY_TIMEOUT)
-                .ok_or(LocalProductError::InvalidCodeOwnedLimit)
-        };
-        let (research, onboarding_catalog, feature_dataset_production_publisher) =
-            open_research(&paths)?;
-        let research = Arc::new(research);
-        research.bind_application_changes()?;
-        // Recovery owns a bounded cursor; selected reads still verify their exact objects.
-        // Historical storage size must not hold ordinary application startup behind a full scan.
-        let provider_capture_recovery = research.create_provider_capture_recovery()?;
-        let feature_dataset_production_publisher = Arc::new(feature_dataset_production_publisher);
-        let company_security_resolution = Arc::new(CompanySecurityResolutionAuthority::new(
-            research.company_identities(),
-            research.market_data_instruments(),
-            research.company_security_link_publication(),
-        ));
-        let configured_instruments = configured_live_instruments(&config)?;
-        if !configured_instruments.is_empty() {
-            research.synchronize_configured_instruments(
-                &configured_instruments,
-                local_product_timestamp()?,
-                CatalogLimit::new(MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS)?,
-            )?;
-        }
-        let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
-            .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
-        let artifacts =
-            controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
-        let artifact_repository: Arc<dyn ArtifactRepository> = artifacts.clone();
-        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-        let provider_rate = match &board_fixture {
-            Some(fixture) => fixture.bind_provider_rate(paths.control_root()?.root())?,
-            None => open_provider_rate_authority(paths.control_root()?.root())?,
-        };
-        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
-        let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
+        // Heap-own composition state so outer startup futures do not embed another full copy.
+        Box::pin(async move {
+            // Reject code-owned contract or shutdown-budget defects before marking source authority
+            // in-use. Final composition consumes this exact registry without rebuilding descriptors.
+            let application_preparation =
+                Application::prepare_composition(config.source_shutdown())?;
+            let cancellation = CancellationToken::new();
+            let _startup_cancellation = cancellation.clone().drop_guard();
+            // Each finite recovery operation owns its deadline. Catalog integrity and executable
+            // identity work must not consume a later operation's lifetime before it starts.
+            let recovery_deadline = || {
+                Instant::now()
+                    .checked_add(LOCAL_RECOVERY_TIMEOUT)
+                    .ok_or(LocalProductError::InvalidCodeOwnedLimit)
+            };
+            let (research, onboarding_catalog, feature_dataset_production_publisher) =
+                open_research(&paths)?;
+            let research = Arc::new(research);
+            research.bind_application_changes()?;
+            // Recovery owns a bounded cursor; selected reads still verify their exact objects.
+            // Historical storage size must not hold ordinary application startup behind a full scan.
+            let provider_capture_recovery = research.create_provider_capture_recovery()?;
+            let feature_dataset_production_publisher =
+                Arc::new(feature_dataset_production_publisher);
+            let configured_instruments = configured_live_instruments(&config)?;
+            if !configured_instruments.is_empty() {
+                research.synchronize_configured_instruments(
+                    &configured_instruments,
+                    local_product_timestamp()?,
+                    CatalogLimit::new(MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS)?,
+                )?;
+            }
+            let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
+                .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+            let artifacts =
+                controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
+            let artifact_repository: Arc<dyn ArtifactRepository> = artifacts.clone();
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            let provider_rate = match &board_fixture {
+                Some(fixture) => fixture.bind_provider_rate(paths.control_root()?.root())?,
+                None => open_provider_rate_authority(paths.control_root()?.root())?,
+            };
+            #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
+            let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
-        let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
-            Arc::new(provider_rate.clone());
+            let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
+                Arc::new(provider_rate.clone());
 
-        // The installation-global guard proves that no predecessor service can still own this
-        // selected workspace. Reconcile each configured live authority once, before any runtime
-        // can be constructed. Ordinary in-process source starts retain the strict predecessor
-        // rejection path.
-        if let SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) =
-            &source_authority_startup_policy
-        {
-            // Saved Alpaca profiles are restored after secure unlock; static configuration is
-            // not proof that either retained authority is absent. Recover both under the same
-            // exclusive installation capability before any account runtime can start.
-            for key in [
-                ALPACA_IEX_LIVE_AUTHORITY_KEY,
-                ALPACA_OPTIONS_LIVE_AUTHORITY_KEY,
-            ] {
-                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
-                    selected_workspace,
-                    key,
-                    Arc::clone(&authorization_subject_resolver),
-                )?;
+            // The installation-global guard proves that no predecessor service can still own this
+            // selected workspace. Reconcile each configured live authority once, before any runtime
+            // can be constructed. Ordinary in-process source starts retain the strict predecessor
+            // rejection path.
+            if let SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) =
+                &source_authority_startup_policy
+            {
+                // Saved Alpaca profiles are restored after secure unlock; static configuration is
+                // not proof that either retained authority is absent. Recover both under the same
+                // exclusive installation capability before any account runtime can start.
+                for key in [
+                    ALPACA_IEX_LIVE_AUTHORITY_KEY,
+                    ALPACA_OPTIONS_LIVE_AUTHORITY_KEY,
+                ] {
+                    AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                        selected_workspace,
+                        key,
+                        Arc::clone(&authorization_subject_resolver),
+                    )?;
+                }
+                if config.coinbase().is_some() {
+                    AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                        selected_workspace,
+                        COINBASE_LIVE_AUTHORITY_KEY,
+                        Arc::clone(&authorization_subject_resolver),
+                    )?;
+                }
+                if config.kraken().is_some() {
+                    AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                        selected_workspace,
+                        KRAKEN_LIVE_AUTHORITY_KEY,
+                        Arc::clone(&authorization_subject_resolver),
+                    )?;
+                }
+                if schwab_oauth_installation.is_some() {
+                    AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                        selected_workspace,
+                        SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
+                        Arc::clone(&authorization_subject_resolver),
+                    )?;
+                }
             }
-            if config.coinbase().is_some() {
-                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
-                    selected_workspace,
-                    COINBASE_LIVE_AUTHORITY_KEY,
-                    Arc::clone(&authorization_subject_resolver),
-                )?;
-            }
-            if config.kraken().is_some() {
-                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
-                    selected_workspace,
-                    KRAKEN_LIVE_AUTHORITY_KEY,
-                    Arc::clone(&authorization_subject_resolver),
-                )?;
-            }
-            if schwab_oauth_installation.is_some() {
-                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
-                    selected_workspace,
-                    SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
-                    Arc::clone(&authorization_subject_resolver),
-                )?;
-            }
-        }
 
-        let source_registry = match &source_authority_startup_policy {
-            SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
-                let source_store = LocalAuthorityStateStore::try_open(
-                    paths
-                        .control_root()?
-                        .root()
-                        .join(RESEARCH_SOURCE_AUTHORITY_DIRECTORY),
-                )?;
-                AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
-                    source_store,
-                    authorization_subject_resolver,
-                    provider_rate.clone(),
-                )
-            }
-            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) => {
-                AuthoritativeSourceRegistry::try_new_durable_for_exclusive_installed_service_replacement(
-                    selected_workspace,
-                    authorization_subject_resolver,
-                    provider_rate.clone(),
-                )
-            }
-        }?;
-        let (research_ingest, provider_runtime_mutation, alpaca_historical_source) =
-            ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
-                source_registry,
-                Arc::clone(&research),
-                ResearchExtractionLimits::standard(),
-                registrations,
-            )?;
-
-        let provider_secret_root = paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY);
-        let secret_control = SecretOperationControl::try_new(
-            "provider-credentials-open",
-            recovery_deadline()?,
-            1,
-            SecretInteractionPolicy::Forbid,
-            SecretCancellation::new(),
-        )?;
-        let secrets = Arc::new(AccessControlledSecretStore::try_open(
-            provider_secret_root,
-            "market-squawk",
-            &secret_control,
-        )?);
-        let provider_activation_state =
-            DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
-        // Source-registry exclusive replacement above has succeeded. Only its real selected
-        // installation guard authorizes distinguishing predecessor process exit from graceful drain.
-        match &source_authority_startup_policy {
-            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected) => {
-                provider_activation_state.recover_account_lifecycle_after_process_exit(selected)
-            }
-            SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
-                provider_activation_state.reject_unclean_account_lifecycle()
-            }
-        }
-        .map_err(|_| {
-            LocalProductError::MarketRuntime(market_squawk_services::ServiceError::Unavailable)
-        })?;
-        let runtime_admissions = provider_activation_state.startup_runtime_admissions()?;
-        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-        let onboarding = Arc::new(match &board_fixture {
-            Some(fixture) => ProviderOnboardingService::try_new_with_provider_rate_runtime_admissions_and_board_fixture(
-                onboarding_catalog,
-                secrets,
-                provider_rate.clone(),
-                runtime_admissions,
-                fixture.doctor_executor(),
-            )?,
-            None => ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
-                onboarding_catalog,
-                secrets,
-                provider_rate.clone(),
-                runtime_admissions,
-            )?,
-        });
-        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
-        let onboarding = Arc::new(
-            ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
-                onboarding_catalog,
-                secrets,
-                provider_rate.clone(),
-                runtime_admissions,
-            )?,
-        );
-        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-        let provider_activation = Arc::new(match &board_fixture {
-            Some(fixture) => ProviderAdapterActivation::new_with_board_fixture(
-                Arc::clone(&onboarding),
-                Arc::clone(&research_ingest),
-                provider_runtime_mutation,
-                config.clone(),
-                provider_rate.clone(),
-                paths.control_root()?.root().to_path_buf(),
-                fixture.production_source_factory(),
-            ),
-            None => ProviderAdapterActivation::new(
-                Arc::clone(&onboarding),
-                Arc::clone(&research_ingest),
-                provider_runtime_mutation,
-                config.clone(),
-                provider_rate.clone(),
-                paths.control_root()?.root().to_path_buf(),
-            ),
-        });
-        #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
-        let provider_activation = Arc::new(ProviderAdapterActivation::new(
-            Arc::clone(&onboarding),
-            Arc::clone(&research_ingest),
-            provider_runtime_mutation,
-            config.clone(),
-            provider_rate.clone(),
-            paths.control_root()?.root().to_path_buf(),
-        ));
-        cli_provider::restore_research_providers(
-            &paths,
-            &onboarding,
-            &provider_activation,
-            &provider_activation_state,
-        );
-        let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
-            maximum_live_route_count(&config)?,
-        )?);
-        let nasdaq_reference = Arc::new(
-            NasdaqReferenceUniverseService::try_new_durable(
-                provider_rate.clone(),
-                research.analytical(),
-                research.provider_capture_store(),
-            )
-            .map_err(|error| {
-                tracing::error!(%error, "Nasdaq reference-universe startup failed");
-                LocalProductError::NasdaqReference
-            })?,
-        );
-        let prepared_market_configuration = ProductionMarketProviderConfigurationResolver::new(
-            config.clone(),
-            Arc::clone(&onboarding),
-            Arc::clone(&provider_activation),
-            Arc::clone(&nasdaq_reference),
-            &research,
-        );
-        let prepared_schwab = ProductionSchwabMarketRuntimeResolver::new(
-            Arc::clone(&onboarding),
-            Arc::clone(&provider_activation),
-            Arc::clone(&nasdaq_reference),
-            research.as_ref(),
-        );
-        let prepared_schwab_service: Arc<dyn PreparedSchwabMarketRuntimeResolver> =
-            prepared_schwab.clone();
-        let market_runtime = MarketRuntimeRegistry::try_new(
-            config.clone(),
-            provider_rate.clone(),
-            Arc::clone(&provider_activation),
-            alpaca_historical_source,
-            prepared_market_configuration,
-            prepared_schwab_service,
-            Arc::clone(&live_fair_value),
-            research.application_changes(),
-        )?;
-        let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
-        let schwab_market_doctor = schwab_oauth_installation
-            .as_ref()
-            .map(|_installation| {
-                SchwabMarketDoctorRuntimeCoordinator::try_production(
-                    Arc::clone(&onboarding),
-                    Arc::clone(&research),
-                    paths.control_root()?.root(),
-                )
-                .map(Arc::new)
-                .map_err(|_error| LocalProductError::ProviderVerification)
-            })
-            .transpose()?;
-        let schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory> = schwab_oauth_installation
-            .map(|installation| {
-                let workspace_paths = paths.clone();
-                let onboarding = Arc::clone(&onboarding);
-                let market_drain = Arc::clone(&schwab_market_drain);
-                Arc::new(move || {
-                    let control_root = installation
-                        .paths
-                        .control_root()
-                        .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?;
-                    let identity = Arc::new(
-                        InstallationSchwabOAuthIdentity::try_prepare(
-                            control_root,
-                            installation.installation_id,
-                        )
-                        .map_err(|_error| SchwabOAuthRuntimeInitializationError::Installation)?,
-                    );
-                    open_schwab_oauth_runtime(
-                        &workspace_paths,
-                        Arc::clone(&onboarding),
-                        identity,
-                        market_drain.clone(),
+            let source_registry = match &source_authority_startup_policy {
+                SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
+                    let source_store = LocalAuthorityStateStore::try_open(
+                        paths
+                            .control_root()?
+                            .root()
+                            .join(RESEARCH_SOURCE_AUTHORITY_DIRECTORY),
+                    )?;
+                    AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+                        source_store,
+                        authorization_subject_resolver,
+                        provider_rate.clone(),
                     )
-                }) as SchwabOAuthRuntimeFactory
-            });
-        let portal_activation = Arc::new(cli_provider::ProviderResearchActivationService::new(
-            paths.clone(),
-            Arc::clone(&onboarding),
-            Arc::clone(&provider_activation),
-            provider_activation_state.clone(),
-            schwab_oauth_factory,
-            schwab_market_doctor,
-        ));
-        prepared_schwab.bind_portal(Arc::clone(&portal_activation))?;
-        let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
-            portal_activation.clone();
-        let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference.clone();
-        let source_calendars =
-            crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
-                Arc::clone(&research),
-                Arc::clone(&market_runtime),
-            );
-        let source_action_reads =
-            crate::application::SourceAppliedCorporateActionReadCapability::new(
-                Arc::clone(&research),
-                source_calendars.clone(),
-            )
-            .with_artifact_repository(Arc::clone(&artifact_repository));
-        let source_action_preparation = crate::application::SourceActionPreparationCapability::new(
-            Arc::clone(&research),
-            Arc::clone(&market_runtime),
-            Arc::clone(&research_ingest),
-        )
-        .with_outcome_history_acquisition(Arc::clone(&provider_activation))
-        .with_current_paper_artifacts(Arc::clone(&artifact_repository));
-        let portfolio = Arc::new(PortfolioApplicationService::try_new(
-            &paths,
-            PortfolioApplicationLimits::standard(),
-        )?);
-        portfolio.register_instrument_reader(research.market_data_instruments())?;
-        portfolio.register_planning_storage(
-            research.analytical().portfolio_planning(),
-            artifact_repository.clone(),
-        )?;
-        let product_policy = market_squawk_decisions::RecommendationPolicy::v1()
-            .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
-        let product_mark_age_nanos =
-            u64::try_from(product_policy.parameters().market_max_age_nanos)
-                .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
-        let product_markets =
-            crate::application::market_selection::MarketInvestmentReadCapability::try_new(
-                Arc::clone(&research),
-                research.instrument_definitions(),
-                research.market_data_instruments(),
-                product_mark_age_nanos,
-            )?;
-        let (display_history_requests, display_history_receiver) =
-            ProductionSourceLifecycleAuthority::starter_history_channel();
-        let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
-            paths.clone(),
-            Arc::clone(&onboarding),
-            Arc::clone(&provider_activation),
-            Arc::clone(&provider_portal_activation),
-            provider_activation_state.clone(),
-            Arc::clone(&research),
-            Arc::clone(&market_runtime),
-            source_calendars.clone(),
-            source_action_preparation.clone(),
-            display_history_requests,
-        ));
-        schwab_market_drain.bind(&source_lifecycle)?;
-        let reconnect_owner: Arc<dyn crate::application::AccountMarketRuntimeReconnect> =
-            source_lifecycle.clone();
-        market_runtime
-            .bind_account_reconnect(
-                Arc::downgrade(&reconnect_owner),
-                recovery_deadline()?,
-                &cancellation,
-            )
-            .await?;
-        let source_lifecycle_service: Arc<dyn SourceLifecycleAuthority> = source_lifecycle.clone();
-        // A retained recipe is a per-source startup input. If its exact runtime or saved
-        // selection is unavailable, leave that source disabled and keep the product usable.
-        let fred_startup = (|| -> Result<_, CliProviderActivationError> {
-            let recipe = provider_activation_state
-                .load_recipe(market_squawk_sources::FRED_ALFRED_API_SURFACE_ID)
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-            let DurableActivationRecipeState::Desired(_) = recipe else {
-                return Ok((None, FredLatestKnownOperation::setup_required()));
-            };
-            let provider_dataset =
-                cli_provider::fred_dashboard_provider_dataset(&provider_activation_state)?;
-            let capability = FredPointInTimeReadCapability::try_new(
-                research.analytical_reader(),
-                provider_dataset.clone(),
-            )
-            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-            let operation = FredLatestKnownOperation::try_from_desired_activation(capability, None)
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-            Ok((Some(provider_dataset), operation))
-        })();
-        let (fred_provider_dataset, fred_latest_known) = match fred_startup {
-            Ok(startup) => startup,
-            Err(error) => {
-                tracing::warn!(%error, "FRED startup selection remains unavailable");
-                (None, FredLatestKnownOperation::setup_required())
-            }
-        };
-        let treasury_fiscal_datasets = (|| -> Result<_, CliProviderActivationError> {
-            let recipe = provider_activation_state
-                .load_recipe("treasury.fiscal-data")
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-            let DurableActivationRecipeState::Desired(_) = recipe else {
-                return Ok(None);
-            };
-            let (query, expected_generation) =
-                cli_provider::treasury_fiscal_release_query(&provider_activation_state)?;
-            Ok(Some(TreasuryStartupConfiguration {
-                provider_datasets: vec![
-                    query
-                        .dataset()
-                        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
-                ],
-                generation: treasury_runtime_generation(
-                    &provider_activation,
-                    TreasurySurface::FiscalData,
-                    expected_generation,
-                )?,
-            }))
-        })();
-        let treasury_fiscal_datasets = match treasury_fiscal_datasets {
-            Ok(configuration) => configuration,
-            Err(error) => {
-                tracing::warn!(%error, "Treasury Fiscal startup selection remains unavailable");
-                None
-            }
-        };
-        let treasury_daily_datasets = (|| -> Result<_, CliProviderActivationError> {
-            let recipe = provider_activation_state
-                .load_recipe("treasury.daily-rates-xml")
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-            let DurableActivationRecipeState::Desired(_) = recipe else {
-                return Ok(None);
-            };
-            let (provider_datasets, expected_generation) =
-                cli_provider::treasury_daily_rate_all_history_datasets(&provider_activation_state)?;
-            Ok(Some(TreasuryStartupConfiguration {
-                provider_datasets,
-                generation: treasury_runtime_generation(
-                    &provider_activation,
-                    TreasurySurface::DailyRatesXml,
-                    expected_generation,
-                )?,
-            }))
-        })();
-        let treasury_daily_datasets = match treasury_daily_datasets {
-            Ok(configuration) => configuration,
-            Err(error) => {
-                tracing::warn!(%error, "Treasury daily-rate startup selection remains unavailable");
-                None
-            }
-        };
-        let research_domains = Arc::new(
-            ResearchApplicationServices::new_with_artifacts_and_composed_reads(
-                Arc::clone(&research),
-                Arc::clone(&research_ingest) as Arc<_>,
-                Arc::clone(&artifact_repository),
-                nasdaq_reference.listing_reference_reader(),
-                fred_latest_known,
-            ),
-        );
-        if treasury_fiscal_datasets.is_some() {
-            research_domains
-                .configure_treasury_fiscal_unavailable()
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-        }
-        if treasury_daily_datasets.is_some() {
-            research_domains
-                .configure_treasury_daily_unavailable()
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-        }
-        let pending_fred_dataset = fred_provider_dataset.and_then(|provider_dataset| {
-            reopen_fred_startup(
-                research.as_ref(),
-                research_domains.as_ref(),
-                provider_dataset,
-            )
-        });
-        let treasury_closure = Arc::new(
-            TreasuryApplicationClosure::try_new(
-                Arc::clone(&research_ingest),
-                Arc::clone(&research),
-            )
-            .map_err(|_| CliProviderActivationError::StateUnavailable)?,
-        );
-        portal_activation.bind_treasury_publication(treasury_closure, &research_domains)?;
+                }
+                SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) => {
+                    AuthoritativeSourceRegistry::try_new_durable_for_exclusive_installed_service_replacement(
+                        selected_workspace,
+                        authorization_subject_resolver,
+                        provider_rate.clone(),
+                    )
+                }
+            }?;
+            let (research_ingest, provider_runtime_mutation, alpaca_historical_source) =
+                ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
+                    source_registry,
+                    Arc::clone(&research),
+                    ResearchExtractionLimits::standard(),
+                    registrations,
+                )?;
 
-        let executable_sha256 = current_executable_sha256()?;
-        let strategies = production_backtest_strategy_registry(executable_sha256)?;
-        let backtest_service = Arc::new(ProductionBacktestService::initialize(
-            &paths,
-            experiment_limits()?,
-            strategies,
-        )?);
-        let backtest_inputs = Arc::new(
-            ProductionGovernedBacktestInputAuthority::try_new(
+            let provider_secret_root = paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY);
+            let secret_control = SecretOperationControl::try_new(
+                "provider-credentials-open",
+                recovery_deadline()?,
+                1,
+                SecretInteractionPolicy::Forbid,
+                SecretCancellation::new(),
+            )?;
+            let secrets = Arc::new(AccessControlledSecretStore::try_open(
+                provider_secret_root,
+                "market-squawk",
+                &secret_control,
+            )?);
+            let provider_activation_state =
+                DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
+            // Source-registry exclusive replacement above has succeeded. Only its real selected
+            // installation guard authorizes distinguishing predecessor process exit from graceful drain.
+            match &source_authority_startup_policy {
+                SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected) => {
+                    provider_activation_state.recover_account_lifecycle_after_process_exit(selected)
+                }
+                SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
+                    provider_activation_state.reject_unclean_account_lifecycle()
+                }
+            }
+            .map_err(|_| {
+                LocalProductError::MarketRuntime(market_squawk_services::ServiceError::Unavailable)
+            })?;
+            let runtime_admissions = provider_activation_state.startup_runtime_admissions()?;
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            let onboarding = Arc::new(match &board_fixture {
+                Some(fixture) => ProviderOnboardingService::try_new_with_provider_rate_runtime_admissions_and_board_fixture(
+                    onboarding_catalog,
+                    secrets,
+                    provider_rate.clone(),
+                    runtime_admissions,
+                    fixture.doctor_executor(),
+                )?,
+                None => ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
+                    onboarding_catalog,
+                    secrets,
+                    provider_rate.clone(),
+                    runtime_admissions,
+                )?,
+            });
+            #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
+            let onboarding = Arc::new(
+                ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
+                    onboarding_catalog,
+                    secrets,
+                    provider_rate.clone(),
+                    runtime_admissions,
+                )?,
+            );
+            let nasdaq_reference = Arc::new(
+                NasdaqReferenceUniverseService::try_new_durable(
+                    provider_rate.clone(),
+                    research.analytical(),
+                    research.provider_capture_store(),
+                )
+                .map_err(|error| {
+                    tracing::error!(%error, "Nasdaq reference-universe startup failed");
+                    LocalProductError::NasdaqReference
+                })?,
+            );
+            let company_security_resolution = Arc::new(CompanySecurityResolutionAuthority::new(
+                research.company_identities(),
+                research.market_data_instruments(),
+                research.company_security_link_publication(),
+                nasdaq_reference
+                    .listing_reference_reader()
+                    .ok_or(LocalProductError::NasdaqReference)?,
+            ));
+            #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+            let provider_activation = Arc::new(match &board_fixture {
+                Some(fixture) => ProviderAdapterActivation::new_with_board_fixture(
+                    Arc::clone(&onboarding),
+                    Arc::clone(&research_ingest),
+                    provider_runtime_mutation,
+                    config.clone(),
+                    provider_rate.clone(),
+                    paths.control_root()?.root().to_path_buf(),
+                    Arc::clone(&company_security_resolution),
+                    fixture.production_source_factory(),
+                ),
+                None => ProviderAdapterActivation::new(
+                    Arc::clone(&onboarding),
+                    Arc::clone(&research_ingest),
+                    provider_runtime_mutation,
+                    config.clone(),
+                    provider_rate.clone(),
+                    paths.control_root()?.root().to_path_buf(),
+                    Arc::clone(&company_security_resolution),
+                ),
+            });
+            #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
+            let provider_activation = Arc::new(ProviderAdapterActivation::new(
+                Arc::clone(&onboarding),
+                Arc::clone(&research_ingest),
+                provider_runtime_mutation,
+                config.clone(),
+                provider_rate.clone(),
+                paths.control_root()?.root().to_path_buf(),
+                Arc::clone(&company_security_resolution),
+            ));
+            cli_provider::restore_research_providers(
                 &paths,
-                Arc::clone(&research),
-                GovernedBacktestInputAuthorityLimits::standard(),
-            )?
-            .with_source_action_reader(
+                &onboarding,
+                &provider_activation,
+                &provider_activation_state,
+            );
+            let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
+                maximum_live_route_count(&config)?,
+            )?);
+            let prepared_market_configuration = ProductionMarketProviderConfigurationResolver::new(
+                config.clone(),
+                Arc::clone(&onboarding),
+                Arc::clone(&provider_activation),
+                Arc::clone(&nasdaq_reference),
+                &research,
+            );
+            let prepared_schwab = ProductionSchwabMarketRuntimeResolver::new(
+                Arc::clone(&onboarding),
+                Arc::clone(&provider_activation),
+                Arc::clone(&nasdaq_reference),
+                research.as_ref(),
+            );
+            let prepared_schwab_service: Arc<dyn PreparedSchwabMarketRuntimeResolver> =
+                prepared_schwab.clone();
+            let market_runtime = MarketRuntimeRegistry::try_new(
+                config.clone(),
+                provider_rate.clone(),
+                Arc::clone(&provider_activation),
+                alpaca_historical_source,
+                prepared_market_configuration,
+                prepared_schwab_service,
+                Arc::clone(&live_fair_value),
+                research.application_changes(),
+            )?;
+            let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
+            let schwab_market_doctor = schwab_oauth_installation
+                .as_ref()
+                .map(|_installation| {
+                    SchwabMarketDoctorRuntimeCoordinator::try_production(
+                        Arc::clone(&onboarding),
+                        Arc::clone(&research),
+                        paths.control_root()?.root(),
+                    )
+                    .map(Arc::new)
+                    .map_err(|_error| LocalProductError::ProviderVerification)
+                })
+                .transpose()?;
+            let schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory> = schwab_oauth_installation
+                .map(|installation| {
+                    let workspace_paths = paths.clone();
+                    let onboarding = Arc::clone(&onboarding);
+                    let market_drain = Arc::clone(&schwab_market_drain);
+                    Arc::new(move || {
+                        let control_root = installation.paths.control_root().map_err(|_error| {
+                            SchwabOAuthRuntimeInitializationError::Installation
+                        })?;
+                        let identity = Arc::new(
+                            InstallationSchwabOAuthIdentity::try_prepare(
+                                control_root,
+                                installation.installation_id,
+                            )
+                            .map_err(|_error| {
+                                SchwabOAuthRuntimeInitializationError::Installation
+                            })?,
+                        );
+                        open_schwab_oauth_runtime(
+                            &workspace_paths,
+                            Arc::clone(&onboarding),
+                            identity,
+                            market_drain.clone(),
+                        )
+                    }) as SchwabOAuthRuntimeFactory
+                });
+            let portal_activation = Arc::new(cli_provider::ProviderResearchActivationService::new(
+                paths.clone(),
+                Arc::clone(&onboarding),
+                Arc::clone(&provider_activation),
+                provider_activation_state.clone(),
+                schwab_oauth_factory,
+                schwab_market_doctor,
+            ));
+            prepared_schwab.bind_portal(Arc::clone(&portal_activation))?;
+            let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
+                portal_activation.clone();
+            let reference_search: Arc<dyn MarketReferenceSearchAuthority> =
+                nasdaq_reference.clone();
+            let source_calendars =
+                crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
+                    Arc::clone(&research),
+                    Arc::clone(&market_runtime),
+                );
+            let source_action_reads =
                 crate::application::SourceAppliedCorporateActionReadCapability::new(
                     Arc::clone(&research),
-                    crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
+                    source_calendars.clone(),
+                )
+                .with_artifact_repository(Arc::clone(&artifact_repository));
+            let source_action_preparation =
+                crate::application::SourceActionPreparationCapability::new(
+                    Arc::clone(&research),
+                    Arc::clone(&market_runtime),
+                    Arc::clone(&research_ingest),
+                )
+                .with_outcome_history_acquisition(Arc::clone(&provider_activation))
+                .with_current_paper_artifacts(Arc::clone(&artifact_repository));
+            let portfolio = Arc::new(PortfolioApplicationService::try_new(
+                &paths,
+                PortfolioApplicationLimits::standard(),
+            )?);
+            portfolio.register_instrument_reader(research.market_data_instruments())?;
+            portfolio.register_planning_storage(
+                research.analytical().portfolio_planning(),
+                artifact_repository.clone(),
+            )?;
+            let product_policy = market_squawk_decisions::RecommendationPolicy::v1()
+                .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
+            let product_mark_age_nanos =
+                u64::try_from(product_policy.parameters().market_max_age_nanos)
+                    .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
+            let product_markets =
+                crate::application::market_selection::MarketInvestmentReadCapability::try_new(
+                    Arc::clone(&research),
+                    research.instrument_definitions(),
+                    research.market_data_instruments(),
+                    product_mark_age_nanos,
+                )?;
+            let (display_history_requests, display_history_receiver) =
+                ProductionSourceLifecycleAuthority::starter_history_channel();
+            let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
+                paths.clone(),
+                Arc::clone(&onboarding),
+                Arc::clone(&provider_activation),
+                Arc::clone(&provider_portal_activation),
+                provider_activation_state.clone(),
+                Arc::clone(&research),
+                Arc::clone(&market_runtime),
+                source_calendars.clone(),
+                source_action_preparation.clone(),
+                display_history_requests,
+            ));
+            schwab_market_drain.bind(&source_lifecycle)?;
+            let reconnect_owner: Arc<dyn crate::application::AccountMarketRuntimeReconnect> =
+                source_lifecycle.clone();
+            market_runtime
+                .bind_account_reconnect(
+                    Arc::downgrade(&reconnect_owner),
+                    recovery_deadline()?,
+                    &cancellation,
+                )
+                .await?;
+            let source_lifecycle_service: Arc<dyn SourceLifecycleAuthority> =
+                source_lifecycle.clone();
+            // A retained recipe is a per-source startup input. If its exact runtime or saved
+            // selection is unavailable, leave that source disabled and keep the product usable.
+            let fred_startup = (|| -> Result<_, CliProviderActivationError> {
+                let recipe = provider_activation_state
+                    .load_recipe(market_squawk_sources::FRED_ALFRED_API_SURFACE_ID)
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                let DurableActivationRecipeState::Desired(_) = recipe else {
+                    return Ok((None, FredLatestKnownOperation::setup_required()));
+                };
+                let provider_dataset =
+                    cli_provider::fred_dashboard_provider_dataset(&provider_activation_state)?;
+                let capability = FredPointInTimeReadCapability::try_new(
+                    research.analytical_reader(),
+                    provider_dataset.clone(),
+                )
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                let operation =
+                    FredLatestKnownOperation::try_from_desired_activation(capability, None)
+                        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                Ok((Some(provider_dataset), operation))
+            })();
+            let (fred_provider_dataset, fred_latest_known) = match fred_startup {
+                Ok(startup) => startup,
+                Err(error) => {
+                    tracing::warn!(%error, "FRED startup selection remains unavailable");
+                    (None, FredLatestKnownOperation::setup_required())
+                }
+            };
+            let treasury_fiscal_datasets = (|| -> Result<_, CliProviderActivationError> {
+                let recipe = provider_activation_state
+                    .load_recipe("treasury.fiscal-data")
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                let DurableActivationRecipeState::Desired(_) = recipe else {
+                    return Ok(None);
+                };
+                let (query, expected_generation) =
+                    cli_provider::treasury_fiscal_release_query(&provider_activation_state)?;
+                Ok(Some(TreasuryStartupConfiguration {
+                    provider_datasets: vec![
+                        query
+                            .dataset()
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+                    ],
+                    generation: treasury_runtime_generation(
+                        &provider_activation,
+                        TreasurySurface::FiscalData,
+                        expected_generation,
+                    )?,
+                }))
+            })();
+            let treasury_fiscal_datasets = match treasury_fiscal_datasets {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    tracing::warn!(%error, "Treasury Fiscal startup selection remains unavailable");
+                    None
+                }
+            };
+            let treasury_daily_datasets = (|| -> Result<_, CliProviderActivationError> {
+                let recipe = provider_activation_state
+                    .load_recipe("treasury.daily-rates-xml")
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                let DurableActivationRecipeState::Desired(_) = recipe else {
+                    return Ok(None);
+                };
+                let (provider_datasets, expected_generation) =
+                    cli_provider::treasury_daily_rate_all_history_datasets(
+                        &provider_activation_state,
+                    )?;
+                Ok(Some(TreasuryStartupConfiguration {
+                    provider_datasets,
+                    generation: treasury_runtime_generation(
+                        &provider_activation,
+                        TreasurySurface::DailyRatesXml,
+                        expected_generation,
+                    )?,
+                }))
+            })();
+            let treasury_daily_datasets = match treasury_daily_datasets {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    tracing::warn!(%error, "Treasury daily-rate startup selection remains unavailable");
+                    None
+                }
+            };
+            let research_domains = Arc::new(
+                ResearchApplicationServices::new_with_artifacts_and_composed_reads(
+                    Arc::clone(&research),
+                    Arc::clone(&research_ingest) as Arc<_>,
+                    Arc::clone(&artifact_repository),
+                    nasdaq_reference.listing_reference_reader(),
+                    fred_latest_known,
+                ),
+            );
+            if treasury_fiscal_datasets.is_some() {
+                research_domains
+                    .configure_treasury_fiscal_unavailable()
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+            }
+            if treasury_daily_datasets.is_some() {
+                research_domains
+                    .configure_treasury_daily_unavailable()
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+            }
+            let pending_fred_dataset = fred_provider_dataset.and_then(|provider_dataset| {
+                reopen_fred_startup(
+                    research.as_ref(),
+                    research_domains.as_ref(),
+                    provider_dataset,
+                )
+            });
+            let treasury_closure = Arc::new(
+                TreasuryApplicationClosure::try_new(
+                    Arc::clone(&research_ingest),
+                    Arc::clone(&research),
+                )
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            );
+            portal_activation.bind_treasury_publication(treasury_closure, &research_domains)?;
+
+            let executable_sha256 = current_executable_sha256()?;
+            let strategies = production_backtest_strategy_registry(executable_sha256)?;
+            let backtest_service = Arc::new(ProductionBacktestService::initialize(
+                &paths,
+                experiment_limits()?,
+                strategies,
+            )?);
+            let backtest_inputs = Arc::new(
+                ProductionGovernedBacktestInputAuthority::try_new(
+                    &paths,
+                    Arc::clone(&research),
+                    GovernedBacktestInputAuthorityLimits::standard(),
+                )?
+                .with_source_action_reader(
+                    crate::application::SourceAppliedCorporateActionReadCapability::new(
                         Arc::clone(&research),
-                        Arc::clone(&market_runtime),
+                        crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
+                            Arc::clone(&research),
+                            Arc::clone(&market_runtime),
+                        ),
                     ),
                 ),
-            ),
-        );
-        let resolver: Arc<dyn GovernedBacktestInputResolver> = backtest_inputs.clone();
-        let backtest_repository = Arc::new(ProductionGovernedBacktestRepository::try_new(
-            &paths,
-            resolver,
-            artifacts.clone(),
-            GovernedBacktestRepositoryLimits::standard(),
-        )?);
-        let repository: Arc<dyn GovernedBacktestRepository> = backtest_repository.clone();
-        let backtests: Arc<dyn GovernedBacktestAuthority> = Arc::new(
-            ProductionBacktestAuthority::new(backtest_service, repository),
-        );
-        let backtest_registrar: Arc<dyn GovernedBacktestInputRegistrar> = backtest_inputs.clone();
-        let analysis = Arc::new(
-            AnalysisDomainService::new_with_feature_reader_and_artifacts(
-                Arc::new(analysis_catalog()?),
-                research.analytical_reader(),
-                Arc::clone(&artifact_repository),
-                Arc::clone(&backtest_registrar),
-                Arc::clone(&backtests),
-            ),
-        );
-
-        let model_limits = ProductionModelRuntimeLimits::standard()?;
-        let forecasts = Arc::new(ForecastApplicationService::try_open(
-            research.analytical().forecast_inventory(),
-            research.analytical().chart_projections(),
-            Arc::clone(&artifact_repository),
-        )?);
-        let (model_runtime, model) = open_model_domain(
-            &paths,
-            &config,
-            model_limits,
-            Arc::clone(&forecasts),
-            research.analytical_reader(),
-            source_calendars.clone(),
-            research.analytical().model_inventory(),
-            source_action_reads.clone(),
-            source_action_preparation.clone(),
-        )?;
-
-        let fair_value_inputs =
-            ProductionFairValueInputAuthority::try_new(FairValueInputAuthorityLimits::standard())?;
-        let fair_value_limits = fair_value_limits()?;
-        let recovery_context = ArtifactReadContext::new(cancellation.clone(), recovery_deadline()?);
-        recovery_context.ensure_live()?;
-        let forecast_sources =
-            ForecastValuationSourceFactory::new(Arc::clone(&model), Arc::clone(&research));
-        let forecast_resolver = forecast_sources.resolver(recovery_context.clone());
-        let fair_value_service = FairValueService::open_with_forecast_resolver(
-            research.fair_value_catalog(),
-            fair_value_limits,
-            &forecast_resolver,
-            local_product_timestamp()?,
-        )
-        .await;
-        recovery_context.ensure_live()?;
-        let fair_value_service = fair_value_service?;
-        let selection_authority: Arc<dyn FairValueProducerSelectionAuthority> =
-            Arc::new(ProductionFairValueProducerSelectionAuthority::new(
-                research.analytical_reader(),
-                portfolio.fair_value_reader(),
-                live_fair_value,
-                fair_value_inputs.live_publisher(),
-                fair_value_inputs.research_publisher(),
-                fair_value_inputs.analytics_publisher(),
-                fair_value_inputs.portfolio_publisher(),
-            ));
-        let maximum_quote_age_nanos = u64::try_from(config.stale_after().as_nanos())
-            .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
-        let fair_value = Arc::new(FairValueDomainService::try_new(
-            fair_value_service,
-            fair_value_inputs.resolver(),
-            selection_authority,
-            maximum_quote_age_nanos,
-        )?);
-        let decision_replay = crate::application::decision::current_share::CurrentShareReplayCapability {
-            research: Arc::clone(&research),
-            calendars: crate::application::market_calendar::ForecastSessionReadCapability::Retained(
-                crate::application::market_calendar::RetainedMarketSessionReadCapability::new(
-                    Arc::clone(&research),
+            );
+            let resolver: Arc<dyn GovernedBacktestInputResolver> = backtest_inputs.clone();
+            let backtest_repository = Arc::new(ProductionGovernedBacktestRepository::try_new(
+                &paths,
+                resolver,
+                artifacts.clone(),
+                GovernedBacktestRepositoryLimits::standard(),
+            )?);
+            let repository: Arc<dyn GovernedBacktestRepository> = backtest_repository.clone();
+            let backtests: Arc<dyn GovernedBacktestAuthority> = Arc::new(
+                ProductionBacktestAuthority::new(backtest_service, repository),
+            );
+            let backtest_registrar: Arc<dyn GovernedBacktestInputRegistrar> =
+                backtest_inputs.clone();
+            let analysis = Arc::new(
+                AnalysisDomainService::new_with_feature_reader_and_artifacts(
+                    Arc::new(analysis_catalog()?),
+                    research.analytical_reader(),
+                    Arc::clone(&artifact_repository),
+                    Arc::clone(&backtest_registrar),
+                    Arc::clone(&backtests),
                 ),
-            ),
-            market: product_markets,
-            forecasts: model.clone(),
-            valuations: fair_value.automatic_read_capability(),
-            valuation_sources: forecast_sources.clone(),
-            source_actions: crate::application::SourceAppliedCorporateActionReadCapability::for_paper_backup(
-                Arc::clone(&research), Arc::clone(&artifact_repository),
-            ),
-            maximum_forecast_artifact_bytes: NonZeroUsize::new(
-                crate::application::model::forecast::MAXIMUM_FORECAST_ARTIFACT_BYTES,
-            ).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
-        };
-        let decision_recovery_context =
-            crate::application::decision::current_share::recovery_request_context(
-                &recovery_context,
-            )?;
-        let decisions = Arc::new(
-            DecisionApplication::open_with_current_share_replay(
-                paths.control_root()?.decision_database_location(),
-                decision_repository_limits()?,
-                &decision_replay,
-                &decision_recovery_context,
-            )
-            .await?,
-        );
-        let market_collection = Arc::new(
-            crate::application::market_collection::MarketCollectionAuthority::try_open(
-                paths.control_root()?.root(),
-            )
-            .map_err(|_| ServiceError::Unavailable)?,
-        );
-        let paper = PaperApplicationServices::new(
-            config.clone(),
-            Arc::clone(&decisions),
-            Arc::clone(&market_runtime),
-            research.instrument_definitions(),
-            research.market_data_instruments(),
-            reference_search,
-            MarketHistoryReadCapability::new(research.analytical_reader()),
-            crate::application::EquityPaperServices::new(
-                Arc::new(source_action_preparation.clone()),
-                Arc::new(source_action_reads.clone()),
-                source_calendars.clone(),
-            ),
-            portfolio.paper_publisher(),
-            Arc::clone(&market_collection),
-            Arc::clone(&research),
-        );
-        let portfolio_candidate_resolution =
-            paper.candidate_resolution_factory(Arc::clone(&research))?;
-        let paper_backup = paper.stopped_backup_authority(
-            Arc::clone(&research),
-            paths.artifacts()?.clone(),
-            paths.control_root()?.clone(),
-            NonZeroUsize::new(crate::paper_bot::LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)
-                .ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
-            std::num::NonZeroU64::new(operations::workspace_backup::MAXIMUM_COMPONENT_BYTES)
-                .ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
-        );
-        let paper_activity = paper.runtime_activity_authority();
-        let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
-            Arc::clone(&research_ingest) as Arc<_>;
-        let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
-            Arc::clone(&onboarding),
-            paper.source_runtime_view(),
-            source_discovery,
-            portal_activation.clone(),
-            portal_activation.clone(),
-            source_lifecycle_service,
-        )?);
-        let decision_governance: Arc<dyn DecisionGovernanceActionFactory> =
-            Arc::new(DecisionGovernanceAdapter::new(Arc::clone(&decisions)));
-        let fair_value_governance: Arc<dyn FairValueGovernanceActionFactory> = Arc::new(
-            ProductionFairValueGovernanceActionFactory::new(Arc::clone(&fair_value)),
-        );
+            );
 
-        let application = application_preparation.compose_product_services(
-            source,
-            &research_domains,
-            portfolio.clone(),
-            analysis.clone(),
-            model.clone(),
-            fair_value.clone(),
-            &paper,
-        )?;
-        recovery_context.ensure_live()?;
-        // Everything above can fail without launching source publication. The fixed task owner
-        // below retains every future through cancellation and the provider's actual replay join.
-        let startup_cancellation = CancellationToken::new();
-        let fred_startup = pending_fred_dataset.map(|dataset| {
-            let coordinator = Arc::clone(&research_ingest);
-            let domains = Arc::clone(&research_domains);
-            let cancellation = startup_cancellation.child_token();
-            Box::pin(publish_fred_startup(
-                coordinator,
-                domains,
-                dataset,
-                cancellation,
-            )) as startup::StartupFuture
-        });
-        let fiscal_startup = treasury_fiscal_datasets.map(|_| {
-            Box::pin(publish_treasury_startup_surface(
-                Arc::clone(&portal_activation),
-                TreasurySurface::FiscalData,
+            let model_limits = ProductionModelRuntimeLimits::standard()?;
+            let forecasts = Arc::new(ForecastApplicationService::try_open(
+                research.analytical().forecast_inventory(),
+                research.analytical().chart_projections(),
+                Arc::clone(&artifact_repository),
+            )?);
+            let (model_runtime, model) = open_model_domain(
+                &paths,
+                &config,
+                model_limits,
+                Arc::clone(&forecasts),
+                research.analytical_reader(),
+                source_calendars.clone(),
+                research.analytical().model_inventory(),
+                source_action_reads.clone(),
+                source_action_preparation.clone(),
+            )?;
+
+            let fair_value_inputs = ProductionFairValueInputAuthority::try_new(
+                FairValueInputAuthorityLimits::standard(),
+            )?;
+            let fair_value_limits = fair_value_limits()?;
+            let recovery_context =
+                ArtifactReadContext::new(cancellation.clone(), recovery_deadline()?);
+            recovery_context.ensure_live()?;
+            let forecast_sources =
+                ForecastValuationSourceFactory::new(Arc::clone(&model), Arc::clone(&research));
+            let forecast_resolver = forecast_sources.resolver(recovery_context.clone());
+            let fair_value_service = FairValueService::open_with_forecast_resolver(
+                research.fair_value_catalog(),
+                fair_value_limits,
+                &forecast_resolver,
+                local_product_timestamp()?,
+            )
+            .await;
+            recovery_context.ensure_live()?;
+            let fair_value_service = fair_value_service?;
+            let selection_authority: Arc<dyn FairValueProducerSelectionAuthority> =
+                Arc::new(ProductionFairValueProducerSelectionAuthority::new(
+                    research.analytical_reader(),
+                    portfolio.fair_value_reader(),
+                    live_fair_value,
+                    fair_value_inputs.live_publisher(),
+                    fair_value_inputs.research_publisher(),
+                    fair_value_inputs.analytics_publisher(),
+                    fair_value_inputs.portfolio_publisher(),
+                ));
+            let maximum_quote_age_nanos = u64::try_from(config.stale_after().as_nanos())
+                .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
+            let fair_value = Arc::new(FairValueDomainService::try_new(
+                fair_value_service,
+                fair_value_inputs.resolver(),
+                selection_authority,
+                maximum_quote_age_nanos,
+            )?);
+            let decision_replay = crate::application::decision::current_share::CurrentShareReplayCapability {
+                research: Arc::clone(&research),
+                calendars: crate::application::market_calendar::ForecastSessionReadCapability::Retained(
+                    crate::application::market_calendar::RetainedMarketSessionReadCapability::new(
+                        Arc::clone(&research),
+                    ),
+                ),
+                market: product_markets,
+                forecasts: model.clone(),
+                valuations: fair_value.automatic_read_capability(),
+                valuation_sources: forecast_sources.clone(),
+                source_actions: crate::application::SourceAppliedCorporateActionReadCapability::for_paper_backup(
+                    Arc::clone(&research), Arc::clone(&artifact_repository),
+                ),
+                maximum_forecast_artifact_bytes: NonZeroUsize::new(
+                    crate::application::model::forecast::MAXIMUM_FORECAST_ARTIFACT_BYTES,
+                ).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
+            };
+            let decision_recovery_context =
+                crate::application::decision::current_share::recovery_request_context(
+                    &recovery_context,
+                )?;
+            let decisions = Arc::new(
+                DecisionApplication::open_with_current_share_replay(
+                    paths.control_root()?.decision_database_location(),
+                    decision_repository_limits()?,
+                    &decision_replay,
+                    &decision_recovery_context,
+                )
+                .await?,
+            );
+            let market_collection = Arc::new(
+                crate::application::market_collection::MarketCollectionAuthority::try_open(
+                    paths.control_root()?.root(),
+                )
+                .map_err(|_| ServiceError::Unavailable)?,
+            );
+            let paper = PaperApplicationServices::new(
+                config.clone(),
+                Arc::clone(&decisions),
+                Arc::clone(&market_runtime),
+                research.instrument_definitions(),
+                research.market_data_instruments(),
+                reference_search,
+                MarketHistoryReadCapability::new(research.analytical_reader()),
+                crate::application::EquityPaperServices::new(
+                    Arc::new(source_action_preparation.clone()),
+                    Arc::new(source_action_reads.clone()),
+                    source_calendars.clone(),
+                ),
+                portfolio.paper_publisher(),
+                Arc::clone(&market_collection),
+                Arc::clone(&research),
+            );
+            let portfolio_candidate_resolution =
+                paper.candidate_resolution_factory(Arc::clone(&research))?;
+            let paper_backup = paper.stopped_backup_authority(
+                Arc::clone(&research),
+                paths.artifacts()?.clone(),
+                paths.control_root()?.clone(),
+                NonZeroUsize::new(crate::paper_bot::LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)
+                    .ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
+                std::num::NonZeroU64::new(operations::workspace_backup::MAXIMUM_COMPONENT_BYTES)
+                    .ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
+            );
+            let paper_activity = paper.runtime_activity_authority();
+            let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
+                Arc::clone(&research_ingest) as Arc<_>;
+            let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
+                Arc::clone(&onboarding),
+                paper.source_runtime_view(),
+                source_discovery,
+                portal_activation.clone(),
+                portal_activation.clone(),
+                source_lifecycle_service,
+            )?);
+            let decision_governance: Arc<dyn DecisionGovernanceActionFactory> =
+                Arc::new(DecisionGovernanceAdapter::new(Arc::clone(&decisions)));
+            let fair_value_governance: Arc<dyn FairValueGovernanceActionFactory> = Arc::new(
+                ProductionFairValueGovernanceActionFactory::new(Arc::clone(&fair_value)),
+            );
+
+            let application = application_preparation.compose_product_services(
+                source,
+                &research_domains,
+                portfolio.clone(),
+                analysis.clone(),
+                model.clone(),
+                fair_value.clone(),
+                &paper,
+            )?;
+            recovery_context.ensure_live()?;
+            // Everything above can fail without launching source publication. The fixed task owner
+            // below retains every future through cancellation and the provider's actual replay join.
+            let startup_cancellation = CancellationToken::new();
+            let fred_startup = pending_fred_dataset.map(|dataset| {
+                let coordinator = Arc::clone(&research_ingest);
+                let domains = Arc::clone(&research_domains);
+                let cancellation = startup_cancellation.child_token();
+                Box::pin(publish_fred_startup(
+                    coordinator,
+                    domains,
+                    dataset,
+                    cancellation,
+                )) as startup::StartupFuture
+            });
+            let fiscal_startup = treasury_fiscal_datasets.map(|_| {
+                Box::pin(publish_treasury_startup_surface(
+                    Arc::clone(&portal_activation),
+                    TreasurySurface::FiscalData,
+                    startup_cancellation.child_token(),
+                )) as startup::StartupFuture
+            });
+            let daily_startup = treasury_daily_datasets.map(|_| {
+                Box::pin(publish_treasury_startup_surface(
+                    Arc::clone(&portal_activation),
+                    TreasurySurface::DailyRatesXml,
+                    startup_cancellation.child_token(),
+                )) as startup::StartupFuture
+            });
+            let display_history_startup = Some(Box::pin(
+                Arc::clone(&source_lifecycle).run_display_history_worker(
+                    display_history_receiver,
+                    startup_cancellation.child_token(),
+                ),
+            ) as startup::StartupFuture);
+            let market_event_archive = Some(Box::pin(startup::run_market_event_archive(
+                research.analytical_service(),
                 startup_cancellation.child_token(),
-            )) as startup::StartupFuture
-        });
-        let daily_startup = treasury_daily_datasets.map(|_| {
-            Box::pin(publish_treasury_startup_surface(
-                Arc::clone(&portal_activation),
-                TreasurySurface::DailyRatesXml,
-                startup_cancellation.child_token(),
-            )) as startup::StartupFuture
-        });
-        let display_history_startup = Some(Box::pin(
-            Arc::clone(&source_lifecycle).run_display_history_worker(
-                display_history_receiver,
-                startup_cancellation.child_token(),
-            ),
-        ) as startup::StartupFuture);
-        let market_event_archive = Some(Box::pin(startup::run_market_event_archive(
-            research.analytical_service(),
-            startup_cancellation.child_token(),
-        )) as startup::StartupFuture);
-        let provider_capture_recovery = Some(Box::pin(startup::run_provider_capture_recovery(
-            research.analytical_service(),
-            provider_capture_recovery,
-            startup_cancellation.child_token(),
-        )) as startup::StartupFuture);
-        let startup_tasks = startup::ProductStartupTasks::start(
-            Arc::clone(&research_domains),
-            startup_cancellation,
-            [
-                fred_startup,
-                fiscal_startup,
-                daily_startup,
-                display_history_startup,
-                market_event_archive,
+            )) as startup::StartupFuture);
+            let provider_capture_recovery = Some(Box::pin(startup::run_provider_capture_recovery(
+                research.analytical_service(),
                 provider_capture_recovery,
-            ],
-        );
-        source_lifecycle.bind_public_startup_tasks(Arc::downgrade(&startup_tasks))?;
-        let application = Arc::new(application.with_startup_tasks(Arc::clone(&startup_tasks)));
-        let credential_access = Arc::new(credential_access::CredentialAccessCoordinator::new(
-            Arc::clone(&onboarding),
-            Arc::clone(&provider_portal_activation),
-            source_lifecycle.clone(),
-            paper.credential_runtime_control(),
-            Arc::clone(&startup_tasks),
-        ));
-        Ok(Self {
-            paths,
-            artifacts,
-            application,
-            research,
-            feature_dataset_production_publisher,
-            company_security_resolution,
-            research_ingest,
-            source_lifecycle,
-            market_runtime,
-            market_collection,
-            paper_activity,
-            paper_backup,
-            portfolio_candidate_resolution,
-            provider_onboarding: onboarding,
-            provider_activation,
-            provider_research_activation: portal_activation,
-            provider_portal_activation,
-            credential_access,
-            provider_activation_state,
-            portfolio,
-            decisions,
-            decision_governance,
-            fair_value_governance,
-            research_services: Arc::clone(&research_domains),
-            research_domain: research_domains.research(),
-            analysis_domain: analysis,
-            model_domain: model,
-            source_action_preparation,
-            backtest_registrar,
-            backtest_inputs,
-            backtest_repository,
-            backtests,
-            model_runtime,
-            model_runtime_limits: model_limits,
-            forecasts,
-            fair_value,
-            fair_value_inputs,
-            startup_tasks,
+                startup_cancellation.child_token(),
+            )) as startup::StartupFuture);
+            let startup_tasks = startup::ProductStartupTasks::start(
+                Arc::clone(&research_domains),
+                startup_cancellation,
+                [
+                    fred_startup,
+                    fiscal_startup,
+                    daily_startup,
+                    display_history_startup,
+                    market_event_archive,
+                    provider_capture_recovery,
+                ],
+            );
+            source_lifecycle.bind_public_startup_tasks(Arc::downgrade(&startup_tasks))?;
+            let application = Arc::new(application.with_startup_tasks(Arc::clone(&startup_tasks)));
+            let credential_access = Arc::new(credential_access::CredentialAccessCoordinator::new(
+                Arc::clone(&onboarding),
+                Arc::clone(&provider_portal_activation),
+                source_lifecycle.clone(),
+                paper.credential_runtime_control(),
+                Arc::clone(&startup_tasks),
+            ));
+            Ok(Self {
+                paths,
+                artifacts,
+                application,
+                research,
+                feature_dataset_production_publisher,
+                company_security_resolution,
+                research_ingest,
+                source_lifecycle,
+                market_runtime,
+                market_collection,
+                paper_activity,
+                paper_backup,
+                portfolio_candidate_resolution,
+                provider_onboarding: onboarding,
+                provider_activation,
+                provider_research_activation: portal_activation,
+                provider_portal_activation,
+                credential_access,
+                provider_activation_state,
+                portfolio,
+                decisions,
+                decision_governance,
+                fair_value_governance,
+                research_services: Arc::clone(&research_domains),
+                research_domain: research_domains.research(),
+                analysis_domain: analysis,
+                model_domain: model,
+                source_action_preparation,
+                backtest_registrar,
+                backtest_inputs,
+                backtest_repository,
+                backtests,
+                model_runtime,
+                model_runtime_limits: model_limits,
+                forecasts,
+                fair_value,
+                fair_value_inputs,
+                startup_tasks,
+            })
         })
     }
 

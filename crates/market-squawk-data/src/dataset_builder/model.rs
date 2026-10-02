@@ -1489,10 +1489,12 @@ impl DatasetBuildInputs {
                         .iter()
                         .zip(&component_specs)
                         .any(|(component, spec)| component.spec != *spec)
-                    || example
-                        .components
-                        .iter()
-                        .any(|component| !component_scope_matches(component, example.instrument_id))
+                    || example.components.iter().any(|component| {
+                        !component_scope_matches(component, example.instrument_id)
+                            && !example.financial_source().is_some_and(|financial| {
+                                financial.component_scope_matches(component, example.instrument_id)
+                            })
+                    })
             })
         {
             return Err(DatasetBuildError::InvalidRequest);
@@ -2495,14 +2497,30 @@ fn family_dynamic_bytes(family: &ObservationFamilyKey) -> Result<usize, DatasetB
         ObservationFamilyKey::Filing {
             source_id,
             accession,
-            ..
-        } => checked_family_dynamic(source_id, &[accession.as_str()], None),
+            subject,
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                accession.as_str(),
+                subject.issuer_id().map_or("", |id| id.as_str()),
+            ],
+            None,
+        ),
         ObservationFamilyKey::Fundamental {
             source_id,
             concept,
             unit,
+            subject,
             ..
-        } => checked_family_dynamic(source_id, &[concept.as_str(), unit.as_str()], None),
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                concept.as_str(),
+                unit.as_str(),
+                subject.issuer_id().map_or("", |id| id.as_str()),
+            ],
+            None,
+        ),
         ObservationFamilyKey::Macro {
             source_id,
             series,
@@ -2639,9 +2657,9 @@ fn retained_array_bytes<T>(len: usize) -> Result<usize, DatasetBuildError> {
 
 const fn selector_instrument(family: &ObservationFamilyKey) -> Option<InstrumentId> {
     match family {
-        ObservationFamilyKey::Filing { instrument_id, .. }
-        | ObservationFamilyKey::Fundamental { instrument_id, .. }
-        | ObservationFamilyKey::MarketBar { instrument_id, .. }
+        ObservationFamilyKey::Filing { subject, .. }
+        | ObservationFamilyKey::Fundamental { subject, .. } => subject.instrument_id(),
+        ObservationFamilyKey::MarketBar { instrument_id, .. }
         | ObservationFamilyKey::FundNav { instrument_id, .. }
         | ObservationFamilyKey::PortfolioPosition { instrument_id, .. }
         | ObservationFamilyKey::CorporateAction { instrument_id, .. }

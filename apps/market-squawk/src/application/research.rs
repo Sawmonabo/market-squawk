@@ -85,7 +85,7 @@ mod source_errors;
 mod treasury;
 
 pub(crate) use source_errors::{
-    map_current_population_error, map_durable_market_ingest_error,
+    map_current_population_error, map_durable_market_ingest_error, map_listing_error,
     map_market_definition_read_error, map_point_in_time_read_error, map_python_dataset_error,
     map_research_use_error,
 };

@@ -4,9 +4,9 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 use market_squawk_domain::{
-    BarTimestampBasis, CalendarDate, Currency, FundNavValuationBasis, FundamentalPeriod,
-    InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence, ProviderChannel,
-    ProviderInstrumentId, ProviderProduct, ResearchContext, ResearchObservation,
+    BarTimestampBasis, CalendarDate, CompanyObservationSubject, Currency, FundNavValuationBasis,
+    FundamentalPeriod, InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence,
+    ProviderChannel, ProviderInstrumentId, ProviderProduct, ResearchContext, ResearchObservation,
     ResearchTemporalCoordinate, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 
@@ -255,12 +255,12 @@ impl PointInTimeCandidate {
 pub enum ObservationFamilyKey {
     Filing {
         source_id: SourceId,
-        instrument_id: InstrumentId,
+        subject: CompanyObservationSubject,
         accession: SourceIdentifier,
     },
     Fundamental {
         source_id: SourceId,
-        instrument_id: InstrumentId,
+        subject: CompanyObservationSubject,
         concept: SourceIdentifier,
         unit: SourceIdentifier,
         period: FundamentalPeriod,
@@ -351,12 +351,12 @@ impl ObservationFamilyKey {
         match candidate.observation() {
             ResearchObservation::Filing(value) => Ok(Self::Filing {
                 source_id,
-                instrument_id: required_instrument()?,
+                subject: value.subject().clone(),
                 accession: value.accession().clone(),
             }),
             ResearchObservation::Fundamental(value) => Ok(Self::Fundamental {
                 source_id,
-                instrument_id: required_instrument()?,
+                subject: value.subject().clone(),
                 concept: value.concept().clone(),
                 unit: value.unit().clone(),
                 period: value.fact_context().period(),

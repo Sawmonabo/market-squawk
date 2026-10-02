@@ -399,6 +399,22 @@ pub(super) fn encode_component(hash: &mut Sha256, component: &FeatureLabelCompon
     }
 }
 
+fn encode_company_subject(
+    hash: &mut Sha256,
+    subject: &market_squawk_domain::CompanyObservationSubject,
+) {
+    match subject {
+        market_squawk_domain::CompanyObservationSubject::Issuer(issuer) => {
+            hash.update([1]);
+            put_str(hash, issuer.as_str());
+        }
+        market_squawk_domain::CompanyObservationSubject::Instrument(instrument) => {
+            hash.update([2]);
+            hash.update(instrument.as_uuid().as_bytes());
+        }
+    }
+}
+
 fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
     match family {
         ObservationFamilyKey::MarketCalendar {
@@ -443,24 +459,24 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
         }
         ObservationFamilyKey::Filing {
             source_id,
-            instrument_id,
+            subject,
             accession,
         } => {
             hash.update([1]);
             put_str(hash, source_id.as_str());
-            hash.update(instrument_id.as_uuid().as_bytes());
+            encode_company_subject(hash, subject);
             put_str(hash, accession.as_str());
         }
         ObservationFamilyKey::Fundamental {
             source_id,
-            instrument_id,
+            subject,
             concept,
             unit,
             period,
         } => {
             hash.update([2]);
             put_str(hash, source_id.as_str());
-            hash.update(instrument_id.as_uuid().as_bytes());
+            encode_company_subject(hash, subject);
             put_str(hash, concept.as_str());
             put_str(hash, unit.as_str());
             encode_fundamental_period(hash, *period);

@@ -12,9 +12,9 @@ use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AvailabilityEvidence, CompanyIdentityObservation, CompanyIdentityObservationInput,
     CompanyIdentitySurface, DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, FormerCompanyName, MetadataRevision, ProviderIdentityRegistry,
-    ProviderReportedSecurityAssociation, ResearchContext, ResearchObservation, SchemaVersion,
-    SourceId, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
+    ExactPayloadEvidence, FormerCompanyName, MetadataRevision, ProviderReportedSecurityAssociation,
+    ResearchContext, ResearchObservation, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    VersionPinnedSourceLocator,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, DiscoveryBatch, DiscoveryRequest,
@@ -109,7 +109,6 @@ struct SecPendingFilingXbrlAdmission {
     filing_representation: SecRepresentation,
     taxonomy: SecPendingValidatedXbrlTaxonomySet,
     raw_store: Arc<RawEvidenceStore>,
-    identities: Arc<ProviderIdentityRegistry>,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     parser_limits: SecParserLimits,
@@ -153,7 +152,6 @@ impl SecPendingFilingXbrlAdmission {
             filing_representation,
             taxonomy,
             raw_store,
-            identities,
             source_id,
             metadata_revision,
             parser_limits,
@@ -194,7 +192,6 @@ impl SecPendingFilingXbrlAdmission {
                 filing_representation,
                 taxonomy,
                 raw_store,
-                identities,
                 source_id,
                 metadata_revision,
                 parser_limits,
@@ -210,7 +207,6 @@ struct SecPreparedFilingXbrlExtraction {
     submissions: RetrievedSubmissions,
     filing_document: RetrievedSecBytes,
     document_context: XbrlDocumentContext,
-    identities: Arc<ProviderIdentityRegistry>,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     parser_limits: SecParserLimits,
@@ -545,7 +541,6 @@ impl SecEdgarSource {
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<SecExtractionResult, ExtractionSourceError>> {
         let raw_store = self.raw_store();
-        let identities = self.identity_registry();
         let source_id = self.metadata().source_id().clone();
         Box::pin(async move {
             self.validate_authority(&authority)
@@ -557,7 +552,6 @@ impl SecEdgarSource {
                 extract_blocking(
                     request,
                     raw_store,
-                    identities,
                     source_id,
                     worker_authority,
                     worker_token,
@@ -657,7 +651,6 @@ pub(crate) fn admit_filing_xbrl_root_from_sealed_capture(
 )]
 pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
     raw_store: Arc<RawEvidenceStore>,
-    identities: Arc<ProviderIdentityRegistry>,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     parser_limits: SecParserLimits,
@@ -693,7 +686,6 @@ pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
         filing_representation,
         taxonomy,
         raw_store,
-        identities,
         source_id,
         metadata_revision,
         parser_limits,
@@ -714,7 +706,6 @@ pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
         dataset,
         submissions,
         filing_document,
-        identities,
         source_id,
         metadata_revision,
         parser_limits,
@@ -726,7 +717,6 @@ pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
             submissions,
             filing_document,
             document_context,
-            identities,
             source_id,
             metadata_revision,
             parser_limits,
@@ -891,12 +881,12 @@ fn extract_filing_xbrl_handoff(
         &request,
         &pending.source_id,
         &pending.submissions,
+        CompanyIdentitySurface::SecFilingXbrl,
         ingested_at,
         cancellation,
     )?;
     let normalized = normalize_filing_xbrl_with_cancellation(
         &pending.source_id,
-        &pending.identities,
         pending.dataset,
         document,
         pending.filing_document.evidence(),
@@ -1053,7 +1043,6 @@ impl SecFilingXbrlExtractionStream {
 fn extract_blocking(
     request: ExtractionRequest,
     raw_store: Arc<RawEvidenceStore>,
-    identities: Arc<ProviderIdentityRegistry>,
     source_id: SourceId,
     authority: ExtractionAuthority,
     cancellation: &CancellationToken,
@@ -1095,7 +1084,6 @@ fn extract_blocking(
             }
             let observations = normalize_filings_with_cancellation(
                 &source_id,
-                &identities,
                 &retrieved,
                 ingested_at,
                 cancellation,
@@ -1104,6 +1092,7 @@ fn extract_blocking(
                 &request,
                 &source_id,
                 &retrieved,
+                CompanyIdentitySurface::SecSubmissions,
                 ingested_at,
                 cancellation,
             )?;
@@ -1137,7 +1126,6 @@ fn extract_blocking(
             }
             let observations = normalize_company_facts_with_cancellation(
                 &source_id,
-                &identities,
                 &retrieved,
                 ingested_at,
                 cancellation,
@@ -1467,6 +1455,7 @@ fn company_identity_from_submissions(
     request: &ExtractionRequest,
     source_id: &SourceId,
     retrieved: &RetrievedSubmissions,
+    surface: CompanyIdentitySurface,
     ingested_at: Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<CompanyIdentityObservation, SecClientError> {
@@ -1512,7 +1501,7 @@ fn company_identity_from_submissions(
         schema_version: SchemaVersion::CURRENT,
         source_id: source_id.clone(),
         provider_company_id: retrieved.document().cik().clone(),
-        surface: CompanyIdentitySurface::SecSubmissions,
+        surface,
         conformed_name: metadata.conformed_name().to_owned(),
         former_names,
         entity_type: metadata.entity_type().map(str::to_owned),

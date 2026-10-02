@@ -10,13 +10,14 @@ use std::{io, mem::size_of};
 
 use market_squawk_analytics::FeatureKey;
 use market_squawk_data::{
-    CompanySecurityIdentityDisposition, DatasetManifestRef, MarketEventCommitRef,
-    ProviderMarketEventPointInTimeSelection, SecResearchDisposition, SecResearchIdentityOutcome,
-    SecResearchIdentitySelection,
+    CompanySecurityIdentityDisposition, CompanySecurityIdentitySelectionReceipt,
+    DatasetManifestRef, MarketEventCommitRef, ProviderMarketEventPointInTimeSelection,
+    SecResearchDisposition, SecResearchIdentityOutcome, SecResearchIdentitySelection,
 };
 use market_squawk_domain::{
-    AccountId, Currency, DataQuality, DigestAlgorithm, EvidenceDigest, MarketEvent, Money,
-    ResearchObservation, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AccountId, CompanyIdentityObservation, CompanyIdentitySurface, Currency, DataQuality,
+    DigestAlgorithm, EvidenceDigest, MarketEvent, Money, PayloadReference, ResearchObservation,
+    SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -198,6 +199,12 @@ pub enum EvidenceOrigin {
         result_digest: EvidenceDigest,
         /// Exact company/security relationship selection identity.
         company_security_digest: EvidenceDigest,
+        /// Complete canonical relationship receipt, including selected stock and exact parents.
+        canonical_company_security: Box<str>,
+        /// Canonical issuer parent retained by the source selection.
+        canonical_company_observation: Box<str>,
+        /// Exact issuer parent digest bound by both source and relationship selections.
+        company_observation_digest: EvidenceDigest,
         /// Canonical source row ordinal.
         row: u32,
         /// Exact provider-native extraction record identity.
@@ -326,6 +333,9 @@ impl EvidenceOrigin {
                 selection_digest,
                 result_digest,
                 company_security_digest,
+                canonical_company_security,
+                canonical_company_observation,
+                company_observation_digest,
                 row,
                 canonical_row_digest,
                 knowledge_at,
@@ -340,6 +350,7 @@ impl EvidenceOrigin {
                     selection_digest,
                     result_digest,
                     company_security_digest,
+                    company_observation_digest,
                     canonical_row_digest,
                 ] {
                     hash_digest(hash, *digest);
@@ -348,6 +359,8 @@ impl EvidenceOrigin {
                 hash.i64(knowledge_at.unix_nanos());
                 hash.i64(generation_completed_at.unix_nanos());
                 hash.bytes(canonical_observation.as_bytes());
+                hash.bytes(canonical_company_security.as_bytes());
+                hash.bytes(canonical_company_observation.as_bytes());
             }
             Self::AutomaticValuation { receipt } => {
                 hash.u8(6);
@@ -413,10 +426,18 @@ impl EvidenceOrigin {
             Self::Fundamental {
                 manifest,
                 canonical_observation,
+                canonical_company_security,
+                canonical_company_observation,
                 ..
             } => checked_add(
                 manifest_retained_bytes(manifest)?,
-                canonical_observation.len(),
+                checked_add(
+                    canonical_observation.len(),
+                    checked_add(
+                        canonical_company_security.len(),
+                        canonical_company_observation.len(),
+                    )?,
+                )?,
             ),
             Self::AutomaticValuation { receipt } => receipt.retained_bytes(),
             Self::ForecastDistribution { evidence } => checked_add(
@@ -855,12 +876,16 @@ impl FairValueEvidence {
             }
             EvidenceOrigin::Fundamental {
                 canonical_observation,
+                canonical_company_security,
                 ..
             } => {
                 let observation = decode_fundamental(canonical_observation)?;
+                let receipt = decode_company_security(canonical_company_security)?;
+                let [selected] = receipt.ordered_candidates() else {
+                    return Err(FairValueError::InvalidInstrumentRelationship);
+                };
                 let (currency, basis) = fundamental_amount_unit(&observation)?;
-                if observation.context().provenance().instrument_id()
-                    != Some(spec.subject_instrument_id)
+                if selected.instrument_id() != spec.subject_instrument_id
                     || spec.subject_instrument_id != spec.reference_instrument_id
                     || spec.relationship != InputInstrumentRelation::Identical
                     || spec.amount.money() != Money::new(observation.value(), currency)
@@ -1128,9 +1153,28 @@ impl ValuationInput {
             return Err(FairValueError::InvalidProducerEvidence);
         };
         let provenance = observation.context().provenance();
-        if provenance.instrument_id() != Some(selection.request().instrument_id()) {
-            return Err(FairValueError::InvalidInstrumentRelationship);
-        }
+        let company = selected.company_identity().observation();
+        let company_digest = selected.receipt().company_observation_digest();
+        selection
+            .identity()
+            .receipt()
+            .validate_selected_company(
+                selection.request().instrument_id(),
+                company,
+                company_digest,
+                selection.request().knowledge_at(),
+            )
+            .map_err(|_| FairValueError::InvalidInstrumentRelationship)?;
+        validate_fundamental_company(observation, company)?;
+        let canonical_company_security = String::from_utf8(
+            selection
+                .identity()
+                .receipt()
+                .canonical_bytes()
+                .map_err(|_| FairValueError::InvalidProducerEvidence)?,
+        )
+        .map_err(|_| FairValueError::InvalidProducerEvidence)?
+        .into_boxed_str();
         let canonical_observation = encode_source_record(&source)?;
         let payload_digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
@@ -1157,6 +1201,9 @@ impl ValuationInput {
                 selection_digest: receipt.selection_digest(),
                 result_digest: receipt.result_digest(),
                 company_security_digest: selection.identity().receipt().receipt_digest(),
+                canonical_company_security,
+                canonical_company_observation: encode_source_record(company)?,
+                company_observation_digest: company_digest,
                 row,
                 canonical_row_digest: selected_row.row().canonical_row_digest(),
                 knowledge_at: selection.request().knowledge_at(),
@@ -1377,6 +1424,9 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
             selection_digest,
             result_digest,
             company_security_digest,
+            canonical_company_security,
+            canonical_company_observation,
+            company_observation_digest,
             canonical_row_digest,
             knowledge_at,
             generation_completed_at,
@@ -1390,6 +1440,7 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
                     selection_digest,
                     result_digest,
                     company_security_digest,
+                    company_observation_digest,
                     canonical_row_digest,
                 ]
                 .iter()
@@ -1406,6 +1457,23 @@ fn validate_derived_origin(parts: &FairValueEvidenceParts) -> Result<(), FairVal
                 return Err(FairValueError::InvalidProducerEvidence);
             }
             let observation = decode_fundamental(canonical_observation)?;
+            let company = decode_company(canonical_company_observation)?;
+            let identity = decode_company_security(canonical_company_security)?;
+            let [entry] = identity.ordered_candidates() else {
+                return Err(FairValueError::InvalidProducerEvidence);
+            };
+            identity
+                .validate_selected_company(
+                    entry.instrument_id(),
+                    &company,
+                    *company_observation_digest,
+                    *knowledge_at,
+                )
+                .map_err(|_| FairValueError::InvalidProducerEvidence)?;
+            if identity.receipt_digest() != *company_security_digest {
+                return Err(FairValueError::InvalidProducerEvidence);
+            }
+            validate_fundamental_company(&observation, &company)?;
             let provenance = observation.context().provenance();
             if provenance.source_id() != &parts.source_id
                 || provenance.source_identifier() != &parts.source_identifier
@@ -1607,6 +1675,49 @@ fn market_event_provenance(
 fn fundamental_amount_unit(
     observation: &market_squawk_domain::FundamentalObservation,
 ) -> Result<(Currency, ValuationAmountBasis), FairValueError> {
+    if let Some(xbrl) = observation.xbrl_evidence() {
+        let (currency, basis) = if let Some(currency) = xbrl.unit().measure_name() {
+            let common_total = xbrl.concept().local_name().as_str()
+                == "NetIncomeLossAvailableToCommonStockholdersBasic"
+                && xbrl.concept().namespace_uri().is_some_and(|namespace| {
+                    namespace.as_str().starts_with("http://fasb.org/us-gaap/")
+                });
+            (
+                currency,
+                if common_total {
+                    ValuationAmountBasis::TotalCommonEquity
+                } else {
+                    ValuationAmountBasis::ReportingEntityTotal
+                },
+            )
+        } else {
+            let (numerator, denominator) = xbrl
+                .unit()
+                .divide_parts()
+                .ok_or(FairValueError::InvalidAmount)?;
+            let ([currency], [shares]) = (numerator, denominator) else {
+                return Err(FairValueError::InvalidAmount);
+            };
+            if shares.namespace_uri().map(|namespace| namespace.as_str())
+                != Some("http://www.xbrl.org/2003/instance")
+                || shares.local_name().as_str() != "shares"
+            {
+                return Err(FairValueError::InvalidAmount);
+            }
+            (currency, ValuationAmountBasis::PerInstrumentUnit)
+        };
+        if currency.namespace_uri().map(|namespace| namespace.as_str())
+            != Some("http://www.xbrl.org/2003/iso4217")
+        {
+            return Err(FairValueError::InvalidAmount);
+        }
+        let parsed = Currency::try_from(currency.local_name().as_str())
+            .map_err(|_| FairValueError::InvalidAmount)?;
+        if parsed.as_str() != currency.local_name().as_str() {
+            return Err(FairValueError::InvalidAmount);
+        }
+        return Ok((parsed, basis));
+    }
     let unit = observation.unit().as_str();
     let (currency_text, basis) = match unit.strip_suffix("/shares") {
         Some(currency) => (currency, ValuationAmountBasis::PerInstrumentUnit),
@@ -1622,6 +1733,55 @@ fn fundamental_amount_unit(
         return Err(FairValueError::InvalidAmount);
     }
     Ok((currency, basis))
+}
+
+/// Joins an original issuer-owned fact to its exact source parent without inventing a stock ID.
+pub(crate) fn validate_fundamental_company(
+    observation: &market_squawk_domain::FundamentalObservation,
+    company: &CompanyIdentityObservation,
+) -> Result<(), FairValueError> {
+    let provenance = observation.context().provenance();
+    let payload = match (company.surface(), observation.xbrl_evidence()) {
+        (CompanyIdentitySurface::SecCompanyFacts, None) => {
+            company.identity_payload_evidence().content_digest()
+        }
+        (CompanyIdentitySurface::SecFilingXbrl, Some(xbrl))
+            if xbrl.entity().scheme().as_str() == "http://www.sec.gov/CIK"
+                && xbrl.entity().value().as_str() == company.provider_company_id().as_str()
+                && xbrl.accession() == observation.fact_context().accession() =>
+        {
+            xbrl.source_payload().content_digest()
+        }
+        _ => return Err(FairValueError::InvalidProducerEvidence),
+    };
+    if provenance.instrument_id().is_some()
+        || observation.subject().issuer_id() != Some(company.provider_company_id())
+        || provenance.source_id() != company.source_id()
+        || !matches!(provenance.payload_reference(), PayloadReference::ContentHash(hash)
+            if hash.algorithm() == payload.algorithm() && hash.digest() == payload.bytes())
+    {
+        return Err(FairValueError::InvalidProducerEvidence);
+    }
+    Ok(())
+}
+
+fn decode_company_security(
+    value: &str,
+) -> Result<CompanySecurityIdentitySelectionReceipt, FairValueError> {
+    CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(value.as_bytes())
+        .map_err(|_| FairValueError::InvalidProducerEvidence)
+}
+
+fn decode_company(value: &str) -> Result<CompanyIdentityObservation, FairValueError> {
+    if value.is_empty() || value.len() > MAXIMUM_FUNDAMENTAL_EVIDENCE_BYTES {
+        return Err(FairValueError::InvalidProducerEvidence);
+    }
+    let company =
+        serde_json::from_str(value).map_err(|_| FairValueError::InvalidProducerEvidence)?;
+    if encode_source_record(&company)?.as_ref() != value {
+        return Err(FairValueError::InvalidProducerEvidence);
+    }
+    Ok(company)
 }
 
 fn decode_fundamental(

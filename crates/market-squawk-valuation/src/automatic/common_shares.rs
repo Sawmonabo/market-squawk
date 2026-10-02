@@ -45,6 +45,22 @@ impl CommonShareFilingEvidence {
         {
             return Err(unavailable);
         }
+        let company = selected.company_identity().observation();
+        selection
+            .identity()
+            .receipt()
+            .validate_selected_company(
+                selection.request().instrument_id(),
+                company,
+                selected.receipt().company_observation_digest(),
+                selection.request().knowledge_at(),
+            )
+            .map_err(|_| unavailable)?;
+        if company.surface() != market_squawk_domain::CompanyIdentitySurface::SecFilingXbrl
+            || company.provider_company_id().as_str() != filing.cik()
+        {
+            return Err(unavailable);
+        }
         for fact in filing.nonnumeric_occurrences().iter() {
             if common_count(fact.map_err(|_| unavailable)?.concept()) {
                 return Err(unavailable);
@@ -60,6 +76,8 @@ impl CommonShareFilingEvidence {
             let ResearchObservation::Fundamental(fact) = row else {
                 return Err(unavailable);
             };
+            crate::evidence::validate_fundamental_company(&fact, company)
+                .map_err(|_| unavailable)?;
             let xbrl = fact.xbrl_evidence().ok_or(unavailable)?;
             if xbrl.concept().local_name().as_str() == "EarningsPerShareDiluted"
                 && xbrl

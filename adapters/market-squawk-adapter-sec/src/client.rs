@@ -65,6 +65,7 @@ pub struct SecEdgarSource {
     client: reqwest::Client,
     raw_store: Arc<RawEvidenceStore>,
     representation_registry: Arc<SecRepresentationRegistry>,
+    // Governed fund/bulk identities only; issuer evidence requires no security mapping.
     identities: Arc<ProviderIdentityRegistry>,
     blocking_admission: Arc<Semaphore>,
     extraction_health: Mutex<SecExtractionHealth>,
@@ -1328,10 +1329,6 @@ impl SecEdgarSource {
 
     pub(crate) fn raw_store(&self) -> Arc<RawEvidenceStore> {
         Arc::clone(&self.raw_store)
-    }
-
-    pub(crate) fn identity_registry(&self) -> Arc<ProviderIdentityRegistry> {
-        Arc::clone(&self.identities)
     }
 
     /// Resolves one closed SEC-native identifier through the checked, conflict-quarantining

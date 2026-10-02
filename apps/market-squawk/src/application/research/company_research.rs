@@ -1296,7 +1296,14 @@ fn project_company_research(
                 let [relationship] = selected.identity().candidates() else {
                     return Err(CanonicalResearchReadError::EvidenceConflict);
                 };
-                if relationship.link().instrument_id() != request.instrument_id {
+                let company = selection.company_identity().observation();
+                if relationship.link().instrument_id() != request.instrument_id
+                    || relationship.link().company_observation_digest()
+                        != selection.receipt().company_observation_digest()
+                    || relationship.link().company_source_id() != company.source_id()
+                    || relationship.link().provider_company_id() != company.provider_company_id()
+                    || relationship.link().company_surface() != company.surface()
+                {
                     return Err(CanonicalResearchReadError::EvidenceConflict);
                 }
                 let candidate_company = relationship.link().provider_company_id();
@@ -1416,7 +1423,24 @@ fn append_company_rows(
             .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
         let context = observation_context(&observation)
             .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
-        if context.provenance().instrument_id() != Some(request.instrument_id) {
+        // The outer identity selection binds this issuer generation to the requested security.
+        // Retain source facts unchanged; an absent raw instrument is not itself attribution.
+        let issuer = match &observation {
+            ResearchObservation::Filing(value) => value.subject().issuer_id(),
+            ResearchObservation::Fundamental(value) => value.subject().issuer_id(),
+            _ => None,
+        };
+        if issuer
+            != Some(
+                selection
+                    .company_identity()
+                    .observation()
+                    .provider_company_id(),
+            )
+            || context.provenance().instrument_id().is_some()
+            || context.provenance().source_id()
+                != selection.company_identity().observation().source_id()
+        {
             return Err(CanonicalResearchReadError::EvidenceConflict);
         }
         let known_at = context

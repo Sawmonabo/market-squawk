@@ -1,9 +1,10 @@
 //! Native reported fiscal amounts admitted from the existing sealed SEC selection.
 
 use market_squawk_domain::{
-    Currency, DataQuality, EvidenceDigest, FundamentalCadence, FundamentalFactContext,
-    FundamentalObservation, FundamentalPeriod, HistoricalStudyBasis, InstrumentId,
-    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
+    CompanyIdentityObservation, CompanyIdentitySurface, Currency, DataQuality, EvidenceDigest,
+    FundamentalCadence, FundamentalFactContext, FundamentalObservation, FundamentalPeriod,
+    HistoricalStudyBasis, InstrumentId, PayloadReference, ResearchObservation,
+    ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -609,6 +610,7 @@ pub(super) struct FinancialSeriesSource {
     pub(super) manifest: DatasetManifestRef,
     pub(super) source_receipt: crate::SecResearchSelectionReceipt,
     pub(super) identity_receipt: Box<[u8]>,
+    pub(super) company_identity: CompanyIdentityObservation,
     pub(super) instrument_id: InstrumentId,
     pub(super) selected_as_of: Timestamp,
     pub(super) measurement: FeatureLabelMeasurement,
@@ -668,6 +670,14 @@ impl DatasetBuilderService<'_> {
             .canonical_bytes()
             .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?
             .into_boxed_slice();
+        let company_identity = selected.company_identity().observation().clone();
+        validate_identity_receipt(
+            source.identity().receipt(),
+            source.request().instrument_id(),
+            &company_identity,
+            selected.receipt().company_observation_digest(),
+            selected.request().knowledge_at(),
+        )?;
         let (concept, _, instant) = selection.mapping()?;
         let mut pairs = Vec::<(FinancialSourceInputs<usize>, usize)>::new();
         let mut currency = None;
@@ -707,11 +717,7 @@ impl DatasetBuilderService<'_> {
             if scope.is_none() {
                 scope = Some(row.clone());
             }
-            validate_fact(
-                &row,
-                source.request().instrument_id(),
-                selected.request().knowledge_at(),
-            )?;
+            validate_fact(&row, &company_identity, selected.request().knowledge_at())?;
             if transition(row.fact_context()) {
                 continue;
             }
@@ -767,11 +773,7 @@ impl DatasetBuilderService<'_> {
                         && common_book_context_matches(row.fact_context(), fact.fact_context())
                         && row.unit() == fact.unit()
                     {
-                        validate_fact(
-                            &fact,
-                            source.request().instrument_id(),
-                            selected.request().knowledge_at(),
-                        )?;
+                        validate_fact(&fact, &company_identity, selected.request().knowledge_at())?;
                         if preferred.replace(preferred_index).is_some() {
                             return Err(DatasetBuildError::ComponentEvidenceMismatch);
                         }
@@ -825,6 +827,10 @@ impl DatasetBuilderService<'_> {
         let mut rows = Vec::<SourceRow>::new();
         let mut retained = size_of::<FinancialSeriesSource>()
             + identity_receipt.len()
+            + serde_json::to_vec(&company_identity)
+                .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?
+                .len()
+                * 2
             + selected.origin().manifest().dataset_id().as_str().len()
             + selected.origin().manifest().schema().name().len();
         for pair in &mut pairs {
@@ -875,6 +881,7 @@ impl DatasetBuilderService<'_> {
                 manifest: selected.origin().manifest().clone(),
                 source_receipt: selected.receipt(),
                 identity_receipt,
+                company_identity,
                 instrument_id: source.request().instrument_id(),
                 selected_as_of: selected.request().knowledge_at(),
                 measurement: selection
@@ -959,6 +966,13 @@ impl FinancialDatasetSeries {
             &self.source.identity_receipt,
         )
         .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
+        validate_identity_receipt(
+            &identity,
+            self.source.instrument_id,
+            &self.source.company_identity,
+            self.source.source_receipt.company_observation_digest(),
+            self.source.selected_as_of,
+        )?;
         if policy.basis() == HistoricalStudyBasis::HistoricalAsKnown
             && identity.knowledge_at() > source_selection_as_of
         {
@@ -1008,14 +1022,14 @@ impl FinancialDatasetSeries {
                 .observation(self.source.rows[*index].reference.row_ordinal)
         })?;
         for fact in amount.iter() {
-            validate_fact(fact, self.source.instrument_id, source_selection_as_of)?;
+            validate_fact(fact, &self.source.company_identity, source_selection_as_of)?;
         }
         let anchor_fact: FundamentalObservation =
             serde_json::from_slice(&self.source.rows[*anchor].canonical_json)
                 .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
         validate_fact(
             &anchor_fact,
-            self.source.instrument_id,
+            &self.source.company_identity,
             source_selection_as_of,
         )?;
         let mut components = vec![self.source.component(
@@ -1033,7 +1047,7 @@ impl FinancialDatasetSeries {
             for fact in fact.iter() {
                 validate_fact(
                     fact,
-                    self.source.instrument_id,
+                    &self.source.company_identity,
                     label_selection_as_of.ok_or(DatasetBuildError::TemporalLeakage)?,
                 )?;
             }
@@ -1138,6 +1152,33 @@ impl FinancialSeriesSource {
     }
 }
 impl FinancialExampleSource {
+    pub(super) fn component_scope_matches(
+        &self,
+        component: &FeatureLabelComponentInput,
+        instrument: InstrumentId,
+    ) -> bool {
+        if self.source.instrument_id != instrument {
+            return false;
+        }
+        let references = match component.spec().kind() {
+            ComponentKind::Feature => self.binding.observed_inputs(),
+            ComponentKind::Label => match self.binding.target_inputs() {
+                Some(inputs) => inputs,
+                None => return false,
+            },
+        };
+        references
+            .try_map(|row| self.source.observation(row.row_ordinal()))
+            .and_then(|facts| {
+                self.source.component(
+                    &facts,
+                    component.spec().kind(),
+                    component.selection_effective_cutoff().clone(),
+                    component.label_selection_effective_cutoff().cloned(),
+                )
+            })
+            .is_ok_and(|expected| expected == *component)
+    }
     pub(super) fn validate_component(
         &self,
         component: &FeatureLabelComponentInput,
@@ -1213,7 +1254,9 @@ pub(crate) fn source_currency(unit: &str, per_share: bool) -> Result<Currency, D
     Currency::try_from(currency).map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)
 }
 pub(super) fn same_scope(left: &FundamentalObservation, right: &FundamentalObservation) -> bool {
-    left.context().provenance().instrument_id() == right.context().provenance().instrument_id()
+    left.subject() == right.subject()
+        && left.context().provenance().instrument_id()
+            == right.context().provenance().instrument_id()
         && left.context().provenance().source_id() == right.context().provenance().source_id()
         && left.fact_context().dimensions() == right.fact_context().dimensions()
         && left.fact_context().consolidation() == right.fact_context().consolidation()
@@ -1274,13 +1317,35 @@ pub(super) fn frame_cadence(
     }
     Ok(Some(cadence))
 }
+/// Binds issuer-owned facts to the exact selected security without rewriting source rows.
+pub(super) fn validate_identity_receipt(
+    receipt: &crate::CompanySecurityIdentitySelectionReceipt,
+    instrument: InstrumentId,
+    company: &CompanyIdentityObservation,
+    company_digest: EvidenceDigest,
+    selected_at: Timestamp,
+) -> Result<(), DatasetBuildError> {
+    if company.surface() != CompanyIdentitySurface::SecCompanyFacts {
+        return Err(DatasetBuildError::ComponentEvidenceMismatch);
+    }
+    receipt
+        .validate_selected_company(instrument, company, company_digest, selected_at)
+        .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)
+}
 pub(crate) fn validate_fact(
     fact: &FundamentalObservation,
-    instrument: InstrumentId,
+    company: &CompanyIdentityObservation,
     known: Timestamp,
 ) -> Result<(), DatasetBuildError> {
     let p = fact.context().provenance();
-    if p.instrument_id() != Some(instrument)
+    let payload = company.identity_payload_evidence().content_digest();
+    if p.instrument_id().is_some()
+        || fact.subject().issuer_id() != Some(company.provider_company_id())
+        || p.source_id() != company.source_id()
+        || !matches!(p.payload_reference(), PayloadReference::ContentHash(hash)
+            if hash.algorithm() == payload.algorithm() && hash.digest() == payload.bytes())
+        || p.received_at() > known
+        || p.ingested_at() > known
         || p.availability()
             .conservative_available_at()
             .is_none_or(|t| t > known)

@@ -344,13 +344,13 @@ fn encode_candidate_family(
         ResearchObservation::Filing(value) => {
             encoder.u8(1)?;
             encoder.str(provenance.source_id().as_str())?;
-            encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+            encoder.serializable(value.subject())?;
             encoder.str(value.accession().as_str())?;
         }
         ResearchObservation::Fundamental(value) => {
             encoder.u8(2)?;
             encoder.str(provenance.source_id().as_str())?;
-            encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+            encoder.serializable(value.subject())?;
             encoder.str(value.concept().as_str())?;
             encoder.str(value.unit().as_str())?;
             encode_fundamental_family_context(encoder, value.fact_context())?;

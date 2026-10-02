@@ -28,6 +28,7 @@ use super::{CatalogAuthority, CatalogError, CatalogReadSnapshot, CatalogResultLi
 use crate::RegisteredRightsGrant;
 
 pub use persistence::ListingReferencePublicationDisposition;
+pub(crate) use read::source_qualified_listing_record;
 
 /// Maximum rows accepted across the two official current-directory files.
 pub const MAX_LISTING_REFERENCE_RECORDS: usize = 65_536;
@@ -595,6 +596,7 @@ impl ListingReferenceFileEvidence {
 pub struct ListingReferenceRecord {
     generation: ListingReferenceGenerationReceipt,
     source_file: ListingReferenceFileEvidence,
+    record_digest: EvidenceDigest,
     provider_row_number: u32,
     provider_symbol: String,
     security_name: String,
@@ -622,6 +624,10 @@ impl ListingReferenceRecord {
     }
     pub const fn source_file(&self) -> &ListingReferenceFileEvidence {
         &self.source_file
+    }
+    /// Returns the checked canonical identity of this exact source row.
+    pub const fn record_digest(&self) -> EvidenceDigest {
+        self.record_digest
     }
     pub const fn provider_row_number(&self) -> u32 {
         self.provider_row_number
@@ -1730,6 +1736,7 @@ fn rebuild_membership_record(
         ListingReferenceRecord {
             generation: generation.clone(),
             source_file,
+            record_digest: canonical::digest(record_digest),
             provider_row_number: record_input.provider_row_number,
             provider_symbol: record_input.provider_symbol,
             security_name: record_input.security_name,

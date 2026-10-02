@@ -662,13 +662,11 @@ impl super::SecEdgarSource {
         ensure_before_deadline(deadline)?;
         self.validate_authority(authority)?;
         let raw_store = Arc::clone(&self.raw_store);
-        let identities = Arc::clone(&self.identities);
         let parser_limits = self.parser_limits;
         let handoff = self
             .run_validation_blocking_until(&cancellation, deadline, move |worker_token| {
                 crate::extraction::prepare_filing_xbrl_capture_from_admitted_root(
                     raw_store,
-                    identities,
                     source_id,
                     metadata_revision,
                     parser_limits,

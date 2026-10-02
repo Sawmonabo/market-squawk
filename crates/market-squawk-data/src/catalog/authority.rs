@@ -138,87 +138,94 @@ impl Catalog {
         &self,
         root_endpoint: RootEndpointIdentity,
     ) -> Result<AuthorityEvidenceDigest, CatalogError> {
-        let analytical_records: i64 = self.connection.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM artifacts)
-                 + (SELECT COUNT(*) FROM model_inventory_series)
-                 + (SELECT COUNT(*) FROM model_inventory_records)
-                 + (SELECT COUNT(*) FROM forecast_inventory_vintages)
-                 + (SELECT COUNT(*) FROM forecast_inventory_outcomes)
-                 + (SELECT COUNT(*) FROM chart_projection_headers)
-                 + (SELECT COUNT(*) FROM chart_projection_rows)
-                 + (SELECT COUNT(*) FROM dataset_manifests)
-                 + (SELECT COUNT(*) FROM analytical_generations)
-                 + (SELECT COUNT(*) FROM analytical_generation_objects)
-                 + (SELECT COUNT(*) FROM query_artifact_results)
-                 + (SELECT COUNT(*) FROM company_identity_observations)
-                 + (SELECT COUNT(*) FROM listing_reference_generations)
-                 + (SELECT COUNT(*) FROM listing_reference_files)
-                 + (SELECT COUNT(*) FROM listing_reference_values)
-                 + (SELECT COUNT(*) FROM listing_reference_memberships)
-                 + (SELECT COUNT(*) FROM market_data_instrument_identities)
-                 + (SELECT COUNT(*) FROM market_data_instrument_revisions)
-                 + (SELECT COUNT(*) FROM market_data_instrument_current)
-                 + (SELECT COUNT(*) FROM market_data_instrument_search_terms)
-                 + (SELECT COUNT(*) FROM company_security_link_events)
-                 + (SELECT COUNT(*) FROM company_security_link_current)
-                 + (SELECT COUNT(*) FROM official_options_reference_generations)
-                 + (SELECT COUNT(*) FROM official_options_reference_generation_sources)
-                 + (SELECT COUNT(*) FROM official_options_reference_objects)
-                 + (SELECT COUNT(*) FROM official_options_reference_values)
-                 + (SELECT COUNT(*) FROM official_options_reference_memberships)
-                 + (SELECT COUNT(*) FROM official_options_reference_alias_resolutions)
-                 + (SELECT COUNT(*) FROM official_options_reference_conflicts)
-                 + (SELECT COUNT(*) FROM provider_raw_observations)
-                 + (SELECT COUNT(*) FROM provider_raw_observation_pages)
-                 + (SELECT COUNT(*) FROM sealed_raw_objects)
-                 + (SELECT COUNT(*) FROM provider_raw_observation_objects)
-                 + (SELECT COUNT(*) FROM provider_raw_observation_frames)
-                 + (SELECT COUNT(*) FROM provider_capture_bindings)
-                 + (SELECT COUNT(*) FROM provider_capture_binding_native_lineage)
-                 + (SELECT COUNT(*) FROM provider_capture_binding_objects)
-                 + (SELECT COUNT(*) FROM provider_capture_binding_rows)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_values)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_value_chunks)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_sessions)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_staged_pages)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_terminal_completions)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_finalizations)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_finalized_groups)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_publications)
-                 + (SELECT COUNT(*) FROM provider_macro_plan_published_heads)
-                 + (SELECT COUNT(*) FROM provider_response_market_event_bindings)
-                 + (SELECT COUNT(*) FROM provider_response_market_event_binding_native_lineage)
-                 + (SELECT COUNT(*) FROM provider_response_market_event_binding_rows)
-                 + (SELECT COUNT(*) FROM provider_event_microbatches)
-                 + (SELECT COUNT(*) FROM provider_event_microbatch_frames)
-                 + (SELECT COUNT(*) FROM provider_event_microbatch_objects)
-                 + (SELECT COUNT(*) FROM provider_event_bindings)
-                 + (SELECT COUNT(*) FROM provider_event_binding_native_lineage)
-                 + (SELECT COUNT(*) FROM provider_event_binding_rows)
-                 + (SELECT COUNT(*) FROM provider_composite_response_event_bindings)
-                 + (SELECT COUNT(*) FROM provider_option_market_bindings)
-                 + (SELECT COUNT(*) FROM provider_option_market_binding_native_lineage)
-                 + (SELECT COUNT(*) FROM provider_option_market_binding_rows)
-                 + (SELECT COUNT(*) FROM provider_capture_originals)
-                 + (SELECT COUNT(*) FROM provider_logical_originals)
-                 + (SELECT COUNT(*) FROM provider_logical_original_objects)
-                 + (SELECT COUNT(*) FROM provider_logical_publication_bindings)
-                 + (SELECT COUNT(*) FROM provider_logical_publication_required_families)
-                 + (SELECT COUNT(*) FROM provider_logical_publication_objects)
-                 + (SELECT COUNT(*) FROM provider_logical_publication_partitions)
-                 + (SELECT COUNT(*) FROM provider_logical_publication_canonical_expectations)
-                 + (SELECT COUNT(*) FROM ingest_run_provider_capture_bindings)
-                 + (SELECT COUNT(*) FROM ingest_run_provider_publication_bindings)
-                 + (SELECT COUNT(*) FROM provider_market_event_selection_index)
-                 + (SELECT COUNT(*) FROM analytical_generation_provider_capture_bindings)
-                 + (SELECT COUNT(*) FROM analytical_generation_provider_publication_bindings)",
-            [],
-            |row| row.get(0),
-        )?;
-        if analytical_records != 0 {
-            return Err(CatalogError::ArtifactRootAuthorityTransitionConflict);
+        // Keep one read snapshot without building a deep SQLite expression tree.
+        // Only emptiness matters, so stop at the first retained analytical record.
+        let transaction = self.connection.unchecked_transaction()?;
+        for table in [
+            "artifacts",
+            "model_inventory_series",
+            "model_inventory_records",
+            "forecast_inventory_vintages",
+            "forecast_inventory_outcomes",
+            "chart_projection_headers",
+            "chart_projection_rows",
+            "dataset_manifests",
+            "analytical_generations",
+            "analytical_generation_objects",
+            "query_artifact_results",
+            "company_identity_observations",
+            "listing_reference_generations",
+            "listing_reference_files",
+            "listing_reference_values",
+            "listing_reference_memberships",
+            "market_data_instrument_identities",
+            "market_data_instrument_revisions",
+            "market_data_instrument_current",
+            "market_data_instrument_search_terms",
+            "company_security_link_events",
+            "company_security_link_current",
+            "official_options_reference_generations",
+            "official_options_reference_generation_sources",
+            "official_options_reference_objects",
+            "official_options_reference_values",
+            "official_options_reference_memberships",
+            "official_options_reference_alias_resolutions",
+            "official_options_reference_conflicts",
+            "provider_raw_observations",
+            "provider_raw_observation_pages",
+            "sealed_raw_objects",
+            "provider_raw_observation_objects",
+            "provider_raw_observation_frames",
+            "provider_capture_bindings",
+            "provider_capture_binding_native_lineage",
+            "provider_capture_binding_objects",
+            "provider_capture_binding_rows",
+            "provider_macro_plan_values",
+            "provider_macro_plan_value_chunks",
+            "provider_macro_plan_sessions",
+            "provider_macro_plan_staged_pages",
+            "provider_macro_plan_terminal_completions",
+            "provider_macro_plan_finalizations",
+            "provider_macro_plan_finalized_groups",
+            "provider_macro_plan_publications",
+            "provider_macro_plan_published_heads",
+            "provider_response_market_event_bindings",
+            "provider_response_market_event_binding_native_lineage",
+            "provider_response_market_event_binding_rows",
+            "provider_event_microbatches",
+            "provider_event_microbatch_frames",
+            "provider_event_microbatch_objects",
+            "provider_event_bindings",
+            "provider_event_binding_native_lineage",
+            "provider_event_binding_rows",
+            "provider_composite_response_event_bindings",
+            "provider_option_market_bindings",
+            "provider_option_market_binding_native_lineage",
+            "provider_option_market_binding_rows",
+            "provider_capture_originals",
+            "provider_logical_originals",
+            "provider_logical_original_objects",
+            "provider_logical_publication_bindings",
+            "provider_logical_publication_required_families",
+            "provider_logical_publication_objects",
+            "provider_logical_publication_partitions",
+            "provider_logical_publication_canonical_expectations",
+            "ingest_run_provider_capture_bindings",
+            "ingest_run_provider_publication_bindings",
+            "provider_market_event_selection_index",
+            "analytical_generation_provider_capture_bindings",
+            "analytical_generation_provider_publication_bindings",
+        ] {
+            let populated: bool = transaction.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                [],
+                |row| row.get(0),
+            )?;
+            if populated {
+                return Err(CatalogError::ArtifactRootAuthorityTransitionConflict);
+            }
         }
+        transaction.commit()?;
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/empty-analytical-authority-evidence/v2");
         digest.update(self.catalog_endpoint_identity()?.bytes());

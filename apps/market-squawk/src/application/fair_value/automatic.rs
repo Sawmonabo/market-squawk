@@ -1272,6 +1272,8 @@ fn map_company_identity_error(
             ServiceError::InvalidResult
         }
         E::Storage(_) => ServiceError::Internal,
+        E::Listing(error) => crate::application::research::map_listing_error(error),
+        E::Catalog(error) => crate::application::research::map_catalog_error(error),
     }
 }
 

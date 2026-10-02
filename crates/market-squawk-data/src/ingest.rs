@@ -3172,9 +3172,9 @@ impl AnalyticalDataService {
     /// Returns exact-origin SEC research reads over this service's durable authorities.
     pub fn sec_research_reader(&self) -> crate::SecResearchReadCapability {
         crate::SecResearchReadCapability::new(
-            Arc::clone(&self.authority),
             Arc::clone(&self.manifests),
             Arc::clone(&self.objects),
+            self.company_identities().security_relationships(),
         )
     }
 
@@ -3502,7 +3502,14 @@ impl AnalyticalDataService {
 
     /// Returns bounded company-identity reads over this service's sole catalog session.
     pub fn company_identities(&self) -> crate::CompanyIdentityReadCapability {
-        crate::CompanyIdentityReadCapability::new(Arc::clone(&self.authority))
+        crate::CompanyIdentityReadCapability::new(
+            Arc::clone(&self.authority),
+            crate::CompanySecurityIdentityReadCapability::from_endpoint(
+                self.catalog_read_location.clone(),
+                self.catalog_read_binding,
+                self.catalog_read_limits,
+            ),
+        )
     }
 
     /// Returns the sole narrow publisher for evidence-authorized company/security links.
