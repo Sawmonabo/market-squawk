@@ -42,6 +42,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::provider_runtime::SecLiveFundCoordinatorSeal;
+pub(crate) use super::sec_fundamentals::SecCompanyResearchPublication;
 use super::{
     ResearchIngestCompositionError, ResearchProviderAdmission, ResearchProviderRuntimeGeneration,
     ResearchRightsAuthority, SecFundApplicationBridge, SecFundApplicationError,
@@ -243,12 +244,22 @@ impl SecLiveFundSource {
     }
 
     /// Uses this registered SEC generation for one exact issuer.
-    pub(crate) async fn publish_company_research(
+    pub(crate) async fn publish_company_research<F, Fut>(
         &self,
         cik: &str,
         deadline: std::time::Instant,
         cancellation: CancellationToken,
-    ) -> Result<(), SecLiveFundApplicationError> {
+        mut family_completed: F,
+    ) -> Result<SecCompanyResearchPublication, SecLiveFundApplicationError>
+    where
+        F: FnMut(Arc<dyn IngestPrecommitAuthority>, CancellationToken) -> Fut + Send,
+        Fut: std::future::Future<
+                Output = Result<
+                    usize,
+                    crate::application::company_security_resolution::CompanySecurityResolutionError,
+                >,
+            > + Send,
+    {
         use std::num::{NonZeroU32, NonZeroU64};
         let operation = self.start_company_operation(deadline, cancellation)?;
         let wall_deadline = operation.deadline;
@@ -272,7 +283,7 @@ impl SecLiveFundSource {
             let bytes =
                 NonZeroU64::new(market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
                     .ok_or(SecLiveFundApplicationError::RequestMismatch)?;
-            let _filing_published = self
+            let published = self
                 .fundamentals
                 .acquire_and_publish_company(
                     cik,
@@ -282,13 +293,13 @@ impl SecLiveFundSource {
                     deadline,
                     Arc::clone(&precommit),
                     cancellation.child_token(),
+                    &mut family_completed,
                 )
                 .await?;
             precommit.validate_precommit()?;
-            // Publication retains exact issuer evidence. Security attribution belongs to the
-            // selected financial reader and must not gate successful company acquisition.
+            // Family links are already retained; only complete acquisition reaches this result.
             self.validate_current()?;
-            Ok(())
+            Ok(published)
         }
         .await;
         operation.classify(result)
@@ -501,6 +512,21 @@ impl SecLiveFundSource {
             .await?;
         validate_publication_receipt(&receipt, &expected_scope, &analytical_dataset)?;
         Ok(receipt)
+    }
+
+    /// Revalidates the still-selected runtime and current company-use rights before exposing
+    /// a completed preparation. The operation's intermediate publications grant no new rights.
+    pub(crate) fn validate_company_preparation(&self) -> Result<(), SecLiveFundApplicationError> {
+        self.validate_current()?;
+        let now = system_timestamp()?;
+        self.rights.validate_at(now)?;
+        self.rights.validate_subject(None)?;
+        if !self.source.metadata().is_effective_at(now)
+            || self.generation.rights_exact_subjects().is_some()
+        {
+            return Err(SecLiveFundApplicationError::ScopedRightsUnavailable);
+        }
+        Ok(())
     }
 
     fn validate_current(&self) -> Result<(), SecLiveFundApplicationError> {

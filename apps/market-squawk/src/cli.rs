@@ -581,6 +581,49 @@ pub enum MarketCommand {
         #[arg(long)]
         read_token: uuid::Uuid,
     },
+    /// Prepare company financial information for one selected investment as a durable job.
+    PrepareFinancials {
+        #[arg(long)]
+        selection_token: String,
+        /// Authorize source acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read one exact financial preparation job for the selected investment.
+    FinancialPreparation {
+        #[arg(long)]
+        selection_token: String,
+        /// Durable job identity returned by preparation.
+        #[arg(long)]
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Cancel financial preparation at the exact observed generation and sequence.
+    CancelFinancialPreparation {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Check the original financial start after an uncertain acknowledgement; never start again.
+    ReconcileFinancialPreparation {
+        /// Original request identity reported by the uncertain start.
+        #[arg(long)]
+        request_id: String,
+        /// Exact lowercase SHA-256 reported with that request identity.
+        #[arg(long)]
+        arguments_sha256: String,
+    },
     /// Prepare adjusted daily history for one selected investment as a durable job.
     PrepareHistory {
         #[arg(long)]

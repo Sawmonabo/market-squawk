@@ -55,6 +55,9 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Market.ReadSessionContext"
             | "Market.GetInstrument"
             | "Research.GetInvestmentProfile"
+            | "Research.StartInvestmentFinancialPreparation"
+            | "Research.GetInvestmentFinancialPreparation"
+            | "Research.CancelInvestmentFinancialPreparation"
             | "Research.GetInvestmentFinancials"
             | "Research.CloseInvestmentFinancials"
             | "Market.PrepareInvestmentEvidence"
@@ -707,6 +710,35 @@ const MARKET_HISTORY_START_ARGUMENTS: &[ArgumentSpec] = &[
         ArgumentKind::Unsigned {
             minimum: market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS as u64,
             maximum: market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS as u64,
+        },
+    ),
+];
+const FINANCIAL_PREPARATION_JOB_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("selectionToken", ArgumentKind::MarketSelectionToken),
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+];
+const FINANCIAL_PREPARATION_CANCEL_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("selectionToken", ArgumentKind::MarketSelectionToken),
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "expectedSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
         },
     ),
 ];
@@ -1605,6 +1637,7 @@ const JOB_START_RECONCILIATION_ARGUMENTS: &[ArgumentSpec] = &[
         "operation",
         ArgumentKind::Enumeration(&[
             "Market.StartHistoryPreparation",
+            "Research.StartInvestmentFinancialPreparation",
             "Research.StartIngestSource",
             "Research.StartExport",
             "Research.StartDatasetBuild",
@@ -1995,6 +2028,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         JOB_SCOPE,
         MARKET_INSTRUMENT_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Research.StartInvestmentFinancialPreparation",
+        "Prepare company financial information for one selected investment as a durable job.",
+        ServiceDomain::Research,
+        JOB_SCOPE,
+        MARKET_INSTRUMENT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Research.GetInvestmentFinancialPreparation",
+        "Read the saved financial preparation job for this investment.",
+        ServiceDomain::Research,
+        JOB_SCOPE,
+        FINANCIAL_PREPARATION_JOB_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Research.CancelInvestmentFinancialPreparation",
+        "Cancel the exact financial preparation job for this investment.",
+        ServiceDomain::Research,
+        JOB_SCOPE,
+        FINANCIAL_PREPARATION_CANCEL_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
     ),
     mutation(
         "Market.StartHistoryPreparation",

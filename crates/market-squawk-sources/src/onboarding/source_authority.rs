@@ -97,79 +97,22 @@ const SEC_EDGAR_ENDPOINTS: &[EndpointAuthority] = &[
     },
 ];
 
+// Taxonomy graph admission validates the captured schema's structured family, release and
+// namespace identity. Transport authority belongs to the official publisher, not a stale list
+// of release years or family names. Exact HTTPS host and .xsd/.xml checks remain mandatory.
 const SEC_EDGAR_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[
     EndpointAuthority {
         base_url: "https://www.sec.gov/Archives/edgar/data",
         path_scope: PathScope::Descendants,
     },
     EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/dei",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/country",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/currency",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/exch",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/invest",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/naics",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/rr",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/cef",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/ecd",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/oef",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/vip",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/rxp",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/sic",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/spac",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/srt",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/stpr",
+        base_url: "https://xbrl.sec.gov/",
         path_scope: PathScope::Descendants,
     },
 ];
 
 const FASB_XBRL_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthority {
-    base_url: "https://xbrl.fasb.org/us-gaap",
+    base_url: "https://xbrl.fasb.org/",
     path_scope: PathScope::Descendants,
 }];
 
@@ -178,56 +121,10 @@ const XBRL_US_LEGACY_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthor
     path_scope: PathScope::Descendants,
 }];
 
-const XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2003",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2005",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2006",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2008",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2013",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2014",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2016",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2017",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2021",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/2023",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/lrr",
-        path_scope: PathScope::Descendants,
-    },
-    EndpointAuthority {
-        base_url: "https://www.xbrl.org/dtr",
-        path_scope: PathScope::Descendants,
-    },
-];
+const XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthority {
+    base_url: "https://www.xbrl.org/",
+    path_scope: PathScope::Descendants,
+}];
 
 const W3C_XML_SCHEMA_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[
     EndpointAuthority {
@@ -590,7 +487,7 @@ pub const SEC_EDGAR_AUTHORITY: FilingTaxonomySourceAuthority = FilingTaxonomySou
     weighted_taxonomy_response_budget: false,
 };
 
-/// FASB-published modern US-GAAP taxonomy component authority.
+/// FASB-published financial reporting taxonomy component authority.
 pub const FASB_XBRL_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
     FilingTaxonomySourceAuthority {
         source_id: FASB_XBRL_TAXONOMY_SOURCE_ID,

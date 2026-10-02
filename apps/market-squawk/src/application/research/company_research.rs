@@ -272,16 +272,32 @@ impl CompanyResearchReadCapability {
             MAX_COMPANY_RESEARCH_OBJECT_BYTES,
         )
         .map_err(map_company_data_error)?;
+        let reader = self.research.analytical().sec_research_reader();
+        let raw_store = self.research.provider_capture_store();
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| CanonicalResearchReadError::AuthorityUnavailable)?;
+        // Logical verification and point-in-time indexes perform synchronous disk work.
+        // The existing worker retains their owner through interruption; its closure holds
+        // exact read capabilities, never the ResearchService or another read-lane permit.
         self.research
-            .analytical()
-            .sec_research_reader()
-            .select_by_identity(
-                data_request,
-                self.research.provider_capture_store().as_ref(),
-                deadline,
-                cancellation,
-            )
+            .run_owned_research_read(deadline, &cancellation, move |worker_cancellation| {
+                runtime.block_on(reader.select_by_identity(
+                    data_request,
+                    raw_store.as_ref(),
+                    deadline,
+                    worker_cancellation,
+                ))
+            })
             .await
+            .map_err(|error| match error {
+                crate::ResearchServiceError::Ingest(IngestError::Cancelled) => {
+                    CanonicalResearchReadError::Cancelled
+                }
+                crate::ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => {
+                    CanonicalResearchReadError::DeadlineExceeded
+                }
+                _ => CanonicalResearchReadError::AuthorityUnavailable,
+            })?
             .map_err(map_company_data_error)
     }
 

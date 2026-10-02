@@ -94,6 +94,9 @@ function transport(
     throw new Error("History preparation is not configured for this test.")
   },
   subscriptions?: Parameters<SystemTransport["subscribe"]>[1][],
+  investmentFinancialPreparation: ProductTransport["investmentFinancialPreparation"] = async () => {
+    throw new Error("Financial preparation is not configured for this test.")
+  },
 ): DesktopTransport {
   const productResult = (data: unknown): ApplicationResult => ({
     data,
@@ -135,6 +138,7 @@ function transport(
     }),
     query,
     marketHistoryPreparation,
+    investmentFinancialPreparation,
     systemQuery: async () => systemResult(null),
     modelProducts: async (request) =>
       productResult(request.action === "list" ? { models: [], nextCursor: null } : { activities: [], nextCursor: null }),
@@ -295,6 +299,7 @@ function transport(
   const product: ProductTransport = {
     query: bridge.query,
     marketHistoryPreparation: bridge.marketHistoryPreparation,
+    investmentFinancialPreparation: bridge.investmentFinancialPreparation,
     analyticalController: bridge.analyticalController,
     modelProducts: bridge.modelProducts,
     backtestProducts: bridge.backtestProducts,
@@ -703,6 +708,38 @@ describe("Market Squawk desktop boundary", () => {
     let financialSignal: AbortSignal | undefined
     let finishFinancial: ((value: ApplicationResult) => void) | undefined
     const financialRead = "781276a0-33f1-4fb3-8cbb-bb2095acd0ce"
+    let financialVersion = 0
+    let financialPreparationState: "running" | "cancelled" | "completed" = "running"
+    let financialStarts = 0
+    let wrongFinancialJob = true
+    const financialJobId = "781276a0-33f1-4fb3-8cbb-bb2095acd0cd"
+    const financialSequence = "9007199254740994"
+    const financialRecoveryKey = `market-squawk.financial-preparation.v1:${blockedBootstrap.productSessionToken}:${marketSelectionToken}`
+    sessionStorage.removeItem(financialRecoveryKey)
+    const financialPreparationRequests: { request: Parameters<ProductTransport["investmentFinancialPreparation"]>[0]; confirmed: boolean | undefined }[] = []
+    const financialJob = () => ({
+      ...historyJob(), jobId: financialStarts <= 1 ? financialJobId
+        : financialStarts === 2 ? "781276a0-33f1-4fb3-8cbb-bb2095acd0cb" : "781276a0-33f1-4fb3-8cbb-bb2095acd0ca",
+      kind: "research.prepare-investment-financials.v1", state: financialPreparationState,
+      sequence: financialPreparationState === "running" ? financialSequence : "9007199254740995",
+      cancellationRequested: financialPreparationState === "cancelled",
+      result: financialPreparationState === "completed" ? {
+        authority: "research.financial-preparation-result.v1", identity: "prepared-selected-financials",
+        evidenceDigest: { algorithm: "sha256", bytes: Array<number>(32).fill(2) }, artifacts: [],
+      } : null,
+    })
+    const financialPreparation: ProductTransport["investmentFinancialPreparation"] = async (request, confirmed) => {
+      financialPreparationRequests.push({ request, confirmed })
+      if (request.action === "start") {
+        financialPreparationState = "running"
+        if (++financialStarts === 1) throw new Error("The financial start acknowledgment was lost.")
+      }
+      if (request.action === "cancel") financialPreparationState = "cancelled"
+      const data = request.action === "cancelStart" || request.action === "reconcileStart"
+        ? { state: "admitted", job: financialJob() }
+        : request.action === "get" && wrongFinancialJob ? { ...financialJob(), jobId: historyJobId } : financialJob()
+      return { data, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } }
+    }
     const financialFact = {
       scope: "company_wide", revision: "current", metric: "current_assets", displayName: "Current assets",
       value: "123456.78", unit: { kind: "currency", currency: "USD" },
@@ -713,14 +750,16 @@ describe("Market Squawk desktop boundary", () => {
       effective: { precision: "calendar_date", value: { year: 2026, month: 6, day: 30 } },
       knownAt: "1788220800000000000",
     }
-    const financialResult = (cursor = "financial-first"): ApplicationResult => ({
+    const financialResult = (cursor = financialVersion === 0 ? "financial-first" : `financial-updated-${financialVersion}`): ApplicationResult => ({
       data: {
         selectionToken: financialMode === "mismatch" ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
         section: "facts", knowledgeAt: marketObservedAt, effectiveOn: "2026-08-10", revisionPolicy: "latestKnown",
         state: "reported", families: [{ family: "company_facts", state: "reported", reason: null }],
-        items: [{ ...financialFact, value: cursor === "financial-next" ? "234567.89" : financialFact.value }],
+        items: [{ ...financialFact, value: cursor === "financial-next" ? "234567.89"
+          : cursor === "financial-updated-1" ? "345678.90" : cursor === "financial-updated-2" ? "456789.01" : financialFact.value }],
         currentCursor: cursor, nextCursor: cursor === "financial-first" ? "financial-next" : null,
-        readToken: financialRead, omittedItems: 0, limitations: [],
+        readToken: cursor.startsWith("financial-updated") ? "781276a0-33f1-4fb3-8cbb-bb2095acd0cc" : financialRead,
+        omittedItems: 0, limitations: [],
       },
       metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
     })
@@ -741,7 +780,7 @@ describe("Market Squawk desktop boundary", () => {
     const openInvestment = (route: string, supportsFinancials = true) => render(
       <MemoryRouter initialEntries={[route]}>
         <App transport={transport(
-          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument", "market_history", "market_history_preparation_start", "market_history_preparation_get", "market_history_preparation_cancel", ...(supportsFinancials ? ["investment_financials", "investment_financials_close"] as const : [])] },
+          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument", "market_history", "market_history_preparation_start", "market_history_preparation_get", "market_history_preparation_cancel", ...(supportsFinancials ? ["investment_financials", "investment_financials_close", "investment_financial_preparation_start", "investment_financial_preparation_get", "investment_financial_preparation_cancel"] as const : [])] },
           undefined,
           async (request, options) => {
             issuedQueries.push(request)
@@ -753,6 +792,7 @@ describe("Market Squawk desktop boundary", () => {
               }
               if (request.section !== "facts") return {
                 ...financialResult(), data: { ...financialResult().data as object, section: request.section, items: [] },
+                metadata: { completeness: "complete", returnedItems: 0, availableItems: 0 },
               }
               return financialResult(request.cursor)
             }
@@ -766,6 +806,7 @@ describe("Market Squawk desktop boundary", () => {
           },
           historyPreparation,
           subscriptions,
+          financialPreparation,
         )} />
       </MemoryRouter>,
     )
@@ -804,6 +845,103 @@ describe("Market Squawk desktop boundary", () => {
     finishFinancial?.(financialResult())
     await waitFor(() => expect(issuedQueries).toContainEqual({ query: "closeInvestmentFinancials", selectionToken: marketSelectionToken, readToken: financialRead }))
     expect(screen.queryByRole("region", { name: "Reported financial facts" })).toBeNull()
+
+    // Financial acquisition is explicit and independent of retained section reads.
+    // Recover a lost Start acknowledgment, reject another job, and cancel using
+    // the original lossless generation and the last checked sequence.
+    const financialControlNode = screen.getByRole("group", { name: "Financial information preparation" })
+    const financialControls = within(financialControlNode)
+    expect(financialPreparationRequests).toHaveLength(0)
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Load financial information" }))
+    await financialControls.findByText("Preparation could not be verified. Check the original request before loading again.")
+    const financialStart = financialPreparationRequests[0]!.request
+    if (financialStart.action !== "start") throw new Error("Expected financial Start.")
+    expect(financialPreparationRequests[0]!.confirmed).toBe(true)
+    expect(financialStart).toEqual({ action: "start", selectionToken: marketSelectionToken, startRequestId: financialStart.startRequestId })
+    expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).startRequestId).toBe(financialStart.startRequestId)
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel pending start" }))
+    await financialControls.findByText("Preparation status could not be checked. The last checked information is retained.")
+    expect(financialPreparationRequests.find(({ request }) => request.action === "cancelStart")).toEqual({
+      request: { action: "cancelStart", selectionToken: marketSelectionToken, startRequestId: financialStart.startRequestId }, confirmed: true,
+    })
+    expect(financialControls.queryByRole("button", { name: "Cancel preparation" })).toBeNull()
+    expect((financialControls.getByRole("button", { name: "Load financial information" }) as HTMLButtonElement).disabled).toBe(true)
+    wrongFinancialJob = false
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Check preparation" }))
+    await financialControls.findByText("Preparing financial information… 0 of 1 steps complete.")
+    expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).receipt).toMatchObject({
+      jobId: financialJobId, generation: jobGeneration, sequence: financialSequence,
+    })
+    const financialReadsBeforeCancel = issuedQueries.filter((request) => request.query === "investmentFinancials").length
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel preparation" }))
+    await financialControls.findByText("Financial information preparation was cancelled.")
+    expect(financialPreparationRequests.at(-1)).toEqual({ request: {
+      action: "cancel", selectionToken: marketSelectionToken, jobId: financialJobId,
+      generation: jobGeneration, expectedSequence: financialSequence,
+    }, confirmed: true })
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(financialReadsBeforeCancel + 1))
+    expect(issuedQueries.filter((request) => request.query === "investmentFinancials").at(-1)).toEqual({
+      query: "investmentFinancials", selectionToken: marketSelectionToken, section: "filings", limit: 32,
+    })
+    expect(financialControls.getByText("Financial information preparation was cancelled.")).toBeTruthy()
+    expect(financialControls.queryByText("Financial information preparation completed.")).toBeNull()
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(sessionStorage.getItem(financialRecoveryKey)).toBeNull()
+
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Load financial information" }))
+    await financialControls.findByText("Preparing financial information… 0 of 1 steps complete.")
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Facts" }))
+    expect(screen.getByRole("group", { name: "Financial information preparation" })).toBe(financialControlNode)
+    const preparedFacts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
+    await preparedFacts.findByText("USD 123,456.78")
+    await userEvent.setup().click(preparedFacts.getByRole("button", { name: "Next" }))
+    await preparedFacts.findByText("USD 234,567.89")
+    const pagedReads = issuedQueries.filter((request) => request.query === "investmentFinancials").length
+    let financialEventSequence = 0
+    const publishFinancialJob = () => subscriptions[0]!({ productSessionToken: blockedBootstrap.productSessionToken,
+      sequence: String(++financialEventSequence), body: { type: "invalidate", domains: ["job"] } })
+    financialVersion = 1
+    financialPreparationState = "completed"
+    await act(async () => { publishFinancialJob() })
+    await preparedFacts.findByText("Updated financial information is ready. Refresh this section to open it.")
+    expect(preparedFacts.getByText("USD 234,567.89")).toBeTruthy()
+    expect(preparedFacts.getByText("Page 2")).toBeTruthy()
+    expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(pagedReads)
+    financialMode = "pending"
+    financialSignal = undefined
+    await userEvent.setup().click(preparedFacts.getByRole("button", { name: "Refresh this section" }))
+    await waitFor(() => expect(financialSignal).toBeDefined())
+    expect(preparedFacts.getByText("USD 234,567.89")).toBeTruthy()
+    financialMode = "available"
+    await act(async () => { finishFinancial?.(financialResult()) })
+    await preparedFacts.findByText("USD 345,678.90")
+    expect(preparedFacts.getByText("Page 1")).toBeTruthy()
+    expect(issuedQueries.filter((request) => request.query === "investmentFinancials").at(-1)).toEqual({
+      query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32,
+    })
+
+    // A verified completion on page one opens fresh information automatically;
+    // a failed read still keeps the previously checked values visible.
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Update financial information" }))
+    await financialControls.findByText("Preparing financial information… 0 of 1 steps complete.")
+    financialVersion = 2
+    financialMode = "mismatch"
+    financialPreparationState = "completed"
+    await act(async () => { publishFinancialJob() })
+    await preparedFacts.findByRole("alert")
+    expect(preparedFacts.getByText("USD 345,678.90")).toBeTruthy()
+    financialMode = "available"
+    await userEvent.setup().click(preparedFacts.getByRole("button", { name: "Retry" }))
+    await preparedFacts.findByText("USD 456,789.01")
+    const freshReads = issuedQueries.filter((request) => request.query === "investmentFinancials").length
+    await act(async () => { publishFinancialJob() })
+    await financialControls.findByText("Financial information preparation completed.")
+    expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(freshReads)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(3)
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Filings" }))
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "investmentFinancials").at(-1)).toEqual({
+      query: "investmentFinancials", selectionToken: marketSelectionToken, section: "filings", limit: 32,
+    }))
 
     // This same selected-stock journey admits one explicit one-year preparation.
     // A lost acknowledgment is recovered through the original request, not Start.
@@ -1056,7 +1194,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(quote.getByText("USD 68,000.2")).toBeTruthy()
     expect(quote.getByText(/Several trades share the latest timestamp/)).toBeTruthy()
     expect(quote.queryByText("0.5")).toBeNull()
-    expect(screen.getByText("Bid/ask midpoint")).toBeTruthy()
+    expect(within(screen.getByRole("region", { name: "Investment price" })).getByText("Bid/ask midpoint · Current · 1.25%")).toBeTruthy()
     expect(
       issuedQueries.some((request) => request.query === "marketOverview"),
     ).toBe(true)

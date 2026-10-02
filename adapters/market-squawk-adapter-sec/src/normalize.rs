@@ -863,7 +863,6 @@ pub fn normalize_company_facts_with_cancellation(
     observations
         .try_reserve(ordered.len())
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
-    let revision_ruleset = SourceIdentifier::try_from("sec-companyfacts-revision-order-v1")?;
     let mut previous_family: Option<&CompanyFactOccurrence> = None;
     let mut family_revision = 0_u32;
     for occurrence in ordered {
@@ -876,74 +875,97 @@ pub fn normalize_company_facts_with_cancellation(
             family_revision = 1;
         }
         previous_family = Some(occurrence);
-        let start = occurrence.period().start().map(|date| date.to_string());
-        let end = occurrence.period().end().to_string();
-        let revision = RevisionNumber::new(family_revision)?;
-        let source_identifier = SourceIdentifier::try_from(format!(
-            "{}:{}:{}:{}:{}:{}",
-            occurrence.accession(),
-            occurrence.concept(),
-            occurrence.unit(),
-            start.as_deref().unwrap_or("instant"),
-            end,
-            occurrence.source_ordinal(),
-        ))?;
-        let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
-            source_id: source_id.clone(),
-            instrument_id: None,
-            venue_id: None,
-            source_identifier,
-            source_timestamp: None,
-            received_at,
+        observations.push(normalize_company_fact_occurrence(
+            source_id,
+            retrieved,
+            occurrence,
+            family_revision,
             ingested_at,
-            quality: DataQuality::OfficialDelayed,
-            payload_reference: PayloadReference::ContentHash(PayloadHash::new(
-                retrieved.raw().evidence().algorithm(),
-                retrieved.raw().evidence().bytes(),
-            )),
-            availability: retrieved.raw().availability().clone(),
-        })?;
-        let research_time = ResearchTime::try_new_with_coordinates(
-            ResearchTemporalCoordinate::calendar_date(occurrence.period().end()),
-            Some(ResearchTemporalCoordinate::calendar_date(
-                occurrence.filed_on(),
-            )),
-            revision,
-            None,
-        )?;
-        let period = match occurrence.period().start() {
-            Some(start) => FundamentalPeriod::duration(start, occurrence.period().end())?,
-            None => FundamentalPeriod::instant(occurrence.period().end()),
-        };
-        let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
-            schema_version: SchemaVersion::CURRENT,
-            period,
-            unit: occurrence.unit().clone(),
-            accession: occurrence.accession().clone(),
-            filing_form: Some(occurrence.form().clone()),
-            amendment_status: amendment_status(occurrence.form()),
-            filed_on: Some(occurrence.filed_on()),
-            frame: occurrence.frame().cloned(),
-            fiscal_year: occurrence.fiscal_year(),
-            fiscal_period: occurrence.fiscal_period().cloned(),
-            cadence: company_facts_cadence(occurrence.fiscal_period()),
-            xbrl_context_id: None,
-            dimensions: FundamentalDimensionContext::unavailable(),
-            consolidation: FundamentalConsolidation::Unavailable,
-            revision_order: FundamentalRevisionOrder::new(revision, revision_ruleset.clone()),
-            restatement_status: FundamentalRestatementStatus::Unavailable,
-        })?;
-        observations.push(ResearchObservation::Fundamental(
-            FundamentalObservation::new(
-                ResearchContext::new(provenance, research_time)?,
-                CompanyObservationSubject::Issuer(retrieved.document().cik().clone()),
-                occurrence.concept().clone(),
-                occurrence.value(),
-                fact_context,
-            )?,
-        ));
+        )?);
     }
     Ok(observations)
+}
+
+/// Shared row normalization for bounded online extraction and explicit offline imports.
+/// The caller carries the revision sequence across chunk boundaries in the same total order.
+pub(crate) fn normalize_company_fact_occurrence(
+    source_id: &SourceId,
+    retrieved: &RetrievedCompanyFacts,
+    occurrence: &CompanyFactOccurrence,
+    family_revision: u32,
+    ingested_at: Timestamp,
+) -> Result<ResearchObservation, SecNormalizationError> {
+    let received_at = retrieved.raw().received_at();
+    if ingested_at < received_at {
+        return Err(SecNormalizationError::IngestedBeforeReceived);
+    }
+    let revision_ruleset = SourceIdentifier::try_from("sec-companyfacts-revision-order-v1")?;
+    let start = occurrence.period().start().map(|date| date.to_string());
+    let end = occurrence.period().end().to_string();
+    let revision = RevisionNumber::new(family_revision)?;
+    let source_identifier = SourceIdentifier::try_from(format!(
+        "{}:{}:{}:{}:{}:{}",
+        occurrence.accession(),
+        occurrence.concept(),
+        occurrence.unit(),
+        start.as_deref().unwrap_or("instant"),
+        end,
+        occurrence.source_ordinal(),
+    ))?;
+    let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: source_id.clone(),
+        instrument_id: None,
+        venue_id: None,
+        source_identifier,
+        source_timestamp: None,
+        received_at,
+        ingested_at,
+        quality: DataQuality::OfficialDelayed,
+        payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+            retrieved.raw().evidence().algorithm(),
+            retrieved.raw().evidence().bytes(),
+        )),
+        availability: retrieved.raw().availability().clone(),
+    })?;
+    let research_time = ResearchTime::try_new_with_coordinates(
+        ResearchTemporalCoordinate::calendar_date(occurrence.period().end()),
+        Some(ResearchTemporalCoordinate::calendar_date(
+            occurrence.filed_on(),
+        )),
+        revision,
+        None,
+    )?;
+    let period = match occurrence.period().start() {
+        Some(start) => FundamentalPeriod::duration(start, occurrence.period().end())?,
+        None => FundamentalPeriod::instant(occurrence.period().end()),
+    };
+    let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+        schema_version: SchemaVersion::CURRENT,
+        period,
+        unit: occurrence.unit().clone(),
+        accession: occurrence.accession().clone(),
+        filing_form: Some(occurrence.form().clone()),
+        amendment_status: amendment_status(occurrence.form()),
+        filed_on: Some(occurrence.filed_on()),
+        frame: occurrence.frame().cloned(),
+        fiscal_year: occurrence.fiscal_year(),
+        fiscal_period: occurrence.fiscal_period().cloned(),
+        cadence: company_facts_cadence(occurrence.fiscal_period()),
+        xbrl_context_id: None,
+        dimensions: FundamentalDimensionContext::unavailable(),
+        consolidation: FundamentalConsolidation::Unavailable,
+        revision_order: FundamentalRevisionOrder::new(revision, revision_ruleset.clone()),
+        restatement_status: FundamentalRestatementStatus::Unavailable,
+    })?;
+    Ok(ResearchObservation::Fundamental(
+        FundamentalObservation::new(
+            ResearchContext::new(provenance, research_time)?,
+            CompanyObservationSubject::Issuer(retrieved.document().cik().clone()),
+            occurrence.concept().clone(),
+            occurrence.value(),
+            fact_context,
+        )?,
+    ))
 }
 
 pub(crate) fn compare_filings(left: &SecFiling, right: &SecFiling) -> Ordering {
@@ -973,7 +995,10 @@ pub(crate) fn compare_company_facts(
         .then_with(|| left.source_ordinal().cmp(&right.source_ordinal()))
 }
 
-fn same_company_fact_family(left: &CompanyFactOccurrence, right: &CompanyFactOccurrence) -> bool {
+pub(crate) fn same_company_fact_family(
+    left: &CompanyFactOccurrence,
+    right: &CompanyFactOccurrence,
+) -> bool {
     left.concept() == right.concept()
         && left.unit() == right.unit()
         && left.period() == right.period()

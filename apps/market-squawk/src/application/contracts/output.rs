@@ -99,6 +99,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Job.Get"
         | "Job.Cancel"
         | "Job.Confirm"
+        | "Research.GetInvestmentFinancialPreparation"
+        | "Research.CancelInvestmentFinancialPreparation"
         | "Market.GetHistoryPreparation"
         | "Market.CancelHistoryPreparation" => job_view(),
         "Job.ReconcileStart" | "Job.CancelStart" => one_of(vec![
@@ -255,7 +257,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Macro.GetObservations" | "Macro.GetVintages" | "Macro.GetRevisions" => {
             observation_result()
         }
-        "Market.StartHistoryPreparation"
+        "Research.StartInvestmentFinancialPreparation"
+        | "Market.StartHistoryPreparation"
         | "Research.StartIngestSource"
         | "Research.CommitStagedFile"
         | "Research.StartDatasetBuild"

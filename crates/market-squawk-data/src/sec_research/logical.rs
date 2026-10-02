@@ -1,4 +1,4 @@
-//! Exact complete-filing replay through the shared logical publication authority.
+//! Exact complete SEC research replay through the shared logical publication authority.
 use super::filing_xbrl::SecNumericNativeEvidence;
 use super::*;
 use market_squawk_domain::CompanyIdentityObservation;
@@ -11,7 +11,7 @@ use std::io::{Read, Seek};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FilingCompanion {
+struct ResearchCompanion {
     version: u16,
     family: String,
     capture: ProviderCaptureSetReceipt,
@@ -52,6 +52,11 @@ impl SecResearchReadCapability {
         cancellation: CancellationToken,
     ) -> Result<SecResearchSelection, SecResearchReadError> {
         let mismatch = || SecResearchReadError::ProviderBindingMismatch;
+        let (companion_family, capture_page_ordinal) = match request.family() {
+            SecResearchFamily::CompanyFacts => ("sec_company_facts_capture", 0),
+            SecResearchFamily::FilingXbrl => ("sec_filing_capture", 1),
+            SecResearchFamily::Submissions => return Err(mismatch()),
+        };
         let control = SecResearchOperationControl {
             deadline,
             cancellation: &cancellation,
@@ -90,13 +95,13 @@ impl SecResearchReadCapability {
         let mut companion_reader = raw_store
             .open_verified_logical_object_claim(companion_object.claim(), &control)
             .map_err(map_raw_store_error)?;
-        let companion: FilingCompanion =
+        let companion: ResearchCompanion =
             serde_json::from_reader(&mut companion_reader).map_err(|_| mismatch())?;
         companion_reader
             .reverify_for_commit(&control)
             .map_err(map_raw_store_error)?;
         if companion.version != 1
-            || companion.family != "sec_filing_capture"
+            || companion.family != companion_family
             || &companion.company_identity != company_identity.observation()
             || companion.capture.source_id() != &source_id
             || companion.extraction_content_identity
@@ -141,15 +146,41 @@ impl SecResearchReadCapability {
                 .reverify_for_commit(&control)
                 .map_err(map_raw_store_error)?;
         }
-        let descriptor: ProviderNativeSidecarDescriptor =
-            serde_json::from_slice(&companion.native_descriptor).map_err(|_| mismatch())?;
         let sidecar_digest = evidence_digest(Sha256::digest(&companion.native_descriptor).into());
-        if sidecar_digest != native_object.semantic_identity()
-            || descriptor.total_bytes() != native_object.claim().size_bytes()
-            || descriptor.content_digest() != native_object.claim().content_digest()
-        {
+        if sidecar_digest != native_object.semantic_identity() {
             return Err(mismatch());
         }
+        let descriptor = match request.family() {
+            SecResearchFamily::FilingXbrl => {
+                let descriptor: ProviderNativeSidecarDescriptor =
+                    serde_json::from_slice(&companion.native_descriptor).map_err(|_| mismatch())?;
+                if descriptor.total_bytes() != native_object.claim().size_bytes()
+                    || descriptor.content_digest() != native_object.claim().content_digest()
+                {
+                    return Err(mismatch());
+                }
+                Some(descriptor)
+            }
+            SecResearchFamily::CompanyFacts => {
+                let sidecar: CompanyFactsSidecar =
+                    serde_json::from_slice(&companion.native_descriptor).map_err(|_| mismatch())?;
+                if native_object.claim().content_digest() != sidecar_digest
+                    || native_object.claim().size_bytes() != companion.native_descriptor.len() as u64
+                    || sidecar.version != 1
+                    || sidecar.family != "company_facts"
+                    || &sidecar.dataset != companion.capture.dataset()
+                    || &sidecar.cik != company_identity.observation().provider_company_id()
+                    || sidecar.entity_name != company_identity.observation().conformed_name()
+                    || companion.capture.terminal()
+                        != market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
+                    || companion.capture.pages().len() != 1
+                {
+                    return Err(mismatch());
+                }
+                None
+            }
+            SecResearchFamily::Submissions => return Err(mismatch()),
+        };
         let scratch = Arc::new(indexed::IndexScratch::new(
             self.objects.operation_scratch()?,
             request.maximum_spill_bytes(),
@@ -202,14 +233,14 @@ impl SecResearchReadCapability {
                     LogicalPartitionFamily::ProviderNative => {
                         native_rows.push(&SecNumericNativeEvidence {
                             semantic_payload: payload,
-                            capture_page_ordinal: 1,
+                            capture_page_ordinal,
                         })?
                     }
                     LogicalPartitionFamily::CanonicalRowMap => {
                         let row: RowMap =
                             serde_json::from_slice(&payload).map_err(|_| mismatch())?;
                         if u64::from(row.canonical_row_ordinal) != ordinal
-                            || row.capture_page_ordinal != 1
+                            || row.capture_page_ordinal != capture_page_ordinal
                             || row.segment_ordinal != 0
                             || row.physical_frame_ordinal != u32::from(row.capture_page_ordinal)
                         {
@@ -343,6 +374,9 @@ impl SecResearchReadCapability {
                 {
                     return Err(mismatch());
                 }
+                if request.family() == SecResearchFamily::CompanyFacts {
+                    validate_company_fact_native(&native.semantic_payload, &observation)?;
+                }
                 observations.push(&observation)?;
                 coordinates.push(ProviderCaptureRowCoordinate {
                     binding_digest: binding.binding_digest(),
@@ -368,33 +402,40 @@ impl SecResearchReadCapability {
         let mut native_reader = raw_store
             .open_verified_logical_object_claim(native_object.claim(), &control)
             .map_err(map_raw_store_error)?;
-        descriptor
-            .verify_reader(&mut ControlledNativeReader {
-                reader: &mut native_reader,
+        let (filing, retained) = if let Some(descriptor) = descriptor {
+            descriptor
+                .verify_reader(&mut ControlledNativeReader {
+                    reader: &mut native_reader,
+                    deadline,
+                    cancellation: &cancellation,
+                })
+                .map_err(|_| mismatch())?;
+            native_reader.rewind().map_err(|_| mismatch())?;
+            let (filing, retained) = filing_xbrl::read_verified_filing(
+                &companion.capture,
+                &mut native_reader,
+                sidecar_digest,
+                &native_rows,
+                &observations,
+                company_identity
+                    .observation()
+                    .provider_company_id()
+                    .as_str(),
+                request
+                    .maximum_object_bytes()
+                    .checked_sub(base_bytes)
+                    .ok_or(SecResearchReadError::ObjectBudgetExceeded)?,
                 deadline,
-                cancellation: &cancellation,
-            })
-            .map_err(|_| mismatch())?;
-        native_reader.rewind().map_err(|_| mismatch())?;
-        let (filing, retained) = filing_xbrl::read_verified_filing(
-            &companion.capture,
-            &mut native_reader,
-            sidecar_digest,
-            &native_rows,
-            &observations,
-            company_identity
-                .observation()
-                .provider_company_id()
-                .as_str(),
-            request
-                .maximum_object_bytes()
-                .checked_sub(base_bytes)
-                .ok_or(SecResearchReadError::ObjectBudgetExceeded)?,
-            deadline,
-            &cancellation,
-            &control,
-            scratch,
-        )?;
+                &cancellation,
+                &control,
+                scratch,
+            )?;
+            (Some(filing), retained)
+        } else {
+            // The physically verified inline object has the exact digest/size of the already
+            // parsed bounded sidecar. Facts have no filing graph to fabricate or retain.
+            (None, companion.native_descriptor.len())
+        };
         native_reader
             .reverify_for_commit(&control)
             .map_err(map_raw_store_error)?;
@@ -426,7 +467,7 @@ impl SecResearchReadCapability {
             companion.capture.observation_digest(),
             evidence_digest(mapping_digest.finalize().into()),
             observations,
-            Some(filing),
+            filing,
             coordinates,
             base_bytes
                 .checked_add(retained)
@@ -469,4 +510,77 @@ impl<R: Read> Read for ControlledNativeReader<'_, R> {
         check_operation(self.deadline, self.cancellation).map_err(std::io::Error::other)?;
         self.reader.read(bytes)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompanyFactsSidecar {
+    version: u16,
+    family: String,
+    dataset: SourceIdentifier,
+    cik: SourceIdentifier,
+    entity_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompanyFactNative {
+    family: String,
+    occurrence: CompanyFactOccurrence,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompanyFactOccurrence {
+    concept: SourceIdentifier,
+    unit: SourceIdentifier,
+    source_ordinal: u32,
+    value: rust_decimal::Decimal,
+    accession: SourceIdentifier,
+    form: market_squawk_domain::FilingForm,
+    filed_on: market_squawk_domain::CalendarDate,
+    period: CompanyFactPeriod,
+    frame: Option<SourceIdentifier>,
+    fiscal_year: Option<u16>,
+    fiscal_period: Option<SourceIdentifier>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompanyFactPeriod {
+    start: Option<market_squawk_domain::CalendarDate>,
+    end: market_squawk_domain::CalendarDate,
+}
+
+fn validate_company_fact_native(
+    bytes: &[u8],
+    observation: &ResearchObservation,
+) -> Result<(), SecResearchReadError> {
+    let mismatch = || SecResearchReadError::ProviderBindingMismatch;
+    let native: CompanyFactNative = serde_json::from_slice(bytes).map_err(|_| mismatch())?;
+    let ResearchObservation::Fundamental(fact) = observation else {
+        return Err(mismatch());
+    };
+    let occurrence = native.occurrence;
+    let context = fact.fact_context();
+    // The source array ordinal is authenticated by its native digest; it is not the canonical
+    // row ordinal, because SEC rows are sorted across concepts, units and amendments.
+    let _source_ordinal = occurrence.source_ordinal;
+    if native.family != "company_fact"
+        || &occurrence.concept != fact.concept()
+        || occurrence.value != fact.value()
+        || &occurrence.unit != context.unit()
+        || &occurrence.accession != context.accession()
+        || Some(&occurrence.form) != context.filing_form()
+        || Some(occurrence.filed_on) != context.filed_on()
+        || occurrence.period.start != context.period().start()
+        || occurrence.period.end != context.period().end()
+        || occurrence.frame.as_ref() != context.frame()
+        || occurrence.fiscal_year != context.fiscal_year()
+        || occurrence.fiscal_period.as_ref() != context.fiscal_period()
+        || fact.xbrl_evidence().is_some()
+    {
+        return Err(mismatch());
+    }
+    Ok(())
 }

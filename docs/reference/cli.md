@@ -118,8 +118,12 @@ as Desktop and MCP:
 | Command | Effect |
 | --- | --- |
 | `market profile --selection-token <token>` | Read the selected investment's reference and listing profile independently of price availability. |
-| `market financials --selection-token <token> --section <facts\|statements\|ratios\|filings> [--cursor <cursor>] [--limit 1..100]` | Read one financial section; the default page size is 32. A first page may retrieve missing issuer evidence using an already configured connection. |
+| `market financials --selection-token <token> --section <facts\|statements\|ratios\|filings> [--cursor <cursor>] [--limit 1..100]` | Read one retained financial section without acquiring new provider data; the default page size is 32. |
 | `market close-financials --selection-token <token> --read-token <UUID>` | Release an open financial read without deleting its stored source evidence or cancelling a separate durable job. |
+| `market prepare-financials --selection-token <token> --confirm` | Acquire company financial evidence as an independent durable job; ordinary financial reads stay available. |
+| `market financial-preparation --selection-token <token> --job-id <UUID> --generation <positive>` | Read the selected financial job’s exact generation, progress and outcome. |
+| `market cancel-financial-preparation --selection-token <token> --job-id <UUID> --generation <positive> --expected-sequence <n> --confirm` | Cancel against the observed sequence; valid retained intermediate evidence remains available. |
+| `market reconcile-financial-preparation --request-id <original> --arguments-sha256 <digest>` | Resolve an uncertain financial start using its original request identity; never starts another job. |
 | `market prepare-history --history-token <token> --lookback-days <days> --confirm` | Start selected adjusted daily-history acquisition; returns the durable job receipt. |
 | `market history-preparation --history-token <token> --job-id <UUID> --generation <positive>` | Read the selected job's exact generation, progress, outcome and publication result. |
 | `market cancel-history-preparation --history-token <token> --job-id <UUID> --generation <positive> --expected-sequence <n> --confirm` | Cancel against the exact observed sequence; already committed evidence remains retained. |

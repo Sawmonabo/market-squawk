@@ -96,25 +96,6 @@ impl InvestmentFinancialResult {
     pub(crate) fn item_count(&self) -> usize {
         self.items.len()
     }
-    pub(crate) fn read_token(&self) -> Option<&str> {
-        self.read_token.as_deref()
-    }
-    pub(crate) fn needs_acquisition(&self) -> bool {
-        !self
-            .families
-            .iter()
-            .any(|family| family.state == InvestmentFinancialState::Reported)
-            && self
-                .families
-                .iter()
-                .any(|family| matches!(family.reason, Some("identity_missing" | "identity_stale")))
-            && self.families.iter().all(|family| {
-                matches!(
-                    family.reason,
-                    Some("identity_missing" | "identity_stale" | "no_records")
-                )
-            })
-    }
 }
 
 #[derive(Deserialize, Serialize)]

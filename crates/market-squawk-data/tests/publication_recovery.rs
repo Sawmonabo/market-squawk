@@ -1644,6 +1644,13 @@ async fn exercise_staged_macro_terminal_and_finalization_restart() -> TestResult
 }
 
 async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
+    exercise_sec_exact_origin_with_submissions_rows(5).await?;
+    // The live MSFT capture contains 4,525 filings. A production-sized row group must not
+    // become a requirement to decode every row's payload, lineage and projections at once.
+    exercise_sec_exact_origin_with_submissions_rows(4_525).await
+}
+
+async fn exercise_sec_exact_origin_with_submissions_rows(submissions_rows: usize) -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("sec-exact-restart"))?;
     let location = paths.catalog()?.clone();
@@ -1651,7 +1658,8 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     let source = sec_research_source()?;
     let authority = CatalogAuthority::open(catalog_config.clone())?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
-    let store_config = ObjectStoreConfig::try_new(64 * 1024 * 1024, 64, Duration::from_secs(60))?;
+    let store_config =
+        ObjectStoreConfig::try_new(64 * 1024 * 1024, 8_192, Duration::from_secs(60))?;
     let service = AnalyticalDataService::initialize(
         authority,
         AnalyticalManifestCatalog::open(&location, 8)?,
@@ -1660,7 +1668,8 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     )?;
     let raw_store = paths.sealed_research_journal_store()?;
     let base_ns = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
-    let fixture = sec_research_capture_fixture(base_ns, false)?;
+    let fixture =
+        sec_research_capture_fixture_with_submissions_rows(base_ns, false, submissions_rows)?;
     let payload_digest = extraction_provider_payload_digest(&fixture.batch);
     let company = sec_research_company_identity(
         payload_digest,
@@ -1705,6 +1714,7 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
         capture_material,
         revision_plan,
         native_rows,
+        ..
     } = fixture;
     let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
     let (expectation, request) = capture_material.into_whole_seal_parts();
@@ -1739,11 +1749,32 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
         binding_digests[0],
         &raw_store,
     )?;
+    assert_eq!(retained_binding.record_count(), submissions_rows);
+    if submissions_rows > 256 {
+        // Establish that the old whole-row-group decoder rejects this valid retained object
+        // under its unchanged production budget, before exercising the real replay below.
+        let object = &committed.pinned().objects()[0];
+        let mut full_cursor = service.object_store().pinned_object_batch_cursor(
+            committed.pinned(),
+            object.artifact_id(),
+            0,
+            submissions_rows,
+            64 * 1024 * 1024,
+            &cancellation,
+        )?;
+        let whole = full_cursor.next_batch().await?.ok_or("missing SEC batch")?;
+        assert_eq!(whole.num_rows(), submissions_rows);
+        assert!(matches!(
+            ResearchArrowBatch::decode_record_batch_bounded(whole, 64 * 1024 * 1024),
+            Err(market_squawk_data::ArrowConversionError::RetainedLimitExceeded { .. })
+        ));
+        assert!(full_cursor.next_batch().await?.is_none());
+    }
     // A second HTTP receipt for unchanged SEC content must retain the new physical capture
     // while preserving the first canonical/company generation and its original knowledge time.
     let repeat_input = |conflicting_company: bool|
      -> Result<(ProviderPublicationInput, EvidenceDigest), Box<dyn Error>> {
-        let repeated_fixture = sec_research_capture_fixture(base_ns, false)?;
+        let repeated_fixture = sec_research_capture_fixture_with_submissions_rows(base_ns, false, submissions_rows)?;
         let repeat_capture = repeated_fixture.capture_material.receipt();
         let repeat_at = Timestamp::from_unix_nanos(base_ns + 2_000_000);
         let repeat_receipt = ProviderCaptureSetReceipt::try_new(
@@ -1887,6 +1918,33 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
         service.provider_capture_binding_digests(committed.manifest(), None, 2)?,
         binding_digests
     );
+    if submissions_rows > 256 {
+        // Reopening must retain the new receipt and all original rows without manufacturing
+        // a generation or replacing the original company knowledge clock.
+        assert_eq!(
+            committed.pinned().plan().row_count(),
+            submissions_rows as u64
+        );
+        drop(repeated);
+        drop(committed);
+        drop(service);
+        drop(raw_store);
+        let reopened = CatalogAuthority::open(catalog_config)?;
+        let repeat = reopened
+            .catalog()
+            .provider_capture_binding_evidence(repeat_binding_digest)?
+            .ok_or("large SEC repeat receipt was not retained")?;
+        assert_eq!(repeat.record_count(), submissions_rows);
+        assert_eq!(
+            repeat.capture().content_digest(),
+            retained_binding.capture().content_digest()
+        );
+        assert_eq!(
+            repeat.capture().pages()[0].received_at(),
+            Timestamp::from_unix_nanos(base_ns + 2_000_000)
+        );
+        return Ok(());
+    }
     let physical = retained_binding
         .physical_claims()
         .first()
@@ -2120,9 +2178,279 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     Ok(())
 }
 
+// Uses the same bounded canonical/native partitions as complete SEC CompanyFacts publication.
+async fn publish_sec_company_facts_logical_fixture(
+    service: &AnalyticalDataService,
+    source: &SourceMetadata,
+    raw_store: &market_squawk_platform::SealedResearchJournalStore,
+    fixture: SecResearchCaptureFixture,
+    company: &CompanyIdentityObservation,
+) -> Result<
+    (
+        CommittedDataset,
+        EvidenceDigest,
+        market_squawk_platform::ResearchObjectClaim,
+    ),
+    Box<dyn Error>,
+> {
+    use market_squawk_platform::ResearchObjectAdmission;
+    use market_squawk_sources::{
+        ExtractionContentAccumulator, LogicalObjectRole, LogicalPartitionFamily,
+        LogicalPartitionSetAdmission, PendingLogicalPartitionSet, ProviderLogicalTerminalInput,
+        ProviderNativeLineageSchema, SealedLogicalObjectInput,
+        SealedProviderLogicalPublicationBinding,
+    };
+    use std::io::Write as _;
+    struct Control;
+    impl ResearchObjectControl for Control {
+        fn checkpoint(
+            &self,
+            _: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            Ok(())
+        }
+    }
+    let hash =
+        |bytes: &[u8]| EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into());
+    let admission = ResearchObjectAdmission::try_new(8 * 1024 * 1024, 4095)?;
+    let SecResearchCaptureFixture {
+        batch,
+        capture_material,
+        native_rows,
+        stream_records,
+        ..
+    } = fixture;
+    let request = batch.request().clone();
+    let records = stream_records.as_deref().unwrap_or_else(|| batch.records());
+    let dataset = DatasetId::try_from(request.object().dataset().as_str())?;
+    let mut payload_objects = Vec::new();
+    for record in capture_material.records() {
+        let mut pending = raw_store.begin_logical_object(admission)?;
+        pending.write_all(record.payload())?;
+        payload_objects.push(raw_store.finish_logical_object(pending, &Control)?);
+    }
+    let (expected, seal) = capture_material.into_whole_seal_parts();
+    let token = expected
+        .try_rejoin(seal.seal(raw_store)?)?
+        .try_into_whole()?;
+    let (mut objects, receipt) =
+        SealedLogicalObjectInput::try_from_whole_capture(token, payload_objects, &Control)?;
+    let sidecar = serde_json::json!({
+        "version":1, "family":"company_facts", "dataset":request.object().dataset(),
+        "cik":company.provider_company_id(), "entity_name":company.conformed_name(),
+    });
+    let native_descriptor = serde_json::to_vec(&sidecar)?;
+    let mut pending = raw_store.begin_logical_object(admission)?;
+    pending.write_all(&native_descriptor)?;
+    let object = raw_store.finish_logical_object(pending, &Control)?;
+    let native_object = SealedLogicalObjectInput::try_from_verified(
+        LogicalObjectRole::ProviderComponent,
+        objects.len() as u32,
+        hash(&native_descriptor),
+        object,
+        &Control,
+    )?;
+    // Keep the exact non-authoritative native claim for this fixture's post-restart corruption.
+    let native_claim = native_object.object().claim().clone();
+    objects.push(native_object);
+    let cancellation = CancellationToken::new();
+    let mut staging = service.begin_provider_logical_stream(
+        dataset.clone(),
+        source.source_id().clone(),
+        &cancellation,
+    )?;
+    let partition_admission =
+        LogicalPartitionSetAdmission::try_new(admission, 4096, 256, 128 * 1024)?;
+    let mut native_set = PendingLogicalPartitionSet::begin(
+        LogicalPartitionFamily::ProviderNative,
+        ProviderNativeLineageSchema::for_implementation(
+            ProviderNativeLineageImplementation::SecEdgarV1,
+        )
+        .fingerprint(),
+        partition_admission,
+        0,
+    )?;
+    let mut mapping_set = PendingLogicalPartitionSet::begin(
+        LogicalPartitionFamily::CanonicalRowMap,
+        hash(b"market-squawk/sec-filing/logical-row-map/v1"),
+        partition_admission,
+        0,
+    )?;
+    let total_records = records.len();
+    let mut content = ExtractionContentAccumulator::try_new(&request, total_records)?;
+    let mut expectations = Vec::new();
+    for (chunk_ordinal, records) in records.chunks(256).enumerate() {
+        let start = chunk_ordinal * 256;
+        let chunk = ExtractionBatch::try_new(&request, records.to_vec())?
+            .try_bind_provider_capture(receipt.capture())?;
+        let mut native = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::SecEdgarV1,
+            &chunk,
+        )?;
+        native.try_set_batch_sidecar(&sidecar)?;
+        for row in &native_rows[start..start + records.len()] {
+            native.try_push(row)?;
+        }
+        let native = native.finish()?;
+        for (local, (record, row)) in chunk.records().iter().zip(native.rows()).enumerate() {
+            let ordinal = u64::try_from(start + local)?;
+            content.push(record)?;
+            native_set.stage_frame(
+                raw_store,
+                &Control,
+                ordinal,
+                row.semantic_payload(),
+                row.semantic_payload_digest(),
+            )?;
+            let frame = receipt.row_frame(u32::try_from(ordinal)?, 0)?;
+            let mapping = serde_json::to_vec(&serde_json::json!({
+                "canonical_row_ordinal":frame.canonical_row_ordinal(),
+                "capture_page_ordinal":frame.capture_page_ordinal(),
+                "segment_ordinal":frame.segment_ordinal(),
+                "physical_frame_ordinal":frame.physical_frame_ordinal(),
+                "page_body_digest":frame.page_body_digest(), "received_at":frame.received_at(),
+                "source_sequence":frame.source_sequence(), "canonical_record_digest":record.evidence().content_digest(),
+                "native_semantic_digest":row.semantic_payload_digest(),
+            }))?;
+            mapping_set.stage_frame(raw_store, &Control, ordinal, &mapping, hash(&mapping))?;
+        }
+        native_set.seal_current_partition(raw_store, &Control)?;
+        mapping_set.seal_current_partition(raw_store, &Control)?;
+        let mut evidence = Vec::new();
+        for local in 0..records.len() {
+            let ordinal = start + local;
+            evidence.push(ExtractionRevisionEvidence::provider_supplied(
+                b"sec-filing-current-v1",
+                ObservedProviderOrder::try_new(
+                    ResearchTemporalCoordinate::exact(
+                        company
+                            .received_at()
+                            .checked_add_nanos(i64::try_from(ordinal)?)?,
+                    ),
+                    b"sec-filing-current-v1",
+                )?,
+            )?);
+        }
+        let revisions = ExtractionRevisionPlan::try_new_with_native_lineage(evidence)?;
+        expectations.push(
+            service
+                .stage_provider_logical_stream_chunk(
+                    &mut staging,
+                    chunk,
+                    native,
+                    revisions,
+                    &receipt,
+                    &vec![0; records.len()],
+                    &cancellation,
+                )
+                .await?,
+        );
+    }
+    assert_eq!(expectations.len(), total_records.div_ceil(256));
+    let complete = content.finish()?;
+    let companion = serde_json::to_vec(&serde_json::json!({
+        "version":1, "family":"sec_company_facts_capture", "capture":receipt.capture(),
+        "sealed_receipt_digest":receipt.receipt_digest(), "original_segment_claim":receipt.segment().claim(),
+        "company_identity":company, "native_descriptor":native_descriptor,
+        "extraction_content_identity":complete.digest(), "record_count":complete.record_count(),
+    }))?;
+    let mut pending = raw_store.begin_logical_object(admission)?;
+    pending.write_all(&companion)?;
+    let object = raw_store.finish_logical_object(pending, &Control)?;
+    objects.push(SealedLogicalObjectInput::try_from_verified(
+        LogicalObjectRole::ProviderComponent,
+        objects.len() as u32,
+        hash(&companion),
+        object,
+        &Control,
+    )?);
+    let mut partitions = native_set
+        .finish(raw_store, &Control)?
+        .into_partitions()
+        .into_vec();
+    partitions.extend(
+        mapping_set
+            .finish(raw_store, &Control)?
+            .into_partitions()
+            .into_vec(),
+    );
+    let total_logical_object_bytes = objects
+        .iter()
+        .map(|object| object.object().size_bytes())
+        .sum();
+    let binding = SealedProviderLogicalPublicationBinding::try_new(
+        ProviderLogicalTerminalInput {
+            source_id: source.source_id().clone(),
+            source_revision_digest: source
+                .revision_evidence()
+                .payload_evidence()
+                .content_digest(),
+            execution_attempt_digest: Some(receipt.receipt_digest()),
+            provider_terminal_evidence_digest: complete.digest(),
+            total_decoded_events: 0,
+            total_canonical_rows: total_records as u64,
+            total_logical_object_bytes,
+        },
+        &[
+            LogicalPartitionFamily::ProviderNative,
+            LogicalPartitionFamily::CanonicalRowMap,
+        ],
+        objects,
+        partitions,
+        expectations,
+    )?;
+    let binding_digest = binding.binding_digest();
+    // Reserve through the service that already owns this catalog's exclusive writer.
+    // Persist admits LocalAnalysis through the existing rights policy, but never Train.
+    let reservation = service
+        .reserve_source_ingest(
+            source,
+            company.received_at(),
+            RightsDecisionInput {
+                source_id: source.source_id().clone(),
+                payload_digest: binding_digest,
+                retrieved_at: company.received_at(),
+                basis: RightsBasis::reviewed_terms(
+                    "https://www.sec.gov/os/accessing-edgar-data",
+                    digest(221),
+                )?,
+                authorization_evidence: digest(222),
+                authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                permitted_operations: vec![SourceOperation::Persist],
+            },
+            &IngestIdentity::try_new(
+                source.source_id().clone(),
+                binding_digest,
+                SourceOperation::Persist,
+                "sec:companyfacts:fiscal-restart",
+            )?,
+            &cancellation,
+        )
+        .await?;
+    let (committed, retained) = service
+        .finish_provider_logical_stream(
+            staging,
+            reservation,
+            binding,
+            company.clone(),
+            Arc::new(AllowProviderEventPublication),
+            cancellation,
+        )
+        .await?;
+    assert_eq!(retained, binding_digest);
+    Ok((committed, retained, native_claim))
+}
+
 // The existing SEC recovery journey also proves selected-security attribution survives fiscal
 // publication without adding an instrument to issuer-owned source observations.
 async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
+    exercise_sec_fiscal_epoch_restart_with_rows(257).await?;
+    // Actual retained MSFT CompanyFacts contains 32,671 rows. Keep the installed writer's
+    // 65,536-row grouping and 64 MiB working admission; feed it only bounded 256-row chunks.
+    exercise_sec_fiscal_epoch_restart_with_rows(32_671).await
+}
+
+async fn exercise_sec_fiscal_epoch_restart_with_rows(fact_rows: usize) -> TestResult {
     use market_squawk_data::{
         DatasetBuildPurpose, DatasetStudyPolicy, DatasetTargetHorizon, FinancialAmountBasis,
         FinancialAmountRole, FinancialAmountSelection, FinancialSeriesLimits, PythonDatasetRow,
@@ -2138,7 +2466,12 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
     let paths = LocalPaths::prepare(directory.path().join("sec-fiscal-restart"))?;
     let location = paths.catalog()?.clone();
     let config = test_catalog_config(location.clone())?;
-    let store_config = ObjectStoreConfig::try_new(64 * 1024 * 1024, 64, Duration::from_secs(60))?;
+    let pressure = fact_rows > 257;
+    let store_config = ObjectStoreConfig::try_new(
+        if pressure { 256 } else { 64 } * 1024 * 1024,
+        if pressure { 65_536 } else { 64 },
+        Duration::from_secs(60),
+    )?;
     let authority = CatalogAuthority::open(config.clone())?;
     let source = sec_research_source()?;
     let membership_source = local_source()?;
@@ -2155,7 +2488,8 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         )?))
     };
     let base = now()?;
-    let fixture = sec_research_capture_fixture(base.unix_nanos(), true)?;
+    let fixture =
+        sec_research_capture_fixture_with_row_counts(base.unix_nanos(), true, 5, fact_rows)?;
     let raw_digest = fixture.capture_material.receipt().pages()[0].body_digest();
     let payload_digest = extraction_provider_payload_digest(&fixture.batch);
     let company = sec_research_company_identity(
@@ -2169,6 +2503,14 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         Sha256::digest(serde_json::to_vec(&company)?).into(),
     );
     let membership_batch = dataset_extraction_batch()?;
+    // Dataset construction revalidates both complete parent generations, even though the
+    // fiscal product selects only NetIncomeLoss from the complete streaming fixture.
+    let fiscal_input_rows = fixture
+        .batch
+        .records()
+        .len()
+        .checked_add(membership_batch.records().len())
+        .ok_or("SEC fiscal fixture input count overflow")?;
     let reserve = |metadata: &SourceMetadata, payload, key: &str| -> Result<_, Box<dyn Error>> {
         let rights = authority.admit_source_rights(RightsDecisionInput {
             source_id: metadata.source_id().clone(),
@@ -2198,7 +2540,6 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
             &rights,
         )?)
     };
-    let facts_reservation = reserve(&source, payload_digest, "sec:companyfacts:fiscal-restart")?;
     let membership_reservation = reserve(
         &membership_source,
         extraction_provider_payload_digest(&membership_batch),
@@ -2220,39 +2561,11 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         )
         .await?;
     let raw_store = paths.sealed_research_journal_store()?;
-    let SecResearchCaptureFixture {
-        batch,
-        capture_material,
-        revision_plan,
-        native_rows,
-    } = fixture;
-    let dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
-    let (expected, capture) = capture_material.into_whole_seal_parts();
-    let seal = expected
-        .try_rejoin(capture.seal(&raw_store)?)?
-        .try_into_whole()?;
-    let mut native = ProviderNativeLineageBatchBuilder::try_new(
-        ProviderNativeLineageImplementation::SecEdgarV1,
-        &batch,
-    )?;
-    for row in &native_rows {
-        native.try_push(row)?;
-    }
-    let native = native.finish()?;
-    let binding =
-        SealedProviderCaptureBinding::try_whole(seal, batch, native, vec![0; native_rows.len()])?;
-    let facts = service
-        .ingest_provider_publication(
-            facts_reservation,
-            dataset,
-            ProviderPublicationInput::try_new(binding, revision_plan)?
-                .with_company_identity(company.clone()),
-            CancellationToken::new(),
-        )
-        .await
-        .map_err(|error| format!("SEC Company Facts issuer publication: {error:?}"))?;
+    let (facts, facts_binding, native_claim) =
+        publish_sec_company_facts_logical_fixture(&service, &source, &raw_store, fixture, &company)
+            .await?;
     let instrument = dataset_membership_instrument()?;
-    let deadline = || Instant::now() + Duration::from_secs(30);
+    let deadline = || Instant::now() + Duration::from_secs(if pressure { 120 } else { 30 });
     let cancellation = CancellationToken::new();
     service
         .market_data_instrument_synchronization()
@@ -2301,7 +2614,13 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         &cancellation,
     )?;
     let known = relationship.record().published_at();
-    let pit_limits = PointInTimeLimits::try_new(32, 32, 8, 32, 8 * 1024 * 1024)?;
+    let pit_limits = PointInTimeLimits::try_new(
+        fact_rows.max(512),
+        fact_rows.max(512),
+        8,
+        fact_rows.max(512),
+        if pressure { 128 } else { 8 } * 1024 * 1024,
+    )?;
     let source_request = SecResearchIdentityReadRequest::try_new(
         instrument,
         SecResearchFamily::CompanyFacts,
@@ -2309,7 +2628,7 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         ResearchTemporalCoordinate::calendar_date(known.utc_calendar_date()?),
         PointInTimeRevisionMode::LatestKnown,
         pit_limits,
-        16 * 1024 * 1024,
+        if pressure { 256 } else { 16 } * 1024 * 1024,
     )?;
     let selected = service
         .sec_research_reader()
@@ -2323,6 +2642,31 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
     let SecResearchIdentityOutcome::Exact(exact) = selected.outcome() else {
         return Err("issuer relationship did not resolve fiscal source".into());
     };
+    assert_eq!(exact.decoded_rows().len(), fact_rows);
+    assert_eq!(exact.selected().len(), fact_rows);
+    assert!(exact.filing_xbrl().is_none());
+    let all_rows = exact.decoded_rows().iter().collect::<Result<Vec<_>, _>>()?;
+    assert!(exact.decoded_rows().get(fact_rows - 1)?.is_some());
+    assert!(exact.decoded_rows().get(fact_rows)?.is_none());
+    // A caller cannot substitute another publication binding while preserving issuer identity.
+    let wrong_binding = SecResearchReadRequest::try_new(
+        exact.origin().manifest().clone(),
+        SecResearchFamily::CompanyFacts,
+        digest(249),
+        company_digest,
+        known,
+        source_request.effective_cutoff().clone(),
+        PointInTimeRevisionMode::LatestKnown,
+        pit_limits,
+        if pressure { 256 } else { 16 } * 1024 * 1024,
+    )?;
+    assert!(matches!(
+        service
+            .sec_research_reader()
+            .select(wrong_binding, &raw_store, deadline(), cancellation.clone(),)
+            .await,
+        Err(SecResearchReadError::OriginMismatch)
+    ));
     let original_fact = match exact.decoded_rows().get(0)? {
         Some(ResearchObservation::Fundamental(fact)) => fact,
         _ => return Err("issuer publication has no fundamental observation".into()),
@@ -2334,6 +2678,44 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
     );
     let identity_receipt = selected.identity().receipt().canonical_bytes()?;
     let selection_receipt = exact.receipt();
+    if pressure {
+        // The large regression exercises the complete publication, selected row set and
+        // restart. The original small case above retains the unrelated fiscal build checks.
+        drop(selected);
+        drop(publisher);
+        drop(onboarding);
+        drop(service);
+        drop(raw_store);
+        let reopened = AnalyticalDataService::open(
+            CatalogAuthority::open(config)?,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
+        let reopened_raw = paths.sealed_research_journal_store()?;
+        let replay = reopened
+            .sec_research_reader()
+            .select_by_identity(source_request, &reopened_raw, deadline(), cancellation)
+            .await?;
+        assert_eq!(
+            replay.identity().receipt().canonical_bytes()?,
+            identity_receipt
+        );
+        let SecResearchIdentityOutcome::Exact(replayed) = replay.outcome() else {
+            return Err("reopened complete facts lost their exact issuer relationship".into());
+        };
+        assert_eq!(replayed.receipt(), selection_receipt);
+        assert_eq!(replayed.selected().len(), fact_rows);
+        assert_eq!(
+            replayed
+                .decoded_rows()
+                .iter()
+                .collect::<Result<Vec<_>, _>>()?,
+            all_rows
+        );
+        assert!(replayed.decoded_rows().get(fact_rows)?.is_none());
+        return Ok(());
+    }
     let series = service.dataset_builder().financial_series(
         selected,
         FinancialAmountSelection {
@@ -2435,11 +2817,11 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
             None,
         )?,
         DatasetBuildLimits::try_new(
-            32,
+            fiscal_input_rows,
             1,
             1,
             1,
-            16 * 1024 * 1024,
+            if pressure { 256 } else { 16 } * 1024 * 1024,
             Duration::from_secs(20),
             pit_limits,
             UniverseLimits::try_new(8, 1024 * 1024)?,
@@ -2535,7 +2917,7 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
                 source_request.effective_cutoff().clone(),
                 PointInTimeRevisionMode::LatestKnown,
                 pit_limits,
-                16 * 1024 * 1024,
+                if pressure { 256 } else { 16 } * 1024 * 1024,
             )?,
             &raw_store,
             deadline(),
@@ -2576,7 +2958,7 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
     let replay = reopened
         .sec_research_reader()
         .select_by_identity(
-            source_request,
+            source_request.clone(),
             &reopened_raw,
             deadline(),
             cancellation.clone(),
@@ -2590,6 +2972,13 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         return Err("reopened issuer source lost its exact relationship".into());
     };
     assert_eq!(replayed_facts.receipt(), selection_receipt);
+    assert_eq!(
+        replayed_facts
+            .decoded_rows()
+            .iter()
+            .collect::<Result<Vec<_>, _>>()?,
+        all_rows
+    );
     let saved = reopened
         .analytical_reader()
         .feature_dataset(
@@ -2613,6 +3002,55 @@ async fn exercise_sec_fiscal_epoch_restart() -> TestResult {
         .await?;
     assert_eq!(reopened_epochs.epochs(), &[epoch]);
     assert_eq!(reopened_epochs.epochs()[0].canonical_bytes()?, epoch_bytes);
+    // Exact catalog binding cannot conceal changed original native bytes after restart.
+    // SEC publishes this binding directly with company identity; it does not create the
+    // pending-original custody row queried by provider_logical_origin. Target the exact sealed
+    // native claim retained by the fixture and require the restarted selector's same binding.
+    assert_eq!(
+        replayed_facts.request().provider_binding_digest(),
+        facts_binding
+    );
+    assert_eq!(replayed_facts.origin().manifest(), facts.manifest());
+    let native_path = paths
+        .journal_dir()
+        .join("research-segments")
+        .join(native_claim.relative_reference());
+    let original_permissions = std::fs::metadata(&native_path)?.permissions();
+    let mut writable = original_permissions.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        writable.set_mode(0o600);
+    }
+    #[cfg(not(unix))]
+    writable.set_readonly(false);
+    std::fs::set_permissions(&native_path, writable)?;
+    {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut file = std::fs::OpenOptions::new().write(true).open(&native_path)?;
+        file.seek(SeekFrom::End(-1))?;
+        file.write_all(&[0xff])?;
+        file.sync_all()?;
+    }
+    std::fs::set_permissions(&native_path, original_permissions)?;
+    let corrupted = reopened
+        .sec_research_reader()
+        .select_by_identity(
+            source_request,
+            &reopened_raw,
+            deadline(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(
+            corrupted,
+            Err(SecResearchReadError::RawStore(
+                SealedResearchJournalStoreError::ObjectReceiptMismatch
+            ))
+        ),
+        "an exact issuer binding must reject corrupted CompanyFacts native evidence: {corrupted:?}"
+    );
     drop(reopened_publisher);
     drop(reopened_onboarding);
     Ok(())
@@ -7592,11 +8030,24 @@ struct SecResearchCaptureFixture {
     capture_material: ProviderCaptureMaterial,
     revision_plan: ExtractionRevisionPlan,
     native_rows: Vec<serde_json::Value>,
+    // Large stream fixture input is partitioned before ExtractionBatch admission, as in the
+    // production producer. Never ask the bounded batch API to admit the complete history.
+    stream_records: Option<Vec<ExtractionRecord>>,
 }
 
-fn sec_research_capture_fixture(
+fn sec_research_capture_fixture_with_submissions_rows(
     base_ns: i64,
     company_facts: bool,
+    submissions_rows: usize,
+) -> Result<SecResearchCaptureFixture, Box<dyn Error>> {
+    sec_research_capture_fixture_with_row_counts(base_ns, company_facts, submissions_rows, 257)
+}
+
+fn sec_research_capture_fixture_with_row_counts(
+    base_ns: i64,
+    company_facts: bool,
+    submissions_rows: usize,
+    company_facts_rows: usize,
 ) -> Result<SecResearchCaptureFixture, Box<dyn Error>> {
     let source_id = SourceId::try_from("sec-edgar")?;
     let metadata_revision =
@@ -7608,7 +8059,27 @@ fn sec_research_capture_fixture(
     })?;
     let received_at = Timestamp::from_unix_nanos(base_ns);
     let body = if company_facts {
-        Bytes::from_static(br#"{"cik":320193,"entityName":"Apple Inc.","facts":{"us-gaap":{"NetIncomeLoss":{"units":{"USD":[{"start":"2025-01-01","end":"2025-12-31","val":1000000,"accn":"0000320193-26-000001","fy":2025,"fp":"FY","form":"10-K","filed":"2026-01-30","frame":"CY2025"}]}}}}}"#)
+        {
+            let mut concepts = serde_json::Map::new();
+            for ordinal in 0..company_facts_rows {
+                let concept = if ordinal == 0 {
+                    "NetIncomeLoss".to_owned()
+                } else {
+                    format!("FixtureMetric{ordinal}")
+                };
+                concepts.insert(
+                    concept,
+                    serde_json::json!({"units":{"USD":[{
+                        "start":"2025-01-01", "end":"2025-12-31", "val":1000000,
+                        "accn":"0000320193-26-000001", "fy":2025, "fp":"FY", "form":"10-K",
+                        "filed":"2026-01-30", "frame":"CY2025"
+                    }]}}),
+                );
+            }
+            Bytes::from(serde_json::to_vec(&serde_json::json!({
+                "cik":320193, "entityName":"Apple Inc.", "facts":{"us-gaap":concepts}
+            }))?)
+        }
     } else {
         Bytes::from_static(b"{\"cik\":\"0000320193\",\"filings\":{\"recent\":\"bounded-fixture\"}}")
     };
@@ -7670,8 +8141,13 @@ fn sec_research_capture_fixture(
     )?;
     let request = ExtractionRequest::try_new(
         object,
-        NonZeroU32::new(5).ok_or("nonzero SEC record ceiling")?,
-        NonZeroU64::new(1024 * 1024).ok_or("nonzero SEC byte ceiling")?,
+        NonZeroU32::new(if company_facts {
+            u32::try_from(company_facts_rows)?
+        } else {
+            u32::try_from(submissions_rows)?
+        })
+        .ok_or("nonzero SEC record ceiling")?,
+        NonZeroU64::new(64 * 1024 * 1024).ok_or("nonzero SEC byte ceiling")?,
         Timestamp::from_unix_nanos(
             base_ns
                 .checked_add(5_000_000_000)
@@ -7726,6 +8202,13 @@ fn sec_research_capture_fixture(
             "sec-filing-future-effective-v1",
         ),
     ];
+    let rows = if company_facts {
+        vec![rows[0]; company_facts_rows]
+    } else {
+        let mut expanded = rows.to_vec();
+        expanded.resize(submissions_rows, rows[0]);
+        expanded
+    };
     let mut records = Vec::new();
     let mut revision_evidence = Vec::new();
     let mut native_rows = Vec::new();
@@ -7735,9 +8218,18 @@ fn sec_research_capture_fixture(
     for (ordinal, (accession, form, effective, available, received, ingested, source_version)) in
         rows.into_iter().enumerate()
     {
-        if company_facts && ordinal != 0 {
-            break;
-        }
+        let extra_accession = format!("0000320193-26-{:06}", ordinal + 1);
+        let extra_version = format!("sec-filing-current-{ordinal}");
+        let accession = if !company_facts && ordinal >= 5 {
+            extra_accession.as_str()
+        } else {
+            accession
+        };
+        let source_version = if !company_facts && ordinal >= 5 {
+            extra_version.as_str()
+        } else {
+            source_version
+        };
         let filing = sec_filing_observation(
             accession,
             form,
@@ -7774,7 +8266,11 @@ fn sec_research_capture_fixture(
                 market_squawk_domain::CompanyObservationSubject::Issuer(
                     SourceIdentifier::try_from("0000320193")?,
                 ),
-                SourceIdentifier::try_from("us-gaap:NetIncomeLoss")?,
+                SourceIdentifier::try_from(if ordinal == 0 {
+                    "us-gaap:NetIncomeLoss".to_owned()
+                } else {
+                    format!("us-gaap:FixtureMetric{ordinal}")
+                })?,
                 Decimal::from(1_000_000),
                 FundamentalFactContext::try_new(FundamentalFactContextInput {
                     schema_version: SchemaVersion::CURRENT,
@@ -7835,14 +8331,29 @@ fn sec_research_capture_fixture(
                 source_version.as_bytes(),
             )?,
         )?);
-        native_rows.push(serde_json::json!({
+        native_rows.push(if company_facts {
+            let ResearchObservation::Fundamental(fact) = &observation else { unreachable!() };
+            let context = fact.fact_context();
+            serde_json::json!({ "family":"company_fact", "occurrence": {
+                "concept":fact.concept(), "unit":context.unit(), "source_ordinal":0,
+                "value":fact.value(), "accession":context.accession(), "form":context.filing_form(),
+                "filed_on":context.filed_on(),
+                "period":{"start":context.period().start(), "end":context.period().end()},
+                "frame":context.frame(), "fiscal_year":context.fiscal_year(), "fiscal_period":context.fiscal_period()
+            }})
+        } else { serde_json::json!({
             "cik": "0000320193",
             "accession": accession,
             "form": form,
             "row_ordinal": ordinal,
             "source_version": source_version,
-        }));
+        }) });
     }
+    let (records, stream_records) = if company_facts && company_facts_rows > 257 {
+        (records[..256].to_vec(), Some(records))
+    } else {
+        (records, None)
+    };
     let batch = ExtractionBatch::try_new(&request, records)?
         .try_bind_provider_capture(capture_material.receipt())?;
     Ok(SecResearchCaptureFixture {
@@ -7850,6 +8361,7 @@ fn sec_research_capture_fixture(
         capture_material,
         revision_plan: ExtractionRevisionPlan::try_new_with_native_lineage(revision_evidence)?,
         native_rows,
+        stream_records,
     })
 }
 

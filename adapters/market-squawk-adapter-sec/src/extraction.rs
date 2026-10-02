@@ -33,7 +33,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::normalize::{
     SecFilingXbrlNormalization, compare_company_facts, compare_filings,
-    normalize_filing_xbrl_with_cancellation,
+    normalize_company_fact_occurrence, normalize_filing_xbrl_with_cancellation,
+    same_company_fact_family,
 };
 use crate::product::{SEC_FILING_XBRL_DATASET_PREFIX, SecFilingXbrlCoordinates};
 use crate::xbrl::{
@@ -297,7 +298,7 @@ impl SecFilingXbrlCaptureHandoff {
         deadline: Timestamp,
         cancellation: CancellationToken,
         scratch_parent: &std::path::Path,
-    ) -> Result<(SecFilingXbrlExtractionStream, ProviderCaptureMaterial), SecClientError> {
+    ) -> Result<(SecResearchExtractionStream, ProviderCaptureMaterial), SecClientError> {
         extract_filing_xbrl_handoff(
             self.pending,
             self.capture_material,
@@ -528,6 +529,51 @@ impl SecEdgarSource {
             )?);
         }
         ExtractionRevisionPlan::try_new_with_native_lineage(evidence).map_err(Into::into)
+    }
+
+    /// Opens complete CompanyFacts as bounded canonical/native chunks from the exact discovered
+    /// capture. Whole-input parsing keeps its existing admission; chunk size never limits the
+    /// complete occurrence set. Raw material remains inseparable from its admitted stream.
+    pub fn extract_company_facts_stream(
+        &self,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        material: ProviderCaptureMaterial,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<
+        '_,
+        Result<(SecResearchExtractionStream, ProviderCaptureMaterial), ExtractionSourceError>,
+    > {
+        let raw_store = self.raw_store();
+        let source_id = self.metadata().source_id().clone();
+        Box::pin(async move {
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
+            let remaining = deadline_remaining(request.deadline())?;
+            let worker_cancellation = cancellation.child_token();
+            let worker_authority = authority.clone();
+            let worker = self.run_validation_blocking(&worker_cancellation, move |token| {
+                let stream = company_facts_stream_blocking(
+                    request,
+                    raw_store,
+                    source_id,
+                    worker_authority,
+                    &material,
+                    token,
+                )?;
+                Ok((stream, material))
+            });
+            tokio::pin!(worker);
+            tokio::select! {
+                result = &mut worker => {
+                    let result = result.inspect_err(|error| trace_protocol_failure(error, "extraction", SecResearchDatasetKind::CompanyFacts)).map_err(map_client_error)?;
+                    self.validate_authority(&authority).map_err(map_client_error)?;
+                    Ok(result)
+                },
+                () = tokio::time::sleep(remaining) => { worker_cancellation.cancel(); let _ = worker.await; Err(ExtractionSourceError::DeadlineExceeded) },
+                () = cancellation.cancelled() => { worker_cancellation.cancel(); let _ = worker.await; Err(ExtractionSourceError::Cancelled) },
+            }
+        })
     }
 
     /// Extracts SEC analytical records with company identity from the same exact source bytes.
@@ -767,7 +813,7 @@ fn extract_filing_xbrl_handoff(
     deadline: Timestamp,
     cancellation: &CancellationToken,
     scratch_parent: &std::path::Path,
-) -> Result<(SecFilingXbrlExtractionStream, ProviderCaptureMaterial), SecClientError> {
+) -> Result<(SecResearchExtractionStream, ProviderCaptureMaterial), SecClientError> {
     authority.validate_current()?;
     if cancellation.is_cancelled() {
         return Err(SecClientError::Cancelled);
@@ -922,10 +968,10 @@ fn extract_filing_xbrl_handoff(
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
     Ok((
-        SecFilingXbrlExtractionStream {
+        SecResearchExtractionStream {
             authority,
             request,
-            normalized,
+            normalized: SecResearchNormalization::FilingXbrl(normalized),
             company_identity,
             pending_record: None,
             emitted: 0,
@@ -936,28 +982,197 @@ fn extract_filing_xbrl_handoff(
     ))
 }
 
-/// Complete validated filing producer. Each yielded range is bounded; EOF is mandatory before
-/// the common logical-publication owner can seal the entire filing's canonical identity.
 #[derive(Debug)]
-pub struct SecFilingXbrlExtractionStream {
+enum SecResearchNormalization {
+    FilingXbrl(SecFilingXbrlNormalization),
+    CompanyFacts(SecCompanyFactsNormalization),
+}
+
+impl SecResearchNormalization {
+    const fn family(&self) -> SecResearchDatasetKind {
+        match self {
+            Self::FilingXbrl(_) => SecResearchDatasetKind::FilingXbrl,
+            Self::CompanyFacts(_) => SecResearchDatasetKind::CompanyFacts,
+        }
+    }
+    const fn total_records(&self) -> usize {
+        match self {
+            Self::FilingXbrl(value) => value.numeric_fact_count(),
+            Self::CompanyFacts(value) => value.ordered.len(),
+        }
+    }
+    const fn capture_page_ordinal(&self) -> u16 {
+        match self {
+            Self::FilingXbrl(_) => 1,
+            Self::CompanyFacts(_) => 0,
+        }
+    }
+    fn try_next_observation(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ResearchObservation>, SecNormalizationError> {
+        match self {
+            Self::FilingXbrl(value) => value.try_next_observation(cancellation),
+            Self::CompanyFacts(value) => value.try_next_observation(cancellation),
+        }
+    }
+    fn native_for_batch(
+        &mut self,
+        batch: &ExtractionBatch,
+        start: usize,
+        maximum_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderNativeLineageBatch, market_squawk_sources::ProviderNativeLineageError> {
+        match self {
+            Self::FilingXbrl(value) => {
+                value.native_for_batch(batch, start, maximum_retained_bytes, cancellation)
+            }
+            Self::CompanyFacts(value) => {
+                value.native_for_batch(batch, start, maximum_retained_bytes, cancellation)
+            }
+        }
+    }
+}
+
+/// The bounded parsed source remains owned while canonical/native rows are emitted together.
+/// Only source-row indices and the preceding family revision cross chunk boundaries; there is
+/// no complete canonical-observation vector and no per-chunk reset of revision ordering.
+#[derive(Debug)]
+struct SecCompanyFactsNormalization {
+    source_id: SourceId,
+    retrieved: RetrievedCompanyFacts,
+    ingested_at: Timestamp,
+    ordered: Vec<usize>,
+    next: usize,
+    family_revision: u32,
+}
+impl SecCompanyFactsNormalization {
+    fn try_new(
+        source_id: SourceId,
+        retrieved: RetrievedCompanyFacts,
+        ingested_at: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, SecClientError> {
+        if cancellation.is_cancelled() {
+            return Err(SecClientError::Cancelled);
+        }
+        let occurrences = retrieved.document().occurrences();
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(occurrences.len())
+            .map_err(|_| SecClientError::AllocationFailed)?;
+        ordered.extend(0..occurrences.len());
+        ordered.sort_unstable_by(|left, right| {
+            compare_company_facts(&occurrences[*left], &occurrences[*right])
+        });
+        Ok(Self {
+            source_id,
+            retrieved,
+            ingested_at,
+            ordered,
+            next: 0,
+            family_revision: 0,
+        })
+    }
+    fn try_next_observation(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ResearchObservation>, SecNormalizationError> {
+        if cancellation.is_cancelled() {
+            return Err(SecNormalizationError::Cancelled);
+        }
+        let Some(&ordinal) = self.ordered.get(self.next) else {
+            return Ok(None);
+        };
+        let occurrences = self.retrieved.document().occurrences();
+        let occurrence = &occurrences[ordinal];
+        if self.next > 0
+            && same_company_fact_family(&occurrences[self.ordered[self.next - 1]], occurrence)
+        {
+            self.family_revision = self
+                .family_revision
+                .checked_add(1)
+                .ok_or(SecNormalizationError::RevisionOverflow)?;
+        } else {
+            self.family_revision = 1;
+        }
+        let observation = normalize_company_fact_occurrence(
+            &self.source_id,
+            &self.retrieved,
+            occurrence,
+            self.family_revision,
+            self.ingested_at,
+        )?;
+        self.next += 1;
+        Ok(Some(observation))
+    }
+    fn native_for_batch(
+        &self,
+        batch: &ExtractionBatch,
+        start: usize,
+        maximum_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderNativeLineageBatch, market_squawk_sources::ProviderNativeLineageError> {
+        use market_squawk_sources::ProviderNativeLineageError;
+        let end = start
+            .checked_add(batch.records().len())
+            .ok_or(ProviderNativeLineageError::AlignmentMismatch)?;
+        let ordered = self
+            .ordered
+            .get(start..end)
+            .ok_or(ProviderNativeLineageError::AlignmentMismatch)?;
+        let document = self.retrieved.document();
+        let mut native = ProviderNativeLineageBatchBuilder::try_new_bounded(
+            ProviderNativeLineageImplementation::SecEdgarV1,
+            batch,
+            maximum_retained_bytes,
+        )?;
+        native.try_set_batch_sidecar(&SecCompanyFactsNativeBatchV1 {
+            version: 1,
+            family: "company_facts",
+            dataset: batch.request().object().dataset(),
+            cik: document.cik(),
+            entity_name: document.entity_name(),
+        })?;
+        for ordinal in ordered {
+            if cancellation.is_cancelled() {
+                return Err(ProviderNativeLineageError::SerializationFailure);
+            }
+            native.try_push(&SecCompanyFactsNativeRowV1 {
+                family: "company_fact",
+                occurrence: &document.occurrences()[*ordinal],
+            })?;
+        }
+        native.finish()
+    }
+}
+
+/// Complete validated SEC research producer. Each yielded range is bounded; EOF is mandatory
+/// before the common logical-publication owner seals the complete family canonical identity.
+#[derive(Debug)]
+pub struct SecResearchExtractionStream {
     authority: ExtractionAuthority,
     request: ExtractionRequest,
-    normalized: SecFilingXbrlNormalization,
+    normalized: SecResearchNormalization,
     company_identity: CompanyIdentityObservation,
     pending_record: Option<ExtractionRecord>,
     emitted: usize,
     finished: bool,
     maximum_working_bytes: usize,
 }
-impl SecFilingXbrlExtractionStream {
+impl SecResearchExtractionStream {
     pub const fn request(&self) -> &ExtractionRequest {
         &self.request
     }
     pub const fn total_records(&self) -> usize {
-        self.normalized.numeric_fact_count()
+        self.normalized.total_records()
     }
     pub const fn company_identity(&self) -> &CompanyIdentityObservation {
         &self.company_identity
+    }
+    /// Returns the independently evidenced family represented by this complete stream.
+    pub const fn family(&self) -> SecResearchDatasetKind {
+        self.normalized.family()
     }
     pub const fn emitted_records(&self) -> usize {
         self.emitted
@@ -1042,9 +1257,102 @@ impl SecFilingXbrlExtractionStream {
             batch,
             company_identity: Some(self.company_identity.clone()),
             native_lineage,
-            row_capture_page_ordinals: vec![1; count],
+            row_capture_page_ordinals: vec![self.normalized.capture_page_ordinal(); count],
         }))
     }
+}
+
+pub(crate) fn company_facts_stream_blocking(
+    request: ExtractionRequest,
+    raw_store: Arc<RawEvidenceStore>,
+    source_id: SourceId,
+    authority: ExtractionAuthority,
+    material: &ProviderCaptureMaterial,
+    cancellation: &CancellationToken,
+) -> Result<SecResearchExtractionStream, SecClientError> {
+    authority.validate_current()?;
+    if cancellation.is_cancelled() {
+        return Err(SecClientError::Cancelled);
+    }
+    let dataset = SecResearchDataset::try_from_identifier(request.object().dataset())?;
+    let capture = material.receipt();
+    if dataset.kind() != SecResearchDatasetKind::CompanyFacts
+        || authority.metadata().source_id() != &source_id
+        || request.object().source_id() != &source_id
+        || request.object().metadata_revision() != authority.metadata().revision()
+        || request.object().object_id() != dataset.source_object_id()
+        || capture.source_id() != &source_id
+        || capture.metadata_revision() != authority.metadata().revision()
+        || capture.dataset() != dataset.dataset()
+        || capture.pages().len() != 1
+        || capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || SourceObjectCaptureIdentity::try_from_capture(capture)?
+            != request.object().capture_identity()
+        || capture.pages()[0].body_digest() != request.object().evidence().content_digest()
+    {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+    let maximum = request
+        .max_bytes()
+        .min(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES);
+    let bytes = raw_store.read_verified_bounded_cancellable(
+        &request.object().evidence().content_digest(),
+        maximum,
+        cancellation,
+    )?;
+    let parser_limits = request_parser_limits(&request, bytes.len(), bytes.capacity())?;
+    let received_at = request.object().effective_interval().starts_at();
+    // Representation availability remains its first observed content clock. A physical
+    // response has its own receipt clock: the first response precedes representation
+    // persistence, while an unchanged later response follows it. Neither clock replaces
+    // the other; both must precede this admitted extraction and its absolute deadline.
+    let observed_at = crate::client::system_timestamp()?;
+    if received_at > observed_at
+        || received_at > request.deadline()
+        || capture.pages()[0].received_at() > observed_at
+        || capture.pages()[0].received_at() > request.deadline()
+        || capture.pages()[0].body_bytes() != bytes.len() as u64
+    {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+    let retrieved = RetrievedCompanyFacts::restored(
+        bytes,
+        request.object().evidence().content_digest(),
+        received_at,
+        AvailabilityEvidence::LocalFirstObserved {
+            observed_at: received_at,
+        },
+        parser_limits,
+        cancellation,
+    )?;
+    if retrieved.document().cik().as_str() != dataset.cik() {
+        return Err(SecClientError::ResponseCikMismatch);
+    }
+    let ingested_at = crate::client::system_timestamp()?;
+    let company_identity = company_identity_from_company_facts(
+        &request,
+        &source_id,
+        &retrieved,
+        ingested_at,
+        cancellation,
+    )?;
+    let normalized =
+        SecCompanyFactsNormalization::try_new(source_id, retrieved, ingested_at, cancellation)?;
+    if normalized.ordered.is_empty() {
+        return Err(SecClientError::InvalidCompositeRepresentation);
+    }
+    authority.validate_current()?;
+    Ok(SecResearchExtractionStream {
+        authority,
+        request,
+        normalized: SecResearchNormalization::CompanyFacts(normalized),
+        company_identity,
+        pending_record: None,
+        emitted: 0,
+        finished: false,
+        maximum_working_bytes: usize::try_from(maximum)
+            .map_err(|_| SecClientError::ResponseTooLarge)?,
+    })
 }
 
 fn extract_blocking(
@@ -1549,9 +1857,7 @@ fn company_identity_from_company_facts(
         sic: None,
         sic_description: None,
         associations: Vec::new(),
-        parent_ingest_payload_evidence: ExactPayloadEvidence::from_content_digest(
-            request.object().evidence().content_digest(),
-        ),
+        parent_ingest_payload_evidence: request.object().evidence().clone(),
         identity_payload_evidence: retrieved_payload_evidence(identity_raw)?,
         received_at: identity_raw.received_at(),
         availability: identity_raw.availability().clone(),

@@ -57,6 +57,7 @@ function productPort(transport: ProductTransport): ProductTransport {
   return Object.freeze({
     query: transport.query.bind(transport),
     marketHistoryPreparation: transport.marketHistoryPreparation.bind(transport),
+    investmentFinancialPreparation: transport.investmentFinancialPreparation.bind(transport),
     analyticalController: transport.analyticalController.bind(transport),
     modelProducts: transport.modelProducts.bind(transport),
     backtestProducts: transport.backtestProducts.bind(transport),
@@ -157,6 +158,18 @@ class TauriTransport implements ProductTransport, SystemTransport {
     const value = request.action === "get" || request.action === "reconcileStart"
       ? await this.read("market_history_preparation", args, options)
       : await invoke("market_history_preparation", args)
+    return applicationResultSchema.parse(value)
+  }
+
+  async investmentFinancialPreparation(
+    request: Parameters<ProductTransport["investmentFinancialPreparation"]>[0],
+    confirmed = false,
+    options?: ReadOptions,
+  ) {
+    const args = { request, confirmed }
+    const value = request.action === "get" || request.action === "reconcileStart"
+      ? await this.read("investment_financial_preparation", args, options)
+      : await invoke("investment_financial_preparation", args)
     return applicationResultSchema.parse(value)
   }
 
@@ -496,6 +509,10 @@ class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
   }
 
   systemQuery(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  investmentFinancialPreparation(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

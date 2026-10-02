@@ -19,6 +19,7 @@ fn main() {
         "governance_query",
         "import_provider_credential_bundle",
         "installation_control",
+        "investment_financial_preparation",
         "job_control",
         "market_history_preparation",
         "mcp_client_control",

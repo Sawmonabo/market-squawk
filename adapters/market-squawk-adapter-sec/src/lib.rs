@@ -46,7 +46,7 @@ pub use composite::SecCompositeBounds;
 pub use evidence_store::{RawEvidenceError, RawEvidenceStore};
 pub use extraction::{
     SecDiscoveryResult, SecExtractionResult, SecFilingXbrlCaptureHandoff,
-    SecFilingXbrlExtractionStream,
+    SecResearchExtractionStream,
 };
 pub use json::{
     CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument, SecFiling, SecFormerName,

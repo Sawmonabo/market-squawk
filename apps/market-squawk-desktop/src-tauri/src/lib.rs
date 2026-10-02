@@ -46,8 +46,9 @@ use input_staging::{
 use mcp_clients::{mcp_client_control, mcp_status};
 use service_client::{
     analysis_control, backtest_products, dashboard_query, decision_control, fair_value_control,
-    governance_control, governance_query, job_control, market_history_preparation, model_control,
-    model_products, operations_control, paper_control, research_control, source_control,
+    governance_control, governance_query, investment_financial_preparation, job_control,
+    market_history_preparation, model_control, model_products, operations_control, paper_control,
+    research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -283,6 +284,15 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             window.visible = false;
         }
     }
+    #[cfg(all(debug_assertions, feature = "desktop-automation"))]
+    if args.webdriver_port.is_some() {
+        // Background native checks must allow WebKit to paint charts without taking focus.
+        // Ordinary launches retain the platform's energy-saving scheduling policy.
+        for window in &mut context.config_mut().app.windows {
+            window.background_throttling =
+                Some(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+        }
+    }
     let builder = tauri::Builder::default();
     #[cfg(all(debug_assertions, feature = "desktop-automation"))]
     let builder = match args.webdriver_port {
@@ -316,6 +326,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             governance_query,
             job_control,
             market_history_preparation,
+            investment_financial_preparation,
             installation_control,
             import_provider_credential_bundle,
             mcp_client_control,

@@ -11,6 +11,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
+import { FinancialPreparation } from "./financial-preparation"
 import {
   parseInvestmentFinancialsResult,
   type InvestmentFinancialDate,
@@ -46,10 +47,25 @@ export function InvestmentFinancials(props: FinancialProps) {
       <p role="status" className="text-sm text-muted-foreground">Financial details are not available in this app session.</p>
     </section>
   }
+  return <SelectedFinancials key={`${props.bootstrap.productSessionToken}:${props.selectionToken}`} {...props} />
+}
+
+function SelectedFinancials(props: FinancialProps) {
+  const [preparedRevision, setPreparedRevision] = React.useState(0)
+  const [preparationCompleted, setPreparationCompleted] = React.useState(false)
+  const onPrepared = React.useCallback(async () => {
+    setPreparationCompleted(true)
+    setPreparedRevision((value) => value + 1)
+  }, [])
+  const onSettled = React.useCallback(async () => {
+    setPreparationCompleted(false)
+    setPreparedRevision((value) => value + 1)
+  }, [])
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment financial information">
     <h2 className="text-base font-semibold">Financial information</h2>
     <p className="mt-1 text-xs text-muted-foreground">Reported company values, with their reporting periods and source context.</p>
-    <Tabs.Root key={`${props.bootstrap.productSessionToken}:${props.selectionToken}`} defaultValue="facts" activationMode="manual" className="mt-4">
+    <div className="mt-4"><FinancialPreparation {...props} onPrepared={onPrepared} onSettled={onSettled} /></div>
+    <Tabs.Root defaultValue="facts" activationMode="manual" className="mt-4">
       <Tabs.List aria-label="Financial sections" className="flex flex-wrap gap-1 border-b border-border pb-2">
         {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Trigger key={section} value={section}
           className="rounded-md px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring data-[state=active]:bg-primary/10 data-[state=active]:text-primary">
@@ -57,14 +73,16 @@ export function InvestmentFinancials(props: FinancialProps) {
         </Tabs.Trigger>)}
       </Tabs.List>
       {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Content key={section} value={section} className="pt-4 focus-visible:outline-ring">
-        <FinancialSectionRead {...props} section={section} />
+        <FinancialSectionRead {...props} section={section} preparedRevision={preparedRevision} preparationCompleted={preparationCompleted} />
       </Tabs.Content>)}
     </Tabs.Root>
   </section>
 }
 
-function FinancialSectionRead({ selectionToken, section, bootstrap, transport }: FinancialProps & {
+function FinancialSectionRead({ selectionToken, section, bootstrap, transport, preparedRevision, preparationCompleted }: FinancialProps & {
   section: InvestmentFinancialSection
+  preparedRevision: number
+  preparationCompleted: boolean
 }) {
   const queryClient = useQueryClient()
   const navigation = useCursorNavigation()
@@ -75,6 +93,8 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
   const [revision, setRevision] = React.useState(0)
   const [releasing, setReleasing] = React.useState(false)
   const [releaseFailed, setReleaseFailed] = React.useState(false)
+  const [updateAvailable, setUpdateAvailable] = React.useState(false)
+  const seenPreparedRevision = React.useRef(preparedRevision)
   const closeRead = React.useCallback(async (readToken: string) => {
     try {
       await transport.query({ query: "closeInvestmentFinancials", selectionToken, readToken })
@@ -133,7 +153,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
     },
   })
 
-  const refresh = async () => {
+  const refresh = React.useCallback(async () => {
     setReleasing(true)
     setReleaseFailed(false)
     epoch.current += 1
@@ -145,10 +165,19 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
     }
     if (!alive.current) return
     snapshot.current = undefined
+    setUpdateAvailable(false)
     navigation.restart()
     setRevision((value) => value + 1)
     setReleasing(false)
-  }
+  }, [queryClient, queryKey, closeRead, navigation])
+  React.useEffect(() => {
+    if (seenPreparedRevision.current === preparedRevision) return
+    seenPreparedRevision.current = preparedRevision
+    // An already paged read keeps its original snapshot and exact cursor. An
+    // inactive tab mounts a new reader and obtains fresh retained information.
+    if (navigation.page === 1) void refresh()
+    else setUpdateAvailable(true)
+  }, [preparedRevision, navigation.page, refresh])
   const result = page.data ?? lastChecked.current
   const busy = page.isFetching || releasing
   const showingPrior = page.isPlaceholderData || page.isError || releasing
@@ -160,6 +189,9 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport }:
       <Button variant="outline" size="sm" disabled={busy} onClick={() => void refresh()}>Refresh this section</Button>
     </div>
     <div className="mt-2 min-h-16 text-xs leading-5">
+    {updateAvailable ? <p role="status" className="text-muted-foreground">{preparationCompleted
+      ? "Updated financial information is ready. Refresh this section to open it."
+      : "Financial preparation ended. Refresh this section to check for saved information."}</p> : null}
     {releaseFailed ? <p role="alert" className="text-destructive">The previous financial information could not be released. Try refreshing this section.</p>
       : page.isError ? <div className="flex items-start justify-between gap-3">
       <p role="alert" className="text-destructive">{result

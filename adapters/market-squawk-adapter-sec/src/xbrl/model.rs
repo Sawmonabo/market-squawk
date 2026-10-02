@@ -34,13 +34,6 @@ pub(crate) const MAX_TAXONOMY_REFERENCES: usize = 256;
 pub(crate) const MAX_TAXONOMY_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_TAXONOMY_SET_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_TAXONOMY_GRAPH_SCAN_BYTES: u64 = 128 * 1024 * 1024;
-const EARLIEST_SEC_TAXONOMY_YEAR: u16 = 2005;
-const EARLIEST_FASB_TAXONOMY_YEAR: u16 = 2011;
-const EARLIEST_LEGACY_XBRL_US_GAAP_YEAR: u16 = 2009;
-const LATEST_LEGACY_XBRL_US_GAAP_YEAR: u16 = 2010;
-const LATEST_CATALOGUED_TAXONOMY_YEAR: u16 = 2026;
-const XBRL_STANDARD_RELEASE_YEARS: &[u16] =
-    &[2003, 2005, 2006, 2008, 2013, 2014, 2016, 2017, 2021, 2023];
 const XML_SCHEMA_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema";
 const XBRL_LINK_NAMESPACE: &str = "http://www.xbrl.org/2003/linkbase";
 const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
@@ -1622,22 +1615,16 @@ fn pinned_taxonomy_release(
             format!("sec-filing-extension.{}", digest_prefix(digest, 8))
         }
         SecXbrlTaxonomyOrigin::SecTaxonomy => {
-            if segments.len() < 3 || !is_sec_taxonomy_family(segments[0]) {
+            if segments.len() < 3 || !is_taxonomy_family(segments[0]) {
                 return Err(SecXbrlError::InvalidTaxonomySet);
             }
-            let directory_release = admitted_taxonomy_release(
-                segments[1],
-                EARLIEST_SEC_TAXONOMY_YEAR,
-                LATEST_CATALOGUED_TAXONOMY_YEAR,
-            )?;
+            let directory_release = admitted_taxonomy_release(segments[1])?;
             let release = taxonomy_artifact_release(
                 segments
                     .last()
                     .copied()
                     .ok_or(SecXbrlError::InvalidTaxonomySet)?,
                 directory_release,
-                EARLIEST_SEC_TAXONOMY_YEAR,
-                LATEST_CATALOGUED_TAXONOMY_YEAR,
             )?;
             format!("sec-{}-{release}", segments[0])
         }
@@ -1645,34 +1632,24 @@ fn pinned_taxonomy_release(
             if !matches!(segments.as_slice(), ["us-gaap", _, ..]) {
                 return Err(SecXbrlError::InvalidTaxonomySet);
             }
-            let directory_release = admitted_taxonomy_release(
-                segments[1],
-                EARLIEST_LEGACY_XBRL_US_GAAP_YEAR,
-                LATEST_LEGACY_XBRL_US_GAAP_YEAR,
-            )?;
+            let directory_release = admitted_taxonomy_release(segments[1])?;
             let release = taxonomy_artifact_release(
                 segments
                     .last()
                     .copied()
                     .ok_or(SecXbrlError::InvalidTaxonomySet)?,
                 directory_release,
-                EARLIEST_LEGACY_XBRL_US_GAAP_YEAR,
-                LATEST_LEGACY_XBRL_US_GAAP_YEAR,
             )?;
             format!("xbrl-us-us-gaap-{release}")
         }
         SecXbrlTaxonomyOrigin::FasbTaxonomy => {
-            if !matches!(segments.as_slice(), ["us-gaap", _, ..]) {
+            if segments.len() < 3 || !is_taxonomy_family(segments[0]) {
                 return Err(SecXbrlError::InvalidTaxonomySet);
             }
             let directory_release = if segments[1] == "2019_with_2019_dei" {
                 segments[1]
             } else {
-                admitted_taxonomy_release(
-                    segments[1],
-                    EARLIEST_FASB_TAXONOMY_YEAR,
-                    LATEST_CATALOGUED_TAXONOMY_YEAR,
-                )?
+                admitted_taxonomy_release(segments[1])?
             };
             let release = taxonomy_artifact_release(
                 segments
@@ -1680,10 +1657,8 @@ fn pinned_taxonomy_release(
                     .copied()
                     .ok_or(SecXbrlError::InvalidTaxonomySet)?,
                 directory_release,
-                EARLIEST_FASB_TAXONOMY_YEAR,
-                LATEST_CATALOGUED_TAXONOMY_YEAR,
             )?;
-            format!("fasb-us-gaap-{release}")
+            format!("fasb-{}-{release}", segments[0])
         }
         SecXbrlTaxonomyOrigin::XbrlStandard => xbrl_standard_release(&segments)?,
         SecXbrlTaxonomyOrigin::W3cStandard => {
@@ -1739,12 +1714,7 @@ fn validate_pinned_namespace(
         SecXbrlTaxonomyOrigin::SecFiling => true,
         SecXbrlTaxonomyOrigin::SecTaxonomy => {
             matches!(parsed.host_str(), Some("xbrl.sec.gov" | "xbrl.us"))
-                && namespace_segments.len() >= 2
-                && release
-                    .strip_prefix(&format!("sec-{}-", namespace_segments[0]))
-                    .is_some_and(|request_release| {
-                        taxonomy_releases_compatible(request_release, namespace_segments[1])
-                    })
+                && publisher_namespace_matches(request, &namespace_segments, "sec")?
         }
         SecXbrlTaxonomyOrigin::XbrlUsLegacyTaxonomy => {
             matches!(parsed.host_str(), Some("xbrl.us" | "taxonomies.xbrl.us"))
@@ -1758,13 +1728,7 @@ fn validate_pinned_namespace(
         }
         SecXbrlTaxonomyOrigin::FasbTaxonomy => {
             matches!(parsed.host_str(), Some("fasb.org" | "xbrl.fasb.org"))
-                && namespace_segments.len() >= 2
-                && namespace_segments[0] == "us-gaap"
-                && release
-                    .strip_prefix("fasb-us-gaap-")
-                    .is_some_and(|request_release| {
-                        taxonomy_releases_compatible(request_release, namespace_segments[1])
-                    })
+                && publisher_namespace_matches(request, &namespace_segments, "fasb")?
         }
         SecXbrlTaxonomyOrigin::XbrlStandard => {
             if !matches!(parsed.host_str(), Some("www.xbrl.org" | "xbrl.org")) {
@@ -1798,6 +1762,41 @@ fn validate_pinned_namespace(
     }
 }
 
+// Publisher namespaces use a release-qualified family. A component schema may declare its
+// own exact file family (for example ecd/2025/ecd-sub-2025.xsd -> ecd-sub/2025), rather
+// than the containing directory's family. Neither a prefix match nor a different year suffices.
+fn publisher_namespace_matches(
+    request: &SecXbrlTaxonomyArtifactRequest,
+    namespace_segments: &[&str],
+    publisher: &str,
+) -> Result<bool, SecXbrlError> {
+    let [namespace_family, namespace_release] = namespace_segments else {
+        return Ok(false);
+    };
+    if !is_taxonomy_family(namespace_family) {
+        return Ok(false);
+    }
+    admitted_taxonomy_release(namespace_release)?;
+    let locator = Url::parse(request.logical_locator.as_str())
+        .map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
+    let mut segments = locator
+        .path_segments()
+        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+    let family = segments.next().ok_or(SecXbrlError::InvalidTaxonomySet)?;
+    let release = request
+        .pinned_release
+        .as_str()
+        .strip_prefix(&format!("{publisher}-{family}-"))
+        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+    let file = locator
+        .path()
+        .rsplit('/')
+        .next()
+        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+    Ok(taxonomy_releases_compatible(release, namespace_release)
+        && (*namespace_family == family || file == format!("{namespace_family}-{release}.xsd")))
+}
+
 fn filing_directory(filing: &Url) -> Result<String, SecXbrlError> {
     filing
         .path()
@@ -1806,11 +1805,7 @@ fn filing_directory(filing: &Url) -> Result<String, SecXbrlError> {
         .ok_or(SecXbrlError::InvalidTaxonomySet)
 }
 
-fn admitted_taxonomy_release<'a>(
-    value: &'a str,
-    minimum: u16,
-    maximum: u16,
-) -> Result<&'a str, SecXbrlError> {
+fn admitted_taxonomy_release(value: &str) -> Result<&str, SecXbrlError> {
     let year_text = value.get(..4).ok_or(SecXbrlError::InvalidTaxonomySet)?;
     let quarter = value
         .get(4..)
@@ -1822,20 +1817,12 @@ fn admitted_taxonomy_release<'a>(
     {
         return Err(SecXbrlError::InvalidTaxonomySet);
     }
-    let year = year_text
-        .parse::<u16>()
-        .map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
-    if !(minimum..=maximum).contains(&year) {
-        return Err(SecXbrlError::InvalidTaxonomySet);
-    }
     Ok(value)
 }
 
 fn taxonomy_artifact_release<'a>(
     file: &'a str,
     directory_release: &'a str,
-    minimum: u16,
-    maximum: u16,
 ) -> Result<&'a str, SecXbrlError> {
     let stem = file
         .strip_suffix(".xsd")
@@ -1848,9 +1835,7 @@ fn taxonomy_artifact_release<'a>(
                 .len()
                 .checked_sub(length)
                 .and_then(|start| stem.get(start..))?;
-            admitted_taxonomy_release(release, minimum, maximum)
-                .ok()
-                .map(|_| release)
+            admitted_taxonomy_release(release).ok().map(|_| release)
         })
         .unwrap_or(directory_release);
     if taxonomy_releases_compatible(candidate, directory_release) {
@@ -1878,18 +1863,10 @@ fn xbrl_standard_release(segments: &[&str]) -> Result<String, SecXbrlError> {
         [release, ..]
             if release.len() == 4 && release.as_bytes().iter().all(u8::is_ascii_digit) =>
         {
-            let year = release
-                .parse::<u16>()
-                .map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
-            if !XBRL_STANDARD_RELEASE_YEARS.contains(&year) {
-                return Err(SecXbrlError::InvalidTaxonomySet);
-            }
-            Ok(format!("xbrl-standard-{year}"))
+            admitted_taxonomy_release(release)?;
+            Ok(format!("xbrl-standard-{release}"))
         }
-        ["lrr", "role", file] => Ok(format!(
-            "xbrl-lrr-{}",
-            dated_taxonomy_schema_release(file, 2005)?
-        )),
+        ["lrr", "role", file] => Ok(format!("xbrl-lrr-{}", dated_taxonomy_schema_release(file)?)),
         ["dtr", "type", release, ..] => {
             let release = release
                 .strip_prefix("CR-")
@@ -1899,7 +1876,7 @@ fn xbrl_standard_release(segments: &[&str]) -> Result<String, SecXbrlError> {
             } else {
                 Ok(format!(
                     "xbrl-dtr-{}",
-                    dated_taxonomy_schema_release(release, 2009)?
+                    dated_taxonomy_schema_release(release)?
                 ))
             }
         }
@@ -1909,7 +1886,7 @@ fn xbrl_standard_release(segments: &[&str]) -> Result<String, SecXbrlError> {
     }
 }
 
-fn dated_taxonomy_schema_release(file: &str, minimum_year: u16) -> Result<&str, SecXbrlError> {
+fn dated_taxonomy_schema_release(file: &str) -> Result<&str, SecXbrlError> {
     let stem = file
         .strip_suffix(".xsd")
         .ok_or(SecXbrlError::InvalidTaxonomySet)?;
@@ -1919,37 +1896,14 @@ fn dated_taxonomy_schema_release(file: &str, minimum_year: u16) -> Result<&str, 
         .and_then(|offset| stem.get(offset..))
         .ok_or(SecXbrlError::InvalidTaxonomySet)?;
     NaiveDate::parse_from_str(release, "%Y-%m-%d").map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
-    let year = release
-        .get(..4)
-        .ok_or(SecXbrlError::InvalidTaxonomySet)?
-        .parse::<u16>()
-        .map_err(|_| SecXbrlError::InvalidTaxonomySet)?;
-    if !(minimum_year..=LATEST_CATALOGUED_TAXONOMY_YEAR).contains(&year) {
-        return Err(SecXbrlError::InvalidTaxonomySet);
-    }
     Ok(release)
 }
 
-fn is_sec_taxonomy_family(value: &str) -> bool {
-    matches!(
-        value,
-        "cef"
-            | "country"
-            | "currency"
-            | "dei"
-            | "ecd"
-            | "exch"
-            | "invest"
-            | "naics"
-            | "oef"
-            | "rr"
-            | "rxp"
-            | "sic"
-            | "spac"
-            | "srt"
-            | "stpr"
-            | "vip"
-    )
+fn is_taxonomy_family(value: &str) -> bool {
+    value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn check_taxonomy_cancelled(cancellation: &CancellationToken) -> Result<(), SecXbrlError> {
@@ -2412,6 +2366,239 @@ mod tests {
         let registered = registry.register(metadata.clone(), at)?;
         let extraction_authority =
             registry.extraction_authority(&registered, &MetadataOwner(metadata.clone()))?;
+        // CompanyFacts uses the same complete logical stream, preserving revisions and native
+        // source ordinals across the existing 256-row work window. Repeat one official fixture
+        // occurrence as distinct source-array occurrences; no rows are deduplicated or capped.
+        {
+            use market_squawk_sources::{
+                DiscoveryRequest, ExtractionContentAccumulator, ExtractionRequest,
+                ProviderCaptureMaterial, ProviderCaptureSetReceipt, SourceObject,
+                SourceObjectCaptureIdentity,
+            };
+            let mut json: serde_json::Value =
+                serde_json::from_slice(include_bytes!("../../fixtures/company-facts.json"))?;
+            let fact = json["facts"]["us-gaap"]["Assets"]["units"]["USD"][0].clone();
+            json["facts"] = serde_json::json!({ "us-gaap": { "Assets": { "units": { "USD": vec![fact; 257] } } } });
+            let facts_bytes = serde_json::to_vec(&json)?;
+            let selection = crate::SecResearchDataset::company_facts("0000320193")?;
+            // Use the actual HTTP-to-representation boundary. A later successful response
+            // preserves the first content-observation clock but has a fresh physical receipt.
+            let body_received_at = crate::client::system_timestamp()?;
+            let body_digest = store.persist(&facts_bytes)?;
+            let representation = representations.record_source_success_cancellable(
+                &source_id,
+                selection.initial_provider_locator().as_str(),
+                body_digest,
+                facts_bytes.len() as u64,
+                crate::SecHttpValidators::default(),
+                &cancellation,
+            )?;
+            let first_capture = crate::client::retrieved_from_representation(
+                facts_bytes.clone(),
+                representation.clone(),
+                &source_id,
+                &revision,
+                body_digest,
+                200,
+                body_received_at,
+            )?;
+            let later_received_at = crate::client::system_timestamp()?;
+            let captured = crate::client::retrieved_from_representation(
+                facts_bytes.clone(),
+                representation,
+                &source_id,
+                &revision,
+                body_digest,
+                200,
+                later_received_at,
+            )?;
+            let at = captured.received_at();
+            assert!(body_received_at < at);
+            assert!(at < later_received_at);
+            assert_eq!(first_capture.received_at(), at);
+            assert_eq!(
+                captured.capture_receipt().ok_or("facts capture")?.pages()[0].received_at(),
+                later_received_at
+            );
+            let transport = captured.capture_material()?.ok_or("facts transport")?;
+            let receipt = transport.receipt();
+            let material = ProviderCaptureMaterial::try_new(
+                ProviderCaptureSetReceipt::try_new(
+                    receipt.source_id().clone(),
+                    receipt.metadata_revision().clone(),
+                    selection.dataset().clone(),
+                    receipt.request_set_identity(),
+                    receipt.terminal(),
+                    receipt.pages().to_vec(),
+                )?,
+                transport.records().to_vec(),
+            )?;
+            let deadline = crate::client::system_timestamp()?.checked_add_nanos(60_000_000_000)?;
+            let discovery = DiscoveryRequest::try_new(
+                selection.dataset().clone(),
+                None,
+                std::num::NonZeroU16::MIN,
+                deadline,
+            )?;
+            let request_for = |object_id: SourceIdentifier| -> Result<ExtractionRequest, Box<dyn std::error::Error>> {
+            let object = SourceObject::try_new_with_capture_identity(
+                source_id.clone(),
+                revision.clone(),
+                &discovery,
+                object_id,
+                SourceIdentifier::try_from("application/json")?,
+                ExactPayloadEvidence::with_version_pinned_locator(
+                    captured.evidence(),
+                    market_squawk_domain::VersionPinnedSourceLocator::new(
+                        SourceIdentifier::try_from(captured.locator().ok_or("facts locator")?)?,
+                        SourceIdentifier::try_from(captured.retrieval_revision().ok_or("facts revision")?.to_string())?,
+                    ),
+                ),
+                SourceObjectCaptureIdentity::try_from_capture(material.receipt())?,
+                EffectiveInterval::new(at, None)?,
+                None,
+                market_squawk_sources::AvailabilityEvidence::LocalFirstObserved { observed_at: at },
+                Some(facts_bytes.len() as u64),
+            )?;
+            Ok(ExtractionRequest::try_new(
+                object,
+                NonZeroU32::new(100_000).ok_or("facts rows")?,
+                NonZeroU64::new(64 * 1024 * 1024).ok_or("facts bytes")?,
+                deadline,
+            )?)
+            };
+            let request = request_for(selection.source_object_id().clone())?;
+            let wrong_locator = crate::SecObjectLocator::company_facts("0000789019")?;
+            assert!(matches!(
+                crate::extraction::company_facts_stream_blocking(
+                    request_for(SourceIdentifier::try_from(wrong_locator.url())?)?,
+                    Arc::clone(&store),
+                    source_id.clone(),
+                    extraction_authority.clone(),
+                    &material,
+                    &cancellation,
+                ),
+                Err(crate::SecClientError::InvalidCaptureMaterial)
+            ));
+            // The first response's physical clock is earlier than the same representation
+            // clock; accept it without rewriting either retained timestamp as well.
+            let original = first_capture
+                .capture_material()?
+                .ok_or("first facts transport")?;
+            let first_material = ProviderCaptureMaterial::try_new(
+                ProviderCaptureSetReceipt::try_new(
+                    original.receipt().source_id().clone(),
+                    original.receipt().metadata_revision().clone(),
+                    selection.dataset().clone(),
+                    original.receipt().request_set_identity(),
+                    original.receipt().terminal(),
+                    original.receipt().pages().to_vec(),
+                )?,
+                original.records().to_vec(),
+            )?;
+            let first_stream = crate::extraction::company_facts_stream_blocking(
+                request_for(selection.source_object_id().clone())?,
+                Arc::clone(&store),
+                source_id.clone(),
+                extraction_authority.clone(),
+                &first_material,
+                &cancellation,
+            )?;
+            assert_eq!(first_stream.company_identity().received_at(), at);
+            drop(first_stream);
+            let mut facts = crate::extraction::company_facts_stream_blocking(
+                request,
+                Arc::clone(&store),
+                source_id.clone(),
+                extraction_authority.clone(),
+                &material,
+                &cancellation,
+            )?;
+            assert_eq!(facts.family(), crate::SecResearchDatasetKind::CompanyFacts);
+            assert_eq!(facts.total_records(), 257);
+            assert!(
+                facts
+                    .request()
+                    .object()
+                    .evidence()
+                    .version_pinned_locator()
+                    .is_some()
+            );
+            assert_eq!(
+                facts.company_identity().parent_ingest_payload_evidence(),
+                facts.request().object().evidence(),
+                "logical publication must retain the complete admitted parent evidence",
+            );
+            let retrieved = crate::RetrievedCompanyFacts::restored(
+                facts_bytes,
+                captured.evidence(),
+                at,
+                market_squawk_domain::AvailabilityEvidence::LocalFirstObserved { observed_at: at },
+                SecParserLimits::production_defaults(),
+                &cancellation,
+            )?;
+            let expected = crate::normalize_company_facts(
+                &source_id,
+                &retrieved,
+                facts.company_identity().ingested_at(),
+            )?;
+            let mut whole = ExtractionContentAccumulator::try_new(facts.request(), 257)?;
+            let mut seen = 0;
+            let mut chunks = 0;
+            while let Some(chunk) = facts.next_chunk(&cancellation)? {
+                chunks += 1;
+                chunk.native_lineage().validate(chunk.batch())?;
+                assert_eq!(
+                    chunk.row_capture_page_ordinals(),
+                    vec![0; chunk.batch().records().len()]
+                );
+                assert!(
+                    chunk
+                        .native_lineage()
+                        .batch_sidecar()
+                        .ok_or("facts sidecar")?
+                        .chunks()
+                        .is_none()
+                );
+                for (record, native) in chunk
+                    .batch()
+                    .records()
+                    .iter()
+                    .zip(chunk.native_lineage().rows())
+                {
+                    let decoded: market_squawk_domain::ResearchObservation =
+                        serde_json::from_slice(record.payload())?;
+                    assert_eq!(decoded, expected[seen]);
+                    let expected_native = serde_json::to_vec(&serde_json::json!({
+                        "family": "company_fact", "occurrence": &retrieved.document().occurrences()[seen],
+                    }))?;
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(native.semantic_payload())?,
+                        serde_json::from_slice::<serde_json::Value>(&expected_native)?
+                    );
+                    whole.push(record)?;
+                    seen += 1;
+                }
+                if chunks == 1 {
+                    assert_eq!(seen, 256);
+                    let cancelled = CancellationToken::new();
+                    cancelled.cancel();
+                    assert!(matches!(
+                        facts.next_chunk(&cancelled),
+                        Err(crate::SecClientError::Cancelled)
+                    ));
+                    assert_eq!(facts.emitted_records(), 256);
+                    // Incomplete output cannot become a complete family content identity.
+                    let mut partial = ExtractionContentAccumulator::try_new(facts.request(), 257)?;
+                    for record in chunk.batch().records() {
+                        partial.push(record)?;
+                    }
+                    assert!(partial.finish().is_err());
+                }
+            }
+            assert_eq!((chunks, seen, facts.emitted_records()), (2, 257, 257));
+            assert_eq!(whole.finish()?.record_count(), 257);
+        }
         let paths = LocalPaths::prepare(root.join("normalized-filing-restart"))?;
         let raw_store = paths.sealed_research_journal_store()?;
         let submissions_bytes = include_bytes!("../../fixtures/submissions-recent.json");
@@ -3259,7 +3446,7 @@ mod tests {
             sec_revision.clone(),
             observed_at,
         )?;
-        let artifacts = vec![
+        let mut artifacts = vec![
             captured_artifact(
                 &store,
                 "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/company-20251231.xsd",
@@ -3269,6 +3456,14 @@ mod tests {
                     targetNamespace="https://example.test/company/2025">
                     <xs:import namespace="http://fasb.org/us-gaap/2025"
                       schemaLocation="http://xbrl.fasb.org/us-gaap/2025/us-gaap-2025.xsd"/>
+                    <xs:import namespace="http://xbrl.org/2020/extensible-enumerations-2.0"
+                      schemaLocation="https://www.xbrl.org/2020/extensible-enumerations-2.0.xsd"/>
+                    <xs:import namespace="http://fasb.org/srt/2025"
+                      schemaLocation="https://xbrl.fasb.org/srt/2025/elts/srt-2025.xsd"/>
+                    <xs:import namespace="http://xbrl.sec.gov/cyd/2025"
+                      schemaLocation="https://xbrl.sec.gov/cyd/2025/cyd-2025.xsd"/>
+                    <xs:import namespace="http://xbrl.sec.gov/ecd-sub/2025"
+                      schemaLocation="https://xbrl.sec.gov/ecd/2025/ecd-sub-2025.xsd"/>
                     <link:linkbaseRef xlink:type="simple"
                       xlink:role="http://www.xbrl.org/2003/role/presentationLinkbase"
                       xlink:href="company-20251231_pre.xml"/>
@@ -3328,6 +3523,73 @@ mod tests {
                 observed_at,
             )?,
         ];
+        // Exact declarations reduced from retained MSFT 0001193125-26-323660. These
+        // official components add graph evidence without adding financial facts or meanings.
+        for (locator, namespace, publisher) in [
+            (
+                "https://www.xbrl.org/2020/extensible-enumerations-2.0.xsd",
+                "http://xbrl.org/2020/extensible-enumerations-2.0",
+                XBRL_INTERNATIONAL_STANDARDS_AUTHORITY,
+            ),
+            (
+                "https://xbrl.fasb.org/srt/2025/elts/srt-2025.xsd",
+                "http://fasb.org/srt/2025",
+                FASB_XBRL_TAXONOMY_AUTHORITY,
+            ),
+            (
+                "https://xbrl.sec.gov/cyd/2025/cyd-2025.xsd",
+                "http://xbrl.sec.gov/cyd/2025",
+                SEC_EDGAR_AUTHORITY,
+            ),
+            (
+                "https://xbrl.sec.gov/ecd/2025/ecd-sub-2025.xsd",
+                "http://xbrl.sec.gov/ecd-sub/2025",
+                SEC_EDGAR_AUTHORITY,
+            ),
+        ] {
+            let body = format!(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="{namespace}"/>"#
+            );
+            artifacts.push(captured_artifact(
+                &store,
+                locator,
+                body.as_bytes(),
+                publisher.canonical_source_id()?,
+                if publisher == SEC_EDGAR_AUTHORITY {
+                    sec_revision.clone()
+                } else {
+                    publisher.metadata_revision()?
+                },
+                observed_at,
+            )?);
+            let (physical_locator, origin) =
+                map_taxonomy_locator(filing_locator, locator, SecXbrlTaxonomyArtifactKind::Schema)?;
+            let request = SecXbrlTaxonomyArtifactRequest {
+                logical_locator: SourceIdentifier::try_from(locator)?,
+                physical_locator,
+                kind: SecXbrlTaxonomyArtifactKind::Schema,
+                pinned_release: pinned_taxonomy_release(filing_locator, locator, origin)?,
+                origin,
+            };
+            assert_eq!(request.authority()?, publisher);
+            for incompatible in [
+                namespace
+                    .replace("/2025", "/2024")
+                    .replace("/2020", "/2019"),
+                namespace
+                    .replace("xbrl.sec.gov", "unrelated.test")
+                    .replace("fasb.org", "unrelated.test")
+                    .replace("xbrl.org", "unrelated.test"),
+            ] {
+                assert!(matches!(
+                    validate_pinned_namespace(
+                        &request,
+                        Some(&SourceIdentifier::try_from(incompatible)?)
+                    ),
+                    Err(SecXbrlError::InvalidTaxonomySet)
+                ));
+            }
+        }
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
@@ -3393,7 +3655,7 @@ mod tests {
             SecParserLimits::production_defaults(),
             &CancellationToken::new(),
         )?;
-        assert_eq!(admitted.validated().artifacts().len(), 6);
+        assert_eq!(admitted.validated().artifacts().len(), 10);
         let parser_context = || {
             XbrlDocumentContext::new(
                 SourceIdentifier::try_from("0001").expect("static accession"),

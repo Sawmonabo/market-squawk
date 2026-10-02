@@ -329,6 +329,11 @@ Its initial launch follows normal visible startup and can take focus; subsequent
 WebView requests do not use global keystrokes. The visibility option requires a port and is available
 only with the same development feature/debug configuration. Standard WebDriver session, element,
 script and screenshot requests operate within the native WebView.
+On macOS 14+, this explicit automation mode also disables WebKit background throttling through
+[Tauri's supported configuration](https://v2.tauri.app/reference/config/#backgroundthrottling)
+(reviewed 2026-10-02). Otherwise an occluded window can report loaded chart data while its canvas
+has not painted. Ordinary launches keep the platform scheduling policy; automation screenshots
+and instrumented resource use are separate from final installed acceptance.
 
 For coordinated development, pass both options to the existing `scripts/develop.mjs` invocation
 instead of starting an additional Desktop. An already running process without a port has no

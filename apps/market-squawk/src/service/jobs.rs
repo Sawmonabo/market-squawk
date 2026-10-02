@@ -20,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     application::job::{JobAdmission, JobApplication, JobApplicationError, JobReceipt, JobView},
-    jobs::{InstalledJobAuthority, MarketHistoryJobRunner},
+    jobs::{InstalledJobAuthority, InstalledJobRunners},
 };
 
 /// Closed typed job query and mutation authority.
@@ -121,7 +121,9 @@ impl InstalledJobOperations {
     pub(super) fn owns(operation: &str) -> bool {
         matches!(
             operation,
-            "Market.GetHistoryPreparation"
+            "Research.GetInvestmentFinancialPreparation"
+                | "Research.CancelInvestmentFinancialPreparation"
+                | "Market.GetHistoryPreparation"
                 | "Market.CancelHistoryPreparation"
                 | "Job.List"
                 | "Job.Get"
@@ -138,26 +140,52 @@ impl InstalledJobOperations {
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
-        history_runner: &MarketHistoryJobRunner,
+        runners: &InstalledJobRunners,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
         let arguments = super::business_arguments(request.arguments());
         let content = match request.name() {
-            "Market.GetHistoryPreparation" | "Market.CancelHistoryPreparation" => {
-                let input: HistoryPreparationRequest = decode(&arguments)?;
-                let snapshot = self
-                    .history_snapshot(history_runner, &input, context)
-                    .await?;
-                let view = if request.name() == "Market.CancelHistoryPreparation" {
+            "Market.GetHistoryPreparation"
+            | "Market.CancelHistoryPreparation"
+            | "Research.GetInvestmentFinancialPreparation"
+            | "Research.CancelInvestmentFinancialPreparation" => {
+                let financial = request.name().starts_with("Research.");
+                let (token, job_id, generation, expected_sequence) = if financial {
+                    let input: FinancialPreparationRequest = decode(&arguments)?;
+                    (
+                        input.selection_token,
+                        input.job_id,
+                        input.generation,
+                        input.expected_sequence,
+                    )
+                } else {
+                    let input: HistoryPreparationRequest = decode(&arguments)?;
+                    (
+                        input.history_token,
+                        input.job_id,
+                        input.generation,
+                        input.expected_sequence,
+                    )
+                };
+                let snapshot = self.owned_snapshot(&job_id, generation, context).await?;
+                let belongs = if financial {
+                    runners
+                        .investment_financials()
+                        .is_some_and(|runner| runner.belongs_to(&snapshot, &token))
+                } else {
+                    runners.market_history().belongs_to(&snapshot, &token)
+                };
+                if !belongs {
+                    return Err(ServiceError::Unauthorized);
+                }
+                let view = if request.name().contains(".Cancel") {
                     self.cancel_generation(
                         snapshot.id(),
                         snapshot.generation(),
                         JobEventSequence::new(
-                            input
-                                .expected_sequence
-                                .ok_or(ServiceError::InvalidRequest)?,
+                            expected_sequence.ok_or(ServiceError::InvalidRequest)?,
                         ),
-                        history_runner,
+                        runners,
                     )
                     .await?
                 } else {
@@ -235,7 +263,7 @@ impl InstalledJobOperations {
                         parse_id(&input.job_id)?,
                         parse_generation(input.generation)?,
                         JobEventSequence::new(input.expected_sequence),
-                        history_runner,
+                        runners,
                     )
                     .await?,
                 )?
@@ -293,7 +321,7 @@ impl InstalledJobOperations {
         id: JobId,
         generation: JobGeneration,
         expected: JobEventSequence,
-        history_runner: &MarketHistoryJobRunner,
+        runners: &InstalledJobRunners,
     ) -> Result<JobView, ServiceError> {
         let view = self
             .application
@@ -313,24 +341,32 @@ impl InstalledJobOperations {
                 .get(id, generation)
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
-            if history_runner.input(&snapshot).is_some() {
-                history_runner
+            if runners.market_history().input(&snapshot).is_some() {
+                runners
+                    .market_history()
                     .release_terminal(&snapshot)
                     .map_err(super::tool_services::map_research_admission)?;
+            }
+            if let Some(runner) = runners.investment_financials() {
+                if runner.input(&snapshot).is_some() {
+                    runner
+                        .release_terminal(&snapshot)
+                        .map_err(super::tool_services::map_research_admission)?;
+                }
             }
         }
         Ok(view)
     }
 
-    async fn history_snapshot(
+    async fn owned_snapshot(
         &self,
-        runner: &MarketHistoryJobRunner,
-        input: &HistoryPreparationRequest,
+        job_id: &str,
+        job_generation: u64,
         context: &RequestContext,
     ) -> Result<market_squawk_jobs::JobSnapshot, ServiceError> {
         let origin = authenticated_origin(context)?;
-        let id = parse_id(&input.job_id)?;
-        let generation = parse_generation(input.generation)?;
+        let id = parse_id(job_id)?;
+        let generation = parse_generation(job_generation)?;
         let snapshot = tokio::select! {
             biased;
             _ = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
@@ -340,9 +376,7 @@ impl InstalledJobOperations {
                 _ => ServiceError::Unavailable,
             })?,
         };
-        if snapshot.spec().origin() != &origin
-            || !runner.belongs_to(&snapshot, &input.history_token)
-        {
+        if snapshot.spec().origin() != &origin {
             return Err(ServiceError::Unauthorized);
         }
         Ok(snapshot)
@@ -540,6 +574,15 @@ struct StartReconciliationRequest {
     request_id: Value,
     operation: SourceIdentifier,
     arguments_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct FinancialPreparationRequest {
+    selection_token: String,
+    job_id: String,
+    generation: u64,
+    expected_sequence: Option<u64>,
 }
 
 #[derive(Deserialize)]

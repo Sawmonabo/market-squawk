@@ -76,6 +76,7 @@ use super::{
     research_file_import::{InstalledResearchFileImportOperations, PreparedResearchFileCommit},
 };
 
+const START_FINANCIALS: &str = "Research.StartInvestmentFinancialPreparation";
 const START_HISTORY: &str = "Market.StartHistoryPreparation";
 const START_INGEST: &str = "Research.StartIngestSource";
 const START_EXPORT: &str = "Research.StartExport";
@@ -532,411 +533,449 @@ impl InstalledToolServices {
         }
     }
 
-    async fn prepare_job(
-        &self,
-        request: &TypedToolRequest,
-        context: &RequestContext,
-    ) -> Result<(crate::application::job::JobAdmission, JobAdmissionOwner), ServiceError> {
-        let captured_at =
-            super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
-        let limits = context.limits();
-        let (admission, revoke) = match request.name() {
-            START_HISTORY => {
-                use crate::application::market_selection::product::{
-                    MarketProductSelectionReadCapability, product_market_identities, resolve_token,
-                };
-                let input: HistoryPreparationStart = decode(request.arguments())?;
-                let lookback =
-                    market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(
-                        input.lookback_days,
-                    )
-                    .map_err(|_| ServiceError::InvalidRequest)?;
-                let selection = MarketProductSelectionReadCapability::new(
-                    Arc::clone(&self.profile_research),
-                    self.profile_research.market_data_instruments(),
-                );
-                let records = selection
-                    .population(captured_at, context.deadline(), context.cancellation())
-                    .await?;
-                let identities = product_market_identities(&records, captured_at, None)?;
-                let instrument_id = resolve_token(&identities, &input.history_token, |identity| {
-                    identity.history_token()
-                })?;
-                let instrument = records
-                    .into_iter()
-                    .find(|record| record.definition().instrument_id() == instrument_id)
-                    .ok_or(ServiceError::InvalidResult)?;
-                ensure_live(context)?;
-                let admission = self
-                    .runners
-                    .market_history()
-                    .admit(
-                        instrument,
-                        input.history_token,
-                        lookback,
-                        limits,
-                        captured_at,
-                    )
-                    .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::MarketHistory)
-            }
-            START_INGEST => {
-                let terminal = self.terminal_request(request, "Research.IngestSource")?;
-                let admission = self
-                    .runners
-                    .ingest()
-                    .admit(terminal, limits, captured_at)
-                    .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::Ingest)
-            }
-            START_EXPORT => {
-                let terminal = self.terminal_request(request, "Research.GetHistory")?;
-                let admission = self
-                    .runners
-                    .export()
-                    .admit(terminal, limits, captured_at)
-                    .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::Export)
-            }
-            START_DATASET | START_FEATURE_DATASET => {
-                let registration = request
-                    .arguments()
-                    .get("registration")
-                    .and_then(serde_json::Value::as_object)
-                    .ok_or(ServiceError::InvalidRequest)?;
-                let build = admit_inline_phase_one_derived_generation_request(registration)
-                    .map_err(map_phase_one_derived_generation_admission)?;
-                if request.name() == START_DATASET {
+    // The operation match retains the largest admission future. Keep that state behind one
+    // heap boundary so start_job and its transport caller do not embed additional copies while
+    // polling a selected branch on an ordinary runtime worker stack.
+    fn prepare_job<'a>(
+        &'a self,
+        request: &'a TypedToolRequest,
+        context: &'a RequestContext,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (crate::application::job::JobAdmission, JobAdmissionOwner),
+                        ServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let captured_at =
+                super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
+            let limits = context.limits();
+            let (admission, revoke) = match request.name() {
+                START_FINANCIALS => {
+                    let input: FinancialPreparationStart = decode(request.arguments())?;
+                    let runner = self
+                        .runners
+                        .investment_financials()
+                        .ok_or(ServiceError::Unavailable)?;
+                    let admission = runner
+                        .admit(
+                            &input.selection_token,
+                            limits,
+                            captured_at,
+                            context.deadline(),
+                            context.cancellation(),
+                        )
+                        .await
+                        .map_err(map_research_admission)?;
+                    (admission, JobAdmissionOwner::InvestmentFinancials)
+                }
+                START_HISTORY => {
+                    use crate::application::market_selection::product::{
+                        MarketProductSelectionReadCapability, product_market_identities,
+                        resolve_token,
+                    };
+                    let input: HistoryPreparationStart = decode(request.arguments())?;
+                    let lookback =
+                        market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(
+                            input.lookback_days,
+                        )
+                        .map_err(|_| ServiceError::InvalidRequest)?;
+                    let selection = MarketProductSelectionReadCapability::new(
+                        Arc::clone(&self.profile_research),
+                        self.profile_research.market_data_instruments(),
+                    );
+                    let records = selection
+                        .population(captured_at, context.deadline(), context.cancellation())
+                        .await?;
+                    let identities = product_market_identities(&records, captured_at, None)?;
+                    let instrument_id =
+                        resolve_token(&identities, &input.history_token, |identity| {
+                            identity.history_token()
+                        })?;
+                    let instrument = records
+                        .into_iter()
+                        .find(|record| record.definition().instrument_id() == instrument_id)
+                        .ok_or(ServiceError::InvalidResult)?;
+                    ensure_live(context)?;
                     let admission = self
                         .runners
-                        .research_phase_one_derived_generation()
-                        .admit(build, captured_at)
+                        .market_history()
+                        .admit(
+                            instrument,
+                            input.history_token,
+                            lookback,
+                            limits,
+                            captured_at,
+                        )
                         .map_err(map_research_admission)?;
-                    (admission, JobAdmissionOwner::ResearchPhaseOneGeneration)
-                } else {
+                    (admission, JobAdmissionOwner::MarketHistory)
+                }
+                START_INGEST => {
+                    let terminal = self.terminal_request(request, "Research.IngestSource")?;
+                    let admission = self
+                        .runners
+                        .ingest()
+                        .admit(terminal, limits, captured_at)
+                        .map_err(map_research_admission)?;
+                    (admission, JobAdmissionOwner::Ingest)
+                }
+                START_EXPORT => {
+                    let terminal = self.terminal_request(request, "Research.GetHistory")?;
+                    let admission = self
+                        .runners
+                        .export()
+                        .admit(terminal, limits, captured_at)
+                        .map_err(map_research_admission)?;
+                    (admission, JobAdmissionOwner::Export)
+                }
+                START_DATASET | START_FEATURE_DATASET => {
+                    let registration = request
+                        .arguments()
+                        .get("registration")
+                        .and_then(serde_json::Value::as_object)
+                        .ok_or(ServiceError::InvalidRequest)?;
+                    let build = admit_inline_phase_one_derived_generation_request(registration)
+                        .map_err(map_phase_one_derived_generation_admission)?;
+                    if request.name() == START_DATASET {
+                        let admission = self
+                            .runners
+                            .research_phase_one_derived_generation()
+                            .admit(build, captured_at)
+                            .map_err(map_research_admission)?;
+                        (admission, JobAdmissionOwner::ResearchPhaseOneGeneration)
+                    } else {
+                        let admission = self
+                            .runners
+                            .analysis_phase_one_feature_derived_generation()
+                            .admit(build, captured_at)
+                            .map_err(map_research_admission)?;
+                        (
+                            admission,
+                            JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                        )
+                    }
+                }
+                START_RECOMMENDATION_BACKTEST => {
+                    let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
+                    let (setup, catalog) =
+                        self.recommendation_setup.resolve_for_analysis(context)?;
+                    let prepared = self
+                        .historical_study
+                        .prepare_study(
+                            runner,
+                            &self.forecast_preparation,
+                            request,
+                            setup.selected_account().account_id(),
+                            market_squawk_valuation::ActorId::try_from(
+                                "installed-investment-analysis",
+                            )
+                            .map_err(|_| ServiceError::Internal)?,
+                            context,
+                        )
+                        .await?;
+                    self.recommendation_setup
+                        .recheck_for_analysis(&setup, &catalog, context)?;
+                    let (study, issuer) = prepared.into_parts();
+                    let admission = self
+                        .runners
+                        .backtest()
+                        .admit_recommendation(
+                            study,
+                            issuer,
+                            captured_at,
+                            context.limits(),
+                            self.historical_study
+                                .fiscal_reader()
+                                .ok_or(ServiceError::Unavailable)?,
+                        )
+                        .map_err(map_backtest_admission)?;
+                    (admission, JobAdmissionOwner::Backtest)
+                }
+                START_PROBABILITY_DATASET => {
+                    let setup = match self.recommendation_setup.resolve_for_analysis(context) {
+                        Ok(value) => Some(value),
+                        Err(ServiceError::Unavailable | ServiceError::NotFound) => None,
+                        Err(error) => return Err(error),
+                    };
+                    let prepared = self
+                        .probability_preparation
+                        .prepare_dataset(
+                            &self.forecast_preparation,
+                            request,
+                            setup
+                                .as_ref()
+                                .map(|(setup, _)| setup.selected_account().account_id()),
+                            context,
+                        )
+                        .await?;
+                    if let Some((setup, catalog)) = &setup {
+                        self.recommendation_setup
+                            .recheck_for_analysis(setup, catalog, context)?;
+                    }
                     let admission = self
                         .runners
                         .analysis_phase_one_feature_derived_generation()
-                        .admit(build, captured_at)
+                        .admit_prepared(prepared, captured_at)
                         .map_err(map_research_admission)?;
                     (
                         admission,
                         JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
                     )
                 }
-            }
-            START_RECOMMENDATION_BACKTEST => {
-                let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
-                let (setup, catalog) = self.recommendation_setup.resolve_for_analysis(context)?;
-                let prepared = self
-                    .historical_study
-                    .prepare_study(
-                        runner,
-                        &self.forecast_preparation,
-                        request,
-                        setup.selected_account().account_id(),
-                        market_squawk_valuation::ActorId::try_from("installed-investment-analysis")
-                            .map_err(|_| ServiceError::Internal)?,
-                        context,
-                    )
-                    .await?;
-                self.recommendation_setup
-                    .recheck_for_analysis(&setup, &catalog, context)?;
-                let (study, issuer) = prepared.into_parts();
-                let admission = self
-                    .runners
-                    .backtest()
-                    .admit_recommendation(
-                        study,
-                        issuer,
-                        captured_at,
-                        context.limits(),
-                        self.historical_study
-                            .fiscal_reader()
-                            .ok_or(ServiceError::Unavailable)?,
-                    )
-                    .map_err(map_backtest_admission)?;
-                (admission, JobAdmissionOwner::Backtest)
-            }
-            START_PROBABILITY_DATASET => {
-                let setup = match self.recommendation_setup.resolve_for_analysis(context) {
-                    Ok(value) => Some(value),
-                    Err(ServiceError::Unavailable | ServiceError::NotFound) => None,
-                    Err(error) => return Err(error),
-                };
-                let prepared = self
-                    .probability_preparation
-                    .prepare_dataset(
-                        &self.forecast_preparation,
-                        request,
-                        setup
-                            .as_ref()
-                            .map(|(setup, _)| setup.selected_account().account_id()),
-                        context,
-                    )
-                    .await?;
-                if let Some((setup, catalog)) = &setup {
-                    self.recommendation_setup
-                        .recheck_for_analysis(setup, catalog, context)?;
-                }
-                let admission = self
-                    .runners
-                    .analysis_phase_one_feature_derived_generation()
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_research_admission)?;
-                (
-                    admission,
-                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
-                )
-            }
-            START_FISCAL_DATASET_BUILD => {
-                let prepared = self
-                    .forecast_preparation
-                    .prepare_fiscal_dataset(
-                        self.dataset_preparation.authority().as_ref(),
-                        request,
-                        context,
-                    )
-                    .await?;
-                let admission = self
-                    .runners
-                    .analysis_phase_one_feature_derived_generation()
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_research_admission)?;
-                (
-                    admission,
-                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
-                )
-            }
-            START_HISTORICAL_STUDY_DATASET => {
-                let prepared = self
-                    .historical_study
-                    .prepare_dataset(&self.forecast_preparation, request, context)
-                    .await?;
-                let admission = self
-                    .runners
-                    .analysis_phase_one_feature_derived_generation()
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_research_admission)?;
-                (
-                    admission,
-                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
-                )
-            }
-            START_HISTORICAL_STUDY_TRAINING => {
-                let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
-                let prepared = self
-                    .historical_study
-                    .prepare_training(runner, &self.forecast_preparation, request, context)
-                    .await?;
-                let admission = runner
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_training_admission)?;
-                (admission, JobAdmissionOwner::Training)
-            }
-            START_INVESTMENT_DATASET => {
-                let prepared = self
-                    .training_preparation
-                    .prepare_dataset(&self.dataset_preparation, self.runtime, request, context)
-                    .await?;
-                let admission = self
-                    .runners
-                    .analysis_phase_one_feature_derived_generation()
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_research_admission)?;
-                (
-                    admission,
-                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
-                )
-            }
-            current_find::START_DATASET => {
-                let prepared = self
-                    .current_find
-                    .prepare_dataset(
-                        &self.dataset_preparation,
-                        request,
-                        context,
-                        &self.forecast_preparation,
-                    )
-                    .await?;
-                let admission = self
-                    .runners
-                    .analysis_phase_one_feature_derived_generation()
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_research_admission)?;
-                (
-                    admission,
-                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
-                )
-            }
-            current_find::START_SCREEN => {
-                let prepared = self
-                    .current_find
-                    .prepare_screen(
-                        &self.dataset_preparation,
-                        &self.training_preparation,
-                        request,
-                        context,
-                        &self.forecast_preparation,
-                        captured_at,
-                    )
-                    .await?;
-                let admission = self
-                    .runners
-                    .screen()
-                    .admit(crate::jobs::ScreenJobCommand::new(prepared), captured_at)
-                    .map_err(map_screen_admission)?;
-                (admission, JobAdmissionOwner::Screen)
-            }
-            START_PREPARED_FEATURE_DATASET => {
-                let input: PreparedFeatureDatasetStart = decode(request.arguments())?;
-                let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
-                let workspace = WorkspaceRuntimeIdentity::try_from_runtime(self.runtime)
-                    .map_err(|_error| ServiceError::Unavailable)?;
-                let prepared = self
-                    .dataset_preparation
-                    .consume(
-                        input.receipt,
-                        origin,
-                        workspace,
-                        Instant::now(),
-                        context.deadline(),
-                        context.cancellation(),
-                    )
-                    .map_err(ServiceError::from)?;
-                let admission = self
-                    .runners
-                    .analysis_phase_one_feature_derived_generation()
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_research_admission)?;
-                (
-                    admission,
-                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
-                )
-            }
-            START_SCENARIO => {
-                let terminal = self.terminal_request(request, "Analysis.GetScenarios")?;
-                let admission = self
-                    .runners
-                    .scenario()
-                    .admit(terminal, limits, captured_at)
-                    .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::Scenario)
-            }
-            START_BACKTEST => {
-                let registration = request
-                    .arguments()
-                    .get("registration")
-                    .and_then(serde_json::Value::as_object)
-                    .ok_or(ServiceError::InvalidRequest)?;
-                let admission = self
-                    .runners
-                    .backtest()
-                    .admit_registration(
-                        self.runners.backtest_registrar().as_ref(),
-                        registration,
-                        context.cancellation().clone(),
-                        context.deadline(),
-                        captured_at,
-                    )
-                    .await
-                    .map_err(map_backtest_admission)?;
-                (admission, JobAdmissionOwner::Backtest)
-            }
-            START_PREPARED_BACKTEST => {
-                let input = self.backtest_preparation.consume(request, context).await?;
-                let admission = self
-                    .runners
-                    .backtest()
-                    .admit_prepared(
-                        self.runners.backtest_registrar().as_ref(),
-                        input,
-                        context.cancellation().clone(),
-                        context.deadline(),
-                        captured_at,
-                    )
-                    .await
-                    .map_err(map_backtest_admission)?;
-                (admission, JobAdmissionOwner::Backtest)
-            }
-            START_PREPARED_TRAINING => {
-                let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
-                let prepared = self
-                    .training_preparation
-                    .prepare(runner, request, context)
-                    .await?;
-                let admission = runner
-                    .admit_prepared(prepared, captured_at)
-                    .map_err(map_training_admission)?;
-                (admission, JobAdmissionOwner::Training)
-            }
-            START_TRAINING => {
-                let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
-                let client = ClientId::try_from_uuid(origin.client_id())
-                    .map_err(|_error| ServiceError::Unauthorized)?;
-                let config = self.claim_input(
-                    request,
-                    "configTicketId",
-                    client,
-                    TRAINING_CONFIG_MEDIA_TYPE,
-                    captured_at,
-                )?;
-                let authority = self.claim_input(
-                    request,
-                    "authorityTicketId",
-                    client,
-                    TRAINING_AUTHORITY_MEDIA_TYPE,
-                    captured_at,
-                )?;
-                let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
-                let admission = runner
-                    .admit_staged(config, authority, captured_at)
-                    .map_err(map_training_admission)?;
-                (admission, JobAdmissionOwner::Training)
-            }
-            START_PREPARED_FORECAST | START_FISCAL_FORECAST => {
-                let terminal = if request.name() == START_FISCAL_FORECAST {
-                    self.forecast_preparation
-                        .prepare_fiscal_forecast(
+                START_FISCAL_DATASET_BUILD => {
+                    let prepared = self
+                        .forecast_preparation
+                        .prepare_fiscal_dataset(
                             self.dataset_preparation.authority().as_ref(),
-                            &self.training_preparation,
-                            self.runners.training().ok_or(ServiceError::Unavailable)?,
                             request,
                             context,
                         )
-                        .await?
-                } else {
-                    self.forecast_preparation.consume(request, context).await?
-                };
-                let admission = self
-                    .runners
-                    .forecast()
-                    .admit(
-                        terminal,
-                        limits,
-                        captured_at,
-                        context.cancellation().clone(),
-                        context.deadline(),
+                        .await?;
+                    let admission = self
+                        .runners
+                        .analysis_phase_one_feature_derived_generation()
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_research_admission)?;
+                    (
+                        admission,
+                        JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
                     )
-                    .await
-                    .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::Forecast)
-            }
-            RUN_SCREEN => {
-                let prepared = self
-                    .decisions
-                    .prepare_screen_job(request, context, captured_at)
-                    .await?;
-                let admission = self
-                    .runners
-                    .screen()
-                    .admit(crate::jobs::ScreenJobCommand::new(prepared), captured_at)
-                    .map_err(map_screen_admission)?;
-                (admission, JobAdmissionOwner::Screen)
-            }
-            _ => return Err(ServiceError::InvalidRequest),
-        };
-        Ok((admission, revoke))
+                }
+                START_HISTORICAL_STUDY_DATASET => {
+                    let prepared = self
+                        .historical_study
+                        .prepare_dataset(&self.forecast_preparation, request, context)
+                        .await?;
+                    let admission = self
+                        .runners
+                        .analysis_phase_one_feature_derived_generation()
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_research_admission)?;
+                    (
+                        admission,
+                        JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                    )
+                }
+                START_HISTORICAL_STUDY_TRAINING => {
+                    let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
+                    let prepared = self
+                        .historical_study
+                        .prepare_training(runner, &self.forecast_preparation, request, context)
+                        .await?;
+                    let admission = runner
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_training_admission)?;
+                    (admission, JobAdmissionOwner::Training)
+                }
+                START_INVESTMENT_DATASET => {
+                    let prepared = self
+                        .training_preparation
+                        .prepare_dataset(&self.dataset_preparation, self.runtime, request, context)
+                        .await?;
+                    let admission = self
+                        .runners
+                        .analysis_phase_one_feature_derived_generation()
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_research_admission)?;
+                    (
+                        admission,
+                        JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                    )
+                }
+                current_find::START_DATASET => {
+                    let prepared = self
+                        .current_find
+                        .prepare_dataset(
+                            &self.dataset_preparation,
+                            request,
+                            context,
+                            &self.forecast_preparation,
+                        )
+                        .await?;
+                    let admission = self
+                        .runners
+                        .analysis_phase_one_feature_derived_generation()
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_research_admission)?;
+                    (
+                        admission,
+                        JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                    )
+                }
+                current_find::START_SCREEN => {
+                    let prepared = self
+                        .current_find
+                        .prepare_screen(
+                            &self.dataset_preparation,
+                            &self.training_preparation,
+                            request,
+                            context,
+                            &self.forecast_preparation,
+                            captured_at,
+                        )
+                        .await?;
+                    let admission = self
+                        .runners
+                        .screen()
+                        .admit(crate::jobs::ScreenJobCommand::new(prepared), captured_at)
+                        .map_err(map_screen_admission)?;
+                    (admission, JobAdmissionOwner::Screen)
+                }
+                START_PREPARED_FEATURE_DATASET => {
+                    let input: PreparedFeatureDatasetStart = decode(request.arguments())?;
+                    let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
+                    let workspace = WorkspaceRuntimeIdentity::try_from_runtime(self.runtime)
+                        .map_err(|_error| ServiceError::Unavailable)?;
+                    let prepared = self
+                        .dataset_preparation
+                        .consume(
+                            input.receipt,
+                            origin,
+                            workspace,
+                            Instant::now(),
+                            context.deadline(),
+                            context.cancellation(),
+                        )
+                        .map_err(ServiceError::from)?;
+                    let admission = self
+                        .runners
+                        .analysis_phase_one_feature_derived_generation()
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_research_admission)?;
+                    (
+                        admission,
+                        JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                    )
+                }
+                START_SCENARIO => {
+                    let terminal = self.terminal_request(request, "Analysis.GetScenarios")?;
+                    let admission = self
+                        .runners
+                        .scenario()
+                        .admit(terminal, limits, captured_at)
+                        .map_err(map_research_admission)?;
+                    (admission, JobAdmissionOwner::Scenario)
+                }
+                START_BACKTEST => {
+                    let registration = request
+                        .arguments()
+                        .get("registration")
+                        .and_then(serde_json::Value::as_object)
+                        .ok_or(ServiceError::InvalidRequest)?;
+                    let admission = self
+                        .runners
+                        .backtest()
+                        .admit_registration(
+                            self.runners.backtest_registrar().as_ref(),
+                            registration,
+                            context.cancellation().clone(),
+                            context.deadline(),
+                            captured_at,
+                        )
+                        .await
+                        .map_err(map_backtest_admission)?;
+                    (admission, JobAdmissionOwner::Backtest)
+                }
+                START_PREPARED_BACKTEST => {
+                    let input = self.backtest_preparation.consume(request, context).await?;
+                    let admission = self
+                        .runners
+                        .backtest()
+                        .admit_prepared(
+                            self.runners.backtest_registrar().as_ref(),
+                            input,
+                            context.cancellation().clone(),
+                            context.deadline(),
+                            captured_at,
+                        )
+                        .await
+                        .map_err(map_backtest_admission)?;
+                    (admission, JobAdmissionOwner::Backtest)
+                }
+                START_PREPARED_TRAINING => {
+                    let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
+                    let prepared = self
+                        .training_preparation
+                        .prepare(runner, request, context)
+                        .await?;
+                    let admission = runner
+                        .admit_prepared(prepared, captured_at)
+                        .map_err(map_training_admission)?;
+                    (admission, JobAdmissionOwner::Training)
+                }
+                START_TRAINING => {
+                    let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
+                    let client = ClientId::try_from_uuid(origin.client_id())
+                        .map_err(|_error| ServiceError::Unauthorized)?;
+                    let config = self.claim_input(
+                        request,
+                        "configTicketId",
+                        client,
+                        TRAINING_CONFIG_MEDIA_TYPE,
+                        captured_at,
+                    )?;
+                    let authority = self.claim_input(
+                        request,
+                        "authorityTicketId",
+                        client,
+                        TRAINING_AUTHORITY_MEDIA_TYPE,
+                        captured_at,
+                    )?;
+                    let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
+                    let admission = runner
+                        .admit_staged(config, authority, captured_at)
+                        .map_err(map_training_admission)?;
+                    (admission, JobAdmissionOwner::Training)
+                }
+                START_PREPARED_FORECAST | START_FISCAL_FORECAST => {
+                    let terminal = if request.name() == START_FISCAL_FORECAST {
+                        self.forecast_preparation
+                            .prepare_fiscal_forecast(
+                                self.dataset_preparation.authority().as_ref(),
+                                &self.training_preparation,
+                                self.runners.training().ok_or(ServiceError::Unavailable)?,
+                                request,
+                                context,
+                            )
+                            .await?
+                    } else {
+                        self.forecast_preparation.consume(request, context).await?
+                    };
+                    let admission = self
+                        .runners
+                        .forecast()
+                        .admit(
+                            terminal,
+                            limits,
+                            captured_at,
+                            context.cancellation().clone(),
+                            context.deadline(),
+                        )
+                        .await
+                        .map_err(map_research_admission)?;
+                    (admission, JobAdmissionOwner::Forecast)
+                }
+                RUN_SCREEN => {
+                    let prepared = self
+                        .decisions
+                        .prepare_screen_job(request, context, captured_at)
+                        .await?;
+                    let admission = self
+                        .runners
+                        .screen()
+                        .admit(crate::jobs::ScreenJobCommand::new(prepared), captured_at)
+                        .map_err(map_screen_admission)?;
+                    (admission, JobAdmissionOwner::Screen)
+                }
+                _ => return Err(ServiceError::InvalidRequest),
+            };
+            Ok((admission, revoke))
+        })
     }
 
     async fn start_research_file_import_job(
@@ -1071,6 +1110,11 @@ impl InstalledToolServices {
 
     fn revoke(&self, owner: JobAdmissionOwner, admission: &crate::application::job::JobAdmission) {
         match owner {
+            JobAdmissionOwner::InvestmentFinancials => {
+                if let Some(runner) = self.runners.investment_financials() {
+                    let _result = runner.revoke(admission);
+                }
+            }
             JobAdmissionOwner::MarketHistory => {
                 let _result = self.runners.market_history().revoke(admission);
             }
@@ -1204,6 +1248,7 @@ fn required_argument<'a>(
 #[derive(Clone, Copy)]
 enum JobAdmissionOwner {
     MarketHistory,
+    InvestmentFinancials,
     Ingest,
     Export,
     ResearchPhaseOneGeneration,
@@ -1367,10 +1412,7 @@ impl InstalledToolServices {
                 {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let result = self
-                    .jobs
-                    .call(&request, &context, self.runners.market_history())
-                    .await?;
+                let result = self.jobs.call(&request, &context, &self.runners).await?;
                 result
                     .validate_against(context.limits())
                     .map_err(ServiceError::from)?;
@@ -2069,6 +2111,7 @@ fn owns_job_start(name: &str) -> bool {
     matches!(
         name,
         START_HISTORY
+            | START_FINANCIALS
             | START_INGEST
             | START_EXPORT
             | START_DATASET
@@ -2091,6 +2134,12 @@ fn owns_job_start(name: &str) -> bool {
             | current_find::START_DATASET
             | current_find::START_SCREEN
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinancialPreparationStart {
+    selection_token: String,
 }
 
 #[derive(Deserialize)]

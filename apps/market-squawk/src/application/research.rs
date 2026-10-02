@@ -70,7 +70,9 @@ mod instrument_context;
 mod investment_financial_preparation;
 mod investment_financials;
 mod investment_profile;
-use investment_financial_preparation::InvestmentFinancialPreparation;
+pub(crate) use investment_financial_preparation::{
+    InvestmentFinancialPreparation, InvestmentFinancialPreparationInput,
+};
 use investment_financials::{InvestmentFinancialReadCapability, InvestmentFinancialSection};
 use investment_profile::{INVESTMENT_PROFILE_READ_OPERATION, InvestmentProfileReadCapability};
 mod macro_context;
@@ -468,12 +470,12 @@ impl ResearchApplicationServices {
             .zip(product_identity.as_deref().cloned())
             .zip(listing_reference.clone())
             .map(|((activation, references), listings)| {
-                InvestmentFinancialPreparation::new(
+                Arc::new(InvestmentFinancialPreparation::new(
                     Arc::clone(&service),
                     references,
                     listings,
                     activation,
-                )
+                ))
             });
         let product_research =
             ResearchProductReadCapability::new(company_research.clone(), product_identity);
@@ -575,6 +577,12 @@ impl ResearchApplicationServices {
     /// Returns provider-neutral option context with truthful startup availability.
     pub(crate) fn options_context_read_capability(&self) -> OptionsContextReadCapability {
         self.controller.options_context.clone()
+    }
+
+    pub(crate) fn investment_financial_preparation(
+        &self,
+    ) -> Option<Arc<InvestmentFinancialPreparation>> {
+        self.controller.financial_preparation.clone()
     }
 
     /// Returns canonical, provider-neutral market-bar history reads.
@@ -748,33 +756,19 @@ impl ApplicationDomainService for ResearchDomainService {
                     })
                     .transpose()?
                     .unwrap_or(32);
-                let page = if let Some(preparation) = &self.controller.financial_preparation {
-                    preparation
-                        .read(
-                            &self.controller.investment_financials,
-                            token,
-                            section,
-                            cursor,
-                            limit,
-                            limits,
-                            context.deadline(),
-                            context.cancellation(),
-                        )
-                        .await?
-                } else {
-                    self.controller
-                        .investment_financials
-                        .read(
-                            token,
-                            section,
-                            cursor,
-                            limit,
-                            limits,
-                            context.deadline(),
-                            context.cancellation(),
-                        )
-                        .await?
-                };
+                let page = self
+                    .controller
+                    .investment_financials
+                    .read(
+                        token,
+                        section,
+                        cursor,
+                        limit,
+                        limits,
+                        context.deadline(),
+                        context.cancellation(),
+                    )
+                    .await?;
                 let count = page.item_count();
                 TypedToolResult::try_new(
                     serde_json::to_value(page).map_err(|_| ServiceError::InvalidResult)?,
@@ -998,7 +992,7 @@ struct ResearchController {
     product_research: ResearchProductReadCapability,
     investment_profile: InvestmentProfileReadCapability,
     investment_financials: InvestmentFinancialReadCapability,
-    financial_preparation: Option<InvestmentFinancialPreparation>,
+    financial_preparation: Option<Arc<InvestmentFinancialPreparation>>,
     fred_latest_known: FredLatestKnownOperation,
     macro_context: MacroContextOperation,
     options_context: OptionsContextReadCapability,

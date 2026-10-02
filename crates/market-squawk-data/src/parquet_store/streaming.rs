@@ -244,7 +244,7 @@ impl StreamingParquetWriter {
         };
         // Reservation ownership moves with the writer into the supervised worker, including
         // after the caller drops a timed-out future. No detached unaccounted encoder survives.
-        state.admit(&batch, input.is_some())?;
+        let flush = state.admit_or_flush(&batch, input.is_some())?;
         let worker_cancel = cancellation.clone();
         let mut worker = self
             .supervisor
@@ -253,6 +253,20 @@ impl StreamingParquetWriter {
                 #[cfg(test)]
                 if let Some(barrier) = state.barrier.take() {
                     barrier.wait();
+                }
+                if flush {
+                    if worker_cancel.is_cancelled() {
+                        return Err(ParquetStoreError::Cancelled);
+                    }
+                    state.writer.flush()?;
+                    if u64::try_from(state.writer.bytes_written())
+                        .map_err(|_| ParquetStoreError::SizeOverflow)?
+                        > state.max_output_bytes
+                    {
+                        return Err(ParquetStoreError::StagingLimitExceeded);
+                    }
+                    // Account the actual flushed footer before admitting the new group.
+                    state.admit(&batch, input.is_some())?;
                 }
                 state.write(&batch, &worker_cancel)?;
                 drop(batch);
@@ -312,6 +326,45 @@ impl Drop for StreamingParquetWriter {
 }
 
 impl WriterState {
+    /// Admit encoding, or only the flush of a previously admitted nonempty group.
+    /// The caller performs that I/O on its supervised worker and then repeats admission.
+    fn admit_or_flush(
+        &mut self,
+        batch: &RecordBatch,
+        input_reserved: bool,
+    ) -> Result<bool, ParquetStoreError> {
+        match self.admit(batch, input_reserved) {
+            Ok(()) => return Ok(false),
+            Err(ParquetStoreError::WriterMemoryLimitExceeded { .. })
+                if self.writer.in_progress_rows() > 0 => {}
+            Err(error) => return Err(error),
+        }
+        // Retain the previous group's already-admitted encoding/flush workspace, including
+        // its footer, while the current input remains owned by the same worker. A separately
+        // reserved query input stays charged to its original reservation until it is dropped.
+        let working = self
+            .active_limit
+            .checked_add(self.metadata_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(if input_reserved {
+                    0
+                } else {
+                    batch.get_array_memory_size()
+                })
+            })
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        if u64::try_from(working).map_err(|_| ParquetStoreError::SizeOverflow)? > self.memory_limit
+        {
+            return Err(ParquetStoreError::WriterMemoryLimitExceeded {
+                limit: self.memory_limit,
+            });
+        }
+        if let Some(memory) = &self.memory {
+            memory.resize(working, self.memory_limit)?;
+        }
+        Ok(true)
+    }
+
     fn admit(
         &mut self,
         batch: &RecordBatch,

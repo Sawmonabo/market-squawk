@@ -337,11 +337,33 @@ pub(crate) enum SecFundProductError {
 }
 
 /// Selected issuer acquisition requires directory discovery followed by exact parent corroboration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum SecSelectedCompanyAcquisition {
-    Published,
+    Published(SecSelectedCompanyPublication),
     MissingIssuer,
     AmbiguousIssuer,
+}
+
+/// An operation outcome, not a transferable live authority. The exact activation is checked
+/// again before a job may expose its immutable completed result.
+#[derive(Debug)]
+pub(crate) struct SecSelectedCompanyPublication {
+    activation: Arc<SecFundProductActivation>,
+    value: serde_json::Value,
+}
+
+impl SecSelectedCompanyAcquisition {
+    pub(crate) fn value(&self) -> serde_json::Value {
+        match self {
+            Self::Published(publication) => publication.value.clone(),
+            Self::MissingIssuer => {
+                serde_json::json!({ "state": "unavailable", "reason": "issuer_missing" })
+            }
+            Self::AmbiguousIssuer => {
+                serde_json::json!({ "state": "unavailable", "reason": "issuer_ambiguous" })
+            }
+        }
+    }
 }
 
 /// Application-owned activation authority shared by CLI, MCP, and local onboarding transports.
@@ -930,32 +952,239 @@ impl ProviderAdapterActivation {
             return Ok(SecSelectedCompanyAcquisition::AmbiguousIssuer);
         }
         let cik = candidate.cik().clone();
-        activation
+        let publication = activation
             .operation
-            .publish_company_research(cik.as_str(), deadline, cancellation.child_token())
+            .publish_company_research(
+                cik.as_str(),
+                deadline,
+                cancellation.child_token(),
+                |precommit, family_cancellation| {
+                    Box::pin(self.associate_sec_company_families(
+                        &activation,
+                        &cik,
+                        Some((instrument_id, listing)),
+                        precommit,
+                        deadline,
+                        family_cancellation,
+                    ))
+                },
+            )
             .await?;
-        // Revalidate the activation before associating separately retained actual issuer parents.
+        // Revalidate the activation before reading the already-associated exact issuer parents.
         let current = self.active_sec_company_operation()?;
         if !Arc::ptr_eq(&activation, &current) {
             return Err(SecFundProductError::Unavailable);
         }
-        let resolution = Arc::clone(&self.company_security_resolution);
         let source = activation.source.metadata().source_id().clone();
-        let listing = listing.clone();
-        self.research
+        let parents = publication.company_parents();
+        let published = publication.new_link_count();
+        let relationships = self
+            .research
+            .research_service()
+            .company_security_identities();
+        let associations = self.research
             .research_service()
             .run_owned_research_io(deadline, &cancellation, move |owned_cancellation| {
-                resolution.ensure_source_qualified_listing(
-                    &source,
-                    &cik,
-                    instrument_id,
-                    &listing,
-                    deadline,
-                    &owned_cancellation,
+                // Existing links may have been retained or explicitly adjudicated. Reopen each
+                // exact acquired parent rather than treating zero new links as success/readiness.
+                let now = chrono::Utc::now().timestamp_nanos_opt()
+                    .filter(|value| *value > 0)
+                    .map(Timestamp::from_unix_nanos)
+                    .ok_or(crate::application::company_security_resolution::CompanySecurityResolutionError::InvalidRequest)?;
+                let mut selected = Vec::with_capacity(parents.len());
+                for (surface, digest) in parents {
+                    let query = market_squawk_data::SecFundamentalIdentityQuery::try_new(
+                        source.clone(), cik.clone(), surface, digest, now, now,
+                    )
+                    .map_err(crate::application::company_security_resolution::CompanySecurityResolutionError::CompanyCatalog)?
+                    .for_instrument(instrument_id);
+                    let selection = relationships.sec_fundamental_identity_as_of(&query, deadline, &owned_cancellation)
+                        .map_err(crate::application::company_security_resolution::CompanySecurityResolutionError::CompanyCatalog)?;
+                    let state = match selection.availability() {
+                        market_squawk_data::SecFundamentalIdentityAvailability::Available => "available",
+                        market_squawk_data::SecFundamentalIdentityAvailability::IdentityPending => "identity_pending",
+                        market_squawk_data::SecFundamentalIdentityAvailability::Conflict => "conflict",
+                        market_squawk_data::SecFundamentalIdentityAvailability::Unavailable => "unavailable",
+                    };
+                    selected.push(serde_json::json!({
+                        "surface": surface, "state": state,
+                        "companyObservationDigest": digest,
+                        "selectionReceiptDigest": selection.receipt_digest(),
+                        "relationshipDigest": selection.relationship().map(|record| record.link_digest()),
+                        "knowledgeAtUnixNanos": now.unix_nanos().to_string(),
+                    }));
+                }
+                Ok::<_, crate::application::company_security_resolution::CompanySecurityResolutionError>(
+                    serde_json::json!({ "newLinkCount": published, "surfaces": selected })
                 )
             })
             .await??;
-        Ok(SecSelectedCompanyAcquisition::Published)
+        let result = SecSelectedCompanyAcquisition::Published(SecSelectedCompanyPublication {
+            value: serde_json::json!({
+                "state": "prepared",
+                "sourceId": activation.source.metadata().source_id(),
+                "cik": publication.cik(),
+                "families": publication.value(),
+                "associations": associations,
+            }),
+            activation,
+        });
+        self.validate_selected_company_preparation(&result)?;
+        Ok(result)
+    }
+
+    /// Associates only retained successful families, using the acquisition's original lease.
+    /// Joining the worker keeps that lease alive through interruption and catalog cleanup.
+    async fn associate_sec_company_families(
+        &self,
+        activation: &Arc<SecFundProductActivation>,
+        cik: &SourceIdentifier,
+        selected: Option<(
+            market_squawk_domain::InstrumentId,
+            &market_squawk_data::ListingReferenceRecord,
+        )>,
+        precommit: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        usize,
+        crate::application::company_security_resolution::CompanySecurityResolutionError,
+    > {
+        use crate::application::company_security_resolution::CompanySecurityResolutionError as Error;
+        let current = self
+            .active_sec_company_operation()
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "active-operation",
+                    "SEC family association failed"
+                );
+            })
+            .map_err(|_| Error::AuthorityUnavailable)?;
+        if !Arc::ptr_eq(activation, &current) {
+            tracing::warn!(
+                stage = "activation-replaced",
+                "SEC family association failed"
+            );
+            return Err(Error::AuthorityUnavailable);
+        }
+        activation
+            .operation
+            .validate_company_preparation()
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "company-authority",
+                    "SEC family association failed"
+                );
+            })
+            .map_err(|_| Error::AuthorityUnavailable)?;
+        let resolution = Arc::clone(&self.company_security_resolution);
+        let onboarding = Arc::clone(&self.onboarding);
+        let lease = activation.lease.clone();
+        let source = activation.source.metadata().source_id().clone();
+        let cik = cik.clone();
+        let selected = selected.map(|(instrument, listing)| (instrument, listing.clone()));
+        self.research
+            .research_service()
+            .run_owned_research_io_joined(deadline, &cancellation, move |owned_cancellation| {
+                let validate = |stage| {
+                    if owned_cancellation.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(Error::DeadlineExceeded);
+                    }
+                    // These are nonblocking read/currentness checks, not a second mutation or
+                    // publication lease. The original precommit lease owns generation lifetime.
+                    onboarding
+                        .try_acquire_runtime_read_authority()
+                        .and_then(|authority| authority.require_active(&lease))
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                ?error,
+                                stage,
+                                authority = "onboarding",
+                                "SEC family association failed"
+                            );
+                        })
+                        .map_err(|_| Error::AuthorityUnavailable)?;
+                    precommit
+                        .validate_precommit()
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                ?error,
+                                stage,
+                                authority = "precommit",
+                                "SEC family association failed"
+                            );
+                        })
+                        .map_err(|error| match error {
+                            market_squawk_data::IngestError::Cancelled => Error::Cancelled,
+                            market_squawk_data::IngestError::DeadlineExceeded => {
+                                Error::DeadlineExceeded
+                            }
+                            _ => Error::AuthorityUnavailable,
+                        })
+                };
+                validate("before-resolution")?;
+                let published = match &selected {
+                    Some((instrument, listing)) => resolution.ensure_source_qualified_listing(
+                        &source,
+                        &cik,
+                        *instrument,
+                        listing,
+                        deadline,
+                        &owned_cancellation,
+                    ),
+                    None => resolution.ensure_company_listing_relationships(
+                        &source,
+                        &cik,
+                        deadline,
+                        &owned_cancellation,
+                    ),
+                }
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        ?error,
+                        stage = "relationship-resolution",
+                        "SEC family association failed"
+                    );
+                })?;
+                validate("after-resolution")?;
+                Ok(published)
+            })
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "owned-worker",
+                    "SEC family association failed"
+                );
+            })
+            .map_err(|_| {
+                if cancellation.is_cancelled() {
+                    Error::Cancelled
+                } else if Instant::now() >= deadline {
+                    Error::DeadlineExceeded
+                } else {
+                    Error::AuthorityUnavailable
+                }
+            })?
+    }
+
+    pub(crate) fn validate_selected_company_preparation(
+        &self,
+        outcome: &SecSelectedCompanyAcquisition,
+    ) -> Result<(), SecFundProductError> {
+        if let SecSelectedCompanyAcquisition::Published(publication) = outcome {
+            let current = self.active_sec_company_operation()?;
+            if !Arc::ptr_eq(&publication.activation, &current) {
+                return Err(SecFundProductError::Unavailable);
+            }
+            current.operation.validate_company_preparation()?;
+        }
+        Ok(())
     }
 
     fn active_sec_company_operation(
@@ -971,14 +1200,32 @@ impl ProviderAdapterActivation {
         self.onboarding
             .try_acquire_runtime_read_authority()
             .and_then(|authority| authority.require_active(&activation.lease))
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "active-onboarding",
+                    "SEC company authority unavailable"
+                );
+            })
             .map_err(|_| SecFundProductError::Unavailable)?;
         if self
             .research
             .provider_runtime_generation(activation.generation.profile())
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "runtime-generation",
+                    "SEC company authority unavailable"
+                );
+            })
             .map_err(|_| SecFundProductError::Unavailable)?
             .as_ref()
             != Some(&activation.generation)
         {
+            tracing::warn!(
+                stage = "runtime-generation-replaced",
+                "SEC company authority unavailable"
+            );
             return Err(SecFundProductError::Unavailable);
         }
         Ok(activation)
@@ -994,22 +1241,22 @@ impl ProviderAdapterActivation {
         for cik in &activation.selected_companies {
             activation
                 .operation
-                .publish_company_research(cik.as_str(), deadline, cancellation.child_token())
+                .publish_company_research(
+                    cik.as_str(),
+                    deadline,
+                    cancellation.child_token(),
+                    |precommit, family_cancellation| {
+                        Box::pin(self.associate_sec_company_families(
+                            &activation,
+                            cik,
+                            None,
+                            precommit,
+                            deadline,
+                            family_cancellation,
+                        ))
+                    },
+                )
                 .await?;
-            let resolution = Arc::clone(&self.company_security_resolution);
-            let source = activation.source.metadata().source_id().clone();
-            let cik = cik.clone();
-            self.research
-                .research_service()
-                .run_owned_research_io(deadline, &cancellation, move |owned_cancellation| {
-                    resolution.ensure_company_listing_relationships(
-                        &source,
-                        &cik,
-                        deadline,
-                        &owned_cancellation,
-                    )
-                })
-                .await??;
         }
         Ok(())
     }

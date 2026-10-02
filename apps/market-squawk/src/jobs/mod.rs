@@ -3,7 +3,9 @@
 mod backtest;
 mod backup;
 mod forecast;
+mod investment_financials;
 mod market_history;
+pub(crate) use investment_financials::InvestmentFinancialJobRunner;
 mod recovery;
 mod research;
 pub(crate) use market_history::MarketHistoryJobRunner;
@@ -62,6 +64,7 @@ const RUNNER_DEADLINE: Duration = Duration::from_secs(60 * 60);
 pub struct InstalledJobRunners {
     ingest: Arc<ResearchJobRunner>,
     market_history: Arc<MarketHistoryJobRunner>,
+    investment_financials: Option<Arc<InvestmentFinancialJobRunner>>,
     research_phase_one_derived_generation: Arc<PhaseOneDerivedGenerationJobRunner>,
     analysis_phase_one_feature_derived_generation: Arc<PhaseOneDerivedGenerationJobRunner>,
     export: Arc<ResearchExportJobRunner>,
@@ -104,6 +107,19 @@ impl InstalledJobRunners {
             )
             .map_err(|_| InstalledJobError::RunnerComposition)?,
         );
+        let investment_financials = product
+            .investment_financial_preparation()
+            .map(|preparation| {
+                InvestmentFinancialJobRunner::try_new(
+                    preparation,
+                    Arc::clone(&artifacts),
+                    RUNNER_PENDING_CAPACITY,
+                    RUNNER_DEADLINE,
+                )
+                .map(Arc::new)
+            })
+            .transpose()
+            .map_err(|_| InstalledJobError::RunnerComposition)?;
         let research_phase_one_derived_generation = Arc::new(
             PhaseOneDerivedGenerationJobRunner::try_new_research_dataset(
                 product.research(),
@@ -221,6 +237,7 @@ impl InstalledJobRunners {
         Ok(Self {
             ingest,
             market_history,
+            investment_financials,
             research_phase_one_derived_generation,
             analysis_phase_one_feature_derived_generation,
             export,
@@ -252,6 +269,9 @@ impl InstalledJobRunners {
             mutation_registration(self.recovery.clone()),
             mutation_registration(self.update.clone()),
         ];
+        if let Some(financials) = &self.investment_financials {
+            runners.push(mutation_registration(financials.clone()));
+        }
         if let Some(training) = &self.training {
             runners.push(mutation_registration(training.clone()));
         }
@@ -264,6 +284,10 @@ impl InstalledJobRunners {
 
     pub(crate) const fn market_history(&self) -> &Arc<MarketHistoryJobRunner> {
         &self.market_history
+    }
+
+    pub(crate) fn investment_financials(&self) -> Option<&Arc<InvestmentFinancialJobRunner>> {
+        self.investment_financials.as_ref()
     }
 
     pub(crate) const fn export(&self) -> &Arc<ResearchExportJobRunner> {

@@ -370,7 +370,13 @@ export type MarketHistoryPreparationRequest =
   | { action: "get"; historyToken: string; jobId: string; generation: string }
   | { action: "cancel"; historyToken: string; jobId: string; generation: string; expectedSequence: string }
 
+export type InvestmentFinancialPreparationRequest =
+  | { action: "start" | "reconcileStart" | "cancelStart"; selectionToken: string; startRequestId: string }
+  | { action: "get"; selectionToken: string; jobId: string; generation: string }
+  | { action: "cancel"; selectionToken: string; jobId: string; generation: string; expectedSequence: string }
+
 export interface ProductTransport {
+  investmentFinancialPreparation(request: InvestmentFinancialPreparationRequest, confirmed?: boolean, options?: ReadOptions): Promise<ApplicationResult>
   marketHistoryPreparation(request: MarketHistoryPreparationRequest, confirmed?: boolean, options?: ReadOptions): Promise<ApplicationResult>
   recommendationSetup(request: RecommendationSetupRequest, confirmed?: boolean): Promise<ApplicationResult>
   query(request: ProductQuery, options?: ReadOptions): Promise<ApplicationResult>

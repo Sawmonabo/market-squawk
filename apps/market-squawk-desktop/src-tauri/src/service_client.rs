@@ -1,25 +1,25 @@
 //! Narrow desktop controls over the shared application service.
 
-use market_squawk_services::RequestId;
 use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
 use tauri::State;
 
 use crate::{
     bridge::{
-        DesktopState, InvocationAuthority, invoke_analytical_operation, invoke_application,
-        invoke_private_application, invoke_read_application, prepare_analytical_arguments,
+        DesktopState, InvocationAuthority, invoke_application, invoke_private_application,
+        invoke_read_application,
     },
     contracts::{
         AnalysisControlCommand, ApplicationInvocation, BacktestProductCommand,
         DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
         FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
-        JobControlCommand, MarketHistoryPreparationCommand, ModelControlCommand,
-        ModelProductCommand, OperationLogDomain, OperationLogSeverity, OperationSettingValue,
-        OperationsControlCommand, PaperControlCommand, ProductSessionToken, ResearchControlCommand,
-        SourceLifecycleAction, SourceLifecycleInput,
+        InvestmentFinancialPreparationCommand, JobControlCommand, MarketHistoryPreparationCommand,
+        ModelControlCommand, ModelProductCommand, OperationLogDomain, OperationLogSeverity,
+        OperationSettingValue, OperationsControlCommand, PaperControlCommand, ProductSessionToken,
+        ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
     },
 };
+
+mod selected_preparation;
 
 // Canonical string conversion happens after the shared bridge's size check, so retain its cap.
 const MAXIMUM_CANONICAL_JOB_RESULT_BYTES: usize = 1024 * 1024;
@@ -2205,173 +2205,32 @@ pub(crate) async fn market_history_preparation(
     request_id: Option<uuid::Uuid>,
     product_session_token: Option<ProductSessionToken>,
 ) -> Result<Value, DesktopCommandError> {
-    let generation = state.generation()?;
-    let read = if matches!(
-        &request,
-        MarketHistoryPreparationCommand::Get { .. }
-            | MarketHistoryPreparationCommand::ReconcileStart { .. }
-    ) {
-        Some(generation.begin_read(
-            request_id.ok_or_else(|| {
-                DesktopCommandError::invalid_request("The screen read requires a request identity.")
-            })?,
-            product_session_token.ok_or_else(|| {
-                DesktopCommandError::invalid_request(
-                    "The screen read requires its current session.",
-                )
-            })?,
-        )?)
-    } else {
-        if request_id.is_some() || product_session_token.is_some() {
-            return Err(DesktopCommandError::invalid_request(
-                "A history preparation change is not a cancellable read.",
-            ));
-        }
-        None
-    };
-    let (operation, arguments, mutation) = match request {
-        MarketHistoryPreparationCommand::Start {
-            history_token,
-            lookback_days,
-            start_request_id,
-        } => {
-            require_confirmation(confirmed)?;
-            let request_id = history_preparation_request_id(start_request_id)?;
-            let arguments = history_preparation_start_arguments(history_token, lookback_days);
-            state.admit_current(&generation)?;
-            // The renderer retains this UUID before sending; replay uses the same durable start.
-            let mut result = invoke_analytical_operation(
-                &generation,
-                "Market.StartHistoryPreparation",
-                arguments,
-                InvocationAuthority::ExactConfirmed("Market.StartHistoryPreparation"),
-                request_id,
-                generation.cancellation(),
-            )
-            .await?;
-            state.admit_current(&generation)?;
-            canonicalize_job_result("Market.StartHistoryPreparation", &mut result)?;
-            return Ok(result);
-        }
-        MarketHistoryPreparationCommand::Get {
-            history_token,
-            job_id,
-            generation,
-        } => {
-            let mut arguments = map_with_job_id(job_id);
-            arguments.insert("historyToken".to_owned(), json!(history_token));
-            arguments.insert(
-                "generation".to_owned(),
-                json!(parse_job_generation(generation)?),
-            );
-            ("Market.GetHistoryPreparation", arguments, false)
-        }
-        MarketHistoryPreparationCommand::Cancel {
-            history_token,
-            job_id,
-            generation,
-            expected_sequence,
-        } => {
-            let mut arguments = job_mutation_arguments(job_id, generation, expected_sequence)?;
-            arguments.insert("historyToken".to_owned(), json!(history_token));
-            ("Market.CancelHistoryPreparation", arguments, true)
-        }
-        MarketHistoryPreparationCommand::ReconcileStart {
-            history_token,
-            lookback_days,
-            start_request_id,
-        } => (
-            "Job.ReconcileStart",
-            history_preparation_reconciliation_arguments(
-                &generation,
-                history_token,
-                lookback_days,
-                start_request_id,
-            )?,
-            false,
-        ),
-        MarketHistoryPreparationCommand::CancelStart {
-            history_token,
-            lookback_days,
-            start_request_id,
-        } => (
-            "Job.CancelStart",
-            history_preparation_reconciliation_arguments(
-                &generation,
-                history_token,
-                lookback_days,
-                start_request_id,
-            )?,
-            true,
-        ),
-    };
-    if let Some(read) = read {
-        let mut result = invoke_read_application(operation, arguments, &state, &read).await?;
-        canonicalize_job_result(operation, &mut result)?;
-        Ok(result)
-    } else {
-        invoke_narrow(
-            operation,
-            arguments,
-            mutation,
-            confirmed,
-            &state,
-            &generation,
-        )
-        .await
-    }
+    selected_preparation::invoke(
+        request.into(),
+        confirmed,
+        state,
+        request_id,
+        product_session_token,
+    )
+    .await
 }
 
-fn history_preparation_start_arguments(
-    history_token: String,
-    lookback_days: u16,
-) -> Map<String, Value> {
-    let mut arguments = Map::new();
-    arguments.insert("historyToken".to_owned(), json!(history_token));
-    arguments.insert("lookbackDays".to_owned(), json!(lookback_days));
-    arguments
-}
-
-fn history_preparation_request_id(
-    start_request_id: uuid::Uuid,
-) -> Result<RequestId, DesktopCommandError> {
-    if start_request_id.is_nil() {
-        return Err(DesktopCommandError::invalid_request(
-            "The history preparation requires its original request identity.",
-        ));
-    }
-    RequestId::try_string(format!("desktop-history-{}", start_request_id.simple()))
-        .map_err(|_error| DesktopCommandError::internal())
-}
-
-fn history_preparation_reconciliation_arguments(
-    generation: &crate::bridge::DesktopGeneration,
-    history_token: String,
-    lookback_days: u16,
-    start_request_id: uuid::Uuid,
-) -> Result<Map<String, Value>, DesktopCommandError> {
-    let request_id = history_preparation_request_id(start_request_id)?;
-    // Match InstalledJobOperations::begin_start: hash the exact admitted argument map,
-    // including the same native confirmation/result limits. No caller-selected operation or digest.
-    let original = prepare_analytical_arguments(
-        generation,
-        "Market.StartHistoryPreparation",
-        history_preparation_start_arguments(history_token, lookback_days),
-        InvocationAuthority::ExactConfirmed("Market.StartHistoryPreparation"),
-    )?;
-    let encoded =
-        serde_json::to_vec(&original).map_err(|_error| DesktopCommandError::internal())?;
-    let mut arguments = Map::new();
-    arguments.insert("requestId".to_owned(), json!(request_id));
-    arguments.insert(
-        "operation".to_owned(),
-        json!("Market.StartHistoryPreparation"),
-    );
-    arguments.insert(
-        "argumentsSha256".to_owned(),
-        json!(format!("{:x}", Sha256::digest(encoded))),
-    );
-    Ok(arguments)
+#[tauri::command]
+pub(crate) async fn investment_financial_preparation(
+    request: InvestmentFinancialPreparationCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+    request_id: Option<uuid::Uuid>,
+    product_session_token: Option<ProductSessionToken>,
+) -> Result<Value, DesktopCommandError> {
+    selected_preparation::invoke(
+        request.into(),
+        confirmed,
+        state,
+        request_id,
+        product_session_token,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2559,6 +2418,9 @@ async fn invoke_narrow(
             | "Market.StartHistoryPreparation"
             | "Market.GetHistoryPreparation"
             | "Market.CancelHistoryPreparation"
+            | "Research.StartInvestmentFinancialPreparation"
+            | "Research.GetInvestmentFinancialPreparation"
+            | "Research.CancelInvestmentFinancialPreparation"
             | "Job.ReconcileStart"
             | "Job.CancelStart"
     ) {
@@ -2893,10 +2755,14 @@ fn canonicalize_job_result(
         | "Job.Cancel"
         | "Job.Confirm"
         | "Market.GetHistoryPreparation"
-        | "Market.CancelHistoryPreparation" => {
+        | "Market.CancelHistoryPreparation"
+        | "Research.GetInvestmentFinancialPreparation"
+        | "Research.CancelInvestmentFinancialPreparation" => {
             canonicalize_job_view(data)?;
         }
-        "Job.Retry" | "Market.StartHistoryPreparation" => canonicalize_job_receipt(data)?,
+        "Job.Retry"
+        | "Market.StartHistoryPreparation"
+        | "Research.StartInvestmentFinancialPreparation" => canonicalize_job_receipt(data)?,
         "Job.ReconcileStart" | "Job.CancelStart" => {
             let job = data
                 .get_mut("job")
@@ -2997,7 +2863,9 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{canonicalize_job_result, project_research_activity_payload};
+    use super::{
+        canonicalize_job_result, project_product_metadata, project_research_activity_payload,
+    };
 
     #[test]
     fn scoped_history_job_results_keep_lossless_generation_and_sequence() {
@@ -3005,6 +2873,9 @@ mod tests {
             "Market.StartHistoryPreparation",
             "Market.GetHistoryPreparation",
             "Market.CancelHistoryPreparation",
+            "Research.StartInvestmentFinancialPreparation",
+            "Research.GetInvestmentFinancialPreparation",
+            "Research.CancelInvestmentFinancialPreparation",
             "Job.ReconcileStart",
             "Job.CancelStart",
         ] {
@@ -3015,7 +2886,16 @@ mod tests {
             } else {
                 json!({"data": job})
             };
+            result["metadata"] = json!({"completeness": "complete", "returnedItems": 1,
+                "availableItems": 1, "sourceCoverage": {"status": "not_applicable"},
+                "dataQuality": {"status": "not_applicable"}});
             canonicalize_job_result(operation, &mut result).expect("supported scoped job result");
+            project_product_metadata(&mut result).expect("closed selected product envelope");
+            assert_eq!(
+                result["metadata"],
+                json!({"completeness": "complete",
+                "returnedItems": 1, "availableItems": 1})
+            );
             let data = if reconciliation {
                 &result["data"]["job"]
             } else {

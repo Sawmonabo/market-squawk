@@ -40,11 +40,16 @@ pub mod operations;
 mod paper;
 pub(crate) mod recommendation;
 mod research;
-pub(crate) use research::fiscal_projection::{fiscal_projection_policy_value, fiscal_projection_targets};
-pub(crate) use research::map_current_population_error;
+pub(crate) use research::fiscal_projection::{
+    fiscal_projection_policy_value, fiscal_projection_targets,
+};
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 pub use research::{
     H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
+};
+pub(crate) use research::{
+    InvestmentFinancialPreparation, InvestmentFinancialPreparationInput,
+    map_current_population_error,
 };
 pub(crate) use research::{benchmark, saved_benchmark};
 pub mod settings;
@@ -113,25 +118,26 @@ pub(crate) use research::{
     EiaApplicationAcquisitionLimits, EiaLiveComposition, EiaMacroApplicationClosure,
     EiaMacroApplicationError, EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest,
     EiaMacroPublicationReceipt, EiaMacroRestartReceipt, EiaMacroRestartSelector,
-    FeatureDatasetProductionFinalizer, FiscalDatasetPreparationRequest, FredLatestKnownOperation, FredPublishedGenerationHandoff,
-    InstrumentContext, InstrumentContextOutcome, InstrumentContextReadCapability,
-    InstrumentContextReadError, InstrumentContextRequest, InstrumentIdentityReadCapability,
-    InstrumentIdentityResolutionOutcome, InstrumentIdentityResolutionRead,
-    InstrumentIdentityResolutionRequest, InstrumentOfficialLifecycleEvidence,
-    InstrumentSearchCandidate, InstrumentSearchListing, InstrumentSearchMatchReason,
-    InstrumentSearchRead, InstrumentSearchRequest, KrakenMarketApplicationOutcome,
-    MacroContextReadCapability, MacroFeatureVector, MarketEventDurableRead,
-    MarketEventDurableReadWriter, MarketEventReadError, MarketEventRestartSelector,
-    MarketHistoryReadCapability, MarketHistoryUnavailableReason, OptionsContextAvailability,
-    OptionsContextError, OptionsContextReadCapability, OptionsContextRequest,
-    OptionsContextUnavailableReason, PreparedFeatureDatasetBuild, PreparedFiscalDatasetPair,
-    ResearchProviderPublicationOperation, ResearchProviderRuntimeMutationAuthority,
-    ResearchProviderRuntimeReplacement, SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION,
-    SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
-    SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
-    SchwabRestQuoteSourceHealthOutcome, SchwabStreamerApplicationOutcome,
-    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt,
-    SecFundamentalsResearchError, SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
+    FeatureDatasetProductionFinalizer, FiscalDatasetPreparationRequest, FredLatestKnownOperation,
+    FredPublishedGenerationHandoff, InstrumentContext, InstrumentContextOutcome,
+    InstrumentContextReadCapability, InstrumentContextReadError, InstrumentContextRequest,
+    InstrumentIdentityReadCapability, InstrumentIdentityResolutionOutcome,
+    InstrumentIdentityResolutionRead, InstrumentIdentityResolutionRequest,
+    InstrumentOfficialLifecycleEvidence, InstrumentSearchCandidate, InstrumentSearchListing,
+    InstrumentSearchMatchReason, InstrumentSearchRead, InstrumentSearchRequest,
+    KrakenMarketApplicationOutcome, MacroContextReadCapability, MacroFeatureVector,
+    MarketEventDurableRead, MarketEventDurableReadWriter, MarketEventReadError,
+    MarketEventRestartSelector, MarketHistoryReadCapability, MarketHistoryUnavailableReason,
+    OptionsContextAvailability, OptionsContextError, OptionsContextReadCapability,
+    OptionsContextRequest, OptionsContextUnavailableReason, PreparedFeatureDatasetBuild,
+    PreparedFiscalDatasetPair, ResearchProviderPublicationOperation,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION, SchwabMarketPublicationError,
+    SchwabRestQuoteGenerationAuthority, SchwabRestQuotePostSealFailure,
+    SchwabRestQuotePublicationPackage, SchwabRestQuoteSourceHealthOutcome,
+    SchwabStreamerApplicationOutcome, SchwabStreamerGenerationAuthority,
+    SchwabStreamerPublicationPackage, SecFundPublicationReceipt, SecFundamentalsResearchError,
+    SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
     SecFundamentalsResearchStatus, SecLiveFundApplicationError, SecLiveFundRequest,
     SecLiveFundSource, SecResearchFamilyBinding, TiingoCompletedEodActionRead,
     TiingoCompletedEodHistoryReference, TiingoEodHistoryPublicationReceipt,

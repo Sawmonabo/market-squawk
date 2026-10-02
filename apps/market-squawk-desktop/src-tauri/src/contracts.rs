@@ -109,6 +109,9 @@ pub(crate) enum ProductCapability {
     InvestmentProfile,
     InvestmentFinancials,
     InvestmentFinancialsClose,
+    InvestmentFinancialPreparationStart,
+    InvestmentFinancialPreparationGet,
+    InvestmentFinancialPreparationCancel,
     JobList,
     JobWatch,
     MacroContext,
@@ -275,6 +278,13 @@ impl ProductCapability {
             "Research.GetInvestmentProfile" => Self::InvestmentProfile,
             "Research.GetInvestmentFinancials" => Self::InvestmentFinancials,
             "Research.CloseInvestmentFinancials" => Self::InvestmentFinancialsClose,
+            "Research.StartInvestmentFinancialPreparation" => {
+                Self::InvestmentFinancialPreparationStart
+            }
+            "Research.GetInvestmentFinancialPreparation" => Self::InvestmentFinancialPreparationGet,
+            "Research.CancelInvestmentFinancialPreparation" => {
+                Self::InvestmentFinancialPreparationCancel
+            }
             "Research.ListDatasets" => Self::ResearchDatasetList,
             "Research.PreviewStagedFile" => Self::ResearchFilePreview,
             "Research.StartExport" => Self::ResearchExport,
@@ -1347,6 +1357,39 @@ pub(crate) enum MarketHistoryPreparationCommand {
     CancelStart {
         history_token: String,
         lookback_days: u16,
+        start_request_id: Uuid,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
+pub(crate) enum InvestmentFinancialPreparationCommand {
+    Start {
+        selection_token: String,
+        start_request_id: Uuid,
+    },
+    Get {
+        selection_token: String,
+        job_id: Uuid,
+        generation: String,
+    },
+    Cancel {
+        selection_token: String,
+        job_id: Uuid,
+        generation: String,
+        expected_sequence: String,
+    },
+    ReconcileStart {
+        selection_token: String,
+        start_request_id: Uuid,
+    },
+    CancelStart {
+        selection_token: String,
         start_request_id: Uuid,
     },
 }

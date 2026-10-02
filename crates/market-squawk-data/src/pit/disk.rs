@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::mem::size_of;
 use std::time::Instant;
 
-use market_squawk_domain::ResearchObservation;
+use market_squawk_domain::{ResearchObservation, RevisionNumber};
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
 
@@ -13,7 +13,7 @@ use super::canonical::{self, CanonicalEncoder, map_error};
 use super::retained::{OperationControl, RetainedBudget};
 use super::{
     PointInTimeCandidate, PointInTimeConflictCounts, PointInTimeError, PointInTimeExclusionCounts,
-    PointInTimeExclusionReasons, PointInTimeRecord, PointInTimeRequest, PointInTimeRevisionCounts,
+    PointInTimeExclusionReasons, PointInTimeRequest, PointInTimeRevisionCounts,
     PointInTimeRevisionMode, PointInTimeRevisionState,
 };
 use crate::{DatasetManifestRef, Sha256Digest};
@@ -25,6 +25,17 @@ pub(crate) enum DecisionDisposition {
     Selected,
     Excluded(PointInTimeExclusionReasons),
     Conflict,
+}
+
+/// Exact identities already computed from admitted observations during append/selection.
+/// Decision-only consumers do not need another decoded copy of the source payload.
+pub(crate) struct DecisionRecord {
+    pub(crate) family_identity: Sha256Digest,
+    pub(crate) payload_identity: Sha256Digest,
+    pub(crate) provenance_identity: Sha256Digest,
+    pub(crate) evidence_identity: Sha256Digest,
+    pub(crate) revision: RevisionNumber,
+    pub(crate) revision_state: PointInTimeRevisionState,
 }
 
 /// All source payloads and canonical identities live on disk, once per operation.
@@ -192,23 +203,34 @@ impl CandidateStore {
     /// append position. Exclusions and conflicts remain available until the next selection.
     pub(crate) fn visit_decisions(
         &self,
-        mut visit: impl FnMut(usize, PointInTimeRecord<'_>, DecisionDisposition) -> Result<()>,
+        mut visit: impl FnMut(usize, DecisionRecord, DecisionDisposition) -> Result<()>,
     ) -> Result<()> {
         if !self.usable || !self.has_selection {
             return Err(PointInTimeError::ScratchStorage);
         }
         let mut control = OperationControl::new(&self.cancellation, self.deadline)?;
         let mut statement = self.connection.prepare(
-            "SELECT c.id,c.source,c.observation,c.family_identity,c.payload,c.provenance,c.evidence,
-             d.state,d.decision,d.reasons FROM candidates c INDEXED BY canonical_order
+            "SELECT c.id,c.source,length(c.observation),c.family_identity,c.payload,c.provenance,c.evidence,
+             d.state,d.decision,d.reasons,c.revision FROM candidates c INDEXED BY canonical_order
              JOIN decisions d ON d.id=c.id ORDER BY c.family,c.revision,c.payload,c.evidence,c.id"
         ).map_err(storage)?;
         let mut rows = statement.query([]).map_err(storage)?;
         while let Some(row) = rows.next().map_err(storage)? {
             control.observe()?;
-            let candidate = self.decode(row, 1, 2)?;
-            let record = PointInTimeRecord {
-                candidate: &candidate,
+            let source = read_usize(row, 1).map_err(storage)?;
+            self.manifests
+                .get(source)
+                .ok_or(PointInTimeError::CanonicalEncoding)?;
+            let bytes = read_usize(row, 2).map_err(storage)?;
+            if bytes > self.working_bytes / 4 {
+                return Err(PointInTimeError::RetainedBytesExceeded {
+                    limit: self.working_bytes,
+                    observed: bytes,
+                });
+            }
+            let record = DecisionRecord {
+                revision: RevisionNumber::new(row.get(10).map_err(storage)?)
+                    .map_err(|_| PointInTimeError::CanonicalEncoding)?,
                 family_identity: read_digest(row, 3)?,
                 payload_identity: read_digest(row, 4)?,
                 provenance_identity: read_digest(row, 5)?,
@@ -226,6 +248,7 @@ impl CandidateStore {
             let ordinal = read_usize(row, 0)
                 .map_err(storage)?
                 .checked_sub(1)
+                .filter(|ordinal| *ordinal < self.count)
                 .ok_or(PointInTimeError::CanonicalEncoding)?;
             visit(ordinal, record, disposition)?;
         }

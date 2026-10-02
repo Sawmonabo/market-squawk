@@ -1629,6 +1629,12 @@ impl LocalProduct {
         Arc::clone(&self.fair_value_governance)
     }
 
+    pub(crate) fn investment_financial_preparation(
+        &self,
+    ) -> Option<Arc<crate::application::InvestmentFinancialPreparation>> {
+        self.research_services.investment_financial_preparation()
+    }
+
     pub(crate) fn research_domain(&self) -> Arc<dyn ApplicationDomainService> {
         Arc::clone(&self.research_domain)
     }

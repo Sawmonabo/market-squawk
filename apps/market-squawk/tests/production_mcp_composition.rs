@@ -322,17 +322,32 @@ async fn run_installed_service_authority_scenario(
             assert_eq!(descriptor["metadata"]["privateInstalledClient"], true);
         }
 
-        // Selected history preparation is a shared product surface, even before provider setup.
-        for (operation, read_only) in [
-            ("Market.StartHistoryPreparation", false),
-            ("Market.GetHistoryPreparation", true),
-            ("Market.CancelHistoryPreparation", false),
+        // Selected preparation is shared across native and ordinary MCP clients before setup.
+        for (operation, domain, read_only) in [
+            ("Market.StartHistoryPreparation", "market", false),
+            ("Market.GetHistoryPreparation", "market", true),
+            ("Market.CancelHistoryPreparation", "market", false),
+            (
+                "Research.StartInvestmentFinancialPreparation",
+                "research",
+                false,
+            ),
+            (
+                "Research.GetInvestmentFinancialPreparation",
+                "research",
+                true,
+            ),
+            (
+                "Research.CancelInvestmentFinancialPreparation",
+                "research",
+                false,
+            ),
         ] {
             let descriptor = descriptors
                 .iter()
                 .find(|value| value["name"] == operation)
-                .context("history preparation omitted from native product descriptors")?;
-            assert_eq!(descriptor["contract"]["domain"], "market");
+                .context("selected preparation omitted from native product descriptors")?;
+            assert_eq!(descriptor["contract"]["domain"], domain);
             assert_eq!(descriptor["effects"]["readOnly"], read_only);
             assert_ne!(descriptor["metadata"]["privateInstalledClient"], true);
         }
@@ -3755,6 +3770,9 @@ async fn exercise_installed_relay_with_gate(
         "Research.GetInvestmentProfile",
         "Research.GetInvestmentFinancials",
         "Research.CloseInvestmentFinancials",
+        "Research.StartInvestmentFinancialPreparation",
+        "Research.GetInvestmentFinancialPreparation",
+        "Research.CancelInvestmentFinancialPreparation",
     ];
     assert!(investment_research.iter().all(|name| names.contains(name)));
     assert!(names.iter().all(|name| {

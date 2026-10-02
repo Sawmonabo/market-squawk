@@ -47,7 +47,25 @@ const CLI_JSON_MAXIMUM_BYTES: u64 = 8 * 1024 * 1024;
 const CLI_DEFAULT_MAXIMUM_ITEMS: usize = 10_000;
 const CLI_DEFAULT_MAXIMUM_BYTES: usize = 16 * 1024 * 1024;
 const CLI_HARD_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
-const HISTORY_PREPARATION_START: &str = "Market.StartHistoryPreparation";
+#[derive(Clone, Copy)]
+enum PreparationKind {
+    History,
+    Financials,
+}
+impl PreparationKind {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::History => "Market.StartHistoryPreparation",
+            Self::Financials => "Research.StartInvestmentFinancialPreparation",
+        }
+    }
+    const fn reconcile_command(self) -> &'static str {
+        match self {
+            Self::History => "reconcile-history-preparation",
+            Self::Financials => "reconcile-financial-preparation",
+        }
+    }
+}
 static LOCAL_PAPER_CLI_ORIGIN: OnceLock<RequestOrigin> = OnceLock::new();
 
 /// Structured result returned by one product CLI command.
@@ -130,9 +148,11 @@ pub enum CliProductError {
     ConfirmationRequired,
     /// Start admission is unresolved; retain this binding instead of submitting another start.
     #[error(
-        "history preparation start remains {state}; check the original Market.StartHistoryPreparation request with `market-squawk market reconcile-history-preparation --request-id {request_id} --arguments-sha256 {arguments_sha256}`"
+        "preparation start remains {state}; check the original {operation} request with `market-squawk market {reconcile_command} --request-id {request_id} --arguments-sha256 {arguments_sha256}`"
     )]
-    HistoryPreparationStartUncertain {
+    PreparationStartUncertain {
+        operation: &'static str,
+        reconcile_command: &'static str,
         request_id: String,
         arguments_sha256: String,
         state: &'static str,
@@ -704,13 +724,81 @@ async fn market(
             )
             .await
         }
+        MarketCommand::PrepareFinancials {
+            selection_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            start_preparation(
+                authority,
+                PreparationKind::Financials,
+                json!({"selectionToken": selection_token, "confirm": true}),
+            )
+            .await
+        }
+        MarketCommand::FinancialPreparation {
+            selection_token,
+            job_id,
+            generation,
+        } => {
+            require_installed(authority, "Research.GetInvestmentFinancialPreparation")?;
+            invoke_without_result_limits(
+                authority,
+                "Research.GetInvestmentFinancialPreparation",
+                json!({"selectionToken": selection_token, "jobId": job_id, "generation": generation}),
+                "financial preparation read",
+            )
+            .await
+        }
+        MarketCommand::CancelFinancialPreparation {
+            selection_token,
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            require_installed(authority, "Research.CancelInvestmentFinancialPreparation")?;
+            invoke_without_result_limits(
+                authority,
+                "Research.CancelInvestmentFinancialPreparation",
+                json!({
+                    "selectionToken": selection_token,
+                    "jobId": job_id,
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "confirm": true,
+                }),
+                "financial preparation cancellation requested",
+            )
+            .await
+        }
+        MarketCommand::ReconcileFinancialPreparation {
+            request_id,
+            arguments_sha256,
+        } => {
+            reconcile_preparation(
+                authority,
+                PreparationKind::Financials,
+                &request_id,
+                &arguments_sha256,
+            )
+            .await
+        }
         MarketCommand::PrepareHistory {
             history_token,
             lookback_days,
             confirm,
         } => {
             require_confirmation(confirm)?;
-            prepare_history(authority, history_token, lookback_days).await
+            {
+                market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(
+                    lookback_days,
+                )
+                .map_err(|_| CliProductError::RequestShape)?;
+                start_preparation(authority, PreparationKind::History,
+                    json!({"historyToken": history_token, "lookbackDays": lookback_days, "confirm": true})).await
+            }
         }
         MarketCommand::HistoryPreparation {
             history_token,
@@ -752,38 +840,39 @@ async fn market(
         MarketCommand::ReconcileHistoryPreparation {
             request_id,
             arguments_sha256,
-        } => reconcile_history_preparation(authority, &request_id, &arguments_sha256).await,
+        } => {
+            reconcile_preparation(
+                authority,
+                PreparationKind::History,
+                &request_id,
+                &arguments_sha256,
+            )
+            .await
+        }
     }
 }
 
-async fn prepare_history(
+async fn start_preparation(
     authority: CliAuthority<'_>,
-    history_token: String,
-    lookback_days: u16,
+    kind: PreparationKind,
+    arguments: Value,
 ) -> Result<CliProductResult, CliProductError> {
     let CliAuthority::Installed(client) = authority else {
         return Err(CliProductError::InstalledServiceRequired {
-            operation: HISTORY_PREPARATION_START,
+            operation: kind.operation(),
         });
     };
-    market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(lookback_days)
-        .map_err(|_| CliProductError::RequestShape)?;
-    let arguments = json!({
-        "historyToken": history_token,
-        "lookbackDays": lookback_days,
-        "confirm": true,
-    });
     // Match InstalledJobOperations::begin_start: hash every admitted argument, including
     // confirmation. This operation has no resultLimits, so no transport adds that field.
     let encoded = serde_json::to_vec(&arguments).map_err(|_| CliProductError::RequestShape)?;
     let arguments_sha256 = hex(&Sha256::digest(encoded));
-    let request_id = format!("cli-history-{}", uuid::Uuid::new_v4().simple());
+    let request_id = format!("cli-preparation-{}", uuid::Uuid::new_v4().simple());
     let original_request =
         RequestId::try_string(request_id.clone()).map_err(|_| CliProductError::RuntimeRequest)?;
     let delivered = client
         .invoke_operation(
             original_request,
-            HISTORY_PREPARATION_START,
+            kind.operation(),
             arguments,
             CLI_INSTALLED_REQUEST_TIMEOUT,
             CancellationToken::new(),
@@ -794,7 +883,7 @@ async fn prepare_history(
     let cause = match delivered {
         Ok(value) => {
             return Ok(CliProductResult {
-                summary: "history preparation job admitted",
+                summary: "preparation job admitted",
                 value,
             });
         }
@@ -804,14 +893,14 @@ async fn prepare_history(
     // A failed acknowledgement never authorizes another start. Inspect the same binding once;
     // unresolved admission stays explicit and can be checked by the next CLI invocation.
     let (state, cause) =
-        match reconcile_history_preparation(authority, &request_id, &arguments_sha256).await {
+        match reconcile_preparation(authority, kind, &request_id, &arguments_sha256).await {
             Ok(mut result) => match result
                 .value()
                 .pointer("/data/state")
                 .and_then(Value::as_str)
             {
                 Some("admitted") => {
-                    result.summary = "history preparation admission reconciled";
+                    result.summary = "preparation admission reconciled";
                     return Ok(result);
                 }
                 Some("not_admitted") => return Err(cause),
@@ -821,7 +910,9 @@ async fn prepare_history(
             },
             Err(error) => ("unresolved", error),
         };
-    Err(CliProductError::HistoryPreparationStartUncertain {
+    Err(CliProductError::PreparationStartUncertain {
+        operation: kind.operation(),
+        reconcile_command: kind.reconcile_command(),
         request_id,
         arguments_sha256,
         state,
@@ -829,8 +920,9 @@ async fn prepare_history(
     })
 }
 
-async fn reconcile_history_preparation(
+async fn reconcile_preparation(
     authority: CliAuthority<'_>,
+    kind: PreparationKind,
     request_id: &str,
     arguments_sha256: &str,
 ) -> Result<CliProductResult, CliProductError> {
@@ -842,10 +934,10 @@ async fn reconcile_history_preparation(
         "Job.ReconcileStart",
         json!({
             "requestId": request_id,
-            "operation": HISTORY_PREPARATION_START,
+            "operation": kind.operation(),
             "argumentsSha256": lowercase_sha256(arguments_sha256)?,
         }),
-        "history preparation start checked",
+        "preparation start checked",
     )
     .await
 }

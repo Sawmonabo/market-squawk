@@ -6493,27 +6493,33 @@ impl AnalyticalDataService {
             .ok_or(IngestError::ReplayConflict)?;
         let maximum_bytes = usize::try_from(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
             .map_err(|_| IngestError::ReplayConflict)?;
-        // The store owns a child-token drop guard and a supervised/reaped blocking task.
-        // Dropping this timed read cancels its child without cancelling the caller's token.
-        let batches = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.objects.read_pinned_object_bounded_async(
-                &owned.pinned,
-                object.artifact_id(),
-                owned.suffix_start,
-                retained.record_count(),
-                maximum_bytes,
-                cancellation,
-            ),
-        )
-        .await
-        .map_err(|_| IngestError::DeadlineExceeded)??;
+        // Reuse the SEC reader's processing batch size: the complete object can be much
+        // larger than the temporary decoded observations and rebuilt lineage/projections.
+        // The cursor owns supervised blocking I/O and a child token cancelled on drop.
+        let mut cursor = self.objects.pinned_object_batch_cursor(
+            &owned.pinned,
+            object.artifact_id(),
+            owned.suffix_start,
+            256,
+            maximum_bytes,
+            cancellation,
+        )?;
         let control = MarketEventReadControl {
             deadline,
             cancellation,
         };
         let mut seen = std::collections::BTreeSet::new();
-        for batch in batches {
+        loop {
+            check_market_event_read(deadline, cancellation)?;
+            let batch = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                cursor.next_batch(),
+            )
+            .await
+            .map_err(|_| IngestError::DeadlineExceeded)??;
+            let Some(batch) = batch else {
+                break;
+            };
             let (originals, _) = ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
                 batch,
                 retained,

@@ -2,50 +2,64 @@
 
 ## Current execution — 2026-10-02
 
-Last pushed head: `c8795d8b` (SEC archive-summary correction); read/SEC batching checkpoint `cc179307`. Current read/SEC checkpoint keeps original canonical SEC evidence
-while retaining repeat captures, batches exact price selections within one read snapshot, and removes
-actor-only Source invalidations. Native build2527 PASS6m24s. Existing SEC replay/restart case PASS1/1
-(6.70s); retained batched selection/restart case PASS1/1 (10.88s). The actual visible Desktop collection
-returned9/9 genuine previous closes in7.016s under its unchanged15s request deadline; this improves
-on prior15.59–26.01s observations but is not an instant-read or streaming-quote completion claim.
-Evidence: sec-reobservation-critical.log, retained-batch-critical.log, retained-batch-native-collection.json
-under `.agents/tmp/v1-first-stock/`.
+Pushed checkpoints: `f5d92426` retained dated quotes with unchanged fresh-mark eligibility;
+`78bcecc1` recent-first financial reports with stable cursors; `1537370a` bounded catalog writer
+admission; `7ac69488` stable chart refresh; `c0df3336` history normalization/runtime retirement.
+Actual MSFT 365-day history/OHLC reopens after service replacement. Native refresh retained all
+seven canvas nodes, chart position and selected layers across15 samples. Actual Filings begins
+September2026. Native quote shows retained bid493.86/ask545.98/last512.71 with original dates;
+these are not current prices. Quote sizes are shown only where available. These focused outcomes
+do not establish complete V1 acceptance.
 
-Native build9608 PASS5m29s with history receipt cardinality and SEC archive-summary corrections.
-Both existing SEC summary/integrity cases PASS1/1 (queue95303). Replacement was blocked because
-service5073 exited1 on stale Alpaca historical parent during shutdown; Desktop5118 also exited.
-Lead restores the single visible supervisor. Financial/history positive native evidence remains open.
-History/layout checks already pass; no installed completion or successful shutdown claim.
+One visible development supervisor(session37993/PID27544) owns Desktop/service, Vite, watcher
+and serialized single-job compilation. No agent builds or new branches/worktrees. Three local
+branches, three origin branches plus origin/HEAD, one primary worktree last verified.
+Main/release and original recovery/session remain preserved.
 
-| Owner | Concrete outcome / exclusive ownership | Current evidence and next dependency |
+MSFT financial failures are now separately evidenced:
+- CompanyFacts clock/full-parent binding fixes pass existing adapter checks and live acquisition.
+- Real32,671-fact/4,881,196-byte capture hit Parquet64MiB writer admission. Pressure-triggered
+  bounded row-group flush is implemented without increasing production limits or dropping rows.
+  Corrected production-size critical fixture reproduced the original error(88.63s), then passed
+  complete publication/PIT/reopen(213.99s); writer cancellation passed1/1(0.51s).
+- Real storage now succeeds, but saved financial first-page read exceeds native deadline.
+  Batched candidate transactions and metadata decoding pass the full32,671-row PIT/reopen
+  regression(206.42s), but native first-page still exceeds15s. Late native sample shows887/1232
+  financial-worker samples waiting on recovery exclusion. This change is insufficient by itself.
+- Later live filing acquisition rejects an official XBRL2020 schema and other valid MSFT
+  taxonomy components. Structured publisher/release/component namespace correction is applied
+  with shared official-host transport policy; critical captured-graph case passes1/1(1.76s); live acquisition remains unproved.
+  Descriptor changes require current SEC activation; original evidence must not be rewritten.
+
+| Owner | Exact ownership/outcome | State / next dependency |
 | --- | --- | --- |
-| Lead | History runner/contracts, native/CLI/UI integration, shared manifests/permissions, ledger/Git and serialized checks | History producer/consumer implementation critically checked; checkpoint with explicit live ingestion blocker, then resolve actual MSFT chart/financials. |
-| Astra financial_pages | Candidate-only shutdown correction in application/market_runtime/group.rs and research/ingest/alpaca_historical.rs, including closest existing critical case | Trace original parent retirement versus replacement, ensure owned runtime drains and stale handles cannot retire replacements. No live edits/builds/Git. |
-| Astra startup_read_diagnosis | Candidate-only adapter json/submissions.rs and tests/official_fixtures.rs | Exact MSFT archive count/identity passes, but declared end2008-08-11 disagrees with one actual2008-08-12 filing. Preserve both dates and all strict identity/count checks; classify summary disagreement. |
-| Sol financial_detail_ui / investment_profile_ui, integrated | History preparation + existing stock fixture; selected-detail layout | Open chart, separate ticker/company, stable refresh and viewport checks pass; native data completion remains required. |
+| Lead | Shared contracts/jobs/service/CLI/MCP/native composition, source_authority.rs, Git/docs/build scheduling | Applied frozen read and taxonomy candidates together. Native build PASS7m19s(service98300/Desktop98348); graph and full facts/PIT checks PASS. Actual financial page still times out under background recovery; commit coherent storage/job checkpoint then apply recovery/routing candidates. |
+| Astra financial_pages | Candidate-only data sec_research.rs, pit/disk.rs and application research/company_research.rs | First candidate critical verified, native latency still fails. Candidate-only follow-up routes bulk reads through existing generation worker; shared research_service.rs and financial snapshot routing remain lead applied. No new worker/runtime. |
+| Astra startup_read_diagnosis | Candidate-only SEC xbrl/model.rs; separate suggested shared authority diff | Inspected candidate applied. Current SEC replacement Start completed using saved public contact. Candidate-only platform sealed_recovery.rs and existing sealed.rs regression plus data ingest/provider_capture_recovery.rs remove full-turn read exclusion and reuse catalog connection with fresh per-read transactions. No agent runtime/builds/Git. |
+| Sol investment_profile_ui | InvestmentQuote presentation in investment-page.tsx | Compact dated quote layout types/live verified and pushed; ownership released. |
+| Sol financial_preparation_ui_resume | Chart/read/shared financial controls and existing UI journey case | Stable chart checkpoint pushed; financial terminal settlement integrated. Ownership released. |
 
-Native retry evidence: service14502/Desktop14547 are visible under supervisor83295; restart reused
-fresh Cargo outputs in1.03s. MSFT history job8eae4f2f passed receipt admission but failed nested
-history-registered-ingest with DeadlineExceeded despite the independent1h job deadline. No chart
-completion claimed. Astra history_ingest_deadline owns read-only tracing of this nested ingest
-failure and writes only `.agents/tmp/v1-first-stock/history-ingest-deadline.md`; no live edits,
-builds or calls. Lead retains ingest coordinator edits. Other agent ownership is unchanged.
+Candidate packets and critical/native evidence live under `.agents/tmp/v1-first-stock`.
+Lead alone applies production changes. Financial integration includes retained-only page reads,
+scoped installed preparation jobs, original-request reconciliation/cancellation, bounded
+CompanyFacts publication and exact retained reader, per-family issuer association, and shared
+native/Desktop/CLI/MCP registration. Later-family failure stays a failed job while retained
+families remain available; successful storage alone does not prove financial-page completion.
 
-Financial preparation next dependency wave (candidate-only while the current native build runs):
-Astra startup_read_diagnosis owns application/research/investment_financial_preparation.rs,
-research/ingest/{sec_fundamentals,sec_live}.rs, provider_activation/mod.rs and new
-jobs/investment_financials.rs. Deliver retained-only reads plus one existing-runner-owned selected
-preparation with typed complete/partial family evidence and original cancellation/publication
-semantics. No live edits/builds. Lead reserves all composition, shared contracts/transports/native
-permissions/CLI/UI. Freeze interfaces before callers change; existing fixture/native selected-stock
-proof is the gate. This closes the proven cold-read lifetime defect, not speculative hardening.
+Critical evidence: history normalization1/1, runtime retirement1/1, streamed SEC revision/
+cancellation1/1, retained facts/restart/corruption1/1(257rows), repeated submissions1/1(4,525rows),
+native lossless history/financial metadata1/1, company relationship/PIT/restart with writer wait1/1,
+Desktop types and three existing market/lookup/refresh journeys, facts clock1/1, full-parent1/1,
+recent-first cursor1/1, corrected large writer/PIT/reopen1/1, writer cancellation1/1 and retained
+quote/current-mark separation1/1. Read/taxonomy affected checks now pass. Financial-page live completion remains blocked by recovery/read contention.
+No per-task CI, broad release gate or whole-app RAM claim.
 
-Next barrier: integrate the two concrete native-data failure fixes → one serialized build/critical
-checks → actual MSFT chart/financials and refresh observation → coherent commits/push. Cold financial
-acquisition still runs under the15s read; next necessary ownership correction uses the existing
-installed job runner and retained-only financial reads, preserving typed family outcomes and one
-final product-publication boundary. No new job framework or per-family terminal-fence reuse.
-Preserve full V1 scope. No main/release changes or additional worktrees.
+Next barrier: integrate recovery/read routing correction, then time saved facts and inspect
+statements/ratios/filings and cursor navigation; rerun only affected critical verification;
+refresh SEC activation and reconcile one acquisition from known terminal state; commit/push
+coherent integration and update PR43. Complete stock analysis, installed lifecycle and V1
+acceptance remain open. A painted native chart is verified separately from canvas presence,
+which alone is insufficient when background macOS animation frames are suspended.
 
 ## Checkpoint history — 2026-10-02
 
@@ -6495,3 +6509,5 @@ Latest resolves its cutoff inside actor processing and cannot yield virtual-pape
 explicit financial callers retain At. Lead owns paper/market.rs, paper/market/durable_product.rs,
 paper/equity.rs and paper_bot/virtual_routes.rs caller alignment. Reuse one selection/validation
 path, no compatibility wrappers. Freeze all callers before the one scheduled service build.
+
+Financial UI ownership transferred to GPT-6.1 Sol High financial_preparation_ui_resume after two provider capacity errors; preserve and finish the existing candidate, not a replacement design.
