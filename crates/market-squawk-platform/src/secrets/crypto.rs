@@ -367,14 +367,16 @@ fn derive_key(
         .try_reserve_exact(block_count)
         .map_err(|_| LocalSecretStoreError::Allocation)?;
     blocks.resize(block_count, Block::default());
-    let mut blocks = Zeroizing::new(blocks);
+    // Fix the initialized allocation before it contains secrets. A boxed slice wipes each
+    // block once; Vec zeroization also clears its entire spare-capacity allocation.
+    let mut blocks = Zeroizing::new(blocks.into_boxed_slice());
     let mut derived = Zeroizing::new([0_u8; KEY_BYTES]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into_with_memory(
             unlock.expose_secret().as_bytes(),
             &entry.salt,
             derived.as_mut(),
-            blocks.as_mut_slice(),
+            &mut blocks[..],
         )
         .map_err(|_| LocalSecretStoreError::CorruptVault)?;
     Ok(derived)

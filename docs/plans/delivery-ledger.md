@@ -2,19 +2,31 @@
 
 ## Current execution — 2026-10-01
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. Current checkpoint
-`1ae2704a` (pushed): Overview watchlist, dedicated investment navigation and isolation of compact retained
-reads from bulk generation reopening. Current working checkpoint carries independent quote/trade fields
-and valid tied-trade uncertainty into the shared product result. Previous pushed checkpoint `2552f8e4` delivers the coordinated
-development watcher; `aba0af19` delivers committed data-to-screen updates. These checkpoints do not
-establish complete rich investment details, live streaming coverage or installed-workflow acceptance.
-One worktree, three local and three origin branches; protected recovery history remains untouched.
+Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed checkpoint
+`6ba236c9` preserves independent quote/trade evidence and unresolved same-time trade batches;
+`1ae2704a` separates Overview watchlist, discovery and exact investment navigation. These checkpoints
+do not establish complete rich detail, live streaming coverage or installed acceptance.
+One worktree and three local/origin branches; recovery history remains untouched.
 
-| Active owner / outcome | State and exact scope | Next dependency / evidence |
+| Active owner / outcome | Exact ownership and dependency | Critical evidence / finish boundary |
 | --- | --- | --- |
-| Lead — quote/trade integration | Navigation/read-isolation pushed as `1ae2704a`; tied-trade Astra handoff frozen and inspected. Lead owns shared output schema, projection, Desktop consumers and critical verification. | Focused Rust market checks PASS2/2; Desktop two critical journeys and typecheck pass. Integrated watcher build and real overview/watchlist/exact MSFT reads pass; ready for commit/push. |
-| Astra startup_read_diagnosis — completed implementation | Full tied-candidate validation, all-coordinate Display authorization, explicit ambiguous trade and independent quote projection implemented; files released to lead. | Existing quote precision/freshness regression extended; lead owns check and live integration. |
-| Lead — rich investment and Overview integration | Dedicated route preserves existing price, history and analysis behavior. Rich quote/profile/financial projections, backend movers and Overview portfolio summary remain incomplete. | Extend existing producer-to-consumer contracts without fabricating data or conflating watchlist with holdings. |
+| Lead — credential startup cleanup | `crates/market-squawk-platform/src/secrets/crypto.rs`, shared ledger/Git/builds. Astra diagnosis complete; boxed initialized Argon2 buffer preserves cleanup without redundant Vec capacity wipe. | Existing optional-access/rotation and encrypted-store integrity cases, then observed same-root startup. No KDF weakening, vault-format change or authentication bypass. |
+| Sol investment_navigation — selected reference profile | New `application/research/investment_profile.rs` only. Reuse canonical token resolver and InstrumentContextReadCapability; return provider-neutral profile with exact identity, clocks and explicit missing/ambiguous states. | Send result contract first. Lead owns operation registration, shared schema/transport/CLI, module composition and integration. No builds/Git; no company facts falsely joined by ticker. |
+| Sol investment_profile_ui — profile detail presentation | New Desktop `src/features/markets/investment-profile.tsx` and `investment-profile-schema.ts` only. Start on frozen `Research.GetInvestmentProfile` DTO; root owns parent page, transport types, shared critical fixture. | Independent profile loading/error/retry; provider-neutral reference metadata, exact selected token validation. No builds/Git or routine tests. |
+| Lead — profile clients and remaining financial identity | Shared contracts/registration/transports plus Desktop consumer after profile DTO freezes. SEC financial production still stamps CIK-derived IDs; canonical issuer binding/publication is a subsequent required producer checkpoint. | Detail profile independently loads/retries without hiding quote/history. Existing critical journey covers selected identity and failure isolation. Financial reports and movers remain incomplete. |
+
+Credential cleanup correction critically verified: four existing platform secret-store cases PASS4/4
+(19.40s; compile8.33s), including managed restart/optional explicit locking, generation identity,
+redaction, tamper rejection and rotation. `credential-buffer-critical.log`. The initialized allocation
+becomes `Zeroizing<Box<[Block]>>` before Argon2 writes secrets, preserving RAII cleanup and identical
+KDF/cipher parameters. Installed dependency source zeroize1.9.0 confirms boxed slices wipe every
+initialized block, while Vec additionally wipes its full capacity. Argon2's supported caller-owned
+memory API is retained. Live startup improvement awaits the next coordinated build; no timing claim.
+
+Dependency order: finish/push quote checkpoint (done), prepare profile leaf concurrently with
+credential-buffer correction, verify/commit startup correction, then integrate profile producer and
+all clients as one checkpoint. Only the lead schedules compilation; the watcher is paused while
+manual focused Cargo checks run, with current visible Desktop/service retained.
 
 Navigation critical evidence: existing market journey passes with watchlist mutation and failed-refresh
 preservation on Overview, separate Markets navigation, exact investment selection and demand-loaded
