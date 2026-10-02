@@ -6,9 +6,9 @@ Working branch `feature/v1-installed-product-experience`, primary worktree only.
 `49b96e5a` removes redundant credential-buffer wiping without changing key derivation;
 `6ba236c9` preserves independent quote/trade evidence and unresolved same-time trade batches;
 `1ae2704a` separates Overview watchlist, discovery and exact investment navigation.
-The current selected-profile checkpoint adds independent reference metadata across shared clients
-and removes ordinary listing reads from the catalog writer. Its critical/live evidence is below;
-its commit identity is recorded in Git and PR #43. These checkpoints do not establish complete
+Selected-profile checkpoint `c59e0b71` adds independent reference metadata across shared clients
+and removes ordinary listing reads from the catalog writer. Its critical/live evidence is below
+and in PR #43. These checkpoints do not establish complete
 rich detail, live streaming coverage or installed acceptance.
 One worktree and three local/origin branches; recovery history remains untouched.
 
@@ -16,12 +16,33 @@ One worktree and three local/origin branches; recovery history remains untouched
 | --- | --- | --- |
 | Lead — selected profile checkpoint | Frozen Sol profile leaf/UI, shared Research/native/CLI contracts, Astra listing snapshot correction, lead constructor integrations, docs/Git. All writers released. | TypeScript PASS; existing Desktop2/2; held-writer listing regression1/1; rebuilt real MSFT/SPY profiles both available with exact selection; unknown selection rejected. Integrated checkpoint; native profile rendering and full rich detail remain unverified/incomplete. |
 | Lead — next financial dependency | Astra source-qualified SEC design complete, no implementation dispatched. New exact relationship basis must join issuer-owned facts to selected security without invented stock identity or unconditional manual setup. | Full scope recorded below; refresh against the profile checkpoint before disjoint producer/authority/financial/UI assignment. |
-| Astra startup_latency — read-only next correction | `.agents/tmp/v1-first-stock/listing-startup.sample.txt`, `listing-startup-observation.json` and directly implicated startup source; no edits/builds/runtime actions. | Longer sample has393 main-thread samples; observed Ready29.845s. Identify the measured dominant path before choosing a code change; do not attribute all latency to earlier hypotheses. |
+| Lead — duplicate startup scan checkpoint | `crates/market-squawk-data/src/authority_transition.rs`, ledger/evidence only; Astra startup_latency diagnosis complete at `c59e0b71`. The repeated ordinary bound-open scan is removed. | Initial integrity/FK scan, catalog/manifest binding, authority-chain and artifact-root validation retained. Existing root-restart/replacement and catalog-recovery cases PASS3/3; rebuild and exact MSFT/SPY profile reopen pass. Observed Ready32.038s; overall startup remains unresolved. |
 
 Overview owns the editable watchlist; it does not represent holdings. Markets owns broader discovery,
 Portfolio owns actual holdings with practice accounts distinguished, and every selected ticker opens
 its dedicated detail. The current Overview already mounts the independent Watchlist component;
 market snapshot, portfolio summary and complete signals remain required product work.
+
+Startup correction base `c59e0b71`: the 12-second runtime-composition sample shows119/393
+service-main samples in initial integrity/FK checking and58/393 in a repeated scan of the same
+catalog during `AuthorityTransitionService::open_bound`; executable hashing accounts for110/393.
+The second scan follows transfer of the same non-clone catalog authority, with no intervening
+catalog write in ordinary startup. Remove that duplicate only. These sample shares do not
+attribute the entire29.845s startup interval. Original initialization/restore checks and exact
+root validation remain; no arbitrary timeout, optimistic validity cache or cryptographic change.
+Existing critical cases PASS3/3 (`startup-scan-critical.log`): normal bound restart and wrong-root
+rejection, replacement-directory rejection, and complete catalog recovery. No tests were added.
+The watcher was paused during those checks and resumed for one coordinated application build
+(PASS6m26s). Service84759/native84825 replaced the previous processes and remain running.
+Same-root observation: ConfigurationLoaded6.470s, RuntimeComposition6.672s, Ready32.038s from
+replacement detection (`deduplicated-startup-{observation.json,sample.txt}`). The sample has one
+initial integrity/FK scan and no repeated bound-open scan. This observation does not demonstrate
+an overall startup improvement against the earlier29.845s run; prompt readiness remains unresolved.
+Real MSFT/XNAS and SPY/ARCX profiles reopen as Available with exact selection tokens in0.905s and
+0.708s; unknown selection is rejected (`startup-scan-live-{MSFT,SPY,rejected,results}.json`).
+No new test, full gate, whole-app RAM run or schema change. One worktree and three local/actual
+origin branches reverified; no retirement is needed. Next integration remains selected financial
+evidence; the unresolved startup timing remains explicit rather than becoming an acceptance claim.
 
 Credential cleanup checkpoint `49b96e5a` passed four existing platform secret-store cases (19.40s;
 compile8.33s), preserving managed restart, optional explicit locking, identity, redaction, tamper

@@ -970,7 +970,8 @@ impl AuthorityTransitionService {
         root: ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<(CatalogAuthority, ParquetObjectStore), AuthorityTransitionError> {
-        authority.integrity_check()?;
+        // Catalog opening already checks database integrity under the retained writer authority.
+        // Composition verifies the authority chain and root binding without rescanning the data.
         let snapshot = authority.authority_snapshot()?;
         let AuthorityState::Bound { transition, .. } = snapshot.state() else {
             return match snapshot.state() {
