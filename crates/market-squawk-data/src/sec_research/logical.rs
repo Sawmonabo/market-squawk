@@ -249,10 +249,11 @@ impl SecResearchReadCapability {
         if object.row_count() != companion.record_count as u64 {
             return Err(mismatch());
         }
-        let mut cursor = self.objects.pinned_object_batch_cursor(
+        let mut cursor = self.objects.pinned_object_batch_cursor_with_projection(
             &pinned,
             company_identity.artifact_id(),
             object_ordinal,
+            &crate::ResearchArrowBatch::AUTHENTICATED_CANONICAL_COLUMNS,
             256,
             request.maximum_object_bytes(),
             &cancellation,
@@ -289,7 +290,7 @@ impl SecResearchReadCapability {
                 .checked_sub(base_bytes)
                 .and_then(|bytes| bytes.checked_sub(batch.get_array_memory_size()))
                 .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-            let decoded = crate::ResearchArrowBatch::decode_provider_logical_record_batch_bounded(
+            let decoded = crate::ResearchArrowBatch::decode_authenticated_provider_logical_projection_bounded(
                 batch,
                 available,
                 &mut lineage,

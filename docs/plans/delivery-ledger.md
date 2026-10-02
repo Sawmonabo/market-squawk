@@ -2,6 +2,8 @@
 
 ## Current execution — 2026-10-02
 
+Pushed checkpoint `36d7617d` streams retained fact frames, reuses canonical decoding and archive read connections. Arrow6/6, complete32k-fact PIT/reopen and archive/restart critical checks PASS. Native financial latency remains unresolved.
+
 Pushed checkpoint `0d96969b` preserves trade-only display and exposes typed capture-rejoin/archive failure causes. Current live feed failure is stale-session publication after reconnect, not receipt corruption.
 
 Pushed checkpoint `16b0dc69` corrects captured taxonomy relationships in place; existing graph/cancellation/hostile-binding fixture PASS. Actual MSFT filing retry awaits the next runtime.
@@ -46,8 +48,8 @@ MSFT financial failures are now separately evidenced:
 | Owner | Exact ownership/outcome | State / next dependency |
 | --- | --- | --- |
 | Lead | Shared contracts/jobs/service/CLI/MCP/native composition, source_authority.rs, Git/docs/build scheduling | Applied frozen read and taxonomy candidates together. Recovery/routing correction applied; both existing recovery critical cases PASS. Actual price/history remain usable; facts still exceed15s in logical index construction. One financial acquisition started after SEC status reconciliation; track exact original job. |
-| Astra financial_pages | Candidate-only data `parquet_store/cursor.rs`, `arrow_convert.rs`, `sec_research/logical.rs` and existing `tests/arrow_roundtrip.rs` | Implement authenticated canonical projection through existing exact-artifact cursor, eliminating full producer-column reconstruction. Keep complete checksum/schema/row-count, native/map checks, issuer/PIT/rights and lineage. Lead integrates after current reader checkpoint; no builds/Git/runtime mutation. |
-| Astra startup_read_diagnosis | Candidate-only app `application/research/ingest/alpaca_historical/market.rs` and its existing owning test module | Handle only post-seal `PublicationSessionNotCurrent` as existing RawRetained, preserving raw custody and successor-generation progress. Binding/authority failures remain fatal. Extend genuine queued-old-frame/successor critical fixture; no builds/Git/runtime/provider mutation. Cleanup timeout cause remains unproven and outside this correction. |
+| Astra financial_pages | Authenticated canonical read candidate frozen and lead-integrated; now read-only writer-memory diagnosis in data parquet_store/streaming.rs and ingest/provider_logical_stream.rs | New MSFT job4acaade1 reached beyond taxonomy rejection then failed Parquet WriterMemoryLimitExceeded(64MiB). Exact latest reserved run is CompanyFacts, before filing parsing; taxonomy live success is not established. Identify actual batch/allocation/flush path from retained evidence; no edits/builds/runtime/provider mutation or raised limit. Lead runs projection critical queue47669; existing fixture ownership remains frozen. |
+| Astra startup_read_diagnosis | Candidate-only app `application/research/ingest/alpaca_historical/market.rs` and inline tests in `alpaca_historical.rs` | Handle only post-seal `PublicationSessionNotCurrent` as existing RawRetained, preserving raw custody and successor-generation progress. Binding/authority failures remain fatal. Extend genuine queued-old-frame/successor critical fixture; no builds/Git/runtime/provider mutation. Cleanup timeout cause remains unproven and outside this correction. |
 | Sol investment_profile_ui | InvestmentQuote presentation in investment-page.tsx | Compact dated quote layout types/live verified and pushed; ownership released. |
 | Sol financial_preparation_ui_resume | Chart/read/shared financial controls and existing UI journey case | Stable chart checkpoint pushed; financial terminal settlement integrated. Ownership released. |
 
@@ -65,6 +67,8 @@ Desktop types and three existing market/lookup/refresh journeys, facts clock1/1,
 recent-first cursor1/1, corrected large writer/PIT/reopen1/1, writer cancellation1/1 and retained
 quote/current-mark separation1/1. Read/taxonomy affected checks now pass. Financial-page live completion remains blocked by logical index construction; the latest sample no longer shows recovery exclusion waiting.
 No per-task CI, broad release gate or whole-app RAM claim.
+Authenticated projection critical queue47669 PASS: Arrow6/6 and existing complete PIT/reopen/origin/unprojected-column corruption1/1 (185.28s test). The large retained selector alone took26.21s on32,671 rows; therefore this optimization still does not meet the native15s first-page deadline. Do not claim financial workflow complete or rebuild merely to repeat that known failure.
+
 Current critical checks: taxonomy edge/fragment fixture PASS1/1 (4.69s), Arrow roundtrip/exactness/tamper cases PASS6/6 (0.01s). Full facts/PIT/reopen check PASS1/1 (314.26s including Cargo); archive/restart case PASS1/1 (12.60s). W3C WebDriver execute request timed out after restart, while supported /wdio/eval directly returned complete page/title/URL; direct evaluation now checks actual MSFT without focus. Archive runtime diagnostics confirm analytical operation deadline exceeded; reuse remains awaiting live proof.
 
 Recovery/read routing and owned SEC publication are implemented and built; existing quarantine/read concurrency and logical recovery checks pass. The fresh financial job `053b2f82-bdd5-404d-9d06-7aafaaa96e30` failed acquisition with `InvalidTaxonomySet`; service6192 survived, and no duplicate job was started.
@@ -82,6 +86,8 @@ existing physical source authority. Sources checked2026-10-02:
 https://www.w3.org/TR/xmlschema-1/#src-import and
 https://www.xbrl.org/Specification/XBRL-2.1/REC-2003-12-31/XBRL-2.1-REC-2003-12-31%2Bcorrected-errata-2013-02-20.html.
 
+
+New runtime68941/Desktop69606 includes taxonomy-edge/archive reuse (build PASS11m37s). Exactly one native MSFT financial preparation job4acaade1-ac52-47ec-a445-4a819aa90b80 is confirmed terminal failed with Parquet WriterMemoryLimitExceeded(64MiB), no new start issued. Watcher27555 is paused for lead-owned authenticated projection critical checks before the next coordinated build.
 
 Next barrier: integrate authenticated canonical read and stale-session queue handling as separate coherent fixes, run relevant existing critical checks, then verify the real MSFT financial page and continued quote updates. After runtime replacement retry exactly one financial preparation job; previous job640d66bd is confirmed terminal failed. Full stock analysis, installed lifecycle and V1 acceptance remain open. No first-page or current-feed completion claim.
 

@@ -143,40 +143,15 @@ impl ParquetObjectStore {
         max_batch_bytes: usize,
         cancellation: &CancellationToken,
     ) -> Result<PinnedBatchCursor, ParquetStoreError> {
-        if columns.is_empty() {
-            return Err(ParquetStoreError::ObjectMetadataMismatch);
-        }
-        let mut cursor = self.pinned_batch_cursor_from(
+        self.pinned_batch_cursor_from(
             dataset,
             start_object,
             start_row,
             batch_rows,
             max_batch_bytes,
             cancellation,
-        )?;
-        let state = cursor
-            .state
-            .as_mut()
-            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-        let schema = state
-            .schema
-            .as_ref()
-            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-        let mut projection = columns
-            .iter()
-            .map(|name| {
-                schema
-                    .index_of(name)
-                    .map_err(|_| ParquetStoreError::ObjectMetadataMismatch)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        projection.sort_unstable();
-        projection.dedup();
-        if projection.len() != columns.len() {
-            return Err(ParquetStoreError::ObjectMetadataMismatch);
-        }
-        state.projection = Some(projection);
-        Ok(cursor)
+        )?
+        .with_projection(columns)
     }
 
     /// Opens only the exact artifact and ordinal selected by a retained immutable manifest.
@@ -202,6 +177,33 @@ impl ParquetObjectStore {
             max_batch_bytes,
             cancellation,
         )
+    }
+
+    /// Projects columns from one exact artifact while verifying the complete object first.
+    /// Physical row ordinals, full source schema, content digest and EOF counts are unchanged.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact artifact, projection and reader bounds"
+    )]
+    pub fn pinned_object_batch_cursor_with_projection(
+        &self,
+        dataset: &PinnedDataset,
+        artifact_id: Uuid,
+        ordinal: usize,
+        columns: &[&str],
+        batch_rows: usize,
+        max_batch_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<PinnedBatchCursor, ParquetStoreError> {
+        self.pinned_object_batch_cursor(
+            dataset,
+            artifact_id,
+            ordinal,
+            batch_rows,
+            max_batch_bytes,
+            cancellation,
+        )?
+        .with_projection(columns)
     }
 
     fn make_batch_cursor(
@@ -376,6 +378,35 @@ impl ParquetObjectStore {
 }
 
 impl PinnedBatchCursor {
+    fn with_projection(mut self, columns: &[&str]) -> Result<Self, ParquetStoreError> {
+        if columns.is_empty() {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+        let schema = state
+            .schema
+            .as_ref()
+            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+        let mut projection = columns
+            .iter()
+            .map(|name| {
+                schema
+                    .index_of(name)
+                    .map_err(|_| ParquetStoreError::ObjectMetadataMismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        projection.sort_unstable();
+        projection.dedup();
+        if projection.len() != columns.len() {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        state.projection = Some(projection);
+        Ok(self)
+    }
+
     /// Returns the exact next unread object ordinal and row, suitable for a generation-bound page.
     pub fn position(&self) -> (usize, u64) {
         let Some(state) = &self.state else {

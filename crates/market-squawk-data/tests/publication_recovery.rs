@@ -2630,6 +2630,7 @@ async fn exercise_sec_fiscal_epoch_restart_with_rows(fact_rows: usize) -> TestRe
         pit_limits,
         if pressure { 256 } else { 16 } * 1024 * 1024,
     )?;
+    let selection_started = Instant::now();
     let selected = service
         .sec_research_reader()
         .select_by_identity(
@@ -2639,6 +2640,10 @@ async fn exercise_sec_fiscal_epoch_restart_with_rows(fact_rows: usize) -> TestRe
             cancellation.clone(),
         )
         .await?;
+    eprintln!(
+        "retained SEC selection: rows={fact_rows}, elapsed={:?}",
+        selection_started.elapsed()
+    );
     let SecResearchIdentityOutcome::Exact(exact) = selected.outcome() else {
         return Err("issuer relationship did not resolve fiscal source".into());
     };
@@ -2648,6 +2653,65 @@ async fn exercise_sec_fiscal_epoch_restart_with_rows(fact_rows: usize) -> TestRe
     let all_rows = exact.decoded_rows().iter().collect::<Result<Vec<_>, _>>()?;
     assert!(exact.decoded_rows().get(fact_rows - 1)?.is_some());
     assert!(exact.decoded_rows().get(fact_rows)?.is_none());
+    if !pressure {
+        // Compare the authenticated logical decoder with the strict full-column decoder on
+        // this real, atomically published artifact. The large case below retains its existing
+        // complete source/PIT/restart coverage without adding a second full decode.
+        let pinned = service.pinned(exact.origin().manifest())?;
+        assert_eq!(pinned.objects().len(), 1);
+        let objects = service.object_store();
+        let mut strict_rows = Vec::new();
+        for batch in objects.read_pinned(&pinned, &cancellation)? {
+            strict_rows.extend(
+                ResearchArrowBatch::decode_record_batch_bounded(batch, 16 * 1024 * 1024)?.0,
+            );
+        }
+        assert_eq!(all_rows, strict_rows);
+        let columns = [
+            "schema_version",
+            "request_sha256",
+            "extraction_lineage_json",
+            "payload_sha256",
+            "payload_json",
+        ];
+        assert!(matches!(
+            objects.pinned_object_batch_cursor_with_projection(
+                &pinned,
+                uuid::Uuid::nil(),
+                exact.origin().object_ordinal(),
+                &columns,
+                32,
+                16 * 1024 * 1024,
+                &cancellation,
+            ),
+            Err(market_squawk_data::ParquetStoreError::ObjectMetadataMismatch)
+        ));
+        let mut cursor = objects.pinned_object_batch_cursor_with_projection(
+            &pinned,
+            exact.origin().artifact_id(),
+            exact.origin().object_ordinal(),
+            &columns,
+            32,
+            16 * 1024 * 1024,
+            &cancellation,
+        )?;
+        let mut decoded = Vec::new();
+        while let Some(batch) = cursor.next_batch().await? {
+            assert_eq!(batch.num_columns(), columns.len());
+            let payloads = batch
+                .column_by_name("payload_json")
+                .and_then(|values| values.as_any().downcast_ref::<arrow::array::BinaryArray>())
+                .ok_or("missing projected canonical payloads")?;
+            for payload in payloads.iter() {
+                decoded.push(serde_json::from_slice::<ResearchObservation>(
+                    payload.ok_or("null projected canonical payload")?,
+                )?);
+            }
+            // A narrow projection alone must never gain the public strict decoder's authority.
+            assert!(ResearchArrowBatch::try_from_record_batch(batch).is_err());
+        }
+        assert_eq!(decoded, strict_rows);
+    }
     // A caller cannot substitute another publication binding while preserving issuer identity.
     let wrong_binding = SecResearchReadRequest::try_new(
         exact.origin().manifest().clone(),
@@ -3051,6 +3115,65 @@ async fn exercise_sec_fiscal_epoch_restart_with_rows(fact_rows: usize) -> TestRe
         ),
         "an exact issuer binding must reject corrupted CompanyFacts native evidence: {corrupted:?}"
     );
+    // The projected cursor must authenticate bytes in columns and rows it will not return.
+    // Corrupt the last row group's payload column, then request only the first schema-version
+    // row. Neither decoding that column nor reaching that row group may be needed to reject it.
+    let pinned = reopened.pinned(facts.manifest())?;
+    let object = &pinned.objects()[replayed_facts.origin().object_ordinal()];
+    let parquet_path = paths.artifacts()?.root().join(object.relative_reference());
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(&parquet_path)?,
+    )?;
+    let payload_column = reader.schema().index_of("payload_json")?;
+    let (offset, length) = reader
+        .metadata()
+        .row_groups()
+        .last()
+        .ok_or("missing published row group")?
+        .columns()[payload_column]
+        .byte_range();
+    assert!(length > 0);
+    drop(reader);
+    let original_permissions = std::fs::metadata(&parquet_path)?.permissions();
+    let mut writable = original_permissions.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        writable.set_mode(0o600);
+    }
+    #[cfg(not(unix))]
+    writable.set_readonly(false);
+    std::fs::set_permissions(&parquet_path, writable)?;
+    {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&parquet_path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut byte = [0];
+        file.read_exact(&mut byte)?;
+        byte[0] ^= 0x40;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&byte)?;
+        file.sync_all()?;
+    }
+    std::fs::set_permissions(&parquet_path, original_permissions)?;
+    let mut cursor = reopened
+        .object_store()
+        .pinned_object_batch_cursor_with_projection(
+            &pinned,
+            object.artifact_id(),
+            replayed_facts.origin().object_ordinal(),
+            &["schema_version"],
+            1,
+            16 * 1024 * 1024,
+            &CancellationToken::new(),
+        )?;
+    assert!(matches!(
+        cursor.next_batch().await,
+        Err(market_squawk_data::ParquetStoreError::ObjectMetadataMismatch)
+    ));
     drop(reopened_publisher);
     drop(reopened_onboarding);
     Ok(())

@@ -293,7 +293,11 @@ fn availability_projection_is_conservative_typed_and_tamper_evident() -> TestRes
     ])) as ArrayRef;
     let hostile = RecordBatch::try_new(batch.schema(), columns)?;
     assert!(matches!(
-        ResearchArrowBatch::try_from_record_batch(hostile),
+        ResearchArrowBatch::try_from_record_batch(hostile.clone()),
+        Err(ArrowConversionError::ProjectionMismatch)
+    ));
+    assert!(matches!(
+        ResearchArrowBatch::decode_query_projection_bounded(hostile, 1024 * 1024),
         Err(ArrowConversionError::ProjectionMismatch)
     ));
     Ok(())

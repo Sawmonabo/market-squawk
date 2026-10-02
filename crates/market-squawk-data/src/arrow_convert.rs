@@ -1593,7 +1593,18 @@ impl ResearchArrowBatch {
         })
     }
 
-    pub(crate) fn decode_provider_logical_record_batch_bounded(
+    /// The canonical columns written by the publication owner. These are decoded only from
+    /// an exact, checksum-verified provider-logical artifact; arbitrary Arrow/query batches must
+    /// continue through the complete projection validator.
+    pub(crate) const AUTHENTICATED_CANONICAL_COLUMNS: [&'static str; 5] = [
+        "schema_version",
+        "request_sha256",
+        "extraction_lineage_json",
+        "payload_sha256",
+        "payload_json",
+    ];
+
+    pub(crate) fn decode_authenticated_provider_logical_projection_bounded(
         batch: RecordBatch,
         max_additional_bytes: usize,
         lineage: &mut ResearchLineageDigestAccumulator,
@@ -1610,13 +1621,8 @@ impl ResearchArrowBatch {
             },
         )?;
         let mut operation = ArrowOperationControl::new(control);
-        let (candidate, observations, observation_bytes, _, row_lineages) =
-            Self::validate_and_decode_record_batch_inner(
-                batch,
-                allowance,
-                false,
-                Some(&mut operation),
-            )?;
+        let (candidate, observations, observation_bytes, row_lineages) =
+            Self::decode_authenticated_canonical_projection(batch, allowance, &mut operation)?;
         let payloads = candidate
             .batch
             .column_by_name("payload_sha256")
@@ -1655,6 +1661,115 @@ impl ResearchArrowBatch {
                 .checked_add(coordinate_bytes)
                 .ok_or(ArrowConversionError::RetainedSizeOverflow)?,
         })
+    }
+
+    /// Publication already constructed all scalar projections from these exact canonical bytes.
+    /// The caller must authenticate the entire immutable artifact and its logical publication
+    /// before entering here. Recheck schema, payloads and lineage without reconstructing columns
+    /// that this reader does not consume. Native SEC equality and whole-input lineage checks stay
+    /// with the logical reader; a checksum alone never substitutes for those semantic checks.
+    fn decode_authenticated_canonical_projection(
+        batch: RecordBatch,
+        max_additional_bytes: usize,
+        control: &mut ArrowOperationControl<'_>,
+    ) -> Result<(Self, Vec<ResearchObservation>, usize, Vec<RowLineage>), ArrowConversionError>
+    {
+        control.checkpoint_now()?;
+        let schema = batch.schema();
+        let metadata = schema.metadata();
+        let version = metadata
+            .get(SCHEMA_VERSION_KEY)
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(ArrowConversionError::InvalidSchemaMetadata)?;
+        if version != RESEARCH_SCHEMA_VERSION {
+            return Err(ArrowConversionError::UnsupportedSchemaVersion { found: version });
+        }
+        let dataset = metadata
+            .get(DATASET_KEY)
+            .ok_or(ArrowConversionError::InvalidSchemaMetadata)
+            .and_then(|value| {
+                SourceIdentifier::try_from(value.as_str())
+                    .map_err(|_| ArrowConversionError::InvalidSchemaMetadata)
+            })?;
+        let request_digest = metadata
+            .get(REQUEST_DIGEST_KEY)
+            .and_then(|value| decode_hex(value))
+            .ok_or(ArrowConversionError::InvalidSchemaMetadata)?;
+        let expected = research_schema(
+            &dataset,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest),
+        )?;
+        let indices = Self::AUTHENTICATED_CANONICAL_COLUMNS
+            .iter()
+            .map(|name| expected.index_of(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        if schema.as_ref() != &expected.project(&indices)?
+            || batch.num_rows() == 0
+            || batch
+                .columns()
+                .iter()
+                .any(|column| column.null_count() != 0)
+        {
+            return Err(ArrowConversionError::InvalidSchema);
+        }
+        let candidate = Self {
+            schema_ref: DatasetSchemaRegistry::local().canonical_research_observations()?,
+            batch,
+        };
+        // Retain the existing conservative decode admission; this path allocates fewer vectors
+        // and no rebuilt Arrow arrays, and does not introduce a new memory ceiling.
+        let (working_bytes, observation_bytes) = candidate.decode_admission(Some(&mut *control))?;
+        if working_bytes > max_additional_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: working_bytes,
+                limit_bytes: max_additional_bytes,
+            });
+        }
+        let observations = candidate.decode_payloads(Some(&mut *control))?;
+        let requests = candidate.decode_request_digests(Some(&mut *control))?;
+        let lineages = candidate.decode_row_lineages(Some(&mut *control))?;
+        let payloads = candidate
+            .batch
+            .column_by_name("payload_json")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let digests = candidate
+            .batch
+            .column_by_name("payload_sha256")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let versions = candidate
+            .batch
+            .column_by_name("schema_version")
+            .and_then(|array| array.as_any().downcast_ref::<UInt16Array>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        for (ordinal, ((observation, row_lineage), request)) in
+            observations.iter().zip(&lineages).zip(requests).enumerate()
+        {
+            control.checkpoint_row(ordinal)?;
+            if versions.value(ordinal) != RESEARCH_SCHEMA_VERSION {
+                return Err(ArrowConversionError::UnsupportedSchemaVersion {
+                    found: versions.value(ordinal),
+                });
+            }
+            let payload = payloads.value(ordinal);
+            let mut hash = Sha256::new();
+            update_hash_bytes(&mut hash, payload, Some(&mut *control))?;
+            let digest: [u8; 32] = hash.finalize().into();
+            if digest.as_slice() != digests.value(ordinal) {
+                return Err(ArrowConversionError::ProjectionMismatch);
+            }
+            validate_row_lineage(
+                row_lineage,
+                &dataset,
+                request,
+                observation,
+                payload,
+                Some(&mut *control),
+            )?;
+        }
+        control.checkpoint_now()?;
+        Ok((candidate, observations, observation_bytes, lineages))
     }
 
     /// Decodes a canonical research projection whose query engine discarded schema metadata.
