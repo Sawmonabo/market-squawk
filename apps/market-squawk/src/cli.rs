@@ -563,6 +563,24 @@ pub enum MarketCommand {
         #[arg(long)]
         selection_token: String,
     },
+    /// Read a page of financial facts, statements, ratios or filings for an investment.
+    Financials {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long, value_parser = ["facts", "statements", "ratios", "filings"])]
+        section: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Release an open financial read; retained investment evidence is unchanged.
+    CloseFinancials {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long)]
+        read_token: uuid::Uuid,
+    },
     /// Return immutable daily history for one opaque investment selection.
     History {
         #[arg(long)]

@@ -640,6 +640,31 @@ describe("Market Squawk desktop boundary", () => {
       identity: { symbol: "MSQ", name: "Requested investment", assetClass: "equity" },
     }
     let wrongProfileSelection = false
+    let financialMode: "available" | "mismatch" | "pending" = "available"
+    let financialSignal: AbortSignal | undefined
+    let finishFinancial: ((value: ApplicationResult) => void) | undefined
+    const financialRead = "781276a0-33f1-4fb3-8cbb-bb2095acd0ce"
+    const financialFact = {
+      scope: "company_wide", revision: "current", metric: "current_assets", displayName: "Current assets",
+      value: "123456.78", unit: { kind: "currency", currency: "USD" },
+      period: { kind: "instant", instant: { year: 2026, month: 6, day: 30 } },
+      fiscalContext: { fiscalYear: 2026, fiscalPeriod: "second_quarter", cadence: "quarterly" },
+      reportingContext: { dimensionality: "no_dimensions", consolidation: "reported_consolidated", amendment: "original", restatement: "unavailable", occurrence: 1 },
+      filedOn: { year: 2026, month: 8, day: 1 },
+      effective: { precision: "calendar_date", value: { year: 2026, month: 6, day: 30 } },
+      knownAt: "1788220800000000000",
+    }
+    const financialResult = (cursor = "financial-first"): ApplicationResult => ({
+      data: {
+        selectionToken: financialMode === "mismatch" ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
+        section: "facts", knowledgeAt: marketObservedAt, effectiveOn: "2026-08-10", revisionPolicy: "latestKnown",
+        state: "reported", families: [{ family: "company_facts", state: "reported", reason: null }],
+        items: [{ ...financialFact, value: cursor === "financial-next" ? "234567.89" : financialFact.value }],
+        currentCursor: cursor, nextCursor: cursor === "financial-first" ? "financial-next" : null,
+        readToken: financialRead, omittedItems: 0, limitations: [],
+      },
+      metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
+    })
     const profileResult = (): ApplicationResult => ({
       data: {
         selectionToken: wrongProfileSelection ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
@@ -654,13 +679,21 @@ describe("Market Squawk desktop boundary", () => {
       },
       metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
     })
-    const openInvestment = (route: string) => render(
+    const openInvestment = (route: string, supportsFinancials = true) => render(
       <MemoryRouter initialEntries={[route]}>
         <App transport={transport(
-          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument"] },
+          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument", ...(supportsFinancials ? ["investment_financials", "investment_financials_close"] as const : [])] },
           undefined,
-          async (request) => {
+          async (request, options) => {
             issuedQueries.push(request)
+            if (request.query === "closeInvestmentFinancials") return { data: { released: true }, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } }
+            if (request.query === "investmentFinancials") {
+              if (financialMode === "pending") {
+                financialSignal = options?.signal
+                return new Promise<ApplicationResult>((resolve) => { finishFinancial = resolve })
+              }
+              return financialResult(request.cursor)
+            }
             if (request.query === "marketOverview") return marketOverviewResult
             if (request.query === "investmentProfile" && request.selectionToken === marketSelectionToken) return profileResult()
             if (request.query === "marketInstrument" && request.selectionToken === marketSelectionToken) {
@@ -681,7 +714,42 @@ describe("Market Squawk desktop boundary", () => {
     expect((await profile.findByRole("alert")).textContent).toContain("The profile could not be refreshed")
     expect(profile.getByText("XNAS")).toBeTruthy()
     expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
+    // Financial demand reads are independent of quotes/profile and retain exact page identity.
+    expect(issuedQueries.some((request) => request.query === "investmentFinancials")).toBe(false)
+    const financialToggle = screen.getByText("Open reported financial facts")
+    await userEvent.setup().click(financialToggle)
+    const facts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
+    expect(await facts.findByText("USD 123,456.78")).toBeTruthy()
+    await userEvent.setup().click(facts.getByRole("button", { name: "Next" }))
+    expect(await facts.findByText("USD 234,567.89")).toBeTruthy()
+    expect(issuedQueries).toContainEqual({ query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32, cursor: "financial-next" })
+    await userEvent.setup().click(facts.getByRole("button", { name: "Previous" }))
+    expect(await facts.findByText("USD 123,456.78")).toBeTruthy()
+    expect(issuedQueries).toContainEqual({ query: "investmentFinancials", selectionToken: marketSelectionToken, section: "facts", limit: 32, cursor: "financial-first" })
+    financialMode = "mismatch"
+    await userEvent.setup().click(facts.getByRole("button", { name: "Refresh this section" }))
+    expect((await facts.findByRole("alert")).textContent).toContain("could not be updated")
+    expect(facts.getByText("USD 123,456.78")).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
+    financialMode = "pending"
+    await userEvent.setup().click(facts.getByRole("button", { name: "Retry" }))
+    await waitFor(() => expect(financialSignal).toBeDefined())
+    await userEvent.setup().click(financialToggle)
+    await waitFor(() => expect(financialSignal?.aborted).toBe(true))
+    financialMode = "available"
+    finishFinancial?.(financialResult())
+    await waitFor(() => expect(issuedQueries).toContainEqual({ query: "closeInvestmentFinancials", selectionToken: marketSelectionToken, readToken: financialRead }))
+    expect(screen.queryByRole("region", { name: "Reported financial facts" })).toBeNull()
     investment.unmount()
+
+    // A development UI refresh must not send a new command to an older running native bridge.
+    const financialQueriesBefore = issuedQueries.filter((request) => request.query === "investmentFinancials").length
+    const unsupported = openInvestment(lookupRoute(parsed.matches[0]!), false)
+    expect(await screen.findByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
+    expect(screen.getByText("Financial details are not available in this app session.")).toBeTruthy()
+    expect(screen.queryByText("Open reported financial facts")).toBeNull()
+    expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(financialQueriesBefore)
+    unsupported.unmount()
 
     const staleToken = "market_ffffffffffffffffffffffffffffffff"
     openInvestment(`/investments/${staleToken}`)

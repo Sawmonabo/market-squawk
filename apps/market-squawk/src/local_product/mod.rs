@@ -1085,6 +1085,7 @@ impl LocalProduct {
                     Arc::clone(&artifact_repository),
                     nasdaq_reference.listing_reference_reader(),
                     fred_latest_known,
+                    Arc::clone(&provider_activation),
                 ),
             );
             if treasury_fiscal_datasets.is_some() {

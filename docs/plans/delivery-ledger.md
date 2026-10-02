@@ -2,6 +2,51 @@
 
 ## Current execution — 2026-10-02
 
+Selected financial detail wave, refreshed at `5f31458a` (Quarter 4, existing Wave 1/4):
+user outcome is independently loaded facts, statements, ratios and filings for the selected ticker,
+with exact evidence and bounded pages. Existing issuer publication/association is critically verified.
+Selected acquisition, financial page readers and Desktop/CLI/MCP composition are implemented in the
+checkpoint; critical integration checks pass. Live native financial proof remains pending. All author lanes are frozen.
+
+| Owner | Exclusive files / dependency | Finish and critical evidence |
+| --- | --- | --- |
+| Astra financial_pages | Application `research/company_research.rs`, `company_product.rs`, new `research/investment_financials{.rs,/}`; data `sec_research/indexed.rs` only if necessary | First freeze the page/lifetime contract with lead, then reuse exact indexed selection and financial projection; avoid whole-company materialization, preserve rights/cutoffs/cancellation and complete ratio envelopes. Existing financial projection case plus selected page integrity case if uncovered. |
+| Sol selected_issuer_acquisition | Application `research/ingest/sec_live.rs`, narrow selected-company method in `provider_activation/mod.rs`, SEC adapter `client/company_directory.rs` plus declaration/accessor in `client.rs` | Trace existing operation and propose the exact selected-CIK acquisition method before editing; then wire one company through existing publication/relationship logic without fetching every configured company. Unknown identity stays explicit. No fabricated CIK. |
+| Sol financial_detail_ui | Desktop `features/markets/investment-financials.tsx` and `investment-financials-schema.ts`; frozen section/page DTO from Astra | Four independent demand panels, exact identity/cursor validation, release on close, existing product styling; lead owns parent mount/shared transport and critical journey. |
+| Lead | Shared transports, schemas, research registration/composition, tests scheduling, ledger/Git | Integrate exact selection and per-section operations across Desktop/CLI/MCP, then one serialized check and native evidence on a fresh canonical root. Preserve the old runtime/root. |
+| Sol dev_launcher — read-only preparation | Existing launcher, onboarding and background-native procedures; report only under `.agents/tmp/v1-first-stock/financial-native-launch-plan.md` | Identify the exact fresh-root development invocation and credential/bootstrap prerequisites without launching, building, stopping processes or reading secret values. Lead owns runtime replacement after compilation. |
+
+Dependency: page/acquisition interface freeze → lead composition and disjoint Desktop implementation →
+focused integrated verification → coherent commit/push. No new worktree, build by agents, broad gate,
+whole-app RAM measurement or per-task review. Finished prior lanes release ownership.
+
+| Financial-detail critical evidence | Result / artifact under `.agents/tmp/v1-first-stock/` |
+| --- | --- |
+| Selected-page cutoff, cursor ownership, close/expiry and original receipt requirement | PASS1/1, 0.47s — `investment-financials-backend-final.log` |
+| Statements/ratios require the exact complete filing envelope | PASS1/1 — `investment-financials-envelope-final.log` |
+| Every registered operation has a valid code-owned output contract | PASS1/1, 1.22s — `investment-financials-registry-final.log` |
+| Native Desktop and shared application compile, including background automation | PASS, 5m08s — `investment-financials-native-final.log` |
+| Desktop types and existing lookup/market journeys, including unsupported running native capabilities | PASS; 2/2 journeys — `investment-financials-{typecheck,desktop}-final.log` |
+| Exact SEC directory candidates, duplicate handling and conflicting/invalid identity | PASS1/1 — `selected-directory-critical.log` |
+
+The initial compile found unsupported SQLite `usize` reads; checked `i64` conversion corrects them
+without accepting negative/overflow coordinates. Sessions92215/67114/45830 are terminal0. Rust
+source remained frozen through these checks; the final Desktop change reran its affected checks.
+The operation annotates possible configured-source retrieval on a first financial page. Original
+financial history is not materialized into one frontend payload; each section reads bounded pages
+from retained evidence with its own frozen cutoff. Ratio inputs retain complete filing contexts.
+
+The owner's visible financial error was traced to Vite refreshing these UI commands ahead of the
+running native binary: staged Desktop84825 contains `Research.GetInvestmentProfile` but not
+`Research.GetInvestmentFinancials` or its native query variant. The UI now checks advertised read
+and close capabilities, preserving other sections instead of issuing unsupported requests. This is
+not positive financial-data proof. The staged old service84759/Desktop84825 and their original root
+remain preserved; watcher6907 stays paused. Next: build the integrated binaries, configure a fresh
+canonical root and prove actual stock financial pages through background native interaction, then
+restore the coordinated visible development session. The read-only launch procedure is saved at
+`financial-native-launch-plan.md`; it does not itself establish runtime verification.
+No live financial, installed-workflow, full-gate or whole-app-memory completion is claimed.
+
 Working branch `feature/v1-installed-product-experience`, primary worktree only.
 
 Pushed implementation checkpoint `11388990` completes issuer acquisition → verified security
@@ -23,12 +68,11 @@ This is **implemented and critically verified**, not live financial Desktop or i
 Lead inspected actual author changes and affected callers. The final source hash snapshot was
 unchanged through checks/commit; unused-import cleanup changes no tested behavior. No broad gate,
 CI, whole-app RAM measurement, new branch/worktree or runtime replacement. All author lanes below
-are finished/frozen. Lead owns the next selected financial detail contract and shared-client
-integration; UI ownership starts after that contract is fixed. Overall startup readiness timing,
+are finished/frozen. The selected financial detail contract and shared-client integration were the next dependency at
+that checkpoint; the current wave above now implements them. Overall startup readiness timing,
 complete live data presentation and native financial rendering remain unresolved.
 
 Earlier pushed checkpoints:
- Pushed checkpoint
 `ffde1663` removes the duplicate bound-open catalog scan (startup remains unresolved);
 `49b96e5a` removes redundant credential-buffer wiping without changing key derivation;
 `6ba236c9` preserves independent quote/trade evidence and unresolved same-time trade batches;
@@ -39,7 +83,7 @@ and in PR #43. These checkpoints do not establish complete
 rich detail, live streaming coverage or installed acceptance.
 One worktree and three local/origin branches; recovery history remains untouched.
 
-| Current owner / outcome | Exact ownership and dependency | Critical evidence / finish boundary |
+| Earlier issuer-checkpoint owner / outcome | Exact ownership and dependency | Critical evidence / finish boundary |
 | --- | --- | --- |
 | Sol sec_issuer_producer — frozen | SEC `normalize.rs`, `extraction.rs`, `client.rs`, `client/taxonomy.rs`, `xbrl/model.rs`, existing `tests/point_in_time.rs`. | Actual CIK subject on facts/submissions/XBRL; company registry dependency removed, fund registry retained. Provider/PIT and physical-XBRL restart cases PASS1/1 each. |
 | Astra sec_relationship — frozen | Data `catalog/company_security.rs` and existing company/security case in `tests/catalog.rs`. | Automatic retained-parent validation, multiple common share classes, preferred rejection, exact historical receipts and held-writer reads. Final critical case PASS1/1. |
@@ -53,7 +97,7 @@ that same journal. Releasing the receipt before reopen preserves exclusive journ
 allows the original receipt/issuer/native-value comparisons to execute. Final restart case PASS1/1
 (1.48s); no publication or read-admission rule was relaxed.
 
-Next selected-detail preparation is complete (read-only, no transport/UI implementation):
+Historical selected-detail preparation at the issuer checkpoint (superseded by the current implementation above):
 Astra `selected_financial_contract` traced exact selection, acquisition, cutoff, family origins and
 existing disk-backed reads; Sol `financial_detail_ui` traced independent section loading, cancellation,
 cursor navigation and existing market-journey coverage. The result must page facts/filings from
@@ -64,7 +108,7 @@ this issuer checkpoint is committed; quote/history/profile remain independent.
 Final consumer inspection found valuation still requiring raw stock attribution. That consumer now
 retains the exact relationship receipt and company parent, revalidates them on reopen, and decodes
 physical XBRL units using their namespace-qualified currency/share expressions. This is part of the
-same producer/consumer checkpoint; its physical-XBRL restart case is queued for verification.
+same producer/consumer checkpoint; its physical-XBRL restart case passed as recorded above.
 
 Lead also owns `release/{providers,close_provider}.rs`: provider acceptance now verifies every raw
 row against its actual issuer CIK and absent instrument attribution; the closer retains matching
@@ -85,14 +129,14 @@ ordinary test-thread stack. Lead replaces that expression with shallow existence
 exactly the same tables in one read transaction, preserving empty-catalog authority admission.
 No stack-size increase or integrity bypass. Current SQLite [expression-depth documentation](https://www.sqlite.org/limits.html)
 and [EXISTS semantics](https://www.sqlite.org/lang_expr.html) support the correction (reviewed
-2026-10-01). The existing saved-recipe case must pass before this failure is closed. Historical first check session33700: relationship PASS1/1 (1.47s), fiscal PASS1/1 (6.59s), physical-XBRL/valuation restart PASS1/1 (1.59s); saved recipe failed during setup; release-consumer compilation PASS (2m57s, `sec-issuer-release-consumer-check.log`). The existing nonempty initialization rejection also passes1/1 (0.46s), run directly from the already compiled publication test binary (`initialization-nonempty-critical.log`). No other compilation is authorized while it runs.
+2026-10-01). The existing saved-recipe case must pass before this failure is closed. Historical first check session33700: relationship PASS1/1 (1.47s), fiscal PASS1/1 (6.59s), physical-XBRL/valuation restart PASS1/1 (1.59s); saved recipe failed during setup; release-consumer compilation PASS (2m57s, `sec-issuer-release-consumer-check.log`). The existing nonempty initialization rejection also passes1/1 (0.46s), run directly from the already compiled publication test binary (`initialization-nonempty-critical.log`). That historical check is terminal; lead schedules subsequent compilation.
 
 Follow-up startup failure: session33700 reached recipe execution and aborted after the SQL
 correction. New crash report `market_squawk-b71b7ba6fb63c02f-2026-10-01-234754.ips` points to
 `research_service::retained_use::current_policies`, not SQLite. Astra `startup_stack_policies`
 measured debug stack frames and found the nested startup futures plus test body consume
 1,630,240 bytes before the research/profile calls. The small faulting leaf is not the root cause.
-It now exclusively owns the private composition boundary in `local_product/mod.rs`: heap-own the
+It completed the private composition boundary in `local_product/mod.rs`: heap-own the
 large startup future before outer callers await it, preserving cancellation/order/errors. The
 existing `source_lifecycle.rs` uses the same pattern. [Rust Box::pin](https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin)
 and [Rust 2024 lifetime capture](https://doc.rust-lang.org/edition-guide/rust-2024/rpit-lifetime-capture.html)

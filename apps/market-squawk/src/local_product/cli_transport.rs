@@ -629,6 +629,36 @@ async fn market(
             )
             .await
         }
+        MarketCommand::Financials {
+            selection_token,
+            section,
+            cursor,
+            limit,
+        } => {
+            let mut arguments = json_object(
+                json!({"selectionToken": selection_token, "section": section, "limit": limit}),
+            )?;
+            insert_optional_string(&mut arguments, "cursor", cursor);
+            invoke_without_result_limits(
+                authority,
+                "Research.GetInvestmentFinancials",
+                Value::Object(arguments),
+                "investment financials read",
+            )
+            .await
+        }
+        MarketCommand::CloseFinancials {
+            selection_token,
+            read_token,
+        } => {
+            invoke_without_result_limits(
+                authority,
+                "Research.CloseInvestmentFinancials",
+                json!({"selectionToken": selection_token, "readToken": read_token}),
+                "investment financial read closed",
+            )
+            .await
+        }
         MarketCommand::History {
             history_token,
             start_unix_nanos,

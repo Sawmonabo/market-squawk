@@ -253,6 +253,38 @@ impl CompanyResearchReadCapability {
         })
     }
 
+    /// Selects one family without materializing the company's projected fact history.
+    pub(crate) async fn select_company_family(
+        &self,
+        request: &CompanyResearchRequest,
+        family: SecResearchFamily,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecResearchIdentitySelection, CanonicalResearchReadError> {
+        check_operation(deadline, &cancellation)?;
+        let data_request = SecResearchIdentityReadRequest::try_new(
+            request.instrument_id,
+            family,
+            request.knowledge_at,
+            request.fact_effective_cutoff.clone(),
+            request.revision_policy.data_policy(),
+            company_point_in_time_limits()?,
+            MAX_COMPANY_RESEARCH_OBJECT_BYTES,
+        )
+        .map_err(map_company_data_error)?;
+        self.research
+            .analytical()
+            .sec_research_reader()
+            .select_by_identity(
+                data_request,
+                self.research.provider_capture_store().as_ref(),
+                deadline,
+                cancellation,
+            )
+            .await
+            .map_err(map_company_data_error)
+    }
+
     /// Reopens every exact selector receipt and requires the same private and product result.
     pub(crate) async fn verify_company_restart(
         &self,
@@ -1414,104 +1446,152 @@ fn append_company_rows(
         return Err(CanonicalResearchReadError::EvidenceConflict);
     }
     for selected in selection.selected() {
-        let ordinal = usize::try_from(selected.row().row_ordinal())
-            .map_err(|_| CanonicalResearchReadError::EvidenceConflict)?;
-        let observation = selection
-            .decoded_rows()
-            .get(ordinal)
-            .map_err(map_company_data_error)?
-            .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
-        let context = observation_context(&observation)
-            .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
-        // The outer identity selection binds this issuer generation to the requested security.
-        // Retain source facts unchanged; an absent raw instrument is not itself attribution.
-        let issuer = match &observation {
-            ResearchObservation::Filing(value) => value.subject().issuer_id(),
-            ResearchObservation::Fundamental(value) => value.subject().issuer_id(),
-            _ => None,
-        };
-        if issuer
-            != Some(
-                selection
-                    .company_identity()
-                    .observation()
-                    .provider_company_id(),
-            )
-            || context.provenance().instrument_id().is_some()
-            || context.provenance().source_id()
-                != selection.company_identity().observation().source_id()
-        {
-            return Err(CanonicalResearchReadError::EvidenceConflict);
+        append_company_row(
+            request,
+            family,
+            selection,
+            selected,
+            facts,
+            filings,
+            latest_known_at,
+        )?;
+    }
+    Ok(())
+}
+
+/// Decodes and validates just one original selected occurrence from its retained disk index.
+pub(crate) fn selected_company_row(
+    request: &CompanyResearchRequest,
+    selection: &market_squawk_data::SecResearchSelection,
+    position: usize,
+) -> Result<(Option<CompanyResearchFact>, Option<CompanyResearchFiling>), CanonicalResearchReadError>
+{
+    let selected = selection
+        .selected()
+        .get(position)
+        .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+    let mut facts = Vec::new();
+    let mut filings = Vec::new();
+    append_company_row(
+        request,
+        selection.request().family(),
+        selection,
+        selected,
+        &mut facts,
+        &mut filings,
+        &mut None,
+    )?;
+    Ok((facts.pop(), filings.pop()))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one original source row and its existing projection accumulators"
+)]
+fn append_company_row(
+    request: &CompanyResearchRequest,
+    family: SecResearchFamily,
+    selection: &market_squawk_data::SecResearchSelection,
+    selected: &market_squawk_data::SecResearchSelectedRow,
+    facts: &mut Vec<CompanyResearchFact>,
+    filings: &mut Vec<CompanyResearchFiling>,
+    latest_known_at: &mut Option<Timestamp>,
+) -> Result<(), CanonicalResearchReadError> {
+    let ordinal = usize::try_from(selected.row().row_ordinal())
+        .map_err(|_| CanonicalResearchReadError::EvidenceConflict)?;
+    let observation = selection
+        .decoded_rows()
+        .get(ordinal)
+        .map_err(map_company_data_error)?
+        .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+    let context =
+        observation_context(&observation).ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+    // The outer identity selection binds this issuer generation to the requested security.
+    // Retain source facts unchanged; an absent raw instrument is not itself attribution.
+    let issuer = match &observation {
+        ResearchObservation::Filing(value) => value.subject().issuer_id(),
+        ResearchObservation::Fundamental(value) => value.subject().issuer_id(),
+        _ => None,
+    };
+    if issuer
+        != Some(
+            selection
+                .company_identity()
+                .observation()
+                .provider_company_id(),
+        )
+        || context.provenance().instrument_id().is_some()
+        || context.provenance().source_id()
+            != selection.company_identity().observation().source_id()
+    {
+        return Err(CanonicalResearchReadError::EvidenceConflict);
+    }
+    let known_at = context
+        .provenance()
+        .availability()
+        .conservative_available_at()
+        .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+    if known_at > request.knowledge_at {
+        return Err(CanonicalResearchReadError::EvidenceConflict);
+    }
+    *latest_known_at = Some(latest_known_at.map_or(known_at, |current| current.max(known_at)));
+    let retained_rows = facts
+        .len()
+        .checked_add(filings.len())
+        .ok_or(CanonicalResearchReadError::ResourceExhausted)?;
+    if retained_rows >= MAX_COMPANY_RESEARCH_RESULT_ROWS {
+        return Err(CanonicalResearchReadError::ResourceExhausted);
+    }
+    match (family, observation) {
+        (SecResearchFamily::CompanyFacts, ResearchObservation::Fundamental(fundamental))
+        | (SecResearchFamily::FilingXbrl, ResearchObservation::Fundamental(fundamental)) => {
+            let fact_context = fundamental.fact_context();
+            facts
+                .try_reserve(1)
+                .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
+            facts.push(CompanyResearchFact {
+                lineage: CompanyResearchFactLineage {
+                    filing_identity: try_boxed_text(fact_context.accession().as_str())?,
+                    publication_identity: selection.origin().origin_digest(),
+                },
+                scope: match family {
+                    SecResearchFamily::CompanyFacts => CompanyFactScope::CompanyWide,
+                    SecResearchFamily::FilingXbrl => CompanyFactScope::FilingDetail,
+                    SecResearchFamily::Submissions => {
+                        return Err(CanonicalResearchReadError::EvidenceConflict);
+                    }
+                },
+                revision: product_revision_state(selected.point_in_time().revision_state()),
+                metric: try_boxed_text(fundamental.concept().as_str())?,
+                value: fundamental.value(),
+                unit: try_boxed_text(fundamental.unit().as_str())?,
+                period: fact_context.period(),
+                fiscal_year: fact_context.fiscal_year(),
+                fiscal_period: company_fiscal_period(fact_context.fiscal_period()),
+                cadence: fact_context.cadence(),
+                dimension_state: company_dimension_state(fact_context.dimensions().dimensions()),
+                consolidation: fact_context.consolidation(),
+                amendment_status: fact_context.amendment_status(),
+                restatement_state: company_restatement_state(fact_context.restatement_status()),
+                occurrence: fact_context.revision_order().ordinal(),
+                filed_on: fact_context.filed_on(),
+                effective: fundamental.context().time().effective().clone(),
+                known_at,
+            });
         }
-        let known_at = context
-            .provenance()
-            .availability()
-            .conservative_available_at()
-            .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
-        if known_at > request.knowledge_at {
-            return Err(CanonicalResearchReadError::EvidenceConflict);
+        (SecResearchFamily::Submissions, ResearchObservation::Filing(filing)) => {
+            filings
+                .try_reserve(1)
+                .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
+            filings.push(CompanyResearchFiling {
+                revision: product_revision_state(selected.point_in_time().revision_state()),
+                form: try_boxed_text(filing.form_type().as_str())?,
+                effective: filing.context().time().effective().clone(),
+                published: filing.context().time().published().cloned(),
+                known_at,
+            });
         }
-        *latest_known_at = Some(latest_known_at.map_or(known_at, |current| current.max(known_at)));
-        let retained_rows = facts
-            .len()
-            .checked_add(filings.len())
-            .ok_or(CanonicalResearchReadError::ResourceExhausted)?;
-        if retained_rows >= MAX_COMPANY_RESEARCH_RESULT_ROWS {
-            return Err(CanonicalResearchReadError::ResourceExhausted);
-        }
-        match (family, observation) {
-            (SecResearchFamily::CompanyFacts, ResearchObservation::Fundamental(fundamental))
-            | (SecResearchFamily::FilingXbrl, ResearchObservation::Fundamental(fundamental)) => {
-                let fact_context = fundamental.fact_context();
-                facts
-                    .try_reserve(1)
-                    .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
-                facts.push(CompanyResearchFact {
-                    lineage: CompanyResearchFactLineage {
-                        filing_identity: try_boxed_text(fact_context.accession().as_str())?,
-                        publication_identity: selection.origin().origin_digest(),
-                    },
-                    scope: match family {
-                        SecResearchFamily::CompanyFacts => CompanyFactScope::CompanyWide,
-                        SecResearchFamily::FilingXbrl => CompanyFactScope::FilingDetail,
-                        SecResearchFamily::Submissions => {
-                            return Err(CanonicalResearchReadError::EvidenceConflict);
-                        }
-                    },
-                    revision: product_revision_state(selected.point_in_time().revision_state()),
-                    metric: try_boxed_text(fundamental.concept().as_str())?,
-                    value: fundamental.value(),
-                    unit: try_boxed_text(fundamental.unit().as_str())?,
-                    period: fact_context.period(),
-                    fiscal_year: fact_context.fiscal_year(),
-                    fiscal_period: company_fiscal_period(fact_context.fiscal_period()),
-                    cadence: fact_context.cadence(),
-                    dimension_state: company_dimension_state(
-                        fact_context.dimensions().dimensions(),
-                    ),
-                    consolidation: fact_context.consolidation(),
-                    amendment_status: fact_context.amendment_status(),
-                    restatement_state: company_restatement_state(fact_context.restatement_status()),
-                    occurrence: fact_context.revision_order().ordinal(),
-                    filed_on: fact_context.filed_on(),
-                    effective: fundamental.context().time().effective().clone(),
-                    known_at,
-                });
-            }
-            (SecResearchFamily::Submissions, ResearchObservation::Filing(filing)) => {
-                filings
-                    .try_reserve(1)
-                    .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
-                filings.push(CompanyResearchFiling {
-                    revision: product_revision_state(selected.point_in_time().revision_state()),
-                    form: try_boxed_text(filing.form_type().as_str())?,
-                    effective: filing.context().time().effective().clone(),
-                    published: filing.context().time().published().cloned(),
-                    known_at,
-                });
-            }
-            _ => return Err(CanonicalResearchReadError::EvidenceConflict),
-        }
+        _ => return Err(CanonicalResearchReadError::EvidenceConflict),
     }
     Ok(())
 }

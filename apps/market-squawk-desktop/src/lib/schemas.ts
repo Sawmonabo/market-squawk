@@ -45,6 +45,8 @@ const productCapabilities = [
   "fundamental_facts",
   "investment_lookup",
   "investment_profile",
+  "investment_financials",
+  "investment_financials_close",
   "macro_context",
   "macro_revisions",
   "market_history",

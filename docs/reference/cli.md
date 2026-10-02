@@ -9,7 +9,7 @@ typed operation registry rather than this operator-oriented command projection.
 | --- | --- |
 | Document type | Reference |
 | Status | Current implementation contract |
-| Last substantive review | 2026-09-29 |
+| Last substantive review | 2026-10-02 |
 | Authority | `apps/market-squawk/src/cli.rs` and `src/main.rs` |
 
 ## Invocation and global options
@@ -108,6 +108,28 @@ Arrow IPC, 64 MiB complete result, 256 MiB query memory, four partitions, 2,048 
 4,096 plan nodes, and 60 seconds. A result above inline and within the complete ceiling is a
 path-free Parquet artifact reference with `artifactId`, `sha256`, `byteCount`, `mediaType`, and
 `rowCount`; retrieve it through `query artifact`.
+
+### Selected investment details
+
+Use the exact `selectionToken` returned by `market search --query <ticker>` or `market overview`;
+do not construct a token from a ticker. These commands share the same selected-detail operations
+as Desktop and MCP:
+
+| Command | Effect |
+| --- | --- |
+| `market profile --selection-token <token>` | Read the selected investment's reference and listing profile independently of price availability. |
+| `market financials --selection-token <token> --section <facts\|statements\|ratios\|filings> [--cursor <cursor>] [--limit 1..100]` | Read one financial section; the default page size is 32. A first page may retrieve missing issuer evidence using an already configured connection. |
+| `market close-financials --selection-token <token> --read-token <UUID>` | Release an open financial read without deleting its stored source evidence or cancelling a separate durable job. |
+
+Financial pages return `currentCursor`, `nextCursor`, `readToken`, frozen `knowledgeAt` and
+`effectiveOn`, per-family availability, and explicit omissions/limitations. Pass cursor strings
+unchanged to the same selection and section. Statements and ratios use complete reporting contexts;
+page boundaries do not combine facts from different filings to calculate a ratio. Use
+`--output json` for exact decimals, contexts and evidence dates.
+
+Read handles are temporary, process-owned views. Closing, expiry or service restart requires a new
+first page; it does not erase published evidence. A fresh first page selects current evidence and
+is not a promise to reproduce an earlier cutoff. Saved analysis retains its own durable evidence.
 
 ### Models, portfolio, backtests, paper, and fair value
 

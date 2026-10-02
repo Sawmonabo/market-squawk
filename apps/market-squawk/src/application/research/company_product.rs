@@ -947,6 +947,48 @@ pub(crate) fn project_company_product(
     Ok(result)
 }
 
+/// Exact private grouping key, shared with the disk-backed selected-investment reader.
+pub(crate) fn fact_envelope_bytes(
+    fact: &CompanyFactProduct,
+) -> Result<Vec<u8>, CompanyProductProjectionError> {
+    serde_json::to_vec(&fact_envelope_key(fact))
+        .map_err(|_| CompanyProductProjectionError::InvalidEvidence)
+}
+
+/// Receives one complete reporting envelope, never a page of arbitrary source facts.
+pub(crate) fn project_financial_envelope(
+    facts: &[CompanyFactProduct],
+    ratios: bool,
+) -> Result<Vec<serde_json::Value>, CompanyProductProjectionError> {
+    if facts.is_empty()
+        || facts
+            .iter()
+            .any(|fact| fact_envelope_key(fact) != fact_envelope_key(&facts[0]))
+    {
+        return Err(CompanyProductProjectionError::InvalidEvidence);
+    }
+    let mut budget = CompanySerializedBudget::new();
+    if ratios {
+        project_ratios(facts, CompanyProductSectionState::Reported, &mut budget)?
+            .items
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item)
+                    .map_err(|_| CompanyProductProjectionError::InvalidEvidence)
+            })
+            .collect()
+    } else {
+        project_statements(facts, CompanyProductSectionState::Reported, &mut budget)?
+            .groups
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item)
+                    .map_err(|_| CompanyProductProjectionError::InvalidEvidence)
+            })
+            .collect()
+    }
+}
+
 fn project_snapshot(
     instrument_id: InstrumentId,
     knowledge_cutoff: Timestamp,
@@ -1229,7 +1271,7 @@ const fn statement_for_metric(metric: CompanyFinancialMetric) -> CompanyStatemen
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct CompanyFactEnvelopeKey<'fact> {
     filing_identity: &'fact str,
     publication_identity: [u8; 32],
@@ -1567,7 +1609,7 @@ const fn reporting_envelope(fact: &CompanyFactProduct) -> CompanyReportingEnvelo
     }
 }
 
-fn project_fact(
+pub(crate) fn project_fact(
     fact: &CompanyResearchFact,
     knowledge_cutoff: Timestamp,
 ) -> Result<Option<CompanyFactProduct>, CompanyProductProjectionError> {
@@ -1795,7 +1837,7 @@ fn product_reporting_context(fact: &CompanyResearchFact) -> Option<CompanyFactRe
     })
 }
 
-fn project_filing(
+pub(crate) fn project_filing(
     filing: &CompanyResearchFiling,
     knowledge_cutoff: Timestamp,
 ) -> Result<CompanyFilingProduct, CompanyProductProjectionError> {
@@ -2045,6 +2087,30 @@ mod tests {
                 2,
             )?,
         ];
+        // The disk index must use the identical full private envelope key. Equal public
+        // dates and periods never join distinct original filing/publication receipts.
+        assert_ne!(
+            fact_envelope_bytes(&distinct_filings[0])?,
+            fact_envelope_bytes(&distinct_filings[1])?
+        );
+        assert_eq!(
+            project_financial_envelope(&distinct_filings, true),
+            Err(CompanyProductProjectionError::InvalidEvidence)
+        );
+        let instant_envelope = &facts[..2];
+        assert_eq!(
+            fact_envelope_bytes(&instant_envelope[0])?,
+            fact_envelope_bytes(&instant_envelope[1])?
+        );
+        let projected = project_financial_envelope(instant_envelope, true)?;
+        assert!(projected.iter().any(|ratio| {
+            ratio["metric"] == "current_ratio"
+                && ratio["state"] == "reported"
+                && ratio["inputs"]
+                    .as_array()
+                    .is_some_and(|inputs| inputs.len() == 2)
+        }));
+
         let distinct_ratios = project_ratios(
             &distinct_filings,
             CompanyProductSectionState::Reported,

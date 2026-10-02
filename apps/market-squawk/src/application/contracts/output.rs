@@ -13,6 +13,7 @@ pub(super) use find_results::{
     analysis_references as find_analysis_references, member_context as find_member_context,
 };
 mod investment_analysis;
+mod investment_financials;
 mod market_evidence;
 mod market_session_context;
 pub(super) use market_session_context::reference as market_session_reference;
@@ -230,6 +231,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Market.GetHistory" => market_history_result(),
         "Market.SearchUniverse" => market_search_page(),
         "Research.GetInvestmentProfile" => investment_profile(),
+        "Research.GetInvestmentFinancials" => investment_financials::page(),
+        "Research.CloseInvestmentFinancials" => closed_complete(vec![("released", boolean())]),
         "Research.ListDatasets" => nullable(page(generation())),
         "Research.GetManifest" => generation(),
         "Research.GetHistory" | "Research.GetAlternativeData" => observation_page(),

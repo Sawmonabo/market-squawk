@@ -79,6 +79,8 @@ export type ProductQuery =
   | { query: "marketSessionRead"; reference: MarketSessionReference }
   | { query: "analysisSettings" }
   | { query: "investmentProfile"; selectionToken: string }
+  | { query: "investmentFinancials"; selectionToken: string; section: "facts" | "statements" | "ratios" | "filings"; cursor?: string; limit?: number }
+  | { query: "closeInvestmentFinancials"; selectionToken: string; readToken: string }
   | { query: "marketUniverse"; text: string; pageToken?: string }
   | {
       query: "marketInstrument"

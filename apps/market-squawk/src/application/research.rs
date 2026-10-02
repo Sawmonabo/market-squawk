@@ -67,7 +67,11 @@ mod fund_product;
 mod h15_installed_acceptance;
 mod ingest;
 mod instrument_context;
+mod investment_financial_preparation;
+mod investment_financials;
 mod investment_profile;
+use investment_financial_preparation::InvestmentFinancialPreparation;
+use investment_financials::{InvestmentFinancialReadCapability, InvestmentFinancialSection};
 use investment_profile::{INVESTMENT_PROFILE_READ_OPERATION, InvestmentProfileReadCapability};
 mod macro_context;
 mod macro_features;
@@ -370,6 +374,7 @@ impl ResearchApplicationServices {
             FredLatestKnownOperation::setup_required(),
             TreasuryLatestKnownOperation::fiscal_setup_required(),
             TreasuryLatestKnownOperation::daily_setup_required(),
+            None,
         )
     }
 
@@ -388,6 +393,7 @@ impl ResearchApplicationServices {
             FredLatestKnownOperation::setup_required(),
             TreasuryLatestKnownOperation::fiscal_setup_required(),
             TreasuryLatestKnownOperation::daily_setup_required(),
+            None,
         )
     }
 
@@ -398,6 +404,7 @@ impl ResearchApplicationServices {
         artifacts: Arc<dyn ArtifactRepository>,
         listing_reference: Option<ListingReferenceReadCapability>,
         fred_latest_known: FredLatestKnownOperation,
+        provider_activation: Arc<crate::provider_activation::ProviderAdapterActivation>,
     ) -> Self {
         Self::compose(
             service,
@@ -407,6 +414,7 @@ impl ResearchApplicationServices {
             fred_latest_known,
             TreasuryLatestKnownOperation::fiscal_setup_required(),
             TreasuryLatestKnownOperation::daily_setup_required(),
+            Some(provider_activation),
         )
     }
 
@@ -422,6 +430,7 @@ impl ResearchApplicationServices {
         fred_latest_known: FredLatestKnownOperation,
         treasury_fiscal_latest_known: TreasuryLatestKnownOperation,
         treasury_daily_latest_known: TreasuryLatestKnownOperation,
+        provider_activation: Option<Arc<crate::provider_activation::ProviderAdapterActivation>>,
     ) -> Self {
         let reader = service.analytical_reader();
         let macro_context = MacroContextOperation::with_treasury(
@@ -448,6 +457,24 @@ impl ResearchApplicationServices {
             ),
             product_identity.as_deref().cloned(),
         );
+        let investment_financials = InvestmentFinancialReadCapability::new(
+            Arc::clone(&service),
+            super::market_selection::product::MarketProductSelectionReadCapability::new(
+                Arc::clone(&service),
+                service.market_data_instruments(),
+            ),
+        );
+        let financial_preparation = provider_activation
+            .zip(product_identity.as_deref().cloned())
+            .zip(listing_reference.clone())
+            .map(|((activation, references), listings)| {
+                InvestmentFinancialPreparation::new(
+                    Arc::clone(&service),
+                    references,
+                    listings,
+                    activation,
+                )
+            });
         let product_research =
             ResearchProductReadCapability::new(company_research.clone(), product_identity);
         let options_context = OptionsContextReadCapability::new(
@@ -475,6 +502,8 @@ impl ResearchApplicationServices {
                 company_research,
                 product_research,
                 investment_profile,
+                investment_financials,
+                financial_preparation,
                 fred_latest_known,
                 macro_context,
                 options_context,
@@ -661,7 +690,12 @@ impl ApplicationDomainService for ResearchDomainService {
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
-        let limits = if request.name() == INVESTMENT_PROFILE_READ_OPERATION {
+        let limits = if matches!(
+            request.name(),
+            INVESTMENT_PROFILE_READ_OPERATION
+                | "Research.GetInvestmentFinancials"
+                | "Research.CloseInvestmentFinancials"
+        ) {
             context.limits()
         } else {
             effective_service_limits(&request, &context)?
@@ -680,6 +714,92 @@ impl ApplicationDomainService for ResearchDomainService {
                     .await?;
                 TypedToolResult::try_new(
                     serde_json::to_value(profile).map_err(|_| ServiceError::InvalidResult)?,
+                    1,
+                    ToolResultMetadata::complete_not_applicable(),
+                    limits,
+                )
+                .map_err(Into::into)
+            }
+            "Research.GetInvestmentFinancials" => {
+                let arguments = request.arguments();
+                let token = arguments
+                    .get("selectionToken")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let section: InvestmentFinancialSection = serde_json::from_value(
+                    arguments
+                        .get("section")
+                        .cloned()
+                        .ok_or(ServiceError::InvalidRequest)?,
+                )
+                .map_err(|_| ServiceError::InvalidRequest)?;
+                let cursor = arguments
+                    .get("cursor")
+                    .filter(|value| !value.is_null())
+                    .map(|value| value.as_str().ok_or(ServiceError::InvalidRequest))
+                    .transpose()?;
+                let limit = arguments
+                    .get("limit")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .and_then(|value| usize::try_from(value).ok())
+                            .ok_or(ServiceError::InvalidRequest)
+                    })
+                    .transpose()?
+                    .unwrap_or(32);
+                let page = if let Some(preparation) = &self.controller.financial_preparation {
+                    preparation
+                        .read(
+                            &self.controller.investment_financials,
+                            token,
+                            section,
+                            cursor,
+                            limit,
+                            limits,
+                            context.deadline(),
+                            context.cancellation(),
+                        )
+                        .await?
+                } else {
+                    self.controller
+                        .investment_financials
+                        .read(
+                            token,
+                            section,
+                            cursor,
+                            limit,
+                            limits,
+                            context.deadline(),
+                            context.cancellation(),
+                        )
+                        .await?
+                };
+                let count = page.item_count();
+                TypedToolResult::try_new(
+                    serde_json::to_value(page).map_err(|_| ServiceError::InvalidResult)?,
+                    count,
+                    ToolResultMetadata::complete_not_applicable(),
+                    limits,
+                )
+                .map_err(Into::into)
+            }
+            "Research.CloseInvestmentFinancials" => {
+                let arguments = request.arguments();
+                let token = arguments
+                    .get("selectionToken")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let read_token = arguments
+                    .get("readToken")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let released = self
+                    .controller
+                    .investment_financials
+                    .close(token, read_token)?;
+                TypedToolResult::try_new(
+                    json!({"released": released}),
                     1,
                     ToolResultMetadata::complete_not_applicable(),
                     limits,
@@ -877,6 +997,8 @@ struct ResearchController {
     company_research: CompanyResearchReadCapability,
     product_research: ResearchProductReadCapability,
     investment_profile: InvestmentProfileReadCapability,
+    investment_financials: InvestmentFinancialReadCapability,
+    financial_preparation: Option<InvestmentFinancialPreparation>,
     fred_latest_known: FredLatestKnownOperation,
     macro_context: MacroContextOperation,
     options_context: OptionsContextReadCapability,
@@ -1106,6 +1228,7 @@ impl ResearchController {
     fn begin_shutdown(&self) {
         self.begin_startup_shutdown();
         self.lifecycle.begin_shutdown();
+        self.investment_financials.clear();
         self.ingest.begin_shutdown();
     }
 

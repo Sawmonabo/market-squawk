@@ -17,10 +17,10 @@ use std::{
 
 use market_squawk_adapter_sec::{
     SecAuthoritativeIdentifierNamespace, SecBulkError, SecBulkLayoutManifest, SecBulkParseLimits,
-    SecBulkSelection, SecClientError, SecEdgarSource, SecFundHoldingIdentityInput,
-    SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPublicationScope,
-    SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput, SecGovernedIdentityReceipt,
-    SecPreparedFundLogicalPublication,
+    SecBulkSelection, SecClientError, SecCompanyDirectoryCandidate, SecEdgarSource,
+    SecFundHoldingIdentityInput, SecFundIdentityAuthority, SecFundPartitionAdmissions,
+    SecFundPublicationScope, SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput,
+    SecGovernedIdentityReceipt, SecPreparedFundLogicalPublication,
 };
 use market_squawk_data::{
     DatasetId, IngestError, IngestPrecommitAuthority, SecFundJobCatalogError, SecFundJobCommit,
@@ -217,7 +217,32 @@ impl SecLiveFundSource {
         })
     }
 
-    /// Uses this registered SEC generation for the companies already selected in Settings.
+    /// Discovers candidates for one official listed symbol without granting security attribution.
+    pub(crate) async fn discover_company_candidates(
+        &self,
+        listed_symbol: &str,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<SecCompanyDirectoryCandidate>, SecLiveFundApplicationError> {
+        let operation = self.start_company_operation(deadline, cancellation)?;
+        let result = async {
+            let candidates = self
+                .source
+                .fetch_company_directory_candidates(
+                    &self.extraction,
+                    listed_symbol,
+                    operation.cancellation(),
+                )
+                .await?;
+            self.validate_current()?;
+            self.rights.validate_at(system_timestamp()?)?;
+            Ok(candidates)
+        }
+        .await;
+        operation.classify(result)
+    }
+
+    /// Uses this registered SEC generation for one exact issuer.
     pub(crate) async fn publish_company_research(
         &self,
         cik: &str,
@@ -225,30 +250,8 @@ impl SecLiveFundSource {
         cancellation: CancellationToken,
     ) -> Result<(), SecLiveFundApplicationError> {
         use std::num::{NonZeroU32, NonZeroU64};
-        self.validate_current()?;
-        let started_at = system_timestamp()?;
-        self.rights.validate_at(started_at)?;
-        if self.generation.rights_exact_subjects().is_some() {
-            return Err(SecLiveFundApplicationError::ScopedRightsUnavailable);
-        }
-        self.rights.validate_subject(None)?;
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .ok_or(SecLiveFundApplicationError::DeadlineExceeded)?;
-        let wall_deadline = started_at
-            .unix_nanos()
-            .checked_add(
-                i64::try_from(remaining.as_nanos())
-                    .map_err(|_| SecLiveFundApplicationError::DeadlineExceeded)?,
-            )
-            .map(Timestamp::from_unix_nanos)
-            .ok_or(SecLiveFundApplicationError::DeadlineExceeded)?;
-        let operation = SecLiveFundOperation::try_new(
-            cancellation,
-            self.admission.cancellation().clone(),
-            wall_deadline,
-            started_at,
-        )?;
+        let operation = self.start_company_operation(deadline, cancellation)?;
+        let wall_deadline = operation.deadline;
         let cancellation = operation.cancellation();
         let result = async {
             let generation = Arc::new(self.admission.acquire_publication_lease().await?);
@@ -289,6 +292,37 @@ impl SecLiveFundSource {
         }
         .await;
         operation.classify(result)
+    }
+
+    fn start_company_operation(
+        &self,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecLiveFundOperation, SecLiveFundApplicationError> {
+        self.validate_current()?;
+        let started_at = system_timestamp()?;
+        self.rights.validate_at(started_at)?;
+        if self.generation.rights_exact_subjects().is_some() {
+            return Err(SecLiveFundApplicationError::ScopedRightsUnavailable);
+        }
+        self.rights.validate_subject(None)?;
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or(SecLiveFundApplicationError::DeadlineExceeded)?;
+        let wall_deadline = started_at
+            .unix_nanos()
+            .checked_add(
+                i64::try_from(remaining.as_nanos())
+                    .map_err(|_| SecLiveFundApplicationError::DeadlineExceeded)?,
+            )
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(SecLiveFundApplicationError::DeadlineExceeded)?;
+        SecLiveFundOperation::try_new(
+            cancellation,
+            self.admission.cancellation().clone(),
+            wall_deadline,
+            started_at,
+        )
     }
 
     /// Completes one live bounded SEC fund graph through durable application publication.

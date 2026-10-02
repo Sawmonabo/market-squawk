@@ -336,6 +336,14 @@ pub(crate) enum SecFundProductError {
     Worker(#[from] crate::ResearchServiceError),
 }
 
+/// Selected issuer acquisition requires directory discovery followed by exact parent corroboration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecSelectedCompanyAcquisition {
+    Published,
+    MissingIssuer,
+    AmbiguousIssuer,
+}
+
 /// Application-owned activation authority shared by CLI, MCP, and local onboarding transports.
 pub struct ProviderAdapterActivation {
     onboarding: Arc<ProviderOnboardingService>,
@@ -891,12 +899,68 @@ impl ProviderAdapterActivation {
             .map_err(Into::into)
     }
 
-    /// Closes the selected companies through the existing Settings SEC generation and catalog.
-    pub(crate) async fn publish_sec_fundamentals(
+    /// Publishes only the issuer candidate for this exact admitted official listing.
+    /// Callers invoke this on missing financial evidence, not for every section or cursor page.
+    pub(crate) async fn publish_sec_company_for_listing(
         &self,
+        instrument_id: market_squawk_domain::InstrumentId,
+        listing: &market_squawk_data::ListingReferenceRecord,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<(), SecFundProductError> {
+    ) -> Result<SecSelectedCompanyAcquisition, SecFundProductError> {
+        let activation = self.active_sec_company_operation()?;
+        let candidates = activation
+            .operation
+            .discover_company_candidates(
+                listing.provider_symbol(),
+                deadline,
+                cancellation.child_token(),
+            )
+            .await?;
+        let mut matching = candidates.iter().filter(|candidate| {
+            market_squawk_data::sec_listing_exchange_matches_venue(
+                candidate.exchange(),
+                listing.listing_venue().as_str(),
+            )
+        });
+        let Some(candidate) = matching.next() else {
+            return Ok(SecSelectedCompanyAcquisition::MissingIssuer);
+        };
+        if matching.any(|other| other.cik() != candidate.cik()) {
+            return Ok(SecSelectedCompanyAcquisition::AmbiguousIssuer);
+        }
+        let cik = candidate.cik().clone();
+        activation
+            .operation
+            .publish_company_research(cik.as_str(), deadline, cancellation.child_token())
+            .await?;
+        // Revalidate the activation before associating separately retained actual issuer parents.
+        let current = self.active_sec_company_operation()?;
+        if !Arc::ptr_eq(&activation, &current) {
+            return Err(SecFundProductError::Unavailable);
+        }
+        let resolution = Arc::clone(&self.company_security_resolution);
+        let source = activation.source.metadata().source_id().clone();
+        let listing = listing.clone();
+        self.research
+            .research_service()
+            .run_owned_research_io(deadline, &cancellation, move |owned_cancellation| {
+                resolution.ensure_source_qualified_listing(
+                    &source,
+                    &cik,
+                    instrument_id,
+                    &listing,
+                    deadline,
+                    &owned_cancellation,
+                )
+            })
+            .await??;
+        Ok(SecSelectedCompanyAcquisition::Published)
+    }
+
+    fn active_sec_company_operation(
+        &self,
+    ) -> Result<Arc<SecFundProductActivation>, SecFundProductError> {
         let activation = self
             .sec_fund
             .read()
@@ -917,6 +981,16 @@ impl ProviderAdapterActivation {
         {
             return Err(SecFundProductError::Unavailable);
         }
+        Ok(activation)
+    }
+
+    /// Closes the selected companies through the existing Settings SEC generation and catalog.
+    pub(crate) async fn publish_sec_fundamentals(
+        &self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), SecFundProductError> {
+        let activation = self.active_sec_company_operation()?;
         for cik in &activation.selected_companies {
             activation
                 .operation

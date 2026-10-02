@@ -131,6 +131,30 @@ pub(crate) async fn dashboard_query(
             arguments.insert("selectionToken".to_owned(), json!(selection_token));
             ("Research.GetInvestmentProfile", arguments)
         }
+        DashboardQueryCommand::InvestmentFinancials {
+            selection_token,
+            section,
+            cursor,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("selectionToken".to_owned(), json!(selection_token));
+            arguments.insert("section".to_owned(), json!(section));
+            insert_optional(&mut arguments, "cursor", cursor);
+            if let Some(limit) = limit {
+                arguments.insert("limit".to_owned(), json!(limit));
+            }
+            ("Research.GetInvestmentFinancials", arguments)
+        }
+        DashboardQueryCommand::CloseInvestmentFinancials {
+            selection_token,
+            read_token,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("selectionToken".to_owned(), json!(selection_token));
+            arguments.insert("readToken".to_owned(), json!(read_token));
+            ("Research.CloseInvestmentFinancials", arguments)
+        }
         DashboardQueryCommand::MarketHistory {
             history_token,
             start_unix_nanos,

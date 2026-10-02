@@ -1,7 +1,10 @@
 //! Registered, allowlisted, budgeted SEC HTTP retrieval.
 
+mod company_directory;
 mod contracts;
 mod taxonomy;
+
+pub use company_directory::SecCompanyDirectoryCandidate;
 
 pub use contracts::{
     RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions, RetrievedXbrlDocument,

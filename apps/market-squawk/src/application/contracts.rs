@@ -55,6 +55,8 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Market.ReadSessionContext"
             | "Market.GetInstrument"
             | "Research.GetInvestmentProfile"
+            | "Research.GetInvestmentFinancials"
+            | "Research.CloseInvestmentFinancials"
             | "Market.PrepareInvestmentEvidence"
             | "Market.SelectInvestmentEvidence"
             | "Market.ReadInvestmentEvidence"
@@ -628,6 +630,19 @@ const MARKET_INSTRUMENT_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
     "selectionToken",
     ArgumentKind::MarketSelectionToken,
 )];
+const INVESTMENT_FINANCIAL_ARGUMENTS: &[ArgumentSpec] = &[
+    MARKET_INSTRUMENT_ARGUMENTS[0],
+    ArgumentSpec::required(
+        "section",
+        ArgumentKind::Enumeration(&["facts", "statements", "ratios", "filings"]),
+    ),
+    CURSOR_PAGE_ARGUMENTS[0],
+    CURSOR_PAGE_ARGUMENTS[1],
+];
+const INVESTMENT_FINANCIAL_CLOSE_ARGUMENTS: &[ArgumentSpec] = &[
+    MARKET_INSTRUMENT_ARGUMENTS[0],
+    ArgumentSpec::required("readToken", ArgumentKind::Uuid),
+];
 const MARKET_PREPARE_INVESTMENT_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("shareOriginUnixNanos", ArgumentKind::UnixNanosText),
     ArgumentSpec::optional("originalKnowledgeAtUnixNanos", ArgumentKind::UnixNanosText),
@@ -2042,6 +2057,26 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Research,
         JOB_SCOPE,
         MARKET_INSTRUMENT_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    OperationSpec {
+        open_world: true,
+        idempotent: false,
+        ..read(
+            "Research.GetInvestmentFinancials",
+            "Read selected financial facts, statements, ratios or filings; a first page may acquire missing issuer evidence through an already configured connection.",
+            ServiceDomain::Research,
+            JOB_SCOPE,
+            INVESTMENT_FINANCIAL_ARGUMENTS,
+            SourceEvidencePolicy::NotApplicable,
+        )
+    },
+    read(
+        "Research.CloseInvestmentFinancials",
+        "Release the selected investment's open financial pages while preserving saved evidence.",
+        ServiceDomain::Research,
+        JOB_SCOPE,
+        INVESTMENT_FINANCIAL_CLOSE_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(

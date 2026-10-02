@@ -107,6 +107,8 @@ pub(crate) enum ProductCapability {
     InstallationStatus,
     InvestmentLookup,
     InvestmentProfile,
+    InvestmentFinancials,
+    InvestmentFinancialsClose,
     JobList,
     JobWatch,
     MacroContext,
@@ -265,6 +267,8 @@ impl ProductCapability {
             "Research.DiscardStagedFile" => Self::ResearchFileDiscard,
             "Research.GetManifest" => Self::ResearchManifest,
             "Research.GetInvestmentProfile" => Self::InvestmentProfile,
+            "Research.GetInvestmentFinancials" => Self::InvestmentFinancials,
+            "Research.CloseInvestmentFinancials" => Self::InvestmentFinancialsClose,
             "Research.ListDatasets" => Self::ResearchDatasetList,
             "Research.PreviewStagedFile" => Self::ResearchFilePreview,
             "Research.StartExport" => Self::ResearchExport,
@@ -437,6 +441,16 @@ pub(crate) enum DashboardQueryCommand {
     },
     InvestmentProfile {
         selection_token: String,
+    },
+    InvestmentFinancials {
+        selection_token: String,
+        section: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
+    CloseInvestmentFinancials {
+        selection_token: String,
+        read_token: String,
     },
     MarketHistory {
         history_token: String,

@@ -75,6 +75,11 @@ pub struct SecObjectLocator {
 }
 
 impl SecObjectLocator {
+    /// Locates the official current ticker/exchange-to-CIK discovery directory.
+    pub fn company_directory() -> Result<Self, SecClientError> {
+        Self::from_url("https://www.sec.gov/files/company_tickers_exchange.json".to_owned())
+    }
+
     /// Locates the current submissions object for a CIK.
     pub fn submissions(cik: &str) -> Result<Self, SecClientError> {
         let cik = normalized_cik(cik)?;

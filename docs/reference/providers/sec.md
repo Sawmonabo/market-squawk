@@ -48,6 +48,7 @@ placeholder identity, and owns every SEC request. Frontend code never calls SEC 
 | Surface | Exact locator/family |
 | --- | --- |
 | Current submissions | `GET https://data.sec.gov/submissions/CIK##########.json` |
+| Selected-issuer discovery | `GET https://www.sec.gov/files/company_tickers_exchange.json`; discovery candidates only, not security identity authority |
 | Provider-declared older submission pages | `GET https://data.sec.gov/submissions/{returned_file_name}` |
 | Company Facts | `GET https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json` |
 | Company Concept | `GET https://data.sec.gov/api/xbrl/companyconcept/CIK##########/{taxonomy}/{tag}.json` |
@@ -152,6 +153,21 @@ amendment lineage. A later amended filing, corrected bulk archive, or new taxono
 generation; it cannot rewrite an earlier model, backtest, valuation, or recommendation input.
 
 ## Issuer ownership and selected-security use
+
+Selected-detail implementation update, 2026-10-02: opening a financial section with missing issuer
+identity can discover the exact symbol/exchange candidate from SEC's company directory through the
+configured server-side source operation. Conflicting CIK candidates remain ambiguous. The operation
+then acquires that one company's submissions and facts through the existing publication path;
+actual submissions and an admitted official listing must corroborate security attribution. It does
+not loop over every configured company or infer identity from company-name similarity. The
+[SEC access guide](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data)
+documents the directory and its accuracy/completeness caveat.
+
+Desktop, CLI and MCP selected financial reads share independently loaded facts, statements, ratios
+and filings. They retain original selected evidence and a frozen cutoff, using a temporary disk
+index for cursor pages and complete reporting contexts for derived ratios. Quote/profile reads
+remain independent. Current critical and live verification are recorded in the delivery ledger;
+this implementation description does not establish live or installed acceptance.
 
 Company submissions, Company Facts and filing XBRL retain an explicit issuer subject with the
 validated CIK and `instrument_id: None` in their original observations. The source-qualified subject
