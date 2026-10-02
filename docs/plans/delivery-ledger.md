@@ -2,6 +2,81 @@
 
 ## Current execution — 2026-10-02
 
+Prepared financial reads are live-verified before and after service restart. Dedicated native
+audit on service3916/Desktop3982 returns MSFT Facts32 items, Statements32 groups, Ratios32 items
+and Filings32 items without parse failures; filing cursors exercised. Post-restart observed
+click-to-section bounds were 0.9/5.6/9.4/1.5 seconds respectively, so instant loading is NOT proven.
+Evidence: `.agents/tmp/desktop-product-audit/financial-tabs.json` and financial filing cursor
+captures; earlier four-tab/chart-retention evidence remains under `.agents/tmp/v1-first-stock`.
+Job `aa060694-848c-4a5b-9526-d8c390f53532` is terminal failed on SEC `numwordsen` lexical `three`;
+retained facts/submissions remain readable. Diagnosis is complete in
+`.agents/tmp/v1-first-stock/sec-transform-diagnosis.md`; detailed filing remediation remains next.
+
+The shared `preparation_required` output descriptor is corrected and built (6m11s). Supervisor23243
+stopped cleanly; replacement supervisor4797/PID99692 now runs service3916/Desktop3982 from
+`session-GR8i4q/generation-xC2hed`. Home renders through background native evaluation. Native
+audit is complete and exclusive auditor navigation ownership is released; the visible app was
+returned to Home. No financial job
+will be duplicated during restart verification. All154 existing local catalog table counts survived
+the backed-up canonical schema update (`prepared-sec-local-schema-update.json`).
+
+| Active owner | Dependencies and exclusive files | Finishable outcome / check |
+| --- | --- | --- |
+| Lead | Integrated prepared-source/display, app/contracts/UI, Git/runtime/builds and this ledger | Prepared financial availability/restart checkpoint `d0dcb849` integrated and pushed; preserve separate filing transform blocker. Dedicated screen audit inspected; report and ordered remediation evidence recorded below. |
+| Astra sec_transform_diagnosis (finished) | `.agents/tmp/v1-first-stock/sec-transform-diagnosis.md`; read-only production investigation | Exact valid `numwordsen`/`three` failure and complete official grammar identified; report inspected by lead. No production edits. Parser implementation follows current availability integration. |
+| Sol desktop_product_audit (finished) | Read-only source/native screen inspection; exclusive report `docs/reports/2026-10-02-desktop-product-audit.md` and `.agents/tmp/desktop-product-audit/` evidence. Depends on current routes/contracts/mocks; native navigation exclusive to auditor during audit, coordinated with lead runtime replacement. | Completed all19 default routes through document end,156 unique full-scroll/panel/sidebar screenshots individually inspected, and6 actual official competitor images viewed. Report has16 Open findings (11Important/5Minor), exact evidence/ownership/fixes/acceptance and explicit unavailable-state limits. Lead checked source findings, representative images and all156 screenshot hashes. No production edits/builds/Git; native ownership released and Home restored. |
+
+
+Current integration owner: lead; active investigation/audit ownership is listed above. Frozen candidate packets are integrated
+in the primary worktree, not redispatched. `086029b4` is pushed for the global refresh controls.
+Prepared SEC source/display reads and selected-family preparation are integrated and pushed in
+`d0dcb849`; native sections reopen after restart. Detailed filing acquisition remains incomplete. Application check and Desktop typecheck PASS; the existing selected-investment/
+financial-job lifecycle UI check PASS1/1 (3.59s). Existing complete SEC recovery critical PASS1/1
+(147.16s), including original evidence corruption rejection, fiscal dataset construction,
+backup/restore, and all32,671 facts after restart. Initial source preparation27.40s; prepared
+selection1.93s. This is a retained-data timing, not native page or whole-app acceptance.
+The recovery fixture's nested unoptimized async poll frames exhausted the default thread stack;
+heap-owning its existing fiscal journey removed that embedding without changing assertions,
+input counts, stack limits or production decoding. Evidence:
+`.agents/tmp/v1-first-stock/prepared-sec-recovery-critical.log` and
+`prepared-financial-ui-{types,critical}.log`. The local catalog backup and in-place canonical schema update are complete, with original rows
+preserved. Prepared financial availability after service restart is now verified. Next barrier:
+publish the full screen audit, then resolve the detailed filing transformation failure and the
+audit findings through their existing workflow dependencies.
+Branch refresh: three local branches and one primary worktree; origin has four branches because
+Dependabot PR55 (`dependabot/cargo/crc32fast-1.5.2`) is open and unmerged. Its unique active work was
+preserved; it is not a completed stale branch. Main/release and recovery/session backups unchanged.
+
+
+### Current screen-audit remediation
+
+The [full Desktop product audit](../reports/2026-10-02-desktop-product-audit.md) is complete against
+production source `d0dcb849`. Its16 findings remain Open; audit completion is not product completion.
+All19 default-page ends and selected financial/Research panels were captured at1376×775CSSpx.
+The156 unique native screenshots and6 official competitor images were individually inspected;
+local evidence is preserved in `.agents/tmp/desktop-product-audit/` and
+`.agents/tmp/desktop-competitor-reference/`. Background chart-paint uncertainty, unavailable saved
+analyses/accounts, other widths and lifecycle mutations remain explicitly unverified.
+
+Resolve through coherent producer/consumer checkpoints in this order, with exact file reservations
+before dispatch; no implementation agents currently own these findings:
+
+1. Existing SEC filing transform blocker plus DP07/08/09/14: usable financial/research inputs and
+   intended typed family consumers; diagnose the actual source-status row and preparation rejection.
+2. DP04/06: complete Portfolio import and the same-account Home financial summary.
+3. DP13/01/05: tracked-market discovery, global investment/object lookup and labeled search.
+4. DP03/10/12: reusable scoped display data, honest live-update states and stable loading layout.
+5. DP02/11/15/16: signed financial presentation, readable ratios, benchmark and log-cell containment.
+6. Revisit populated saved-analysis/account/forecast/backtest states and recovery at their existing
+   workflow barriers. Empty-screen captures cannot establish these workflows.
+
+Independent UI presentation fixes may run alongside data prerequisites with disjoint ownership;
+shared transport/contracts and native runtime/build scheduling remain lead-owned. The report
+contains source locations and closure checks for each finding; it is not a second execution queue.
+
+
+### Earlier checkpoint evidence — historical status, not current assignments
+
 Owner clarification applied across Desktop: all 32 routine refresh controls in 31 feature files
 now use one shared faint 28px icon component, preserving scoped labels, handlers, loading and
 unavailable states. No new tests: existing market/watchlist and demand-loaded portfolio journeys
