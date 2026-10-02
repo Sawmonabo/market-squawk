@@ -11,7 +11,8 @@ const calendarDate = new Intl.DateTimeFormat(undefined, {
 export function timestampFromUnixNanos(value: string | bigint): Date | null {
   try {
     const nanos = typeof value === "bigint" ? value : BigInt(value)
-    const milliseconds = nanos / NANOSECONDS_PER_MILLISECOND
+    const milliseconds = nanos >= 0n ? nanos / NANOSECONDS_PER_MILLISECOND
+      : (nanos - (NANOSECONDS_PER_MILLISECOND - 1n)) / NANOSECONDS_PER_MILLISECOND
     const asNumber = Number(milliseconds)
     if (!Number.isSafeInteger(asNumber)) return null
     const date = new Date(asNumber)

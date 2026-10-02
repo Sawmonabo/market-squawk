@@ -2,6 +2,24 @@
 
 ## Current execution — 2026-10-02
 
+Native market correction is live verified after the supervised restart to generation `Dxbarz`
+(service26909, Desktop26961). MSFT now exposes original last trade 517.13 USD, size4, and both
+supplied quote sizes40 with unit uncertainty, retaining their independent Oct2 source timestamps.
+The observations remain not current; the previous-close card does not invent a live return.
+Native DOM/screenshot `msft-market-components-native.{json,png}` inspected; active market,
+profile, history and financial reads succeeded, with no page alert or horizontal overflow.
+`e4cd258e` is pushed. This proves retained display, not fresh streaming or full-page completion.
+
+Formatting follow-up retains floor semantics for negative fractional Unix timestamps; direct
+-1ns boundary check and final Desktop typecheck PASS. Readable dates remain visible after restart.
+The explicit MSFT filing retry is job `6b80fcf8-13fa-4aa9-90c5-ed16ccd5de97`; its current
+recorded state is running, sequence3 (`msft-filing-occurrence-job.json`). Do not retry again or
+claim detailed-filing success until its terminal result is observed.
+
+Operational note: touching unchanged Rust to wake the watcher retriggered Cargo compilation.
+That extra serialized build passed in6m03s but was unnecessary. Do not change Rust source
+metadata solely to trigger a handoff after an already-completed matching build.
+
 Matched market projection is implemented and critically verified: independent retained quote/trade
 components, qualified supplied quote sizes, exact backend change with dated completed-close basis,
 and matched closed Desktop/native descriptors. Single-job development build PASS (7m52s),
