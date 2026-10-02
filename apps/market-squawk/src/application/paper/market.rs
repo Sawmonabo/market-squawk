@@ -151,7 +151,7 @@ struct DurableMarketRouteEvidence {
     venue_id: VenueId,
     selections: Vec<MarketEventPointInTimeReceipt>,
     trade_status: TradeStatus,
-    display_authorizations: Vec<market_squawk_data::AuthorizedMarketEventUse>,
+    display_authorizations: Vec<Arc<market_squawk_data::AuthorizedMarketEventUse>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1196,6 +1196,8 @@ async fn load_retained_display_evidence(
     let mut routes = Vec::new();
     let mut sources = Vec::new();
     let mut expected = 0usize;
+    let mut pending = Vec::new();
+    let mut reads = Vec::new();
     for instrument in instruments {
         ensure_live(context)?;
         let record = records
@@ -1235,173 +1237,250 @@ async fn load_retained_display_evidence(
                     route.dataset().clone(),
                     route.source_surface().clone(),
                 );
-                let mut selections = Vec::new();
                 for kind in kinds {
-                    ensure_live(context)?;
-                    match selector
-                        .select_current(
-                            *instrument,
-                            route.venue_id().clone(),
-                            *kind,
-                            reference_at,
-                            reference_at,
-                            MAXIMUM_DURABLE_EVENT_CANDIDATES,
-                            context.deadline(),
-                            context.cancellation().clone(),
-                        )
-                        .await
-                    {
-                        Ok(Some(selection)) => selections.push(selection),
-                        Ok(None) => {}
-                        Err(error) => {
-                            match crate::application::market_selection::map_market_event_read_error(
-                                error,
-                            ) {
-                                ServiceError::Unavailable | ServiceError::Unauthorized => {
-                                    selections.clear();
-                                    break;
-                                }
-                                error => return Err(error),
-                            }
-                        }
-                    }
+                    reads.push((
+                        selector.clone(),
+                        *instrument,
+                        route.venue_id().clone(),
+                        *kind,
+                    ));
                 }
-                let Some(latest) = selections
-                    .iter()
-                    .flat_map(|receipt| receipt.selection().sources())
-                    .flat_map(|source| source.tied_candidates())
-                    .max_by_key(|candidate| durable_cohort_recency_key(candidate))
-                else {
-                    continue;
-                };
-                let provenance = market_event_provenance(latest.event());
-                let Some(metadata) = research
-                    .analytical()
-                    .retained_source_metadata(
-                        provenance.binding().source_id(),
-                        provenance.binding().metadata_revision(),
-                        reference_at,
-                        context.deadline(),
-                        context.cancellation(),
-                    )
-                    .map_err(map_durable_market_ingest_error)?
-                else {
-                    continue;
-                };
-                if !metadata.is_effective_at(reference_at) {
-                    continue;
-                }
-                let surface = SourceIdentifier::try_from(route.source_surface().as_str())
-                    .map_err(|_| ServiceError::InvalidResult)?;
-                let Some(mut evidence) = DurableMarketRouteEvidence::try_new(
-                    surface,
-                    metadata,
-                    route.source_surface().clone(),
-                    *instrument,
-                    route.venue_id().clone(),
-                    selections,
-                )?
-                else {
-                    continue;
-                };
-                let mut denied = false;
-                for receipt in &evidence.selections {
-                    let candidates = receipt.selection().sources()[0].tied_candidates();
-                    let mut coordinates = Vec::new();
-                    coordinates
-                        .try_reserve_exact(candidates.len())
-                        .map_err(|_| ServiceError::ResourceExhausted)?;
-                    for candidate in candidates {
-                        let provenance = market_event_provenance(candidate.event());
-                        if !evidence.metadata.is_effective_at(
-                            provenance
-                                .source_timestamp()
-                                .unwrap_or(provenance.received_at()),
-                        ) {
-                            denied = true;
-                            break;
-                        }
-                        let native_reference = match candidate.event() {
-                            MarketEvent::MarketDataQuote(quote) => Some(quote.reference()),
-                            MarketEvent::MarketDataTrade(trade) => Some(trade.reference()),
-                            _ => None,
-                        };
-                        if let Some(reference) = native_reference {
-                            if reference.definition_digest() != record.revision_digest() {
-                                denied = true;
-                                break;
-                            }
-                            crate::application::market_selection::validate_native_reference(
-                                reference,
-                                record,
-                                provenance,
-                                reference_at,
-                            )?;
-                        }
-                        coordinates.push(candidate.coordinate().clone());
-                    }
-                    if denied {
-                        break;
-                    }
-                    let remaining = context.deadline().saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(ServiceError::DeadlineExceeded);
-                    }
-                    let use_limits = ResearchUseLimits::try_new(
-                        coordinates.len(),
-                        market_squawk_data::MAX_RESEARCH_USE_GRAPH_NODES,
-                        market_squawk_data::MAX_RESEARCH_USE_EDGES,
-                        market_squawk_data::MAX_RESEARCH_USE_SOURCES,
-                        market_squawk_data::MAX_RESEARCH_USE_RETAINED_BYTES,
-                        remaining.min(std::time::Duration::from_secs(
-                            market_squawk_data::MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS,
-                        )),
-                        std::time::Duration::from_secs(
-                            market_squawk_data::MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
-                        ),
-                    )
-                    .map_err(|_| ServiceError::InvalidResult)?;
-                    let authorization = research
-                        .authorize_market_event_use(
-                            MarketEventUseRequest::try_new(
-                                receipt.selection().commit().clone(),
-                                coordinates,
-                                ResearchUse::Display,
-                                use_limits,
-                            )
-                            .map_err(|_| ServiceError::InvalidResult)?,
-                            context.deadline(),
-                            context.cancellation(),
-                        )
-                        .await
-                        .map_err(
-                            crate::application::research::corporate_actions::map_research_error,
-                        )?
-                        .map_err(crate::application::research::map_research_use_error);
-                    match authorization {
-                        Ok(authorization)
-                            if authorization.research_use() == ResearchUse::Display
-                                && authorization.commit() == receipt.selection().commit()
-                                && system_timestamp()? < authorization.expires_at() =>
-                        {
-                            evidence.display_authorizations.push(authorization)
-                        }
-                        Ok(_) | Err(ServiceError::Unauthorized) => {
-                            denied = true;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                if !denied {
-                    routes.push(evidence);
-                }
+                pending.push((route, instrument, record, kinds.len()));
             }
             if exhausted {
                 break;
             }
         }
     }
+    let mut results = MarketEventPointInTimeSelector::select_current_batch(
+        research,
+        &reads,
+        reference_at,
+        reference_at,
+        MAXIMUM_DURABLE_EVENT_CANDIDATES,
+        context.deadline(),
+        context.cancellation().clone(),
+    )
+    .await
+    .map_err(crate::application::market_selection::map_market_event_read_error)?
+    .into_iter();
+    // Group only exact selected coordinates with the same horizon, source and original
+    // publication. One shared Display permit covers those inputs; it never widens selection.
+    struct DisplayUseGroup {
+        commit: market_squawk_data::MarketEventCommitRef,
+        publication: EvidenceDigest,
+        source: SourceId,
+        coordinates: Vec<market_squawk_data::ProviderMarketEventSelectionCoordinate>,
+        routes: Vec<usize>,
+    }
+    let mut use_groups: Vec<DisplayUseGroup> = Vec::new();
+    for (route, instrument, record, count) in pending {
+        ensure_live(context)?;
+        let mut selections = Vec::new();
+        let mut unavailable = false;
+        for _ in 0..count {
+            match results.next().ok_or(ServiceError::InvalidResult)? {
+                Ok(Some(selection)) => selections.push(selection),
+                Ok(None) => {}
+                Err(error) => {
+                    match crate::application::market_selection::map_market_event_read_error(error) {
+                        ServiceError::Unavailable | ServiceError::Unauthorized => {
+                            unavailable = true
+                        }
+                        error => return Err(error),
+                    }
+                }
+            }
+        }
+        if unavailable {
+            continue;
+        }
+        let Some(latest) = selections
+            .iter()
+            .flat_map(|receipt| receipt.selection().sources())
+            .flat_map(|source| source.tied_candidates())
+            .max_by_key(|candidate| durable_cohort_recency_key(candidate))
+        else {
+            continue;
+        };
+        let provenance = market_event_provenance(latest.event());
+        let Some(metadata) = research
+            .analytical()
+            .retained_source_metadata(
+                provenance.binding().source_id(),
+                provenance.binding().metadata_revision(),
+                reference_at,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(map_durable_market_ingest_error)?
+        else {
+            continue;
+        };
+        if !metadata.is_effective_at(reference_at) {
+            continue;
+        }
+        let surface = SourceIdentifier::try_from(route.source_surface().as_str())
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let Some(evidence) = DurableMarketRouteEvidence::try_new(
+            surface,
+            metadata,
+            route.source_surface().clone(),
+            *instrument,
+            route.venue_id().clone(),
+            selections,
+        )?
+        else {
+            continue;
+        };
+        let mut denied = false;
+        for receipt in &evidence.selections {
+            for candidate in receipt.selection().sources()[0].tied_candidates() {
+                let provenance = market_event_provenance(candidate.event());
+                if !evidence.metadata.is_effective_at(
+                    provenance
+                        .source_timestamp()
+                        .unwrap_or(provenance.received_at()),
+                ) {
+                    denied = true;
+                    break;
+                }
+                let native_reference = match candidate.event() {
+                    MarketEvent::MarketDataQuote(quote) => Some(quote.reference()),
+                    MarketEvent::MarketDataTrade(trade) => Some(trade.reference()),
+                    _ => None,
+                };
+                if let Some(reference) = native_reference {
+                    if reference.definition_digest() != record.revision_digest() {
+                        denied = true;
+                        break;
+                    }
+                    crate::application::market_selection::validate_native_reference(
+                        reference,
+                        record,
+                        provenance,
+                        reference_at,
+                    )?;
+                }
+            }
+            if denied {
+                break;
+            }
+        }
+        if denied {
+            continue;
+        }
+        let route_index = routes.len();
+        for receipt in &evidence.selections {
+            for candidate in receipt.selection().sources()[0].tied_candidates() {
+                let coordinate = candidate.coordinate();
+                let commit = receipt.selection().commit();
+                let publication = coordinate.publication().digest();
+                let source = coordinate.source_surface();
+                // Bound a permit by the existing authorization input limit; a large exact
+                // publication may produce several permits without dropping any selected row.
+                let group_index = use_groups.iter().position(|group| {
+                    &group.commit == commit
+                        && group.publication == publication
+                        && &group.source == source
+                        && (group.coordinates.len() < market_squawk_data::MAX_RESEARCH_USE_SOURCES
+                            || group.coordinates.contains(coordinate))
+                });
+                let group_index = match group_index {
+                    Some(index) => index,
+                    None => {
+                        use_groups.push(DisplayUseGroup {
+                            commit: commit.clone(),
+                            publication,
+                            source: source.clone(),
+                            coordinates: Vec::new(),
+                            routes: Vec::new(),
+                        });
+                        use_groups.len() - 1
+                    }
+                };
+                let group = &mut use_groups[group_index];
+                if !group.coordinates.contains(coordinate) {
+                    group.coordinates.push(coordinate.clone());
+                }
+                if !group.routes.contains(&route_index) {
+                    group.routes.push(route_index);
+                }
+            }
+        }
+        routes.push(evidence);
+    }
+    if results.next().is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let mut denied = vec![false; routes.len()];
+    for DisplayUseGroup {
+        commit,
+        coordinates,
+        routes: members,
+        ..
+    } in use_groups
+    {
+        ensure_live(context)?;
+        let remaining = context.deadline().saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let use_limits = ResearchUseLimits::try_new(
+            1,
+            market_squawk_data::MAX_RESEARCH_USE_GRAPH_NODES,
+            market_squawk_data::MAX_RESEARCH_USE_EDGES,
+            market_squawk_data::MAX_RESEARCH_USE_SOURCES,
+            market_squawk_data::MAX_RESEARCH_USE_RETAINED_BYTES,
+            remaining.min(std::time::Duration::from_secs(
+                market_squawk_data::MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS,
+            )),
+            std::time::Duration::from_secs(
+                market_squawk_data::MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
+            ),
+        )
+        .map_err(|_| ServiceError::InvalidResult)?;
+        let authorization = research
+            .authorize_market_event_use(
+                MarketEventUseRequest::try_new(
+                    commit.clone(),
+                    coordinates,
+                    ResearchUse::Display,
+                    use_limits,
+                )
+                .map_err(|_| ServiceError::InvalidResult)?,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await
+            .map_err(crate::application::research::corporate_actions::map_research_error)?
+            .map_err(crate::application::research::map_research_use_error);
+        match authorization {
+            Ok(authorization)
+                if authorization.research_use() == ResearchUse::Display
+                    && authorization.commit() == &commit
+                    && system_timestamp()? < authorization.expires_at() =>
+            {
+                let authorization = Arc::new(authorization);
+                for index in members {
+                    routes[index]
+                        .display_authorizations
+                        .push(Arc::clone(&authorization));
+                }
+            }
+            Ok(_) | Err(ServiceError::Unauthorized) => {
+                for index in members {
+                    denied[index] = true;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let routes = routes
+        .into_iter()
+        .zip(denied)
+        .filter_map(|(route, denied)| (!denied).then_some(route))
+        .collect();
     DurableMarketEvidenceSet::try_new(sources, routes, expected)
 }
 

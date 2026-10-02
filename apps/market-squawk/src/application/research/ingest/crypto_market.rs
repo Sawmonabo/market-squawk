@@ -861,6 +861,67 @@ impl MarketEventPointInTimeSelector {
             .transpose()
     }
 
+    /// Shares one retained read across the selected page, retaining each source-bound receipt.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "selected identities, both cutoffs and read control remain explicit"
+    )]
+    pub(crate) async fn select_current_batch(
+        research: &Arc<ResearchService>,
+        selections: &[(Self, InstrumentId, VenueId, LiveEventClass)],
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        maximum_candidates: usize,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        Vec<Result<Option<MarketEventPointInTimeReceipt>, MarketEventReadError>>,
+        MarketEventReadError,
+    > {
+        let mut requests = Vec::new();
+        for (selector, instrument, venue, kind) in selections {
+            if !Arc::ptr_eq(research, &selector.research) {
+                return Err(MarketEventReadError::PointInTimeInvalid);
+            }
+            requests.push(
+                ProviderMarketEventPointInTimeRequest::try_latest(
+                    selector.analytical_dataset.clone(),
+                    *instrument,
+                    venue.clone(),
+                    *kind,
+                    as_of_cutoff,
+                    knowledge_cutoff,
+                    ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+                    maximum_candidates,
+                    Some(selector.source_surface.clone()),
+                )?
+                .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation),
+            );
+        }
+        let results = research
+            .analytical()
+            .read_provider_market_event_point_in_time_batch(
+                &requests,
+                research.provider_capture_store(),
+                deadline,
+                cancellation,
+            )
+            .await?;
+        if results.len() != selections.len() {
+            return Err(MarketEventReadError::PointInTimeInvalid);
+        }
+        Ok(results
+            .into_iter()
+            .zip(selections)
+            .map(|(result, (selector, ..))| {
+                result
+                    .map_err(MarketEventReadError::from)?
+                    .map(|selection| MarketEventPointInTimeReceipt::try_new(selector, selection))
+                    .transpose()
+            })
+            .collect())
+    }
+
     /// Reads one exact source-declared screener cohort through the ordinary immutable selector.
     #[allow(
         clippy::too_many_arguments,

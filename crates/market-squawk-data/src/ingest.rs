@@ -1085,6 +1085,26 @@ fn same_provider_facts_on_reobservation(
         {
             (old.context(), new.context())
         }
+        (ResearchObservation::Filing(old), ResearchObservation::Filing(new))
+            if old.subject() == new.subject()
+                && old.form_type() == new.form_type()
+                && old.accession() == new.accession()
+                && old.context().provenance().source_identifier()
+                    == new.context().provenance().source_identifier() =>
+        {
+            (old.context(), new.context())
+        }
+        (ResearchObservation::Fundamental(old), ResearchObservation::Fundamental(new))
+            if old.subject() == new.subject()
+                && old.concept() == new.concept()
+                && old.value() == new.value()
+                && old.fact_context() == new.fact_context()
+                && old.xbrl_evidence() == new.xbrl_evidence()
+                && old.context().provenance().source_identifier()
+                    == new.context().provenance().source_identifier() =>
+        {
+            (old.context(), new.context())
+        }
         _ => return false,
     };
     let old_provenance = old_context.provenance();
@@ -3542,6 +3562,24 @@ impl AnalyticalDataService {
         )
     }
 
+    /// Reopens the immutable company observation owned by one creating provider capture.
+    pub fn provider_company_identity_for_binding(
+        &self,
+        manifest: &DatasetManifestRef,
+        binding: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::CompanyIdentityExactRecord>, IngestError> {
+        check_market_event_read(deadline, cancellation)?;
+        let result = self
+            .lock_authority()?
+            .catalog()
+            .company_identity_for_provider_binding(manifest, binding, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        check_market_event_read(deadline, cancellation)?;
+        Ok(result)
+    }
+
     /// Returns the sole narrow publisher for evidence-authorized company/security links.
     ///
     /// The capability publishes only a fully constructed domain link and owns no review,
@@ -4900,7 +4938,7 @@ impl AnalyticalDataService {
                             &reservation,
                             &analytical_dataset,
                             &retained,
-                            None,
+                            company_identity.as_ref(),
                         )?;
                         Some((retained, committed))
                     } else {
@@ -4911,9 +4949,20 @@ impl AnalyticalDataService {
                 }
             };
             if let Some((retained, committed)) = reobserved {
-                if company_identity.is_some()
-                    || !revisions.is_locally_observed()
+                let sec_company = prepared.evidence.native_lineage().implementation()
+                    == "sec_edgar_v1"
+                    && company_identity.as_ref().is_some_and(|company| {
+                        matches!(
+                            company.surface(),
+                            market_squawk_domain::CompanyIdentitySurface::SecSubmissions
+                                | market_squawk_domain::CompanyIdentitySurface::SecCompanyFacts
+                        )
+                    });
+                if (!sec_company
+                    && (company_identity.is_some() || !revisions.is_locally_observed()))
+                    || (sec_company && revisions.is_locally_observed())
                     || !revisions.native_lineage_required()
+                    || revisions.len() != sealed_capture.batch().records().len()
                 {
                     return Err(IngestError::ReplayConflict);
                 }
@@ -6404,6 +6453,10 @@ impl AnalyticalDataService {
                 .iter()
                 .any(|row| match new_schema.implementation() {
                     "alpaca_calendar_v1" => !matches!(row, ResearchObservation::MarketCalendar(_)),
+                    "sec_edgar_v1" => !matches!(
+                        row,
+                        ResearchObservation::Filing(_) | ResearchObservation::Fundamental(_)
+                    ),
                     _ => !matches!(row, ResearchObservation::Macro(_)),
                 })
         {

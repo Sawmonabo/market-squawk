@@ -812,6 +812,7 @@ impl SecFundamentalsApplicationBridge {
         }
 
         Ok(SecFundamentalsSealedHandoff {
+            deadline,
             source: source.metadata().clone(),
             coordinates,
             batch,
@@ -840,6 +841,7 @@ impl SecFundamentalsApplicationBridge {
         }
         precommit_authority.validate_precommit()?;
         let SecFundamentalsSealedHandoff {
+            deadline,
             source,
             coordinates,
             batch,
@@ -910,7 +912,72 @@ impl SecFundamentalsApplicationBridge {
         )?
         .with_company_identity(company_identity)?
         .with_precommit_authority(precommit_authority);
-        let committed = self.research.ingest(ingest, cancellation).await?;
+        let committed = self.research.ingest(ingest, cancellation.clone()).await?;
+        let original_binding = committed
+            .original_binding_for_reobservation(restart.binding_digest)
+            .unwrap_or(restart.binding_digest);
+        // A successful repeat keeps the first canonical generation and company observation.
+        // Reopen their exact creating input; the newly retained receipt is an independent
+        // reobservation, not the original generation's restart authority.
+        let restart = self
+            .research
+            .read_provider_capture_generation(
+                committed.manifest().clone(),
+                deadline,
+                &cancellation,
+                move |generation, _, _, analytical, worker_cancellation| {
+                    let company = analytical
+                        .provider_company_identity_for_binding(
+                            generation.pinned().manifest(),
+                            original_binding,
+                            deadline,
+                            worker_cancellation,
+                        )?
+                        .ok_or(IngestError::ReplayConflict)?;
+                    let object = generation
+                        .objects()
+                        .first()
+                        .filter(|_| generation.objects().len() == 1)
+                        .ok_or(IngestError::ReplayConflict)?;
+                    let original = object
+                        .inputs()
+                        .first()
+                        .filter(|_| object.inputs().len() == 1)
+                        .ok_or(IngestError::ReplayConflict)?
+                        .binding();
+                    if original.binding_digest() != original_binding
+                        || generation.source_id() != restart.source.source_id()
+                        || original.capture().dataset() != &restart.provider_dataset
+                        || original.capture().metadata_revision() != restart.source.revision()
+                        || original.record_count() != restart.expected_record_count
+                        || !company
+                            .observation()
+                            .same_source_representation(&restart.company_identity)
+                        || company.observation().ingested_at()
+                            > restart.company_identity.ingested_at()
+                    {
+                        return Err(IngestError::ReplayConflict.into());
+                    }
+                    let mut restart = restart;
+                    restart.company_identity = Arc::new(company.observation().clone());
+                    restart.company_observation_digest = company.observation_digest();
+                    restart.binding_digest = original.binding_digest();
+                    restart.extraction_content_identity = original.extraction_content_identity();
+                    restart.sealed_capture_receipt_digest =
+                        original.sealed_capture_receipt_digest();
+                    restart.native_schema_version = original.native_lineage().version();
+                    restart.native_schema_fingerprint = original.native_lineage().fingerprint();
+                    restart.native_batch_digest = original.native_lineage().batch_digest();
+                    restart.row_capture_page_ordinals = original
+                        .rows()
+                        .iter()
+                        .map(|row| row.capture_page_ordinal())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    Ok(restart)
+                },
+            )
+            .await?;
         let restart = restart.with_manifest(committed.manifest().clone())?;
         Ok(match restart.family {
             SecFundamentalsFamily::Submissions => {
@@ -1065,6 +1132,7 @@ fn company_identity_digest(
 /// application inference.
 #[derive(Debug)]
 pub(crate) struct SecFundamentalsSealedHandoff {
+    deadline: Instant,
     source: SourceMetadata,
     coordinates: SecFundamentalsCoordinates,
     batch: ExtractionBatch,

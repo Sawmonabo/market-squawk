@@ -1082,8 +1082,9 @@ impl Catalog {
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<(), CatalogError> {
         self.market_recovery_read(deadline, cancellation, || {
+            // The run/rights payload can be an exact composite manifest (SEC submissions),
+            // while capture content binds its remote components. Both are checked below.
             if reservation.catalog_id() != self.catalog_id || grant.catalog_id != self.catalog_id
-                || grant.payload_digest() != fresh.capture().content_digest()
             {
                 return Err(CatalogError::InvalidRightsCapability);
             }

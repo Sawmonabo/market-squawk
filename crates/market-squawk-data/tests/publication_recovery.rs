@@ -1723,11 +1723,11 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
         SealedProviderCaptureBinding::try_whole(token, batch, native, vec![0; native_rows.len()])?;
     let committed = service
         .ingest_provider_publication(
-            reservation,
-            analytical_dataset,
+            reservation.clone(),
+            analytical_dataset.clone(),
             ProviderPublicationInput::try_new(binding, revision_plan)?
-                .with_company_identity(company),
-            cancellation,
+                .with_company_identity(company.clone()),
+            cancellation.clone(),
         )
         .await
         .map_err(|error| format!("SEC submissions issuer publication: {error:?}"))?;
@@ -1739,6 +1739,154 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
         binding_digests[0],
         &raw_store,
     )?;
+    // A second HTTP receipt for unchanged SEC content must retain the new physical capture
+    // while preserving the first canonical/company generation and its original knowledge time.
+    let repeat_input = |conflicting_company: bool|
+     -> Result<(ProviderPublicationInput, EvidenceDigest), Box<dyn Error>> {
+        let repeated_fixture = sec_research_capture_fixture(base_ns, false)?;
+        let repeat_capture = repeated_fixture.capture_material.receipt();
+        let repeat_at = Timestamp::from_unix_nanos(base_ns + 2_000_000);
+        let repeat_receipt = ProviderCaptureSetReceipt::try_new(
+            repeat_capture.source_id().clone(),
+            repeat_capture.metadata_revision().clone(),
+            repeat_capture.dataset().clone(),
+            repeat_capture.request_set_identity(),
+            repeat_capture.terminal(),
+            repeat_capture
+                .pages()
+                .iter()
+                .map(|page| {
+                    ProviderCapturePageReceipt::try_new(
+                        page.ordinal(),
+                        page.request_identity(),
+                        page.request_page_token_digest(),
+                        page.response_next_page_token_digest(),
+                        page.http_status(),
+                        page.body_bytes(),
+                        page.body_digest(),
+                        repeat_at,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let repeat_material = ProviderCaptureMaterial::try_new(
+            repeat_receipt,
+            repeated_fixture
+                .capture_material
+                .records()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, record)| {
+                    RawCaptureRecord::try_new_live(
+                        Uuid::from_u128(9_001 + ordinal as u128),
+                        Arc::from(source.source_id().as_str()),
+                        Uuid::from_u128(9_002),
+                        Some(ordinal as u64),
+                        None,
+                        DateTime::<Utc>::from_timestamp_nanos(repeat_at.unix_nanos()),
+                        Bytes::copy_from_slice(record.payload()),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        assert_eq!(
+            repeat_material.receipt().content_digest(),
+            retained_binding.capture().content_digest()
+        );
+        assert_ne!(
+            repeat_material.receipt().observation_digest(),
+            retained_binding.capture().observation_digest()
+        );
+        assert_ne!(
+            payload_digest,
+            repeat_material.receipt().content_digest(),
+            "SEC body/composite payload is distinct from capture graph content"
+        );
+        let (expectation, seal) = repeat_material.into_whole_seal_parts();
+        let repeat_token = expectation
+            .try_rejoin(seal.seal(&raw_store)?)?
+            .try_into_whole()?;
+        let mut native = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::SecEdgarV1,
+            &repeated_fixture.batch,
+        )?;
+        for row in &repeated_fixture.native_rows {
+            native.try_push(row)?;
+        }
+        let native = native.finish()?;
+        let repeat_binding = SealedProviderCaptureBinding::try_whole(
+            repeat_token,
+            repeated_fixture.batch,
+            native,
+            vec![0; repeated_fixture.native_rows.len()],
+        )?;
+        let repeat_binding_digest = repeat_binding.evidence_digest().evidence();
+        let mut repeated_company = serde_json::to_value(&company)?;
+        repeated_company["ingested_at"] = serde_json::json!(base_ns + 3_000_000);
+        if conflicting_company {
+            repeated_company["conformed_name"] = serde_json::json!("Conflicting issuer");
+        }
+        let repeated_company: CompanyIdentityObservation =
+            serde_json::from_value(repeated_company)?;
+        let repeat_rights = RightsDecisionInput {
+            source_id: source.source_id().clone(),
+            payload_digest,
+            retrieved_at: repeat_at,
+            basis: RightsBasis::reviewed_terms(
+                "https://www.sec.gov/os/accessing-edgar-data",
+                digest(211),
+            )?,
+            authorization_evidence: digest(212),
+            authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+            permitted_operations: vec![SourceOperation::Persist],
+        };
+        let input =
+            ProviderPublicationInput::try_new(repeat_binding, repeated_fixture.revision_plan)?
+                .with_company_identity(repeated_company)
+                .with_reobservation_rights(repeat_rights)
+                .with_precommit_authority(Arc::new(AllowProviderEventPublication));
+        Ok((input, repeat_binding_digest))
+    };
+    let (conflicting, _) = repeat_input(true)?;
+    assert!(matches!(
+        service
+            .ingest_provider_publication(
+                reservation.clone(),
+                analytical_dataset.clone(),
+                conflicting,
+                cancellation.clone(),
+            )
+            .await,
+        Err(IngestError::Catalog(CatalogError::EvidenceConflict))
+    ));
+    let (input, repeat_binding_digest) = repeat_input(false)?;
+    let repeated = service
+        .ingest_provider_publication(
+            reservation.clone(),
+            analytical_dataset.clone(),
+            input,
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(repeated.manifest(), committed.manifest());
+    assert_eq!(
+        repeated.original_binding_for_reobservation(repeat_binding_digest),
+        Some(binding_digests[0])
+    );
+    let original_company = service
+        .provider_company_identity_for_binding(
+            committed.manifest(),
+            binding_digests[0],
+            Instant::now() + Duration::from_secs(30),
+            &cancellation,
+        )?
+        .ok_or("original SEC company disappeared after repeat")?;
+    assert_eq!(original_company.observation(), &company);
+    assert_eq!(original_company.observation_digest(), company_digest);
+    assert_eq!(
+        service.provider_capture_binding_digests(committed.manifest(), None, 2)?,
+        binding_digests
+    );
     let physical = retained_binding
         .physical_claims()
         .first()
@@ -1924,8 +2072,21 @@ async fn exercise_sec_exact_origin_point_in_time_restart() -> TestResult {
     drop(committed);
     drop(service);
     drop(raw_store);
+    let restarted_authority = CatalogAuthority::open(catalog_config)?;
+    let durable_repeat = restarted_authority
+        .catalog()
+        .provider_capture_binding_evidence(repeat_binding_digest)?
+        .ok_or("fresh SEC capture did not survive restart")?;
+    assert_eq!(
+        durable_repeat.capture().pages()[0].received_at(),
+        Timestamp::from_unix_nanos(base_ns + 2_000_000)
+    );
+    assert_eq!(
+        durable_repeat.capture().content_digest(),
+        retained_binding.capture().content_digest()
+    );
     let restarted = AnalyticalDataService::open(
-        CatalogAuthority::open(catalog_config)?,
+        restarted_authority,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         store_config,
@@ -4109,6 +4270,89 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     assert_eq!(selected.sources().len(), 1);
     assert_eq!(selected.commit(), &first_commit);
     assert_eq!(selected.commit_available_at(), first_commit.available_at());
+    // Selected-page reads share one snapshot/publication while keeping each exact
+    // cutoff and source. Repeated requests must reproduce the original full receipt.
+    let empty_request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
+        first_commit.dataset_id().clone(),
+        instrument,
+        retained_routes[0].venue_id().clone(),
+        LiveEventClass::Trade,
+        Timestamp::from_unix_nanos(489),
+        Timestamp::from_unix_nanos(i64::MAX),
+        market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+        1,
+        first_commit.clone(),
+        Some(source.source_id().clone()),
+    )?;
+    let other_source_request =
+        market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
+            first_commit.dataset_id().clone(),
+            instrument,
+            retained_routes[0].venue_id().clone(),
+            LiveEventClass::Trade,
+            Timestamp::from_unix_nanos(490),
+            Timestamp::from_unix_nanos(i64::MAX),
+            market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+            1,
+            first_commit.clone(),
+            Some(SourceId::try_from("other-retained-source")?),
+        )?;
+    let batch_requests = [
+        selection_request.clone(),
+        empty_request,
+        other_source_request,
+        selection_request.clone(),
+    ];
+    let batch = restarted
+        .read_provider_market_event_point_in_time_batch(
+            &batch_requests,
+            Arc::clone(&capture_store),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(batch.len(), batch_requests.len());
+    for (request, result) in batch_requests.iter().zip(batch) {
+        let result = result?;
+        let independent = restarted
+            .read_provider_market_event_point_in_time(
+                request,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await?;
+        assert_eq!(result, independent);
+        if request == &selection_request {
+            assert_eq!(result, Some(selected.clone()));
+        } else {
+            assert!(result.is_some_and(|selection| selection.sources().is_empty()));
+        }
+    }
+    let cancelled_batch = CancellationToken::new();
+    cancelled_batch.cancel();
+    assert!(matches!(
+        restarted
+            .read_provider_market_event_point_in_time_batch(
+                &batch_requests,
+                Arc::clone(&capture_store),
+                deadline,
+                cancelled_batch,
+            )
+            .await,
+        Err(IngestError::Cancelled)
+    ));
+    assert!(matches!(
+        restarted
+            .read_provider_market_event_point_in_time_batch(
+                &batch_requests,
+                Arc::clone(&capture_store),
+                Instant::now(),
+                cancellation.clone(),
+            )
+            .await,
+        Err(IngestError::DeadlineExceeded)
+    ));
     let coordinates = selected
         .sources()
         .iter()
@@ -4480,6 +4724,14 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     cancellation.clone(),
                 )
                 .await;
+            let batch_during_write = restarted
+                .read_provider_market_event_point_in_time_batch(
+                    &batch_requests,
+                    Arc::clone(&capture_store),
+                    Instant::now() + Duration::from_secs(5),
+                    cancellation.clone(),
+                )
+                .await;
             let display_during_write = restarted.authorize_current_market_event_use(
                 display_request.clone(),
                 Instant::now() + Duration::from_secs(5),
@@ -4538,6 +4790,17 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             let committed = publication??;
             released?;
             assert_eq!(during_write, selected);
+            let batch_during_write = batch_during_write?;
+            assert_eq!(batch_during_write.len(), batch_requests.len());
+            for (index, result) in batch_during_write.into_iter().enumerate() {
+                let result = result?.ok_or("writer hid existing batched market evidence")?;
+                if index == 0 || index == 3 {
+                    assert_eq!(result, selected);
+                } else {
+                    assert!(result.sources().is_empty());
+                }
+            }
+
             let display_during_write =
                 display_during_write?.ok_or("held writer hid an already admitted Display grant")?;
             assert_eq!(display_during_write.inputs(), display_request.inputs());
@@ -4650,6 +4913,42 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             100 + expected_ties
         );
         assert_eq!(historical.exclusions().superseded_received_observation(), 0);
+        // Different horizons and multiple publications share verification without sharing
+        // selection policy. A failing request must not discard its successful siblings.
+        let mixed = restarted
+            .read_provider_market_event_point_in_time_batch(
+                &[
+                    selection_request.clone(),
+                    request.clone(),
+                    current_request.clone(),
+                    historical_request.clone(),
+                ],
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await?;
+        let mut mixed = mixed.into_iter();
+        assert_eq!(
+            mixed.next().ok_or("missing exact batch result")??,
+            Some(selected.clone())
+        );
+        assert!(matches!(
+            mixed.next().ok_or("missing limited batch result")?,
+            Err(IngestError::ProviderMarketEventSelection(
+                market_squawk_data::ProviderMarketEventSelectionError::CandidateLimitExceeded
+            ))
+        ));
+        assert_eq!(
+            mixed.next().ok_or("missing current batch result")??,
+            Some(current.clone())
+        );
+        assert_eq!(
+            mixed.next().ok_or("missing historical batch result")??,
+            Some(historical.clone())
+        );
+        assert!(mixed.next().is_none());
+
         assert_eq!(u128::from(committed.sequence()), batch_number);
         assert_eq!(committed.row_count(), observations.len() as u64);
         if batch_number == 2 {
@@ -7359,7 +7658,7 @@ fn sec_research_capture_fixture(
         &discovery,
         dataset.clone(),
         SourceIdentifier::try_from("application/json")?,
-        ExactPayloadEvidence::from_content_digest(capture_material.receipt().content_digest()),
+        ExactPayloadEvidence::from_content_digest(body_digest),
         SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())?,
         EffectiveInterval::new(Timestamp::from_unix_nanos(base_ns - 10_000_000), None)?,
         None,

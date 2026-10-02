@@ -296,17 +296,14 @@ pub(crate) fn exact_company_identity_by_digest(
             (1, Some(value)) => Some(parse_digest(1, &value)?),
             _ => return Err(CatalogError::ProviderCaptureConflict),
         };
-        let provider_logical_binding_digest = match (publication_count, logical_binding_digest)
-        {
+        let provider_logical_binding_digest = match (publication_count, logical_binding_digest) {
             (0, None) => None,
             (1, Some(value)) if provider_binding_digest.is_none() => {
                 let digest = parse_digest(1, &value)?;
-                let binding =
-                    super::provider_logical::load_provider_logical_publication_binding(
-                        connection,
-                        digest,
-                    )?
-                    .ok_or(CatalogError::ProviderLogicalMismatch)?;
+                let binding = super::provider_logical::load_provider_logical_publication_binding(
+                    connection, digest,
+                )?
+                .ok_or(CatalogError::ProviderLogicalMismatch)?;
                 if binding.terminal().source_id().as_str() != source_id {
                     return Err(CatalogError::ProviderLogicalMismatch);
                 }
@@ -349,6 +346,42 @@ pub(crate) fn exact_company_identity_by_digest(
 }
 
 impl Catalog {
+    /// Reads the original company observation belonging to one exact creating capture binding.
+    pub(crate) fn company_identity_for_provider_binding(
+        &self,
+        manifest: &crate::DatasetManifestRef,
+        binding: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CompanyIdentityExactRecord>, CatalogError> {
+        check_search(deadline, cancellation)?;
+        let digest: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT company.record_digest FROM company_identity_observations AS company
+             JOIN ingest_run_provider_capture_bindings AS input ON input.run_id=company.run_id
+             JOIN analytical_generations AS generation ON generation.anchor_manifest_id=company.manifest_id
+             WHERE input.binding_digest=?1 AND input.input_ordinal=0
+               AND generation.dataset_id=?2 AND generation.manifest_version=?3
+               AND generation.content_hash=?4",
+                params![binding.bytes(), manifest.dataset_id().as_str(),
+                    i64::try_from(manifest.manifest_version()).map_err(|_| CatalogError::InvalidRecord)?,
+                    manifest.content_hash().bytes()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(digest) = digest else {
+            return Ok(None);
+        };
+        let exact = self
+            .exact_company_identity_by_digest(parse_digest(1, &digest)?, deadline, cancellation)?
+            .ok_or(CatalogError::CorruptCatalog)?;
+        if exact.provider_binding_digest() != Some(binding) {
+            return Err(CatalogError::EvidenceConflict);
+        }
+        Ok(Some(exact))
+    }
+
     /// Reads one exact company observation by its retained canonical SHA-256 digest.
     pub fn exact_company_identity_by_digest(
         &self,
@@ -738,7 +771,9 @@ pub(super) fn validate_provider_company_identity_replay(
             if digest.as_slice() != sha256(json.as_bytes()) {
                 return Err(CatalogError::CorruptCatalog);
             }
-            if retained == *observation {
+            if retained.same_source_representation(observation)
+                && retained.ingested_at() <= observation.ingested_at()
+            {
                 Ok(())
             } else {
                 Err(CatalogError::EvidenceConflict)

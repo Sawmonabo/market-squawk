@@ -3346,8 +3346,8 @@ fn provider_market_event_exclusion_counts(
     clock: i64,
 ) -> Result<ProviderMarketEventExclusionCounts, ManifestCatalogError> {
     let instrument = request.instrument_id().map(|id| id.as_uuid());
-    let counts: (i64, i64, i64, i64, i64, i64, i64) = connection.query_row(
-        "WITH keyed_rows AS (
+    let mut statement = connection.prepare(
+        "WITH keyed_rows AS MATERIALIZED (
              SELECT indexed.source_id, indexed.source_timestamp_ns, indexed.received_at_ns,
                     indexed.available_at_ns, indexed.ingested_at_ns,
                     CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
@@ -3412,6 +3412,8 @@ fn provider_market_event_exclusion_counts(
            COALESCE((SELECT COUNT(*) FROM eligible
                      WHERE ?13=1 AND effective_at_ns=newest_effective_at_ns
                        AND received_at_ns<newest_received_at_ns), 0)",
+    )?;
+    let counts: (i64, i64, i64, i64, i64, i64, i64) = statement.query_row(
         params![
             request.dataset().as_str(),
             commit_sequence,

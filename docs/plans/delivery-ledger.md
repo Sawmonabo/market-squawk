@@ -2,12 +2,63 @@
 
 ## Current execution — 2026-10-02
 
+Last pushed head: `1c10b218`. Current read/SEC checkpoint keeps original canonical SEC evidence
+while retaining repeat captures, batches exact price selections within one read snapshot, and removes
+actor-only Source invalidations. Native build2527 PASS6m24s. Existing SEC replay/restart case PASS1/1
+(6.70s); retained batched selection/restart case PASS1/1 (10.88s). The actual visible Desktop collection
+returned9/9 genuine previous closes in7.016s under its unchanged15s request deadline; this improves
+on prior15.59–26.01s observations but is not an instant-read or streaming-quote completion claim.
+Evidence: sec-reobservation-critical.log, retained-batch-critical.log, retained-batch-native-collection.json
+under `.agents/tmp/v1-first-stock/`.
+
+Supervisor66579/PID83744 owns service5073, visible Desktop5118, Vite and the sole watcher.
+No compiler is active after queue14651 PASS. History producer/consumer and layout remain uncommitted:
+Desktop types/lookup/market/coalescing PASS; notification/lossless-number/shared-service checks PASS.
+The corrected native history permission now admits actual job4c547cb8-3a8e-4aba-ac5a-259758d06577,
+but it fails operation-input-rejected before any chart is rendered. Real MSFT financial discovery
+fails parser_invalid_companion_coverage. No positive financial/chart or installed completion claim.
+
+| Owner | Concrete outcome / exclusive ownership | Current evidence and next dependency |
+| --- | --- | --- |
+| Lead | History runner/contracts, native/CLI/UI integration, shared manifests/permissions, ledger/Git and serialized checks | Freeze read/SEC checkpoint; correct actual history rejection, then verify visible MSFT chart and stable refresh. |
+| Astra financial_pages | Read-only history rejection diagnosis: jobs/market_history.rs and corporate_actions/preflight/{display_history,history}.rs | Admitted job fails before historical-publication diagnostics. Trace exact request/limits/runtime validation; no live edits. |
+| Astra startup_read_diagnosis | Candidate-only adapter json/submissions.rs and tests/official_fixtures.rs | Exact MSFT archive count/identity passes, but declared end2008-08-11 disagrees with one actual2008-08-12 filing. Preserve both dates and all strict identity/count checks; classify summary disagreement. |
+| Sol financial_detail_ui / investment_profile_ui, integrated | History preparation + existing stock fixture; selected-detail layout | Open chart, separate ticker/company, stable refresh and viewport checks pass; native data completion remains required. |
+
+Next barrier: integrate the two concrete native-data failure fixes → one serialized build/critical
+checks → actual MSFT chart/financials and refresh observation → coherent commits/push. Cold financial
+acquisition still runs under the15s read; next necessary ownership correction uses the existing
+installed job runner and retained-only financial reads, preserving typed family outcomes and one
+final product-publication boundary. No new job framework or per-family terminal-fence reuse.
+Preserve full V1 scope. No main/release changes or additional worktrees.
+
+## Checkpoint history — 2026-10-02
+
 Current SEC checkpoint: native build86475 PASS5m28s; supervisor83744 now owns service88641
 and visible Desktop88695. The three existing adapter cases pass individually: composite restore,
 canonical CompanyFacts capture/transport binding and streamed XBRL cancellation. Exact logs:
 `sec-{composite-budget,company-capture,filing-stream}-critical.log`. Live activation advanced past
 the corrected parser/capture boundary but fails Catalog(EvidenceConflict); financial rendering
 is not live verified. Preserve captured evidence and diagnose the exact conflicting publication.
+
+SEC repeated-capture correction: Astra startup_read_diagnosis owns candidate-only data
+`src/ingest.rs`, `src/catalog/{company_identity,provider_capture}.rs`, application
+`research/ingest/sec_fundamentals.rs`. The original publication is rejected when identical SEC
+content arrives with a fresh capture timestamp; correction must preserve both observations and
+original financial coordinates. Existing `tests/publication_recovery.rs` is reserved to
+financial_pages until its batching fixture freezes; SEC then receives the sequential test-file
+handoff. No competing edits to this shared fixture.
+
+Visible layout follow-up: Sol investment_profile_ui owns candidate-only
+`features/markets/{investment-page,investment-profile}.tsx`. The actual native screenshot shows
+an overlong heading and large unused status space. Tighten hierarchy/spacing within existing
+Obsidian components, retaining stable refresh dimensions and truthful data. No new fields or
+transport, no builds. Lead integrates with the history renderer after native command readiness.
+
+Selected-history integration critical check: Astra sec_automatic_resolution owns only candidate
+`apps/market-squawk/tests/production_mcp_composition.rs` to extend its existing shared-service
+journey for product history discovery, real scoped admission/status and wrong-token rejection,
+using its existing selected instrument fixture. No network or new harness; lead schedules checks.
 
 Current remaining ownership (candidate-only; no competing Cargo): Astra startup_read_diagnosis
 owns diagnosis of that live SEC catalog conflict, with no source edits yet. Astra financial_pages
