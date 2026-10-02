@@ -64,11 +64,15 @@ impl IndexAllocation {
     pub(super) fn update(&mut self, connection: &Connection) -> Result<(), SecResearchReadError> {
         self.scratch.ensure_budget()?;
         let pages = u64::try_from(
-            connection.pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))?,
+            connection
+                .prepare_cached("PRAGMA page_count")?
+                .query_row([], |row| row.get::<_, i64>(0))?,
         )
         .map_err(|_| SecResearchReadError::SpillBudgetExceeded)?;
         let page_size = u64::try_from(
-            connection.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
+            connection
+                .prepare_cached("PRAGMA page_size")?
+                .query_row([], |row| row.get::<_, i64>(0))?,
         )
         .map_err(|_| SecResearchReadError::SpillBudgetExceeded)?;
         let bytes = pages
@@ -141,8 +145,8 @@ impl<T: DeserializeOwned> SecResearchRows<T> {
             .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
         let bytes: Option<Vec<u8>> =
             connection
+                .prepare_cached("SELECT payload FROM rows WHERE ordinal=?1")?
                 .query_row(
-                    "SELECT payload FROM rows WHERE ordinal=?1",
                     [i64::try_from(ordinal)
                         .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?],
                     |row| row.get(0),
@@ -168,11 +172,8 @@ impl<T: DeserializeOwned> SecResearchRows<T> {
             .lock()
             .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
         let bytes: Option<Vec<u8>> = connection
-            .query_row(
-                "SELECT payload FROM rows WHERE row_key=?1 ORDER BY ordinal LIMIT 1",
-                [key],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT payload FROM rows WHERE row_key=?1 ORDER BY ordinal LIMIT 1")?
+            .query_row([key], |row| row.get(0))
             .optional()?;
         bytes
             .map(|bytes| {
@@ -211,7 +212,7 @@ impl<T: Serialize> RowsBuilder<T> {
         let bytes =
             serde_json::to_vec(row).map_err(|_| SecResearchReadError::ProviderBindingMismatch)?;
         // The JSON key is read by SQLite, avoiding a second decoded ownership tree.
-        self.connection.execute("INSERT INTO rows(ordinal,row_key,payload) VALUES (?1,json_extract(CAST(?2 AS TEXT),'$.context_id'),?2)", params![i64::try_from(self.count).map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?, bytes]).map_err(|error| {
+        self.connection.prepare_cached("INSERT INTO rows(ordinal,row_key,payload) VALUES (?1,json_extract(CAST(?2 AS TEXT),'$.context_id'),?2)")?.execute(params![i64::try_from(self.count).map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?, bytes]).map_err(|error| {
             let error = SecResearchReadError::from(error);
             if matches!(error, SecResearchReadError::SpillBudgetExceeded) { self.allocation.scratch.exhausted.store(true, Ordering::Relaxed); }
             error

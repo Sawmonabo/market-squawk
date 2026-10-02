@@ -2,6 +2,8 @@
 
 ## Current execution — 2026-10-02
 
+Pushed checkpoint `0d96969b` preserves trade-only display and exposes typed capture-rejoin/archive failure causes. Current live feed failure is stale-session publication after reconnect, not receipt corruption.
+
 Pushed checkpoint `16b0dc69` corrects captured taxonomy relationships in place; existing graph/cancellation/hostile-binding fixture PASS. Actual MSFT filing retry awaits the next runtime.
 
 Pushed checkpoint `dc9ea88e` separates recovery verification from foreground read exclusion, routes bulk financial reads away from compact price reads, and keeps SEC publication on its owned worker. Recovery critical checks pass; native facts still time out.
@@ -44,8 +46,8 @@ MSFT financial failures are now separately evidenced:
 | Owner | Exact ownership/outcome | State / next dependency |
 | --- | --- | --- |
 | Lead | Shared contracts/jobs/service/CLI/MCP/native composition, source_authority.rs, Git/docs/build scheduling | Applied frozen read and taxonomy candidates together. Recovery/routing correction applied; both existing recovery critical cases PASS. Actual price/history remain usable; facts still exceed15s in logical index construction. One financial acquisition started after SEC status reconciliation; track exact original job. |
-| Astra financial_pages | Read-only data sec_research/Parquet/PIT publication-to-read proof and existing financial preparation ownership; candidate design note only | New native96132 direct evaluation still fails Facts at16.31s after Arrow reuse. Compare smallest existing indexed/columnar projection path against full-generation revalidation; preserve checksummed original files, exact identity/rights/cutoffs/revisions and selected-row evidence. No speculative cache, new runtime, source edits/builds/Git. Return exact contract and disjoint implementation seams before code. |
-| Astra startup_read_diagnosis | Frozen Alpaca error.rs/market_publication.rs and startup.rs diagnostic packet | Lead integrated typed capture-rejoin stages and archive error causes plus re-export/exhaustive mapping. No policy changes. Await replacement runtime's actual rejection before a behavior correction. Frozen data ingest/market_event_store/archive.rs candidate inspected and applied by lead for one-turn catalog connection reuse for measured thousands of repeated schema opens. Keep fresh transactions, cancellation, original evidence and final exact-plan commit. This removes demonstrated redundant work; actual archive failure resolution still requires new diagnostic evidence. Existing publication_recovery fixture reserved only for an uncovered critical gap. Archive packet is now integrated; read-only follow-up owns runtime96132 diagnostic timeline and account-market generation drain/calendar cancellation cause. Current isolated log line29 explicitly reports PublicationSessionNotCurrent before registry/calendar cancellation and stale-generation drain timeout; no receipt-binding corruption claim. No policy/source edits without concrete diagnosis. |
+| Astra financial_pages | Candidate-only data `parquet_store/cursor.rs`, `arrow_convert.rs`, `sec_research/logical.rs` and existing `tests/arrow_roundtrip.rs` | Implement authenticated canonical projection through existing exact-artifact cursor, eliminating full producer-column reconstruction. Keep complete checksum/schema/row-count, native/map checks, issuer/PIT/rights and lineage. Lead integrates after current reader checkpoint; no builds/Git/runtime mutation. |
+| Astra startup_read_diagnosis | Candidate-only app `application/research/ingest/alpaca_historical/market.rs` and its existing owning test module | Handle only post-seal `PublicationSessionNotCurrent` as existing RawRetained, preserving raw custody and successor-generation progress. Binding/authority failures remain fatal. Extend genuine queued-old-frame/successor critical fixture; no builds/Git/runtime/provider mutation. Cleanup timeout cause remains unproven and outside this correction. |
 | Sol investment_profile_ui | InvestmentQuote presentation in investment-page.tsx | Compact dated quote layout types/live verified and pushed; ownership released. |
 | Sol financial_preparation_ui_resume | Chart/read/shared financial controls and existing UI journey case | Stable chart checkpoint pushed; financial terminal settlement integrated. Ownership released. |
 
@@ -63,17 +65,11 @@ Desktop types and three existing market/lookup/refresh journeys, facts clock1/1,
 recent-first cursor1/1, corrected large writer/PIT/reopen1/1, writer cancellation1/1 and retained
 quote/current-mark separation1/1. Read/taxonomy affected checks now pass. Financial-page live completion remains blocked by logical index construction; the latest sample no longer shows recovery exclusion waiting.
 No per-task CI, broad release gate or whole-app RAM claim.
-Current critical checks: taxonomy edge/fragment fixture PASS1/1 (4.69s), Arrow roundtrip/exactness/tamper cases PASS6/6 (0.01s). Full facts/PIT/reopen check still runs in the serialized queue. W3C WebDriver execute request timed out after restart, while supported /wdio/eval directly returned complete page/title/URL; direct evaluation now checks actual MSFT without focus. Archive runtime diagnostics confirm analytical operation deadline exceeded; reuse remains awaiting live proof.
+Current critical checks: taxonomy edge/fragment fixture PASS1/1 (4.69s), Arrow roundtrip/exactness/tamper cases PASS6/6 (0.01s). Full facts/PIT/reopen check PASS1/1 (314.26s including Cargo); archive/restart case PASS1/1 (12.60s). W3C WebDriver execute request timed out after restart, while supported /wdio/eval directly returned complete page/title/URL; direct evaluation now checks actual MSFT without focus. Archive runtime diagnostics confirm analytical operation deadline exceeded; reuse remains awaiting live proof.
 
 Recovery/read routing and owned SEC publication are implemented and built; existing quarantine/read concurrency and logical recovery checks pass. The fresh financial job `053b2f82-bdd5-404d-9d06-7aafaaa96e30` failed acquisition with `InvalidTaxonomySet`; service6192 survived, and no duplicate job was started.
 
-Watcher PID27555 is temporarily SIGSTOP-paused while build24445 finishes. Lead critical queue
-session79049 waits for Cargo idle, then runs the existing taxonomy edge, Arrow roundtrip and full
-facts/PIT/reopen cases serially; its finally block resumes the watcher with SIGCONT. Native check
-session23737 waits for service17280 replacement before inspecting the MSFT page. The current
-build excludes later taxonomy-edge and archive-connection changes. Critical session80253 waits
-for all three checks, then runs the existing archive/restart case on the newly built publication
-recovery binary without another Cargo invocation. No other compilation is scheduled.
+Serialized critical queue79049 completed all three checks successfully and resumed watcher27555. Archive critical80253 also passed on the fresh publication-recovery executable. Current pending reader/archive changes are critically verified for correctness; live financial first-page latency still fails at16.31s. Watcher owns the next single-job runtime build. Supported /wdio/eval works without focus; the old W3C execute path timed out after restart.
 83 older duplicate executable outputs were removed from target/debug/deps (35.04GiB apparent);
 two newest per target, active binaries, libraries, object files, source and evidence retained.
 Free filesystem space rose to52GiB. This is build-artifact cleanup, not whole-app memory evidence.
@@ -87,9 +83,7 @@ https://www.w3.org/TR/xmlschema-1/#src-import and
 https://www.xbrl.org/Specification/XBRL-2.1/REC-2003-12-31/XBRL-2.1-REC-2003-12-31%2Bcorrected-errata-2013-02-20.html.
 
 
-Next barrier: one watcher build now integrates streaming reader, Arrow decode reuse and typed diagnostics. Run existing Arrow/large PIT/reopen critical checks, then time native facts and inspect statements/ratios/filings and cursor navigation. Review and integrate the namespace-relationship candidate when frozen. Resolve the separately evidenced trade-depth rejection and remaining filing-schema failure. Commit/push coherent integration and update PR43. Complete stock analysis, installed lifecycle and V1
-acceptance remain open. A painted native chart is verified separately from canvas presence,
-which alone is insufficient when background macOS animation frames are suspended.
+Next barrier: integrate authenticated canonical read and stale-session queue handling as separate coherent fixes, run relevant existing critical checks, then verify the real MSFT financial page and continued quote updates. After runtime replacement retry exactly one financial preparation job; previous job640d66bd is confirmed terminal failed. Full stock analysis, installed lifecycle and V1 acceptance remain open. No first-page or current-feed completion claim.
 
 ## Checkpoint history — 2026-10-02
 

@@ -56,10 +56,10 @@ impl AnalyticalDataService {
         let token = supervisor.cancellation().clone();
         let permit = self.objects.acquire_blocking_permit(cancellation).await?;
         let worker = supervisor
-            .spawn_blocking(move || {
+            .spawn_blocking(move || -> Result<_, IngestError> {
                 let _permit = permit;
                 let snapshot = manifests.read_snapshot(read_limits, deadline, &token)?;
-                snapshot.read(|snapshot| {
+                let plan = snapshot.read(|snapshot| {
                     plan_market_event_archive(
                         snapshot.connection(),
                         after.as_ref(),
@@ -68,10 +68,11 @@ impl AnalyticalDataService {
                         deadline,
                         &token,
                     )
-                })
+                })?;
+                Ok((snapshot, plan))
             })
             .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)?;
-        let plan = worker
+        let (mut snapshot, plan) = worker
             .await
             .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)??;
         let Some(plan) = plan else {
@@ -95,9 +96,10 @@ impl AnalyticalDataService {
             .objects
             .begin_archive_writer(Arc::clone(&schema), limits.working_bytes, supervisor)
             .await?;
+        // Reuse only the verified connection. Each publication still opens a fresh transaction
+        // and revalidates the catalog endpoint and original operation control in read().
         for commit in &plan.commits {
             check_market_event_read(deadline, cancellation)?;
-            let manifests = Arc::clone(&self.manifests);
             let objects = Arc::clone(&self.objects);
             let commit = commit.clone();
             let token = supervisor.cancellation().clone();
@@ -105,8 +107,7 @@ impl AnalyticalDataService {
             let permit = self.objects.acquire_blocking_permit(cancellation).await?;
             let worker = supervisor.spawn_blocking(move || -> Result<_, IngestError> {
                 let _permit = permit;
-                let snapshot = manifests.read_snapshot(read_limits, deadline, &token)?;
-                snapshot.read(|snapshot| -> Result<_,IngestError> {
+                let batch = snapshot.read(|snapshot| -> Result<_,IngestError> {
                     let rows = load_market_event_rows(snapshot.connection(), &commit, &objects, read_limits, deadline, &token)?;
                     let evidence = snapshot.publication_evidence(commit.publication_digest())?
                         .ok_or(IngestError::ProviderCaptureRequired)?;
@@ -124,11 +125,13 @@ impl AnalyticalDataService {
                     // keep the existing registered types and exact canonical JSON for every variant.
                     arrow::record_batch::RecordBatch::try_new(schema,batch.dataset_batch().record_batch().columns().to_vec())
                         .map_err(|_|IngestError::ProviderCaptureRequired)
-                })
+                })?;
+                Ok((snapshot, batch))
             }).map_err(|_|IngestError::ProviderCaptureRecoveryWorkerUnavailable)?;
-            let batch = worker
+            let (returned_snapshot, batch) = worker
                 .await
                 .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)??;
+            snapshot = returned_snapshot;
             let payloads = batch
                 .column_by_name("event_json")
                 .and_then(|column| column.as_any().downcast_ref::<arrow::array::BinaryArray>())
@@ -159,6 +162,7 @@ impl AnalyticalDataService {
                 first = end;
             }
         }
+        drop(snapshot);
         let staged = writer.finish().await?;
         check_market_event_read(deadline, cancellation)?;
         // Encoding owns only scratch. Ordinary gate -> publication ordering begins here.

@@ -1,7 +1,9 @@
 //! Exact complete SEC research replay through the shared logical publication authority.
 use super::filing_xbrl::SecNumericNativeEvidence;
 use super::*;
+use crate::catalog::PersistedProviderLogicalPartitionClaim;
 use market_squawk_domain::CompanyIdentityObservation;
+use market_squawk_platform::VerifiedResearchObject;
 use market_squawk_sources::{
     LogicalObjectRole, LogicalPartitionFamily, ProviderCaptureSetReceipt,
     ProviderNativeSidecarDescriptor,
@@ -185,9 +187,12 @@ impl SecResearchReadCapability {
             self.objects.operation_scratch()?,
             request.maximum_spill_bytes(),
         ));
-        let mut mappings = indexed::RowsBuilder::<RowMap>::new(Arc::clone(&scratch))?;
-        let mut native_rows =
-            indexed::RowsBuilder::<SecNumericNativeEvidence>::new(Arc::clone(&scratch))?;
+        // Filing graph verification revisits its numeric evidence. CompanyFacts consumes
+        // each exact native frame once, beside its canonical row, with no intermediate index.
+        let mut native_rows = descriptor
+            .as_ref()
+            .map(|_| indexed::RowsBuilder::<SecNumericNativeEvidence>::new(Arc::clone(&scratch)))
+            .transpose()?;
         let map_schema =
             evidence_digest(Sha256::digest(b"market-squawk/sec-filing/logical-row-map/v1").into());
         let native_schema = market_squawk_sources::ProviderNativeLineageSchema::for_implementation(
@@ -199,6 +204,7 @@ impl SecResearchReadCapability {
         let mut mapping_digest = Sha256::new();
         mapping_digest.update(b"market-squawk/sec-filing/logical-row-map-complete/v1");
         for partition in binding.partitions() {
+            check_operation(deadline, &cancellation)?;
             let next = match partition.family() {
                 LogicalPartitionFamily::ProviderNative => &mut next_native,
                 LogicalPartitionFamily::CanonicalRowMap => &mut next_map,
@@ -220,71 +226,27 @@ impl SecResearchReadCapability {
             {
                 return Err(mismatch());
             }
-            let mut reader = raw_store
-                .open_verified_logical_object_claim(partition.claim(), &control)
-                .map_err(map_raw_store_error)?;
-            for _ in 0..partition.item_range().item_count().get() {
-                check_operation(deadline, &cancellation)?;
-                let (ordinal, payload) = read_frame(&mut reader)?;
-                if ordinal != *next {
-                    return Err(mismatch());
-                }
-                match partition.family() {
-                    LogicalPartitionFamily::ProviderNative => {
-                        native_rows.push(&SecNumericNativeEvidence {
-                            semantic_payload: payload,
-                            capture_page_ordinal,
-                        })?
-                    }
-                    LogicalPartitionFamily::CanonicalRowMap => {
-                        let row: RowMap =
-                            serde_json::from_slice(&payload).map_err(|_| mismatch())?;
-                        if u64::from(row.canonical_row_ordinal) != ordinal
-                            || row.capture_page_ordinal != capture_page_ordinal
-                            || row.segment_ordinal != 0
-                            || row.physical_frame_ordinal != u32::from(row.capture_page_ordinal)
-                        {
-                            return Err(mismatch());
-                        }
-                        let page = companion
-                            .capture
-                            .pages()
-                            .get(usize::from(row.capture_page_ordinal))
-                            .ok_or_else(mismatch)?;
-                        if row.page_body_digest != page.body_digest()
-                            || row.received_at != page.received_at()
-                            || row.source_sequence != Some(u64::from(page.ordinal()))
-                        {
-                            return Err(mismatch());
-                        }
-                        mapping_digest.update((payload.len() as u64).to_be_bytes());
-                        mapping_digest.update(&payload);
-                        mappings.push(&row)?;
-                    }
-                    _ => return Err(mismatch()),
-                }
-                *next = next.checked_add(1).ok_or_else(mismatch)?;
-            }
-            let mut tail = [0u8; 1];
-            if reader.read(&mut tail).map_err(|_| mismatch())? != 0 {
-                return Err(mismatch());
-            }
-            reader
-                .reverify_for_commit(&control)
-                .map_err(map_raw_store_error)?;
+            *next = partition
+                .item_range()
+                .end_exclusive()
+                .map_err(|_| mismatch())?;
         }
         if next_native != companion.record_count as u64 || next_map != next_native {
             return Err(mismatch());
         }
-        let mappings = mappings.finish()?;
-        let native_rows = native_rows.finish()?;
+        let mut maps = PartitionFrames::new(
+            binding.partitions(),
+            LogicalPartitionFamily::CanonicalRowMap,
+        );
+        let mut natives =
+            PartitionFrames::new(binding.partitions(), LogicalPartitionFamily::ProviderNative);
         let object_ordinal = exact_origin_object_ordinal(&pinned, &company_identity)?;
         let object = pinned
             .objects()
             .get(object_ordinal)
             .ok_or(SecResearchReadError::OriginMismatch)?
             .object();
-        if object.row_count() != next_native {
+        if object.row_count() != companion.record_count as u64 {
             return Err(mismatch());
         }
         let mut cursor = self.objects.pinned_object_batch_cursor(
@@ -342,8 +304,34 @@ impl SecResearchReadCapability {
             for (observation, coordinate) in
                 decoded.observations.into_iter().zip(decoded.coordinates)
             {
-                let row = mappings.get(row_ordinal)?.ok_or_else(mismatch)?;
-                let native = native_rows.get(row_ordinal)?.ok_or_else(mismatch)?;
+                check_operation(deadline, &cancellation)?;
+                let (map_partition, map_payload) =
+                    maps.next(raw_store, &control)?.ok_or_else(mismatch)?;
+                let (native_partition, native_payload) =
+                    natives.next(raw_store, &control)?.ok_or_else(mismatch)?;
+                let row: RowMap = serde_json::from_slice(&map_payload).map_err(|_| mismatch())?;
+                if row.canonical_row_ordinal as usize != row_ordinal
+                    || row.capture_page_ordinal != capture_page_ordinal
+                    || row.segment_ordinal != 0
+                    || row.physical_frame_ordinal != u32::from(row.capture_page_ordinal)
+                    || map_partition != coordinate.partition_ordinal
+                    || native_partition != coordinate.partition_ordinal
+                {
+                    return Err(mismatch());
+                }
+                let page = companion
+                    .capture
+                    .pages()
+                    .get(usize::from(row.capture_page_ordinal))
+                    .ok_or_else(mismatch)?;
+                if row.page_body_digest != page.body_digest()
+                    || row.received_at != page.received_at()
+                    || row.source_sequence != Some(u64::from(page.ordinal()))
+                {
+                    return Err(mismatch());
+                }
+                mapping_digest.update((map_payload.len() as u64).to_be_bytes());
+                mapping_digest.update(&map_payload);
                 let expected = binding
                     .canonical_partitions()
                     .iter()
@@ -357,7 +345,7 @@ impl SecResearchReadCapability {
                     || coordinate.binding_digest != binding.binding_digest()
                     || coordinate.canonical_row_digest != row.canonical_record_digest
                     || coordinate.native_semantic_digest != row.native_semantic_digest
-                    || evidence_digest(Sha256::digest(&native.semantic_payload).into())
+                    || evidence_digest(Sha256::digest(&native_payload).into())
                         != row.native_semantic_digest
                     || coordinate.canonical_row_ordinal < expected.row_range().first_ordinal()
                     || coordinate.canonical_row_ordinal >= end
@@ -375,7 +363,13 @@ impl SecResearchReadCapability {
                     return Err(mismatch());
                 }
                 if request.family() == SecResearchFamily::CompanyFacts {
-                    validate_company_fact_native(&native.semantic_payload, &observation)?;
+                    validate_company_fact_native(&native_payload, &observation)?;
+                }
+                if let Some(native_rows) = native_rows.as_mut() {
+                    native_rows.push(&SecNumericNativeEvidence {
+                        semantic_payload: native_payload,
+                        capture_page_ordinal,
+                    })?;
                 }
                 observations.push(&observation)?;
                 coordinates.push(ProviderCaptureRowCoordinate {
@@ -398,7 +392,11 @@ impl SecResearchReadCapability {
         {
             return Err(mismatch());
         }
+        // No result may escape with an unread partition or a partially consumed descriptor.
+        maps.finish(companion.record_count as u64)?;
+        natives.finish(companion.record_count as u64)?;
         let observations = observations.finish()?;
+        let native_rows = native_rows.map(|rows| rows.finish()).transpose()?;
         let mut native_reader = raw_store
             .open_verified_logical_object_claim(native_object.claim(), &control)
             .map_err(map_raw_store_error)?;
@@ -415,7 +413,7 @@ impl SecResearchReadCapability {
                 &companion.capture,
                 &mut native_reader,
                 sidecar_digest,
-                &native_rows,
+                native_rows.as_ref().ok_or_else(mismatch)?,
                 &observations,
                 company_identity
                     .observation()
@@ -439,7 +437,6 @@ impl SecResearchReadCapability {
         native_reader
             .reverify_for_commit(&control)
             .map_err(map_raw_store_error)?;
-        drop(mappings);
         drop(native_rows);
         let mut origin = SecResearchOrigin {
             manifest: request.manifest().clone(),
@@ -480,6 +477,89 @@ impl SecResearchReadCapability {
         .await
     }
 }
+/// Sequential evidence frames from one already shape-checked partition family. Only the
+/// current verified descriptor and one bounded frame are retained; partition objects are
+/// reverified after exact EOF before advancing. Canonical rows remain the iteration driver.
+struct PartitionFrames<'a> {
+    partitions: std::slice::Iter<'a, PersistedProviderLogicalPartitionClaim>,
+    family: LogicalPartitionFamily,
+    current: Option<(
+        &'a PersistedProviderLogicalPartitionClaim,
+        VerifiedResearchObject,
+    )>,
+    next_ordinal: u64,
+}
+impl<'a> PartitionFrames<'a> {
+    fn new(
+        partitions: &'a [PersistedProviderLogicalPartitionClaim],
+        family: LogicalPartitionFamily,
+    ) -> Self {
+        Self {
+            partitions: partitions.iter(),
+            family,
+            current: None,
+            next_ordinal: 0,
+        }
+    }
+
+    fn next(
+        &mut self,
+        raw_store: &SealedResearchJournalStore,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<Option<(u32, Vec<u8>)>, SecResearchReadError> {
+        let mismatch = || SecResearchReadError::ProviderBindingMismatch;
+        if self.current.is_none() {
+            let Some(partition) = self
+                .partitions
+                .find(|partition| partition.family() == self.family)
+            else {
+                return Ok(None);
+            };
+            if partition.item_range().first_ordinal() != self.next_ordinal {
+                return Err(mismatch());
+            }
+            let reader = raw_store
+                .open_verified_logical_object_claim(partition.claim(), control)
+                .map_err(map_raw_store_error)?;
+            self.current = Some((partition, reader));
+        }
+        let (partition, reader) = self.current.as_mut().ok_or_else(mismatch)?;
+        let end = partition
+            .item_range()
+            .end_exclusive()
+            .map_err(|_| mismatch())?;
+        let partition_ordinal = partition.partition_ordinal();
+        let (ordinal, payload) = read_frame(reader)?;
+        if ordinal != self.next_ordinal || ordinal >= end {
+            return Err(mismatch());
+        }
+        self.next_ordinal = self.next_ordinal.checked_add(1).ok_or_else(mismatch)?;
+        if self.next_ordinal == end {
+            let mut tail = [0u8; 1];
+            if reader.read(&mut tail).map_err(|_| mismatch())? != 0 {
+                return Err(mismatch());
+            }
+            let (_, reader) = self.current.take().ok_or_else(mismatch)?;
+            reader
+                .reverify_for_commit(control)
+                .map_err(map_raw_store_error)?;
+        }
+        Ok(Some((partition_ordinal, payload)))
+    }
+
+    fn finish(mut self, expected_rows: u64) -> Result<(), SecResearchReadError> {
+        if self.next_ordinal != expected_rows
+            || self.current.is_some()
+            || self
+                .partitions
+                .any(|partition| partition.family() == self.family)
+        {
+            return Err(SecResearchReadError::ProviderBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
 fn read_frame(reader: &mut impl Read) -> Result<(u64, Vec<u8>), SecResearchReadError> {
     let mut ordinal = [0u8; 8];
     let mut length = [0u8; 8];

@@ -31,7 +31,7 @@ market-squawk-sources = { workspace = true }
 parquet = { workspace = true }
 rust_decimal = { workspace = true }
 rustix = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["cache"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

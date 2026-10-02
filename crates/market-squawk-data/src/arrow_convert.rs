@@ -188,6 +188,16 @@ fn decode_json<T: DeserializeOwned>(
     let Some(control) = control else {
         return Ok(serde_json::from_slice(bytes)?);
     };
+    // A resident JSON value that fits the remaining existing control quantum needs no
+    // bytewise I/O adapter. Check both sides of that bounded parse; larger values retain
+    // incremental checkpoints through ControlledJsonReader.
+    if bytes.len() <= control.byte_permit(bytes.len())? {
+        control.checkpoint_now()?;
+        let decoded = serde_json::from_slice(bytes);
+        control.complete_bytes(bytes.len())?;
+        control.checkpoint_now()?;
+        return Ok(decoded?);
+    }
     let failure = Cell::new(None);
     let result = {
         let reader = ControlledJsonReader {
@@ -993,7 +1003,7 @@ impl ResearchArrowBatch {
                 .as_ref()
                 .map_or(request_digest, |logical| logical.binding.binding_digest()),
             request_digests,
-            lineages,
+            &lineages,
             &observations,
             None,
         )
@@ -1006,7 +1016,7 @@ impl ResearchArrowBatch {
         observations: Vec<ResearchObservation>,
     ) -> Result<Self, ArrowConversionError> {
         let request_digests = vec![request_digest.bytes(); observations.len()];
-        let lineages = observations
+        let lineages: Vec<_> = observations
             .iter()
             .map(|observation| RowLineage::CanonicalObservation {
                 schema_version: RESEARCH_SCHEMA_VERSION,
@@ -1022,7 +1032,7 @@ impl ResearchArrowBatch {
             dataset,
             request_digest,
             request_digests,
-            lineages,
+            &lineages,
             &observations,
             None,
         )
@@ -1119,7 +1129,7 @@ impl ResearchArrowBatch {
         dataset: SourceIdentifier,
         batch_digest: EvidenceDigest,
         request_digests: Vec<[u8; 32]>,
-        row_lineages: Vec<RowLineage>,
+        row_lineages: &[RowLineage],
         observations: &[ResearchObservation],
         mut control: Option<&mut ArrowOperationControl<'_>>,
     ) -> Result<Self, ArrowConversionError> {
@@ -1128,25 +1138,6 @@ impl ResearchArrowBatch {
         }
         if request_digests.len() != observations.len() || row_lineages.len() != observations.len() {
             return Err(ArrowConversionError::InvalidSchema);
-        }
-        for (ordinal, ((lineage, observation), request_digest)) in row_lineages
-            .iter()
-            .zip(observations)
-            .zip(&request_digests)
-            .enumerate()
-        {
-            if let Some(control) = control.as_deref_mut() {
-                control.checkpoint_row(ordinal)?;
-            }
-            let payload = encode_json(observation, control.as_deref_mut())?;
-            validate_row_lineage(
-                lineage,
-                &dataset,
-                *request_digest,
-                observation,
-                &payload,
-                control.as_deref_mut(),
-            )?;
         }
         let mut encoded_lineages = Vec::new();
         encoded_lineages
@@ -1158,7 +1149,6 @@ impl ResearchArrowBatch {
             }
             encoded_lineages.push(encode_json(lineage, control.as_deref_mut())?);
         }
-        let row_lineages = encoded_lineages;
         let mut payloads = Vec::with_capacity(observations.len());
         let mut payload_digests = Vec::with_capacity(observations.len());
         let mut kinds = Vec::with_capacity(observations.len());
@@ -1211,6 +1201,14 @@ impl ResearchArrowBatch {
                 control.checkpoint_row(ordinal)?;
             }
             let payload = encode_json(observation, control.as_deref_mut())?;
+            validate_row_lineage(
+                &row_lineages[ordinal],
+                &dataset,
+                request_digests[ordinal],
+                observation,
+                &payload,
+                control.as_deref_mut(),
+            )?;
             let mut payload_hash = Sha256::new();
             update_hash_bytes(&mut payload_hash, &payload, control.as_deref_mut())?;
             payload_digests.push(payload_hash.finalize().to_vec());
@@ -1419,7 +1417,7 @@ impl ResearchArrowBatch {
                 let arrays: Vec<ArrayRef> = vec![
                     Arc::new(schema_versions),
                     Arc::new(controlled_binary_array(request_digests, control)?),
-                    Arc::new(controlled_binary_array(row_lineages, control)?),
+                    Arc::new(controlled_binary_array(encoded_lineages, control)?),
                     Arc::new(controlled_string_array(kinds, control)?),
                     Arc::new(controlled_string_array(source_ids, control)?),
                     Arc::new(controlled_string_array(instrument_ids, control)?),
@@ -1481,7 +1479,7 @@ impl ResearchArrowBatch {
                         observations.len(),
                     )),
                     Arc::new(BinaryArray::from_iter_values(request_digests)),
-                    Arc::new(BinaryArray::from_iter_values(row_lineages)),
+                    Arc::new(BinaryArray::from_iter_values(encoded_lineages)),
                     Arc::new(StringArray::from(kinds)),
                     Arc::new(StringArray::from(source_ids)),
                     Arc::new(StringArray::from(instrument_ids)),
@@ -1569,7 +1567,7 @@ impl ResearchArrowBatch {
         control: &dyn ResearchObjectControl,
     ) -> Result<DecodedProviderCaptureBatch, ArrowConversionError> {
         let mut operation = ArrowOperationControl::new(control);
-        let (candidate, observations, observation_bytes, coordinates) =
+        let (candidate, observations, observation_bytes, coordinates, _) =
             Self::validate_and_decode_record_batch_inner(
                 batch,
                 max_additional_bytes,
@@ -1612,14 +1610,13 @@ impl ResearchArrowBatch {
             },
         )?;
         let mut operation = ArrowOperationControl::new(control);
-        let (candidate, observations, observation_bytes, _) =
+        let (candidate, observations, observation_bytes, _, row_lineages) =
             Self::validate_and_decode_record_batch_inner(
                 batch,
                 allowance,
                 false,
                 Some(&mut operation),
             )?;
-        let row_lineages = candidate.decode_row_lineages(Some(&mut operation))?;
         let payloads = candidate
             .batch
             .column_by_name("payload_sha256")
@@ -1729,7 +1726,7 @@ impl ResearchArrowBatch {
             producer_dataset,
             EvidenceDigest::new(DigestAlgorithm::Sha256, batch_digest),
             request_digests,
-            row_lineages,
+            &row_lineages,
             &observations,
             control.as_deref_mut(),
         )?;
@@ -1881,7 +1878,7 @@ impl ResearchArrowBatch {
         max_additional_bytes: usize,
     ) -> Result<(Self, Vec<ResearchObservation>, usize), ArrowConversionError> {
         Self::validate_and_decode_record_batch_inner(batch, max_additional_bytes, false, None)
-            .map(|(candidate, observations, retained, _)| (candidate, observations, retained))
+            .map(|(candidate, observations, retained, _, _)| (candidate, observations, retained))
     }
 
     fn validate_and_decode_record_batch_inner(
@@ -1895,6 +1892,7 @@ impl ResearchArrowBatch {
             Vec<ResearchObservation>,
             usize,
             Option<Vec<ProviderCaptureRowCoordinate>>,
+            Vec<RowLineage>,
         ),
         ArrowConversionError,
     > {
@@ -1971,7 +1969,7 @@ impl ResearchArrowBatch {
             dataset,
             EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest),
             request_digests,
-            row_lineages,
+            &row_lineages,
             &observations,
             control.as_deref_mut(),
         )?;
@@ -1987,7 +1985,13 @@ impl ResearchArrowBatch {
         if let Some(control) = control {
             control.checkpoint_now()?;
         }
-        Ok((candidate, observations, observation_bytes, coordinates))
+        Ok((
+            candidate,
+            observations,
+            observation_bytes,
+            coordinates,
+            row_lineages,
+        ))
     }
 
     /// Returns the immutable Arrow batch.
