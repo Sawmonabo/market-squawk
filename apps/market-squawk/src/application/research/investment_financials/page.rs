@@ -143,21 +143,27 @@ pub(super) fn page(
     Ok(result)
 }
 
-fn row_items(
-    snapshot: &Snapshot,
+fn row_coordinate(
     connection: &Connection,
     ordinal: u64,
-    authorized: &[bool],
-) -> Result<Option<Vec<Value>>, ServiceError> {
-    let coordinate: Option<(i64, i64)> = connection
+) -> Result<Option<(i64, i64)>, ServiceError> {
+    connection
         .query_row(
             "SELECT family,position FROM coordinates WHERE ordinal=?1",
             [i64::try_from(ordinal).map_err(|_| ServiceError::InvalidRequest)?],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(sql_error)?;
-    coordinate
+        .map_err(sql_error)
+}
+
+fn row_items(
+    snapshot: &Snapshot,
+    connection: &Connection,
+    ordinal: u64,
+    authorized: &[bool],
+) -> Result<Option<Vec<Value>>, ServiceError> {
+    row_coordinate(connection, ordinal)?
         .map(|(family, position)| {
             let family = checked_coordinate(family)?;
             let position = checked_coordinate(position)?;
@@ -425,6 +431,60 @@ mod tests {
             &cancellation,
         )?;
         assert_eq!(owned.knowledge_at, page.knowledge_at);
+        // The same disk snapshot assigns recent-first display ordinals while retaining
+        // every original family/position and every complete envelope across page boundaries.
+        let ordered = Connection::open(directory.path().join("display-order.sqlite"))?;
+        super::super::snapshot::begin_coordinates(&ordered)?;
+        let old = i64::from(CalendarDate::new(1994, 12, 31)?.days_since_unix_epoch());
+        let recent = i64::from(CalendarDate::new(2026, 6, 30)?.days_since_unix_epoch());
+        for (ordinal, family, position, envelope, day, published) in [
+            (0, 0, 12, Some(b"older".as_slice()), old, Some(old)),
+            (1, 1, 22, None, recent, None),
+            (
+                2,
+                0,
+                34,
+                Some(b"recent".as_slice()),
+                recent,
+                Some(recent + 1),
+            ),
+            (
+                3,
+                0,
+                35,
+                Some(b"recent".as_slice()),
+                recent,
+                Some(recent + 1),
+            ),
+            (4, 1, 45, None, recent, Some(recent + 2)),
+        ] {
+            ordered.execute(
+                "INSERT INTO source_coordinates(ordinal,family,position,envelope,effective_day,published_day) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![ordinal, family, position, envelope, day, published],
+            )?;
+        }
+        super::super::snapshot::finish_coordinates(&ordered)?;
+        let expected = [(1, 45), (0, 34), (0, 35), (1, 22), (0, 12)];
+        for (unit, expected) in expected.into_iter().enumerate() {
+            let encoded = super::cursor(id, unit as u64, 0)?;
+            let position: Cursor = serde_json::from_str(&encoded)?;
+            assert_eq!(position.read_token, id);
+            assert_eq!(row_coordinate(&ordered, position.unit)?, Some(expected));
+        }
+        assert_eq!(row_coordinate(&ordered, 5)?, None);
+        // Previous visits the identical coordinate, including tied report dates.
+        assert_eq!(row_coordinate(&ordered, 1)?, Some((0, 34)));
+        let envelopes: Vec<Vec<u8>> = ordered
+            .prepare("SELECT envelope FROM reporting_envelopes ORDER BY ordinal")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(envelopes, vec![b"recent".to_vec(), b"older".to_vec()]);
+        let recent_inputs: i64 = ordered.query_row(
+            "SELECT COUNT(*) FROM coordinates WHERE envelope=?1",
+            [b"recent".as_slice()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(recent_inputs, 2);
         // A coordinate cannot manufacture rows without its original source selection receipt.
         let connection = Connection::open(&snapshot.index)?;
         connection.execute(
