@@ -7,7 +7,7 @@ import { createProductQueryClient, productKeys, snapshotQueryMeta } from "@/app/
 import { describe, expect, it, vi } from "vitest"
 
 import { App } from "@/app/app"
-import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
+import type { AnalyticalControllerResponse, AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
 import { lookupResultSchema } from "@/features/lookup/schemas"
 import type { MarketProductRow } from "@/features/markets/market-product"
@@ -1077,6 +1077,7 @@ describe("Market Squawk desktop boundary", () => {
     // Load the real lazy route before timing UI assertions; Vite's cold transform is not app latency.
     await import("@/features/markets")
     await import("@/components/overview-page")
+    await import("@/features/opportunities")
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     let collectionRevision = 3
@@ -1108,60 +1109,88 @@ describe("Market Squawk desktop boundary", () => {
       ...blockedBootstrap,
       capabilities: ["market_overview", "market_instrument"],
     }
+    const nativeTransport = transport(readyBootstrap, undefined, async (request, options) => {
+      issuedQueries.push(request)
+      if (request.query === "analysisSettings") return {
+        data: { label: "Recommended", kind: "recommended", activatedAt: "1800000000000000000",
+          workflowAvailability: "available", nextAction: "Analyze this investment." },
+        metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
+      }
+      if (request.query === "marketCollection") {
+        if (collectionRefreshFails || (request.includeMarket === true && marketRefreshFails)) {
+          throw new Error("Current market evidence could not be read.")
+        }
+        return {
+          data: { revision: collectionRevision.toString(), entries: collectionChoices.map((choice) => ({
+            ...choice,
+            market: request.includeMarket && choice.symbol === "SPY" ? {
+              ...marketOverviewRow,
+              identity: { symbol: "SPY", name: "S&P 500 fund", assetClass: "fund" },
+            } : null,
+          })) },
+          metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
+        }
+      }
+      if (request.query === "marketSetCollectionChoice") {
+        if (request.expectedRevision !== collectionRevision.toString()) throw new Error("Collection revision is stale.")
+        collectionChoices = collectionChoices.map((choice) => choice.symbol === request.symbol
+          ? { ...choice, kept: request.kept } : choice)
+        collectionRevision += 1
+        return {
+          data: { revision: collectionRevision.toString(), choices: collectionChoices },
+          metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
+        }
+      }
+      if (request.query === "investmentProfile") return {
+        data: { selectionToken: request.selectionToken, knowledgeAt: marketObservedAt,
+          state: "missing", reason: "official_membership", profile: null },
+        metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
+      }
+      if (request.query === "marketOverview") return marketOverviewResult
+      if (request.query === "marketInstrument") {
+        if (holdInstrumentRead) await new Promise<void>((resolve) => { resolveInstrument = resolve })
+        return marketResult({
+          ...marketOverviewRow, historyToken, priceBasis: "bid_ask_midpoint",
+          changeBasis: { ...marketOverviewRow.changeBasis, priceBasis: "bid_ask_midpoint" },
+          quote: { ...marketOverviewRow.quote, tradeStatus: "ambiguous", lastPrice: null, lastSize: null,
+            lastObservedAt: null, lastCurrentThrough: null, lastFresh: false },
+        })
+      }
+      if (request.query === "marketHistory") {
+        if (request.startDate !== undefined) {
+          viewportSignal = options?.signal
+          return new Promise<ApplicationResult>((resolve) => { resolveViewport = resolve })
+        }
+        return historyResult
+      }
+      throw new Error(`Unexpected market query: ${request.query}`)
+    })
+    const setupMessage = "Choose a portfolio and confirm your allocation preferences on the Portfolio page before starting analysis."
+    const workflow: Extract<AnalyticalControllerResponse, { kind: "workflow" }>["workflow"] = {
+      workflowToken: "workflow_44444444444444444444444444444444", kind: "investment_analysis", state: "waiting",
+      progress: { stage: "preparing", completedSteps: 0, waitingForBackgroundWork: false },
+      coverage: null, resultCount: 0, resultActionTokens: [], resultOrdering: null, unavailableMembers: [],
+      startedAt: "1800000000000000000", updatedAt: "1800000000000000000", explanation: null,
+      canCancel: true, canResume: false,
+    }
+    const analysisStarts: { request: Parameters<ProductTransport["analyticalController"]>[0]; confirmed?: boolean }[] = []
+    const readController = nativeTransport.product.analyticalController
+    nativeTransport.product.analyticalController = async (request, confirmed, options) => {
+      if (request.action === "analyzeInvestment") {
+        analysisStarts.push({ request, confirmed })
+        if (analysisStarts.length === 1) throw { code: "analysis_setup_required", message: setupMessage }
+        if (analysisStarts.length === 2) throw { code: "internal", message: "Private diagnostic details" }
+        return { kind: "workflow", workflow }
+      }
+      if (request.action === "status" && analysisStarts.length === 3) {
+        return { ...analyticalControllerStatus(), workflows: [workflow] }
+      }
+      return readController(request, confirmed, options)
+    }
     render(
       <MemoryRouter initialEntries={["/home"]}>
         <App
-          transport={transport(readyBootstrap, undefined, async (request, options) => {
-            issuedQueries.push(request)
-            if (request.query === "marketCollection") {
-              if (collectionRefreshFails || (request.includeMarket === true && marketRefreshFails)) {
-                throw new Error("Current market evidence could not be read.")
-              }
-              return {
-                data: { revision: collectionRevision.toString(), entries: collectionChoices.map((choice) => ({
-                  ...choice,
-                  market: request.includeMarket && choice.symbol === "SPY" ? {
-                    ...marketOverviewRow,
-                    identity: { symbol: "SPY", name: "S&P 500 fund", assetClass: "fund" },
-                  } : null,
-                })) },
-                metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
-              }
-            }
-            if (request.query === "marketSetCollectionChoice") {
-              if (request.expectedRevision !== collectionRevision.toString()) throw new Error("Collection revision is stale.")
-              collectionChoices = collectionChoices.map((choice) => choice.symbol === request.symbol
-                ? { ...choice, kept: request.kept } : choice)
-              collectionRevision += 1
-              return {
-                data: { revision: collectionRevision.toString(), choices: collectionChoices },
-                metadata: { completeness: "complete", returnedItems: collectionChoices.length, availableItems: collectionChoices.length },
-              }
-            }
-            if (request.query === "investmentProfile") return {
-              data: { selectionToken: request.selectionToken, knowledgeAt: marketObservedAt,
-                state: "missing", reason: "official_membership", profile: null },
-              metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
-            }
-            if (request.query === "marketOverview") return marketOverviewResult
-            if (request.query === "marketInstrument") {
-              if (holdInstrumentRead) await new Promise<void>((resolve) => { resolveInstrument = resolve })
-              return marketResult({
-                ...marketOverviewRow, historyToken, priceBasis: "bid_ask_midpoint",
-                changeBasis: { ...marketOverviewRow.changeBasis, priceBasis: "bid_ask_midpoint" },
-                quote: { ...marketOverviewRow.quote, tradeStatus: "ambiguous", lastPrice: null, lastSize: null,
-                  lastObservedAt: null, lastCurrentThrough: null, lastFresh: false },
-              })
-            }
-            if (request.query === "marketHistory") {
-              if (request.startDate !== undefined) {
-                viewportSignal = options?.signal
-                return new Promise<ApplicationResult>((resolve) => { resolveViewport = resolve })
-              }
-              return historyResult
-            }
-            throw new Error(`Unexpected market query: ${request.query}`)
-          })}
+          transport={nativeTransport}
         />
       </MemoryRouter>,
     )
@@ -1309,6 +1338,22 @@ describe("Market Squawk desktop boundary", () => {
     expect(renderedText).not.toMatch(/kraken|coinbase|websocket-v2/i)
     expect(renderedText).not.toContain(marketSelectionToken)
     expect(renderedText).not.toMatch(/\bticks?\b|\blots?\b/i)
+
+    await user.click(screen.getByRole("button", { name: "Analyze this investment" }))
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveProperty("textContent", setupMessage))
+    expect(screen.getByRole("link", { name: "Open Portfolio" }).getAttribute("href")).toBe("/portfolio")
+    expect(screen.getByRole("link", { name: "Back to Markets" })).toBeTruthy()
+    expect(analysisStarts).toHaveLength(1)
+    await user.click(screen.getByRole("button", { name: "Analyze this investment" }))
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveProperty("textContent", "Analysis could not start. Check current analysis activity and try again."))
+    expect(screen.queryByText("Private diagnostic details")).toBeNull()
+    expect(screen.queryByRole("link", { name: "Open Portfolio" })).toBeNull()
+    expect(analysisStarts).toHaveLength(2)
+    await user.click(screen.getByRole("button", { name: "Analyze this investment" }))
+    expect(await screen.findByText("Selected analysis")).toBeTruthy()
+    expect(analysisStarts).toEqual(Array.from({ length: 3 }, () => ({
+      request: { action: "analyzeInvestment", selectionToken: marketSelectionToken }, confirmed: true,
+    })))
   })
 
   it("opens the exact saved valuation with method amounts and preserves explicit selection", async () => {

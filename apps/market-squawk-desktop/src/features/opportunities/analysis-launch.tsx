@@ -1,7 +1,7 @@
 import { useId, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Search } from "lucide-react"
-import { useNavigate } from "react-router-dom"
+import { Link, useNavigate } from "react-router-dom"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
@@ -48,6 +48,7 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
     retry: false,
   })
   const available = profile.data?.workflowAvailability === "available"
+  const setupMessage = launch.isError ? setupRequiredMessage(launch.error) : null
   return <div className="min-w-0">
     <div className="mb-4 min-w-0 max-w-xl">
       <label className="grid min-w-0 gap-2 text-xs font-medium">
@@ -95,8 +96,19 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
     </Button>
     <p className="mt-2 max-w-xl text-xs leading-5 text-muted-foreground" role={launch.isError ? "alert" : undefined}>
       {launch.isError
-        ? "Analysis could not start. Check current analysis activity and try again."
+        ? setupMessage ?? "Analysis could not start. Check current analysis activity and try again."
         : profile.data?.nextAction ?? "Checking analysis availability…"}
     </p>
+    {setupMessage ? <Link className="mt-2 inline-block text-sm text-primary underline underline-offset-4" to="/portfolio">
+      Open Portfolio
+    </Link> : null}
   </div>
+}
+
+function setupRequiredMessage(error: unknown): string | null {
+  if (typeof error !== "object" || error === null
+    || !("code" in error) || error.code !== "analysis_setup_required"
+    || !("message" in error) || typeof error.message !== "string"
+    || error.message.trim().length === 0) return null
+  return error.message
 }

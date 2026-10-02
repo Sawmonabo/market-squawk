@@ -2,6 +2,54 @@
 
 ## Current execution — 2026-10-02
 
+First-stock execution update: the existing native controls created one $100,000 USD virtual
+portfolio with 0.25% modeled costs, then saved the owner's 2–5% position range, $10,000 cash
+reserve, 1% downside limit and 365-day horizon. `Portfolio.GetRecommendationSetup` is now
+`ready`. No virtual session or order was started. Review and ready receipts are under
+`.agents/tmp/v1-first-stock/analysis-{account-review,allocation-review,allocation-ready}.json`.
+
+Normal MSFT Analyze admitted `workflow_96bca8b553dd5278afa3e9a2a4040af5` with SPY comparison.
+The authoritative native status is now paused at completedSteps2, retaining its original pending
+request. The exact failed operation is `Market.PrepareInvestmentEvidence`, `option_context`,
+`source_evidence_invalid`; no forecast or brief has been produced. Cached hidden-window status
+is not authoritative because background polling is intentionally suspended. Preserve this workflow
+and diagnose the option acquisition before resuming; do not start a replacement or suppress its error.
+
+The independently useful setup-guidance fix is implemented and critically verified: the Analyze
+control shows admitted `analysis_setup_required` guidance and links to Portfolio, preserving the
+selected investment. Unknown errors remain generic. Existing selected-market journey PASS
+(1 case, 3.79s; includes rejected setup, protected unknown diagnostic and successful later launch);
+Desktop typecheck PASS. No new test suite, native rebuild, full CI or review round. Lead inspected
+both changes; Sol releases ownership. Native failure before correction and focused test establish
+this fix's scope; the repaired guidance was not re-triggered by deleting the now-valid account.
+
+
+Observed first-stock start is correctly rejected as `analysis_setup_required`: this fresh root
+has no recommendation account. Owner-authorized practice settings are being configured through
+native review/confirm controls. Concrete UI defect: `AnalysisLaunch` discards the actionable native
+setup message. Sol stock_input_trace now owns only `features/opportunities/analysis-launch.tsx`
+and its existing market journey in `src/test/app.test.tsx`: show validated setup guidance and a
+Portfolio link, preserve safe fallback for unknown errors and selected investment; no new suite.
+Lead owns verification/native run and all other files. This independent consumer fix does not
+weaken backend setup admission or substitute for completing the stock analysis.
+
+First-stock continuation at `827771db` (acceptance items 1, 2 and 6; Quarter 4): the
+native MSFT detail and completed financial preparation are live, with no active compilation.
+Next outcome is the ordinary Analyze action through a saved Investment Brief, preserving real
+missing-input reasons. Prior presentation checks do not prove the analytical pipeline.
+
+| Owner | Exclusive scope | Dependency / finish evidence |
+| --- | --- | --- |
+| Lead | Native workflow execution, ledger, shared integration, all Git/build scheduling | Inspect current profile/account, start or resume the exact existing workflow, capture its first actual failed edge; no duplicate job or blind retry. |
+| Astra stock_workflow_trace | Read-only `application/analytical_workflow/`, `service/decision/`, relevant current native receipts; write only `.agents/tmp/v1-first-stock/stock-workflow-next-edge.md` | Trace the present first-stock producer/consumer path and closest existing critical check; diagnose the exact lead-observed failure, no speculative rewrite/build/runtime mutation. |
+| Sol stock_input_trace | Read-only `service/market_evidence*`, `application/research/corporate_actions/preflight/history.rs`, profile/account prerequisites; write only `.agents/tmp/v1-first-stock/stock-input-next-edge.md` | Identify existing input preparation and native readiness seams for MSFT/SPY; distinguish actual input absence from acquisition/wiring failure. No credential reads, provider calls, edits/build/runtime/Git. |
+
+DAG: current profile/readiness → ordinary native start → exact workflow receipt → scoped
+failure correction if necessary → same workflow completion/readback. Independent source traces
+run in parallel and converge with the receipt before any shared producer/consumer edit. No new
+branches/worktrees or review quarter; only relevant critical checks after an actual code change.
+
+
 Pushed owner correction checkpoint `b3b92abf`: concise product copy, automatic
 selected history/financial loading, dated retained price/change and exact filing-context ratios.
 All assigned agents have finished and released ownership. Lead integrated shared schemas,
