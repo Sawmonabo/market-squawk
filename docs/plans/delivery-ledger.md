@@ -1,8 +1,35 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-01
+## Current execution — 2026-10-02
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed checkpoint
+Working branch `feature/v1-installed-product-experience`, primary worktree only.
+
+Pushed implementation checkpoint `11388990` completes issuer acquisition → verified security
+association → fiscal/valuation retained evidence for this slice. SEC facts carry actual issuer
+subjects; submissions, Company Facts and filing XBRL retain separate parents. The shared selected
+company validator and original evidence survive fiscal and valuation reopen. It also corrects the
+two reproduced startup stack failures: deep SQL count expressions and nested inline startup futures.
+This is **implemented and critically verified**, not live financial Desktop or installed acceptance.
+
+| Final critical evidence for `11388990` | Result / ignored local artifact under `.agents/tmp/v1-first-stock/` |
+| --- | --- |
+| Exact relationship, simultaneous family parents, held-writer reads, retained receipts/restart | PASS1/1, 1.47s — `sec-issuer-relationship-integrated.log` |
+| Rights-bound fiscal ingest and original epoch replay | PASS1/1, 6.59s — `sec-issuer-fiscal-integrated.log` |
+| Physical filing, namespace-exact EPS valuation input, persisted valuation and original reopen | PASS1/1, 1.59s — `sec-issuer-valuation-restart-integrated.log` |
+| Reject initialization over retained analytical data | PASS1/1, 0.46s — `initialization-nonempty-critical.log` |
+| Saved issuer activation recipe, actual fresh LocalProduct startup and orderly shutdown | PASS1/1, 6.30s, ordinary thread stack — `sec-issuer-recipe-stack-final.log` |
+| All changed application/release-evidence consumers compile | PASS, 2m08s — `sec-issuer-release-consumer-final.log` |
+
+Lead inspected actual author changes and affected callers. The final source hash snapshot was
+unchanged through checks/commit; unused-import cleanup changes no tested behavior. No broad gate,
+CI, whole-app RAM measurement, new branch/worktree or runtime replacement. All author lanes below
+are finished/frozen. Lead owns the next selected financial detail contract and shared-client
+integration; UI ownership starts after that contract is fixed. Overall startup readiness timing,
+complete live data presentation and native financial rendering remain unresolved.
+
+Earlier pushed checkpoints:
+ Pushed checkpoint
+`ffde1663` removes the duplicate bound-open catalog scan (startup remains unresolved);
 `49b96e5a` removes redundant credential-buffer wiping without changing key derivation;
 `6ba236c9` preserves independent quote/trade evidence and unresolved same-time trade batches;
 `1ae2704a` separates Overview watchlist, discovery and exact investment navigation.
@@ -14,9 +41,76 @@ One worktree and three local/origin branches; recovery history remains untouched
 
 | Current owner / outcome | Exact ownership and dependency | Critical evidence / finish boundary |
 | --- | --- | --- |
-| Lead — selected profile checkpoint | Frozen Sol profile leaf/UI, shared Research/native/CLI contracts, Astra listing snapshot correction, lead constructor integrations, docs/Git. All writers released. | TypeScript PASS; existing Desktop2/2; held-writer listing regression1/1; rebuilt real MSFT/SPY profiles both available with exact selection; unknown selection rejected. Integrated checkpoint; native profile rendering and full rich detail remain unverified/incomplete. |
-| Lead — next financial dependency | Astra source-qualified SEC design complete, no implementation dispatched. New exact relationship basis must join issuer-owned facts to selected security without invented stock identity or unconditional manual setup. | Full scope recorded below; refresh against the profile checkpoint before disjoint producer/authority/financial/UI assignment. |
-| Lead — duplicate startup scan checkpoint | `crates/market-squawk-data/src/authority_transition.rs`, ledger/evidence only; Astra startup_latency diagnosis complete at `c59e0b71`. The repeated ordinary bound-open scan is removed. | Initial integrity/FK scan, catalog/manifest binding, authority-chain and artifact-root validation retained. Existing root-restart/replacement and catalog-recovery cases PASS3/3; rebuild and exact MSFT/SPY profile reopen pass. Observed Ready32.038s; overall startup remains unresolved. |
+| Sol sec_issuer_producer — frozen | SEC `normalize.rs`, `extraction.rs`, `client.rs`, `client/taxonomy.rs`, `xbrl/model.rs`, existing `tests/point_in_time.rs`. | Actual CIK subject on facts/submissions/XBRL; company registry dependency removed, fund registry retained. Provider/PIT and physical-XBRL restart cases PASS1/1 each. |
+| Astra sec_relationship — frozen | Data `catalog/company_security.rs` and existing company/security case in `tests/catalog.rs`. | Automatic retained-parent validation, multiple common share classes, preferred rejection, exact historical receipts and held-writer reads. Final critical case PASS1/1. |
+| Sol sec_parent_reads — frozen | Data `catalog/{company_identity.rs,listing_reference.rs,listing_reference/read.rs}`. | Borrowed exact-parent helpers and canonical retained listing reconstruction; shared endpoint-bound snapshot readers. |
+| Astra sec_automatic_resolution — frozen | Application `company_security_resolution/automatic.rs`; lead owns composition/callers. | Idempotent corroborated listing links, explicit successors on parent refresh, revocation/operator-decision preservation. Application compile PASS; live acquisition still required. |
+| Astra sec_financial_read — frozen | Sources revision canonical encoder; data `pit/{model,canonical}.rs`, `sec_research{,/logical}.rs`, `dataset_builder/{model,canonical,financial,epoch}.rs`, existing PIT/publication-recovery cases. | Explicit issuer family isolation; exact fiscal relationship and original fact evidence retained in saved epochs. Fiscal ingestion/restart PASS1/1; corrected comparable-date PIT fixture rerun PASS1/1. |
+| Lead — issuer integration and next selected detail | Domain subjects/relationship types, existing schema/checksum, activation/composition/CLI/application consumers, docs/Git. Shared transports and Desktop financial result contract remain lead-owned. | Domain research checks PASS15/15 and XBRL roundtrip PASS1/1. Producer and physical-XBRL restart PASS1/1 each; application check PASS (2m55s). Saved activation recipe PASS after the startup correction below. Integrated and pushed as `11388990`; selected financial detail and live native rendering remain incomplete. |
+
+The physical-XBRL restart fixture initially retained its live raw-capture receipt while reopening
+that same journal. Releasing the receipt before reopen preserves exclusive journal ownership and
+allows the original receipt/issuer/native-value comparisons to execute. Final restart case PASS1/1
+(1.48s); no publication or read-admission rule was relaxed.
+
+Next selected-detail preparation is complete (read-only, no transport/UI implementation):
+Astra `selected_financial_contract` traced exact selection, acquisition, cutoff, family origins and
+existing disk-backed reads; Sol `financial_detail_ui` traced independent section loading, cancellation,
+cursor navigation and existing market-journey coverage. The result must page facts/filings from
+retained indexes and derive statements/ratios from complete reporting contexts. Do not materialize
+the whole company result and paginate it afterward. Lead freezes the shared result contract after
+this issuer checkpoint is committed; quote/history/profile remain independent.
+
+Final consumer inspection found valuation still requiring raw stock attribution. That consumer now
+retains the exact relationship receipt and company parent, revalidates them on reopen, and decodes
+physical XBRL units using their namespace-qualified currency/share expressions. This is part of the
+same producer/consumer checkpoint; its physical-XBRL restart case is queued for verification.
+
+Lead also owns `release/{providers,close_provider}.rs`: provider acceptance now verifies every raw
+row against its actual issuer CIK and absent instrument attribution; the closer retains matching
+CIK/family/source/time/row checks and no longer requires a fabricated security UUID. This updates
+the acceptance consumer in place; it does not run the release gate.
+
+Completed final-integration remediation (same primary worktree):
+
+| Owner | Exclusive files / dependency | Completion |
+| --- | --- | --- |
+| Astra selected_financial_contract — frozen | Family-origin correction only: SEC `extraction.rs`; data `sec_research.rs`, existing catalog/publication-recovery cases; application `research/ingest/sec_fundamentals.rs`, `research/sec_fundamentals.rs`, `company_security_resolution/automatic.rs`. | Preserve simultaneous submissions/facts/XBRL with distinct `SecFilingXbrl`; actual submissions remain listing-corroboration authority. Lead supplies domain/schema. No transport/UI expansion. |
+| Astra issuer_valuation_consumer — frozen | Data `catalog/company_security.rs`, `dataset_builder/financial.rs`; valuation `evidence.rs`, `automatic/common_shares.rs`, `persistence{,/write,/recovery}.rs`; SEC `xbrl/model.rs` fixture released by prior owner. | Complete retained identity and exact XBRL units; existing persistence/restart check PASS. |
+| Lead | Domain surface, schema/checksums, release evidence/closer, data `catalog/authority.rs`, compilation and recipe-stack diagnosis. | Existing recipe case passes after both diagnosed stack corrections; no larger stack or omitted policy. |
+
+The recipe-test crash report identifies SQLite expression compilation under
+`Catalog::initialization_evidence_digest`: a sum of 73 table counts recursively exhausts the
+ordinary test-thread stack. Lead replaces that expression with shallow existence queries over
+exactly the same tables in one read transaction, preserving empty-catalog authority admission.
+No stack-size increase or integrity bypass. Current SQLite [expression-depth documentation](https://www.sqlite.org/limits.html)
+and [EXISTS semantics](https://www.sqlite.org/lang_expr.html) support the correction (reviewed
+2026-10-01). The existing saved-recipe case must pass before this failure is closed. Historical first check session33700: relationship PASS1/1 (1.47s), fiscal PASS1/1 (6.59s), physical-XBRL/valuation restart PASS1/1 (1.59s); saved recipe failed during setup; release-consumer compilation PASS (2m57s, `sec-issuer-release-consumer-check.log`). The existing nonempty initialization rejection also passes1/1 (0.46s), run directly from the already compiled publication test binary (`initialization-nonempty-critical.log`). No other compilation is authorized while it runs.
+
+Follow-up startup failure: session33700 reached recipe execution and aborted after the SQL
+correction. New crash report `market_squawk-b71b7ba6fb63c02f-2026-10-01-234754.ips` points to
+`research_service::retained_use::current_policies`, not SQLite. Astra `startup_stack_policies`
+measured debug stack frames and found the nested startup futures plus test body consume
+1,630,240 bytes before the research/profile calls. The small faulting leaf is not the root cause.
+It now exclusively owns the private composition boundary in `local_product/mod.rs`: heap-own the
+large startup future before outer callers await it, preserving cancellation/order/errors. The
+existing `source_lifecycle.rs` uses the same pattern. [Rust Box::pin](https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin)
+and [Rust 2024 lifetime capture](https://doc.rust-lang.org/edition-guide/rust-2024/rpit-lifetime-capture.html)
+were checked against pinned Rust1.97.1. No stack-size increase, policy omission, builds, Git or
+runtime replacement by the agent. Lead inspected the semantic diff and owns integration. The patch is frozen; session35163 saved-recipe test PASS1/1 (6.30s) with ordinary thread stack and no test-specific workaround (`sec-issuer-recipe-stack-final.log`). Final release-consumer compilation PASS (2m08s); session35163 is terminal0.
+
+The initial fiscal check exposed `RevisionAuthority(CanonicalEncoding)`: filing/fundamental family
+encoding still required a stock identifier. Merely accepting raw `None` would merge unrelated issuers.
+The canonical contract now requires `CompanyObservationSubject`: source-native issuer or explicit
+source-attributed instrument, consistent with provenance. SEC carries its validated CIK. Revision,
+PIT, dataset selectors, application financial readers and restart evidence use that same subject.
+The existing isolation fixture initially excluded calendar-date facts against an exact-timestamp
+cutoff; its native coordinates were corrected without changing selection rules.
+
+The active development root and its original evidence remain preserved. Service84759/native84825
+are still running the previous build, and watcher6907 is paused during serialized checks. The edited
+canonical schema/recipe must use a fresh development root before a new runtime is launched; do not
+resume this watcher against the preserved old schema. No migration or backward-compatibility path.
 
 Overview owns the editable watchlist; it does not represent holdings. Markets owns broader discovery,
 Portfolio owns actual holdings with practice accounts distinguished, and every selected ticker opens
@@ -83,12 +177,13 @@ exact file bytes and Tauri configuration as well as its package/features. Omitti
 foundation input previously invalidated modeling/application dependencies unnecessarily. Keep the
 watcher paused during focused Cargo checks and preserve the current visible Desktop/service.
 
-Next financial checkpoint — Astra design complete (source anchor `49b96e5a` plus frozen profile
-changes; refresh after this checkpoint, no financial implementation yet):
+Current financial integration — issuer producer, relationship authority, snapshot helpers and
+fiscal consumers implemented in the working tree; focused fiscal/relationship restart checks pass.
+Persisted activation recipe verification passes; selected financial Desktop integration remains incomplete. The following design governs this integration:
 
 - SEC CIK identifies an issuer. Publish Company Facts/submissions/XBRL as issuer-owned evidence with
-  `instrument_id: None`, preserving exact CIK/company parent/source/clocks and the independent fund
-  registry. Remove invented CIK-stock IDs and one-to-one company registry requirements.
+  an explicit issuer subject and `instrument_id: None`, preserving exact CIK/company parent/source/
+  clocks and the independent fund registry. Remove invented CIK-stock IDs and one-to-one company registry requirements.
 - Ordinary exact relationships can be automatic: add an explicit source-qualified listing basis to
   the existing company/security authority. Retain and atomically revalidate exact submissions,
   official listing row/generation, canonical definition, venue/symbol form, classification evidence
@@ -102,23 +197,19 @@ changes; refresh after this checkpoint, no financial implementation yet):
   epochs. Validate exact selected instrument, issuer/company parent, source and cutoff; never admit
   every raw row with absent instrument identity. Issuer totals do not authorize per-share economics
   for a particular class without the required shares/class evidence.
-- The SEC status selector currently accepts only direct strong-identifier links and can call multiple
-  valid share classes a conflict. The actual fiscal route uses instrument_company_as_of, which admits
-  operator relationships, but its consumers require raw Some(selected InstrumentId). Correct both
-  contracts together. The earlier preview/confirm-only recommendation is not the complete design.
+- The SEC selector now admits verified automatic and operator relationships alongside direct
+  crosswalks, with exact selected-instrument queries. Fiscal and company-product consumers validate
+  issuer subjects against retained relationship evidence; raw stock attribution is no longer required.
+  The earlier preview/confirm-only recommendation is not the complete design.
 - Reuse existing acquisition for missing issuer data, then freeze the result cutoff after publication;
   display independently loaded financial facts/filings with current Display authorization. Preserve
   LocalAnalysis/Train separately. Narrow company/security reads reuse the snapshot mechanism rather
   than writer try_lock. Do not make provider/CIK setup part of ordinary investment detail.
 
-Proposed next ownership after refresh: lead reserves domain relationship contract, existing schema
-constraint/checksum, application composition and shared transports; Sol SEC adapter normalization/
-client/extraction; Astra data company-security authority and SEC fiscal/epoch readers; Sol Desktop
-financial section after DTO freeze. Before any canonical schema change, explicitly account for the
-current development root and preserve its original evidence; do not introduce migration machinery
-or silently discard data. Existing parent/PIT/restart and SEC origin/epoch cases are the critical
-checks, extended for multiple share classes, preferred-class rejection, exact receipts and reads
-under writer ownership. No new general manual-confirmation prerequisite.
+Next dependency: complete the demand-loaded selected financial result and its shared clients,
+then verify real acquisition and native rendering against a fresh canonical development root.
+Preserve the previous root and evidence. Existing parent/PIT/restart and SEC origin/epoch cases
+cover core integrity; they do not establish a complete rich investment detail or installed journey.
 
 Primary-source basis reviewed2026-10-01:
 [SEC entity APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces),
@@ -129,10 +220,9 @@ Ticker directories discover candidates; retained submissions plus exact listing/
 corroborate the actual issuer/security relationship. Explicit user resolution is exceptional and
 cannot invent missing evidence or historical validity.
 
-Dependency order: finish/push quote checkpoint (done), prepare profile leaf concurrently with
-credential-buffer correction, verify/commit startup correction, then integrate profile producer and
-all clients as one checkpoint. Only the lead schedules compilation; the watcher is paused while
-manual focused Cargo checks run, with current visible Desktop/service retained.
+Dependency order: quote/profile/startup checkpoints pushed → issuer acquisition and fiscal authority
+checkpoint pushed as `11388990` → selected financial detail/shared clients → real stock journey.
+Only the lead schedules compilation; preserve the running visible Desktop during manual checks.
 
 Navigation critical evidence: existing market journey passes with watchlist mutation and failed-refresh
 preservation on Overview, separate Markets navigation, exact investment selection and demand-loaded
