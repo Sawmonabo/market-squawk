@@ -2,6 +2,44 @@
 
 ## Current execution — 2026-10-02
 
+Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop46253,
+service46206, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
+Old processes stopped gracefully; original roots remain preserved. One queued runtime rebuild
+is active (Cargo46301); no test compiler runs alongside it. The previous runtime build passed
+in8m04s. SEC official-shape and malformed/resource parser cases now PASS2/2 (0.05s execution).
+A later live retry identified legitimate spaced form names rejected by the generic identifier
+type, detailed below. MSFT profile and previous close remain independently visible; positive
+financial rendering and complete startup remain unproved.
+
+Pushed `33a441db` prevents test-only source edits from triggering runtime rebuilds; existing
+launcher lifecycle PASS1/1 (0.51s). The integrated runtime uses that correction. Compiler queue
+15319 completed the SEC cases, then was stopped before application-test compilation because a
+queued watcher rebuild had begun. The empty-collection check is pending after that build.
+
+| Active lane | Exclusive ownership / dependency | Finish boundary |
+| --- | --- | --- |
+| Astra sec_automatic_resolution — complete/frozen | SEC `src/json.rs`; lead owns existing parser WIP | Typed resource rejection now survives Serde with budgets unchanged. Lead inspected diff; existing two parser cases queued. |
+| Sol dev_launcher — complete, source unchanged | Read-only launcher/Vite/capability inspection | Keep Fast Refresh and existing advertised read/close capability guard. A global HMR gate would not fix the SEC acquisition failure; names alone cannot guarantee compatibility of changed existing payloads. No speculative version framework. |
+| Lead | Activation diagnostics, runtime, integration/shared files, ledger/Git and all compilation | Reveal typed live SEC failure, fix actual acquisition edge, verify selected financial pages and empty starter read, commit/push coherent checkpoint. |
+
+Next proven financial-input correction: retained Apple submissions has 47 legitimate spaced
+form labels; row32 `SCHEDULE 13G` is rejected by `SourceIdentifier` whitespace rules. The error
+is then collapsed to InvalidProtocolState. Existing source identifiers must stay strict. Lead
+will integrate one canonical `FilingForm` through domain, adapter, stored financial context and
+actual consumers. No whitespace rewriting or record omission. Astra sec_automatic_resolution owns
+preparing that complete patch under `.agents/tmp/v1-first-stock/filing-form-candidate/` (no live
+source edits during compilation); lead alone applies the inspected coherent batch. Existing SEC
+parser and canonical filing/context roundtrip checks provide the thin regression seam. Current
+parser checks PASS2/2; empty-collection test15319 was stopped before compilation when the watcher
+started its queued build. It is pending rescheduling after that exact build finishes.
+
+Dependency: parser correction plus exact acquisition diagnosis → one coordinated runtime build →
+serialized critical checks and live financial retry → commit/push. No new worktree or broad gate.
+The separate diagnosed Kraken freshness/publication continuity defect remains required next work;
+its correction must preserve already-admitted evidence while revoking new stale admission. It is
+not solved by a sink-only exception. Earlier startup_read_diagnosis is complete and owns no files.
+
+
 Selected financial detail wave, refreshed at `5f31458a` (Quarter 4, existing Wave 1/4):
 user outcome is independently loaded facts, statements, ratios and filings for the selected ticker,
 with exact evidence and bounded pages. Existing issuer publication/association is critically verified.
@@ -40,10 +78,9 @@ The owner's visible financial error was traced to Vite refreshing these UI comma
 running native binary: staged Desktop84825 contains `Research.GetInvestmentProfile` but not
 `Research.GetInvestmentFinancials` or its native query variant. The UI now checks advertised read
 and close capabilities, preserving other sections instead of issuing unsupported requests. This is
-not positive financial-data proof. The staged old service84759/Desktop84825 and their original root
-remain preserved; watcher6907 stays paused. Next: build the integrated binaries, configure a fresh
-canonical root and prove actual stock financial pages through background native interaction, then
-restore the coordinated visible development session. The read-only launch procedure is saved at
+not positive financial-data proof. Those old processes and watcher have since stopped gracefully; their original root remains
+preserved. The integrated binaries now run on the fresh root recorded above. Positive stock
+financial pages through background native interaction remain the next proof. The read-only launch procedure is saved at
 `financial-native-launch-plan.md`; it does not itself establish runtime verification.
 No live financial, installed-workflow, full-gate or whole-app-memory completion is claimed.
 

@@ -284,9 +284,8 @@ impl SubmissionsDocument {
             cancellation,
             &retained,
         )?;
-        for filing in &filings {
-            validate_accession_owner(filing.accession(), &cik)?;
-        }
+        // Accession prefixes identify the submitting account, which can be a filing agent.
+        // The response CIK and retained submissions context establish the subject company.
         let companions =
             parse_companions(filings_object.get("files"), limits, cancellation, &retained)?;
         retained.admit_bytes(
@@ -662,7 +661,7 @@ fn parse_filing_columns(
                     .map(parse_date)
                     .transpose()?,
                 accepted_at: nonempty_column_string(object, "acceptanceDateTime", index)?
-                    .map(parse_acceptance_timestamp)
+                    .map(parse_rfc3339_timestamp)
                     .transpose()?,
                 primary_document: optional_nonempty_column_string(
                     object,
@@ -825,11 +824,18 @@ pub(crate) fn validate_companion_coverage(
     archive: &SubmissionsArchive,
     cik: &SourceIdentifier,
 ) -> Result<(), SecParserError> {
-    if u64::try_from(archive.filings.len()).ok() != Some(declaration.filing_count) {
+    let company_companion = declaration
+        .name()
+        .as_str()
+        .strip_prefix("CIK")
+        .and_then(|name| name.strip_prefix(cik.as_str()))
+        .is_some_and(|suffix| suffix.starts_with("-submissions-"));
+    if !company_companion
+        || u64::try_from(archive.filings.len()).ok() != Some(declaration.filing_count)
+    {
         return Err(SecParserError::InvalidCompanionCoverage);
     }
     for filing in &archive.filings {
-        validate_accession_owner(filing.accession(), cik)?;
         if filing.filed_on() < declaration.filing_from || filing.filed_on() > declaration.filing_to
         {
             return Err(SecParserError::InvalidCompanionCoverage);

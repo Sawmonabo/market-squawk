@@ -71,6 +71,76 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
         former_name.company_metadata().former_names()[0].name(),
         "APPLE COMPUTER INC"
     );
+    // Reduced from the retained official Apple submissions response retrieved 2026-10-02.
+    // The accession's submitting account differs from the response's subject company.
+    let agent_submission = serde_json::json!({
+        "cik":"0000320193", "name":"Apple Inc.",
+        "tickers":["AAPL"], "exchanges":["Nasdaq"],
+        "filings":{"recent":{
+            "accessionNumber":["0001628280-17-004790"], "form":["10-Q"],
+            "filingDate":["2017-05-03"], "reportDate":["2017-04-01"],
+            "acceptanceDateTime":["2017-05-04T00:32:23.000Z"],
+            "primaryDocument":["a10-qq22017412017.htm"]
+        }, "files":[]}
+    });
+    let agent_recent = SubmissionsDocument::parse(&serde_json::to_vec(&agent_submission)?, limits)?;
+    assert_eq!(agent_recent.cik().as_str(), "0000320193");
+    let agent_filing = agent_recent
+        .filing("0001628280-17-004790")
+        .ok_or("missing agent-submitted filing")?;
+    assert_eq!(
+        agent_filing
+            .accepted_at()
+            .ok_or("missing acceptance time")?
+            .unix_nanos(),
+        1_493_857_943_000_000_000
+    );
+    let agent_archive = SubmissionsDocument::parse_archive(
+        &serde_json::to_vec(&agent_submission["filings"]["recent"])?,
+        limits,
+    )?;
+    let mut archive_context = agent_submission.clone();
+    for column in archive_context["filings"]["recent"]
+        .as_object_mut()
+        .ok_or("missing columns")?
+        .values_mut()
+    {
+        *column = serde_json::json!([]);
+    }
+    archive_context["filings"]["files"] = serde_json::json!([{
+        "name":"CIK0000320193-submissions-001.json", "filingCount":1,
+        "filingFrom":"2017-05-03", "filingTo":"2017-05-03"
+    }]);
+    let recent_context =
+        SubmissionsDocument::parse(&serde_json::to_vec(&archive_context)?, limits)?;
+    let joined = reconcile_submissions(
+        &recent_context,
+        std::slice::from_ref(&agent_archive),
+        limits,
+    )?;
+    assert_eq!(joined.cik(), agent_recent.cik());
+    assert_eq!(joined.filings(), agent_recent.filings());
+    archive_context["filings"]["files"][0]["name"] =
+        serde_json::json!("CIK0000789019-submissions-001.json");
+    let wrong_context = SubmissionsDocument::parse(&serde_json::to_vec(&archive_context)?, limits)?;
+    assert!(matches!(
+        reconcile_submissions(&wrong_context, &[agent_archive], limits),
+        Err(SecParserError::InvalidCompanionCoverage)
+    ));
+    let mut missing_zone = agent_submission.clone();
+    missing_zone["filings"]["recent"]["acceptanceDateTime"][0] =
+        serde_json::json!("2017-05-04T00:32:23");
+    assert!(matches!(
+        SubmissionsDocument::parse(&serde_json::to_vec(&missing_zone)?, limits),
+        Err(SecParserError::InvalidTimestamp)
+    ));
+    let mut malformed_accession = agent_submission;
+    malformed_accession["filings"]["recent"]["accessionNumber"][0] =
+        serde_json::json!("0001628280-17-bad");
+    assert!(matches!(
+        SubmissionsDocument::parse(&serde_json::to_vec(&malformed_accession)?, limits),
+        Err(SecParserError::InvalidAccession)
+    ));
     assert_eq!(reconciled.filings().len(), 3);
     assert_eq!(
         reconciled
@@ -129,11 +199,16 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
         "entityName":"APPLE INC",
         "facts":{"us-gaap":{"ExactRatio":{"units":{"pure":[{
             "val":0.1234567890123456789012345678,
-            "accn":"0000320193-25-000079","form":"10-Q",
+            "accn":"0001628280-25-000079","form":"10-Q",
             "filed":"2025-08-01","end":"2025-06-28"
         }]}}}}
     }"#;
     let exact = CompanyFactsDocument::parse(high_precision, limits)?;
+    assert_eq!(exact.cik().as_str(), "0000320193");
+    assert_eq!(
+        exact.occurrences()[0].accession().as_str(),
+        "0001628280-25-000079"
+    );
     assert_eq!(
         exact.occurrences()[0].value().to_string(),
         "0.1234567890123456789012345678"
@@ -221,12 +296,13 @@ fn malformed_columnar_shapes_and_record_limits_fail_closed() -> TestResult {
     ));
     let no_retained_output =
         SecParserLimits::try_new(1024 * 1024, 10, 128, 256 * 1024, 512 * 1024, 1)?;
-    assert!(matches!(
-        CompanyFactsDocument::parse(
-            include_bytes!("../fixtures/company-facts.json"),
-            no_retained_output
-        ),
-        Err(SecParserError::RetainedOutputLimitExceeded)
-    ));
+    let rejected = CompanyFactsDocument::parse(
+        include_bytes!("../fixtures/company-facts.json"),
+        no_retained_output,
+    );
+    assert!(
+        matches!(rejected, Err(SecParserError::RetainedOutputLimitExceeded)),
+        "{rejected:?}"
+    );
     Ok(())
 }

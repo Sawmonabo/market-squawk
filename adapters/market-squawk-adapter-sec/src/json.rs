@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Datelike as _, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike as _, NaiveDate};
 use market_squawk_domain::{CalendarDate, SourceIdentifier, Timestamp};
 use serde::de;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -340,7 +340,8 @@ pub(crate) fn parse_bounded_json_with_allocation_authority(
         budget: &mut budget,
         depth: 1,
     }
-    .deserialize(&mut deserializer)?;
+    .deserialize(&mut deserializer)
+    .map_err(|error| budget.failure.take().unwrap_or_else(|| error.into()))?;
     deserializer.end()?;
     Ok(value)
 }
@@ -352,6 +353,7 @@ pub(crate) struct RawJsonParseAuthority {
     max_nodes: usize,
     cancellation: CancellationToken,
     retained: RetainedJsonBudget,
+    failure: Option<SecParserError>,
 }
 
 impl RawJsonParseAuthority {
@@ -367,7 +369,18 @@ impl RawJsonParseAuthority {
             max_nodes: limits.max_records.saturating_mul(16),
             cancellation,
             retained,
+            failure: None,
         }
+    }
+
+    // Serde visitors must return the deserializer's error type. Retain the original authority
+    // failure separately so resource/cancellation failures survive without parsing error text.
+    fn serde_error<E: de::Error>(&mut self, error: SecParserError) -> E {
+        let external = E::custom(&error);
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+        external
     }
 
     pub(crate) fn charge_node(&mut self) -> Result<(), SecParserError> {
@@ -413,9 +426,13 @@ impl<'de> DeserializeSeed<'de> for BoundedValueSeed<'_> {
         D: serde::Deserializer<'de>,
     {
         if self.depth > self.budget.limits.max_depth {
-            return Err(de::Error::custom(SecParserError::DepthLimitExceeded));
+            return Err(self
+                .budget
+                .serde_error::<D::Error>(SecParserError::DepthLimitExceeded));
         }
-        self.budget.charge_node().map_err(de::Error::custom)?;
+        self.budget
+            .charge_node()
+            .map_err(|error| self.budget.serde_error::<D::Error>(error))?;
         deserializer.deserialize_any(BoundedValueVisitor {
             budget: self.budget,
             depth: self.depth,
@@ -455,19 +472,24 @@ impl Visitor<'_> for BoundedStringVisitor<'_> {
     where
         E: de::Error,
     {
-        self.budget.charge_string(value).map_err(E::custom)?;
-        owned_string_bounded(value, &self.budget.retained).map_err(E::custom)
+        self.budget
+            .charge_string(value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
+        owned_string_bounded(value, &self.budget.retained)
+            .map_err(|error| self.budget.serde_error::<E>(error))
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        self.budget.charge_string(&value).map_err(E::custom)?;
+        self.budget
+            .charge_string(&value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         self.budget
             .retained
             .admit_bytes(value.capacity())
-            .map_err(E::custom)?;
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         Ok(value)
     }
 }
@@ -502,28 +524,32 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     {
         Number::from_f64(value)
             .map(Value::Number)
-            .ok_or_else(|| E::custom(SecParserError::InvalidNumber))
+            .ok_or_else(|| self.budget.serde_error::<E>(SecParserError::InvalidNumber))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        self.budget.charge_string(value).map_err(E::custom)?;
+        self.budget
+            .charge_string(value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         owned_string_bounded(value, &self.budget.retained)
             .map(Value::String)
-            .map_err(E::custom)
+            .map_err(|error| self.budget.serde_error::<E>(error))
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        self.budget.charge_string(&value).map_err(E::custom)?;
+        self.budget
+            .charge_string(&value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         self.budget
             .retained
             .admit_bytes(value.capacity())
-            .map_err(E::custom)?;
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         Ok(Value::String(value))
     }
 
@@ -550,21 +576,21 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     where
         A: SeqAccess<'de>,
     {
-        let child_depth = self
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| de::Error::custom(SecParserError::DepthLimitExceeded))?;
+        let child_depth = self.depth.checked_add(1).ok_or_else(|| {
+            self.budget
+                .serde_error::<A::Error>(SecParserError::DepthLimitExceeded)
+        })?;
         let initial = sequence.size_hint().unwrap_or(0).min(1_024);
         let mut values = Vec::new();
         try_reserve_exact_bounded(&mut values, initial, &self.budget.retained)
-            .map_err(de::Error::custom)?;
+            .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
         while let Some(value) = sequence.next_element_seed(BoundedValueSeed {
             budget: self.budget,
             depth: child_depth,
         })? {
             if values.len() == values.capacity() {
                 try_reserve_exact_bounded(&mut values, 1, &self.budget.retained)
-                    .map_err(de::Error::custom)?;
+                    .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
             }
             values.push(value);
         }
@@ -575,17 +601,19 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let child_depth = self
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| de::Error::custom(SecParserError::DepthLimitExceeded))?;
+        let child_depth = self.depth.checked_add(1).ok_or_else(|| {
+            self.budget
+                .serde_error::<A::Error>(SecParserError::DepthLimitExceeded)
+        })?;
         let Some(first_key) = map.next_key_seed(BoundedStringSeed {
             budget: self.budget,
         })?
         else {
             return Ok(Value::Object(Map::new()));
         };
-        self.budget.charge_node().map_err(de::Error::custom)?;
+        self.budget
+            .charge_node()
+            .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
         if first_key == "$serde_json::private::Number" {
             let lexical = map.next_value_seed(BoundedStringSeed {
                 budget: self.budget,
@@ -602,14 +630,18 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
         self.budget
             .retained
             .admit_btree_entry::<String, Value>(0)
-            .map_err(de::Error::custom)?;
+            .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
         values.insert(first_key, first_value);
         while let Some(key) = map.next_key_seed(BoundedStringSeed {
             budget: self.budget,
         })? {
-            self.budget.charge_node().map_err(de::Error::custom)?;
+            self.budget
+                .charge_node()
+                .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
             if values.contains_key(&key) {
-                return Err(de::Error::custom(SecParserError::DuplicateKey));
+                return Err(self
+                    .budget
+                    .serde_error::<A::Error>(SecParserError::DuplicateKey));
             }
             let value = map.next_value_seed(BoundedValueSeed {
                 budget: self.budget,
@@ -618,7 +650,7 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
             self.budget
                 .retained
                 .admit_btree_entry::<String, Value>(0)
-                .map_err(de::Error::custom)?;
+                .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
             values.insert(key, value);
         }
         Ok(Value::Object(values))
@@ -683,16 +715,6 @@ fn parse_date(value: &str) -> Result<CalendarDate, SecParserError> {
     )?)
 }
 
-fn parse_acceptance_timestamp(value: &str) -> Result<Timestamp, SecParserError> {
-    let timestamp = NaiveDateTime::parse_from_str(value, "%Y-%m-%d%H%M%S")
-        .map_err(|_| SecParserError::InvalidTimestamp)?
-        .and_utc();
-    let nanos = timestamp
-        .timestamp_nanos_opt()
-        .ok_or(SecParserError::InvalidTimestamp)?;
-    Ok(Timestamp::from_unix_nanos(nanos))
-}
-
 fn parse_rfc3339_timestamp(value: &str) -> Result<Timestamp, SecParserError> {
     let timestamp = DateTime::parse_from_rfc3339(value)
         .map_err(|_| SecParserError::InvalidTimestamp)?
@@ -726,17 +748,6 @@ fn validate_accession(value: &str) -> Result<(), SecParserError> {
     } else {
         Ok(())
     }
-}
-
-fn validate_accession_owner(
-    value: &SourceIdentifier,
-    cik: &SourceIdentifier,
-) -> Result<(), SecParserError> {
-    validate_accession(value.as_str())?;
-    if value.as_str().get(..10) != Some(cik.as_str()) {
-        return Err(SecParserError::InvalidAccessionOwner);
-    }
-    Ok(())
 }
 
 fn validate_component(value: &str) -> Result<(), SecParserError> {
@@ -891,7 +902,6 @@ pub enum SecParserError {
     ColumnLengthMismatch,
     InvalidCik,
     InvalidAccession,
-    InvalidAccessionOwner,
     InvalidCompanionName,
     InvalidCompanionCoverage,
     InvalidConcept,

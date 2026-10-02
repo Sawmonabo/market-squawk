@@ -88,6 +88,14 @@ Filing acceptance, filing date, report period, quarterly bulk cutoff, provider p
 local first observation are distinct clocks. Company Facts occurrences and filing amendments append
 revision lineage; they are never overwritten. A missing derived N-CEN row cannot mean no filing.
 
+Parser correction, 2026-10-02: `acceptanceDateTime` uses the reported RFC3339 timezone; a missing
+zone is not assumed to mean UTC. The accession prefix identifies the submitting login CIK,
+which can belong to a filing agent rather than the subject company, as the
+[SEC login-CIK guide](https://www.sec.gov/submit-filings/filer-support-resources/how-do-i-guides/understand-select-set-default-login-cik)
+explains (reviewed 2026-10-02). Issuer attribution uses the exact submissions response CIK and
+retained filing context. Companion pages retain their declared company-CIK filename, count and
+filing-date bounds; accepting agent-submitted accessions does not relax those checks.
+
 ## Official limits, application budgets, and scheduling
 
 **VERIFIED PROVIDER FACT:** SEC states a maximum of `10 requests/second` for automated access.

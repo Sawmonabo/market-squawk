@@ -183,7 +183,7 @@ impl CompanyFactsDocument {
                             source_ordinal,
                             &retained,
                         )?;
-                        validate_accession_owner(occurrence.accession(), &cik)?;
+                        validate_accession(occurrence.accession().as_str())?;
                         if occurrences.len() == occurrences.capacity() {
                             try_reserve_exact_bounded(&mut occurrences, 1, &retained)?;
                         }

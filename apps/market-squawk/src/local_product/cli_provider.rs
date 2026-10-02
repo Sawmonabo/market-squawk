@@ -1792,6 +1792,9 @@ pub(super) async fn publish_activated_macro_data(
     if lease.surface_id().as_str() == SEC_EDGAR_PROFILE_ID {
         return Box::pin(activation.publish_sec_fundamentals(deadline, cancellation))
             .await
+            .inspect_err(|error| {
+                tracing::warn!(error = ?error, "SEC company publication failed");
+            })
             .map_err(|_| CliProviderActivationError::ProviderConfiguration);
     }
     let operation = match lease.surface_id().as_str() {
