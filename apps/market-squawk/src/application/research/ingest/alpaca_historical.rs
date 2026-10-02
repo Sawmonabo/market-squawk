@@ -2352,6 +2352,314 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn queued_alpaca_capture_survives_session_end_and_successor_publishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::system_timestamp;
+        use bytes::Bytes;
+        use market_squawk_adapter_alpaca::{
+            AlpacaIexDecoder, AlpacaIexLiveConfig, AlpacaTransportLimits,
+        };
+        use market_squawk_data::MarketDataInstrumentSynchronization;
+        use market_squawk_domain::{
+            AssignmentVerification, ConnectionGeneration, ExternalIdentifier,
+            ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
+            IdentifierRightsPolicyReference, MarketDataReference, Ticker,
+        };
+        use market_squawk_platform::{
+            CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureWriterPolicy,
+            MemoryCaptureSink, initialize_capture_process_infrastructure, raw_capture_channel,
+            spawn_capture_writer,
+        };
+        use market_squawk_sources::{
+            AuthoritativeSourceRegistry, CatalogProviderIdentityAuthority, DecodeOutcome,
+            SessionId, TransportFrameKind,
+        };
+        use std::num::NonZeroUsize;
+
+        // Reuse the owning coordinator/reference fixture. Account admission is unchanged and
+        // precedes the production seam exercised here; no test account authority is fabricated.
+        let (coordinator, _mutation) = test_coordinator()?;
+        let research = &coordinator.research;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (_, original, _) = fixture_plan()?;
+        // Alpaca's asset UUID and the assigned subscription ticker are distinct identities.
+        let ticker = ExternalIdentifierRecord::new(ExternalIdentifierRecordInput {
+            identifier: ExternalIdentifier::Ticker(Ticker::try_from("AAPL")?),
+            assignment_verification: AssignmentVerification::VerifiedAssigned,
+            source_id: SourceId::try_from("nasdaq-trader-symbol-directory-reference")?,
+            source_evidence: original.reference_evidence().payload_evidence().clone(),
+            source_timestamp: None,
+            observed_at: original.provider_identities()[0].observed_at(),
+            validity: original.effective_interval(),
+            rights_policy: IdentifierRightsPolicyReference::new(
+                SourceIdentifier::try_from("reference-local-use")?,
+                IdentifierEntitlement::LicensedInternalUse,
+                SourceIdentifier::try_from("https://www.nasdaqtrader.com")?,
+            ),
+        });
+        let definition =
+            MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                instrument_id: original.instrument_id(),
+                reference_evidence: original.reference_evidence().clone(),
+                effective_interval: original.effective_interval(),
+                asset_class: original.asset_class(),
+                display_name: None,
+                quote_currency: original.quote_currency(),
+                quote_currency_evidence: original.quote_currency_evidence().clone(),
+                venue_mappings: original.venue_mappings().to_vec(),
+                provider_identities: original.provider_identities().to_vec(),
+                identifiers: vec![ticker],
+            })?;
+        coordinator
+            .market_data_instrument_synchronization()
+            .synchronize(
+                MarketDataInstrumentSynchronization::try_new(vec![definition], 1)?,
+                deadline,
+                &cancellation,
+            )?;
+        let catalog = research.market_data_instruments();
+        let record = catalog
+            .latest(original.instrument_id(), deadline, &cancellation)?
+            .ok_or("missing live reference")?;
+        let at = system_timestamp()?;
+        let native = market_squawk_sources::ProviderNativeIdentityRequest {
+            namespace: original.provider_identities()[0].source_id().clone(),
+            provider_instrument_id: original.provider_identities()[0]
+                .provider_instrument_id()
+                .clone(),
+            instrument: original.instrument_id(),
+            venue: VenueId::try_from("iex")?,
+            venue_symbol: VenueSymbol::try_from("AAPL")?,
+            knowledge_at: at,
+            effective_at: at,
+        };
+        let selected = catalog.select_current(&native, deadline, &cancellation)?;
+        let reference = MarketDataReference::try_from_assigned_identifier(
+            record.definition(),
+            record.revision_digest(),
+            &record.definition().identifiers()[0],
+            ProviderInstrumentId::try_from("AAPL")?,
+            at,
+        )?;
+        let history = fixture_metadata(21, HttpRequestBounds::default())?;
+        let config = AlpacaIexLiveConfig::try_new(
+            SourceId::try_from("alpaca-live-reconnect-test")?,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("alpaca-live-reconnect-v1")?),
+                exact_evidence(61),
+            ),
+            history.authorization().clone(),
+            exact_evidence(62),
+            original.effective_interval(),
+            vec![
+                AlpacaInstrumentMapping::try_new(
+                    "AAPL".to_owned(),
+                    original.instrument_id(),
+                    AssetClass::Equity,
+                )?
+                .try_with_native_identity(native.clone())?,
+            ],
+            history.freshness_policy(),
+            history
+                .budget_policy()
+                .ok_or("missing fixture budget")?
+                .clone(),
+            AlpacaTransportLimits::try_new(
+                1024 * 1024,
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            )?,
+        )?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+            Arc::new(TestAuthorizationSubjectResolver { evidence: exact_evidence(22).content_digest(), record: SourceIdentifier::try_from("alpaca-test-credential-record")? }),
+        )?.with_provider_identity_authority(Arc::new(catalog.clone()))?;
+        let registered = registry.register(config.metadata().clone(), at)?;
+        registry.record_provider_identities(&registered, &[native], deadline, &cancellation)?;
+        let process =
+            initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+                NonZeroUsize::new(1024 * 1024).ok_or("zero process bound")?,
+            ))?;
+        let expected_directory = tempfile::tempdir()?;
+        let expected_paths = LocalPaths::prepare(expected_directory.path().join("expected"))?;
+        let expected_store = expected_paths.sealed_research_journal_store()?;
+        let publication = market::AlpacaMarketPublicationClosure::try_new(
+            Arc::clone(research),
+            config.metadata().clone(),
+            fixture_rights(config.metadata().source_id().clone(), 24)?,
+            at,
+        )?;
+        let mut published = None;
+        for generation in 1..=2 {
+            let session = registry.begin_session(
+                &registered,
+                SessionId::new(SourceIdentifier::try_from(format!(
+                    "alpaca-queued-{generation}"
+                ))?),
+                ConnectionGeneration::new(generation)?,
+                system_timestamp()?,
+            )?;
+            let capabilities = registry.take_capture_generation_capabilities(&session)?;
+            let mut frames = registry.take_raw_frame_factory(&session)?;
+            let (publisher, mut capture, writer) = raw_capture_channel(
+                &process,
+                CaptureChannelLimits::new(
+                    NonZeroUsize::new(8).ok_or("zero queue")?,
+                    NonZeroUsize::new(4 * 1024 * 1024).ok_or("zero bytes")?,
+                ),
+                capabilities,
+            )?;
+            let writer = spawn_capture_writer(
+                writer,
+                MemoryCaptureSink::try_new(
+                    NonZeroUsize::new(8).ok_or("zero records")?,
+                    NonZeroUsize::new(4 * 1024 * 1024).ok_or("zero sink bytes")?,
+                )?,
+                CaptureWriterPolicy::default(),
+            )?;
+            capture.activate_initial()?;
+            let mut decoder = AlpacaIexDecoder::try_new(&config)?;
+            for payload in [
+                r#"{"AAPL":{}}"#,
+                r#"[{"T":"success","msg":"connected"}]"#,
+                r#"[{"T":"success","msg":"authenticated"}]"#,
+                r#"[{"T":"subscription","trades":["AAPL"],"quotes":["AAPL"],"statuses":["AAPL"],"corrections":["AAPL"],"cancelErrors":["AAPL"]}]"#,
+            ] {
+                let frame = frames.try_frame(
+                    TransportFrameKind::Text,
+                    Bytes::copy_from_slice(payload.as_bytes()),
+                )?;
+                let admitted = session.validate_live_frame(&frame)?;
+                let (outcome, pending) = decoder
+                    .decode_for_publication(
+                        &admitted,
+                        std::slice::from_ref(&reference),
+                        system_timestamp()?,
+                    )?
+                    .into_parts();
+                assert!(matches!(
+                    outcome,
+                    DecodeOutcome::Ignored(_) | DecodeOutcome::Control(_)
+                ));
+                assert!(pending.is_none());
+            }
+            let payload = serde_json::to_vec(&serde_json::json!([{
+                "T":"t", "S":"AAPL", "i":generation, "x":"V", "p":512.71, "s":2,
+                "t":chrono::Utc::now().to_rfc3339(),
+            }]))?;
+            let frame = frames.try_frame(TransportFrameKind::Text, Bytes::from(payload.clone()))?;
+            let mut captured = publisher.try_publish(&frame)?;
+            let admitted = session.validate_live_frame(&frame)?;
+            let (outcome, prepared) = decoder
+                .decode_for_publication(
+                    &admitted,
+                    std::slice::from_ref(&reference),
+                    system_timestamp()?,
+                )?
+                .into_parts();
+            assert!(matches!(outcome, DecodeOutcome::Data(_)));
+            let prepared = prepared.ok_or("missing queued live publication")?;
+            let material = captured.try_issue_provider_event_microbatch_material(
+                &frame,
+                prepared.dataset().clone(),
+                prepared.stream_identity().clone(),
+            )?;
+            // An independent deterministic receipt lets us verify the actual custody store
+            // after disposition, without resealing into that store or trusting a file count.
+            let expected = expected_store.seal(material.records())?;
+            let (rejoin, seal_request) = prepared.into_pending_publication(&admitted, material)?;
+            if generation == 1 {
+                registry.end_session(&session, system_timestamp()?)?;
+            }
+            let sealed = research
+                .seal_provider_capture(seal_request, &cancellation, deadline)
+                .await?;
+            let binding = market::prepare_current_alpaca_binding(
+                rejoin,
+                sealed,
+                std::slice::from_ref(&reference),
+                std::slice::from_ref(&selected),
+            )?;
+            let retained = research
+                .provider_capture_store()
+                .open_verified_claim(expected.claim())?;
+            assert_eq!(retained.records().len(), 1);
+            assert_eq!(retained.records()[0].payload(), payload.as_slice());
+            if generation == 1 {
+                assert!(binding.is_none(), "ended session published canonically");
+            } else {
+                let binding = binding.ok_or("stale predecessor poisoned successor")?;
+                let receipt = publication
+                    .publish_market_events(
+                        binding,
+                        DatasetId::try_from("market_squawk.market_events")?,
+                        "alpaca-successor-fixture",
+                        system_timestamp()?,
+                        Arc::new(QueuedAlpacaFixturePrecommit {
+                            deadline,
+                            cancellation: cancellation.clone(),
+                        }),
+                        cancellation.clone(),
+                    )
+                    .await?;
+                assert_eq!(
+                    receipt.commit().sequence(),
+                    1,
+                    "obsolete capture acquired a commit"
+                );
+                assert_eq!(receipt.event_count(), 1);
+                published = Some(receipt);
+                registry.end_session(&session, system_timestamp()?)?;
+            }
+            drop(publisher);
+            drop(capture);
+            let mut shutdown = writer.shutdown(Duration::from_secs(2));
+            let _status = shutdown.wait_until_deadline().await;
+            assert!(shutdown.try_reap()?.is_some());
+        }
+        let receipt = published.ok_or("successor was not published")?;
+        let selectors =
+            research
+                .analytical()
+                .provider_market_event_publications(receipt.commit(), None, 2)?;
+        assert_eq!(selectors.len(), 1);
+        let reopened = research
+            .analytical()
+            .read_provider_market_event_publication(
+                receipt.commit(),
+                selectors[0],
+                research.provider_capture_store(),
+                deadline,
+                cancellation,
+            )
+            .await?;
+        assert_eq!(reopened.events().len(), 1);
+        assert!(
+            matches!(&reopened.events()[0], market_squawk_domain::MarketEvent::MarketDataTrade(trade)
+            if trade.price().amount() == rust_decimal::Decimal::new(51271, 2))
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct QueuedAlpacaFixturePrecommit {
+        deadline: Instant,
+        cancellation: CancellationToken,
+    }
+
+    impl market_squawk_data::IngestPrecommitAuthority for QueuedAlpacaFixturePrecommit {
+        fn validate_precommit(&self) -> Result<(), market_squawk_data::IngestError> {
+            if self.cancellation.is_cancelled() {
+                Err(market_squawk_data::IngestError::Cancelled)
+            } else if Instant::now() >= self.deadline {
+                Err(market_squawk_data::IngestError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn retained_authorization_waits_outside_original_capture_io_worker()
     -> Result<(), Box<dyn std::error::Error>> {
         use market_squawk_data::{

@@ -28,8 +28,8 @@ use market_squawk_sources::{
     OptionMarketBatchKind, OptionMarketCursorState, OptionMarketRequestFilter,
     ProviderCaptureError, ProviderCaptureSealRequest, ProviderIdentitySelectionEvidence,
     ProviderMarketEventBatch, ProviderNativeIdentityRequest, ProviderNativeLineageImplementation,
-    SealedProviderOptionMarketBinding, SealedProviderPublicationBinding, SourceClass,
-    SourceMetadata, SourceProtocolProfile,
+    SealedProviderCaptureMaterial, SealedProviderOptionMarketBinding,
+    SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceProtocolProfile,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -1077,11 +1077,11 @@ impl AlpacaPublicationRuntimeInput {
             deadline,
             cancellation: operation.cancellation().clone(),
         });
-        let binding = rejoin.try_rejoin(sealed)?;
-        // The sealed adapter batch keeps original HTTP response / stream frame row ordinals.
-        // Attach each accepted catalog selection at that canonical ordinal before reservation.
-        let binding =
-            attach_alpaca_selected_identities(binding, &self.references, &self.identities)?;
+        let Some(binding) =
+            prepare_current_alpaca_binding(rejoin, sealed, &self.references, &self.identities)?
+        else {
+            return Ok(AlpacaLivePublicationOutcome::RawRetained);
+        };
         let digest = provider_market_event_publication_digest(&binding)?;
         let idempotency = format!(
             "alpaca-current-{}",
@@ -1108,6 +1108,24 @@ impl AlpacaPublicationRuntimeInput {
         }
         Ok(AlpacaLivePublicationOutcome::CanonicalPublished)
     }
+}
+
+/// Rejoins sealed custody and attaches exact selected identities before any reservation.
+/// A queued frame can outlive its transport session during ordinary source reconnect. Its raw
+/// evidence remains retained, but it cannot publish canonically under that ended session.
+pub(super) fn prepare_current_alpaca_binding(
+    rejoin: AlpacaMarketSealRejoin,
+    sealed: SealedProviderCaptureMaterial,
+    references: &[MarketDataReference],
+    identities: &[Arc<dyn CurrentCatalogProviderIdentity>],
+) -> Result<Option<SealedProviderPublicationBinding>, AlpacaMarketPublicationError> {
+    let binding = match rejoin.try_rejoin(sealed) {
+        Ok(binding) => binding,
+        Err(AlpacaError::PublicationSessionNotCurrent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // Preserve original response/frame ordinals and all canonical/native/catalog bindings.
+    attach_alpaca_selected_identities(binding, references, identities).map(Some)
 }
 
 /// Checks the catalog-selected native route against the accepted publication reference.
