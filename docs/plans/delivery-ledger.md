@@ -2,42 +2,46 @@
 
 ## Current execution — 2026-10-02
 
-Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop46253,
-service46206, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
-Old processes stopped gracefully; original roots remain preserved. One queued runtime rebuild
-is active (Cargo46301); no test compiler runs alongside it. The previous runtime build passed
-in8m04s. SEC official-shape and malformed/resource parser cases now PASS2/2 (0.05s execution).
-A later live retry identified legitimate spaced form names rejected by the generic identifier
-type, detailed below. MSFT profile and previous close remain independently visible; positive
-financial rendering and complete startup remain unproved.
+Current coordinated runtime: supervisor98843/PID89778 owns one visible Desktop49116,
+service49078, Vite and watcher89789 on `.market-squawk/v1-owner-test-financial-detail-2026-10-02`.
+The two queued application builds finished sequentially. Shared-service rerun3350 is terminal0;
+no compiler is active at this checkpoint.
+Original runtime roots and recovery history remain preserved.
 
-Pushed `33a441db` prevents test-only source edits from triggering runtime rebuilds; existing
-launcher lifecycle PASS1/1 (0.51s). The integrated runtime uses that correction. Compiler queue
-15319 completed the SEC cases, then was stopped before application-test compilation because a
-queued watcher rebuild had begun. The empty-collection check is pending after that build.
+Check78271 compiled in7m45s, then failed on an outdated MCP discovery assertion excluding all
+Research operations. The current product policy intentionally exposes exactly the investment
+profile, financial-read and financial-close operations. The fixture now asserts those three are
+visible while retaining all other management exclusions. The same shared-service case now PASS1/1,
+including concurrent startup reads, empty selected stock collection, MCP discovery and restart.
+Evidence: `.agents/tmp/v1-first-stock/financial-empty-collection-critical-rerun.log`; compile12.56s.
+
+Pushed `33a441db` prevents integration-test edits from rebuilding the running application;
+existing launcher lifecycle PASS1/1 (0.51s). Pushed `892903d0` accepts official RFC3339 acceptance
+timestamps and filing-agent accession prefixes while retaining typed parser failures. Existing SEC
+parser checks PASS2/2 (0.05s). PR #43 records both checkpoints. Neither proves live financial pages.
 
 | Active lane | Exclusive ownership / dependency | Finish boundary |
 | --- | --- | --- |
-| Astra sec_automatic_resolution — complete/frozen | SEC `src/json.rs`; lead owns existing parser WIP | Typed resource rejection now survives Serde with budgets unchanged. Lead inspected diff; existing two parser cases queued. |
-| Sol dev_launcher — complete, source unchanged | Read-only launcher/Vite/capability inspection | Keep Fast Refresh and existing advertised read/close capability guard. A global HMR gate would not fix the SEC acquisition failure; names alone cannot guarantee compatibility of changed existing payloads. No speculative version framework. |
-| Lead | Activation diagnostics, runtime, integration/shared files, ledger/Git and all compilation | Reveal typed live SEC failure, fix actual acquisition edge, verify selected financial pages and empty starter read, commit/push coherent checkpoint. |
+| Astra sec_automatic_resolution | Candidate files only under `.agents/tmp/v1-first-stock/filing-form-candidate/`; manifest records exact live-source base hashes. Canonical FilingForm and its SEC/domain/data/application consumers; no live edits/builds/Git. | Preserve legitimate spaced filing names through normalization and retained roundtrip; lead inspects and applies the complete batch after the running check finishes. |
+| Astra startup_read_diagnosis — bounded read-only follow-up | Current `Market.GetCollection` retained/previous-close read chain and financial-visible-dev.log; report only `.agents/tmp/v1-first-stock/collection-deadline-diagnosis.md`. No source edits, builds, runtime changes or Git. | Identify the source-supported reason a nine-symbol read reaches its deadline and the smallest producer-to-consumer correction; distinguish measured facts from hypotheses. |
+| Sol dev_launcher — complete, source unchanged | Read-only launcher/Vite/capability inspection | Existing advertised read/close guard handles unsupported new commands; no speculative global HMR/version framework. |
+| Lead | Empty collection early-return fix and existing shared-service fixture; shared contracts, runtime/build scheduling, integration, ledger/Git | Check3350 passed: empty selected stock pages no longer become wildcard registry reads. Commit this coherent checkpoint, then apply canonical form correction and verify actual financial acquisition. |
 
-Next proven financial-input correction: retained Apple submissions has 47 legitimate spaced
-form labels; row32 `SCHEDULE 13G` is rejected by `SourceIdentifier` whitespace rules. The error
-is then collapsed to InvalidProtocolState. Existing source identifiers must stay strict. Lead
-will integrate one canonical `FilingForm` through domain, adapter, stored financial context and
-actual consumers. No whitespace rewriting or record omission. Astra sec_automatic_resolution owns
-preparing that complete patch under `.agents/tmp/v1-first-stock/filing-form-candidate/` (no live
-source edits during compilation); lead alone applies the inspected coherent batch. Existing SEC
-parser and canonical filing/context roundtrip checks provide the thin regression seam. Current
-parser checks PASS2/2; empty-collection test15319 was stopped before compilation when the watcher
-started its queued build. It is pending rescheduling after that exact build finishes.
+Confirmed next financial defect: the real SEC submissions response contains `SCHEDULE 13G`,
+`DEF 14A` and other legitimate spaced forms. The generic SourceIdentifier rejects whitespace,
+causing parser failure and then `InvalidProtocolState`. The correction changes the owning form
+contract and all consumers together, preserving exact text and the existing byte bound rather
+than rewriting labels or relaxing unrelated identifiers. Candidate preparation is isolated only
+to keep the watcher from compiling half-applied producer/consumer edits; it is inside this worktree.
 
-Dependency: parser correction plus exact acquisition diagnosis → one coordinated runtime build →
-serialized critical checks and live financial retry → commit/push. No new worktree or broad gate.
-The separate diagnosed Kraken freshness/publication continuity defect remains required next work;
-its correction must preserve already-admitted evidence while revoking new stale admission. It is
-not solved by a sink-only exception. Earlier startup_read_diagnosis is complete and owns no files.
+Dependency: passed empty-collection checkpoint → coherent FilingForm application →
+one watcher build → serialized parser/domain checks → live SEC and selected financial reads.
+MSFT profile and previous close are independently observed; positive financial rendering,
+complete startup and installed restart remain unproved. Current live collection reads also show
+retained/previous-close deadline failures; the empty-page fix does not claim to solve those.
+The separately diagnosed Kraken freshness/publication continuity defect remains required next work;
+its correction must preserve admitted evidence while rejecting stale new admission and retaining
+real revocation. It is not solved by a sink-only exception. Prior diagnosis owns no live files.
 
 
 Selected financial detail wave, refreshed at `5f31458a` (Quarter 4, existing Wave 1/4):

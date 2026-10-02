@@ -1145,7 +1145,7 @@ async fn exercise_market_collection(
         client.invoke_operation(
             RequestId::try_string(format!("collection-read-{restored}"))?,
             "Market.GetCollection",
-            json!({}),
+            json!({"includeMarket": true}),
             INSTALLED_MCP_SERVICE_TIMEOUT,
             CancellationToken::new(),
         ),
@@ -3726,12 +3726,18 @@ async fn exercise_installed_relay_with_gate(
     assert!(!names.contains(&"Portfolio.GetRecommendationSetup"));
     assert!(names.contains(&"Macro.GetContext"));
     assert!(names.contains(&"Model.ListProductActivity"));
+    let investment_research = [
+        "Research.GetInvestmentProfile",
+        "Research.GetInvestmentFinancials",
+        "Research.CloseInvestmentFinancials",
+    ];
+    assert!(investment_research.iter().all(|name| names.contains(name)));
     assert!(names.iter().all(|name| {
         !name.starts_with("Source.")
             && !name.starts_with("Job.")
             && !name.starts_with("Operations.")
             && !name.starts_with("Setup.")
-            && !name.starts_with("Research.")
+            && (!name.starts_with("Research.") || investment_research.contains(name))
             && !name.starts_with("Fundamental.")
     }));
     assert!(!names.contains(&"Market.GetUnifiedFeed"));

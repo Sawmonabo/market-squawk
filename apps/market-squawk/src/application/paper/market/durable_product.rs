@@ -432,6 +432,11 @@ impl MarketDomainService {
         limits: ServiceLimits,
         context: &RequestContext,
     ) -> Result<Vec<Value>, ServiceError> {
+        ensure_live(context)?;
+        // An empty selected page is not the registry's wildcard instrument filter.
+        if instrument_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut progress = ProductReadProgress::new("market_display_rows", context);
         progress.enter("display_filters", None);
         let filters = MarketFilters {
@@ -572,6 +577,10 @@ impl MarketDomainService {
         limits: ServiceLimits,
         context: &RequestContext,
     ) -> Result<Vec<Value>, ServiceError> {
+        ensure_live(context)?;
+        if instruments.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut progress = ProductReadProgress::new("retained_market_display", context);
         progress.enter("retained_routes_and_events", None);
         let durable = load_retained_display_evidence(
