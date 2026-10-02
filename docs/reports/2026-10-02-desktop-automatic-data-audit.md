@@ -126,6 +126,8 @@ Extends existing **DP-03**, not a new duplicate defect. Remaining source `gcTime
 
 ### AD-05 — Minor: expanded workflow coverage requires a redundant second Open
 
+Remediation: expansion now mounts a scoped cancellable read through the existing DemandPanel; the redundant Open control is removed and native structured cursors are preserved. Lead source/transport inspection and typecheck pass. Populated native coverage and cancellation/reopen behavior remain unverified; this finding is not marked closed.
+
 Source `opportunities/analysis-activity.tsx:151–179`: `<details>` has no read trigger; first `workflowCoverage` call occurs only on “Open saved reasons.” Mutation-state data has no query caching/event invalidation or read cancellation. Impact: a user opens the unavailable-reasons view and still sees no saved reasons until another click. Fix: mount a bounded scoped cancellable read on expansion using existing workflow/cursor authority; keep Next navigation. Closure: expanding the panel shows initial reasons/loading/error automatically; reopen/retry behaves coherently and does not replay Resume/Cancel/analysis. Source-only because no saved workflow was available. Group: analytical workflow consumer after existing saved coverage producer.
 
 ### AD-06 — Important: transport/schema success is incorrectly sufficient evidence of completeness

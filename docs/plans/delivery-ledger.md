@@ -2,6 +2,27 @@
 
 ## Current execution — 2026-10-02
 
+Active next dependency wave (same worktree):
+
+| Owner | Outcome / exclusive files | Dependency and critical evidence |
+| --- | --- | --- |
+| Lead | Deploy `0cc7f04d`/`4ca72551` and verify real ratios/filing; shared contracts, native integration, Git and all build scheduling | Single supervisor rebuild only; real MSFT ratios, retained evidence/cursor and filing job outcome. |
+| Sol financial_display_fixes | AD-05: opening saved coverage automatically reads its reasons. Own only `src/features/opportunities/analysis-activity.tsx` | Reuse DemandPanel, scoped cancellable query and existing cursor controls; preserve deliberate Resume/Cancel. No tests/build/runtime/Git. Lead verifies existing critical workflow and expanded-read behavior before integration. |
+| Astra ratio_availability_diagnosis | Read-only AD-01 admission trace: existing selected financial/history jobs, deduplication and freshness authority | Return smallest coherent reuse of service-owned job/readiness flow and exact edit seams; no source edits/builds/Git/runtime. Lead owns subsequent shared contract integration. |
+
+AD-05 is implemented in `analysis-activity.tsx`: expanding saved coverage mounts a scoped
+cancellable query; the original structured cursor is passed unchanged; Resume/Cancel remain
+explicit. Lead inspected the diff and transport cancellation path; Desktop typecheck passes
+(`coverage-demand-types.log`). No populated saved workflow is available for live closure yet;
+the existing unrelated market test is not claimed as proof of this coverage behavior. The Sol
+assignment is complete and file ownership released.
+
+Current display correction is pushed as `0cc7f04d`; warm-return delayed-response check and
+typecheck passed. Agent ownership of the four market display files is released. The lead resumed
+Watchexec PID99703 and requested the single coordinated backend/native build; no other compile
+may run concurrently. Automatic selected financial/history acquisition remains the next shared
+service/transport integration dependency; AD-05 is independent of that authority change.
+
 Current integration: SEC number-word normalization is pushed as `2a819049`. Ratio applicability
 is pushed as `4ca72551` and ready for the supervised backend rebuild. The exact-envelope case
 passes (1/1), as does the existing snapshot/cursor case (1/1); logs are

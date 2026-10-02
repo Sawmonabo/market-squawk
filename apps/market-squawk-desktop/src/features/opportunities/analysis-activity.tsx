@@ -1,7 +1,7 @@
 import { RefreshButton } from "@/components/ui/refresh-button"
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { CircleAlert, Play, Square } from "lucide-react"
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { AnalyticalControllerResponse, MissingInvestmentEvidence, WorkflowCoverageCursor } from "@/features/advanced/analytical-profile-contracts"
 import { Link, useSearchParams } from "react-router-dom"
 
@@ -9,6 +9,7 @@ import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { useAnalyticalControllerStatus } from "@/features/advanced/use-analytical-profile"
+import { DemandPanel } from "@/features/shared/demand-panel"
 import type { ProductTransport } from "@/lib/transport"
 
 import { formatUnixNanos } from "./format"
@@ -116,7 +117,7 @@ export function AnalysisActivity({ transport, scope }: {
               <Count label="Analysis unavailable" value={workflow.coverage.unavailable} />
             </dl>
             {workflow.kind === "opportunity_discovery" && workflow.state === "complete"
-              ? <CoverageDetails transport={transport} workflowToken={workflow.workflowToken} /> : null}
+              ? <CoverageDetails transport={transport} scope={scope} workflowToken={workflow.workflowToken} /> : null}
           </> : <p className="mt-3 text-xs text-muted-foreground">{stageLabel(workflow.progress.stage)}</p>}
         </article>
       ))}
@@ -149,33 +150,51 @@ function stageLabel(stage: string) {
   return labels[stage] ?? "Checking progress"
 }
 
-function CoverageDetails({ transport, workflowToken }: {
+function CoverageDetails({ transport, scope, workflowToken }: {
   transport: Pick<ProductTransport, "analyticalController">
+  scope: ProductScope
   workflowToken: string
 }) {
-  const page = useMutation({
-    mutationFn: async (after?: WorkflowCoverageCursor) => {
-      const result = await transport.analyticalController({ action: "workflowCoverage", workflowToken, ...(after ? { after } : {}) }, false)
+  return <DemandPanel className="mt-4 text-xs" title="Why investments were excluded or unavailable">
+    <CoverageRead transport={transport} scope={scope} workflowToken={workflowToken} />
+  </DemandPanel>
+}
+
+function CoverageRead({ transport, scope, workflowToken }: {
+  transport: Pick<ProductTransport, "analyticalController">
+  scope: ProductScope
+  workflowToken: string
+}) {
+  const [after, setAfter] = useState<WorkflowCoverageCursor>()
+  const page = useQuery({
+    queryKey: [...productKeys.operation(scope, "analysis", "Desktop.AnalyticalProfiles", {}), "coverage", { workflowToken, after }],
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
+      const result = await transport.analyticalController({ action: "workflowCoverage", workflowToken, ...(after ? { after } : {}) }, false, { signal })
       if (result.kind !== "workflow_coverage" || result.workflowToken !== workflowToken) throw new Error("Saved coverage did not match this search.")
       return result
     },
   })
-  return <details className="mt-4 text-xs">
-    <summary className="cursor-pointer font-medium">Why investments were excluded or unavailable</summary>
-    <p className="mt-2 text-muted-foreground">These are the original reasons saved with this search. Each investment brief explains its own decision and evidence.</p>
-    {page.isError ? <p className="mt-2 text-destructive">Saved coverage could not be opened. Try again.</p> : null}
+  return <>
+    <p className="text-muted-foreground">These are the original reasons saved with this search. Each investment brief explains its own decision and evidence.</p>
+    {page.isPending ? <p className="mt-2 text-muted-foreground" role="status">Opening saved coverage…</p> : null}
+    {page.isError ? <div className="mt-2">
+      <p className="text-destructive" role="alert">Saved coverage could not be opened.</p>
+      <Button className="mt-3" size="sm" variant="outline" disabled={page.isFetching}
+        onClick={() => void page.refetch()}>Retry saved reasons</Button>
+    </div> : null}
     {page.data ? <>
       <ul className="mt-3 space-y-3">{page.data.rows.map((row) => <li key={row.instrumentId}>
         <span>{coverageReasonLabel(row.reason)}</span>
       </li>)}</ul>
       {page.data.rows.length === 0 ? <p className="mt-3 text-muted-foreground">No reasons in this part of the saved coverage.</p> : null}
-      {page.data.nextAfter ? <Button className="mt-3" size="sm" variant="outline" disabled={page.isPending}
-        onClick={() => { const next = page.data?.nextAfter; if (next) page.mutate(next) }}>Next reasons</Button>
+      {page.data.nextAfter ? <Button className="mt-3" size="sm" variant="outline" disabled={page.isFetching || page.isError}
+        onClick={() => { const next = page.data?.nextAfter; if (next) setAfter(next) }}>Next reasons</Button>
         : <p className="mt-3 text-muted-foreground">End of saved coverage.</p>}
     </> : null}
-    <Button className="mt-3" size="sm" variant="outline" disabled={page.isPending}
-      onClick={() => page.mutate(undefined)}>{page.isPending ? "Opening coverage…" : page.data ? "Start again" : "Open saved reasons"}</Button>
-  </details>
+    {page.data || after ? <Button className="mt-3" size="sm" variant="outline" disabled={page.isFetching}
+      onClick={() => { setAfter(undefined); if (after === undefined) void page.refetch() }}>Start again</Button> : null}
+  </>
 }
 
 function coverageReasonLabel(reason: Extract<AnalyticalControllerResponse, { kind: "workflow_coverage" }>["rows"][number]["reason"]) {
