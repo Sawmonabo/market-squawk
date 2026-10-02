@@ -2188,7 +2188,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         idempotent: false,
         ..read(
             "Research.GetInvestmentFinancials",
-            "Read selected financial facts, statements, ratios or filings; a first page may acquire missing issuer evidence through an already configured connection.",
+            "Read retained financial facts, statements, ratios or filings for one investment. Missing prepared reports are loaded through the separate financial preparation job.",
             ServiceDomain::Research,
             JOB_SCOPE,
             INVESTMENT_FINANCIAL_ARGUMENTS,

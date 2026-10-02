@@ -264,6 +264,7 @@ impl InvestmentFinancialJobRunner {
         .map_err(|_| JobRunError::Recovery)?;
         self.preparation
             .validate_completion(&outcome, deadline, context.cancellation())
+            .await
             .map_err(map_service_error)?;
         // All provider, association, artifact and result work is complete. This is the only
         // terminal claim, matching the derived-generation runner's staged-result finalization.

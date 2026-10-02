@@ -22,7 +22,14 @@ pub(super) fn page() -> Value {
                 ("revisionPolicy", constant("latestKnown")),
                 (
                     "state",
-                    enumeration(&["reported", "missing", "conflict", "unavailable", "expired"]),
+                    enumeration(&[
+                        "reported",
+                        "preparation_required",
+                        "missing",
+                        "conflict",
+                        "unavailable",
+                        "expired",
+                    ]),
                 ),
                 (
                     "families",
@@ -33,7 +40,13 @@ pub(super) fn page() -> Value {
                         ),
                         (
                             "state",
-                            enumeration(&["reported", "missing", "conflict", "unavailable"]),
+                            enumeration(&[
+                                "reported",
+                                "preparation_required",
+                                "missing",
+                                "conflict",
+                                "unavailable",
+                            ]),
                         ),
                         (
                             "reason",
@@ -46,6 +59,7 @@ pub(super) fn page() -> Value {
                                 "no_records",
                                 "evidence_unavailable",
                                 "rights_unavailable",
+                                "preparation_required",
                             ])),
                         ),
                     ])),

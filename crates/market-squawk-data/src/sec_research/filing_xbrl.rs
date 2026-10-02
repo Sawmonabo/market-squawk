@@ -352,7 +352,7 @@ impl<'de> Visitor<'de> for FilingSidecarSeed {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct FilingCoordinates {
     cik: String,
@@ -367,7 +367,7 @@ struct FilingCoordinates {
     acceptance_evidence: Option<SourceIdentifier>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct TaxonomyCoordinates {
     version: SourceIdentifier,
@@ -384,7 +384,7 @@ struct TaxonomyCoordinates {
     artifacts: CapturedGraph,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 struct CapturedGraph;
 impl<'de> Deserialize<'de> for CapturedGraph {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -720,4 +720,112 @@ fn context_digest(context: &SecFilingXbrlContext) -> Result<Vec<u8>, SecResearch
     let bytes =
         serde_json::to_vec(context).map_err(|_| SecResearchReadError::ProviderBindingMismatch)?;
     Ok(Sha256::digest(bytes).to_vec())
+}
+
+/// Metadata is derived only from a fully authenticated filing. The complete original graph
+/// remains in the retained provider binding; row indexes preserve all exposed occurrences.
+#[derive(Serialize, Deserialize)]
+struct PreparedFiling {
+    version: u16,
+    family: SourceIdentifier,
+    dataset: SourceIdentifier,
+    filing: FilingCoordinates,
+    taxonomy: TaxonomyCoordinates,
+    availability: AvailabilityEvidence,
+    received_at: Timestamp,
+    ingested_at: Timestamp,
+    total_retained_bytes: u64,
+    numeric_fact_count: usize,
+    sidecar_digest: EvidenceDigest,
+}
+impl SecVerifiedFilingXbrl {
+    pub(super) fn persist_into(
+        &self,
+        connection: &Connection,
+        deadline: std::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SecResearchReadError> {
+        self.source
+            .contexts
+            .persist_into(connection, "filing_contexts", deadline, cancellation)?;
+        self.source.nonnumeric_occurrences.persist_into(
+            connection,
+            "filing_nonnumeric",
+            deadline,
+            cancellation,
+        )?;
+        self.source.footnotes.persist_into(
+            connection,
+            "filing_footnotes",
+            deadline,
+            cancellation,
+        )?;
+        let value = PreparedFiling {
+            version: self.source.version,
+            family: self.source.family.clone(),
+            dataset: self.source.dataset.clone(),
+            filing: self.source.filing.clone(),
+            taxonomy: self.source.taxonomy.clone(),
+            availability: self.source.availability.clone(),
+            received_at: self.source.received_at,
+            ingested_at: self.source.ingested_at,
+            total_retained_bytes: self.source.total_retained_bytes,
+            numeric_fact_count: self.source.numeric_fact_count,
+            sidecar_digest: self.sidecar_digest,
+        };
+        let bytes = serde_json::to_vec(&value).map_err(|_| SecResearchReadError::DigestEncoding)?;
+        connection.execute(
+            "INSERT INTO metadata(name,payload) VALUES('filing',?1)",
+            [bytes],
+        )?;
+        Ok(())
+    }
+    pub(super) fn reopen(
+        artifact: Arc<super::prepared::PreparedArtifact>,
+        connection: Arc<std::sync::Mutex<Connection>>,
+    ) -> Result<Option<Self>, SecResearchReadError> {
+        let bytes: Option<Vec<u8>> = connection
+            .lock()
+            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
+            .query_row(
+                "SELECT payload FROM metadata WHERE name='filing'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let value: PreparedFiling =
+            serde_json::from_slice(&bytes).map_err(|_| SecResearchReadError::PreparedIntegrity)?;
+        let contexts = SecResearchRows::reopen(
+            Arc::clone(&artifact),
+            Arc::clone(&connection),
+            "filing_contexts",
+        )?;
+        let nonnumeric_occurrences = SecResearchRows::reopen(
+            Arc::clone(&artifact),
+            Arc::clone(&connection),
+            "filing_nonnumeric",
+        )?;
+        let footnotes = SecResearchRows::reopen(artifact, connection, "filing_footnotes")?;
+        Ok(Some(Self {
+            source: FilingSidecar {
+                version: value.version,
+                family: value.family,
+                dataset: value.dataset,
+                filing: value.filing,
+                taxonomy: value.taxonomy,
+                availability: value.availability,
+                received_at: value.received_at,
+                ingested_at: value.ingested_at,
+                total_retained_bytes: value.total_retained_bytes,
+                numeric_fact_count: value.numeric_fact_count,
+                contexts,
+                nonnumeric_occurrences,
+                footnotes,
+            },
+            sidecar_digest: value.sidecar_digest,
+        }))
+    }
 }

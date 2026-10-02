@@ -3,6 +3,11 @@ use crate::{DatasetSchemaRef, Sha256Digest};
 
 #[derive(Debug)]
 pub(crate) enum PhysicalArtifactEvidence {
+    PreparedIndex {
+        relative_reference: Box<str>,
+        content_hash: Sha256Digest,
+        size_bytes: u64,
+    },
     Artifact {
         relative_reference: Box<str>,
         content_hash: Sha256Digest,
@@ -26,7 +31,10 @@ pub(crate) enum PhysicalArtifactEvidence {
 impl PhysicalArtifactEvidence {
     pub(crate) fn relative_reference(&self) -> &str {
         match self {
-            Self::Artifact {
+            Self::PreparedIndex {
+                relative_reference, ..
+            }
+            | Self::Artifact {
                 relative_reference, ..
             }
             | Self::QueryArtifact {
@@ -39,20 +47,23 @@ impl PhysicalArtifactEvidence {
     }
     pub(crate) fn content_hash(&self) -> Sha256Digest {
         match self {
-            Self::Artifact { content_hash, .. }
+            Self::PreparedIndex { content_hash, .. }
+            | Self::Artifact { content_hash, .. }
             | Self::QueryArtifact { content_hash, .. }
             | Self::MarketEventArchive { content_hash, .. } => *content_hash,
         }
     }
     pub(crate) fn size_bytes(&self) -> u64 {
         match self {
-            Self::Artifact { size_bytes, .. }
+            Self::PreparedIndex { size_bytes, .. }
+            | Self::Artifact { size_bytes, .. }
             | Self::QueryArtifact { size_bytes, .. }
             | Self::MarketEventArchive { size_bytes, .. } => *size_bytes,
         }
     }
     pub(crate) fn expected_row_count(&self) -> Option<u64> {
         match self {
+            Self::PreparedIndex { .. } => None,
             Self::Artifact {
                 expected_row_count, ..
             }

@@ -207,6 +207,15 @@ fn evidence_snapshot(
     })?;
     check_count(expected, observed)?;
     add(&mut references, observed)?;
+    {
+        let mut prepared = transaction
+            .prepare("SELECT size_bytes FROM sec_prepared_indexes ORDER BY generation_digest")?;
+        let mut rows = prepared.query([])?;
+        while let Some(row) = rows.next()? {
+            check_cancellation(cancellation)?;
+            account(parse_positive_u64(row.get(0)?)?)?;
+        }
+    }
     add(&mut total_bytes, physical_bytes)?;
     let expected = ProviderCatalogRelation::ALL
         .iter()
@@ -428,6 +437,10 @@ fn read_indexed_resource_evidence(
         (
             "model_inventory_records",
             "SELECT printf('%019d',sequence), sequence, model_id, bundle_id, bundle_version, candidate_directory, product_token, record, record_sha256, chain_sha256 FROM model_inventory_records ORDER BY sequence",
+        ),
+        (
+            "sec_prepared_indexes",
+            "SELECT hex(generation_digest),generation_digest,source_artifact_id,artifact_id,relative_reference,content_algorithm,content_digest,size_bytes,created_at_ns FROM sec_prepared_indexes ORDER BY generation_digest",
         ),
     ] {
         let mut statement = connection.prepare(query)?;

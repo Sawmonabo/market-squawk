@@ -20,7 +20,7 @@ use market_squawk_data::{
     AnalyticalReadError, CommittedDataset, CompanySecurityIdentityReadCapability, DatasetId,
     DatasetManifestRef, IngestError, IngestPrecommitAuthority, ObservationKnowledgeRange,
     PersistedProviderCaptureBindingEvidence, QueryLimits, SecFundamentalIdentityAvailability,
-    SecFundamentalIdentityQuery, SecFundamentalIdentitySelection,
+    SecFundamentalIdentityQuery, SecFundamentalIdentitySelection, SecResearchFamily,
     extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
@@ -76,13 +76,14 @@ impl From<SecResearchDatasetKind> for SecFundamentalsFamily {
     }
 }
 
-/// Exact retained outcomes of the complete selected-company acquisition.
+/// Exact retained outcomes of the requested selected-company families.
 #[derive(Debug)]
 pub(crate) struct SecCompanyResearchPublication {
-    submissions: SecSubmissionsPublicationReceipt,
-    company_facts: SecResearchStreamPublication,
+    cik: SourceIdentifier,
+    submissions: Option<SecSubmissionsPublicationReceipt>,
+    company_facts: Option<SecResearchStreamPublication>,
     filing: SecCompanyFilingPublication,
-    filing_selection: SecCompanyFilingSelection,
+    filing_selection: Option<SecCompanyFilingSelection>,
     new_link_count: usize,
 }
 
@@ -95,6 +96,7 @@ struct SecCompanyFilingSelection {
 
 #[derive(Debug)]
 enum SecCompanyFilingPublication {
+    NotRequested,
     Published {
         committed: CommittedDataset,
         binding_digest: EvidenceDigest,
@@ -105,7 +107,7 @@ enum SecCompanyFilingPublication {
 
 impl SecCompanyResearchPublication {
     pub(crate) fn cik(&self) -> &SourceIdentifier {
-        self.submissions.cik()
+        &self.cik
     }
 
     pub(crate) const fn new_link_count(&self) -> usize {
@@ -114,16 +116,19 @@ impl SecCompanyResearchPublication {
 
     /// Exact parents to reopen through the existing security-identity selector.
     pub(crate) fn company_parents(&self) -> Vec<(CompanyIdentitySurface, EvidenceDigest)> {
-        let mut parents = vec![
-            (
+        let mut parents = Vec::new();
+        if let Some(submissions) = &self.submissions {
+            parents.push((
                 CompanyIdentitySurface::SecSubmissions,
-                self.submissions.company_observation_digest(),
-            ),
-            (
+                submissions.company_observation_digest(),
+            ));
+        }
+        if let Some(company_facts) = &self.company_facts {
+            parents.push((
                 CompanyIdentitySurface::SecCompanyFacts,
-                self.company_facts.company_observation_digest,
-            ),
-        ];
+                company_facts.company_observation_digest,
+            ));
+        }
         if let SecCompanyFilingPublication::Published {
             company_observation_digest,
             ..
@@ -139,7 +144,30 @@ impl SecCompanyResearchPublication {
 
     pub(crate) fn value(&self) -> serde_json::Value {
         use market_squawk_modeling::ForecastArtifactManifestRecord;
+        let submissions = self.submissions.as_ref().map_or_else(
+            || serde_json::json!({ "state": "not_requested" }),
+            |receipt| {
+                serde_json::json!({
+                    "state": "published",
+                    "manifest": ForecastArtifactManifestRecord::from_manifest(receipt.manifest()),
+                    "publicationBindingDigest": receipt.provider_binding_digest(),
+                    "companyObservationDigest": receipt.company_observation_digest(),
+                })
+            },
+        );
+        let company_facts = self.company_facts.as_ref().map_or_else(
+            || serde_json::json!({ "state": "not_requested" }),
+            |receipt| serde_json::json!({
+                "state": "published",
+                "manifest": ForecastArtifactManifestRecord::from_manifest(receipt.committed.manifest()),
+                "publicationBindingDigest": receipt.binding_digest,
+                "companyObservationDigest": receipt.company_observation_digest,
+            }),
+        );
         let filing = match &self.filing {
+            SecCompanyFilingPublication::NotRequested => {
+                serde_json::json!({ "state": "not_requested" })
+            }
             SecCompanyFilingPublication::Published {
                 committed,
                 binding_digest,
@@ -154,23 +182,35 @@ impl SecCompanyResearchPublication {
                 serde_json::json!({ "state": "no_eligible_filing" })
             }
         };
+        let filing_selection = self.filing_selection.as_ref().map(|selection| {
+            serde_json::json!({
+                "currentSubmissionsBodyDigest": selection.submissions_body_digest,
+                "receivedAtUnixNanos": selection.received_at.unix_nanos().to_string(),
+                "accession": selection.accession,
+            })
+        });
         serde_json::json!({
-            "submissions": { "state": "published",
-                "manifest": ForecastArtifactManifestRecord::from_manifest(self.submissions.manifest()),
-                "publicationBindingDigest": self.submissions.provider_binding_digest(),
-                "companyObservationDigest": self.submissions.company_observation_digest() },
-            "companyFacts": { "state": "published",
-                "manifest": ForecastArtifactManifestRecord::from_manifest(self.company_facts.committed.manifest()),
-                "publicationBindingDigest": self.company_facts.binding_digest,
-                "companyObservationDigest": self.company_facts.company_observation_digest },
+            "submissions": submissions,
+            "companyFacts": company_facts,
             "filingXbrl": filing,
-            "filingSelection": {
-                "currentSubmissionsBodyDigest": self.filing_selection.submissions_body_digest,
-                "receivedAtUnixNanos": self.filing_selection.received_at.unix_nanos().to_string(),
-                "accession": self.filing_selection.accession,
-            },
+            "filingSelection": filing_selection,
         })
     }
+}
+
+/// Rejects empty or repeated families before any provider acquisition or publication.
+pub(super) fn validate_company_research_families(
+    families: &[SecResearchFamily],
+) -> Result<(), SecFundamentalsApplicationError> {
+    if families.is_empty()
+        || families
+            .iter()
+            .enumerate()
+            .any(|(index, family)| families[..index].contains(family))
+    {
+        return Err(SecFundamentalsApplicationError::InvalidSelection);
+    }
+    Ok(())
 }
 
 /// Application-owned bridge into the sole physical provider-response store.
@@ -214,7 +254,7 @@ impl SecFundamentalsCoordinatorClosure {
         })
     }
 
-    /// Publishes complete company API families and one stable selected financial-report filing.
+    /// Publishes only requested company API families and/or one selected financial-report filing.
     /// The selected filing always comes from the exact captured current submissions document.
     #[allow(
         clippy::too_many_arguments,
@@ -223,6 +263,7 @@ impl SecFundamentalsCoordinatorClosure {
     pub(super) async fn acquire_and_publish_company<F, Fut>(
         &self,
         cik: &str,
+        families: &[SecResearchFamily],
         max_records: NonZeroU32,
         max_bytes: NonZeroU64,
         wall_deadline: Timestamp,
@@ -240,13 +281,23 @@ impl SecFundamentalsCoordinatorClosure {
                 >,
             > + Send,
     {
+        validate_company_research_families(families)?;
+        let submissions_dataset = SecResearchDataset::submissions(cik)?;
+        let company_cik = SourceIdentifier::try_from(submissions_dataset.cik())
+            .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?;
         let mut new_link_count = 0usize;
         let mut submissions_publication = None;
         let mut facts_publication = None;
-        for dataset in [
-            SecResearchDataset::submissions(cik)?,
-            SecResearchDataset::company_facts(cik)?,
+        for (family, dataset) in [
+            (SecResearchFamily::Submissions, submissions_dataset),
+            (
+                SecResearchFamily::CompanyFacts,
+                SecResearchDataset::company_facts(cik)?,
+            ),
         ] {
+            if !families.contains(&family) {
+                continue;
+            }
             self.extraction.validate_current()?;
             precommit.validate_precommit()?;
             let discovery = DiscoveryRequest::try_new(
@@ -289,6 +340,9 @@ impl SecFundamentalsCoordinatorClosure {
                         deadline,
                     )
                     .await?;
+                if sealed.stream.company_identity().provider_company_id() != &company_cik {
+                    return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+                }
                 facts_publication = Some(
                     self.publish_research_stream(
                         sealed,
@@ -307,6 +361,9 @@ impl SecFundamentalsCoordinatorClosure {
                         deadline,
                     )
                     .await?;
+                if sealed.cik() != &company_cik {
+                    return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+                }
                 let SecFundamentalsPublicationReceipt::Submissions(receipt) = self
                     .publish(sealed, Arc::clone(&precommit), cancellation.child_token())
                     .await?
@@ -314,6 +371,15 @@ impl SecFundamentalsCoordinatorClosure {
                     return Err(SecFundamentalsApplicationError::InvalidSelection);
                 };
                 submissions_publication = Some(receipt);
+            }
+            if submissions_publication
+                .as_ref()
+                .is_some_and(|receipt| receipt.cik() != &company_cik)
+                || facts_publication
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.cik != company_cik)
+            {
+                return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
             }
             // Only a genuinely committed (or exactly reused) family reaches this boundary.
             // Its issuer relationship must not wait for a later provider family to succeed.
@@ -325,12 +391,15 @@ impl SecFundamentalsCoordinatorClosure {
                 .ok_or(SecFundamentalsApplicationError::AllocationFailed)?;
             precommit.validate_precommit()?;
         }
-        let submissions_publication =
-            submissions_publication.ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
-        let facts_publication =
-            facts_publication.ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
-        if submissions_publication.cik() != &facts_publication.cik {
-            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        if !families.contains(&SecResearchFamily::FilingXbrl) {
+            return Ok(SecCompanyResearchPublication {
+                cik: company_cik,
+                submissions: submissions_publication,
+                company_facts: facts_publication,
+                filing: SecCompanyFilingPublication::NotRequested,
+                filing_selection: None,
+                new_link_count,
+            });
         }
         self.extraction.validate_current()?;
         precommit.validate_precommit()?;
@@ -338,6 +407,9 @@ impl SecFundamentalsCoordinatorClosure {
             .source
             .fetch_submissions(&self.extraction, cik, cancellation.child_token())
             .await?;
+        if submissions.document().cik() != &company_cik {
+            return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+        }
         let selected = submissions
             .document()
             .filings()
@@ -368,13 +440,14 @@ impl SecFundamentalsCoordinatorClosure {
             accession: selected.map(|filing| filing.accession().clone()),
         };
         let Some(filing) = selected else {
-            // Complete API families remain usable. This refresh publishes no filing detail;
+            // Any requested API families remain usable. This publishes no filing detail;
             // the common point-in-time selector retains its existing typed availability.
             return Ok(SecCompanyResearchPublication {
+                cik: company_cik,
                 submissions: submissions_publication,
                 company_facts: facts_publication,
                 filing: SecCompanyFilingPublication::NoEligibleFiling,
-                filing_selection,
+                filing_selection: Some(filing_selection),
                 new_link_count,
             });
         };
@@ -428,6 +501,9 @@ impl SecFundamentalsCoordinatorClosure {
                 deadline,
             )
             .await?;
+        if sealed.stream.company_identity().provider_company_id() != &company_cik {
+            return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+        }
         let filing = self
             .publish_research_stream(
                 sealed,
@@ -436,6 +512,9 @@ impl SecFundamentalsCoordinatorClosure {
                 deadline,
             )
             .await?;
+        if filing.cik != company_cik {
+            return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+        }
         precommit.validate_precommit()?;
         new_link_count = new_link_count
             .checked_add(
@@ -444,6 +523,7 @@ impl SecFundamentalsCoordinatorClosure {
             .ok_or(SecFundamentalsApplicationError::AllocationFailed)?;
         precommit.validate_precommit()?;
         Ok(SecCompanyResearchPublication {
+            cik: company_cik,
             submissions: submissions_publication,
             company_facts: facts_publication,
             filing: SecCompanyFilingPublication::Published {
@@ -451,7 +531,7 @@ impl SecFundamentalsCoordinatorClosure {
                 binding_digest: filing.binding_digest,
                 company_observation_digest: filing.company_observation_digest,
             },
-            filing_selection,
+            filing_selection: Some(filing_selection),
             new_link_count,
         })
     }

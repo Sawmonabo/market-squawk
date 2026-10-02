@@ -64,6 +64,7 @@ pub(crate) struct VerifiedArtifact {
     content_hash: Sha256Digest,
     size_bytes: u64,
     row_count: u64,
+    prepared_index: bool,
     file: File,
 }
 
@@ -172,7 +173,13 @@ fn verify_one(
     if content_hash != artifact.content_hash() {
         return Err(EvidenceError::ArtifactMetadataMismatch);
     }
-    let row_count = validate_parquet(&mut file, artifact.size_bytes(), max_metadata_bytes)?;
+    let prepared_index = matches!(artifact, PhysicalArtifactEvidence::PreparedIndex { .. });
+    let row_count = if prepared_index {
+        validate_sqlite_header(&mut file)?;
+        0
+    } else {
+        validate_parquet(&mut file, artifact.size_bytes(), max_metadata_bytes)?
+    };
     if artifact
         .expected_row_count()
         .is_some_and(|expected| expected != row_count)
@@ -204,6 +211,7 @@ fn verify_one(
         content_hash,
         size_bytes: artifact.size_bytes(),
         row_count,
+        prepared_index,
         file,
     })
 }
@@ -437,4 +445,16 @@ mod tests {
         ));
         Ok(())
     }
+}
+
+// Full content authentication above binds the immutable database verified at publication.
+// Reopening financial indexes additionally checks SQLite structure and derivation metadata.
+fn validate_sqlite_header(file: &mut File) -> Result<(), EvidenceError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header)?;
+    if &header != b"SQLite format 3\0" {
+        return Err(EvidenceError::ArtifactMetadataMismatch);
+    }
+    Ok(())
 }

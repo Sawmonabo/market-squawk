@@ -1202,10 +1202,13 @@ fn map_sec_research_error(error: market_squawk_data::SecResearchReadError) -> Se
         E::InvalidRequest => ServiceError::InvalidRequest,
         E::Cancelled => ServiceError::Cancelled,
         E::DeadlineExceeded => ServiceError::DeadlineExceeded,
-        E::AuthorityUnavailable => ServiceError::Unavailable,
+        E::AuthorityUnavailable | E::PreparationRequired | E::PreparedIo => {
+            ServiceError::Unavailable
+        }
         E::Index(_) => ServiceError::Internal,
         E::ObjectBudgetExceeded | E::SpillBudgetExceeded => ServiceError::ResourceExhausted,
         E::OriginMismatch
+        | E::PreparedIntegrity
         | E::ProviderBindingMismatch
         | E::PointInTimeSelection
         | E::RestartMismatch

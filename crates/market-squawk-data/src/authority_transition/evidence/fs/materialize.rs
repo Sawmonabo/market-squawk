@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     EvidenceError, FileIdentity, HASH_BUFFER_BYTES, MAX_PARQUET_METADATA_BYTES, VerifiedArtifact,
     VerifiedArtifactInventory, append_inventory_digest, inventory_digest, named_identity,
-    opened_file_metadata, validate_parquet, validate_private_regular_file, verify_one,
+    opened_file_metadata, validate_parquet, validate_private_regular_file, validate_sqlite_header,
+    verify_one,
 };
 use crate::parquet_store::VerifiedRestoreControlSubset;
 use crate::{Catalog, Sha256Digest};
@@ -153,33 +154,56 @@ impl VerifiedArtifactInventory {
             )?;
             let source_identity =
                 FileIdentity::from_metadata(&opened_file_metadata(&artifact.file)?);
-            let (shard, filename) = object_components(&artifact.relative_reference)?;
-            if current_shard
-                .as_ref()
-                .is_none_or(|(current, _)| current.as_ref() != shard)
-            {
-                current_shard = Some((shard.into(), ensure_directory(&sha256, shard)?));
-            }
-            let shard_directory = current_shard
-                .as_ref()
-                .map(|(_, directory)| directory)
-                .ok_or(EvidenceError::ArtifactMetadataMismatch)?;
-            match shard_directory.symlink_metadata(filename) {
-                Ok(_) => {
-                    verify_one(
-                        directory,
-                        &expected,
-                        self.snapshot
-                            .request()
-                            .limits()
-                            .max_parquet_metadata_bytes(),
-                        cancellation,
-                    )?;
+            if artifact.prepared_index {
+                let filename = artifact
+                    .relative_reference
+                    .strip_prefix("sec-prepared/")
+                    .filter(|name| !name.contains('/'))
+                    .ok_or(EvidenceError::ArtifactMetadataMismatch)?;
+                let prepared = ensure_directory(directory, "sec-prepared")?;
+                match prepared.symlink_metadata(filename) {
+                    Ok(_) => {
+                        verify_one(
+                            directory,
+                            &expected,
+                            MAX_PARQUET_METADATA_BYTES,
+                            cancellation,
+                        )?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        materialize_one(&prepared, filename, &artifact, cancellation)?;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    materialize_one(shard_directory, filename, &artifact, cancellation)?;
+            } else {
+                let (shard, filename) = object_components(&artifact.relative_reference)?;
+                if current_shard
+                    .as_ref()
+                    .is_none_or(|(current, _)| current.as_ref() != shard)
+                {
+                    current_shard = Some((shard.into(), ensure_directory(&sha256, shard)?));
                 }
-                Err(error) => return Err(error.into()),
+                let shard_directory = current_shard
+                    .as_ref()
+                    .map(|(_, directory)| directory)
+                    .ok_or(EvidenceError::ArtifactMetadataMismatch)?;
+                match shard_directory.symlink_metadata(filename) {
+                    Ok(_) => {
+                        verify_one(
+                            directory,
+                            &expected,
+                            self.snapshot
+                                .request()
+                                .limits()
+                                .max_parquet_metadata_bytes(),
+                            cancellation,
+                        )?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        materialize_one(shard_directory, filename, &artifact, cancellation)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             let metadata = opened_file_metadata(&artifact.file)?;
             validate_private_regular_file(&metadata, artifact.size_bytes)?;
@@ -219,6 +243,7 @@ impl VerifiedArtifactInventory {
             return Err(EvidenceError::Cancelled);
         }
         let mut objects_present = false;
+        let mut prepared_present = false;
         let mut any_entry = false;
         for root_entry in directory.read_dir(".")? {
             let name = root_entry?.file_name();
@@ -228,6 +253,8 @@ impl VerifiedArtifactInventory {
                     return Err(EvidenceError::DestinationConflict);
                 }
                 objects_present = true;
+            } else if name == "sec-prepared" {
+                prepared_present = true;
             } else if !name
                 .to_str()
                 .is_some_and(|name| controls.is_some_and(|controls| controls.contains(name)))
@@ -253,7 +280,9 @@ impl VerifiedArtifactInventory {
                 Ok(())
             };
         }
-        if controls.is_none() && directory.read_dir(".")?.count() != 1 {
+        if controls.is_none()
+            && directory.read_dir(".")?.count() != 1 + usize::from(prepared_present)
+        {
             return Err(EvidenceError::DestinationConflict);
         }
         let objects = directory
@@ -274,6 +303,37 @@ impl VerifiedArtifactInventory {
             .open_dir_nofollow("sha256")
             .map_err(|_| EvidenceError::DestinationConflict)?;
         let mut observed = 0_u64;
+        if prepared_present {
+            let prepared = directory.open_dir_nofollow("sec-prepared")?;
+            for entry in prepared.read_dir(".")? {
+                if cancellation.is_cancelled() {
+                    return Err(EvidenceError::Cancelled);
+                }
+                let name = entry?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| EvidenceError::DestinationConflict)?;
+                let reference = format!("sec-prepared/{name}");
+                let expected = Catalog::physical_evidence_by_reference(
+                    connection,
+                    &self.snapshot,
+                    &reference,
+                )?
+                .filter(|value| {
+                    matches!(value, super::PhysicalArtifactEvidence::PreparedIndex { .. })
+                })
+                .ok_or(EvidenceError::DestinationConflict)?;
+                verify_one(
+                    directory,
+                    &expected,
+                    MAX_PARQUET_METADATA_BYTES,
+                    cancellation,
+                )?;
+                observed = observed
+                    .checked_add(1)
+                    .ok_or(EvidenceError::ResourceLimitExceeded)?;
+            }
+        }
         for shard_entry in sha256.read_dir(".")? {
             if cancellation.is_cancelled() {
                 return Err(EvidenceError::Cancelled);
@@ -415,8 +475,13 @@ fn materialize_one(
     if FileIdentity::from_metadata(&named) != target_identity
         || FileIdentity::from_metadata(&opened_metadata) != target_identity
         || hash_file(&mut target, cancellation)? != artifact.content_hash
-        || validate_parquet(&mut target, artifact.size_bytes, MAX_PARQUET_METADATA_BYTES)?
-            != artifact.row_count
+        || if artifact.prepared_index {
+            validate_sqlite_header(&mut target)?;
+            false
+        } else {
+            validate_parquet(&mut target, artifact.size_bytes, MAX_PARQUET_METADATA_BYTES)?
+                != artifact.row_count
+        }
     {
         return Err(EvidenceError::ArtifactMetadataMismatch);
     }
@@ -453,6 +518,11 @@ fn hash_file(
 }
 
 fn synchronize_layout(directory: &Dir) -> Result<(), EvidenceError> {
+    match directory.open_dir_nofollow("sec-prepared") {
+        Ok(prepared) => sync_directory_at(&prepared, ".")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let objects = directory.open_dir_nofollow("objects")?;
     let sha256 = objects.open_dir_nofollow("sha256")?;
     for shard in sha256.read_dir(".")? {

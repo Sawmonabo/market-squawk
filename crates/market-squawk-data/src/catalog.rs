@@ -33,6 +33,7 @@ mod restore_logical;
 mod runs;
 mod search;
 mod sec_fund_job;
+pub(crate) mod sec_prepared;
 mod storage;
 mod types;
 

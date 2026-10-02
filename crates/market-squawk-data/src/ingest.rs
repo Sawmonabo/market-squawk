@@ -3225,6 +3225,12 @@ impl AnalyticalDataService {
             Arc::clone(&self.manifests),
             Arc::clone(&self.objects),
             self.company_identities().security_relationships(),
+            crate::catalog::sec_prepared::SecPreparedIndexRegistry::new(
+                Arc::clone(&self.authority),
+                self.catalog_read_location.clone(),
+                self.catalog_read_binding,
+                self.catalog_read_limits,
+            ),
         )
     }
 

@@ -43,7 +43,7 @@ impl SecResearchReadCapability {
         clippy::too_many_arguments,
         reason = "exact read authority and operation controls"
     )]
-    pub(super) async fn select_logical(
+    pub(super) async fn authenticate_logical(
         &self,
         request: SecResearchReadRequest,
         raw_store: &SealedResearchJournalStore,
@@ -52,7 +52,7 @@ impl SecResearchReadCapability {
         company_identity: CompanyIdentityExactRecord,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<SecResearchSelection, SecResearchReadError> {
+    ) -> Result<prepared::AuthenticatedGeneration, SecResearchReadError> {
         let mismatch = || SecResearchReadError::ProviderBindingMismatch;
         let (companion_family, capture_page_ordinal) = match request.family() {
             SecResearchFamily::CompanyFacts => ("sec_company_facts_capture", 0),
@@ -458,24 +458,16 @@ impl SecResearchReadCapability {
             origin_digest: evidence_digest([0; 32]),
         };
         origin.origin_digest = origin_digest(&origin);
-        materialize_selection(
-            request,
+        let _ = retained;
+        Ok(prepared::AuthenticatedGeneration {
             origin,
             company_identity,
-            companion.capture.observation_digest(),
-            evidence_digest(mapping_digest.finalize().into()),
+            capture_observation_digest: companion.capture.observation_digest(),
+            row_mapping_digest: evidence_digest(mapping_digest.finalize().into()),
             observations,
-            filing,
+            filing_xbrl: filing,
             coordinates,
-            base_bytes
-                .checked_add(retained)
-                .ok_or(SecResearchReadError::ObjectBudgetExceeded)?,
-            0,
-            self.objects.operation_scratch()?,
-            deadline,
-            &cancellation,
-        )
-        .await
+        })
     }
 }
 /// Sequential evidence frames from one already shape-checked partition family. Only the

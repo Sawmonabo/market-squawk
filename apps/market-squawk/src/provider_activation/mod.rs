@@ -927,6 +927,7 @@ impl ProviderAdapterActivation {
         &self,
         instrument_id: market_squawk_domain::InstrumentId,
         listing: &market_squawk_data::ListingReferenceRecord,
+        families: &[market_squawk_data::SecResearchFamily],
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<SecSelectedCompanyAcquisition, SecFundProductError> {
@@ -956,6 +957,7 @@ impl ProviderAdapterActivation {
             .operation
             .publish_company_research(
                 cik.as_str(),
+                families,
                 deadline,
                 cancellation.child_token(),
                 |precommit, family_cancellation| {
@@ -1243,6 +1245,11 @@ impl ProviderAdapterActivation {
                 .operation
                 .publish_company_research(
                     cik.as_str(),
+                    &[
+                        market_squawk_data::SecResearchFamily::Submissions,
+                        market_squawk_data::SecResearchFamily::CompanyFacts,
+                        market_squawk_data::SecResearchFamily::FilingXbrl,
+                    ],
                     deadline,
                     cancellation.child_token(),
                     |precommit, family_cancellation| {

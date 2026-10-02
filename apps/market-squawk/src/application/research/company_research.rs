@@ -253,7 +253,7 @@ impl CompanyResearchReadCapability {
         })
     }
 
-    /// Selects one family without materializing the company's projected fact history.
+    /// A page only reopens prepared generations; original source decoding belongs to preparation.
     pub(crate) async fn select_company_family(
         &self,
         request: &CompanyResearchRequest,
@@ -261,37 +261,72 @@ impl CompanyResearchReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<SecResearchIdentitySelection, CanonicalResearchReadError> {
-        check_operation(deadline, &cancellation)?;
-        let data_request = SecResearchIdentityReadRequest::try_new(
-            request.instrument_id,
-            family,
-            request.knowledge_at,
-            request.fact_effective_cutoff.clone(),
-            request.revision_policy.data_policy(),
-            company_point_in_time_limits()?,
-            MAX_COMPANY_RESEARCH_OBJECT_BYTES,
-        )
-        .map_err(map_company_data_error)?;
+        let request = company_data_request(request, family)?;
+        let reader = self.research.analytical().sec_research_reader();
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| CanonicalResearchReadError::AuthorityUnavailable)?;
+        self.run_company_read(deadline, &cancellation, move |owned| {
+            runtime.block_on(reader.select_prepared_display_by_identity(
+                request,
+                super::investment_financials::financial_display_identity(),
+                deadline,
+                owned,
+            ))
+        })
+        .await
+    }
+
+    /// Resolves exact original parents without decoding source payloads or building an index.
+    pub(crate) async fn resolve_company_family(
+        &self,
+        request: &CompanyResearchRequest,
+        family: SecResearchFamily,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<market_squawk_data::SecResearchIdentityResolution, CanonicalResearchReadError> {
+        let request = company_data_request(request, family)?;
+        let reader = self.research.analytical().sec_research_reader();
+        self.run_company_read(deadline, cancellation, move |owned| {
+            reader.resolve_by_identity(request, deadline, &owned)
+        })
+        .await
+    }
+
+    /// Builds durable source and display indexes from retained evidence, with no network access.
+    pub(crate) async fn prepare_company_family(
+        &self,
+        request: &CompanyResearchRequest,
+        family: SecResearchFamily,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<market_squawk_data::SecResearchIdentityPreparation, CanonicalResearchReadError>
+    {
+        let request = company_data_request(request, family)?;
         let reader = self.research.analytical().sec_research_reader();
         let raw_store = self.research.provider_capture_store();
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CanonicalResearchReadError::AuthorityUnavailable)?;
-        // Logical verification and point-in-time indexes perform synchronous disk work.
-        // The existing worker retains their owner through interruption; its closure holds
-        // exact read capabilities, never the ResearchService or another read-lane permit.
-        self.research
-            .run_owned_research_generation_read(
+        self.run_company_read(deadline, cancellation, move |owned| {
+            runtime.block_on(reader.prepare_display_by_identity(
+                request,
+                raw_store.as_ref(),
+                &super::investment_financials::FinancialDisplayProjection,
                 deadline,
-                &cancellation,
-                move |worker_cancellation| {
-                    runtime.block_on(reader.select_by_identity(
-                        data_request,
-                        raw_store.as_ref(),
-                        deadline,
-                        worker_cancellation,
-                    ))
-                },
-            )
+                owned,
+            ))
+        })
+        .await
+    }
+
+    async fn run_company_read<T: Send + 'static>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(CancellationToken) -> Result<T, SecResearchReadError> + Send + 'static,
+    ) -> Result<T, CanonicalResearchReadError> {
+        check_operation(deadline, cancellation)?;
+        self.research
+            .run_owned_research_generation_read(deadline, cancellation, operation)
             .await
             .map_err(|error| match error {
                 crate::ResearchServiceError::Ingest(IngestError::Cancelled) => {
@@ -1344,6 +1379,9 @@ fn project_company_research(
             SecResearchIdentityOutcome::Ambiguous => identity_ambiguous = true,
             SecResearchIdentityOutcome::Stale => stale = true,
             SecResearchIdentityOutcome::Revoked => revoked = true,
+            SecResearchIdentityOutcome::PreparationRequired => {
+                return Err(CanonicalResearchReadError::AuthorityUnavailable);
+            }
             SecResearchIdentityOutcome::Exact(selection) => {
                 let [relationship] = selected.identity().candidates() else {
                     return Err(CanonicalResearchReadError::EvidenceConflict);
@@ -1441,6 +1479,22 @@ fn project_company_research(
     }
 }
 
+fn company_data_request(
+    request: &CompanyResearchRequest,
+    family: SecResearchFamily,
+) -> Result<SecResearchIdentityReadRequest, CanonicalResearchReadError> {
+    SecResearchIdentityReadRequest::try_new(
+        request.instrument_id,
+        family,
+        request.knowledge_at,
+        request.fact_effective_cutoff.clone(),
+        request.revision_policy.data_policy(),
+        company_point_in_time_limits()?,
+        MAX_COMPANY_RESEARCH_OBJECT_BYTES,
+    )
+    .map_err(map_company_data_error)
+}
+
 fn surface_availability_mut<'availability>(
     family: SecResearchFamily,
     company_facts: &'availability mut CompanyResearchSurfaceAvailability,
@@ -1524,6 +1578,61 @@ fn append_company_row(
         .get(ordinal)
         .map_err(map_company_data_error)?
         .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+    append_authenticated_company_row(
+        request.knowledge_at,
+        family,
+        selection.company_identity().observation(),
+        selection.origin().origin_digest(),
+        selected.point_in_time().revision_state(),
+        observation,
+        facts,
+        filings,
+        latest_known_at,
+    )
+}
+
+/// Projects one authenticated original row using the same source semantics as selected pages.
+/// Index preparation supplies the row's own known-at time; live selection still checks its cutoff.
+pub(crate) fn company_source_row(
+    family: SecResearchFamily,
+    company: &market_squawk_domain::CompanyIdentityObservation,
+    publication_identity: EvidenceDigest,
+    revision: PointInTimeRevisionState,
+    observation: ResearchObservation,
+    knowledge_at: Timestamp,
+) -> Result<(Option<CompanyResearchFact>, Option<CompanyResearchFiling>), CanonicalResearchReadError>
+{
+    let mut facts = Vec::new();
+    let mut filings = Vec::new();
+    append_authenticated_company_row(
+        knowledge_at,
+        family,
+        company,
+        publication_identity,
+        revision,
+        observation,
+        &mut facts,
+        &mut filings,
+        &mut None,
+    )?;
+    Ok((facts.pop(), filings.pop()))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one authenticated source row and existing projection accumulators"
+)]
+fn append_authenticated_company_row(
+    knowledge_at: Timestamp,
+    family: SecResearchFamily,
+    company: &market_squawk_domain::CompanyIdentityObservation,
+    publication_identity: EvidenceDigest,
+    revision: PointInTimeRevisionState,
+    observation: ResearchObservation,
+    facts: &mut Vec<CompanyResearchFact>,
+    filings: &mut Vec<CompanyResearchFiling>,
+    latest_known_at: &mut Option<Timestamp>,
+) -> Result<(), CanonicalResearchReadError> {
     let context =
         observation_context(&observation).ok_or(CanonicalResearchReadError::EvidenceConflict)?;
     // The outer identity selection binds this issuer generation to the requested security.
@@ -1533,16 +1642,9 @@ fn append_company_row(
         ResearchObservation::Fundamental(value) => value.subject().issuer_id(),
         _ => None,
     };
-    if issuer
-        != Some(
-            selection
-                .company_identity()
-                .observation()
-                .provider_company_id(),
-        )
+    if issuer != Some(company.provider_company_id())
         || context.provenance().instrument_id().is_some()
-        || context.provenance().source_id()
-            != selection.company_identity().observation().source_id()
+        || context.provenance().source_id() != company.source_id()
     {
         return Err(CanonicalResearchReadError::EvidenceConflict);
     }
@@ -1551,7 +1653,7 @@ fn append_company_row(
         .availability()
         .conservative_available_at()
         .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
-    if known_at > request.knowledge_at {
+    if known_at > knowledge_at {
         return Err(CanonicalResearchReadError::EvidenceConflict);
     }
     *latest_known_at = Some(latest_known_at.map_or(known_at, |current| current.max(known_at)));
@@ -1572,7 +1674,7 @@ fn append_company_row(
             facts.push(CompanyResearchFact {
                 lineage: CompanyResearchFactLineage {
                     filing_identity: try_boxed_text(fact_context.accession().as_str())?,
-                    publication_identity: selection.origin().origin_digest(),
+                    publication_identity,
                 },
                 scope: match family {
                     SecResearchFamily::CompanyFacts => CompanyFactScope::CompanyWide,
@@ -1581,7 +1683,7 @@ fn append_company_row(
                         return Err(CanonicalResearchReadError::EvidenceConflict);
                     }
                 },
-                revision: product_revision_state(selected.point_in_time().revision_state()),
+                revision: product_revision_state(revision),
                 metric: try_boxed_text(fundamental.concept().as_str())?,
                 value: fundamental.value(),
                 unit: try_boxed_text(fundamental.unit().as_str())?,
@@ -1604,7 +1706,7 @@ fn append_company_row(
                 .try_reserve(1)
                 .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
             filings.push(CompanyResearchFiling {
-                revision: product_revision_state(selected.point_in_time().revision_state()),
+                revision: product_revision_state(revision),
                 form: try_boxed_text(filing.form_type().as_str())?,
                 effective: filing.context().time().effective().clone(),
                 published: filing.context().time().published().cloned(),
@@ -1884,7 +1986,7 @@ fn check_operation(
     }
 }
 
-fn map_company_data_error(error: SecResearchReadError) -> CanonicalResearchReadError {
+pub(super) fn map_company_data_error(error: SecResearchReadError) -> CanonicalResearchReadError {
     match error {
         SecResearchReadError::InvalidRequest => CanonicalResearchReadError::InvalidRequest,
         SecResearchReadError::Cancelled => CanonicalResearchReadError::Cancelled,

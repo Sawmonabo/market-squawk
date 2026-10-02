@@ -243,10 +243,11 @@ impl SecLiveFundSource {
         operation.classify(result)
     }
 
-    /// Uses this registered SEC generation for one exact issuer.
+    /// Uses this registered SEC generation for the requested families of one exact issuer.
     pub(crate) async fn publish_company_research<F, Fut>(
         &self,
         cik: &str,
+        families: &[market_squawk_data::SecResearchFamily],
         deadline: std::time::Instant,
         cancellation: CancellationToken,
         mut family_completed: F,
@@ -261,6 +262,7 @@ impl SecLiveFundSource {
             > + Send,
     {
         use std::num::{NonZeroU32, NonZeroU64};
+        super::sec_fundamentals::validate_company_research_families(families)?;
         let operation = self.start_company_operation(deadline, cancellation)?;
         let wall_deadline = operation.deadline;
         let cancellation = operation.cancellation();
@@ -287,6 +289,7 @@ impl SecLiveFundSource {
                 .fundamentals
                 .acquire_and_publish_company(
                     cik,
+                    families,
                     records,
                     bytes,
                     wall_deadline,
@@ -297,7 +300,7 @@ impl SecLiveFundSource {
                 )
                 .await?;
             precommit.validate_precommit()?;
-            // Family links are already retained; only complete acquisition reaches this result.
+            // Family links are retained; only completion of every requested family reaches here.
             self.validate_current()?;
             Ok(published)
         }

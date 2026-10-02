@@ -47,10 +47,11 @@ pub(crate) enum ProviderCatalogRelation {
     ChartProjectionHeader,
     ChartProjectionRow,
     ModelInventoryRecord,
+    SecPreparedIndex,
 }
 
 impl ProviderCatalogRelation {
-    pub(crate) const ALL: [Self; 29] = [
+    pub(crate) const ALL: [Self; 30] = [
         Self::SealedRawObject,
         Self::LogicalPublicationBinding,
         Self::LogicalPublicationRequiredFamily,
@@ -80,6 +81,7 @@ impl ProviderCatalogRelation {
         Self::ChartProjectionHeader,
         Self::ChartProjectionRow,
         Self::ModelInventoryRecord,
+        Self::SecPreparedIndex,
     ];
     pub(crate) const fn canonical_tag(self) -> u8 {
         match self {
@@ -112,6 +114,7 @@ impl ProviderCatalogRelation {
             Self::ChartProjectionHeader => 27,
             Self::ChartProjectionRow => 28,
             Self::ModelInventoryRecord => 29,
+            Self::SecPreparedIndex => 30,
         }
     }
 
@@ -150,6 +153,7 @@ impl ProviderCatalogRelation {
             Self::ChartProjectionHeader => "chart_projection_headers",
             Self::ChartProjectionRow => "chart_projection_rows",
             Self::ModelInventoryRecord => "model_inventory_records",
+            Self::SecPreparedIndex => "sec_prepared_indexes",
         }
     }
 
@@ -188,6 +192,7 @@ impl ProviderCatalogRelation {
             "chart_projection_headers" => Self::ChartProjectionHeader,
             "chart_projection_rows" => Self::ChartProjectionRow,
             "model_inventory_records" => Self::ModelInventoryRecord,
+            "sec_prepared_indexes" => Self::SecPreparedIndex,
             _ => return None,
         })
     }

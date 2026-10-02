@@ -13,7 +13,8 @@ const PHYSICAL_ROWS: &str = "
  WHERE q.state='published' AND q.expires_at_ns>?1
  UNION ALL
  SELECT 3,relative_reference,content_digest,size_bytes,row_count,schema_name,schema_version,schema_fingerprint
- FROM market_event_archive_objects";
+ FROM market_event_archive_objects
+ UNION ALL SELECT 4,relative_reference,content_digest,size_bytes,NULL,NULL,NULL,NULL FROM sec_prepared_indexes";
 
 impl Catalog {
     pub(crate) fn visit_physical_evidence(
@@ -169,6 +170,11 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<PhysicalArtifactEvidence, CatalogEr
                 schema,
             })
         }
+        4 => Ok(PhysicalArtifactEvidence::PreparedIndex {
+            relative_reference,
+            content_hash,
+            size_bytes,
+        }),
         _ => Err(CatalogError::CorruptCatalog),
     }
 }

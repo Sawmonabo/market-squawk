@@ -10,7 +10,7 @@ use super::{
     },
     company_research::{
         CanonicalResearchReadError, CompanyResearchReadCapability, CompanyResearchRequest,
-        ResearchRevisionPolicy, selected_company_row,
+        ResearchRevisionPolicy, map_company_data_error, selected_company_row,
     },
     corporate_actions::map_research_error,
 };
@@ -39,7 +39,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod authorization;
+pub(super) use authorization::authorize_financial_manifest;
 mod page;
+mod projection;
+pub(super) use projection::{FinancialDisplayProjection, financial_display_identity};
 mod snapshot;
 use page::page;
 use snapshot::build_snapshot;
@@ -61,6 +65,7 @@ pub(crate) enum InvestmentFinancialSection {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InvestmentFinancialState {
     Reported,
+    PreparationRequired,
     Missing,
     Conflict,
     Unavailable,
@@ -436,62 +441,16 @@ impl InvestmentFinancialReadCapability {
                 allowed.push(true);
                 continue;
             }
-            let roots: Vec<DatasetManifestRef> = vec![exact.origin().manifest().clone()];
-            let uses: &[ResearchUse] = if section == InvestmentFinancialSection::Ratios {
-                &[ResearchUse::Display, ResearchUse::LocalAnalysis]
-            } else {
-                &[ResearchUse::Display]
-            };
-            let mut admitted = true;
-            for use_kind in uses {
-                check(deadline, cancellation)?;
-                let duration =
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_secs(
-                            MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS,
-                        ));
-                let request = ResearchUseRequest::try_new(
-                    roots.clone(),
-                    *use_kind,
-                    ResearchUseLimits::try_new(
-                        1,
-                        MAX_RESEARCH_USE_GRAPH_NODES,
-                        MAX_RESEARCH_USE_EDGES,
-                        MAX_RESEARCH_USE_SOURCES,
-                        MAX_RESEARCH_USE_RETAINED_BYTES,
-                        duration,
-                        Duration::from_secs(MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS),
-                    )
-                    .map_err(|_| ServiceError::InvalidResult)?,
+            allowed.push(
+                authorize_financial_manifest(
+                    &self.research,
+                    exact.origin().manifest(),
+                    section == InvestmentFinancialSection::Ratios,
+                    deadline,
+                    cancellation,
                 )
-                .map_err(|_| ServiceError::InvalidResult)?;
-                let authorization = self
-                    .research
-                    .authorize_research_use(request, deadline, cancellation)
-                    .await
-                    .map_err(map_research_error)?;
-                let authorization = match authorization {
-                    Ok(authorization) => authorization,
-                    Err(ResearchUseCatalogError::Cancelled) => return Err(ServiceError::Cancelled),
-                    Err(ResearchUseCatalogError::DeadlineExceeded) => {
-                        return Err(ServiceError::DeadlineExceeded);
-                    }
-                    Err(_) => {
-                        admitted = false;
-                        break;
-                    }
-                };
-                if authorization.research_use() != *use_kind
-                    || authorization.graph().roots() != roots.as_slice()
-                    || Utc::now()
-                        .timestamp_nanos_opt()
-                        .is_none_or(|now| now >= authorization.expires_at().unix_nanos())
-                {
-                    return Err(ServiceError::InvalidResult);
-                }
-            }
-            allowed.push(admitted);
+                .await?,
+            );
         }
         Ok(allowed)
     }
@@ -503,6 +462,9 @@ fn availability(
 ) -> FamilyAvailability {
     use InvestmentFinancialState as S;
     let (state, reason) = match outcome {
+        SecResearchIdentityOutcome::PreparationRequired => {
+            (S::PreparationRequired, Some("preparation_required"))
+        }
         SecResearchIdentityOutcome::Missing => (S::Missing, Some("identity_missing")),
         SecResearchIdentityOutcome::Ambiguous => (S::Conflict, Some("identity_ambiguous")),
         SecResearchIdentityOutcome::Stale => (S::Unavailable, Some("identity_stale")),
@@ -519,7 +481,7 @@ fn availability(
         reason,
     }
 }
-fn family_name(family: SecResearchFamily) -> &'static str {
+pub(super) fn family_name(family: SecResearchFamily) -> &'static str {
     match family {
         SecResearchFamily::CompanyFacts => "company_facts",
         SecResearchFamily::Submissions => "filings",
@@ -538,6 +500,11 @@ fn empty_state(families: &[FamilyAvailability]) -> InvestmentFinancialState {
         .any(|family| family.state == InvestmentFinancialState::Unavailable)
     {
         InvestmentFinancialState::Unavailable
+    } else if families
+        .iter()
+        .any(|family| family.state == InvestmentFinancialState::PreparationRequired)
+    {
+        InvestmentFinancialState::PreparationRequired
     } else {
         InvestmentFinancialState::Missing
     }
@@ -586,7 +553,7 @@ fn check(deadline: Instant, cancellation: &CancellationToken) -> Result<(), Serv
 fn sql_error(_: rusqlite::Error) -> ServiceError {
     ServiceError::Unavailable
 }
-fn canonical_error(error: CanonicalResearchReadError) -> ServiceError {
+pub(super) fn canonical_error(error: CanonicalResearchReadError) -> ServiceError {
     match error {
         CanonicalResearchReadError::Cancelled => ServiceError::Cancelled,
         CanonicalResearchReadError::DeadlineExceeded => ServiceError::DeadlineExceeded,

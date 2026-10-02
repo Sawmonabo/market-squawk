@@ -183,6 +183,7 @@ impl Catalog {
             "analytical_generations",
             "analytical_generation_objects",
             "query_artifact_results",
+            "sec_prepared_indexes",
             "company_identity_observations",
             "listing_reference_generations",
             "listing_reference_files",

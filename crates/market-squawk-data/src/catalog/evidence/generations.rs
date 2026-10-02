@@ -91,12 +91,14 @@ pub(super) fn validate_relations(
          SELECT 1 FROM (SELECT relative_reference FROM artifacts UNION ALL
             SELECT r.relative_reference FROM query_artifact_reservations q JOIN query_artifact_results r USING(reservation_id)
              WHERE q.state='published' AND q.expires_at_ns>?1
-            UNION ALL SELECT relative_reference FROM market_event_archive_objects)
+            UNION ALL SELECT relative_reference FROM market_event_archive_objects
+            UNION ALL SELECT relative_reference FROM sec_prepared_indexes)
           GROUP BY relative_reference HAVING COUNT(*)<>1
          UNION ALL
          SELECT 1 FROM (SELECT artifact_id FROM artifacts UNION ALL
             SELECT r.artifact_id FROM query_artifact_reservations q JOIN query_artifact_results r USING(reservation_id)
-             WHERE q.state='published' AND q.expires_at_ns>?1)
+             WHERE q.state='published' AND q.expires_at_ns>?1
+            UNION ALL SELECT artifact_id FROM sec_prepared_indexes)
           GROUP BY lower(artifact_id) HAVING COUNT(*)<>1
          )",[request.cutoff().unix_nanos()],|row|row.get(0))?;
     if invalid {

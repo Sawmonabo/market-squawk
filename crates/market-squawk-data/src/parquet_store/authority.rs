@@ -783,7 +783,10 @@ fn require_only_expected_v2_control_files(
     for entry in directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
-        let data_namespace = matches!(name.to_str(), Some("objects" | "staging" | "quarantine"));
+        let data_namespace = matches!(
+            name.to_str(),
+            Some("objects" | "staging" | "quarantine" | "sec-prepared")
+        );
         let legacy_control = prepared.kind()
             == crate::authority_transition::AuthorityTransitionKind::LegacyMigration
             && matches!(

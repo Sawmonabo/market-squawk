@@ -106,9 +106,17 @@ impl Drop for IndexAllocation {
 
 #[derive(Debug)]
 struct RowIndex {
-    connection: Mutex<Connection>,
-    _directory: tempfile::TempDir,
-    allocation: IndexAllocation,
+    connection: Arc<Mutex<Connection>>,
+    owner: RowIndexOwner,
+    table: &'static str,
+}
+#[derive(Debug)]
+enum RowIndexOwner {
+    Scratch {
+        _directory: tempfile::TempDir,
+        allocation: IndexAllocation,
+    },
+    Prepared(Arc<super::prepared::PreparedArtifact>),
 }
 /// Complete immutable source rows, indexed on disk and shared across cloned read receipts.
 #[derive(Clone, Debug)]
@@ -126,13 +134,102 @@ impl<T> PartialEq for SecResearchRows<T> {
 impl<T> Eq for SecResearchRows<T> {}
 impl<T> SecResearchRows<T> {
     pub(super) fn remaining_spill_bytes(&self) -> Result<u64, SecResearchReadError> {
-        self.index.allocation.scratch.remaining()
+        match &self.index.owner {
+            RowIndexOwner::Scratch { allocation, .. } => allocation.scratch.remaining(),
+            RowIndexOwner::Prepared(_) => Ok(u64::MAX),
+        }
     }
     pub const fn len(&self) -> usize {
         self.count
     }
     pub const fn is_empty(&self) -> bool {
         self.count == 0
+    }
+}
+impl<T> SecResearchRows<T> {
+    pub(super) fn persist_descriptor(
+        &self,
+        connection: &Connection,
+        table: &'static str,
+    ) -> Result<(), SecResearchReadError> {
+        connection.execute(
+            "INSERT INTO row_indexes(name,row_count,digest) VALUES(?1,?2,?3)",
+            params![table, self.count as i64, self.digest.bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+    pub(super) fn persist_into(
+        &self,
+        destination: &Connection,
+        table: &'static str,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), SecResearchReadError> {
+        let source = self
+            .index
+            .connection
+            .lock()
+            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
+        destination.execute_batch(&format!("CREATE TABLE {table}(ordinal INTEGER PRIMARY KEY,row_key TEXT,payload BLOB NOT NULL); CREATE INDEX {table}_keys ON {table}(row_key);"))?;
+        let mut select = source.prepare(&format!(
+            "SELECT ordinal,row_key,payload FROM {} ORDER BY ordinal",
+            self.index.table
+        ))?;
+        let mut rows = select.query([])?;
+        let mut insert = destination.prepare(&format!(
+            "INSERT INTO {table}(ordinal,row_key,payload) VALUES(?1,?2,?3)"
+        ))?;
+        let mut count = 0usize;
+        while let Some(row) = rows.next()? {
+            super::check_operation(deadline, cancellation)?;
+            let ordinal: i64 = row.get(0)?;
+            if usize::try_from(ordinal).ok() != Some(count) {
+                return Err(SecResearchReadError::PreparedIntegrity);
+            }
+            insert.execute(params![
+                ordinal,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Vec<u8>>(2)?
+            ])?;
+            count += 1;
+        }
+        if count != self.count {
+            return Err(SecResearchReadError::PreparedIntegrity);
+        }
+        destination.execute(
+            "INSERT INTO row_indexes(name,row_count,digest) VALUES(?1,?2,?3)",
+            params![table, count as i64, self.digest.bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+    pub(super) fn reopen(
+        artifact: Arc<super::prepared::PreparedArtifact>,
+        connection: Arc<Mutex<Connection>>,
+        table: &'static str,
+    ) -> Result<Self, SecResearchReadError> {
+        let (count, digest): (i64, Vec<u8>) = connection
+            .lock()
+            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
+            .query_row(
+                "SELECT row_count,digest FROM row_indexes WHERE name=?1",
+                [table],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        Ok(Self {
+            index: Arc::new(RowIndex {
+                connection,
+                owner: RowIndexOwner::Prepared(artifact),
+                table,
+            }),
+            count: usize::try_from(count).map_err(|_| SecResearchReadError::PreparedIntegrity)?,
+            digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                digest
+                    .try_into()
+                    .map_err(|_| SecResearchReadError::PreparedIntegrity)?,
+            ),
+            _row: PhantomData,
+        })
     }
 }
 impl<T: DeserializeOwned> SecResearchRows<T> {
@@ -145,7 +242,11 @@ impl<T: DeserializeOwned> SecResearchRows<T> {
             .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
         let bytes: Option<Vec<u8>> =
             connection
-                .prepare_cached("SELECT payload FROM rows WHERE ordinal=?1")?
+                .prepare_cached(&if self.index.table == "canonical_rows" {
+                    "SELECT observation FROM candidates WHERE id=?1+1".to_owned()
+                } else {
+                    format!("SELECT payload FROM {} WHERE ordinal=?1", self.index.table)
+                })?
                 .query_row(
                     [i64::try_from(ordinal)
                         .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?],
@@ -172,7 +273,10 @@ impl<T: DeserializeOwned> SecResearchRows<T> {
             .lock()
             .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
         let bytes: Option<Vec<u8>> = connection
-            .prepare_cached("SELECT payload FROM rows WHERE row_key=?1 ORDER BY ordinal LIMIT 1")?
+            .prepare_cached(&format!(
+                "SELECT payload FROM {} WHERE row_key=?1 ORDER BY ordinal LIMIT 1",
+                self.index.table
+            ))?
             .query_row([key], |row| row.get(0))
             .optional()?;
         bytes
@@ -232,9 +336,12 @@ impl<T: Serialize> RowsBuilder<T> {
         self.allocation.update(&self.connection)?;
         Ok(SecResearchRows {
             index: Arc::new(RowIndex {
-                connection: Mutex::new(self.connection),
-                _directory: self.directory,
-                allocation: self.allocation,
+                connection: Arc::new(Mutex::new(self.connection)),
+                owner: RowIndexOwner::Scratch {
+                    _directory: self.directory,
+                    allocation: self.allocation,
+                },
+                table: "rows",
             }),
             count: self.count,
             digest: EvidenceDigest::new(DigestAlgorithm::Sha256, self.digest.finalize().into()),

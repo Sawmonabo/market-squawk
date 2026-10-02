@@ -402,6 +402,7 @@ function revisionLabel(revision: InvestmentFinancialFact["revision"]): string {
 function sectionAvailability(state: InvestmentFinancialsResult["state"]): string {
   switch (state) {
     case "reported": return "Reported information is available."
+    case "preparation_required": return "Saved reports are ready to prepare. Choose Load financial information to open them."
     case "missing": return "No reported information is available for this section at the information date."
     case "conflict": return "Conflicting evidence prevents this section from being established."
     case "unavailable": return "This financial section is unavailable with the current evidence."
@@ -412,6 +413,7 @@ function sectionAvailability(state: InvestmentFinancialsResult["state"]): string
 function FinancialFamilies({ families }: { families: InvestmentFinancialsResult["families"] }) {
   const labels = { company_facts: "Company reports", filing_details: "Detailed filing information", filings: "Filing history" }
   const reasons = {
+    preparation_required: "Saved reports need to be prepared. Choose Load financial information.",
     identity_missing: "The company relationship has not been established.", identity_ambiguous: "More than one company relationship matches.",
     identity_stale: "The company relationship needs to be checked again.", identity_revoked: "The previous company relationship is no longer valid.",
     revision_conflict: "Reported revisions conflict.", no_records: "No records are available at the information date.",

@@ -360,12 +360,15 @@ pub use rights::{
 };
 pub use sec_research::{
     MAX_SEC_RESEARCH_OBJECT_BYTES, SecFilingXbrlContext, SecFilingXbrlFootnote,
-    SecFilingXbrlNonnumericOccurrence, SecResearchConflict, SecResearchDisposition,
+    SecFilingXbrlNonnumericOccurrence, SecPreparedGenerationReceipt, SecResearchConflict,
+    SecResearchDisplayCoordinate, SecResearchDisplayProjector, SecResearchDisposition,
     SecResearchExcludedRow, SecResearchFamily, SecResearchIdentityOutcome,
-    SecResearchIdentityReadRequest, SecResearchIdentitySelection, SecResearchKnowledgeExclusions,
-    SecResearchOrigin, SecResearchPointInTimeIdentities, SecResearchReadCapability,
-    SecResearchReadError, SecResearchReadRequest, SecResearchRowIdentity, SecResearchRows,
-    SecResearchSelectedRow, SecResearchSelection, SecResearchSelectionReceipt,
+    SecResearchIdentityPreparation, SecResearchIdentityReadRequest, SecResearchIdentityResolution,
+    SecResearchIdentitySelection, SecResearchKnowledgeExclusions, SecResearchOrigin,
+    SecResearchPointInTimeIdentities, SecResearchPreparationOutcome, SecResearchReadCapability,
+    SecResearchReadError, SecResearchReadRequest, SecResearchResolvedOutcome,
+    SecResearchRowIdentity, SecResearchRows, SecResearchSelectedRow, SecResearchSelection,
+    SecResearchSelectionReceipt, SecResearchSourceCoordinate, SecResearchSourceRow,
     SecVerifiedFilingXbrl,
 };
 pub use universe::{
