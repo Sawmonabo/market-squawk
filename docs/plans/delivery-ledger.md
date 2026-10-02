@@ -2,7 +2,9 @@
 
 ## Current execution — 2026-10-01
 
-Working branch `feature/v1-installed-product-experience`, primary worktree only. Pushed `32382832` (PR #43 comment5942357301), after `30736a9a` (comment5942143016), following `5b25ac44` (comment5941104580)
+Working branch `feature/v1-installed-product-experience`, primary worktree only. Current checkpoint
+(this commit): coordinated development watcher, verified cached model-runtime reuse and clean
+service replacement. Previous pushed `aba0af19` (committed data-to-screen updates), after `32382832` (PR #43 comment5942357301), after `30736a9a` (comment5942143016), following `5b25ac44` (comment5941104580)
 isolates retained reads and adds failed-request stage attribution. The current completed-close/display
 batch below has one successful native initial load after earlier deadline failures; full screen/data
 acceptance remains open. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
@@ -13,11 +15,62 @@ One worktree, three local and three origin branches; protected backup refs remai
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — committed data-to-screen updates | Owns runtime events.rs/lib.rs and existing runtime event test; service/research composition, display actor and history wake plumbing, shared contracts, native events.rs, macro query-key correction and all integration/Git/builds. Reuse closed ServiceDomain union and existing sequenced event journal; coalesce committed background changes without an added worker or timer. | Freeze typed signal API before producer edits. Preserve command-response ordering, cursor gaps/restarts and retained dirty state on publication failure. |
-| GPT-6.1 Sol — Desktop refresh consumer | Owns app/product-context.tsx, app/product-events.ts, one cohesive app/domain-refresh.ts helper if needed, and the existing critical event tests only. Coalesce active-query updates without canceling successful in-flight reads; preserve one follow-up for changes during reads, inactive invalidation and scope cleanup. | Existing Desktop invalidate event shape stays unchanged. Lead owns native conversion and shared DTOs. Critical check covers event-during-read loss and cancellation starvation only; no component matrix. |
-| Astra publication_edges — committed data notification | Delegated preparation in data src/catalog.rs, catalog/types.rs, ingest.rs, lib.rs, manifest/catalog.rs, catalog/market_event_store.rs, catalog/market_data_instruments.rs and children alpaca_asset_reference.rs/option_reference.rs/issuer_reference.rs, catalog/listing_reference/persistence.rs, catalog/official_options_reference.rs, catalog/company_security.rs, catalog/chart_projection.rs; existing tests/publication_recovery.rs critical case. One data-owned synchronous callback, explicit semantic post-commit sites; no read-side/control/rights write notifications. | Runtime ApplicationChanges::record(ServiceDomain) API frozen. Lead owns callback composition, actor/history wake, shared integration and checks; agent has no Git/build/runtime authority. Publication after caller cancellation must still notify; replay/no-op must not. |
-| Lead — accepted macro snapshot checkpoint | Pushed32382832, three critical checks and live native Home/Macro/Research success below. Both prior owners released. | Macro0/15 coverage, crypto faults, log-drain shutdown and complete rich quote/family contracts remain open. |
+| Lead — coordinated development startup | Implemented and critically/live verified on macOS; launcher, lifecycle hooks, model-cache consumers and documentation integrated. All subagent ownership released. | Commit/push this checkpoint. Keep the visible `just dev` session running; stop it before manual Cargo checks. |
+| Astra startup_read_diagnosis — read-only | Owner reports Loading workspace and unavailable investment details in visible native7293/service7082. Trace retained_routes_and_events timeout and startup dependencies; no edits, builds or Git. | Return the exact blocking call/ownership and smallest correction. Lead reserves all implementation files until diagnosis. |
+| Lead — workspace and detail recovery | Trace real Desktop bootstrap/detail failure against the running service; owns integration, launcher and UI/service changes. | Correct established cause and verify actual screen behavior; watcher checks do not establish working investment details. |
 
+
+
+Coordinated watcher evidence: one real-child Node lifecycle regression PASS1/1, existing Python
+foundation-binding regression PASS1/1, Rust formatting and JavaScript syntax checks pass. Real
+Watchexec/Vite/native observation confirms CSS HMR with unchanged processes, service65362→65890
+while native65409 remains open and adopts a new authenticated scope, followed by native-only
+replacement67366 while service66771 remains running. Temporary edits were restored; final
+native68437 reopened on the unchanged service. Backend rebuilds took10.61s and9.85s; native
+rebuilds25.88s and29.44s. The launcher then stopped with0 and its runtime staging directory was
+empty. Evidence: `dev-watch-observed-{result,initial,service-replaced,service-restored,native-replaced,final}.json`,
+`dev-watch-{live,critical,model-critical,format}.log` in ignored `.agents/tmp/v1-first-stock/`.
+
+The initial live probe exposed three concrete integration defects, now corrected: Tauri's macOS
+resource directory requires the staged sibling Resources directory; Watchexec's event-only handler
+ignores stdin EOF and instead receives its supported termination signal; service shutdown wrongly
+counted pre-admission unsafe-log rejection as failure to drain accepted records. Rejections stay
+visible without exposing contents. Accepted/persisted mismatch, overflow and write failures still
+fail shutdown and block automatic service replacement. Real replacement passed after one rejected
+event, and final orderly launcher exit was0. The critical Node check also rejects failed shutdown
+across subsequent saves and catches runtime-directory cleanup failures.
+
+Model cache recovery: loose root foundation, signed installed runtime and historical evidence came
+from three interrupted generations. The canonical installed runtime passed full native signature,
+file and distribution verification. Lead recovered the exact foundation matching both signed
+receipts from three agreeing installed executable/extension copies, preserving old loose records.
+Future builds seal that foundation inside the canonical runtime; development admission now reuses
+that complete runtime without requiring duplicate Cargo release binaries or rewriting old release
+matrix evidence. `just verify-model-runtime` and native Python admission pass. This proves cache
+integrity/reuse, not new model-training or full product acceptance. See
+`dev-watch-{foundation-recovery.json,model-verify.log,canonical-model-verify.log}`. Normal `just dev`
+exposed a nested-Just invocation that dropped workspace overrides and selected historical default
+roots. Parameterized recipe dependencies now preserve the selected roots. Corrected visible launch
+uses indexed-storage workspace, service7082/native7293, a1.47s Cargo freshness check, and an
+on-screen Market Squawk window confirmed by CoreGraphics. Backend reached Ready, but the owner
+reports workspace loading and unavailable investment details; product launch is not accepted.
+Evidence: `dev-watch-visible.log` and `dev-watch-visible-result.json`.
+
+Ordinary developer reloads use one single-job Cargo invocation for shared Desktop/service
+features, one maintained Watchexec event stream and one Vite server. Failed compilation retains
+the working processes. Model-runtime refresh remains explicit for changed model/Python inputs.
+Windows process-tree cleanup is implemented but unverified on this Mac. No CI, broad release gate
+or whole-app RAM measurement ran. The final native scope was admitted; richer market reads later
+logged a15s retained-route/event deadline, so complete screen/data acceptance remains open.
+
+Development watcher lifecycle proof: native/service debug hooks build successfully (service12.93s,
+native24.57s). Closing the parent-owned stdin pipe stopped service2096 with0; replacement2614
+reconnected to the same still-running native2097 with a new admitted product scope. Final service
+also stopped0. Evidence: `dev-watch-reconnect-{before,after,result}.json` and matching logs under
+`.agents/tmp/v1-first-stock/`. This proves real EOF shutdown/reconnect, not yet watcher scheduling.
+Watchexec2.7.3 was installed from its Homebrew bottle. Lead owns native `service.rs` and service
+binary hooks in addition to the integration scope above. Two stale project Vite instances are
+stopped before the new launcher's sole frontend starts; other sessions are untouched.
 
 Data-update wave is integrated and frozen for lead verification. Runtime event coalescing/gap
 check PASS1/1; Desktop event-during-read/reconnect checks PASS2/2 (2.60s) and TypeScript build PASS;
@@ -44,7 +97,7 @@ quotes. Advanced Research completed all four active queries without errors; macr
 The observation exposed a presentation error: background fetching incorrectly relabeled verified
 saved prices as unchecked. Collection cards now distinguish updating the last checked availability
 from an actual failed refresh/disconnection; TypeScript recheck passes. Crypto publication/health
-and orderly log-drain shutdown remain separate open defects. No CI, release gate or RAM claim.
+and orderly log-drain shutdown remain separate open defects. Existing market-journey check also PASS1/1; real Vite refresh shows all nine updated labels. Service29252 stopped cleanly0; native29257 stopped143 after WebDriver session deletion. No CI, release gate or RAM claim.
 
 Macro wave is accepted as a bounded read-contention checkpoint. Three critical checks pass: manifest discovery during an
 active write (1/1,0.56s), publication/origin reads during a write (1/1,7.89s), and Tiingo original

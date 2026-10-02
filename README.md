@@ -298,7 +298,7 @@ lockfile. Crates are grouped by product responsibility:
 ### Build from source
 
 Source development requires Git, exact `just` `1.57.0`, the repository-pinned Rust `1.97.1`
-toolchain, Node.js `24.18.0`, pnpm `10.31.0`, uv `0.12.3`, and the official
+toolchain, Node.js `24.18.0`, pnpm `10.31.0`, uv `0.12.3`, Watchexec `2.7.3`, and the official
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform. Install
 `just` once through the already-required Rust toolchain, then use the repository-owned commands:
 
@@ -316,12 +316,28 @@ with `nvm` or `nvm-windows` when available and validates it in the same process 
 `just setup` also prepares pinned pnpm `10.31.0`.
 
 `just setup` creates the verified, reusable model and training cache at
-`.market-squawk/development-model-runtime`. `just dev` validates that cache and refreshes it when
-shipping inputs have changed before starting the Tauri desktop with Vite hot reload. Its ignored
-`.market-squawk/development` workspace-data root and `.market-squawk/development-installation`
-service-authority root are separate from the installed product. The one shared development service
-may remain available after the desktop exits so the development CLI and MCP clients can reuse it.
-`just dev-web` is frontend-only diagnostic mode, not the complete product.
+`.market-squawk/development-model-runtime`. `just dev` prepares that cache, then starts one visible
+Desktop, Vite and the shared service under the development launcher. Install Watchexec with
+`brew install watchexec` on macOS or use its [official packages](https://github.com/watchexec/watchexec/blob/main/crates/cli/README.md#installation).
+UI changes use React Fast Refresh. Rust changes enter one coalesced, single-job Cargo build for the shared service/Desktop
+dependencies; a failed build leaves the working application running. Successful backend builds gracefully replace
+the owned service and reconnect the open Desktop. Native or shared-contract changes also restart
+Desktop. Generated data, build output and logs do not trigger rebuilds. The development binary includes
+the existing background screen-check feature; its listener remains off unless `--webdriver-port`
+is explicitly supplied to the launcher.
+
+The ignored `.market-squawk/development` workspace-data and
+`.market-squawk/development-installation` authority roots remain separate from the installed product.
+Development CLI/MCP clients can join the same service. Keep the launcher terminal running; Ctrl-C
+stops its owned processes gracefully. A second launcher or unrelated existing server is not killed
+or silently adopted. Development executables are staged privately so builds can finish while the
+previous service runs, including on Windows. `just dev-web` remains frontend-only diagnostics.
+Fixed-build verification runs separately from the watcher; stop the watcher before scheduling
+manual Cargo checks. Model/training-runtime refresh still uses the commands below and its own
+verified evidence; frontend or ordinary service edits do not silently rebuild that release cache.
+Cache reuse validates the installed runtime and its sealed foundation, including signatures and
+installed file identities. Disposable Cargo release output and unfinished build records are not
+required to reuse that runtime.
 
 `just setup` is safe to rerun. It preserves the managed Python environment, synchronizes the
 hash-locked dependencies, and rebuilds and installs Market Squawk's Rust-backed Python package.

@@ -72,6 +72,8 @@ _frontend $frontend_action:
         exit 1
     fi
 
+    # Corepack selects packageManager from cwd, not pnpm's later --dir argument.
+    cd "{{ desktop }}"
     if [[ "${action}" == "setup" ]]; then
         corepack enable
         corepack prepare pnpm@10.31.0 --activate
@@ -90,11 +92,7 @@ _frontend $frontend_action:
             exec pnpm --dir "{{ desktop }}" install --frozen-lockfile
             ;;
         dev)
-            export MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM="{{ root }}/target/debug/market-squawk-service"
-            export MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM="{{ root }}/target/debug/market-squawk-mcp-relay"
-            printf 'Market Squawk development data: %s\n' "{{ development_data }}"
-            printf 'Market Squawk development service state: %s\n' "{{ development_installation }}"
-            exec pnpm --dir "{{ desktop }}" tauri dev -- -- --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
+            exec node "{{ root }}/scripts/develop.mjs" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
             ;;
         dev-web)
             exec pnpm --dir "{{ desktop }}" dev
@@ -143,6 +141,8 @@ _frontend $frontend_action:
         throw "Node.js $requiredNode is required by .nvmrc; found $actualNode."
     }
 
+    # Select this package's pinned pnpm before Corepack resolves its executable.
+    Set-Location -LiteralPath "{{ desktop }}"
     if ($action -eq "setup") {
         & corepack enable
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -161,18 +161,8 @@ _frontend $frontend_action:
             exit $LASTEXITCODE
         }
         "dev" {
-            $env:MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM = "{{ root }}/target/debug/market-squawk-service.exe"
-            $env:MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM = "{{ root }}/target/debug/market-squawk-mcp-relay.exe"
-            try {
-                Write-Output "Market Squawk development data: {{ development_data }}"
-                Write-Output "Market Squawk development service state: {{ development_installation }}"
-                & pnpm --dir "{{ desktop }}" tauri dev -- -- --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
-                $exitCode = $LASTEXITCODE
-            } finally {
-                Remove-Item Env:MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM -ErrorAction SilentlyContinue
-                Remove-Item Env:MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM -ErrorAction SilentlyContinue
-            }
-            exit $exitCode
+            & node "{{ root }}/scripts/develop.mjs" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
+            exit $LASTEXITCODE
         }
         "dev-web" {
             & pnpm --dir "{{ desktop }}" dev
@@ -235,13 +225,13 @@ _ensure-model-runtime:
 _build-development-service-runtime:
     #!/usr/bin/env bash
     set -euo pipefail
-    export MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT="$(< "{{ development_model_runtime }}/python/training-foundation.json")"
+    export MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT="$(< "{{ development_model_release }}/share/market-squawk/training-foundation.json")"
     exec cargo build --locked -p market-squawk --features release-evidence --bin market-squawk-service --bin market-squawk-mcp-relay --bin market-squawk-capture-helper
 
 [private]
 [windows]
 _build-development-service-runtime:
-    $env:MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT = [System.IO.File]::ReadAllText("{{ development_model_runtime }}/python/training-foundation.json"); try { cargo build --locked -p market-squawk --features release-evidence --bin market-squawk-service --bin market-squawk-mcp-relay --bin market-squawk-capture-helper; exit $LASTEXITCODE } finally { Remove-Item Env:MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT -ErrorAction SilentlyContinue }
+    $env:MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT = [System.IO.File]::ReadAllText("{{ development_model_release }}/share/market-squawk/training-foundation.json"); try { cargo build --locked -p market-squawk --features release-evidence --bin market-squawk-service --bin market-squawk-mcp-relay --bin market-squawk-capture-helper; exit $LASTEXITCODE } finally { Remove-Item Env:MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT -ErrorAction SilentlyContinue }
 
 [private]
 [unix]
@@ -267,9 +257,8 @@ refresh-model-runtime: _python-setup
 verify-model-runtime:
     "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --verify-development-runtime
 
-# Run the complete desktop product with Vite hot reload and a verified reusable service runtime.
-dev: _ensure-model-runtime _build-development-service-runtime
-    just _frontend dev
+# Run Desktop with UI hot refresh and one coordinated Rust/service rebuild watcher.
+dev: _ensure-model-runtime (_frontend "dev")
 
 # Run the shared application service in the foreground against development data.
 [unix]

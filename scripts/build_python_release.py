@@ -3262,6 +3262,7 @@ def _build_release(
             release_venv,
             release_python,
             runtime,
+            foundation,
             foundation_sha256,
             training_code_revision,
             release_manifest,
@@ -3597,7 +3598,7 @@ def admit_development_runtime(
     development_root: Path,
     lock: ReleaseLock,
 ) -> None:
-    """Verify the cached release and its training-authority programs."""
+    """Verify the installed cache independently of disposable build outputs."""
 
     artifact_root = development_root / "python"
     canonical_release = artifact_root / CANONICAL_RELEASE
@@ -3616,45 +3617,65 @@ def admit_development_runtime(
     profile = platform_profile(lock.target)
     suffix = profile.executable_suffix
     installed_bin = canonical_release / "bin"
-    native_bin = _cargo_release_dir(root, profile)
-    installed_application = installed_bin / f"market-squawk{suffix}"
-    installed_worker = installed_bin / f"market-squawk-onnx-worker{suffix}"
-    native_application = native_bin / f"market-squawk{suffix}"
-    native_worker = native_bin / f"market-squawk-onnx-worker{suffix}"
-    receipt_path = development_root / "runtime.json"
+    authority = canonical_release / "share/market-squawk"
+    foundation_path = authority / "training-foundation.json"
+    receipt_path = authority / "training-environment.json"
+    manifest_path = authority / "market-squawk-release.json"
+    interpreter = canonical_release / profile.interpreter_relative_path
     required = (
+        foundation_path,
         receipt_path,
-        artifact_root / "training-foundation.json",
-        artifact_root / "market-squawk-release.json",
-        artifact_root / "market-squawk-release-evidence.json",
-        canonical_release / "share/market-squawk/training-environment.json",
-        canonical_release / "share/market-squawk/market-squawk-release.json",
-        installed_application,
-        installed_worker,
+        manifest_path,
+        interpreter,
+        installed_bin / f"market-squawk{suffix}",
+        installed_bin / f"market-squawk-onnx-worker{suffix}",
         installed_bin / f"market-squawk-model-validator{suffix}",
-        installed_bin / f"market-squawk-train{suffix}",
-        native_application,
-        native_worker,
+        canonical_release / _training_driver_path(profile),
     )
     if any(path.is_symlink() or not path.is_file() for path in required):
         raise ReleaseBuildError("development model runtime is incomplete")
-    receipt_size = receipt_path.stat().st_size
-    if receipt_size == 0 or receipt_size > 64 * 1024:
-        raise ReleaseBuildError("development runtime receipt exceeds its byte bound")
+    authority_bytes = []
+    for path in (foundation_path, receipt_path, manifest_path):
+        size = path.stat().st_size
+        if size == 0 or size > 16 * 1024:
+            raise ReleaseBuildError("development runtime authority exceeds its byte bound")
+        with path.open("rb") as stream:
+            raw = stream.read(16 * 1024 + 1)
+        if len(raw) != size:
+            raise ReleaseBuildError("development runtime authority changed during inspection")
+        authority_bytes.append(raw)
+    foundation, raw_receipt, raw_manifest = authority_bytes
     try:
-        raw_receipt = receipt_path.read_bytes()
-        receipt = json.loads(raw_receipt)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ReleaseBuildError("development runtime receipt is unreadable") from error
-    expected_receipt = _development_runtime_receipt(
+        receipt = json.loads(raw_receipt)["payload"]
+        manifest = json.loads(raw_manifest)["payload"]
+        foundation_sha256 = hashlib.sha256(foundation).hexdigest()
+        if (
+            receipt["foundation_sha256"] != foundation_sha256
+            or manifest["foundation_sha256"] != foundation_sha256
+            or receipt["release_manifest_sha256"]
+            != hashlib.sha256(raw_manifest).hexdigest()
+            or manifest["project_wheel"]["target"] != profile.target
+        ):
+            raise ReleaseBuildError("development runtime installed authority identity differs")
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("development runtime installed authority is unreadable") from error
+    # Native admission verifies signatures against the embedded foundation and the complete
+    # installed interpreter, executables, wheel and distribution RECORD file sets.
+    _run(
+        [
+            str(interpreter),
+            "-I",
+            "-B",
+            "-c",
+            "import sys;import market_squawk as native;"
+            "receipt=native.training_environment_receipt();"
+            "raise SystemExit(0 if getattr(native, "
+            "'__market_squawk_build_identity__', None) == 'sealed-release-v1' "
+            "and receipt.sha256 == sys.argv[1] else 2)",
+            hashlib.sha256(raw_receipt).hexdigest(),
+        ],
         root,
-        development_root,
-        layout,
-        development_root / "source-lock.json",
-        profile,
     )
-    if len(raw_receipt) != receipt_size or receipt != expected_receipt:
-        raise ReleaseBuildError("development runtime receipt identity differs")
 
 
 def _copy_native_release_executables(
@@ -5049,6 +5070,7 @@ def install_training_environment(
     release_root: Path,
     release_python: str,
     runtime: PythonRuntime,
+    foundation: bytes,
     foundation_sha256: str,
     training_code_revision: str,
     release_manifest: bytes,
@@ -5068,6 +5090,8 @@ def install_training_environment(
         validator_sha256,
     ):
         _sha256(digest)
+    if hashlib.sha256(foundation).hexdigest() != foundation_sha256:
+        raise ReleaseBuildError("installed training foundation identity differs")
     interpreter = Path(release_python)
     try:
         interpreter_relative = interpreter.relative_to(release_root).as_posix()
@@ -5098,6 +5122,8 @@ def install_training_environment(
     shutil.copyfile(project_wheel, wheel_destination)
     manifest_path = authority / "market-squawk-release.json"
     manifest_path.write_bytes(release_manifest)
+    foundation_path = authority / "training-foundation.json"
+    foundation_path.write_bytes(foundation)
     payload = {
         "foundation_sha256": foundation_sha256,
         "interpreter": {
@@ -5143,7 +5169,7 @@ def install_training_environment(
     receipt_path = authority / "training-environment.json"
     receipt_path.write_bytes(encoded)
     if os.name != "nt":
-        for path in (wheel_destination, manifest_path, receipt_path):
+        for path in (wheel_destination, manifest_path, receipt_path, foundation_path):
             path.chmod(0o444)
         authority.chmod(0o555)
     return hashlib.sha256(encoded).hexdigest()

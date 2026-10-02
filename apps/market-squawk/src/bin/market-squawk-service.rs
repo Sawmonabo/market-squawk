@@ -37,6 +37,10 @@ const LOG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk-service", version)]
 struct ServiceArguments {
+    /// Stop gracefully when the development launcher's private stdin pipe closes.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true, conflicts_with = "foreground_keyring_broker")]
+    development_control_stdin: bool,
     /// Local Market Squawk data root.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -107,6 +111,11 @@ fn run_service() -> Result<InstalledServiceRunOutcome> {
 
 async fn run() -> Result<InstalledServiceRunOutcome> {
     let arguments = ServiceArguments::parse();
+    let development_shutdown = CancellationToken::new();
+    #[cfg(debug_assertions)]
+    if arguments.development_control_stdin {
+        watch_development_parent(development_shutdown.clone())?;
+    }
     let installation_data_root = arguments
         .installation_data_root
         .clone()
@@ -180,15 +189,36 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
             phase: ServiceStartupPhase::LoggingReady,
         },
     )?;
-    let result = run_installed_service(config, logging.store(), instance, startup.as_ref()).await;
+    let result = run_installed_service(
+        config,
+        logging.store(),
+        instance,
+        startup.as_ref(),
+        development_shutdown,
+    )
+    .await;
     let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
+        if evidence.rejected_unsafe != 0 {
+            // These records were deliberately rejected before admission. Their
+            // absence is not a failure to drain accepted persistence work.
+            eprintln!(
+                "Market Squawk log protection rejected {} unsafe events; their contents were not recorded.",
+                evidence.rejected_unsafe
+            );
+        }
         if evidence.accepted == evidence.persisted
             && evidence.dropped_overflow == 0
-            && evidence.rejected_unsafe == 0
             && evidence.write_failures == 0
         {
             Ok(evidence)
         } else {
+            eprintln!(
+                "Market Squawk log drain: accepted={}, persisted={}, overflow={}, write_failures={}",
+                evidence.accepted,
+                evidence.persisted,
+                evidence.dropped_overflow,
+                evidence.write_failures
+            );
             Err(market_squawk::service::InstalledServiceLoggingError::IncompleteDrain)
         }
     });
@@ -207,6 +237,7 @@ async fn run_installed_service(
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
     instance: InstalledServiceInstance,
     startup: Option<&ServiceStartupEvidenceWriter>,
+    development_shutdown: CancellationToken,
 ) -> Result<InstalledServiceRunOutcome> {
     publish_startup(
         startup,
@@ -224,12 +255,19 @@ async fn run_installed_service(
             );
         }
     };
+    let stop = async {
+        tokio::select! {
+            result = termination.wait() => result,
+            () = development_shutdown.cancelled() => Ok(()),
+        }
+    };
+    tokio::pin!(stop);
     let mut starting = Box::pin(InstalledService::start_with_logging_store(
         config, instance, logs,
     ));
     let service_result = tokio::select! {
         result = &mut starting => result,
-        signal = termination.wait() => {
+        signal = &mut stop => {
             signal?;
             publish_startup(
                 startup,
@@ -263,7 +301,7 @@ async fn run_installed_service(
     let mut serving = Box::pin(service.run(cancellation.clone()));
     let result = tokio::select! {
         result = &mut serving => result.map_err(Into::into),
-        signal = termination.wait() => {
+        signal = &mut stop => {
             cancellation.cancel();
             let evidence = publish_startup(
                 startup,
@@ -300,6 +338,27 @@ async fn run_installed_service(
         }
         Err(error) => fail_startup(startup, ServiceStartupPhase::Serving, error),
     }
+}
+
+#[cfg(debug_assertions)]
+fn watch_development_parent(shutdown: CancellationToken) -> std::io::Result<()> {
+    // A detached OS thread avoids an uncancellable Tokio stdin read holding runtime
+    // shutdown open when an ordinary termination signal arrives first.
+    std::thread::Builder::new()
+        .name("development-parent".to_owned())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut input = std::io::stdin().lock();
+            let mut byte = [0];
+            loop {
+                match input.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            shutdown.cancel();
+        })?;
+    Ok(())
 }
 
 async fn run_foreground_keyring_broker(

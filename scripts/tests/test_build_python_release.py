@@ -636,6 +636,25 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
 
             value = json.loads(foundation)
             release = json.loads(manifest)
+            # An interrupted build must not bind a new foundation to old artifacts.
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError, "installed training foundation identity differs"
+            ):
+                builder.install_training_environment(
+                    canonical_release,
+                    str(interpreter),
+                    builder.PythonRuntime(interpreter, (3, 14, 6)),
+                    foundation + b" ",
+                    digest,
+                    value["training_code_revision"],
+                    manifest,
+                    manifest_digest,
+                    project_wheel,
+                    release["payload"]["validator"]["sha256"],
+                    mock.Mock(),
+                    (),
+                    signer,
+                )
             self.assertEqual(hashlib.sha256(foundation).hexdigest(), digest)
             self.assertEqual(value["training_code_revision"], value["source_closure_sha256"])
             self.assertEqual(hashlib.sha256(manifest).hexdigest(), manifest_digest)

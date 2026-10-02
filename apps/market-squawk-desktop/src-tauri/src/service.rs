@@ -94,6 +94,8 @@ struct DesktopServiceLaunch {
     config_path: Option<PathBuf>,
     training_release_root: Option<PathBuf>,
     installation_data_root: PathBuf,
+    /// Debug launcher owns replacement; this Desktop must never spawn a competitor.
+    externally_managed: bool,
 }
 
 pub(crate) enum DesktopBootstrapAction {
@@ -147,6 +149,17 @@ pub(crate) async fn connect_or_start(
             config_path: config_path.map(Path::to_path_buf),
             training_release_root: config.training_release_root().map(Path::to_path_buf),
             installation_data_root,
+            externally_managed: {
+                #[cfg(debug_assertions)]
+                {
+                    std::env::var_os("MARKET_SQUAWK_DEVELOPMENT_EXTERNAL_SERVICE")
+                        .is_some_and(|value| value == "1")
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    false
+                }
+            },
         },
     });
     reconnect_or_start(&authority, cancellation).await
@@ -190,6 +203,9 @@ async fn reconnect_or_start_until(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
+    if authority.launch.externally_managed {
+        return wait_for_started_service(authority, None, None, None, deadline, cancellation).await;
+    }
     let previous = read_service_startup_evidence(&authority.launch.installation_data_root)?;
     if let Some(evidence) = previous
         && process_is_current(evidence.process_identity())?
@@ -296,12 +312,13 @@ async fn wait_for_started_service(
             if process_is_current(process)? {
                 owner = Some(process);
                 live_state = Some(evidence.state());
-            } else if owner == Some(process)
-                || (child_exited
-                    && previous != Some(process)
-                    && child
-                        .as_ref()
-                        .is_some_and(|child| child.id() == process.process_id()))
+            } else if !authority.launch.externally_managed
+                && (owner == Some(process)
+                    || (child_exited
+                        && previous != Some(process)
+                        && child
+                            .as_ref()
+                            .is_some_and(|child| child.id() == process.process_id())))
             {
                 return Err(match evidence.state() {
                     ServiceStartupState::Failed { phase } => {
@@ -312,6 +329,7 @@ async fn wait_for_started_service(
             }
         }
         if live_state.is_none()
+            && !authority.launch.externally_managed
             && let Some(process) = owner
             && !process_is_current(process)?
         {
@@ -321,6 +339,7 @@ async fn wait_for_started_service(
             Some(ServiceStartupState::Failed { phase }) => {
                 return Err(DesktopServiceError::StartupFailed { phase });
             }
+            Some(ServiceStartupState::Stopped) if authority.launch.externally_managed => {}
             Some(ServiceStartupState::Stopped) => return Err(DesktopServiceError::StartupExited),
             Some(ServiceStartupState::Starting { .. }) => {
                 if let Some(bootstrap) = bootstrap_required(authority).await? {
