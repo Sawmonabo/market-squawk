@@ -2,6 +2,45 @@
 
 ## Current execution — 2026-10-02
 
+Financial presentation checkpoint: reviewed shared signed change display, exact-decimal percentage/
+ratio formatting (original precision remains inspectable), persistent Markets label, contained
+benchmark selector and wrapping log operations. Desktop typecheck PASS; existing market/financial
+critical journeys PASS2/2 (4.39s) after aligning the existing price assertion with the accessible
+signed display. Ad-hoc exact-decimal rounding/carry/negative-zero/preservation checks PASS.
+Native passive inspection at1376px confirms no root overflow and benchmark selector within its
+card (x1045–1331,286px); no user navigation or focus was changed. Full affected native visual/
+accessibility and narrow-width closure remains pending, so DP02/05/11/15/16 are implemented and
+critically checked, not all closed. Existing detailed-filing failure and manual-load UI remain
+visible and unresolved. Evidence: `financial-display-{types,critical}.log` and
+`display-passive-inspection.{json,png}` under `.agents/tmp/v1-first-stock`.
+SEC existing critical fixture with exact retained MSFT body is now running serially; watcher99703
+remains paused while the visible service/Desktop/Vite continue. No release or whole-app claim.
+
+Audit coverage correction: the19-route screenshot survey did not exhaustively verify automatic
+loading, freshness, content completeness and every nested tab. Existing DP03/08/09/10/12/14 cover
+related defects, not this entire contract. Dedicated desktop_product_audit owns a read-only
+supplement at `.agents/tmp/desktop-product-audit/automatic-data-coverage.md`: enumerate every
+screen/tab/read panel and Load/Update/Refresh/Retry/Open-data control, trace automatic triggers,
+cache/revalidation/events and distinguish normal reads from explicit consequential actions.
+Lead alone owns edits to the maintained report/ledger. Auditor performs no runtime navigation,
+mutations, builds or Git while the owner is using the app; available native evidence is reused and
+unverified content/interaction states must be labeled. Return actionable per-surface gaps and
+shared causes, not blanket passes based on successful requests. This is completion of requested
+audit coverage, not a new release review round.
+
+Owner correction: successful financial-tab transport/parsing is not complete financial content.
+The earlier native checks establish section reads and filing cursor continuity only; they do not
+establish usable ratios or a reliably painted chart. The owner reports mostly unavailable ratios.
+Routine selected-investment financial/history acquisition and updates must be automatic, preserve
+visible saved values, and share backend job admission/deduplication; a manual Load button must not
+be required for normal browsing. Keep optional compact refresh/retry for actual recovery and
+explicit user actions for consequential workflows. Do not indiscriminately auto-run transactions.
+
+| Additional owner | Exclusive scope | Finishable outcome |
+| --- | --- | --- |
+| Astra ratio_availability_diagnosis | Read-only company_product.rs, prepared financial selection and retained native evidence; write only `.agents/tmp/v1-first-stock/ratio-availability-diagnosis.md` | Identify why ordinary MSFT ratios are unavailable/repeated; distinguish inappropriate period groups from genuinely missing operands. Specify exact financially correct correction and closest existing critical test. No code/build/runtime/Git. |
+| Lead | `preparation-controls.tsx`, financial/history preparation callers and shared job/transport contracts (investigation only initially) | Trace automatic selected-data acquisition, deduplication, freshness and recovery; update current implementation coherently without frontend/backend skew. Existing display changes remain preserved. |
+
 Prepared financial reads are live-verified before and after service restart. Dedicated native
 audit on service3916/Desktop3982 returns MSFT Facts32 items, Statements32 groups, Ratios32 items
 and Filings32 items without parse failures; filing cursors exercised. Post-restart observed
@@ -22,9 +61,19 @@ the backed-up canonical schema update (`prepared-sec-local-schema-update.json`).
 
 | Active owner | Dependencies and exclusive files | Finishable outcome / check |
 | --- | --- | --- |
-| Lead | Integrated prepared-source/display, app/contracts/UI, Git/runtime/builds and this ledger | Prepared financial availability/restart checkpoint `d0dcb849` integrated and pushed; preserve separate filing transform blocker. Dedicated screen audit inspected; report and ordered remediation evidence recorded below. |
-| Astra sec_transform_diagnosis (finished) | `.agents/tmp/v1-first-stock/sec-transform-diagnosis.md`; read-only production investigation | Exact valid `numwordsen`/`three` failure and complete official grammar identified; report inspected by lead. No production edits. Parser implementation follows current availability integration. |
-| Sol desktop_product_audit (finished) | Read-only source/native screen inspection; exclusive report `docs/reports/2026-10-02-desktop-product-audit.md` and `.agents/tmp/desktop-product-audit/` evidence. Depends on current routes/contracts/mocks; native navigation exclusive to auditor during audit, coordinated with lead runtime replacement. | Completed all19 default routes through document end,156 unique full-scroll/panel/sidebar screenshots individually inspected, and6 actual official competitor images viewed. Report has16 Open findings (11Important/5Minor), exact evidence/ownership/fixes/acceptance and explicit unavailable-state limits. Lead checked source findings, representative images and all156 screenshot hashes. No production edits/builds/Git; native ownership released and Home restored. |
+| Lead | Shared contracts, native/runtime, Git/builds, ledger/report closure and existing Desktop critical checks | Integrate the two independent corrections below, run focused critical checks once, deploy through the single supervisor and verify real filing/native behavior. Watcher99703 paused during edits/checks; service3916/Desktop3982 and Vite remain running. |
+| Astra sec_transform_diagnosis | SEC adapter `src/xbrl/{wire.rs,normalize.rs,model.rs}`, `src/xbrl.rs`, and one cohesive `src/xbrl/number_words.rs` if warranted. Existing diagnosis is input; no other writer owns these paths. | Implement full SEC numwordsen lexical grammar and exact integer normalization, preserve scale/sign/original text. Extend existing critical captured-taxonomy fixture and retained-file hook only. Lead runs that one fixture and retained real MSFT body; no agent builds/Git/runtime. |
+| Sol financial_display_fixes | Desktop `src/lib/formatters.ts`, `src/features/markets/{markets-page.tsx,investment-page.tsx,market-collection.tsx,investment-financials.tsx}`, `src/features/opportunities/analysis-launch.tsx`, `src/features/logs/logs-page.tsx`; shared presentation helper only within existing feature/shared if actual reuse requires it | Close DP02/05/11/15/16 together: signed semantic change values, persistent market label, readable exact-detail ratios, contained benchmark and Logs text. Preserve all data/handlers/financial authority. Lead typecheck/existing critical UI checks then background native geometry/screens. No agent tests/builds/Git/runtime. |
+
+| Astra dataset_choices_diagnosis | Read-only `application/research/dataset_preparation.rs`, analytical cursor and selected catalog seams; exclusive `.agents/tmp/v1-first-stock/dataset-choices-diagnosis.md` | Diagnose DP08 real `observation_batch/cursor_memory` failure. Identify actual retained generation and rejecting branch; propose smallest complete indexed/streamed selection correction preserving financial eligibility/evidence. No code, builds, runtime, new data or Git; report may feed next bounded correction after lead review. |
+
+Dependency wave: integrated source39d8c6f0 → SEC parsing and independent financial presentation in
+parallel → lead reviews each actual diff → focused serialized critical checks → one coordinated
+service replacement for parser and native UI inspection → coherent commits/push and finding closure.
+Do not touch transport/schema/manifest/lockfiles, acquire new dependencies, run competing builds,
+create branches/worktrees, or expand into other audit findings. Source/runtime evidence remains
+truthful while corrections are in progress; screenshot audit is preserved unchanged.
+
 
 
 Current integration owner: lead; active investigation/audit ownership is listed above. Frozen candidate packets are integrated
@@ -41,8 +90,8 @@ input counts, stack limits or production decoding. Evidence:
 `.agents/tmp/v1-first-stock/prepared-sec-recovery-critical.log` and
 `prepared-financial-ui-{types,critical}.log`. The local catalog backup and in-place canonical schema update are complete, with original rows
 preserved. Prepared financial availability after service restart is now verified. Next barrier:
-publish the full screen audit, then resolve the detailed filing transformation failure and the
-audit findings through their existing workflow dependencies.
+the detailed filing transformation failure and the assigned presentation findings. The full audit
+is pushed as39d8c6f0; other findings follow their existing workflow dependencies.
 Branch refresh: three local branches and one primary worktree; origin has four branches because
 Dependabot PR55 (`dependabot/cargo/crc32fast-1.5.2`) is open and unmerged. Its unique active work was
 preserved; it is not a completed stale branch. Main/release and recovery/session backups unchanged.
@@ -59,7 +108,7 @@ local evidence is preserved in `.agents/tmp/desktop-product-audit/` and
 analyses/accounts, other widths and lifecycle mutations remain explicitly unverified.
 
 Resolve through coherent producer/consumer checkpoints in this order, with exact file reservations
-before dispatch; no implementation agents currently own these findings:
+before dispatch; current exact ownership is listed above:
 
 1. Existing SEC filing transform blocker plus DP07/08/09/14: usable financial/research inputs and
    intended typed family consumers; diagnose the actual source-status row and preparation rejection.

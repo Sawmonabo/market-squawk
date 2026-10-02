@@ -8,6 +8,7 @@ import { productKeys, type ProductScope } from "@/app/query-client"
 import { useSystem } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { PercentageChange } from "@/features/shared/percentage-change"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatMoney } from "@/lib/formatters"
 import type { ApplicationResult } from "@/lib/schemas"
@@ -188,7 +189,7 @@ function CollectionInvestment({ symbol, market, unverified, refreshing }: {
         <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
         <p>{unverified && market.price !== null ? "Saved price · Freshness not checked" : refreshing
           ? `${marketAvailabilityLabel(market)} at last check · Updating`
-          : marketAvailabilityLabel(market)}{market.changePercent !== null ? ` · ${market.changePercent}%` : ""}</p>
+          : marketAvailabilityLabel(market)} · <PercentageChange value={market.changePercent} /></p>
         {market.asOf ? <time dateTime={market.asOf}>{new Date(market.asOf).toLocaleString()}</time> : null}
       </div>}
   </>

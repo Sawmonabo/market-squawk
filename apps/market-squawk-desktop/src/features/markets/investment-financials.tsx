@@ -305,7 +305,14 @@ function FinancialRatio({ ratio }: { ratio: InvestmentFinancialRatio }) {
   return <tr className="align-top">
     <th scope="row" className="min-w-[180px] px-3 py-3 text-sm font-medium">{ratio.displayName}</th>
     <td className="px-3 py-3 text-right">
-      <p className="whitespace-nowrap font-mono text-sm tabular-nums">{ratio.value === null ? "Unavailable" : `${groupDecimal(ratio.value)} ratio`}</p>
+      <p className="whitespace-nowrap font-mono text-sm tabular-nums">{ratio.value === null ? "Unavailable"
+        : ratio.metric === "current_ratio" ? <>{groupDecimal(ratio.value, { maximumFractionDigits: 2 })}<span aria-hidden="true">×</span><span className="sr-only"> times</span></>
+          : groupDecimal(ratio.value, { maximumFractionDigits: 2, style: "percent" })}</p>
+      {ratio.value !== null ? <details className="mt-2 text-xs text-muted-foreground">
+        <summary className="cursor-pointer focus-visible:outline-ring">Exact value</summary>
+        <p className="mt-2 font-mono tabular-nums [overflow-wrap:anywhere]">{ratio.value} {ratio.unit}</p>
+        <p className="mt-1">Display rounded to at most two decimal places.{ratio.metric !== "current_ratio" ? " Margin is shown as a percentage." : ""}</p>
+      </details> : null}
       {ratio.state !== "reported" ? <p className="mt-1 text-xs text-muted-foreground">{reasons[ratio.state]}</p> : null}
     </td>
     <td className="min-w-[180px] px-3 py-3 leading-5">{ratio.envelope ? <FinancialPeriod period={ratio.envelope.period} /> : "A reporting period is not available."}</td>

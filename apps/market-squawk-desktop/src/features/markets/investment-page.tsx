@@ -7,6 +7,7 @@ import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { AnalysisLaunch } from "@/features/opportunities/analysis-launch"
+import { PercentageChange } from "@/features/shared/percentage-change"
 import { formatMoney, groupDecimal } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
@@ -93,7 +94,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
             <p className="font-mono text-2xl tabular-nums">{row?.price ? formatMoney({ amount: row.price.value, currency: row.price.currency }) : "Price unavailable"}</p>
             <RefreshButton label="Refresh investment" refreshing={pageReads > 0} onClick={refresh} />
           </div>
-          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row?.changePercent !== null && row?.changePercent !== undefined ? ` · ${row.changePercent}%` : ""}</p>
+          <p className="mt-1 min-h-4 text-xs text-muted-foreground">{priceLabels}{row ? <> · <PercentageChange value={row.changePercent} /></> : null}</p>
           <p className="mt-1 min-h-4 text-xs text-muted-foreground">{row?.asOf ? <time dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : "Availability not established"}</p>
         </section>
       </div>

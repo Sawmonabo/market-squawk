@@ -7,13 +7,31 @@ export function formatMoney(value: MoneyValue): string {
   return `${value.currency.toUpperCase()} ${groupDecimal(value.amount)}`
 }
 
-export function groupDecimal(value: string): string {
-  const match = /^(-?)(\d+)(\.\d+)?$/.exec(value)
+/** Group exact decimals; optional precision and percent units affect display only. */
+export function groupDecimal(value: string, options?: { maximumFractionDigits: number; style?: "percent" }): string {
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value)
   if (!match) return value
-  const sign = match[1] ?? ""
-  const integer = match[2] ?? ""
-  const fraction = match[3] ?? ""
-  return `${sign}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`
+  let sign = match[1] ?? ""
+  let integer = match[2] ?? ""
+  let fraction = match[3] ?? ""
+  if (options?.style === "percent") {
+    // Move the decimal point in a unit-rate string, retaining every original digit.
+    const digits = integer + fraction.padEnd(2, "0")
+    const decimalPosition = integer.length + 2
+    integer = digits.slice(0, decimalPosition).replace(/^0+(?=\d)/, "")
+    fraction = digits.slice(decimalPosition)
+  }
+  if (options !== undefined && fraction.length > options.maximumFractionDigits) {
+    const precision = options.maximumFractionDigits
+    const kept = fraction.slice(0, precision)
+    // Round the display half away from zero without converting financial values to Number.
+    const rounded = BigInt(integer + kept) + (fraction[precision]! >= "5" ? 1n : 0n)
+    const digits = String(rounded).padStart(precision + 1, "0")
+    integer = precision === 0 ? digits : digits.slice(0, -precision)
+    fraction = precision === 0 ? "" : digits.slice(-precision)
+    if (rounded === 0n) sign = ""
+  }
+  return `${sign}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction ? `.${fraction}` : ""}${options?.style === "percent" ? "%" : ""}`
 }
 
 export function humanize(value: string): string {

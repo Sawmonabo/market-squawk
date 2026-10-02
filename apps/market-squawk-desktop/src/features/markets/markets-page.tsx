@@ -20,6 +20,7 @@ import {
 import { parseInvestmentSearchPage } from "./reference-market"
 
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { PercentageChange } from "../shared/percentage-change"
 
 const queryPolicy = { retry: false, refetchOnWindowFocus: false } as const
 
@@ -56,7 +57,7 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
   const matches = searchPage?.data ?? []
   return <Page>
     <h2 className="text-lg font-semibold">Explore investments</h2>
-    <form className="flex gap-2" onSubmit={(event) => {
+    <form className="mt-3 space-y-2" onSubmit={(event) => {
       event.preventDefault()
       const value = search.trim()
       if (value) {
@@ -65,8 +66,11 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
         setSubmittedSearch(value)
       }
     }}>
-      <Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find an investment" maxLength={64} />
-      <Button type="submit">Search</Button>
+      <Label htmlFor="markets-investment-search">Find an investment</Label>
+      <div className="flex gap-2">
+        <Input id="markets-investment-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Symbol or company name" maxLength={64} />
+        <Button type="submit">Search</Button>
+      </div>
     </form>
     {overview.isPending ? <p role="status" className="mt-4 text-sm text-muted-foreground">Loading market information…</p> : null}
     {overview.isError ? <div role="alert" className="mt-4 rounded-lg border border-border p-4 text-sm">
@@ -191,7 +195,7 @@ function MarketSessionPanel({ bootstrap, transport }: { bootstrap: DesktopBootst
 }
 
 function MarketCard({ row, onSelect }: { row: MarketProductRow; onSelect: () => void }) {
-  return <button type="button" onClick={onSelect} className="rounded-xl border p-4 text-left"><h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2><p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p><p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p>{row.changePercent ? <p className="text-sm">{row.changePercent}%</p> : null}</button>
+  return <button type="button" onClick={onSelect} className="rounded-xl border p-4 text-left"><h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2><p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p><p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p><p className="mt-1 text-sm"><PercentageChange value={row.changePercent} /></p></button>
 }
 
 function Page({ children, message }: { children?: React.ReactNode; message?: string }) {

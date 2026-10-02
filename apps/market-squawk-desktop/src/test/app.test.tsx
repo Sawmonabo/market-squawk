@@ -1194,7 +1194,9 @@ describe("Market Squawk desktop boundary", () => {
     expect(quote.getByText("USD 68,000.2")).toBeTruthy()
     expect(quote.getByText(/Several trades share the latest timestamp/)).toBeTruthy()
     expect(quote.queryByText("0.5")).toBeNull()
-    expect(within(screen.getByRole("region", { name: "Investment price" })).getByText("Bid/ask midpoint · Current · 1.25%")).toBeTruthy()
+    const investmentPrice = within(screen.getByRole("region", { name: "Investment price" }))
+    expect(investmentPrice.getByText(/^Bid\/ask midpoint · Current/)).toBeTruthy()
+    expect(investmentPrice.getByText("Gain: +1.25%")).toBeTruthy()
     expect(
       issuedQueries.some((request) => request.query === "marketOverview"),
     ).toBe(true)

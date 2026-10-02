@@ -292,7 +292,27 @@ function QueryError({ detail, onRetry }: { detail: string; onRetry: () => void }
 function EmptyResults() { return <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm text-muted-foreground"><Eye className="size-5" aria-hidden="true" /><h3 className="mt-3 font-medium text-foreground">No retained records match this query</h3><p className="mt-1 leading-6">Try a wider time range or fewer filters. This page only searches records still retained by the local service.</p></div> }
 
 function LogRecords({ records, onSelect }: { records: StructuredLogRecord[]; onSelect: (record: StructuredLogRecord) => void }) {
-  return <div className="mt-4 overflow-x-auto rounded-xl border border-border"><table className="w-full min-w-[900px] text-left text-sm" aria-label="Bounded structured log records"><thead className="border-b border-border bg-muted/35 text-[11px] uppercase tracking-wider text-muted-foreground"><tr><th className="px-4 py-3 font-medium">Time</th><th className="px-4 py-3 font-medium">Severity</th><th className="px-4 py-3 font-medium">Domain</th><th className="px-4 py-3 font-medium">Message</th><th className="px-4 py-3 font-medium">Evidence</th><th className="px-4 py-3 font-medium"><span className="sr-only">Details</span></th></tr></thead><tbody>{records.map((record) => <tr key={record.sequence} className="border-b border-border/65 last:border-b-0 hover:bg-accent/25"><td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(record.event.observedAt)}</td><td className="px-4 py-3"><SeverityBadge severity={record.event.severity} /></td><td className="px-4 py-3 font-mono text-xs">{humanize(record.event.domain)}</td><td className="max-w-[420px] px-4 py-3"><p className="line-clamp-2">{record.event.message}</p>{record.event.operation ? <p className="mt-1 font-mono text-[11px] text-muted-foreground">{record.event.operation}</p> : null}</td><td className="px-4 py-3 text-xs text-muted-foreground">{evidenceCount(record)}</td><td className="px-4 py-3"><Button size="sm" variant="ghost" onClick={() => onSelect(record)}>Details</Button></td></tr>)}</tbody></table></div>
+  return <div className="mt-4 min-w-0 max-w-full overflow-x-auto rounded-xl border border-border focus-visible:outline-2 focus-visible:outline-ring"
+    role="region" aria-label="Log records" tabIndex={0}>
+    <table className="w-full min-w-[900px] text-left text-sm" aria-label="Bounded structured log records">
+      <thead className="border-b border-border bg-muted/35 text-[11px] uppercase tracking-wider text-muted-foreground">
+        <tr>{["Time", "Severity", "Domain", "Message", "Evidence"].map((heading) => <th key={heading} scope="col" className="px-4 py-3 font-medium">{heading}</th>)}
+          <th scope="col" className="px-4 py-3 font-medium"><span className="sr-only">Details</span></th>
+        </tr>
+      </thead>
+      <tbody>{records.map((record) => <tr key={record.sequence} className="border-b border-border/65 last:border-b-0 hover:bg-accent/25">
+        <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(record.event.observedAt)}</td>
+        <td className="px-4 py-3"><SeverityBadge severity={record.event.severity} /></td>
+        <td className="px-4 py-3 font-mono text-xs">{humanize(record.event.domain)}</td>
+        <td className="max-w-[420px] px-4 py-3"><div className="max-w-[420px] [overflow-wrap:anywhere]">
+          <p className="line-clamp-2">{record.event.message}</p>
+          {record.event.operation ? <p className="mt-1 font-mono text-[11px] text-muted-foreground">{record.event.operation}</p> : null}
+        </div></td>
+        <td className="px-4 py-3 text-xs text-muted-foreground">{evidenceCount(record)}</td>
+        <td className="whitespace-nowrap px-4 py-3"><Button size="sm" variant="ghost" onClick={() => onSelect(record)}>Details</Button></td>
+      </tr>)}</tbody>
+    </table>
+  </div>
 }
 
 function ArtifactReceipt({ receipt }: { receipt: DiagnosticArtifactReceipt }) { return <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5" aria-labelledby="export-receipt-heading"><div className="flex gap-3"><FileCheck2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div className="min-w-0"><h2 id="export-receipt-heading" className="text-sm font-semibold">Controlled export receipt</h2><p className="mt-1 text-sm text-muted-foreground">The service published the bounded, redacted artifact under its controlled artifact authority.</p><dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><ReceiptFact label="Artifact reference" value={receipt.artifactReference} mono /><ReceiptFact label="Size" value={`${groupDecimal(String(receipt.byteLength))} bytes`} /><ReceiptFact label="SHA-256" value={receipt.sha256} mono /></dl></div></div></section> }
@@ -325,7 +345,7 @@ function LogRecordDetails({ record }: { record: StructuredLogRecord }) {
       </Alert>
       <section>
         <p className="text-sm font-medium">Message</p>
-        <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">
+        <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-muted-foreground [overflow-wrap:anywhere]">
           {event.message}
         </p>
       </section>
@@ -356,7 +376,7 @@ function LogRecordDetails({ record }: { record: StructuredLogRecord }) {
     </div>
   )
 }
-function ReceiptFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div className="min-w-0"><dt className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{label}</dt><dd className={cn("mt-1 break-words text-sm", mono && "font-mono text-xs")}>{value}</dd></div> }
+function ReceiptFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div className="min-w-0"><dt className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{label}</dt><dd className={cn("mt-1 text-sm [overflow-wrap:anywhere]", mono && "font-mono text-xs")}>{value}</dd></div> }
 function SeverityBadge({ severity }: { severity: StructuredLogRecord["event"]["severity"] }) { const colors = { trace: "border-slate-500/40 bg-slate-500/10 text-slate-700 dark:text-slate-300", debug: "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300", info: "border-primary/40 bg-primary/10 text-primary", warn: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300", error: "border-destructive/40 bg-destructive/10 text-destructive" } satisfies Record<typeof severity, string>; return <span className={cn("inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium", colors[severity])}>{humanize(severity)}</span> }
 function evidenceCount(record: StructuredLogRecord) { const dimensions = [record.event.sourceId, record.event.jobId, record.event.correlationId].filter(Boolean).length; const fields = Object.keys(record.event.fields).length; return `${dimensions} indexed · ${fields} field${fields === 1 ? "" : "s"}` }
 function filterSummary(filter: OperationLogFilter) { const parts = [filter.fromUnixNanos || filter.throughUnixNanos ? "time range" : null, filter.minimumSeverity ? `severity ≥ ${humanize(filter.minimumSeverity)}` : null, filter.domain ? humanize(filter.domain) : null, filter.sourceId ? "source" : null, filter.jobId ? "job" : null, filter.correlationId ? "correlation" : null, filter.search ? "text search" : null].filter(Boolean); return parts.length ? parts.join(" · ") : "All retained domains and severities" }

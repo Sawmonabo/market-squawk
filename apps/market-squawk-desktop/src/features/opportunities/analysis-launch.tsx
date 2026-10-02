@@ -19,6 +19,7 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
   const queryClient = useQueryClient()
   const profile = useAnalyticalProductProjection(transport, scope)
   const descriptionId = useId()
+  const identityId = useId()
   const [selectedBenchmark, setSelectedBenchmark] = useState<ProfileOptions["benchmarkChoices"][number] | null>(null)
   const options = useQuery({
     queryKey: [...productKeys.operation(scope, "analysis", "Desktop.AnalyticalProfiles", {}), "options"],
@@ -33,6 +34,7 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
   const currentSelection = choices.find((choice) => choice.instrumentId === selectedBenchmark?.instrumentId)
   const retainedSelection = selectedBenchmark !== null && currentSelection === undefined
   const comparison = selectedBenchmark ? currentSelection ?? selectedBenchmark : defaultBenchmark
+  const comparisonIdentity = comparison ? `${comparison.displayName} (${comparison.symbol})` : null
   const benchmarkInput = selectedBenchmark ? { benchmarkInstrumentId: selectedBenchmark.instrumentId } : {}
   const launch = useMutation({
     mutationFn: () => transport.analyticalController(selectionToken
@@ -46,13 +48,14 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
     retry: false,
   })
   const available = profile.data?.workflowAvailability === "available"
-  return <div>
-    <div className="mb-4 max-w-xl">
-      <label className="grid gap-2 text-xs font-medium">
+  return <div className="min-w-0">
+    <div className="mb-4 min-w-0 max-w-xl">
+      <label className="grid min-w-0 gap-2 text-xs font-medium">
         Compare performance with
-        <select className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+        <select className="h-9 w-full min-w-0 max-w-full truncate rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-ring"
           value={selectedBenchmark?.instrumentId ?? ""} disabled={launch.isPending}
-          aria-describedby={descriptionId}
+          aria-describedby={`${identityId} ${descriptionId}`}
+          title={comparisonIdentity ?? "Default comparison"}
           onChange={(event) => {
             if (event.target.value === "") setSelectedBenchmark(null)
             else {
@@ -71,7 +74,10 @@ export function AnalysisLaunch({ transport, scope, selectionToken }: {
           </option>)}
         </select>
       </label>
-      <p id={descriptionId} className="mt-2 text-xs leading-5 text-muted-foreground" aria-live="polite">
+      <p id={identityId} className="mt-2 text-xs leading-5 [overflow-wrap:anywhere]">
+        {comparisonIdentity ? <>Selected comparison: {comparisonIdentity}</> : "Default comparison"}
+      </p>
+      <p id={descriptionId} className="mt-2 text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]" aria-live="polite">
         {retainedSelection
           ? "Your selected comparison is currently unavailable. Analysis will keep this selection and report any missing comparison evidence."
           : options.isPending ? "Checking available comparisons…"
