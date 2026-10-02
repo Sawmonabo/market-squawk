@@ -399,6 +399,7 @@ pub struct ResearchService {
     provider_captures: Arc<SealedResearchJournalStore>,
     provider_capture_worker: ResearchIoWorker,
     retained_read_worker: ResearchIoWorker,
+    retained_generation_worker: ResearchIoWorker,
     retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
     application_changes: market_squawk_runtime::ApplicationChanges,
     history_publications: Arc<tokio::sync::Notify>,
@@ -640,6 +641,7 @@ impl ResearchService {
             provider_captures: Arc::new(paths.sealed_research_journal_store()?),
             provider_capture_worker: ResearchIoWorker::new(),
             retained_read_worker: ResearchIoWorker::new(),
+            retained_generation_worker: ResearchIoWorker::new(),
             retained_use_policies: retained_use::current_policies()?.into(),
             application_changes,
             history_publications,
@@ -825,19 +827,21 @@ impl ResearchService {
     pub(crate) fn begin_owned_io_shutdown(&self) {
         self.provider_capture_worker.begin_shutdown();
         self.retained_read_worker.begin_shutdown();
+        self.retained_generation_worker.begin_shutdown();
     }
 
-    /// Joins both original workers even if one fails; interrupted joins retain their owners.
+    /// Joins every original worker even if one fails; interrupted joins retain their owners.
     pub(crate) async fn finish_owned_io_shutdown(
         &self,
         deadline: Instant,
     ) -> Result<(), ResearchServiceError> {
         self.begin_owned_io_shutdown();
-        let (capture, reads) = tokio::join!(
+        let (capture, reads, generations) = tokio::join!(
             self.provider_capture_worker.finish_shutdown(deadline),
             self.retained_read_worker.finish_shutdown(deadline),
+            self.retained_generation_worker.finish_shutdown(deadline),
         );
-        capture.and(reads)
+        capture.and(reads).and(generations)
     }
 
     /// Rejoins the fixed analytical selection to bounded original native/physical custody in the
@@ -866,8 +870,8 @@ impl ResearchService {
             .await?
     }
 
-    /// Reopens one original generation and performs a bounded typed read in the retained
-    /// read lane. The callback cannot mint publication authority or use another object store.
+    /// Reopens one original generation independently of compact retained reads. The callback
+    /// cannot mint publication authority or use another object store.
     pub(crate) async fn read_provider_capture_generation<T, F>(
         &self,
         manifest: market_squawk_data::DatasetManifestRef,
@@ -897,7 +901,7 @@ impl ResearchService {
         .await
     }
 
-    /// Reopens the original generation in the same owned lane and joins its worker on job cancel.
+    /// Reopens the original generation on its owned worker and joins it on job cancellation.
     pub(crate) async fn read_provider_capture_generation_with_job_context<T, F>(
         &self,
         job: Option<&market_squawk_jobs::JobRunContext>,
@@ -921,7 +925,7 @@ impl ResearchService {
         use market_squawk_platform::{ResearchObjectControl as _, ResearchObjectControlPoint};
         let analytical = Arc::clone(&self.analytical);
         let store = Arc::clone(&self.provider_captures);
-        self.retained_read_worker
+        self.retained_generation_worker
             .run_with_job_context(
                 job.map(|job| job.cancellation()),
                 deadline,

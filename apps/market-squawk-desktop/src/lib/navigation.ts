@@ -136,6 +136,9 @@ export const navigationSections: NavigationSection[] = [
 export const allNavigation = navigationSections.flatMap((section) => section.items)
 
 export function navigationForPath(pathname: string) {
+  if (pathname.startsWith("/investments/")) {
+    return { label: "Investment details", path: pathname, icon: BarChart3 }
+  }
   return (
     allNavigation.find((item) => item.path === pathname) ??
     allNavigation.find((item) => pathname.startsWith(`${item.path}/`)) ??

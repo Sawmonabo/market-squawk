@@ -257,7 +257,7 @@ function LookupIcon({ category }: { category: LookupCategory }) {
 
 export function lookupRoute(match: ProductLookupMatch) {
   if (match.destination.action === productLookupActions.openInvestment) {
-    return `/markets?selectionToken=${encodeURIComponent(match.destination.selectionToken)}`
+    return `/investments/${encodeURIComponent(match.destination.selectionToken)}`
   }
   return `/opportunities?screenId=${encodeURIComponent(match.destination.screenId)}`
 }

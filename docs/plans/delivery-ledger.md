@@ -3,21 +3,32 @@
 ## Current execution — 2026-10-01
 
 Working branch `feature/v1-installed-product-experience`, primary worktree only. Current checkpoint
-(this commit): coordinated development watcher, verified cached model-runtime reuse and clean
-service replacement. Previous pushed `aba0af19` (committed data-to-screen updates), after `32382832` (PR #43 comment5942357301), after `30736a9a` (comment5942143016), following `5b25ac44` (comment5941104580)
-isolates retained reads and adds failed-request stage attribution. The current completed-close/display
-batch below has one successful native initial load after earlier deadline failures; full screen/data
-acceptance remains open. Prior checkpoint `03d780a5` completes per-instrument starter history (PR #43 comment5940310801).
-`ff788610` fixes verified service-owner joining at Desktop startup (PR #43 comment5940019410).
-`9eac1d57` fixes actor-time current presentation; `4239a7d6` preserves Alpaca publication custody;
-`96abecae` preserves retained evidence access and analytical/I/O admission order.
-One worktree, three local and three origin branches; protected backup refs remain untouched.
+(this commit): Overview watchlist, dedicated investment navigation and isolation of compact retained
+reads from bulk generation reopening. Previous pushed checkpoint `2552f8e4` delivers the coordinated
+development watcher; `aba0af19` delivers committed data-to-screen updates. These checkpoints do not
+establish complete rich investment details, live streaming coverage or installed-workflow acceptance.
+One worktree, three local and three origin branches; protected recovery history remains untouched.
 
 | Active owner / outcome | State and exact scope | Next dependency / evidence |
 | --- | --- | --- |
-| Lead — coordinated development startup | Implemented and critically/live verified on macOS; launcher, lifecycle hooks, model-cache consumers and documentation integrated. All subagent ownership released. | Commit/push this checkpoint. Keep the visible `just dev` session running; stop it before manual Cargo checks. |
-| Astra startup_read_diagnosis — read-only | Owner reports Loading workspace and unavailable investment details in visible native7293/service7082. Trace retained_routes_and_events timeout and startup dependencies; no edits, builds or Git. | Return the exact blocking call/ownership and smallest correction. Lead reserves all implementation files until diagnosis. |
-| Lead — workspace and detail recovery | Trace real Desktop bootstrap/detail failure against the running service; owns integration, launcher and UI/service changes. | Correct established cause and verify actual screen behavior; watcher checks do not establish working investment details. |
+| Lead — navigation/read-isolation integration | Astra worker and Sol navigation handoffs integrated; both agents released their files. Lead owns final critical checks, Git and shared contracts. | Commit/push this checkpoint; visible development session remains running. |
+| Astra startup_read_diagnosis — completed diagnosis | Read-only evidence identifies valid distinct Coinbase trades with tied timestamps; current code rejects the entire market result. No ordering guarantee supports picking an arbitrary trade. | Lead coordinates field-specific ambiguity, all-candidate authorization and independent quote/instrument availability in the next checkpoint. |
+| Lead — rich investment and Overview integration | Dedicated route preserves existing price, history and analysis behavior. Rich quote/profile/financial projections, backend movers and Overview portfolio summary remain incomplete. | Extend existing producer-to-consumer contracts without fabricating data or conflating watchlist with holdings. |
+
+Navigation critical evidence: existing market journey passes with watchlist mutation and failed-refresh
+preservation on Overview, separate Markets navigation, exact investment selection and demand-loaded
+history. Existing lookup destination/rejected-selection case passes separately after correcting its
+fixture title. TypeScript check passes. The first combined run had one test fixture mismatch; the
+corrected lookup rerun passes. Logs: `investment-route-final-critical.log`, `investment-lookup-critical.log`,
+`investment-route-typecheck.log` under ignored `.agents/tmp/v1-first-stock/`.
+
+Worker critical evidence: existing admission/cancellation/shutdown regression extended to hold both
+capture and bulk generation reopening, prove a compact read completes, and join all original workers
+on shutdown. PASS1/1,0.43s; `retained-generation-worker-critical.log`. No deadlines, evidence checks or
+resource limits were relaxed. Live rebuilt service86361/native86415 run the integrated change; service
+reached Ready32.582s after the observer detected replacement (`next-startup-observation.json`). This
+is not acceptable startup completion or proof every screen loads; the tied-trade failure remains.
+The visible window is preserved while subsequent fixes are prepared. No CI or whole-app RAM gate ran.
 
 
 
@@ -55,6 +66,18 @@ uses indexed-storage workspace, service7082/native7293, a1.47s Cargo freshness c
 on-screen Market Squawk window confirmed by CoreGraphics. Backend reached Ready, but the owner
 reports workspace loading and unavailable investment details; product launch is not accepted.
 Evidence: `dev-watch-visible.log` and `dev-watch-visible-result.json`.
+
+Watcher checkpoint committed/pushed as `2552f8e4`. It does not close slow startup or data reads.
+Owner correction: Markets must support discovery and tracked-market movers rather than represent
+the saved collection as personal holdings. Portfolio represents actual holdings; followed symbols
+are a watchlist. Ticker selection must open a detailed investment page, retaining available quote,
+profile, chart, financial and analytical sections independently when another section is unavailable.
+The watchlist belongs on Overview; no separate watchlist screen is required. Markets must not
+hide tracked symbols simply because they also appear in the watchlist. Current backend detail
+projection drops bid/ask/depth clocks and emits no change; company/fund product readers have no
+application callers. These remain explicit producer-to-screen integration requirements, not solved
+by the first route extraction. Market-wide movers require backend ranking over a comparable universe,
+not sorting one fetched page in React.
 
 Ordinary developer reloads use one single-job Cargo invocation for shared Desktop/service
 features, one maintained Watchexec event stream and one Vite server. Failed compilation retains

@@ -22,6 +22,9 @@ const AdvancedOverviewPage = lazy(() =>
 const MarketsPage = lazy(() =>
   import("@/features/markets").then((module) => ({ default: module.MarketsPage })),
 )
+const InvestmentPage = lazy(() =>
+  import("@/features/markets").then((module) => ({ default: module.InvestmentPage })),
+)
 const ResearchPage = lazy(() =>
   import("@/features/research").then((module) => ({ default: module.ResearchPage })),
 )
@@ -97,6 +100,7 @@ export function AppRoutes() {
           <Routes>
             <Route path="/home" element={<OverviewPage />} />
             <Route path="/markets" element={<MarketsPage />} />
+            <Route path="/investments/:selectionToken" element={<InvestmentPage />} />
             <Route path="/opportunities" element={<DecisionsPage />} />
             <Route path="/portfolio" element={<PortfolioPage />} />
             <Route path="/paper-execution" element={<PaperExecutionPage />} />

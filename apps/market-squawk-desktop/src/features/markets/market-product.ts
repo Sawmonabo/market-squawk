@@ -138,3 +138,12 @@ export function parseMarketSessionContext(
   }
   return context
 }
+
+export function marketAvailabilityLabel(row: MarketProductRow): string {
+  switch (row.availability) {
+    case "current": return "Current"
+    case "delayed": return "Delayed"
+    case "previous_close": return "Previous close"
+    case "unavailable": return "Unavailable"
+  }
+}

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ResearchServiceError;
 
-/// Each lane owns at most one blocking operation; capture and retained reads use separate owners.
+/// Each lane owns one blocking operation; capture, compact reads and bulk reopens have separate owners.
 #[derive(Debug)]
 pub(super) struct ResearchIoWorker {
     gate: Arc<Semaphore>,
@@ -283,7 +283,7 @@ mod tests {
 
     // The data-layer history fixture does not exercise application worker admission or custody.
     #[tokio::test]
-    async fn retained_read_progresses_during_capture_and_both_workers_drain()
+    async fn retained_read_progresses_during_capture_and_generation_and_all_workers_drain()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("research"))?;
@@ -319,11 +319,32 @@ mod tests {
             })
         };
         entered.await?;
+        let generation_cancel = CancellationToken::new();
+        let (generation_entered, entered) = oneshot::channel();
+        let (release_generation, generation_release) = std::sync::mpsc::channel();
+        let generation_finished = Arc::new(AtomicBool::new(false));
+        let generation = {
+            let service = Arc::clone(&service);
+            let token = generation_cancel.clone();
+            let finished = Arc::clone(&generation_finished);
+            tokio::spawn(async move {
+                service
+                    .retained_generation_worker
+                    .run(deadline, &token, move |_| {
+                        let _ = generation_entered.send(());
+                        let _ = generation_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
         let read = service
             .run_owned_research_read(deadline, &CancellationToken::new(), |_| 42)
             .await?;
         assert_eq!(read, 42);
         assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!generation_finished.load(Ordering::Acquire));
 
         let read_cancel = CancellationToken::new();
         let (read_entered, entered) = oneshot::channel();
@@ -345,9 +366,14 @@ mod tests {
         };
         entered.await?;
         capture_cancel.cancel();
+        generation_cancel.cancel();
         read_cancel.cancel();
         assert!(matches!(
             capture.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
+            generation.await?,
             Err(ResearchServiceError::Ingest(IngestError::Cancelled))
         ));
         assert!(matches!(
@@ -355,11 +381,14 @@ mod tests {
             Err(ResearchServiceError::Ingest(IngestError::Cancelled))
         ));
         assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!generation_finished.load(Ordering::Acquire));
         assert!(!read_finished.load(Ordering::Acquire));
         release_capture.send(())?;
+        release_generation.send(())?;
         release_read.send(())?;
         service.finish_owned_io_shutdown(deadline).await?;
         assert!(capture_finished.load(Ordering::Acquire));
+        assert!(generation_finished.load(Ordering::Acquire));
         assert!(read_finished.load(Ordering::Acquire));
         Ok(())
     }

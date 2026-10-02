@@ -118,7 +118,7 @@ impl MarketDomainService {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let mut progress = ProductReadProgress::new(request.name(), context);
-        let collection = if matches!(request.name(), MARKET_GET_OVERVIEW | "Market.GetCollection") {
+        let collection = if request.name() == "Market.GetCollection" {
             Some(
                 self.market_collection
                     .snapshot()
@@ -175,11 +175,7 @@ impl MarketDomainService {
                             .find(|choice| Some(choice.symbol.as_str()) == identity.symbol())
                     })
                     .flatten();
-                if request.name() == "Market.GetCollection" {
-                    choice.is_some()
-                } else {
-                    choice.is_none_or(|choice| choice.kept)
-                }
+                choice.is_some()
             });
         }
         let maximum_rows = limits

@@ -522,6 +522,7 @@ function macroContextResult(cutoffs = {
 
 describe("Market Squawk desktop boundary", () => {
   it("keeps lookup output closed and bound to exact product destinations", async () => {
+    await import("@/features/markets")
     const instrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
     const screenId = "screen.long-term-value"
     const output = {
@@ -555,7 +556,7 @@ describe("Market Squawk desktop boundary", () => {
     }
     const parsed = lookupResultSchema.parse(output)
 
-    expect(lookupRoute(parsed.matches[0]!)).toBe(`/markets?selectionToken=${marketSelectionToken}`)
+    expect(lookupRoute(parsed.matches[0]!)).toBe(`/investments/${marketSelectionToken}`)
     expect(lookupRoute(parsed.matches[1]!)).toBe(
       `/opportunities?screenId=${encodeURIComponent(screenId)}`,
     )
@@ -646,22 +647,23 @@ describe("Market Squawk desktop boundary", () => {
       </MemoryRouter>,
     )
     const investment = openInvestment(lookupRoute(parsed.matches[0]!))
-    expect(await screen.findByRole("heading", { name: "Requested investment" })).toBeTruthy()
+    expect(await screen.findByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
     expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: marketSelectionToken })
     investment.unmount()
 
     const staleToken = "market_ffffffffffffffffffffffffffffffff"
-    openInvestment(`/markets?selectionToken=${staleToken}`)
+    openInvestment(`/investments/${staleToken}`)
     expect((await screen.findByRole("alert")).textContent).toContain("This investment could not be opened")
     expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: staleToken })
-    expect(screen.queryByRole("heading", { name: "Requested investment" })).toBeNull()
-    // The overview still contains Bitcoin, but a rejected route must not select it as fallback.
-    expect(screen.getAllByRole("heading", { name: "Bitcoin" })).toHaveLength(1)
+    expect(screen.queryByRole("heading", { name: "MSQ · Requested investment" })).toBeNull()
+    // A rejected detail route must not select another investment as fallback.
+    expect(screen.queryByRole("heading", { name: "Bitcoin" })).toBeNull()
   })
 
   it("renders one provider-neutral market journey with current price and explicit selection", async () => {
     // Load the real lazy route before timing UI assertions; Vite's cold transform is not app latency.
     await import("@/features/markets")
+    await import("@/components/overview-page")
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     let collectionRevision = 3
@@ -692,7 +694,7 @@ describe("Market Squawk desktop boundary", () => {
       capabilities: ["market_overview", "market_instrument"],
     }
     render(
-      <MemoryRouter initialEntries={["/markets"]}>
+      <MemoryRouter initialEntries={["/home"]}>
         <App
           transport={transport(readyBootstrap, undefined, async (request, options) => {
             issuedQueries.push(request)
@@ -736,6 +738,47 @@ describe("Market Squawk desktop boundary", () => {
       </MemoryRouter>,
     )
 
+    const collection = within(await screen.findByRole("region", { name: "Watchlist" }))
+    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
+    await user.click(collection.getByText("Removed investments (1)"))
+    for (const choice of collectionChoices) expect(collection.getByText(choice.symbol)).toBeTruthy()
+    expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(false)
+    expect((collection.getByRole("button", { name: "Follow QQQ in your watchlist" }) as HTMLButtonElement).disabled).toBe(false)
+    expect(collection.queryByText("USD 68,000.15")).toBeNull()
+    expect(issuedQueries).toContainEqual({ query: "marketCollection", includeMarket: true })
+    await user.click(collection.getByRole("button", { name: "Remove SPY from your watchlist" }))
+    const restore = await collection.findByRole("button", { name: "Follow SPY in your watchlist" })
+    await waitFor(() => expect((restore as HTMLButtonElement).disabled).toBe(false))
+    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
+    await user.click(restore)
+    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(false))
+    expect(issuedQueries.filter((request) => request.query === "marketSetCollectionChoice")).toEqual([
+      { query: "marketSetCollectionChoice", expectedRevision: "3", symbol: "SPY", kept: false, confirmed: true },
+      { query: "marketSetCollectionChoice", expectedRevision: "4", symbol: "SPY", kept: true, confirmed: true },
+    ])
+    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
+
+    // A failed background read must preserve the last matching price, without claiming it is live.
+    marketRefreshFails = false
+    await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))
+    expect(await collection.findByText("USD 68,000.15")).toBeTruthy()
+    const priceTime = screen.getByRole("region", { name: "Watchlist" }).querySelector("time")?.dateTime
+    expect(priceTime).toBe(marketObservedAt)
+    marketRefreshFails = true
+    collectionRefreshFails = true
+    await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))
+    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(true))
+    expect(await collection.findByText("Saved watchlist could not be refreshed")).toBeTruthy()
+    expect(collection.getByText(/Saved price · Freshness not checked/)).toBeTruthy()
+    expect(collection.getByText("USD 68,000.15")).toBeTruthy()
+    expect(collection.queryByText(/^Current/)).toBeNull()
+    expect(screen.getByRole("region", { name: "Watchlist" }).querySelector("time")?.dateTime).toBe(priceTime)
+    collectionRefreshFails = false
+    marketRefreshFails = false
+    await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))
+    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(false))
+
+    await user.click(screen.getByRole("link", { name: "Explore investments" }))
     expect(await screen.findByRole("heading", { name: "Markets" })).toBeTruthy()
     const marketHeading = await screen.findByRole("heading", { name: "Bitcoin" })
     const marketCard = marketHeading.closest("button")
@@ -749,46 +792,7 @@ describe("Market Squawk desktop boundary", () => {
       issuedQueries.filter((request) => request.query === "marketInstrument"),
     ).toHaveLength(0)
 
-    const collection = within(screen.getByRole("region", { name: "Your market collection" }))
-    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
-    await user.click(collection.getByText("Removed investments (1)"))
-    for (const choice of collectionChoices) expect(collection.getByText(choice.symbol)).toBeTruthy()
-    expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false)
-    expect((collection.getByRole("button", { name: "Keep QQQ in your collection" }) as HTMLButtonElement).disabled).toBe(false)
-    expect(collection.queryByText("USD 68,000.15")).toBeNull()
-    expect(issuedQueries).toContainEqual({ query: "marketCollection", includeMarket: true })
-    await user.click(collection.getByRole("button", { name: "Remove SPY from your collection" }))
-    const restore = await collection.findByRole("button", { name: "Keep SPY in your collection" })
-    await waitFor(() => expect((restore as HTMLButtonElement).disabled).toBe(false))
-    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
-    await user.click(restore)
-    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false))
-    expect(issuedQueries.filter((request) => request.query === "marketSetCollectionChoice")).toEqual([
-      { query: "marketSetCollectionChoice", expectedRevision: "3", symbol: "SPY", kept: false, confirmed: true },
-      { query: "marketSetCollectionChoice", expectedRevision: "4", symbol: "SPY", kept: true, confirmed: true },
-    ])
-    expect(await collection.findByText("Market information is unavailable")).toBeTruthy()
-
-    // A failed background read must preserve the last matching price, without claiming it is live.
-    marketRefreshFails = false
-    await user.click(collection.getByRole("button", { name: "Refresh collection" }))
-    expect(await collection.findByText("USD 68,000.15")).toBeTruthy()
-    const priceTime = screen.getByRole("region", { name: "Your market collection" }).querySelector("time")?.dateTime
-    expect(priceTime).toBe(marketObservedAt)
-    marketRefreshFails = true
-    collectionRefreshFails = true
-    await user.click(collection.getByRole("button", { name: "Refresh collection" }))
-    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(true))
-    expect(await collection.findByText("Saved collection could not be refreshed")).toBeTruthy()
-    expect(collection.getByText(/Saved price · Freshness not checked/)).toBeTruthy()
-    expect(collection.getByText("USD 68,000.15")).toBeTruthy()
-    expect(collection.queryByText(/^Current/)).toBeNull()
-    expect(screen.getByRole("region", { name: "Your market collection" }).querySelector("time")?.dateTime).toBe(priceTime)
-    collectionRefreshFails = false
-    marketRefreshFails = false
-    await user.click(collection.getByRole("button", { name: "Refresh collection" }))
-    await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your collection" }) as HTMLButtonElement).disabled).toBe(false))
-
+    expect(screen.queryByRole("region", { name: "Watchlist" })).toBeNull()
     await user.click(marketCard)
     await waitFor(() => {
       expect(
@@ -797,7 +801,7 @@ describe("Market Squawk desktop boundary", () => {
         { query: "marketInstrument", selectionToken: marketSelectionToken },
       ])
     })
-    expect(screen.getAllByRole("heading", { name: "Bitcoin" })).toHaveLength(2)
+    expect(screen.getAllByRole("heading", { name: "BTC-USD · Bitcoin" })).toHaveLength(1)
     expect(
       issuedQueries.some((request) => request.query === "marketOverview"),
     ).toBe(true)
