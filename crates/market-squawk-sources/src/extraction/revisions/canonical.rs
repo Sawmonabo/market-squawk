@@ -77,6 +77,16 @@ impl CanonicalObservationFamily {
                     encoder.str(value.accession().as_str())
                 }
                 ResearchObservation::Fundamental(value) => {
+                    if let Some(occurrence) = value.xbrl_evidence() {
+                        // Distinct locations in one filing are evidence occurrences, not
+                        // competing revisions of the same economic fact. Keep this identity
+                        // aligned with the PIT family encoder.
+                        encoder.u8(16)?;
+                        encoder.str(provenance.source_id().as_str())?;
+                        encoder.serializable(value.subject())?;
+                        encoder.str(occurrence.accession().as_str())?;
+                        return encoder.str(occurrence.occurrence_id().as_str());
+                    }
                     encoder.u8(2)?;
                     encoder.str(provenance.source_id().as_str())?;
                     encoder.serializable(value.subject())?;

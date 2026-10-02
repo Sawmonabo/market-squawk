@@ -2758,13 +2758,13 @@ mod tests {
         let deadline = crate::client::system_timestamp()?.checked_add_nanos(60_000_000_000)?;
         let (mut stream, material) = handoff.extract(
             extraction_authority,
-            NonZeroU32::new(1).ok_or("record ceiling")?,
+            NonZeroU32::new(2).ok_or("record ceiling")?,
             NonZeroU64::new(64 * 1024 * 1024).ok_or("byte ceiling")?,
             deadline,
             cancellation.clone(),
             root,
         )?;
-        assert_eq!(stream.total_records(), 2);
+        assert_eq!(stream.total_records(), 4);
         let company = stream.company_identity().clone();
         assert_eq!(
             company.surface(),
@@ -2873,10 +2873,12 @@ mod tests {
         let mut content = None;
         let mut expectations = Vec::new();
         let mut native_descriptor = None;
-        // The fixture forces two chunks while retaining complete shared filing evidence once.
+        let mut revision_replay = None;
+        // Repeated EPS occurrences share a chunk and cross a chunk boundary. They are
+        // independent source occurrences, not successive revisions of the economic fact.
         while let Some(chunk) = stream.next_chunk(&cancellation)? {
-            assert_eq!(chunk.batch().records().len(), 1);
-            assert_eq!(chunk.row_capture_page_ordinals(), &[1]);
+            assert_eq!(chunk.batch().records().len(), 2);
+            assert_eq!(chunk.row_capture_page_ordinals(), &[1, 1]);
             let observation: market_squawk_domain::ResearchObservation =
                 serde_json::from_slice(chunk.batch().records()[0].payload())?;
             let market_squawk_domain::ResearchObservation::Fundamental(fact) = observation else {
@@ -2962,6 +2964,17 @@ mod tests {
             native_set.seal_current_partition(&raw_store, &control)?;
             row_partitions.seal_current_partition(&raw_store, &control)?;
             let revisions = market_squawk_sources::ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())?;
+            let observations = batch
+                .records()
+                .iter()
+                .map(|record| serde_json::from_slice(record.payload()))
+                .collect::<Result<Vec<market_squawk_domain::ResearchObservation>, _>>()?;
+            revision_replay = Some(revisions.clone().into_observed_batch_with_native_lineage(
+                company.source_id().clone(),
+                &batch,
+                &observations,
+                &native,
+            )?);
             expectations.push(
                 service
                     .stage_provider_logical_stream_chunk(
@@ -2976,7 +2989,7 @@ mod tests {
                     .await?,
             );
         }
-        assert_eq!(stream.emitted_records(), 2);
+        assert_eq!(stream.emitted_records(), 4);
         assert_eq!(expectations.len(), 2);
         let whole_content = content.ok_or("whole content")?.finish()?;
         let companion = serde_json::to_vec(&serde_json::json!({
@@ -3020,7 +3033,7 @@ mod tests {
                 execution_attempt_digest: Some(receipt.receipt_digest()),
                 provider_terminal_evidence_digest: whole_content.digest(),
                 total_decoded_events: 0,
-                total_canonical_rows: 2,
+                total_canonical_rows: 4,
                 total_logical_object_bytes,
             },
             &[
@@ -3186,11 +3199,45 @@ mod tests {
             )
             .await?;
         assert_eq!(selected.disposition(), SecResearchDisposition::Selected);
-        assert_eq!(selected.decoded_rows().len(), 2);
+        assert_eq!(selected.decoded_rows().len(), 4);
+        assert_eq!(selected.selected().len(), 4);
+        let expected_observations = selected
+            .decoded_rows()
+            .iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in selected.selected() {
+            let observation = &expected_observations[usize::try_from(row.row().row_ordinal())?];
+            let revision_family =
+                market_squawk_sources::CanonicalObservationFamily::try_from_observation(observation)?;
+            assert_eq!(
+                revision_family.identity().bytes(),
+                row.point_in_time().family_identity().bytes(),
+                "revision assignment and PIT must identify the same source occurrence"
+            );
+        }
+        let mut eps_occurrences = Vec::new();
+        for observation in &expected_observations {
+            let market_squawk_domain::ResearchObservation::Fundamental(fact) = observation else {
+                return Err("unexpected selected filing observation".into());
+            };
+            assert_eq!(fact.context().time().revision().get(), 1);
+            let evidence = fact.xbrl_evidence().ok_or("retained occurrence evidence")?;
+            if evidence.concept().local_name().as_str() == "EarningsPerShareDiluted" {
+                assert_eq!(fact.value(), Decimal::new(650, 2));
+                assert_eq!(evidence.lexical_value().as_str(), "6.50");
+                assert_eq!(evidence.context_id().as_str(), "annual");
+                assert_eq!(
+                    serde_json::to_value(evidence)?["duplicate"]["classification"],
+                    "consistent_numeric"
+                );
+                eps_occurrences.push(evidence.occurrence_id().as_str());
+            }
+        }
+        assert_eq!(eps_occurrences, ["eps-fact", "eps-repeat", "eps-note"]);
         let filing_source = selected
             .filing_xbrl()
             .ok_or("verified full filing source")?;
-        assert_eq!(filing_source.numeric_fact_count(), 2);
+        assert_eq!(filing_source.numeric_fact_count(), 4);
         assert_eq!(filing_source.nonnumeric_occurrences().len(), 3);
         assert_eq!(filing_source.contexts().len(), 1);
         assert_eq!(filing_source.footnotes().len(), 1);
@@ -3381,6 +3428,19 @@ mod tests {
             store_config,
         )?;
         let reopened_raw = paths.sealed_research_journal_store()?;
+        let assignments = reopened
+            .observed_revision_authority()
+            .assign(
+                revision_replay.ok_or("retained occurrence revision batch")?,
+                Instant::now() + Duration::from_secs(30),
+                cancellation.clone(),
+            )
+            .await?;
+        assert_eq!(
+            assignments.as_slice(),
+            &[market_squawk_domain::RevisionNumber::new(1)?; 2],
+            "replaying distinct occurrences after restart must not create new revisions"
+        );
         let valuation_replay = market_squawk_valuation::FairValueService::open(
             reopened.fair_value_catalog(),
             valuation_limits,
@@ -3404,6 +3464,12 @@ mod tests {
             )
             .await?;
         assert_eq!(replay.receipt(), expected_receipt);
+        assert_eq!(replay.selected().len(), 4);
+        assert_eq!(
+            replay.decoded_rows().iter().collect::<Result<Vec<_>, _>>()?,
+            expected_observations,
+            "restart preserves each occurrence, local revision and complete XBRL evidence"
+        );
         for observation in replay.decoded_rows().iter() {
             let market_squawk_domain::ResearchObservation::Fundamental(fact) = observation? else {
                 return Err("unexpected reopened filing observation".into());
@@ -3419,7 +3485,7 @@ mod tests {
                 .filing_xbrl()
                 .ok_or("replayed filing")?
                 .numeric_fact_count(),
-            2
+            4
         );
         assert_eq!(
             replay
@@ -3566,6 +3632,8 @@ mod tests {
                 <xbrli:unit id="eps-unit"><xbrli:divide><xbrli:unitNumerator><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unitNumerator><xbrli:unitDenominator><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unitDenominator></xbrli:divide></xbrli:unit>
                 <ix:nonFraction id="shares-fact" name="dei:EntityCommonStockSharesOutstanding" contextRef="shares" unitRef="shares-unit" decimals="0">15000000000</ix:nonFraction>
                 <ix:nonFraction id="eps-fact" name="us-gaap:EarningsPerShareDiluted" contextRef="annual" unitRef="eps-unit" decimals="2">6.50</ix:nonFraction>
+                <ix:nonFraction id="eps-repeat" name="us-gaap:EarningsPerShareDiluted" contextRef="annual" unitRef="eps-unit" decimals="2">6.50</ix:nonFraction>
+                <ix:nonFraction id="eps-note" name="us-gaap:EarningsPerShareDiluted" contextRef="annual" unitRef="eps-unit" decimals="2">6.50</ix:nonFraction>
                 <ix:nonNumeric id="listing-symbol" name="dei:TradingSymbol" contextRef="listing">AAPL</ix:nonNumeric>
                 <ix:nonNumeric id="listing-title" name="dei:Security12bTitle" contextRef="listing">Common Stock</ix:nonNumeric>
                 <ix:nonNumeric id="nil-file-number" name="dei:EntityFileNumber" contextRef="listing" xsi:nil="true"/>
@@ -3946,7 +4014,7 @@ mod tests {
             parser_context(),
             &CancellationToken::new(),
         )?;
-        assert_eq!(parsed.numeric_facts().len(), 2);
+        assert_eq!(parsed.numeric_facts().len(), 4);
         assert_eq!(parsed.nonnumeric_occurrences().len(), 3);
         assert_eq!(parsed.footnotes().len(), 1);
         super::super::exercise_nested_continuations(parser_context())?;

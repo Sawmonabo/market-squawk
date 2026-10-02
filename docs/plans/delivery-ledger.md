@@ -2,6 +2,44 @@
 
 ## Current execution — 2026-10-02
 
+XBRL occurrence correction is implemented and critically verified: detailed filing facts use
+source + issuer + accession + occurrence ID for both revision assignment and PIT. Ordinary
+CompanyFacts economic grouping and generic ambiguous-revision rejection remain unchanged.
+The existing captured-filing publication/restart check passes (1/1, 2.19s), now preserving three
+agreeing EPS occurrences, exact source/PIT identity parity and stable revisions on replay.
+Evidence `xbrl-occurrence-critical.log`. The actual retained MSFT filing has not yet been retried
+on this source; native detailed-filing completion is pending the single coordinated replacement.
+The identity rule follows XBRL International's duplicate-fact guidance (§§5, 6.4), which preserves
+separately tagged Inline occurrences and source traceability:
+https://www.xbrl.org/WGN/xbrl-duplicates/WGN-2025-01-14/xbrl-duplicates-2025-01-14.html.
+
+
+MSFT missing-data correction wave (refreshed at `6b0658b3`): retained evidence proves a
+cross-cohort trade omission, unqualified quote sizes, unconditional null price change, and
+XBRL occurrence identity collision. Existing data is preserved. Watchexec99703 is paused during
+source integration; the visible current service/Desktop remain running. No competing build.
+
+| Owner | Exact file ownership | Dependency / smallest critical evidence |
+| --- | --- | --- |
+| Astra market_component_display | `apps/market-squawk/src/application/paper/market.rs` | Preserve independently timed quote/trade components with original retained authority and current display permits; keep execution/book coherence. Existing assembly critical case extended for cross-generation retained trade. |
+| Astra market_price_change | `apps/market-squawk/src/application/paper/market/{durable_product.rs,product.rs}` | Compute exact backend change only with eligible price and admitted earlier completed close, preserving null when unqualified. Existing product projection critical case. Shared output changes proposed to lead before edits. |
+| Astra sec_transform_diagnosis | `adapters/market-squawk-adapter-sec/src/xbrl/model.rs` existing critical fixture only | Extend repeated economic occurrences through publication/PIT/restart and optional real-body observed-batch hook; depends on lead occurrence-family correction. No builds. |
+| Sol financial_display_fixes | Read-only Alpaca unit contract research; report `.agents/tmp/v1-first-stock/alpaca-quote-unit-contract.md` | Establish documented bs/as units for actual feed/API and pinned decoder before canonical producer change; no guessed multiplier. |
+| Lead | Both source/PIT canonical family encoders, shared domain/output/native contracts, remaining integration, ledger, Git and all builds | Accession+occurrence identity; preserve CompanyFacts family and generic ambiguity rejection. Inspect all diffs, serialized critical checks, coherent commits/push, one supervisor rebuild, actual MSFT field verification. |
+
+No agent creates branches/worktrees, runs builds, changes runtime or expands file ownership.
+Integration order: canonical occurrence identity with fixture; independent market component and
+change corrections with shared producer/consumer alignment; critical checks; one live replacement.
+Automatic acquisition and all-screen coverage remain open; this wave is not full-page acceptance.
+
+Owner MSFT unavailable-field correction: passive current native capture confirms bid/ask sizes,
+last trade/size and price change are null in `Market.GetInstrument`; previous close is retained
+and bid/ask is an older quote. Current Facts page has 32 reported items, but detailed filing
+preparation is failed. Evidence `owner-msft-{unavailable-current,market-unavailable}.json`.
+Do not describe the complete investment page as working from the ratios-only check. Sol
+financial_display_fixes owns read-only trace of these missing market fields through selector and
+current retained source evidence; no source/runtime/provider/build/Git actions. Lead owns fixes.
+
 Live verification after supervisor generation `generation-6Ru5WP`: MSFT Ratios first page returns
 32/32 reported values, no inapplicable unavailable rows. Current ratio 1.230327…, annual gross
 margin 0.679440…, operating margin 0.467808…, net margin 0.403053… retain their exact source

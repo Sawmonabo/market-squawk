@@ -348,6 +348,15 @@ fn encode_candidate_family(
             encoder.str(value.accession().as_str())?;
         }
         ResearchObservation::Fundamental(value) => {
+            if let Some(occurrence) = value.xbrl_evidence() {
+                // Match revision assignment: a filing can repeat an economic fact at
+                // several separately traceable locations without superseding any of them.
+                encoder.u8(16)?;
+                encoder.str(provenance.source_id().as_str())?;
+                encoder.serializable(value.subject())?;
+                encoder.str(occurrence.accession().as_str())?;
+                return encoder.str(occurrence.occurrence_id().as_str());
+            }
             encoder.u8(2)?;
             encoder.str(provenance.source_id().as_str())?;
             encoder.serializable(value.subject())?;
