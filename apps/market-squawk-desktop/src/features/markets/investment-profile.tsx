@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query"
 
-import { productKeys } from "@/app/query-client"
+import { useSystem } from "@/app/product-context"
+import { currentDisplayQueryOptions, productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { groupDecimal } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
@@ -15,9 +16,10 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
+  const { eventConnection } = useSystem()
   const profile = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "research", "Research.GetInvestmentProfile", { selectionToken }),
-    gcTime: 0,
+    ...currentDisplayQueryOptions,
     retry: false,
     refetchOnWindowFocus: false,
     queryFn: async ({ signal }) => {
@@ -27,6 +29,8 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
     },
   })
   const result = profile.data
+  const disconnected = eventConnection.status !== "connected"
+  const unverified = !profile.isFetchedAfterMount || profile.isError || disconnected
 
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment profile">
     <div className="flex items-center justify-between gap-3">
@@ -38,13 +42,14 @@ export function InvestmentProfile({ selectionToken, bootstrap, transport }: {
         ? "The profile could not be refreshed. Showing the last checked information."
         : "The profile could not be loaded. Try again, or search Markets to choose a fresh selection."}</p>
       <Button variant="outline" size="sm" disabled={profile.isFetching} onClick={() => void profile.refetch()}>Retry</Button>
-    </div> : profile.isFetching ? <p role="status" className="text-muted-foreground">{result ? "Updating profile information…" : "Loading profile information…"}</p> : null}
+    </div> : disconnected && result ? <p role="status" className="text-muted-foreground">Connection interrupted. Showing the last checked profile.</p>
+      : profile.isFetching && !profile.isFetchedAfterMount ? <p role="status" className="text-muted-foreground">{result ? "Checking profile information…" : "Loading profile information…"}</p> : null}
     </div>
     <div className="min-h-[180px]">
     {result ? <>
       {result.state === "available" ? <ReferenceProfile profile={result.profile} />
         : <p role="status" className="mt-3 text-sm text-muted-foreground">{profileAvailability(result)}</p>}
-      <p className="mt-3 text-xs text-muted-foreground">{profile.isError ? "Last checked information through" : "Information through"} <ProfileTime value={result.knowledgeAt} /></p>
+      <p className="mt-3 text-xs text-muted-foreground">{unverified ? "Last checked information through" : "Information through"} <ProfileTime value={result.knowledgeAt} /></p>
     </> : null}
     </div>
   </section>

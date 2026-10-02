@@ -3,8 +3,8 @@ import { useState } from "react"
 import { useQuery, useQueryClient, useIsFetching } from "@tanstack/react-query"
 import { Link, useParams } from "react-router-dom"
 
-import { useProduct } from "@/app/product-context"
-import { productKeys } from "@/app/query-client"
+import { useProduct, useSystem } from "@/app/product-context"
+import { currentDisplayQueryOptions, productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { AnalysisLaunch } from "@/features/opportunities/analysis-launch"
 import { PercentageChange } from "@/features/shared/percentage-change"
@@ -38,6 +38,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
+  const { eventConnection } = useSystem()
   const [showHistory, setShowHistory] = useState(true)
   const [refreshRevision, setRefreshRevision] = useState(0)
   const queryClient = useQueryClient()
@@ -54,7 +55,7 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
   }
   const detail = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetInstrument", { selectionToken }),
-    gcTime: 0,
+    ...currentDisplayQueryOptions,
     retry: false,
     refetchOnWindowFocus: false,
     queryFn: async ({ signal }) => {
@@ -71,11 +72,13 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
       || (input?.historyToken !== undefined && input.historyToken === detail.data?.historyToken)
   } })
   const row = detail.data ?? null
+  const disconnected = eventConnection.status !== "connected"
+  const unverified = !detail.isFetchedAfterMount || detail.isError || disconnected
   const title = row === null ? "Investment" : [row.identity.symbol, row.identity.name]
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
   const companyName = row?.identity.name !== row?.identity.symbol ? row?.identity.name : null
   const priceLabels = row === null ? "Checking price information" : [marketPriceBasisLabel(row),
-    detail.isError && row.price !== null ? "Saved price · Freshness not checked" : marketAvailabilityLabel(row)]
+    unverified && row.price !== null ? "Saved price · Freshness not checked" : marketAvailabilityLabel(row)]
     .filter((value, index, values) => value !== null && values.indexOf(value) === index).join(" · ")
 
   return <main className="mx-auto w-full max-w-[1180px] space-y-4 p-5 lg:p-7">
@@ -102,9 +105,10 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
         {detail.isError ? <p role="alert" className="text-destructive">{row === null
           ? "This investment could not be opened. Try again, or search Markets to choose a fresh selection."
           : "The price could not be refreshed. Showing the last checked information; its freshness is unverified."}</p>
-          : detail.isFetching ? <p role="status" className="text-muted-foreground">{row ? "Updating price information…" : "Opening the selected investment…"}</p> : null}
+          : disconnected && row !== null ? <p role="status" className="text-muted-foreground">Connection interrupted. Showing the last checked information; its freshness is unverified.</p>
+            : detail.isFetching && !detail.isFetchedAfterMount ? <p role="status" className="text-muted-foreground">{row ? "Checking price freshness…" : "Opening the selected investment…"}</p> : null}
       </div>
-      {row !== null ? <InvestmentQuote row={row} unverified={detail.isError} /> : null}
+      {row !== null ? <InvestmentQuote row={row} unverified={unverified} /> : null}
     </header>
     <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
       <section className="min-w-0 rounded-xl border border-border bg-card/30 p-4" aria-label="Investment price history">

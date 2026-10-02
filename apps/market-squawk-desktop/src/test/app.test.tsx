@@ -1067,6 +1067,8 @@ describe("Market Squawk desktop boundary", () => {
     }
     let viewportSignal: AbortSignal | undefined
     let resolveViewport: ((result: ApplicationResult) => void) | undefined
+    let holdInstrumentRead = false
+    let resolveInstrument: (() => void) | undefined
     const readyBootstrap: DesktopSystemBootstrap = {
       ...blockedBootstrap,
       capabilities: ["market_overview", "market_instrument"],
@@ -1107,11 +1109,14 @@ describe("Market Squawk desktop boundary", () => {
               metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 },
             }
             if (request.query === "marketOverview") return marketOverviewResult
-            if (request.query === "marketInstrument") return marketResult({
-              ...marketOverviewRow, historyToken, priceBasis: "bid_ask_midpoint",
-              quote: { ...marketOverviewRow.quote, tradeStatus: "ambiguous", lastPrice: null, lastSize: null,
-                lastObservedAt: null, lastCurrentThrough: null, lastFresh: false },
-            })
+            if (request.query === "marketInstrument") {
+              if (holdInstrumentRead) await new Promise<void>((resolve) => { resolveInstrument = resolve })
+              return marketResult({
+                ...marketOverviewRow, historyToken, priceBasis: "bid_ask_midpoint",
+                quote: { ...marketOverviewRow.quote, tradeStatus: "ambiguous", lastPrice: null, lastSize: null,
+                  lastObservedAt: null, lastCurrentThrough: null, lastFresh: false },
+              })
+            }
             if (request.query === "marketHistory") {
               if (request.startDate !== undefined) {
                 viewportSignal = options?.signal
@@ -1241,6 +1246,21 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(screen.getByRole("button", { name: "Refresh investment" }))
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(4))
     expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
+
+    // Warm navigation must retain the selected price without claiming that the
+    // returning screen has checked its freshness before revalidation completes.
+    holdInstrumentRead = true
+    await user.click(screen.getByRole("link", { name: "Back to Markets" }))
+    const returningCard = (await screen.findByRole("heading", { name: "Bitcoin" })).closest("button")
+    if (!returningCard) throw new Error("The returning market card is absent")
+    await user.click(returningCard)
+    const returningPrice = within(await screen.findByRole("region", { name: "Investment price" }))
+    expect(returningPrice.getByText("USD 68,000.15")).toBeTruthy()
+    expect(returningPrice.getByText(/Saved price · Freshness not checked/)).toBeTruthy()
+    expect(returningPrice.queryByText(/^Bid\/ask midpoint · Current/)).toBeNull()
+    await waitFor(() => expect(resolveInstrument).toBeTypeOf("function"))
+    resolveInstrument?.()
+    expect(await returningPrice.findByText(/^Bid\/ask midpoint · Current/)).toBeTruthy()
 
     const renderedText = document.body.textContent ?? ""
     expect(renderedText).not.toMatch(/kraken|coinbase|websocket-v2/i)

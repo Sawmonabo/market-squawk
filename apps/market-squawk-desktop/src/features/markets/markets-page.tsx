@@ -2,8 +2,8 @@ import * as React from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
 
-import { useProduct } from "@/app/product-context"
-import { productKeys } from "@/app/query-client"
+import { useProduct, useSystem } from "@/app/product-context"
+import { currentDisplayQueryOptions, productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -13,7 +13,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  marketPriceBasisLabel, marketSessionRequestSchema, parseMarketProductResult,
+  marketAvailabilityLabel, marketPriceBasisLabel, marketSessionRequestSchema, parseMarketProductResult,
   parseMarketSessionContext, type MarketProductRow, type MarketSessionContext,
   type MarketSessionReference, type MarketSessionRequest,
 } from "./market-product"
@@ -22,7 +22,7 @@ import { parseInvestmentSearchPage } from "./reference-market"
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 import { PercentageChange } from "../shared/percentage-change"
 
-const queryPolicy = { retry: false, refetchOnWindowFocus: false } as const
+const queryPolicy = { ...currentDisplayQueryOptions, retry: false, refetchOnWindowFocus: false } as const
 
 export function MarketsPage() {
   const product = useProduct()
@@ -31,6 +31,7 @@ export function MarketsPage() {
 }
 
 function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstrap; transport: ProductTransport }) {
+  const { eventConnection } = useSystem()
   const [search, setSearch] = React.useState("")
   const [submittedSearch, setSubmittedSearch] = React.useState<string | null>(null)
   const navigate = useNavigate()
@@ -41,20 +42,21 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
   const searchPageToken = searchNavigation.after
   const overview = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetOverview", { query: "marketOverview", ...(overviewPageToken ? { pageToken: overviewPageToken } : {}) }),
-    gcTime: 0,
     queryFn: async ({ signal }) => parseMarketProductResult(await transport.query({ query: "marketOverview", ...(overviewPageToken ? { pageToken: overviewPageToken } : {}) }, { signal })),
     ...queryPolicy,
   })
   const searchResult = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.SearchUniverse", { query: submittedSearch, searchPageToken }),
     enabled: submittedSearch !== null,
-    gcTime: 0,
     queryFn: async ({ signal }) => parseInvestmentSearchPage(await transport.query({ query: "marketUniverse", text: submittedSearch!, ...(searchPageToken ? { pageToken: searchPageToken } : {}) }, { signal })),
     ...queryPolicy,
   })
   const rows = overview.data?.data ?? []
   const searchPage = searchResult.data ?? null
   const matches = searchPage?.data ?? []
+  const disconnected = eventConnection.status !== "connected"
+  const overviewUnverified = !overview.isFetchedAfterMount || overview.isError || disconnected
+  const searchUnverified = !searchResult.isFetchedAfterMount || searchResult.isError || disconnected
   return <Page>
     <h2 className="text-lg font-semibold">Explore investments</h2>
     <form className="mt-3 space-y-2" onSubmit={(event) => {
@@ -72,24 +74,38 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
         <Button type="submit">Search</Button>
       </div>
     </form>
-    {overview.isPending ? <p role="status" className="mt-4 text-sm text-muted-foreground">Loading market information…</p> : null}
+    <div className="mt-4 min-h-10 text-sm leading-5 text-muted-foreground">
+      {overview.isPending ? <p role="status">Loading market information…</p>
+        : overview.data && !overview.isError && disconnected ? <p role="status">Connection interrupted. Showing the last checked market information; its freshness is unverified.</p>
+          : overview.data && !overview.isError && !overview.isFetchedAfterMount ? <p role="status">Checking market freshness… Showing the last checked values.</p> : null}
+    </div>
     {overview.isError ? <div role="alert" className="mt-4 rounded-lg border border-border p-4 text-sm">
       <p>{overview.data ? "Market information could not be refreshed. Displayed values may be out of date." : "Market information could not be loaded. You can still search for an investment."}</p>
-      <Button className="mt-3" variant="outline" size="sm" disabled={overview.isFetching} onClick={() => void overview.refetch()}>Retry market information</Button>
+      <Button className="mt-3" variant="outline" size="sm" disabled={overview.isFetching} onClick={() => {
+        overviewNavigation.restart()
+        if (overviewPageToken === undefined) void overview.refetch()
+      }}>Retry market information</Button>
     </div> : null}
-    {searchResult.isFetching ? <p role="status" className="mt-4 text-sm text-muted-foreground">Searching investments…</p> : null}
+    {submittedSearch !== null ? <div className="min-h-10 text-sm leading-5 text-muted-foreground">
+      {searchPage && disconnected ? <p role="status">Connection interrupted. Showing the last checked search results.</p>
+        : !searchResult.isError && !searchResult.isFetchedAfterMount ? <p role="status">{searchPage ? "Checking search results… Showing the last checked matches." : "Searching investments…"}</p>
+          : searchResult.isSuccess && !searchUnverified && matches.length === 0 ? <p>No matching investments were found.</p> : null}
+    </div> : null}
     {submittedSearch !== null && searchResult.isError ? <div role="alert" className="mt-4 text-sm">
-      <p>Investment search could not finish.</p>
-      <Button className="mt-2" variant="outline" size="sm" disabled={searchResult.isFetching} onClick={() => void searchResult.refetch()}>Retry search</Button>
+      <p>{searchPage ? "Investment search could not be refreshed. Showing the last checked matches." : "Investment search could not finish."}</p>
+      <Button className="mt-2" variant="outline" size="sm" disabled={searchResult.isFetching} onClick={() => {
+        searchNavigation.restart()
+        if (searchPageToken === undefined) void searchResult.refetch()
+      }}>Retry search</Button>
     </div> : null}
-    {submittedSearch !== null && searchResult.isSuccess && matches.length === 0 ? <p className="mt-4 text-sm text-muted-foreground">No matching investments were found.</p> : null}
     <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-      {rows.map((row) => <MarketCard key={row.selectionToken} row={row} onSelect={() => selectInvestment(row.selectionToken)} />)}
+      {rows.map((row) => <MarketCard key={row.selectionToken} row={row} unverified={overviewUnverified}
+        onSelect={() => selectInvestment(row.selectionToken)} />)}
       {matches.map((row) => <button className="rounded-xl border p-4 text-left" key={row.selectionToken} onClick={() => selectInvestment(row.selectionToken)}>{row.name ?? row.symbol}</button>)}
     </div>
-    <CursorNavigation navigation={overviewNavigation} next={overview.data?.page.nextPageToken ?? null} busy={overview.isFetching}
+    <CursorNavigation navigation={overviewNavigation} next={overview.data?.page.nextPageToken ?? null} busy={overview.isFetching || overviewUnverified}
       onRestart={() => { if (overviewPageToken === undefined) void overview.refetch() }} />
-    {submittedSearch !== null ? <CursorNavigation navigation={searchNavigation} next={searchPage?.page.nextPageToken} busy={searchResult.isFetching}
+    {submittedSearch !== null ? <CursorNavigation navigation={searchNavigation} next={searchPage?.page.nextPageToken} busy={searchResult.isFetching || searchUnverified}
       onRestart={() => { if (searchPageToken === undefined) void searchResult.refetch() }} /> : null}
     <MarketSessionPanel key={bootstrap.productSessionToken} bootstrap={bootstrap} transport={transport} />
   </Page>
@@ -194,8 +210,20 @@ function MarketSessionPanel({ bootstrap, transport }: { bootstrap: DesktopBootst
   </section>
 }
 
-function MarketCard({ row, onSelect }: { row: MarketProductRow; onSelect: () => void }) {
-  return <button type="button" onClick={onSelect} className="rounded-xl border p-4 text-left"><h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2><p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p><p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p><p className="mt-1 text-sm"><PercentageChange value={row.changePercent} /></p></button>
+function MarketCard({ row, unverified, onSelect }: {
+  row: MarketProductRow
+  unverified: boolean
+  onSelect: () => void
+}) {
+  return <button type="button" onClick={onSelect} className="rounded-xl border p-4 text-left">
+    <h2 className="font-semibold">{row.identity.name ?? row.identity.symbol}</h2>
+    <p className="mt-2 text-xs text-muted-foreground">{marketPriceBasisLabel(row)}</p>
+    <p className="mt-1 font-mono">{row.price ? `${row.price.value} ${row.price.currency}` : "Price unavailable"}</p>
+    <p className="mt-1 text-sm"><PercentageChange value={row.changePercent} /></p>
+    <p className="mt-1 min-h-8 text-xs leading-4 text-muted-foreground">{unverified ? row.price ? "Saved price · Freshness not checked" : "Availability not checked"
+      : marketAvailabilityLabel(row)}</p>
+    {row.asOf ? <time className="mt-1 block text-xs text-muted-foreground" dateTime={row.asOf}>{new Date(row.asOf).toLocaleString()}</time> : null}
+  </button>
 }
 
 function Page({ children, message }: { children?: React.ReactNode; message?: string }) {

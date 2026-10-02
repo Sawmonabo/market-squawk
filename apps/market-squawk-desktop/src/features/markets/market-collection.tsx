@@ -4,7 +4,7 @@ import { Activity, CircleAlert } from "lucide-react"
 import { Link } from "react-router-dom"
 import { z } from "zod"
 
-import { productKeys, type ProductScope } from "@/app/query-client"
+import { currentDisplayQueryOptions, productKeys, type ProductScope } from "@/app/query-client"
 import { useSystem } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -39,13 +39,17 @@ export function parseMarketCollectionResult(result: ApplicationResult) {
 }
 
 export function useMarketCollection(transport: ProductTransport, scope: ProductScope) {
+  const { eventConnection } = useSystem()
+  const disconnected = eventConnection.status !== "connected"
   const queryClient = useQueryClient()
   const collection = useQuery({
     queryKey: productKeys.operation(scope, "market", "Market.GetCollection", collectionInput),
+    ...currentDisplayQueryOptions,
     queryFn: async ({ signal }) => parseMarketCollectionResult(await transport.query(collectionInput, { signal })),
   })
   const marketInformation = useQuery({
     queryKey: productKeys.operation(scope, "market", "Market.GetCollection", marketInformationInput),
+    ...currentDisplayQueryOptions,
     enabled: collection.data !== undefined,
     queryFn: async ({ signal }) => parseMarketCollectionResult(await transport.query(marketInformationInput, { signal })),
   })
@@ -57,7 +61,8 @@ export function useMarketCollection(transport: ProductTransport, scope: ProductS
     mutationKey: productKeys.operation(scope, "market", "Market.SetCollectionChoice", {}),
     mutationFn: async (input: { symbol: string; kept: boolean }) => {
       const snapshot = collection.data
-      if (!snapshot || collection.isError || collection.isFetching) {
+      if (!snapshot || !collection.isFetchedAfterMount || collection.isError || collection.isFetching
+        || disconnected) {
         throw new Error("Reload your watchlist before changing it.")
       }
       const result = choicesSchema.parse((await transport.query({
@@ -73,7 +78,7 @@ export function useMarketCollection(transport: ProductTransport, scope: ProductS
     onSuccess: () => { void refresh() },
     onError: () => { void refresh() },
   })
-  return { collection, marketInformation, choice }
+  return { collection, marketInformation, choice, disconnected }
 }
 
 export function MarketCollection({
@@ -83,8 +88,7 @@ export function MarketCollection({
   state: ReturnType<typeof useMarketCollection>
   layout?: "list" | "grid"
 }) {
-  const { collection, marketInformation, choice } = state
-  const { eventConnection } = useSystem()
+  const { collection, marketInformation, choice, disconnected } = state
   const savedCollection = collection.data
   const marketCollection = marketInformation.data ?? null
   const marketInformationMatches = savedCollection !== undefined && marketCollection !== null
@@ -100,9 +104,9 @@ export function MarketCollection({
   })) ?? []
   const kept = entries.filter((entry) => entry.kept)
   const removed = entries.filter((entry) => !entry.kept)
-  const disconnected = eventConnection.status !== "connected"
-  const busy = disconnected || choice.isPending || collection.isFetching || collection.isError
-  const marketInformationUnverified = collection.isError || marketInformation.isError || disconnected
+  const busy = disconnected || choice.isPending || !collection.isFetchedAfterMount || collection.isFetching || collection.isError
+  const marketInformationUnverified = !collection.isFetchedAfterMount || !marketInformation.isFetchedAfterMount
+    || collection.isError || marketInformation.isError || disconnected
   const refreshing = collection.isFetching || marketInformation.isFetching
 
   return <section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Watchlist">

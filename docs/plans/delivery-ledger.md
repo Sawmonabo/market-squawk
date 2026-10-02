@@ -3,7 +3,7 @@
 ## Current execution — 2026-10-02
 
 Current integration: SEC number-word normalization is pushed as `2a819049`. Ratio applicability
-is critically verified and ready for the supervised backend rebuild. The exact-envelope case
+is pushed as `4ca72551` and ready for the supervised backend rebuild. The exact-envelope case
 passes (1/1), as does the existing snapshot/cursor case (1/1); logs are
 `.agents/tmp/v1-first-stock/ratio-{applicability,cursor}-critical.log`. The correction removes
 inapplicable period/share-only rows while preserving genuine missing inputs, exact evidence
@@ -22,9 +22,10 @@ visible paint acceptance.
 DP-03 current-display work is frozen by the Sol agent and owned by the lead for integration:
 `src/app/query-client.ts` and `src/features/markets/{investment-page.tsx,investment-profile.tsx,
 markets-page.tsx,market-collection.tsx}`. It reuses the existing five-minute session display cache,
-revalidates on mount and qualifies cached prices until checked. Existing UI checks and typecheck
-passed; the lead is extending that same critical market journey to prove warm-return freshness
-with a delayed response. It does not retain released financial/history handles or implement
+revalidates on mount and qualifies cached prices until checked. Typecheck and both existing critical UI checks pass, including the added warm-return delayed-response
+assertion: the retained selected price appears before the new response, is marked unverified,
+and becomes current only after revalidation. Logs: `current-display-{types,critical}.log`
+under `.agents/tmp/v1-first-stock` (2/2, 4.43s). It does not retain released financial/history handles or implement
 source preparation. Remaining snapshot-cache and automatic-data findings stay open.
 
 The visible service/Desktop and Vite remain available while Watchexec PID99703 is deliberately

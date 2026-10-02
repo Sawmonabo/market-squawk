@@ -16,6 +16,13 @@ declare module "@tanstack/react-query" {
 // do not replace that snapshot; explicit reads, source authority changes and full reconnect refreshes do.
 export const snapshotQueryMeta = { domainRefresh: "explicit" } as const satisfies ProductQueryMeta
 
+// Current display projections reuse the bounded session cache and revalidate on return.
+// Do not apply this policy to owned snapshot/read handles or consequential operations.
+export const currentDisplayQueryOptions = {
+  staleTime: 0,
+  refetchOnMount: "always",
+} as const
+
 export type ProductScope = DesktopBootstrap["productSessionToken"]
 
 export const productKeys = {
