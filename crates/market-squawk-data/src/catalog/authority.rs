@@ -3,12 +3,14 @@
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use market_squawk_domain::Timestamp;
 use rusqlite::{Connection, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
 
-use super::{Catalog, CatalogError};
+use super::{Catalog, CatalogAuthority, CatalogError};
 use crate::BackupReceipt;
 use crate::authority_transition::evidence::CatalogContentEvidenceDigest;
 use crate::authority_transition::{
@@ -19,6 +21,34 @@ use crate::authority_transition::{
     RestoreReceiptFields, RootEndpointIdentity, RootInstanceId, StableArtifactRootIdentity,
     TransitionId,
 };
+
+/// Acquires the catalog writer only within an owned blocking I/O operation.
+/// The caller preserves its typed deadline/cancellation checks before and after admission.
+pub(super) fn lock_catalog_writer<'a, E>(
+    authority: &'a Mutex<CatalogAuthority>,
+    deadline: Instant,
+    checkpoint: impl Fn() -> Result<(), E>,
+) -> Result<MutexGuard<'a, CatalogAuthority>, E>
+where
+    E: From<CatalogError>,
+{
+    loop {
+        checkpoint()?;
+        match authority.try_lock() {
+            Ok(guard) => {
+                checkpoint()?;
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(CatalogError::AuthorityLockPoisoned.into());
+            }
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
+}
 
 const AUTHORITY_EVENT_VERSION: i64 = 2;
 const MAX_AUTHORITY_EVENTS: usize = 16_384;

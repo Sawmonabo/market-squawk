@@ -1122,10 +1122,10 @@ impl CompanySecurityLinkPublicationCapability {
         cancellation: &CancellationToken,
     ) -> Result<CompanySecurityLinkPublicationReceipt, CompanySecurityIdentityCatalogError> {
         check_operation(deadline, cancellation)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
-            .publish_company_security_link(link, deadline, cancellation)
+        super::authority::lock_catalog_writer(&self.authority, deadline, || {
+            check_operation(deadline, cancellation)
+        })?
+        .publish_company_security_link(link, deadline, cancellation)
     }
 }
 

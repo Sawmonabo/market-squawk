@@ -1538,6 +1538,18 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         ingested_at: Timestamp::from_unix_nanos(101),
         transition: CompanySecurityLinkTransition::Initial,
     })?;
+    // Contention must honor the request deadline, not masquerade as lost authority.
+    {
+        let _writer = authority.lock().map_err(|_| "catalog writer poisoned")?;
+        assert!(matches!(
+            relationship_publisher.publish(
+                link.clone(),
+                Instant::now() + Duration::from_millis(2),
+                &cancellation,
+            ),
+            Err(market_squawk_data::CompanySecurityIdentityCatalogError::DeadlineExceeded)
+        ));
+    }
     let relationship = relationship_publisher.publish(link, deadline(), &cancellation)?;
     let query = CompanySecurityIdentityQuery::new(
         company.source_id().clone(),

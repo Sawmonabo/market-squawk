@@ -925,7 +925,9 @@ impl MarketDataInstrumentReadCapability {
         // The clock and generation watch are mutable authority. Capture them together only
         // after any preceding definition publication has committed or rolled back.
         let (now, generation, location, binding, limits) = {
-            let catalog = lock_native_identity_authority(&self.authority, deadline, cancellation)?;
+            let catalog = super::authority::lock_catalog_writer(&self.authority, deadline, || {
+                check_operation(deadline, cancellation)
+            })?;
             let connection = &catalog.catalog().connection;
             let busy_millis: u32 =
                 connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
@@ -1184,34 +1186,6 @@ fn require_current_market_data_instrument_in_connection(
         return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
     }
     Ok(())
-}
-
-/// Called only in the existing supervised blocking I/O owner. Waiting is bounded by the
-/// original request and applies only to initial endpoint binding or clock/watch mutation,
-/// never snapshot resolution.
-fn lock_native_identity_authority<'a>(
-    authority: &'a Mutex<CatalogAuthority>,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<std::sync::MutexGuard<'a, CatalogAuthority>, MarketDataInstrumentCatalogError> {
-    loop {
-        check_operation(deadline, cancellation)?;
-        match authority.try_lock() {
-            Ok(guard) => {
-                check_operation(deadline, cancellation)?;
-                return Ok(guard);
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(MarketDataInstrumentCatalogError::SourceAuthority(
-                    super::CatalogError::AuthorityLockPoisoned,
-                ));
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
-            }
-        }
-    }
 }
 
 /// Replays retained selection evidence inside the caller's catalog transaction. This
@@ -1628,7 +1602,9 @@ impl MarketDataInstrumentReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<Self, MarketDataInstrumentCatalogError> {
         let reader = {
-            let catalog = lock_native_identity_authority(&authority, deadline, cancellation)?;
+            let catalog = super::authority::lock_catalog_writer(&authority, deadline, || {
+                check_operation(deadline, cancellation)
+            })?;
             Self {
                 authority: Arc::clone(&authority),
                 location: catalog.catalog().location.clone(),
