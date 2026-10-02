@@ -47,7 +47,7 @@ pub struct SecTickerExchangePair {
     exchange: String,
 }
 
-/// One provider-declared historical submissions object and its exact promised coverage.
+/// One provider-declared historical submissions object and its count/date summary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SecSubmissionsCompanion {
     name: SourceIdentifier,
@@ -366,7 +366,7 @@ impl SubmissionsDocument {
             .iter()
             .find(|filing| filing.accession().as_str() == accession)
     }
-    /// Returns provider-declared historical objects with their promised count/date coverage.
+    /// Returns provider-declared historical objects with their original count/date summaries.
     pub fn companions(&self) -> &[SecSubmissionsCompanion] {
         &self.inner.companions
     }
@@ -835,11 +835,17 @@ pub(crate) fn validate_companion_coverage(
     {
         return Err(SecParserError::InvalidCompanionCoverage);
     }
-    for filing in &archive.filings {
-        if filing.filed_on() < declaration.filing_from || filing.filed_on() > declaration.filing_to
-        {
-            return Err(SecParserError::InvalidCompanionCoverage);
-        }
+    // SEC's declared date summary can disagree with its own exact archive rows. Preserve
+    // both sources of evidence: the declaration remains unchanged, while reconciliation,
+    // normalization and point-in-time selection use each filing's actual dates. Identity and
+    // exact row count above still establish the requested companion's completeness.
+    if archive.filings.iter().any(|filing| {
+        filing.filed_on() < declaration.filing_from || filing.filed_on() > declaration.filing_to
+    }) {
+        tracing::warn!(
+            category = "submissions_companion_date_summary_disagreement",
+            "SEC companion date summary differs from retained filing rows"
+        );
     }
     Ok(())
 }

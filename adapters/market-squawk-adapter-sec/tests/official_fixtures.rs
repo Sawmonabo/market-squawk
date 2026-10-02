@@ -195,6 +195,88 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
         reconcile_submissions(&wrong_context, &[agent_archive], limits),
         Err(SecParserError::InvalidCompanionCoverage)
     ));
+    // Reduced from retained official MSFT current 551ff75d... and archive 80701da4...
+    // bodies: archive 002 declares 2008-08-11 but includes this 2008-08-12 filing.
+    // Only the declared count is reduced with the fixture; both source dates remain exact.
+    let msft_current = serde_json::json!({
+        "cik":"0000789019", "name":"MICROSOFT CORP",
+        "tickers":["MSFT"], "exchanges":["Nasdaq"],
+        "filings":{
+            "recent":{"accessionNumber":[],"filingDate":[],"reportDate":[],
+                "acceptanceDateTime":[],"form":[]},
+            "files":[{"name":"CIK0000789019-submissions-002.json", "filingCount":1,
+                "filingFrom":"1994-02-14", "filingTo":"2008-08-11"}]
+        }
+    });
+    let msft_archive = serde_json::json!({
+        "accessionNumber":["0000902012-08-000057"], "form":["4"],
+        "filingDate":["2008-08-12"], "reportDate":["2008-08-08"],
+        "acceptanceDateTime":["2008-08-12T20:41:00.000Z"],
+        "primaryDocument":["xslF345X03/edgar.xml"]
+    });
+    let msft_current_bytes = serde_json::to_vec(&msft_current)?;
+    let msft_archive_bytes = serde_json::to_vec(&msft_archive)?;
+    let msft = RetrievedSubmissions::import_exact_bytes(
+        &msft_current_bytes,
+        &[msft_archive_bytes.as_slice()],
+        &raw_store,
+        limits,
+    )?;
+    assert_eq!(msft.current_component().bytes().as_ref(), msft_current_bytes);
+    assert_eq!(msft.components().len(), 2);
+    assert_eq!(msft.components()[1].bytes().as_ref(), msft_archive_bytes);
+    assert_eq!(msft.document().filings().len(), 1);
+    assert_eq!(
+        msft.document().companions()[0].filing_to().to_string(),
+        "2008-08-11"
+    );
+    let actual = msft
+        .document()
+        .filing("0000902012-08-000057")
+        .ok_or("missing out-of-summary filing")?;
+    assert_eq!(actual.filed_on().to_string(), "2008-08-12");
+    let normalized = normalize_filings(
+        &SourceId::try_from("sec-edgar")?,
+        &msft,
+        msft.raw().received_at().checked_add_nanos(1)?,
+    )?;
+    let [ResearchObservation::Filing(filing)] = normalized.as_slice() else {
+        return Err("expected retained out-of-summary filing".into());
+    };
+    assert_eq!(filing.subject().issuer_id(), Some(msft.document().cik()));
+    assert_eq!(
+        filing.context().provenance().source_timestamp(),
+        actual.accepted_at()
+    );
+    assert_eq!(
+        filing.context().time().published(),
+        actual
+            .accepted_at()
+            .map(market_squawk_domain::ResearchTemporalCoordinate::exact)
+            .as_ref()
+    );
+    let archive = SubmissionsDocument::parse_archive(&msft_archive_bytes, limits)?;
+    let mut wrong_count = msft_current.clone();
+    wrong_count["filings"]["files"][0]["filingCount"] = serde_json::json!(2);
+    assert!(matches!(
+        reconcile_submissions(
+            &SubmissionsDocument::parse(&serde_json::to_vec(&wrong_count)?, limits)?,
+            std::slice::from_ref(&archive),
+            limits,
+        ),
+        Err(SecParserError::InvalidCompanionCoverage)
+    ));
+    let mut wrong_issuer = msft_current;
+    wrong_issuer["filings"]["files"][0]["name"] =
+        serde_json::json!("CIK0000320193-submissions-002.json");
+    assert!(matches!(
+        reconcile_submissions(
+            &SubmissionsDocument::parse(&serde_json::to_vec(&wrong_issuer)?, limits)?,
+            &[archive],
+            limits,
+        ),
+        Err(SecParserError::InvalidCompanionCoverage)
+    ));
     let mut missing_zone = agent_submission.clone();
     missing_zone["filings"]["recent"]["acceptanceDateTime"][0] =
         serde_json::json!("2017-05-04T00:32:23");
@@ -344,15 +426,15 @@ fn malformed_columnar_shapes_and_record_limits_fail_closed() -> TestResult {
         ),
         Err(SecParserError::Cancelled)
     ));
-    let false_companion_coverage = br#"{
+    let false_companion_count = br#"{
         "cik":"0000320193","name":"APPLE INC","tickers":[],"exchanges":[],
         "filings":{
             "recent":{"accessionNumber":[],"filingDate":[],"reportDate":[],"acceptanceDateTime":[],"form":[]},
-            "files":[{"name":"CIK0000320193-submissions-001.json","filingCount":2,"filingFrom":"2020-01-01","filingTo":"2020-12-31"}]
+            "files":[{"name":"CIK0000320193-submissions-001.json","filingCount":3,"filingFrom":"2020-01-01","filingTo":"2020-12-31"}]
         }
     }"#;
     let recent = SubmissionsDocument::parse(
-        false_companion_coverage,
+        false_companion_count,
         SecParserLimits::production_defaults(),
     )?;
     let archive = SubmissionsDocument::parse_archive(
