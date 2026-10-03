@@ -26,6 +26,48 @@ strict rejection of obsolete setup fields. Log: `.agents/tmp/v1-first-stock/sec-
 Lead inspected affected callers and automatic financial loading. Matching build/native verification
 remains the next barrier; no full CI or whole-app RAM measurement ran.
 
+Live `fd8d96dd` matching build passed; service 75379/Desktop 75415. Native SEC connection
+`6a9b80c4-205e-462f-9483-f03c7ac71586` activated in 0.761s after normal re-onboarding of the
+superseded setup record. Opening MSFT automatically started financial job
+`480adf88-b396-45fb-8fe7-7412934daee3`; no manual Load action. Overview remained ready without
+query errors during acquisition, but returning to MSFT produced `request_interrupted` for
+`Market.GetInstrument` and `Market.GetHistory`. At 110s the financial job still ran without a
+completed Microsoft facts manifest. Combined workflow remains failed, not accepted.
+Evidence: `sec-connection-{activated,msft-progress,overview-during-preparation}.json` under
+`.agents/tmp/v1-first-stock/`.
+
+Next read-only lane: Astra High `sec_read_contention` owns only
+`.agents/tmp/v1-first-stock/sec-selected-read-contention.md`: trace the running selected-financial
+job and concurrent quote/history deadline failures at `fd8d96dd`, using bounded captured diagnostics.
+No source/data edits, builds, runtime control or Git; lead alone captures process diagnostics and
+owns integration. Identify the concrete shared wait/CPU/I/O boundary before proposing a fix.
+
+**Live outcome and next barrier:** the same automatically admitted financial job completed,
+with result artifact `mcp-c89f3078cbbd23f71bdb7d272af00bc68cd44abd31c52cb5f95dc286c94e9ba7`.
+Microsoft Company Facts committed at 06:23:04.022119 UTC and filing XBRL at 06:24:05.576115 UTC.
+The completed native capture (264s after job start) has populated facts and no query errors.
+Statements, Filings and Ratios were then selected and verified individually through actual tab
+state and query completion; each displayed data with no query errors. This is not full financial
+coverage, visual approval, instant-loading or installed restart acceptance. Initial click-only tab
+captures did not change Radix's selection; only the `*-verified.json` captures establish those tabs.
+Evidence: `sec-connection-msft-after-publication.json`,
+`sec-connection-msft-{statements,filings,ratios}-verified.json`; inspected native ratio viewport
+`sec-connection-msft-ratios-native.png` (background transition highlight did not settle; no visual
+approval claim). Matching build took 5m26s; local-product composition reported 20,747ms.
+
+Astra's read-only report is complete and ownership released. Lead checked its source boundaries:
+manifest display authorization always waits for the analytical mutation gate held across bulk
+Parquet finalization; full financial index preparation shares the retained-generation read worker.
+The 33.814s facts publication overlapped the quote/history failures; financial gate-admission
+failure is directly logged. Exact per-request mutex ownership was not directly sampled.
+The next coherent fix reuses existing current-grant snapshot authorization for manifest reads and
+separates full financial preparation into an owned instance of the existing I/O worker, retaining
+policy renewal/revocation checks and shutdown custody. Do not increase deadlines, bypass integrity,
+or move full financial-file validation into the compact price-read slot. The report identifies
+existing worker-drain and retained-authority fixtures plus required native reads during ongoing
+preparation. It is a diagnosis, not implementation. All other full V1 obligations remain open.
+
+
 Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
 Pushed: SEC admission waiting `aedee7ee`, pending setup/content revisions `aeced650`,
 filing producer correction `ab0d54e0`.
