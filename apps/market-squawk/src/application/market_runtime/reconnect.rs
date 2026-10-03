@@ -21,20 +21,18 @@ pub(crate) trait AccountMarketRuntimeReconnect: Send + Sync {
         cancellation: CancellationToken,
     ) -> Result<bool, ServiceError>;
 
-    /// Revisit the original durable intent after interrupted cleanup or successor startup.
+    /// Revisit the original durable intent under the lifecycle owner's recovery deadline.
     async fn resume_pending(
         &self,
         surface: AccountMarketSurface,
-        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError>;
 
-    /// Recheck the original coordinates before persisting recovery intent.
+    /// Recheck the original coordinates and recover under the lifecycle owner's deadline.
     async fn reconnect(
         &self,
         request: PreparedMarketProviderConfigurationRequest,
         generation: MarketRuntimeGroupGeneration,
-        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError>;
 }
@@ -90,11 +88,8 @@ impl MarketRuntimeRegistry {
                 AccountMarketSurface::AlpacaBasic,
                 AccountMarketSurface::SchwabMarketData,
             ] {
-                let Ok(deadline) = self.cleanup_deadline() else {
-                    return;
-                };
                 if let Err(error) = owner
-                    .resume_pending(surface, deadline, cancellation.child_token())
+                    .resume_pending(surface, cancellation.child_token())
                     .await
                     && !cancellation.is_cancelled()
                 {
@@ -209,12 +204,13 @@ impl MarketRuntimeRegistry {
                 evidence.credential_generation(),
             )?
         };
+        // The registry deadline bounds only selection. The lifecycle owner gives the complete
+        // renewal/start/calendar operation its existing recovery budget, independently of drain.
         // No registry lock spans the lifecycle gate, OAuth continuation or physical drain.
         owner
             .reconnect(
                 request,
                 snapshot.group_generation,
-                deadline,
                 cancellation.child_token(),
             )
             .await?;

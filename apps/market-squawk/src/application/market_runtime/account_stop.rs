@@ -75,6 +75,9 @@ impl RetainedAccountStop {
         if self.complete.load(Ordering::Acquire) {
             return Ok(());
         }
+        // A recovery operation also prepares its successor. Physical cleanup retains its
+        // own shorter shutdown bound without consuming that operation's entire lifetime.
+        let deadline = deadline.min(registry.cleanup_deadline()?);
         let mut entry = bounded_lock(&self.owner, deadline, cancellation).await?;
         if self.complete.load(Ordering::Acquire) {
             return Ok(());

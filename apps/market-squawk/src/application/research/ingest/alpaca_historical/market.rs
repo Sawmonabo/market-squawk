@@ -1248,16 +1248,24 @@ struct AlpacaReferencePrecommit {
     cancellation: CancellationToken,
 }
 impl AlpacaReferencePrecommit {
+    fn rejected(reason: &'static str) -> IngestError {
+        tracing::warn!(reason, "Alpaca publication precommit rejected");
+        IngestError::PublicationAuthorityRevoked
+    }
+
     fn validate_time_and_references(&self) -> Result<(), IngestError> {
-        if self.cancellation.is_cancelled() || Instant::now() >= self.deadline {
-            return Err(IngestError::PublicationAuthorityRevoked);
+        if self.cancellation.is_cancelled() {
+            return Err(Self::rejected("cancelled"));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Self::rejected("deadline"));
         }
         let now = super::super::system_timestamp()
-            .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+            .map_err(|_| Self::rejected("clock"))?;
         if self.records.len() != self.references.len()
             || self.records.len() != self.identities.len()
         {
-            return Err(IngestError::PublicationAuthorityRevoked);
+            return Err(Self::rejected("reference_alignment"));
         }
         for ((record, reference), identity) in self
             .records
@@ -1267,13 +1275,13 @@ impl AlpacaReferencePrecommit {
         {
             identity
                 .validate_at(now)
-                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+                .map_err(|_| Self::rejected("native_identity"))?;
             if record.revision_digest() != reference.definition_digest() {
-                return Err(IngestError::PublicationAuthorityRevoked);
+                return Err(Self::rejected("definition_revision"));
             }
             reference
                 .validate_definition_at(record.definition(), now)
-                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+                .map_err(|_| Self::rejected("definition_validity"))?;
         }
         Ok(())
     }
@@ -1281,25 +1289,29 @@ impl AlpacaReferencePrecommit {
 impl IngestPrecommitAuthority for AlpacaReferencePrecommit {
     fn validate_precommit(&self) -> Result<(), IngestError> {
         self.validate_time_and_references()?;
-        self.publication.validate_precommit()?;
+        self.publication.validate_precommit().inspect_err(|_| {
+            tracing::warn!(reason = "registration", "Alpaca publication precommit rejected");
+        })?;
         self.account
             .require_current()
-            .map_err(|_| IngestError::PublicationAuthorityRevoked)
+            .map_err(|_| Self::rejected("account"))
     }
     fn validate_catalog_precommit(
         &self,
         catalog: &market_squawk_data::CatalogAuthority,
     ) -> Result<(), IngestError> {
         self.validate_time_and_references()?;
-        self.publication.validate_catalog_precommit(catalog)?;
+        self.publication.validate_catalog_precommit(catalog).inspect_err(|_| {
+            tracing::warn!(reason = "catalog_registration", "Alpaca publication precommit rejected");
+        })?;
         self.account
             .require_catalog_current(catalog)
-            .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+            .map_err(|_| Self::rejected("catalog_account"))?;
         // All admitted references are checked, including a halt-only batch with no quote/trade row.
         for record in self.records.iter() {
             self.catalog
                 .require_current_in_catalog(catalog, record, self.deadline, &self.cancellation)
-                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+                .map_err(|_| Self::rejected("catalog_reference"))?;
         }
         Ok(())
     }

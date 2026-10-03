@@ -38,6 +38,27 @@ Original option recovery is critically verified but not yet a completed live sto
 Whole V1, installed lifecycle and final resource acceptance remain open. No CI or RAM gate run.
 No new branch/worktree; the existing unmerged Dependabot PR55 branch is preserved.
 
+### Active wave — lifecycle recovery and measured startup
+
+Previous goal turn: progress, pushed `0ea2935f`; current branch clean and matched service72588 /
+Desktop72627 / watcher99703 confirmed live. Acceptance2/6/7 remain blocked by exact account
+recovery/publication; acceptance5/7 startup construction takes27.5seconds.
+
+| Owner | Outcome and file ownership | Dependency / completion check |
+| --- | --- | --- |
+| Astra High options_original_recovery | Correct full account recovery inheriting shutdown deadline. Own `application/market_runtime/reconnect.rs` and `local_product/source_lifecycle/reconnect.rs`; coordinate trait consumers with lead before edits outside them | Reuse existing lifecycle operation budget, preserve exact generation/current authority/cancellation and real shutdown limit. Existing currentness shutdown and exact-generation drain cases; saved original MSFT resume after matched build. No new framework or timeout invention. |
+| GPT-6.1 Sol High desktop_startup_trace | Isolate measured27.5second constructor stage. Read-only source/current safe artifacts; append existing `desktop-startup-current.md` only | Identify minimal existing phase boundaries or demonstrated avoidable synchronous work; no guessing from old timings, no runtime mutation/build/Git. |
+| Lead | Narrow safe discriminator for actual publication precommit revocation, all shared consumers/build/Git/runtime/ledger | Static reason fields only; no credential/metadata payloads or relaxed rejection. Inspect agent diff and run critical checks once before one matched rebuild. |
+
+Recovery ownership patch is frozen and integrated: full account resume/reconnect now receives
+its existing30second lifecycle operation budget; exact physical stop is bounded by the earlier
+caller deadline/configured source-shutdown limit. No configured timeout, credential validity,
+source freshness or generation/CAS rule changed. Narrow static precommit-rejection reasons and
+five startup composition timings preserve all behavior. Existing shutdown-currentness,
+exact-generation health drain and saved retry/control checks each PASS1/1 (single test compile
+3m56s; no new tests or CI). Next barrier is one matched development rebuild, then original saved
+MSFT resume and actual phase timings. Both agent lanes are complete; lead owns verification.
+
 ### Current continuation wave — 2026-10-02 late session
 
 Prior turn: progress, pushed `3ee4d7a9` with native history evidence. Fresh branch clean; service53066,

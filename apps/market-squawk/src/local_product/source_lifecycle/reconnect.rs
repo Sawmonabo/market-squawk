@@ -110,9 +110,13 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
     async fn resume_pending(
         &self,
         surface: AccountMarketSurface,
-        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError> {
+        // This resumes the complete saved transition, including renewal and required calendar
+        // publication. The registry's shutdown wait is not its operation deadline.
+        let deadline = Instant::now()
+            .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+            .ok_or(ServiceError::Unavailable)?;
         if !matches!(
             surface,
             AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData
@@ -179,9 +183,11 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         &self,
         request: PreparedMarketProviderConfigurationRequest,
         generation: MarketRuntimeGroupGeneration,
-        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError> {
+        let deadline = Instant::now()
+            .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+            .ok_or(ServiceError::Unavailable)?;
         self.credential_access
             .ensure_resumed()
             .map_err(reconnect_error)?;

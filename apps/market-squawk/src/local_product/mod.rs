@@ -618,6 +618,7 @@ impl LocalProduct {
     {
         // Heap-own composition state so outer startup futures do not embed another full copy.
         Box::pin(async move {
+            let composition_started = Instant::now();
             // Reject code-owned contract or shutdown-budget defects before marking source authority
             // in-use. Final composition consumes this exact registry without rebuilding descriptors.
             let application_preparation =
@@ -633,6 +634,7 @@ impl LocalProduct {
             };
             let (research, onboarding_catalog, feature_dataset_production_publisher) =
                 open_research(&paths)?;
+            tracing::info!(phase = "research_open", elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
             let research = Arc::new(research);
             research.bind_application_changes()?;
             // Recovery owns a bounded cursor; selected reads still verify their exact objects.
@@ -985,6 +987,7 @@ impl LocalProduct {
             schwab_market_drain.bind(&source_lifecycle)?;
             let reconnect_owner: Arc<dyn crate::application::AccountMarketRuntimeReconnect> =
                 source_lifecycle.clone();
+            tracing::info!(phase = "before_reconnect", elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
             market_runtime
                 .bind_account_reconnect(
                     Arc::downgrade(&reconnect_owner),
@@ -992,6 +995,7 @@ impl LocalProduct {
                     &cancellation,
                 )
                 .await?;
+            tracing::info!(phase = "reconnect_bound", elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
             let source_lifecycle_service: Arc<dyn SourceLifecycleAuthority> =
                 source_lifecycle.clone();
             // A retained recipe is a per-source startup input. If its exact runtime or saved
@@ -1114,7 +1118,9 @@ impl LocalProduct {
             );
             portal_activation.bind_treasury_publication(treasury_closure, &research_domains)?;
 
+            let identity_started = Instant::now();
             let executable_sha256 = current_executable_sha256()?;
+            tracing::info!(phase = "executable_identity", elapsed_ms = %identity_started.elapsed().as_millis(), composition_elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
             let strategies = production_backtest_strategy_registry(executable_sha256)?;
             let backtest_service = Arc::new(ProductionBacktestService::initialize(
                 &paths,
@@ -1371,6 +1377,7 @@ impl LocalProduct {
                 paper.credential_runtime_control(),
                 Arc::clone(&startup_tasks),
             ));
+            tracing::info!(phase = "complete", elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
             Ok(Self {
                 paths,
                 artifacts,
