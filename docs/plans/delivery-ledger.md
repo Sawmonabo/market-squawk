@@ -2,6 +2,32 @@
 
 ## Current execution — 2026-10-02
 
+Current code checkpoint: `caa08000`, pushed on the existing feature branch. The single matched
+build passed in 5m18s; service 27815 and Desktop 27852 run generation `tU6dcK`. Watcher is running,
+with no compiler active at this checkpoint.
+
+**Completed in this batch:** compact ticker/price/change watchlist with hover/focus removal;
+automatic first-open history, coherent loading/error states and small retry icons. Native SPY
+acquisition completed and published in 20.5s. Sequential AAPL/NVDA/TSLA/DIA/VTI first-open checks
+completed automatically with 251 bars each in 18.60/16.88/16.69/19.73/18.20s, including observation
+polling. QQQ/MSFT retain 251 bars; IWM retains 21. Final nine-symbol saved reads succeeded in
+211–632ms. Initial downloads are not claimed instantaneous. Background canvas painting remains
+insufficient evidence of foreground chart quality. Full V1 acceptance is still open.
+
+**Remaining defect / next dependency:** one final Market.GetCollection refresh timed out after
+14.9s at `retained_routes_and_events`; the next identical request succeeded. The earlier current-grant
+snapshot authorization correction is already implemented and must not be repeated. Astra
+`stock_workflow_trace` owns read-only diagnosis of current `paper/market/durable_product.rs`,
+`load_retained_display_evidence` and retained-selection/authorization callees. Its output is a local
+report, with no product edits/builds/runtime calls/Git. Lead owns all implementation, native probes,
+integration and build scheduling. No new worktrees, CI, quarter review or RAM measurement.
+
+Evidence: `.agents/tmp/v1-first-stock/starter-history-first-open-results.json`,
+`spy-history-after-calendar-fix.json`, `spy-history-reopen-native.json`,
+`native-watchlist-history-results.json`, `compact-watchlist-native-final.png`.
+
+### Prior execution notes
+
 Current outcome: compact watchlist and automatic first-open history are live. Matched build PASS
 (5m18s), service27815/native27852 generationtU6dcK. Fresh SPY job
 `b63933de-17ed-435a-bb6a-b05968721b0e` completed: admission7.7s, published20.5s;
