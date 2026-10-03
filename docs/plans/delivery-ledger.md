@@ -49,6 +49,25 @@ Logs: `.agents/tmp/v1-first-stock/managed-preparation-{contract-fixed,workflow-c
 lifetime-critical,installed-critical}.log`. Matching deployment and same-MSFT continuation remain
 the next barrier. No live-completion claim yet.
 
+Source checkpoint `9292f3c9` is pushed. The coordinated development build passed in 5m37s and
+replaced service/Desktop with PIDs 57239/57282. Native resumption retained workflow
+`workflow_cf5ef0fe12425ee18f52b84010fdad43`, admitted job
+`1071f4de-c71c-4756-8dd4-596a1d3a4073`, and advanced from five to seven steps while waiting
+for background preparation. It continued about 33 seconds, beyond the former 15-second request
+deadline, then failed at `option-reference-publication` with `publication-authority` / `InvalidResult`.
+The original workflow now retains the terminal failure at eight steps with no published analysis;
+it is not resumable and must not be reset or manually rewritten. Completed-result reopening is
+still unproved. Native artifacts are `managed-preparation-{workflow-matched,native-resume,
+workflow-running,workflow-outcome}.json` under `.agents/tmp/v1-first-stock/`; runtime log is
+`daily-comparison-restart-dev.log`. PR #43 comment: 5967902829.
+
+Next dependency: Astra High `options_original_recovery` performs a bounded read-only trace of the
+current option publication guard, preserving original captures and the failed workflow. Exclusive
+report `.agents/tmp/v1-first-stock/option-publication-authority.md`; no source/build/runtime/Git
+changes. Lead retains all source ownership and checks the exact failed admission before dispatching
+a correction. DAG: actual failed job → exact publication guard → scoped producer/consumer correction
+→ critical check and a new explicitly recorded analysis attempt using the preserved workspace.
+
 
 ### Integrated source correction — renewed option-source admission
 
