@@ -260,6 +260,40 @@ impl CatalogReadSnapshot {
             .ok_or(CatalogError::ProviderCaptureMismatch)
     }
 
+    pub(crate) fn provider_capture_original_pending_session(
+        &self,
+        source: &market_squawk_domain::SourceId,
+    ) -> Result<Option<EvidenceDigest>, CatalogError> {
+        self.check_control()?;
+        super::provider_capture::original::pending_session(&self.connection, source)
+    }
+
+    pub(crate) fn provider_capture_original(
+        &self,
+        session: EvidenceDigest,
+        ordinal: u16,
+    ) -> Result<
+        Option<super::provider_capture::original::ProviderCaptureOriginalReceipt>,
+        CatalogError,
+    > {
+        self.check_control()?;
+        super::provider_capture::original::load(&self.connection, session, ordinal)
+    }
+
+    pub(crate) fn option_market_binding_evidence(
+        &self,
+        binding: EvidenceDigest,
+    ) -> Result<
+        Option<super::provider_option::PersistedProviderOptionMarketBindingEvidence>,
+        CatalogError,
+    > {
+        self.check_control()?;
+        super::provider_option::load_provider_option_market_binding_evidence(
+            &self.connection,
+            binding,
+        )
+    }
+
     pub(crate) fn selected_capture_rows(
         &self,
         selection: crate::analytical_read::SelectedProviderCaptureRows,

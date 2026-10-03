@@ -64,35 +64,24 @@ impl ProviderCaptureOriginalReceipt {
     }
 }
 
+/// Discovers the sole unpublished source session on the caller's existing catalog connection.
+pub(in crate::catalog) fn pending_session(
+    connection: &Connection,
+    source: &SourceId,
+) -> Result<Option<EvidenceDigest>, CatalogError> {
+    let mut statement=connection.prepare("SELECT DISTINCT original.session_digest FROM provider_capture_originals AS original JOIN provider_raw_observations AS observation ON observation.capture_observation_digest=original.capture_observation_digest WHERE original.ordinal=0 AND original.published_binding IS NULL AND original.published_option_binding IS NULL AND original.published_logical_binding IS NULL AND observation.source_id=?1 LIMIT 2")?;
+    let mut rows = statement.query([source.as_str()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let session = parse_digest(1, &row.get::<_, Vec<u8>>(0)?)?;
+    if rows.next()?.is_some() {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    Ok(Some(session))
+}
+
 impl Catalog {
-    pub(crate) fn provider_capture_original_pending_session(
-        &self,
-        source: &SourceId,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<EvidenceDigest>, CatalogError> {
-        self.market_recovery_read(deadline,cancellation,|| {
-            let mut statement=self.connection.prepare("SELECT DISTINCT original.session_digest FROM provider_capture_originals AS original JOIN provider_raw_observations AS observation ON observation.capture_observation_digest=original.capture_observation_digest WHERE original.ordinal=0 AND original.published_binding IS NULL AND original.published_option_binding IS NULL AND original.published_logical_binding IS NULL AND observation.source_id=?1 LIMIT 2")?;
-            let mut rows=statement.query([source.as_str()])?;
-            let Some(row)=rows.next()? else{return Ok(None)};
-            let session=parse_digest(1,&row.get::<_,Vec<u8>>(0)?)?;
-            if rows.next()?.is_some(){return Err(CatalogError::ProviderCaptureConflict)}
-            Ok(Some(session))
-        })
-    }
-
-    pub(crate) fn provider_capture_original(
-        &self,
-        session: EvidenceDigest,
-        ordinal: u16,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<ProviderCaptureOriginalReceipt>, CatalogError> {
-        self.market_recovery_read(deadline, cancellation, || {
-            load(&self.connection, session, ordinal)
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn retain_provider_capture_original(
         &self,

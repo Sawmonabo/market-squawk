@@ -3070,12 +3070,117 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         ),
         Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
     ));
+    // Exercise the real service reader while canonical publication holds its writer, both
+    // before and during the publication transaction. The committed original remains visible.
+    #[derive(Debug)]
+    struct ReadOriginalDuringPublication<'a> {
+        service: &'a AnalyticalDataService,
+        original: &'a market_squawk_data::ProviderCaptureOriginalReceipt,
+        store: &'a market_squawk_platform::SealedResearchJournalStore,
+        checks: AtomicUsize,
+    }
+    impl IngestPrecommitAuthority for ReadOriginalDuringPublication<'_> {
+        fn validate_precommit(&self) -> Result<(), IngestError> {
+            Ok(())
+        }
+
+        fn validate_catalog_precommit(
+            &self,
+            _catalog: &CatalogAuthority,
+        ) -> Result<(), IngestError> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let cancellation = CancellationToken::new();
+            assert_eq!(
+                self.service
+                    .pending_provider_capture_original(
+                        self.original.capture().source_id(),
+                        deadline,
+                        &cancellation,
+                    )?
+                    .as_ref(),
+                Some(self.original),
+            );
+            assert_eq!(
+                self.service
+                    .provider_capture_original(
+                        self.original.session(),
+                        self.original.ordinal(),
+                        deadline,
+                        &cancellation,
+                    )?
+                    .as_ref(),
+                Some(self.original),
+            );
+            self.service.require_provider_capture_original_session(
+                self.original.capture().source_id(),
+                self.original.session(),
+                deadline,
+                &cancellation,
+            )?;
+            assert!(matches!(
+                self.service.require_provider_capture_original_session(
+                    self.original.capture().source_id(),
+                    digest(156),
+                    deadline,
+                    &cancellation,
+                ),
+                Err(IngestError::ReplayConflict),
+            ));
+            let reopened = self.service.reopen_provider_capture_original(
+                self.original,
+                self.store,
+                deadline,
+                &cancellation,
+            )?;
+            assert_eq!(reopened.original(), self.original);
+            assert_eq!(reopened.records().len(), 1);
+            // The read split grants no authority to use an unpublished original as published.
+            assert!(matches!(
+                self.service.reopen_option_contract_reference_original(
+                    self.original,
+                    digest(157),
+                    self.store,
+                    deadline,
+                    &cancellation,
+                ),
+                Err(IngestError::ReplayConflict),
+            ));
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert!(matches!(
+                self.service.pending_provider_capture_original(
+                    self.original.capture().source_id(),
+                    deadline,
+                    &cancelled,
+                ),
+                Err(IngestError::Cancelled),
+            ));
+            assert!(matches!(
+                self.service.provider_capture_original(
+                    self.original.session(),
+                    self.original.ordinal(),
+                    Instant::now(),
+                    &cancellation,
+                ),
+                Err(IngestError::DeadlineExceeded),
+            ));
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let read_during_publication = ReadOriginalDuringPublication {
+        service: &service,
+        original: &originals[0],
+        store: &raw_store,
+        checks: AtomicUsize::new(0),
+    };
     let published = publisher.publish_alpaca_option_references(
         option_admission(created.clone(), source.source_id().clone()),
-        &allowed,
+        &read_during_publication,
         deadline(),
         &cancellation,
     )?;
+    assert!(read_during_publication.checks.load(Ordering::SeqCst) > 0);
     assert_eq!(published.inserted(), 1);
     let reader = service.market_data_instruments();
     let matched = reader.search("AAPL270115C00200000", 2, deadline(), &cancellation)?;

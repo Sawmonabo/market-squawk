@@ -645,7 +645,7 @@ fn insert_option_binding(
     Ok(())
 }
 
-fn load_provider_option_market_binding_evidence(
+pub(in crate::catalog) fn load_provider_option_market_binding_evidence(
     connection: &Connection,
     binding_digest: EvidenceDigest,
 ) -> Result<Option<PersistedProviderOptionMarketBindingEvidence>, CatalogError> {

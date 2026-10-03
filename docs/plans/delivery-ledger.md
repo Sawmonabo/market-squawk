@@ -2,6 +2,29 @@
 
 ## Current execution — 2026-10-02
 
+Original-read snapshot critical case PASS (existing catalog fixture, 1 test). Files frozen.
+Next bounded Astra stock_workflow_trace ownership: `apps/market-squawk/src/application/market_calendar/read.rs`
+and one existing calendar critical fixture if necessary. Diagnose the decoder's transient/retained
+accounting and use existing bounded/chunked decoding to process the complete calendar. Preserve
+all rows, provenance and ordinal reconciliation; no limit increase or weakened admission.
+Include a safe typed decoder failure diagnostic. Lead owns the actual native history query and
+consumer loading/error rendering, all builds and commits. Sol stock_input_trace remains read-only.
+
+
+Owner-visible correction: Sol product_copy_audit owns only
+`apps/market-squawk-desktop/src/features/markets/market-collection.tsx` for compact
+watchlist ticker/price/change rows and keyboard-accessible hover options. Preserve durable
+choice authority and navigation. Lead reserves shared formatters/components and all tests/Git.
+DAG: independent compact presentation → typecheck/native HMR check; Astra frozen original-read
+snapshot fix → existing critical case → one matched build; Sol calendar diagnosis → exact history
+failure evidence. These converge at usable Overview/investment detail; no full-screen success claim.
+
+
+Options read-separation ownership includes `data/src/catalog/provider_option.rs` solely to expose
+its existing canonical binding loader internally for the same read snapshot. Published original
+readback must not retain the same writer-lock bottleneck; no duplicated decoder or admission change.
+
+
 Parallel provider diagnosis: Sol stock_input_trace reads only
 `application/market_calendar/read.rs` and its source origin producer/retained evidence for the
 observed `calendar-origin-row-decode` InvalidEvidence failure; writes only its existing local

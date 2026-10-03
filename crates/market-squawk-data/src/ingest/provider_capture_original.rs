@@ -46,20 +46,19 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ProviderCaptureOriginalReceipt>, IngestError> {
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        let session = authority
-            .catalog()
-            .provider_capture_original_pending_session(source, deadline, cancellation)
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
             .map_err(map_market_recovery_catalog_error)?;
-        session
-            .map(|session| {
-                authority
-                    .catalog()
-                    .provider_capture_original(session, 0, deadline, cancellation)
-                    .map_err(map_market_recovery_catalog_error)
+        snapshot
+            .read(|snapshot| {
+                snapshot
+                    .provider_capture_original_pending_session(source)?
+                    .map(|session| snapshot.provider_capture_original(session, 0))
+                    .transpose()
+                    .map(Option::flatten)
             })
-            .transpose()
-            .map(Option::flatten)
+            .map_err(map_market_recovery_catalog_error)
     }
 
     /// Rejects replacing another unpublished source graph before its original publication finishes.
@@ -70,10 +69,12 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), IngestError> {
-        let pending = self
-            .market_recovery_authority(deadline, cancellation)?
-            .catalog()
-            .provider_capture_original_pending_session(source, deadline, cancellation)
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        let pending = snapshot
+            .read(|snapshot| snapshot.provider_capture_original_pending_session(source))
             .map_err(map_market_recovery_catalog_error)?;
         if pending.is_some_and(|pending| pending != session) {
             return Err(IngestError::ReplayConflict);
@@ -101,9 +102,12 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<ProviderCaptureOriginalReceipt>, IngestError> {
-        self.market_recovery_authority(deadline, cancellation)?
-            .catalog()
-            .provider_capture_original(session, ordinal, deadline, cancellation)
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        snapshot
+            .read(|snapshot| snapshot.provider_capture_original(session, ordinal))
             .map_err(map_market_recovery_catalog_error)
     }
     /// Consumes a new live token into durable original custody before a provider checkpoint moves.
@@ -258,34 +262,40 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<ProviderCaptureOriginalRead, IngestError> {
-        check_market_event_read(deadline, cancellation)?;
-        let actual = self
-            .provider_capture_original(
-                expected.session(),
-                expected.ordinal(),
-                deadline,
-                cancellation,
-            )?
-            .ok_or(IngestError::ProviderCaptureRequired)?;
-        if actual != *expected || actual.published_binding() != Some(owning_option_binding) {
-            return Err(IngestError::ReplayConflict);
-        }
-        let authority = self.market_recovery_authority(deadline, cancellation)?;
-        let binding = authority
-            .catalog()
-            .provider_option_market_binding_evidence(owning_option_binding)
-            .map_err(map_market_recovery_catalog_error)?
-            .ok_or(IngestError::ProviderCaptureRequired)?;
-        let dependency = binding
-            .reference_dependencies()
-            .get(usize::from(actual.ordinal()))
-            .ok_or(IngestError::ReplayConflict)?;
-        if dependency.capture() != actual.capture()
-            || dependency.physical() != actual.physical()
-            || actual.decoded_at() > binding.capture().pages()[0].received_at()
-        {
-            return Err(IngestError::ReplayConflict);
-        }
+        let snapshot = self
+            .manifests
+            .read_snapshot(self.catalog_read_limits, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        let actual = snapshot
+            .read(|snapshot| -> Result<_, IngestError> {
+                let actual = snapshot
+                    .provider_capture_original(expected.session(), expected.ordinal())
+                    .map_err(map_market_recovery_catalog_error)?
+                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                if actual != *expected || actual.published_binding() != Some(owning_option_binding)
+                {
+                    return Err(IngestError::ReplayConflict);
+                }
+                let binding = snapshot
+                    .option_market_binding_evidence(owning_option_binding)
+                    .map_err(map_market_recovery_catalog_error)?
+                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                let dependency = binding
+                    .reference_dependencies()
+                    .get(usize::from(actual.ordinal()))
+                    .ok_or(IngestError::ReplayConflict)?;
+                if dependency.capture() != actual.capture()
+                    || dependency.physical() != actual.physical()
+                    || actual.decoded_at() > binding.capture().pages()[0].received_at()
+                {
+                    return Err(IngestError::ReplayConflict);
+                }
+                Ok(actual)
+            })
+            .map_err(|error| match error {
+                IngestError::Catalog(error) => map_market_recovery_catalog_error(error),
+                other => other,
+            })?;
         let control = MarketEventReadControl {
             deadline,
             cancellation,
