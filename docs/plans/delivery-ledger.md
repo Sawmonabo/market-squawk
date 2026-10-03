@@ -3,18 +3,45 @@
 ## Current execution — 2026-10-03
 
 Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
-Pushed baseline: SEC stack `74eb6762`, SEC/schema `44b9f583`, calendar `dec65cdd`,
-financial autoload `3d078ba5`, saved-analysis research `262a0274`. Origin retains the three
-intended branches plus active, unmerged Dependabot PR55. No new branch/worktree was created.
+Pushed: pending setup/SEC content revisions `aeced650`, filing producer correction `ab0d54e0`.
+Earlier SEC stack `74eb6762`, SEC/schema `44b9f583`, calendar `dec65cdd` and financial autoload
+`3d078ba5` remain integrated. Origin retains the three intended branches plus active, unmerged
+Dependabot PR55. No new branch/worktree was created.
 
-**Owner-approved deployment:** preserve the complete prior workspace
-`.market-squawk/v1-owner-test-financial-detail-2026-10-02` and the attempted fresh root
-`.market-squawk/v1-owner-test-fresh-2026-10-03` as recovery evidence. Initialize corrected V1
-storage after this checkpoint; do not migrate, delete or alter retained revision evidence.
-The second root already contains provider-version Submissions records that cannot be reclassified
-without rewriting history. The owner explicitly chose a fresh workspace. Original MSFT workflow
-`workflow_96bca8b553dd5278afa3e9a2a4040af5`, its three pending captures and all saved evidence
-remain in the first root. Preservation receipt: `.agents/tmp/v1-first-stock/fresh-workspace-preservation.json`.
+**Owner-approved fresh deployment is running:**
+`.market-squawk/v1-owner-test-corrected-2026-10-03`. Both complete prior roots remain preserved:
+`.market-squawk/v1-owner-test-financial-detail-2026-10-02` and
+`.market-squawk/v1-owner-test-fresh-2026-10-03`. Supervisor 21852 exited 0 after graceful shutdown;
+no database migration, deletion or retained-evidence rewrite occurred. Receipt:
+`.agents/tmp/v1-first-stock/corrected-workspace-preservation.json`.
+Original MSFT workflow `workflow_96bca8b553dd5278afa3e9a2a4040af5`, its pending captures and
+prior saved evidence remain in the first root. The second root retains the previously created
+$100,000/0.25% virtual account. Those authorized settings were also recreated in the new root;
+no paper session or order started. Allocation settings remain to be applied.
+
+The matching build passed in 5m26s; the new launcher reused it in 1.35s. Fresh local-product startup
+reported 14,458ms. Desktop 50670/service 50614 are alive; native contexts are ready and connected
+without an app-password prompt. Configured credentials imported privately; Alpaca verified and
+activated. All nine starter prices display. Same-root graceful restart passed: Desktop is ready,
+the identical Tiingo session/candidate generation remains stored and unverified, and no app password
+was requested. Supervisor 50095/watcher 50495 owns the single development instance. Daily changes remain unavailable; this is not
+instant-start or full financial-page acceptance. Captures/logs are `corrected-v1-*` under
+`.agents/tmp/v1-first-stock/`.
+
+**Live SEC remains blocked:** native Microsoft setup returns `connection_setup_rejected` with
+underlying `ExtractionSource(Authority(BudgetWaitUntil { deadline: MonotonicInstant(136613537500) }))`.
+There is no new stack overflow or immutable-revision conflict in this attempt. This rate-admission
+wait is not successful SEC setup. Logs also record Coinbase/Kraken public runtime shutdown-barrier
+failures; the Desktop and stock prices remain available. These additional failures are unresolved.
+
+**Next bounded ownership:** Astra `fresh_activation_stack` owns read-only diagnosis of the SEC
+rate-admission failure and `.agents/tmp/v1-first-stock/sec-budget-wait.md` only. Trace the precise
+wait/propagation and retained publication stage; no provider calls, source/data/runtime changes,
+builds or Git. Lead owns runtime/restart evidence, integration and any shared contracts. Runtime captures include
+`corrected-v1-restarted-native.json`, `corrected-v1-restarted-onboarding.json` and the
+`corrected-v1-paper-*` preparation/preview/creation receipts. The
+closed-session comparison design is complete but unimplemented. Option renewal and the first
+saved analysis remain the subsequent stock-workflow dependencies. All full V1 obligations remain.
 
 ### SEC caller correction — verified integration
 
@@ -24,9 +51,8 @@ now runs before that parser. The existing mixed-taxonomy fixture replaces its sy
 owner/manual revision plan with the real SEC source and `source.revision_plan(&batch)`.
 It passed 1/1 in 2.26s through publication/restart. Log:
 `.agents/tmp/v1-first-stock/sec-filing-revision-critical.log`. No new harness or parser was added.
-Lead inspected both changes; Astra's fixture ownership is released. The previous matching build
-passed in 7m34s; deployment waits for the corrected build. Watcher 22254 remains paused until the
-lead resumes its single build queue. No live SEC success is claimed.
+Lead inspected both changes; Astra's fixture ownership is released. The corrected matching build
+and fresh deployment are recorded above. No live SEC success is claimed.
 
 ### Integrated checkpoint — SEC corrected metadata and pending credential recovery
 
@@ -53,12 +79,6 @@ retain their existing checks. No default password, compatibility path or migrati
 Focused logs: `.agents/tmp/v1-first-stock/{pending-setup-catalog-critical,sec-corrected-metadata-critical,pending-setup-service-critical}.log`.
 Reports: `sec-revision-conflict.md`, `tiingo-setup-recovery.md`, `closed-session-change.md` in that directory.
 No full CI or whole-app RAM gate ran. These are critical fixture results, not live SEC completion.
-
-**Runtime:** current attempted-fresh Desktop 42895/service 42851 remain alive under supervisor 21852;
-watcher 22254 is paused while the lead serializes checks. All three focused checks pass. The next barrier is coherent commit/push and corrected-fresh native deployment. Then prove real SEC publication,
-financial-tab reads and restart, finish daily comparison, option renewal and the first saved analysis.
-The approved $100,000/0.25% virtual account was created in the attempted-fresh root; no paper session
-or order started. Recreate these authorized test settings in the new root, preserving this attempt.
 
 **Preserved live evidence:** `74eb6762` reduced the twelve SEC caller frames by 424,976 bytes without
 raising stack/data limits. Native retry passed the crash point and returned the revision conflict
