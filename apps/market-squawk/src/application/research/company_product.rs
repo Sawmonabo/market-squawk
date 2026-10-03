@@ -22,7 +22,7 @@ use super::company_research::{
     CompanyFactScope, CompanyResearchDimensionState, CompanyResearchFact, CompanyResearchFiling,
     CompanyResearchFiscalPeriod, CompanyResearchOutcome, CompanyResearchRead,
     CompanyResearchRestatementState, CompanyResearchRevisionState, CompanyResearchSnapshot,
-    CompanyResearchSurfaceAvailability, CompanyResearchUnavailableReason,
+    CompanyResearchSurfaceAvailability, CompanyResearchUnavailableReason, financial_input_bit,
 };
 use crate::application::domain_support::{ProductTextCopyError, try_boxed_product_text};
 
@@ -199,6 +199,7 @@ struct CompanyFactPrivateLineage {
     filing_identity: Box<str>,
     publication_identity: [u8; 32],
     xbrl_identity: Option<(SourceIdentifier, SourceIdentifier)>,
+    nonnumeric_inputs: Option<u16>,
 }
 
 impl fmt::Debug for CompanyFactPrivateLineage {
@@ -1328,8 +1329,8 @@ fn project_ratios(
     candidates
         .try_reserve_exact(facts.len())
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
-    // Statement meaning establishes applicability even when both required operands are
-    // absent. Share-only and cash-flow-only envelopes must not manufacture ratio rows.
+    // Statement meaning supplies candidate envelopes; exact operand presence below
+    // determines which ratios apply. Unrelated notes retain their facts and statements.
     for fact in facts.iter().filter(|fact| {
         matches!(
             (fact.period, statement_for_metric(fact.metric)),
@@ -1370,10 +1371,9 @@ fn project_ratios(
                 let revenue = revenue_metrics(group);
                 // Parent-attributable and consolidated income are different bases, not
                 // conflicting observations. Presence selects the basis before validation.
-                let net_income = if group
-                    .iter()
-                    .any(|candidate| candidate.fact.metric == CompanyFinancialMetric::NetIncome)
-                {
+                let net_income = if group.iter().any(|candidate| {
+                    reports_input(candidate.fact, CompanyFinancialMetric::NetIncome)
+                }) {
                     CompanyFinancialMetric::NetIncome
                 } else {
                     CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests
@@ -1457,7 +1457,7 @@ fn revenue_metrics(group: &[EnvelopeFactRef<'_>]) -> &'static [CompanyFinancialM
     // values. An invalid selected total must not fall back to a different financial basis.
     if group
         .iter()
-        .any(|candidate| candidate.fact.metric == CompanyFinancialMetric::Revenue)
+        .any(|candidate| reports_input(candidate.fact, CompanyFinancialMetric::Revenue))
     {
         &[CompanyFinancialMetric::Revenue]
     } else {
@@ -1467,6 +1467,31 @@ fn revenue_metrics(group: &[EnvelopeFactRef<'_>]) -> &'static [CompanyFinancialM
             CompanyFinancialMetric::NetSales,
         ]
     }
+}
+
+fn input_bit(metric: CompanyFinancialMetric) -> u16 {
+    financial_input_bit(match metric {
+        CompanyFinancialMetric::CurrentAssets => "AssetsCurrent",
+        CompanyFinancialMetric::CurrentLiabilities => "LiabilitiesCurrent",
+        CompanyFinancialMetric::Revenue => "Revenues",
+        CompanyFinancialMetric::NetSales => "SalesRevenueNet",
+        CompanyFinancialMetric::CustomerRevenueExcludingAssessedTax => {
+            "RevenueFromContractWithCustomerExcludingAssessedTax"
+        }
+        CompanyFinancialMetric::GrossProfit => "GrossProfit",
+        CompanyFinancialMetric::OperatingIncome => "OperatingIncomeLoss",
+        CompanyFinancialMetric::NetIncome => "NetIncomeLoss",
+        CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests => "ProfitLoss",
+        _ => "",
+    })
+}
+
+fn reports_input(fact: &CompanyFactProduct, metric: CompanyFinancialMetric) -> bool {
+    fact.metric == metric
+        || fact
+            .lineage
+            .nonnumeric_inputs
+            .is_some_and(|inputs| inputs & input_bit(metric) != 0)
 }
 
 fn append_ratio(
@@ -1492,9 +1517,33 @@ fn append_ratio(
         CompanyRatioInputRole::Denominator,
     )?;
     let denominator_count = inputs.len() - numerator_count;
+    let relevant_inputs = numerator_metrics
+        .iter()
+        .chain(denominator_metrics)
+        .fold(0, |bits, metric| bits | input_bit(*metric));
+    let nonnumeric_input = group.iter().any(|candidate| {
+        candidate
+            .fact
+            .lineage
+            .nonnumeric_inputs
+            .is_some_and(|bits| bits & relevant_inputs != 0)
+    });
+    if inputs.is_empty()
+        && group.iter().all(|candidate| {
+            candidate
+                .fact
+                .lineage
+                .nonnumeric_inputs
+                .is_some_and(|bits| bits & relevant_inputs == 0)
+        })
+    {
+        // A complete context reporting neither operand is not an attempted calculation.
+        // Keep its original facts/statements; do not borrow another filing's operands.
+        return Ok(());
+    }
     let numerator = ratio_operand(&inputs[..numerator_count]);
     let denominator = ratio_operand(&inputs[numerator_count..]);
-    let (state, value) = if numerator_count == 0 || denominator_count == 0 {
+    let (state, value) = if numerator_count == 0 || denominator_count == 0 || nonnumeric_input {
         (CompanyRatioState::MissingInput, None)
     } else if numerator.is_none() || denominator.is_none() {
         (CompanyRatioState::ConflictingInput, None)
@@ -1707,6 +1756,7 @@ pub(crate) fn project_fact(
                 .map_err(map_product_text_error)?,
             publication_identity: fact.lineage().publication_identity().bytes(),
             xbrl_identity: fact.lineage().xbrl_identity().cloned(),
+            nonnumeric_inputs: fact.nonnumeric_inputs(),
         },
         scope: match fact.scope() {
             CompanyFactScope::CompanyWide => CompanyFactProductScope::CompanyWide,
@@ -2491,49 +2541,140 @@ mod tests {
             assert!(project_financial_envelope(&[unrelated], true)?.is_empty());
         }
 
-        // An applicable statement still reports missing ratios even when neither operand
-        // exists. Eligibility is statement meaning, not the presence of ratio inputs.
-        for (metric, period, expected_metrics) in [
-            (
-                CompanyFinancialMetric::TotalAssets,
-                instant,
-                vec![CompanyRatioMetric::CurrentRatio],
-            ),
-            (
-                CompanyFinancialMetric::OperatingExpenses,
-                duration,
-                vec![
-                    CompanyRatioMetric::GrossMargin,
-                    CompanyRatioMetric::OperatingMargin,
-                    CompanyRatioMetric::NetMargin,
-                ],
-            ),
+        // Unrelated balance-sheet/operating notes report neither operand. They retain
+        // their facts and statements but must not manufacture missing default ratios.
+        for (metric, period) in [
+            (CompanyFinancialMetric::TotalAssets, instant),
+            (CompanyFinancialMetric::OperatingExpenses, duration),
         ] {
-            let without_operands =
-                fact(metric, 100, usd, period, year_end, known_at, "filing-a", 1)?;
-            let missing = project_ratios(
-                &[without_operands],
+            let unrelated = fact(metric, 100, usd, period, year_end, known_at, "filing-a", 1)?;
+            let empty = project_ratios(
+                std::slice::from_ref(&unrelated),
                 CompanyProductSectionState::Reported,
                 &mut CompanySerializedBudget::new(),
             )?;
-            assert_eq!(missing.state(), CompanyProductSectionState::Unavailable);
-            assert_eq!(
-                missing
-                    .items()
-                    .iter()
-                    .map(CompanyRatioProduct::metric)
-                    .collect::<Vec<_>>(),
-                expected_metrics
-            );
-            assert!(missing.items().iter().all(|ratio| {
-                ratio.state() == CompanyRatioState::MissingInput
-                    && ratio.value().is_none()
-                    && ratio.inputs().is_empty()
-                    && ratio
-                        .envelope()
-                        .is_some_and(|envelope| envelope.period == period)
-            }));
+            assert_eq!(empty.state(), CompanyProductSectionState::Unavailable);
+            assert!(empty.items().is_empty());
+            assert!(project_financial_envelope(std::slice::from_ref(&unrelated), true)?.is_empty());
+            assert_eq!(project_financial_envelope(&[unrelated], false)?.len(), 1);
         }
+
+        // Later equity-only filing contexts must not eclipse the complete same-date
+        // balance sheet. Both consumers use the same applicability and exact lineage.
+        for scope in [
+            CompanyFactProductScope::CompanyWide,
+            CompanyFactProductScope::FilingDetail,
+        ] {
+            let mut complete = facts[..2].to_vec();
+            let mut note = fact(
+                CompanyFinancialMetric::ShareholdersEquity,
+                300,
+                usd,
+                instant,
+                CalendarDate::new(2026, 3, 1)?,
+                known_at,
+                "later-equity-note",
+                9,
+            )?;
+            note.effective = CompanyProductTime::CalendarDate(year_end);
+            note.scope = scope;
+            for (index, item) in complete.iter_mut().enumerate() {
+                item.scope = scope;
+                if scope == CompanyFactProductScope::FilingDetail {
+                    item.lineage.xbrl_identity = Some((
+                        SourceIdentifier::try_from("balance-context")?,
+                        SourceIdentifier::try_from(format!("balance-{index}"))?,
+                    ));
+                }
+            }
+            if scope == CompanyFactProductScope::FilingDetail {
+                note.lineage.xbrl_identity = Some((
+                    SourceIdentifier::try_from("equity-context")?,
+                    SourceIdentifier::try_from("equity-note")?,
+                ));
+            }
+            let original_note = note.clone();
+            let mut combined = vec![note.clone()];
+            combined.extend(complete.clone());
+            let whole = project_ratios(
+                &combined,
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new(),
+            )?;
+            assert_eq!(whole.items().len(), 1);
+            assert_eq!(whole.items()[0].value(), Some(Decimal::from(2)));
+            assert_eq!(
+                whole.items()[0].envelope(),
+                Some(reporting_envelope(&complete[0]))
+            );
+            assert!(project_financial_envelope(std::slice::from_ref(&note), true)?.is_empty());
+            assert_eq!(
+                project_financial_envelope(&complete, true)?[0],
+                serde_json::to_value(&whole.items()[0])?
+            );
+            let evidence = project_statements(
+                &combined,
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new(),
+            )?;
+            assert!(
+                evidence
+                    .groups()
+                    .iter()
+                    .any(|group| group.items().contains(&original_note))
+            );
+
+            // Explicit nil/nonnumeric operands and unchecked sidecars are not absence.
+            // Neither can silently fall back to the earlier complete candidate.
+            for coverage in [
+                None,
+                Some(financial_input_bit("AssetsCurrent")),
+                Some(financial_input_bit("LiabilitiesCurrent")),
+            ] {
+                note.lineage.nonnumeric_inputs = coverage;
+                let unavailable = project_financial_envelope(std::slice::from_ref(&note), true)?;
+                assert_eq!(unavailable.len(), 1);
+                assert_eq!(unavailable[0]["state"], "missing_input");
+                assert!(unavailable[0]["value"].is_null());
+            }
+        }
+
+        // Nonnumeric total revenue is still the chosen financial basis. It cannot be
+        // bypassed by a numeric narrower revenue concept or by operand omission.
+        let mut nil_revenue = facts[2..].to_vec();
+        for item in &mut nil_revenue {
+            item.lineage.nonnumeric_inputs = Some(financial_input_bit("Revenues"));
+        }
+        assert!(
+            project_ratios(
+                &nil_revenue,
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new()
+            )?
+            .items()
+            .iter()
+            .all(
+                |ratio| ratio.state() == CompanyRatioState::MissingInput && ratio.value().is_none()
+            )
+        );
+        let mut nil_note = fact(
+            CompanyFinancialMetric::OperatingExpenses,
+            100,
+            usd,
+            duration,
+            year_end,
+            known_at,
+            "nil-note",
+            4,
+        )?;
+        nil_note.lineage.nonnumeric_inputs = Some(financial_input_bit("Revenues"));
+        let nil_margins = project_financial_envelope(&[nil_note], true)?;
+        assert_eq!(nil_margins.len(), 3);
+        assert!(
+            nil_margins
+                .iter()
+                .all(|ratio| ratio["state"] == "missing_input")
+        );
         let missing_margins = project_financial_envelope(&facts[2..3], true)?;
         assert_eq!(missing_margins.len(), 3);
         assert!(missing_margins.iter().all(|ratio| {
@@ -2701,6 +2842,7 @@ mod tests {
                 filing_identity: filing_identity.into(),
                 publication_identity: [publication_byte; 32],
                 xbrl_identity: None,
+                nonnumeric_inputs: Some(0),
             },
             scope: CompanyFactProductScope::CompanyWide,
             revision: CompanyProductRevisionState::Current,

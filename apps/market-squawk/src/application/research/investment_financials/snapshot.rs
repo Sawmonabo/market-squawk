@@ -1,4 +1,5 @@
 //! Immutable selected-row and complete reporting-envelope coordinate index.
+use super::super::company_research::{financial_input_bit, verified_company_filing};
 use super::*;
 
 #[allow(
@@ -64,6 +65,28 @@ pub(super) fn build_snapshot(
             return Err(ServiceError::InvalidResult);
         }
         issuer = Some(link.provider_company_id().clone());
+        if section == InvestmentFinancialSection::Ratios {
+            if let Some(filing) =
+                verified_company_filing(exact, request.knowledge_at()).map_err(canonical_error)?
+            {
+                // Family is an index into this snapshot's exact immutable selection;
+                // context IDs are never compared across different filing publications.
+                for occurrence in filing.nonnumeric_occurrences().iter() {
+                    check(deadline, cancellation)?;
+                    let occurrence = occurrence
+                        .map_err(map_company_data_error)
+                        .map_err(canonical_error)?;
+                    let inputs = financial_input_bit(occurrence.concept().local_name().as_str());
+                    if inputs != 0 {
+                        connection.execute(
+                            "INSERT INTO nonnumeric_inputs(family,context,inputs) VALUES(?1,?2,?3)
+                             ON CONFLICT(family,context) DO UPDATE SET inputs=inputs|excluded.inputs",
+                            params![family as i64, occurrence.context_id().as_str(), i64::from(inputs)],
+                        ).map_err(sql_error)?;
+                    }
+                }
+            }
+        }
         for coordinate in exact
             .selected_display_coordinates()
             .map_err(map_company_data_error)
@@ -115,6 +138,9 @@ pub(super) fn begin_coordinates(connection: &Connection) -> Result<(), ServiceEr
         .execute_batch(
             "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE;
          PRAGMA mmap_size=0; PRAGMA cache_size=-1024;
+         CREATE TABLE nonnumeric_inputs(
+             family INTEGER NOT NULL,context TEXT NOT NULL,inputs INTEGER NOT NULL,
+             PRIMARY KEY(family,context)) WITHOUT ROWID;
          CREATE TABLE source_coordinates(
              ordinal INTEGER PRIMARY KEY,family INTEGER NOT NULL,position INTEGER NOT NULL,
              envelope BLOB,effective_day INTEGER NOT NULL,effective_time INTEGER,

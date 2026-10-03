@@ -28,6 +28,13 @@ The VTI name concern is withdrawn: the captured name matches Vanguard's current 
 page. Failed audit JavaScript selectors on initial SPY/QQQ/DIA warm attempts are harness failures,
 excluded from app-defect evidence; successful recaptures remain separate.
 
+Subsequent matched-native check: NVDA preparation completed and all four financial reads return32
+reported items; the actual Facts screen renders32 rows without an alert. Its earlier pending
+state is preserved in the baseline below. Full NVIDIA source accuracy/history and preparing-state
+copy remain open. The new shared ratio-applicability correction passes the existing envelope and
+cursor checks; next-page native verification is still pending. Original facts and verified nil,
+partial/conflicting inputs remain explicit; this is not a blanket filter hiding unavailable ratios.
+
 ### All-nine baseline and remaining red flags
 
 

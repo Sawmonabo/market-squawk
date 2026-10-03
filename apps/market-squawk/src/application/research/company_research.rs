@@ -5,6 +5,7 @@
 //! bindings, filing coordinates, and content digests are selected by the data authority and remain
 //! private in this leaf.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1067,6 +1068,8 @@ pub(crate) struct CompanyResearchFact {
     revision: CompanyResearchRevisionState,
     metric: Box<str>,
     value: Decimal,
+    // None means the complete nonnumeric source context has not been inspected.
+    nonnumeric_inputs: Option<u16>,
     unit: Box<str>,
     period: FundamentalPeriod,
     fiscal_year: Option<u16>,
@@ -1122,6 +1125,12 @@ impl CompanyResearchFact {
     }
     pub(crate) const fn value(&self) -> Decimal {
         self.value
+    }
+    pub(crate) const fn nonnumeric_inputs(&self) -> Option<u16> {
+        self.nonnumeric_inputs
+    }
+    pub(crate) fn set_nonnumeric_inputs(&mut self, inputs: u16) {
+        self.nonnumeric_inputs = Some(inputs);
     }
     pub(crate) fn unit(&self) -> &str {
         &self.unit
@@ -1521,6 +1530,7 @@ fn append_company_rows(
     if selection.selected().is_empty() {
         return Err(CanonicalResearchReadError::EvidenceConflict);
     }
+    let start = facts.len();
     for selected in selection.selected() {
         append_company_row(
             request,
@@ -1532,7 +1542,70 @@ fn append_company_rows(
             latest_known_at,
         )?;
     }
+    // Index only the relevant nonnumeric concepts of this exact immutable filing.
+    // The original occurrences remain in its verified disk-backed sidecar.
+    let mut nonnumeric = BTreeMap::<SourceIdentifier, u16>::new();
+    if let Some(filing) = verified_company_filing(selection, request.knowledge_at())? {
+        for occurrence in filing.nonnumeric_occurrences().iter() {
+            let occurrence = occurrence.map_err(map_company_data_error)?;
+            let inputs = financial_input_bit(occurrence.concept().local_name().as_str());
+            if inputs != 0 {
+                *nonnumeric
+                    .entry(occurrence.context_id().clone())
+                    .or_default() |= inputs;
+            }
+        }
+    }
+    for fact in &mut facts[start..] {
+        let inputs = fact
+            .lineage
+            .xbrl_identity
+            .as_ref()
+            .map_or(0, |(context, _)| {
+                nonnumeric.get(context).copied().unwrap_or_default()
+            });
+        fact.set_nonnumeric_inputs(inputs);
+    }
     Ok(())
+}
+
+/// Financial concept presence, independent of whether a numeric value can be calculated.
+/// Local names are conservative for nonnumeric source concepts: an unfamiliar namespace
+/// cannot turn an explicit unavailable operand into evidence of absence.
+pub(crate) fn financial_input_bit(local_name: &str) -> u16 {
+    match local_name {
+        "AssetsCurrent" => 1,
+        "LiabilitiesCurrent" => 1 << 1,
+        "Revenues" => 1 << 2,
+        "SalesRevenueNet" => 1 << 3,
+        "RevenueFromContractWithCustomerExcludingAssessedTax" => 1 << 4,
+        "GrossProfit" => 1 << 5,
+        "OperatingIncomeLoss" => 1 << 6,
+        "NetIncomeLoss" => 1 << 7,
+        "ProfitLoss" => 1 << 8,
+        _ => 0,
+    }
+}
+
+/// Nonnumeric coverage is usable only from the exact selected filing at this cutoff.
+pub(crate) fn verified_company_filing(
+    selection: &market_squawk_data::SecResearchSelection,
+    knowledge_at: Timestamp,
+) -> Result<Option<&market_squawk_data::SecVerifiedFilingXbrl>, CanonicalResearchReadError> {
+    if selection.request().family() != SecResearchFamily::FilingXbrl {
+        return Ok(None);
+    }
+    let filing = selection
+        .filing_xbrl()
+        .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+    if filing
+        .availability()
+        .conservative_available_at()
+        .is_none_or(|known| known > knowledge_at)
+    {
+        return Err(CanonicalResearchReadError::EvidenceConflict);
+    }
+    Ok(Some(filing))
 }
 
 /// Decodes and validates just one original selected occurrence from its retained disk index.
@@ -1709,6 +1782,7 @@ fn append_authenticated_company_row(
                 revision: product_revision_state(revision),
                 metric: try_boxed_text(fundamental.concept().as_str())?,
                 value: fundamental.value(),
+                nonnumeric_inputs: (family == SecResearchFamily::CompanyFacts).then_some(0),
                 unit: try_boxed_text(fundamental.unit().as_str())?,
                 period: fact_context.period(),
                 fiscal_year: fact_context.fiscal_year(),

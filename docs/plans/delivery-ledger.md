@@ -2,6 +2,28 @@
 
 ## Current execution — 2026-10-03
 
+### Verified financial applicability correction
+
+The shared ratio projector now attempts a calculation only when its exact complete reporting
+envelope contains a numeric or verified nonnumeric operand. It retains missing-one, nil, conflict,
+unit and zero-denominator outcomes, and leaves original facts/statement evidence intact. Both
+whole-snapshot and paged readers reuse that rule; the paged reader indexes exact filing/context
+nonnumeric presence once. Display identity changes in place; no migration or compatibility path.
+Source tracing confirms unrelated AAPL equity notes, TSLA comparative notes and MSFT expense
+occurrences generated empty ratio attempts. Broader duplicate/default-summary presentation and
+CompanyFacts occurrence grouping remain open.
+
+Existing exact-envelope and cursor/close checks pass. Six source recovery/custody/lifecycle checks
+also pass from the same single compiled application test binary (8 total, no broad gate/CI).
+Native ratio-page proof awaits the next coherent app update.
+
+NVDA's previously running preparation is now durably Completed, sequence4. Matched native
+`e780b62a` reads return32 reported items in each of Facts/Statements/Ratios/Filings, and the actual
+NVDA screen displays32 financial rows without an alert. This closes that captured pending state,
+not all NVIDIA values/history or the poor preparing-versus-unavailable wording. Evidence:
+`native-nvda-financials-e780b62a.json`, `native-nvda-ui-e780b62a.json`; first UI read7.7s while
+compilation was active is not a responsiveness pass.
+
 ### Source recovery and financial projection wave
 
 Previous goal turn was progress: completed the cross-source evidence trace. `e780b62a` is pushed;

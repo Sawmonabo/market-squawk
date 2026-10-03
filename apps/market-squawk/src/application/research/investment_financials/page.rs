@@ -238,12 +238,23 @@ fn envelope_items(
         let position = checked_coordinate(row.get::<_, i64>(1).map_err(sql_error)?)?;
         let (fact, _) =
             selected_company_row(&snapshot.request, exact, position).map_err(canonical_error)?;
-        let fact = project_fact(
-            &fact.ok_or(ServiceError::InvalidResult)?,
-            snapshot.request.knowledge_at(),
-        )
-        .map_err(projection_error)?
-        .ok_or(ServiceError::InvalidResult)?;
+        let mut fact = fact.ok_or(ServiceError::InvalidResult)?;
+        if snapshot.section == InvestmentFinancialSection::Ratios {
+            if let Some((context, _)) = fact.lineage().xbrl_identity() {
+                let inputs: Option<u16> = connection
+                    .query_row(
+                        "SELECT inputs FROM nonnumeric_inputs WHERE family=?1 AND context=?2",
+                        params![family as i64, context.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?;
+                fact.set_nonnumeric_inputs(inputs.unwrap_or_default());
+            }
+        }
+        let fact = project_fact(&fact, snapshot.request.knowledge_at())
+            .map_err(projection_error)?
+            .ok_or(ServiceError::InvalidResult)?;
         if fact_envelope_bytes(&fact).map_err(projection_error)? != envelope {
             return Err(ServiceError::InvalidResult);
         }
