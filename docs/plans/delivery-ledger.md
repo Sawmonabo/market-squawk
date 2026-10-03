@@ -2,7 +2,23 @@
 
 ## Current execution — 2026-10-03
 
-### Active wave — keep reads available during financial preparation
+### Active wave — selected filing transform completion
+
+Base `970d0b56` pushed; acceptance 1/2/5. On the matching service 93334/Desktop 93392,
+TSLA preparation `c2315ed5-f951-432f-b186-e33cda22285f` acquired submissions and Company Facts,
+then failed in acquisition with `Sec(Xbrl(UnsupportedTransform))`. Existing MSFT data stays
+available. This is a concrete selected-provider acquisition gap, not completion of preparation.
+
+| Owner | Disjoint files / dependency | Critical evidence |
+| --- | --- | --- |
+| Astra High `sec_numeric_transform` | SEC `src/xbrl/wire.rs` and existing XBRL fixture/test; report exact additional path before editing | Identify actual retained TSLA numeric transform, verify primary specification, implement its exact semantics using existing parser, extend smallest critical fixture; no builds/Git/runtime |
+| Lead | Application integration, all manifests/ledger/Git/build/native runtime | Inspect actual parser change and source sample, schedule one relevant critical check, commit/push, matched live preparation completion with concurrent reads |
+
+DAG: retained failing filing → primary transform contract → focused parser fix/fixture → lead
+check → matching build → selected-company completion. No unknown-transform passthrough,
+zero substitution, schema migration, new branch/worktree or speculative parser rewrite.
+
+### Integrated wave — keep reads available during financial preparation
 
 Refresh base `450f4909`, clean primary branch; service 75379/Desktop 75415 confirmed live.
 Acceptance 2/5/7: concurrent market and financial reads timed out during the completed MSFT
@@ -35,6 +51,17 @@ waiting outside capture I/O passed 1/1 (0.42s). Logs:
 `concurrent-read-renewal-critical.log`. Lead inspected producer/consumer and shutdown changes;
 no CI, extra review round or whole-app RAM measurement. Matched native verification remains
 pending; the two preserved workspace roots have not been reset or migrated.
+
+Source checkpoint `970d0b56` is pushed. Matching development build completed in 6m18s;
+service 93334/Desktop 93392 restarted over the same corrected workspace. Native MSFT quote,
+profile, chart and financial facts read successfully during active TSLA preparation. All four
+financial tabs then returned successfully (Statements 4215ms, Filings 874ms, Ratios 3711ms,
+Facts 3283ms). Artifacts: `concurrent-read-msft-during-tsla-1.json`,
+`concurrent-read-msft-tabs.json`, `concurrent-read-tsla-running-after-msft.json` under
+`.agents/tmp/v1-first-stock/`. TSLA later failed on unsupported XBRL transform during acquisition;
+Company Facts publication succeeded, but full financial index preparation/completion is not
+live-proven by this run. The daily-change and public crypto runtime defects remain open.
+No full product, installed lifecycle, visual-quality or instant-response acceptance is claimed.
 
 ### Active wave — connection readiness independent of financial acquisition
 
