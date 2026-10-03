@@ -7542,9 +7542,8 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     );
     drop(split_replay);
 
-    // A complete multi-year calendar must fit the same retained budget when decoded in
-    // bounded work units, even when DataFusion returns the new binding's 2,709 rows
-    // together with the earlier retained calendar rows in one batch.
+    // Multiple original calendars share one manifest. The selected creating object must fit
+    // the unchanged budget even when a whole-generation query retains over 8,000 rows.
     let first_date = chrono::NaiveDate::from_ymd_opt(2015, 1, 1).ok_or("calendar start")?;
     let mut long_days = Vec::with_capacity(2_708);
     for offset in 0..2_708_u64 {
@@ -7574,6 +7573,38 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         date(first_date)?,
         date(last_date)?,
     )?;
+    for (index, opening) in ["14:28:00", "14:29:00"].into_iter().enumerate() {
+        let mut prior_days = long_days.clone();
+        for day in &mut prior_days {
+            let date = day["date"]
+                .as_str()
+                .ok_or("prior calendar date")?
+                .to_owned();
+            day["core_start"] = serde_json::json!(format!("{date}T{opening}Z"));
+        }
+        let prior_body = Bytes::from(serde_json::to_vec(&serde_json::json!({
+            "market": {"acronym":"IEX", "name":"IEX", "timezone":"America/New_York"},
+            "calendar": prior_days,
+        }))?);
+        let prior_at =
+            calendar_later_at.checked_add_nanos(i64::try_from(index + 1)? * 500_000_000)?;
+        let (prior_binding, _) = sealed_calendar_reobservation_fixture(
+            &capture_store,
+            &calendar_source,
+            &long_request,
+            prior_body,
+            prior_at,
+            false,
+        )?;
+        publish_calendar_reobservation_fixture(
+            &restarted,
+            &calendar_source,
+            prior_binding,
+            prior_at,
+            &format!("alpaca:calendar:large-prior-content:{index}:v1"),
+        )
+        .await?;
+    }
     let long_body = Bytes::from(serde_json::to_vec(&serde_json::json!({
         "market": {"acronym":"IEX", "name":"IEX", "timezone":"America/New_York"},
         "calendar": long_days,
@@ -7634,7 +7665,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(long_binding.record_count(), 2_709);
     assert_eq!(
         long_batch.num_rows(),
-        original_calendar.record_count() + long_binding.record_count()
+        original_calendar.record_count() + 3 * long_binding.record_count()
     );
     let mut remaining = (64 * 1024 * 1024_usize)
         .checked_sub(
@@ -7644,17 +7675,37 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         .ok_or("calendar row reservation")?;
     assert!(matches!(
         ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
-            long_batch.clone(),
+            long_batch.slice(0, 256),
             &long_binding,
             remaining,
             &CalendarReplayControl
         ),
         Err(market_squawk_data::ArrowConversionError::RetainedLimitExceeded { .. }),
     ));
+    drop(long_output);
+    let long_origin = restarted
+        .generation_owned_provider_capture_evidence(long_calendar.manifest(), &capture_store)?;
+    let [creating_object] = long_origin.objects() else {
+        return Err("expected one creating calendar object".into());
+    };
+    assert_eq!(creating_object.inputs().len(), 1);
+    assert_eq!(creating_object.inputs()[0].binding(), &long_binding);
+    assert_eq!(creating_object.object().object().row_count(), 2_709);
+    assert!(creating_object.generation_object_ordinal() > 0);
+    let mut cursor = restarted.object_store().pinned_object_batch_cursor(
+        long_origin.pinned(),
+        creating_object.object().artifact_id(),
+        creating_object.generation_object_ordinal(),
+        256,
+        64 * 1024 * 1024,
+        &CancellationToken::new(),
+    )?;
+    let read_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut decoded = Vec::with_capacity(long_binding.record_count());
-    for offset in (0..long_batch.num_rows()).step_by(256) {
+    while let Some(batch) = tokio::time::timeout_at(read_deadline, cursor.next_batch()).await?? {
+        assert!(batch.num_rows() <= 256);
         let (rows, retained) = ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
-            long_batch.slice(offset, 256.min(long_batch.num_rows() - offset)),
+            batch,
             &long_binding,
             remaining,
             &CalendarReplayControl,
@@ -7697,7 +7748,8 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         native_replay.requested_dates(),
         (date(first_date)?, date(last_date)?)
     );
-    drop(long_output);
+    drop(cursor);
+    drop(long_origin);
     drop(long_calendar);
 
     let ambiguity = rusqlite::Connection::open(location.path())?;

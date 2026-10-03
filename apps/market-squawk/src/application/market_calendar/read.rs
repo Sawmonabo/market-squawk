@@ -24,8 +24,7 @@ use chrono::{DateTime, Datelike as _, Utc};
 use chrono_tz::America::New_York;
 use market_squawk_adapter_alpaca::{AlpacaAuthenticatedCalendarRequest, AlpacaCalendarMarket};
 use market_squawk_data::{
-    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadLimit,
-    DatasetId, DatasetManifestRef, QueryLimits, QueryResult, ResearchArrowBatch, Sha256Digest,
+    AnalyticalReadLimit, DatasetId, DatasetManifestRef, ResearchArrowBatch, Sha256Digest,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, MarketCalendarCompleteness,
@@ -42,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 const MAXIMUM_ORIGIN_CANDIDATES: usize = 64;
 const MAXIMUM_CALENDAR_QUERY_ROWS: u64 = 100_000;
 const MAXIMUM_CALENDAR_QUERY_BYTES: u64 = 64 * 1024 * 1024;
-// Bound transient projection reconstruction independently of the query engine's batch size.
+// Bound physical decoding and transient projection reconstruction before retaining Arrow rows.
 const CALENDAR_DECODE_CHUNK_ROWS: usize = 256;
 
 /// Public references retain only immutable content commitments. They contain no provider choice,
@@ -772,49 +771,46 @@ async fn read_calendar_origin(
                     binding.clone(),
                     generation.published_at(),
                     retained_metadata,
+                    generation.pinned().clone(),
+                    generation.objects()[0].object().artifact_id(),
+                    generation.objects()[0].generation_object_ordinal(),
                 )))
             },
         )
         .await
         .inspect_err(|error| calendar_worker_failure("calendar-origin-coordinates", error))
         .map_err(|_| controlled_error(deadline, cancellation))?;
-    let Some((binding, published_at, retained_metadata)) = coordinates else {
+    let Some((binding, published_at, retained_metadata, pinned, artifact_id, object_ordinal)) =
+        coordinates
+    else {
         return Ok(None);
     };
     let capture = binding.capture();
     if capture.pages().len() != 1 {
         return Err(CompletedMarketSessionError::InvalidEvidence);
     }
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(CompletedMarketSessionError::DeadlineExceeded)?;
-    let limits = QueryLimits::try_new_with_inline_bytes(
-        MAXIMUM_CALENDAR_QUERY_ROWS,
-        MAXIMUM_CALENDAR_QUERY_BYTES,
-        MAXIMUM_CALENDAR_QUERY_BYTES,
-        256 * 1024 * 1024,
-        2,
-        512,
-        512,
-        remaining.min(Duration::from_secs(60)),
-    )
-    .map_err(invalid)?;
-    let request = AnalyticalObservationReadRequest::try_new(
-        manifest.clone(),
-        AnalyticalObservationTemplate::MarketCalendar,
-        Vec::new(),
-        None,
-    )
-    .map_err(invalid)?;
-    let output = research
-        .analytical_reader()
-        .read_observations(request, limits, deadline, cancellation.clone())
-        .await
-        .inspect_err(|error| calendar_read_failure("calendar-origin-observation-read", error))
-        .map_err(|_| controlled_error(deadline, cancellation))?;
-    let QueryResult::Inline { batches, .. } = output.output().result() else {
+    if u64::try_from(binding.record_count()).map_err(invalid)? > MAXIMUM_CALENDAR_QUERY_ROWS {
         return Err(CompletedMarketSessionError::ResourceBoundExceeded);
-    };
+    }
+    let read_deadline = deadline.min(
+        Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?,
+    );
+    // The verified creating output excludes inherited calendar objects. Read fresh bounded
+    // batches from that exact object; slicing a whole-generation query retains its buffers.
+    let mut cursor = research
+        .analytical()
+        .object_store()
+        .pinned_object_batch_cursor(
+            &pinned,
+            artifact_id,
+            object_ordinal,
+            CALENDAR_DECODE_CHUNK_ROWS,
+            MAXIMUM_CALENDAR_QUERY_BYTES as usize,
+            cancellation,
+        )
+        .map_err(calendar_cursor_error)?;
     let mut remaining_read_bytes = (MAXIMUM_CALENDAR_QUERY_BYTES as usize)
         .checked_sub(
             binding
@@ -830,73 +826,78 @@ async fn read_calendar_origin(
         deadline,
         cancellation,
     };
-    for batch in batches {
-        // Slices share the query's buffers. The decoder still charges those backing arrays;
-        // only per-row decoding/reconstruction becomes bounded by this smaller work unit.
-        for offset in (0..batch.num_rows()).step_by(CALENDAR_DECODE_CHUNK_ROWS) {
-            check(deadline, cancellation)?;
-            let chunk_rows = CALENDAR_DECODE_CHUNK_ROWS.min(batch.num_rows() - offset);
-            let (records, retained_bytes) =
-                ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
-                    batch.slice(offset, chunk_rows),
-                    &binding,
-                    remaining_read_bytes,
-                    &control,
-                )
-                .map_err(|error| {
-                    // ArrowConversionError Display exposes fixed variants and numeric bounds only.
-                    tracing::warn!(
-                        stage = "calendar-origin-row-decode",
-                        error = %error,
-                        batch_rows = batch.num_rows(),
-                        chunk_offset = offset,
-                        chunk_rows,
-                        remaining_bytes = remaining_read_bytes,
-                        binding = %encode_digest(binding.binding_digest()),
-                        "completed market calendar row decoding failed"
-                    );
-                    use market_squawk_data::ArrowConversionError;
-                    use market_squawk_platform::ResearchObjectControlError;
-                    match error {
-                        ArrowConversionError::RetainedLimitExceeded { .. }
-                        | ArrowConversionError::RetainedSizeOverflow
-                        | ArrowConversionError::AllocationFailure => {
-                            CompletedMarketSessionError::ResourceBoundExceeded
-                        }
-                        ArrowConversionError::ObjectControl(
-                            ResearchObjectControlError::Cancelled,
-                        ) => CompletedMarketSessionError::Cancelled,
-                        ArrowConversionError::ObjectControl(
-                            ResearchObjectControlError::DeadlineExceeded,
-                        ) => CompletedMarketSessionError::DeadlineExceeded,
-                        _ => CompletedMarketSessionError::InvalidEvidence,
+    loop {
+        check(read_deadline, cancellation)?;
+        let batch = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(read_deadline),
+            cursor.next_batch(),
+        )
+        .await
+        .map_err(|_| CompletedMarketSessionError::DeadlineExceeded)?
+        .map_err(calendar_cursor_error)?;
+        let Some(batch) = batch else {
+            break;
+        };
+        let batch_rows = batch.num_rows();
+        let (records, retained_bytes) =
+            ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
+                batch,
+                &binding,
+                remaining_read_bytes,
+                &control,
+            )
+            .map_err(|error| {
+                // ArrowConversionError Display exposes fixed variants and numeric bounds only.
+                tracing::warn!(
+                    stage = "calendar-origin-row-decode",
+                    error = %error,
+                    batch_rows,
+                    remaining_bytes = remaining_read_bytes,
+                    binding = %encode_digest(binding.binding_digest()),
+                    "completed market calendar row decoding failed"
+                );
+                use market_squawk_data::ArrowConversionError;
+                use market_squawk_platform::ResearchObjectControlError;
+                match error {
+                    ArrowConversionError::RetainedLimitExceeded { .. }
+                    | ArrowConversionError::RetainedSizeOverflow
+                    | ArrowConversionError::AllocationFailure => {
+                        CompletedMarketSessionError::ResourceBoundExceeded
                     }
-                })?;
-            remaining_read_bytes = remaining_read_bytes
-                .checked_sub(retained_bytes)
-                .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?;
-            for (ordinal, record) in records {
-                check(deadline, cancellation)?;
-                let ResearchObservation::MarketCalendar(calendar) = record else {
-                    return Err(calendar_invalid("calendar-origin-row-type"));
-                };
-                let provenance = calendar.context().provenance();
-                if provenance.received_at() > as_of
-                    || provenance.ingested_at() > as_of
-                    || provenance.ingested_at() > published_at
-                    || calendar.observed_at() > as_of
-                    || provenance
-                        .availability()
-                        .conservative_available_at()
-                        .is_none_or(|available| available > as_of)
-                    || rows.len() >= binding.record_count()
-                {
-                    return Err(calendar_invalid("calendar-origin-row-clock-or-count"));
+                    ArrowConversionError::ObjectControl(ResearchObjectControlError::Cancelled) => {
+                        CompletedMarketSessionError::Cancelled
+                    }
+                    ArrowConversionError::ObjectControl(
+                        ResearchObjectControlError::DeadlineExceeded,
+                    ) => CompletedMarketSessionError::DeadlineExceeded,
+                    _ => CompletedMarketSessionError::InvalidEvidence,
                 }
-                rows.push((ordinal, calendar));
+            })?;
+        remaining_read_bytes = remaining_read_bytes
+            .checked_sub(retained_bytes)
+            .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?;
+        for (ordinal, record) in records {
+            check(deadline, cancellation)?;
+            let ResearchObservation::MarketCalendar(calendar) = record else {
+                return Err(calendar_invalid("calendar-origin-row-type"));
+            };
+            let provenance = calendar.context().provenance();
+            if provenance.received_at() > as_of
+                || provenance.ingested_at() > as_of
+                || provenance.ingested_at() > published_at
+                || calendar.observed_at() > as_of
+                || provenance
+                    .availability()
+                    .conservative_available_at()
+                    .is_none_or(|available| available > as_of)
+                || rows.len() >= binding.record_count()
+            {
+                return Err(calendar_invalid("calendar-origin-row-clock-or-count"));
             }
+            rows.push((ordinal, calendar));
         }
     }
+    check(deadline, cancellation)?;
     rows.sort_unstable_by_key(|(ordinal, _)| *ordinal);
     if rows.len() != binding.record_count()
         || rows
@@ -939,6 +940,32 @@ async fn read_calendar_origin(
 fn calendar_invalid(stage: &'static str) -> CompletedMarketSessionError {
     tracing::warn!(stage, "completed market calendar evidence invalid");
     CompletedMarketSessionError::InvalidEvidence
+}
+
+fn calendar_cursor_error(
+    error: market_squawk_data::ParquetStoreError,
+) -> CompletedMarketSessionError {
+    use market_squawk_data::ParquetStoreError;
+    let (failure, result) = match error {
+        ParquetStoreError::Cancelled => ("cancelled", CompletedMarketSessionError::Cancelled),
+        ParquetStoreError::ReadDeadlineExceeded | ParquetStoreError::RecoveryDeadlineExceeded => (
+            "deadline-exceeded",
+            CompletedMarketSessionError::DeadlineExceeded,
+        ),
+        ParquetStoreError::ReadLimitExceeded
+        | ParquetStoreError::SizeOverflow
+        | ParquetStoreError::BlockingTaskLimitExceeded => (
+            "resource-limit",
+            CompletedMarketSessionError::ResourceBoundExceeded,
+        ),
+        _ => ("object-read", CompletedMarketSessionError::InvalidEvidence),
+    };
+    tracing::warn!(
+        stage = "calendar-origin-object-read",
+        failure,
+        "completed market calendar read failed"
+    );
+    result
 }
 
 fn calendar_read_failure(stage: &'static str, error: &market_squawk_data::AnalyticalReadError) {

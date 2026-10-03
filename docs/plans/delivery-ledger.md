@@ -12,17 +12,22 @@ existing exact lookup/financial/history journey PASS1/1. Native AAPL opening act
 financial preparation job without a Load action; it subsequently failed SEC XBRL acquisition.
 A successful start is not populated financial information.
 
-**Current integration:** exact-object calendar reader and existing accumulated-calendar regression
-are uncommitted pending the matched app build. Data regression PASS1/1,19.22s:8,130 inherited rows,
-only2,709 selected-original rows decoded via the existing bounded cursor. The old running
-service86277/Desktop86311 remain available during the single scheduled build. Lead owns source
-integration/build/Git; all implementation-agent ownership is released.
+**Calendar checkpoint:** existing accumulated-calendar regression PASS1/1 (19.22s):8,130
+inherited rows, only2,709 selected-original rows decoded through the existing bounded cursor.
+Matched Desktop/service build PASS (5m17s); service2667/Desktop2701 are running. The original
+MSFT workflow advanced from9 to10 completed preparation steps and now stops at exact option
+identity admission, with no calendar budget failure in this attempt. It still has zero saved results.
+Native evidence: `.agents/tmp/v1-first-stock/calendar-object-status.json`; log lines254932–254976
+in `prepared-financial-dev-after-restart.log`. This is partial workflow verification, not completion.
 
-**Concrete blockers:** original MSFT workflow remains without a saved result; calendar read exceeded
-its budget because it materialized inherited objects. Calendar correction needs actual saved-workflow
-verification. AAPL acquisition fails `InvalidTaxonomySet`; read-only diagnosis located standard
-XBRL linkbase role names incorrectly missing the `Ref` suffix in the parser/fixture. Workspace
-construction still measures about28seconds; full screen/data/loading completion remains open.
+**Current integration:** Astra `options_original_recovery` corrects standard SEC linkbase roles
+in the single assigned parser/test file; lead owns critical checks, runtime and Git. The watcher
+is temporarily stopped to serialize edits and verification; the current app remains available.
+
+**Concrete blockers:** original MSFT analysis now fails exact canonical option identity admission.
+AAPL financial acquisition rejects standard XBRL linkbase role names because the parser/fixture
+omit the `Ref` suffix. Workspace construction still takes about28seconds; full screen/data/loading
+completion remains open.
 
 **Owner-requested architecture research:** [saved-analysis storage recommendation](../research/2026-10-02-saved-analysis-storage.md)
 compares current journal/replay with direct SQLite result reads, existing analytical artifacts,
@@ -32,6 +37,20 @@ recorded gaps. Research is independently reviewable and does not imply final per
 
 Full V1, installed lifecycle, remaining provider/analytical workflows and final resource acceptance
 remain incomplete. No full CI or RAM gate. Preserve the existing active unmerged DependabotPR55 branch.
+
+### Active wave — calendar integration and standard filing roles
+
+Acceptance2/5: native calendar build completed (service2667/Desktop2701); lead verifies the
+original MSFT workflow and owns calendar files, Git, runtime and all builds. The existing data
+regression already passes. Watcher is temporarily stopped for serialized verification.
+
+Astra `options_original_recovery` owns only
+`adapters/market-squawk-adapter-sec/src/xbrl/model.rs`: correct the five standard LinkbaseRef
+URI literals and the existing mixed-source graph fixture, retaining strict source/graph admission.
+Dependency: retained AAPL schema diagnosis and XBRL2.1 §4.3.4 Table2. Critical check: existing
+`captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation`; lead schedules it,
+then integrates the matched service and retries the original AAPL preparation. No new test target,
+compatibility aliases, builds or Git by the agent. Calendar and SEC edits have disjoint ownership.
 
 ### Active wave — lifecycle recovery and measured startup
 
