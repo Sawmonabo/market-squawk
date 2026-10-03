@@ -2,7 +2,7 @@ import * as React from "react"
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import { productKeys, snapshotQueryMeta } from "@/app/query-client"
-import { Button } from "@/components/ui/button"
+import { RefreshButton } from "@/components/ui/refresh-button"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -128,7 +128,7 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
         <p role="alert" className="text-destructive">{result?.data
           ? "Price history could not be updated. Showing saved prices, which may be out of date."
           : "Price history could not be loaded. Try again."}</p>
-        <Button variant="outline" size="sm" disabled={busy} onClick={() => void history.refetch()}>Retry</Button>
+        <RefreshButton label="Retry price history" refreshing={busy} onClick={() => void history.refetch()} />
       </div> : showReadStatus ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating prices… Showing saved prices." : "Loading prices…"}</p> : null}
     </div>
     {selectedBar !== null && result?.data ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${result.data.generationToken}`}
@@ -169,7 +169,7 @@ function OriginalMarketBarRead({ bar, historyToken, generationToken, bootstrap, 
   return <div className="mt-4 rounded-lg border border-border p-3 text-xs">
     <p className="font-medium">Exact original price observation</p>
     {original.isPending ? <p role="status" className="mt-2 text-muted-foreground">Checking saved evidence…</p>
-      : original.isError ? <p role="alert" className="mt-2 text-destructive">The saved observation could not be verified. <Button size="xs" variant="outline" onClick={() => void original.refetch()}>Retry</Button></p>
+      : original.isError ? <p role="alert" className="mt-2 text-destructive">The saved observation could not be verified. <RefreshButton label="Retry price observation" refreshing={original.isFetching} onClick={() => void original.refetch()} /></p>
         : <dl className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">{([['Open', original.data.open], ['High', original.data.high], ['Low', original.data.low], ['Close', original.data.close], ['Volume', original.data.volume]] as const).map(([label, value]) => <div key={label}><dt className="text-muted-foreground">{label}</dt><dd className="mt-1 font-mono">{value}</dd></div>)}</dl>}
   </div>
 }
