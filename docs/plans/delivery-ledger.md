@@ -4,6 +4,23 @@
 
 ### Integrated correction — return committed option identities to their consumer
 
+Source `57ac6639` is pushed. Matching development build passed in 6m06s; service/Desktop
+83359/83420 replaced the prior pair through the coordinated launcher. Native reopening retained
+the same paused workflow. Resume was accepted, then paused again at three steps before option
+acquisition: startup reports Alpaca source lifecycle authority unavailable, zero saved live
+connections restored, and repeated pending lifecycle recovery unavailable. The new option consumer
+has therefore **not yet been exercised live**. Keep the failed predecessor and originals intact;
+no additional workspace reset is authorized or needed to hide this failure. Artifacts:
+`option-committed-{matched-status,native-resume,native-progress}.json`; PR #43 comment 5968480536.
+
+Next bounded diagnosis (acceptance 1/2/7): Astra High `stock_preparation_deadline` owns only
+`.agents/tmp/v1-first-stock/alpaca-restart-lifecycle.md`, read-only trace of the persisted pending
+transition through restart and the exact guard behind `reconnect.rs:96`. No source/build/Git,
+provider requests or database mutations. Lead owns all source and native recovery inspection.
+DAG: preserved pending transition → exact replay/recovery rejection → narrow canonical correction
+→ critical restart check → same-workflow continuation. Live-frame normalized retry remains a
+separate known defect, not an excuse to reset the pending lifecycle.
+
 Base `b26736d2`. Acceptance 1/2/6/7: the sampled option worker performs synchronous catalog
 searches for every just-published contract and ignores group cancellation inside that loop,
 preventing retained shutdown from joining. Reuse the committed records the writer already creates.
