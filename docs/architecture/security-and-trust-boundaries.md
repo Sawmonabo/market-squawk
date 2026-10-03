@@ -1,7 +1,7 @@
 # Security and Trust Boundaries
 
 Market Squawk is self-hosted, but local does not mean trusted. Provider responses, imported files,
-model artifacts, desktop/CLI/MCP requests, browser-originated onboarding requests, persisted state,
+model artifacts, desktop/CLI/MCP requests, provider OAuth callbacks, persisted state,
 and execution intent all cross explicit validation or authority boundaries before they can affect
 durable state or an order adapter.
 
@@ -10,8 +10,7 @@ durable state or an order adapter.
 | Document type | Security architecture explanation |
 | Audience | Maintainers, security reviewers, operators, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-09-30 (credential access); other boundaries 2026-08-03 |
 
 ## Contents
 
@@ -37,11 +36,12 @@ central risk, local desktop/CLI/MCP presentations, controlled artifacts, audit, 
 
 It does not claim:
 
-- that inherited stdio authenticates an MCP peer;
+- that inherited stdio authenticates an MCP peer, or that a loopback listener authenticates a
+  request by locality alone;
 - that an ordinary local process can defend against a fully compromised operating-system account,
   kernel, compiler, or hardware;
 - that a digest alone establishes who authored content;
-- that loopback binding replaces host/origin/session/CSRF and request-bound checks;
+- that loopback binding replaces authentication, host/origin, and request-bound checks;
 - that an archived `DirectVerified` value is a bearer credential; or
 - that a fair-value classification, market-depth level, or healthy connection grants execution
   authority.
@@ -88,8 +88,7 @@ flowchart LR
     subgraph Entry["Bounded entry surfaces"]
         Desktop["Bundled WebView and closed Tauri bridge"]
         CLI["CLI transport"]
-        MCP["MCP stdio transport<br/>peer identity recorded as unverified"]
-        Portal["Ephemeral IPv4 loopback onboarding portal"]
+        MCP["Named MCP stdio relay and<br/>authenticated loopback MCP route"]
         Parser["Source decoders and extraction parsers"]
         ModelAdmission["Controlled model and runtime admission"]
     end
@@ -98,7 +97,7 @@ flowchart LR
         App["Application services<br/>closed descriptors, bounds, cancellation, deadlines"]
         Onboarding["Provider onboarding service<br/>session and credential workflow"]
         Activation["Provider activation authority<br/>adapter-specific durable activation"]
-        Secrets["Current secret authority<br/>OS keyring-backed"]
+        Secrets["Current secret authority<br/>managed vault and optional OS-remembered access"]
         Source["Authoritative source registry<br/>rights, metadata, coverage, session, capture"]
         Live["Instrument-owned live shards<br/>integrity, quality, process-local capability"]
         Research["Research authority<br/>catalog, manifests, publication, point-in-time"]
@@ -120,8 +119,7 @@ flowchart LR
 
     Operator -->|typed arguments| CLI
     DesktopUser -->|local interaction| Desktop
-    Client -->|bounded JSON-RPC frames| MCP
-    Operator -->|host, origin, session, CSRF, bounded body| Portal
+    Client -->|bounded stdio frame and named credential| MCP
     Providers -->|untrusted bounded bytes| Parser
     Files -->|untrusted bounded bytes| Parser
     Files -->|untrusted bundle/runtime bytes| ModelAdmission
@@ -129,9 +127,7 @@ flowchart LR
     Desktop -->|read-only bounded operation| App
     Desktop -->|confirmed provider workflow| Onboarding
     Desktop -->|confirmed provider workflow| Activation
-    MCP -->|admitted operation| App
-    Portal -->|session and credential request| Onboarding
-    Portal -->|verified activation request| Activation
+    MCP -->|authenticated bounded operation| App
     Onboarding -->|generation-bound credential operation| Secrets
     Activation -->|provider-specific activation| Source
     Parser -->|validated candidate plus evidence| Source
@@ -192,12 +188,21 @@ Credential material is not ordinary configuration:
   catalog-safe metadata.
 - Creation, read, replacement, and deletion use exact generations. Replacement does not silently
   erase the current generation before the candidate is known.
-- The reviewed `LocalProduct` composes the operating-system keyring first and a code-owned,
-  initially locked encrypted-file fallback. Only an explicit foreground loopback-portal operation
-  can submit the fallback unlock; configuration, environment, command arguments, disk, and
-  background restart cannot.
-- A new secret can use the unlocked fallback only after the primary backend proves unavailable or
-  unable to provide the exact lifecycle.
+- `LocalProduct` and installed-service credential storage use `AccessControlledSecretStore`.
+  New credential generations use the managed encrypted vault. Automatic access is the default:
+  a separately generated random unlock is retained in private local authority state, allowing
+  saved credentials to reopen across service restarts and development rebuilds. No default
+  password is embedded, and user passwords are never stored in that filesystem authority.
+- Application locking is an explicit Settings choice. Enabling it rotates out the automatic
+  unlock; optional remembering stores the user unlock in the OS credential store. Startup reads
+  remembered access without permission to display a platform prompt. Explicit Lock and a
+  user-selected reauthentication deadline require fresh authentication even after restart;
+  no deadline is imposed by default. Forget removes remembered access without deleting provider
+  credentials or ending the current unlocked session.
+- Lock seals new credential reads and drains credential-bearing runtimes before reporting a
+  completed lock. Saved-data services and ordinary screens remain available. Unlock resumes
+  retained connection recovery; paper trading requires a new explicit start. Provider OAuth
+  expiry, revocation and key replacement remain separate, connection-specific recovery.
 - Once a reference exists, its backend is authoritative. The router does not probe another backend
   with that reference or copy secret bytes between stores.
 - Interaction policy distinguishes a forbidden prompt from an explicitly permitted
@@ -206,10 +211,19 @@ Credential material is not ordinary configuration:
   when cancellation or expiry is observed, the result is `IndeterminateCompletion`, not a false
   rollback claim.
 
-The onboarding portal binds only an ephemeral IPv4 loopback port. It additionally validates host
-and origin, uses independently generated session and CSRF tokens, limits lifetime, connections,
-requests, body sizes, and request duration, and cancels in-flight work on shutdown. Loopback is one
-control, not the sole control.
+An older password vault may require its original unlock once before automatic access can be
+adopted; unavailable unlock authority never authorizes replacing its saved credential generations.
+Installed native OS remembering and restart verification are evidence claims maintained in the
+[delivery ledger](../plans/delivery-ledger.md), separate from these source-defined controls.
+
+Native onboarding requires the exact installed Desktop client and current workspace before the
+existing service can touch session, credential, or activation authority. Selected credential-file
+input is identity-checked and staged by the native picker; file values never enter the WebView.
+Private staged activation separately admits only the exact installed CLI client and four closed
+secret-free action classes. Ordinary MCP mutation access cannot inherit either authority.
+
+There is no local setup website. Provider OAuth retains its bounded callback transport only for
+its actual authorization protocol; callback traffic cannot invoke generic setup or secret import.
 
 ## Source and parser authority
 
@@ -294,19 +308,26 @@ alternate constructor or direct submission path.
 
 ## Desktop, CLI, MCP, artifacts, and audit
 
-Desktop, CLI, and MCP share the same lifecycle-owned `Application` and its complete set of eleven
-domain services. Each generic operation is defined by a closed descriptor and admitted before
-dispatch to a domain service. Services own their financial, persistence, and authority invariants;
-presentations own rendering, framing, and their stricter local limits.
+The per-user service owns `LocalProduct`, durable jobs, lifecycle, and `Application`; Desktop, CLI,
+and MCP clients use that one service rather than composing competing domain owners. Each generic
+operation is defined by a closed descriptor and admitted before dispatch to a domain service.
+Services own their financial, persistence, and authority invariants; presentations own rendering,
+framing, and their stricter local limits.
 
-The desktop loads bundled assets under a strict CSP. Its window capability grants five closed
-commands: bootstrap, read-only application invocation, confirmed provider onboarding, exact
-official-provider page opening, and validated protected-setup opening. Credential fields remain
-write-only presentation state and are cleared after submission.
+The desktop loads bundled assets under a strict CSP. Its window capability grants closed
+presentation commands for typed reads and confirmed actions, including native provider onboarding
+and explicit official-provider page opening. Credential fields remain write-only presentation
+state and are cleared after submission. Saved credentials are resolved only by the installed owner
+and are never returned to the Desktop.
 
-The production MCP server:
+The production MCP route:
 
-- uses inherited local stdio and honestly records the peer identity as unverified;
+- binds only to the service's loopback endpoint and requires a named-client credential, expected
+  Host, and an allowlisted or absent Origin before dispatch;
+- uses a named stdio relay as client compatibility transport; the relay has no product authority
+  beyond reading its own credential and forwarding one bounded exchange;
+- validates the selected Streamable HTTP protocol, request metadata, method, media type, body,
+  deadline, and client scope before handler dispatch;
 - incrementally bounds frames and JSON structure before service execution;
 - bounds active request count, aggregate body/result memory, writer queues, inline results,
   progress, deadlines, and shutdown;
@@ -372,6 +393,8 @@ publication contexts are process-local and must be newly admitted.
 - [ADR 0002: Evidence-derived execution quality](decisions/0002-evidence-derived-execution-quality.md)
 - [ADR 0005: Central risk and execution authority](decisions/0005-central-risk-and-execution-authority.md)
 - [Secret-store contracts](../../crates/market-squawk-platform/src/secrets.rs)
+- [Automatic and optional credential access](../../crates/market-squawk-platform/src/secrets/access.rs)
+- [Credential runtime drain and resume](../../apps/market-squawk/src/local_product/credential_access.rs)
 - [Controlled local paths and artifacts](../../crates/market-squawk-platform/src/paths.rs)
 - [Authoritative source registry](../../crates/market-squawk-sources/src/registry/catalog.rs)
 - [Live execution capability](../../crates/market-squawk-live/src/authority.rs)
@@ -382,7 +405,8 @@ publication contexts are process-local and must be newly admitted.
 - [Execution adapter boundary](../../crates/market-squawk-execution/src/adapter.rs)
 - [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Desktop window capability](../../apps/market-squawk-desktop/src-tauri/capabilities/main.json)
-- [MCP server and limits](../../crates/market-squawk-mcp/src/server.rs)
+- [Installed service and route admission](../../apps/market-squawk/src/service/mod.rs)
+- [MCP relay](../../crates/market-squawk-mcp/src/relay.rs)
 - [Production MCP audit sink](../../apps/market-squawk/src/mcp/audit.rs)
 - [Provider activation evidence validation](../research/2026-07-23-provider-activation-evidence-validation.md)
 - [Delivery ledger](../plans/delivery-ledger.md)
@@ -395,9 +419,9 @@ defines Market Squawk's current controls.
 | Source | Relevance | Reviewed |
 | --- | --- | --- |
 | [OWASP threat-modeling guidance](https://owasp.org/www-project-security-culture/stable/6-Threat_Modelling/) | Uses data-flow diagrams and trust boundaries to identify where data changes trust level | 2026-07-23 |
-| [Model Context Protocol transports specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) | Defines stdio transport responsibilities and process-bound message exchange | 2026-07-23 |
-| [Model Context Protocol security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices) | Documents MCP-specific request, credential, and trust threats | 2026-07-23 |
-| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped command permissions for the desktop presentation boundary | 2026-07-28 |
+| [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) | Defines the stateless loopback request transport and Host/Origin protections used by the shared service | 2026-08-03 |
+| [MCP security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices) | Documents MCP-specific request, credential, and trust threats | 2026-08-03 |
+| [Tauri capabilities](https://github.com/tauri-apps/tauri-docs/blob/ed68dc003ed3ff777b5aa7398b11386412a60bf3/src/content/docs/security/capabilities.mdx) | Defines window-scoped command permissions for the desktop presentation boundary | 2026-08-03 |
 | [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the bundled WebView content policy used to restrict desktop content loading | 2026-07-28 |
 | [FASB ASU 2011-04, Fair Value Measurement (Topic 820)](https://fasb.org/page/document?pdf=ASU2011-04.pdf&title=UPDATE+NO.+2011-04%E2%80%94FAIR+VALUE+MEASUREMENT+%28TOPIC+820%29%3A+AMENDMENTS+TO+ACHIEVE+COMMON+FAIR+VALUE+MEASUREMENT+AND+DISCLOSURE+REQUIREMENTS+IN+U.S.+GAAP+AND+IFRSS) | Establishes the accounting fair-value framework that remains separate from market-data execution authority | 2026-07-23 |
 | [IFRS 13 Fair Value Measurement](https://www.ifrs.org/issued-standards/list-of-standards/ifrs-13-fair-value-measurement/) | Defines fair value and the input hierarchy independently of delivery quality and execution eligibility | 2026-07-23 |

@@ -3,7 +3,9 @@
 use std::str::FromStr as _;
 
 use libfuzzer_sys::fuzz_target;
-use market_squawk_adapter_kraken::{KrakenDecoder, KrakenDepth};
+use market_squawk_adapter_kraken::{
+    KrakenChannel, KrakenDecoder, KrakenDepth, KrakenNativeMarketCoordinates,
+};
 use market_squawk_domain::InstrumentId;
 
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -20,15 +22,26 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     if selector & 1 == 0 {
-        let Ok(mut decoder) = KrakenDecoder::try_new("BTC/USD", instrument, KrakenDepth::Ten)
-        else {
+        let Ok(coordinates) = KrakenNativeMarketCoordinates::diagnostic_decoder_fixture(
+            instrument,
+            KrakenChannel::Book(KrakenDepth::Ten),
+        ) else {
+            return;
+        };
+        let Ok(mut decoder) = KrakenDecoder::try_new(coordinates, KrakenDepth::Ten) else {
             return;
         };
         feed_frames(payload, |frame| {
             let _outcome = decoder.decode_payload(frame);
         });
     } else {
-        let Ok(mut decoder) = KrakenDecoder::try_trades("BTC/USD", instrument) else {
+        let Ok(coordinates) = KrakenNativeMarketCoordinates::diagnostic_decoder_fixture(
+            instrument,
+            KrakenChannel::Trades,
+        ) else {
+            return;
+        };
+        let Ok(mut decoder) = KrakenDecoder::try_trades(coordinates) else {
             return;
         };
         feed_frames(payload, |frame| {

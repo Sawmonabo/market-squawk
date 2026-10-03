@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use market_squawk_analytics::{FeatureValidity, RequiredLiveFeature};
 use market_squawk_live::{
-    LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigInput, LiveRuntimeHealthKind,
+    CommittedResearchMarketBatchOutcome, LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigInput,
+    LiveRuntimeExportPlan, LiveRuntimeHealthKind, RouteCommittedResearchMarketExport,
     ShardShutdownStatus, StreamPhaseSnapshot,
 };
 use tokio_util::sync::CancellationToken;
@@ -43,7 +44,7 @@ fn rejection_runtime_config(
             .maximum_venues_per_cross_venue_instrument()
             .get(),
         maximum_feature_snapshot_bytes: base.maximum_feature_snapshot_bytes().get(),
-        maximum_action_hook_bytes_per_route: base.maximum_action_hook_bytes_per_route().get(),
+        maximum_action_hook_bytes_per_route: base.maximum_action_hook_bytes_per_route(),
         registration_control_capacity: base.registration_control_capacity().get(),
         registration_deadline: base.registration_deadline(),
         health_event_capacity: base.health_event_capacity().get(),
@@ -74,20 +75,63 @@ async fn bind(
 #[tokio::test(flavor = "current_thread")]
 async fn rejected_first_observation_is_quarantined_without_killing_other_routes_or_shutdown()
 -> TestResult {
-    let mut runtime = LiveRuntime::start(
+    let (export, mut terminal_batches) =
+        RouteCommittedResearchMarketExport::try_new(route(INSTRUMENT_ONE)?, 1, 4 * 1024 * 1024)?;
+    let mut runtime = LiveRuntime::start_with_exports(
         rejection_runtime_config(4, 4, 1)?,
         vec![route_config(INSTRUMENT_ONE)?, route_config(INSTRUMENT_TWO)?],
+        LiveRuntimeExportPlan::new(Vec::new(), vec![export]),
     )
     .await?;
-    let mut rejected_source = SourceHarness::try_new("rejected-source", 1, INSTRUMENT_ONE)?;
+    let mut rejected_source = SourceHarness::try_new_with_quality(
+        "rejected-source",
+        1,
+        INSTRUMENT_ONE,
+        market_squawk_domain::DataQuality::DirectUnverified,
+    )?;
     let mut healthy_source = SourceHarness::try_new("healthy-source", 1, INSTRUMENT_TWO)?;
     let rejected_ingress = bind(&runtime, &rejected_source, INSTRUMENT_ONE).await?;
     let healthy_ingress = bind(&runtime, &healthy_source, INSTRUMENT_TWO).await?;
     let (_, rejected) = rejected_source.batch_with_price("inexact-price", 1, "100.001")?;
     let (_, healthy) = healthy_source.batch("healthy-trade", 1)?;
 
-    rejected_ingress.try_publish(rejected)?;
     healthy_ingress.try_publish(healthy)?;
+
+    let healthy_key = route(INSTRUMENT_TWO)?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = runtime.snapshots().try_load_all()?;
+            let healthy = snapshot
+                .snapshots()
+                .flat_map(|shard| shard.routes())
+                .find(|candidate| candidate.route() == &healthy_key)
+                .and_then(|route| route.streams().first())
+                .is_some_and(|stream| {
+                    stream.phase() == StreamPhaseSnapshot::Healthy && stream.generation_current()
+                });
+            if healthy {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            drop(snapshot);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+
+    let original_evidence = rejected.observations()[0].evidence().clone();
+    rejected_ingress.try_publish(rejected)?;
+    let terminal = tokio::time::timeout(Duration::from_secs(1), terminal_batches.recv())
+        .await?
+        .ok_or("rejected research batch did not emit terminal coverage")?;
+    let (coordinates, outcome) = terminal.into_parts();
+    assert_eq!(coordinates.evidence(), &original_evidence);
+    assert_eq!(coordinates.row_count(), 1);
+    assert_eq!(coordinates.wire_ordinals(), &[0]);
+    assert!(matches!(
+        outcome,
+        CommittedResearchMarketBatchOutcome::Rejected
+    ));
+    assert!(terminal_batches.try_recv().is_err());
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -102,7 +146,6 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
     .await?;
 
     let rejected_key = route(INSTRUMENT_ONE)?;
-    let healthy_key = route(INSTRUMENT_TWO)?;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let snapshot = runtime.snapshots().try_load_all()?;
@@ -120,7 +163,9 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
                 && rejected_route.streams().len() == 1
                 && healthy_route.streams().len() == 1
                 && rejected_route.streams()[0].phase() == StreamPhaseSnapshot::Quarantined
+                && !rejected_route.streams()[0].generation_current()
                 && healthy_route.streams()[0].phase() == StreamPhaseSnapshot::Healthy
+                && healthy_route.streams()[0].generation_current()
             {
                 return Ok::<_, Box<dyn std::error::Error>>(());
             }
@@ -220,19 +265,54 @@ async fn wait_for_feature_validity(
 
 #[tokio::test(flavor = "current_thread")]
 async fn snapshot_event_trigger_skips_intermediate_prefix_of_successful_batch() -> TestResult {
-    let runtime = LiveRuntime::start(
+    let (export, mut terminal_batches) =
+        RouteCommittedResearchMarketExport::try_new(route(INSTRUMENT_ONE)?, 1, 4 * 1024 * 1024)?;
+    let runtime = LiveRuntime::start_with_exports(
         rejection_runtime_config(4, 4, 2)?,
         vec![route_config(INSTRUMENT_ONE)?],
+        LiveRuntimeExportPlan::new(Vec::new(), vec![export]),
     )
     .await?;
-    let mut source = SourceHarness::try_new("batched-source", 1, INSTRUMENT_ONE)?;
+    let mut source = SourceHarness::try_new_with_quality(
+        "batched-source",
+        1,
+        INSTRUMENT_ONE,
+        market_squawk_domain::DataQuality::DirectUnverified,
+    )?;
     let ingress = bind(&runtime, &source, INSTRUMENT_ONE).await?;
     let (_, batch) = source.batch_many(&[
         ("trade-1", 1, "100.00"),
         ("trade-2", 2, "100.01"),
         ("trade-3", 3, "100.02"),
+        ("trade-4", 4, "100.03"),
+        ("trade-5", 5, "100.04"),
+        ("trade-6", 6, "100.05"),
+        ("trade-7", 7, "100.06"),
     ])?;
+    let original_evidence = batch.observations()[0].evidence().clone();
     ingress.try_publish(batch)?;
+    // One channel slot must hold the whole seven-row result; there is no concurrent row drain.
+    let terminal = tokio::time::timeout(Duration::from_secs(1), terminal_batches.recv())
+        .await?
+        .ok_or("complete research batch was not exported")?;
+    let (coordinates, outcome) = terminal.into_parts();
+    assert_eq!(coordinates.evidence(), &original_evidence);
+    assert_eq!(coordinates.row_count(), 7);
+    assert_eq!(coordinates.wire_ordinals(), &[0, 1, 2, 3, 4, 5, 6]);
+    let CommittedResearchMarketBatchOutcome::Committed(rows) = outcome else {
+        return Err("valid research batch was rejected".into());
+    };
+    assert_eq!(rows.len(), 7);
+    for (ordinal, row) in rows.iter().enumerate() {
+        assert_eq!(row.observation().wire_ordinal(), ordinal);
+        assert_eq!(row.observation().row_count(), 7);
+        assert_eq!(
+            row.observation().source_coordinate().evidence(),
+            &original_evidence
+        );
+    }
+    assert!(terminal_batches.try_recv().is_err());
+    drop(rows);
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -243,7 +323,7 @@ async fn snapshot_event_trigger_skips_intermediate_prefix_of_successful_batch() 
                 .flat_map(|route| route.streams())
                 .find(|stream| stream.source().as_str() == "batched-source");
             if let Some(stream) = published
-                && stream.last_sequence() == Some(market_squawk_domain::SequenceNumber::new(3))
+                && stream.last_sequence() == Some(market_squawk_domain::SequenceNumber::new(7))
             {
                 return Ok::<_, Box<dyn std::error::Error>>(());
             }

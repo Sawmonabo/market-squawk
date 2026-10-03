@@ -1,33 +1,105 @@
-//! Application-owned composition for local research ingestion and point-in-time datasets.
+//! Application-owned composition for research ingestion and immutable analytical generations.
+
+mod retained_use;
+mod worker;
+pub(crate) use retained_use::research_source_operations;
+
+use worker::ResearchIoWorker;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
-    CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder,
-    DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
-    IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
-    ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
+    CatalogConfig, CatalogLimit, CommittedDataset, CompanyIdentityReadCapability,
+    CompanySecurityIdentityReadCapability, CompanySecurityLinkPublicationCapability,
+    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
+    DatasetId, FairValueCatalogCapability, FeatureDatasetProductionPublisher, FeatureLabelDataset,
+    IngestError, IngestIdentity, IngestPrecommitAuthority, InstrumentDefinitionReadCapability,
+    ManifestCatalogError, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingCatalogCapability,
+    PersistedProviderCaptureBindingEvidence, ProviderPublicationInput, RightsDecisionInput,
     RightsError, SourceOperation, extraction_provider_payload_digest,
 };
-use market_squawk_domain::{DigestAlgorithm, ExactPayloadEvidence};
-use market_squawk_platform::{LocalPaths, PathError};
-use market_squawk_sources::{ExtractionBatch, ExtractionRevisionPlan, SourceMetadata};
+use market_squawk_domain::{
+    CompanyIdentityObservation, DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition,
+    ResearchObservation, Timestamp,
+};
+use market_squawk_platform::{
+    LocalPaths, PathError, SealedResearchJournalStore, SealedResearchJournalStoreError, SecretStore,
+};
+use market_squawk_sources::{
+    ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureMaterialSealError,
+    ProviderCaptureSealRequest, ProviderNativeLineageImplementation, ProviderRateAuthority,
+    SealedProviderCaptureBinding, SealedProviderCaptureMaterial, SourceClass, SourceMetadata,
+    SourceObjectCaptureIdentity,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::{ProviderOnboardingError, ProviderOnboardingService};
+
+// Failure-only phase evidence for the existing owned seal lane. No captured data is logged.
+struct CaptureSealDiagnostic {
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    physical_started: Arc<std::sync::OnceLock<Instant>>,
+    started: Instant,
+    completed: bool,
+}
+
+impl CaptureSealDiagnostic {
+    fn new() -> Self {
+        Self {
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            physical_started: Arc::new(std::sync::OnceLock::new()),
+            started: Instant::now(),
+            completed: false,
+        }
+    }
+}
+
+impl Drop for CaptureSealDiagnostic {
+    fn drop(&mut self) {
+        if !self.completed {
+            let stage = match self.phase.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => "queued",
+                1 => "physical_seal",
+                _ => "completed",
+            };
+            tracing::warn!(
+                stage,
+                elapsed_ms = self.started.elapsed().as_millis(),
+                physical_elapsed_ms = self
+                    .physical_started
+                    .get()
+                    .map(|at| at.elapsed().as_millis()),
+                "provider capture seal interrupted"
+            );
+        }
+    }
+}
+
 /// One rights-reserved normalized extraction, with provider revision evidence when required.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ResearchIngestRequest {
     source: SourceMetadata,
     registered_at: market_squawk_domain::Timestamp,
     rights: RightsDecisionInput,
     identity: IngestIdentity,
     analytical_dataset: DatasetId,
-    batch: ExtractionBatch,
-    revisions: Option<ExtractionRevisionPlan>,
+    payload: ResearchIngestPayload,
+    company_identity: Option<CompanyIdentityObservation>,
     precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
+}
+
+#[derive(Debug)]
+enum ResearchIngestPayload {
+    Local(ExtractionBatch),
+    Provider {
+        sealed_capture: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+    },
 }
 
 impl ResearchIngestRequest {
@@ -38,53 +110,71 @@ impl ResearchIngestRequest {
         analytical_dataset: DatasetId,
         batch: ExtractionBatch,
     ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(source, rights, analytical_dataset, batch, None)
+        Self::try_new_local(source, rights, analytical_dataset, batch)
     }
 
-    /// Constructs an ingest with one explicit provider revision decision per normalized record.
-    pub fn with_provider_revisions(
+    /// Constructs a provider ingest from one adapter-produced canonical/native/physical binding.
+    pub fn with_provider_publication(
         source: SourceMetadata,
         rights: RightsDecisionInput,
         analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
+        sealed_capture: SealedProviderCaptureBinding,
         revisions: ExtractionRevisionPlan,
     ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(source, rights, analytical_dataset, batch, Some(revisions))
-    }
-
-    fn try_new(
-        source: SourceMetadata,
-        rights: RightsDecisionInput,
-        analytical_dataset: DatasetId,
-        batch: ExtractionBatch,
-        revisions: Option<ExtractionRevisionPlan>,
-    ) -> Result<Self, ResearchServiceError> {
-        let object = batch.request().object();
-        let payload_digest = extraction_provider_payload_digest(&batch);
-        let source_id = object.source_id();
-        if source.source_id() != source_id
-            || source.revision() != object.metadata_revision()
-            || &rights.source_id != source_id
-            || rights.payload_digest != payload_digest
+        sealed_capture.validate().map_err(IngestError::from)?;
+        let batch = sealed_capture.batch();
+        if matches!(
+            source.source_class(),
+            SourceClass::LocalFile | SourceClass::PortfolioExport
+        ) || revisions.len() != batch.records().len()
         {
             return Err(ResearchServiceError::IngestAuthorityMismatch);
         }
-        let registered_at = rights.retrieved_at;
-        let idempotency_key = provider_object_ingest_key(&source, &analytical_dataset, &batch)?;
-        let identity = IngestIdentity::try_new(
-            source_id.clone(),
-            payload_digest,
-            SourceOperation::Persist,
-            idempotency_key,
-        )?;
+        let (registered_at, identity) =
+            validate_ingest_authority(&source, &rights, &analytical_dataset, batch, true)?;
         Ok(Self {
             source,
             registered_at,
             rights,
             identity,
             analytical_dataset,
-            batch,
-            revisions,
+            payload: ResearchIngestPayload::Provider {
+                sealed_capture,
+                revisions,
+            },
+            company_identity: None,
+            precommit_authority: None,
+        })
+    }
+
+    fn try_new_local(
+        source: SourceMetadata,
+        rights: RightsDecisionInput,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+    ) -> Result<Self, ResearchServiceError> {
+        if !matches!(
+            source.source_class(),
+            SourceClass::LocalFile | SourceClass::PortfolioExport
+        ) {
+            return Err(ResearchServiceError::IngestAuthorityMismatch);
+        }
+        let (registered_at, identity) =
+            validate_ingest_authority(&source, &rights, &analytical_dataset, &batch, false)?;
+        if !matches!(
+            batch.request().object().capture_identity(),
+            SourceObjectCaptureIdentity::Standalone
+        ) {
+            return Err(ResearchServiceError::IngestAuthorityMismatch);
+        }
+        Ok(Self {
+            source,
+            registered_at,
+            rights,
+            identity,
+            analytical_dataset,
+            payload: ResearchIngestPayload::Local(batch),
+            company_identity: None,
             precommit_authority: None,
         })
     }
@@ -96,6 +186,113 @@ impl ResearchIngestRequest {
         self.precommit_authority = Some(precommit_authority);
         self
     }
+
+    pub(crate) fn with_company_identity(
+        mut self,
+        company_identity: CompanyIdentityObservation,
+    ) -> Result<Self, ResearchServiceError> {
+        if !matches!(&self.payload, ResearchIngestPayload::Provider { .. })
+            || company_identity.source_id() != self.source.source_id()
+            || company_identity
+                .parent_ingest_payload_evidence()
+                .content_digest()
+                != self.identity.payload_digest()
+        {
+            return Err(ResearchServiceError::IngestAuthorityMismatch);
+        }
+        self.company_identity = Some(company_identity);
+        Ok(self)
+    }
+}
+
+fn validate_census_reobservation(
+    original: &PersistedProviderCaptureBindingEvidence,
+    fresh: &PersistedProviderCaptureBindingEvidence,
+    fresh_rows: &[ResearchObservation],
+) -> Result<(), IngestError> {
+    let reopen = |evidence: &PersistedProviderCaptureBindingEvidence| {
+        let native = evidence.native_lineage();
+        if native.implementation() != "census_tabular_v1"
+            || evidence.scope() != "whole"
+            || evidence.component_ordinal().is_some()
+            || evidence.record_count() == 0
+            || evidence.rows().len() != evidence.record_count()
+            || native.row_count() != evidence.record_count()
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        let plan = market_squawk_adapter_census::CensusPublicationPlan::try_from_retained_payload(
+            native
+                .batch_sidecar_semantic_payload()
+                .ok_or(IngestError::ReplayConflict)?,
+            evidence.capture(),
+            evidence.extraction_content_identity(),
+        )
+        .map_err(|_| IngestError::ReplayConflict)?;
+        if plan.observations().len() != evidence.record_count() {
+            return Err(IngestError::ReplayConflict);
+        }
+        for (ordinal, row) in evidence.rows().iter().enumerate() {
+            if usize::try_from(row.canonical_row_ordinal()).ok() != Some(ordinal) {
+                return Err(IngestError::ReplayConflict);
+            }
+            plan.validate_native_row(ordinal, row.native_semantic_payload())
+                .map_err(|_| IngestError::ReplayConflict)?;
+        }
+        Ok(plan)
+    };
+    if original.native_lineage().version() != fresh.native_lineage().version()
+        || original.native_lineage().fingerprint() != fresh.native_lineage().fingerprint()
+        || original.record_count() != fresh.record_count()
+        || fresh_rows.len() != fresh.record_count()
+    {
+        return Err(IngestError::ReplayConflict);
+    }
+    let original_plan = reopen(original)?;
+    let fresh_plan = reopen(fresh)?;
+    for (ordinal, observation) in fresh_rows.iter().enumerate() {
+        let ResearchObservation::Macro(observation) = observation else {
+            return Err(IngestError::ReplayConflict);
+        };
+        fresh_plan
+            .validate_canonical_observation(ordinal, observation)
+            .map_err(|_| IngestError::ReplayConflict)?;
+    }
+    fresh_plan
+        .validate_reobservation_of(&original_plan)
+        .map_err(|_| IngestError::ReplayConflict)
+}
+
+fn validate_ingest_authority(
+    source: &SourceMetadata,
+    rights: &RightsDecisionInput,
+    analytical_dataset: &DatasetId,
+    batch: &ExtractionBatch,
+    provider_publication: bool,
+) -> Result<(Timestamp, IngestIdentity), ResearchServiceError> {
+    let object = batch.request().object();
+    let payload_digest = extraction_provider_payload_digest(batch);
+    let source_id = object.source_id();
+    if source.source_id() != source_id
+        || source.revision() != object.metadata_revision()
+        || &rights.source_id != source_id
+        || rights.payload_digest != payload_digest
+        || provider_publication
+            == matches!(
+                object.capture_identity(),
+                SourceObjectCaptureIdentity::Standalone
+            )
+    {
+        return Err(ResearchServiceError::IngestAuthorityMismatch);
+    }
+    let idempotency_key = provider_object_ingest_key(source, analytical_dataset, batch)?;
+    let identity = IngestIdentity::try_new(
+        source_id.clone(),
+        payload_digest,
+        SourceOperation::Persist,
+        idempotency_key,
+    )?;
+    Ok((rights.retrieved_at, identity))
 }
 
 fn provider_object_ingest_key(
@@ -108,7 +305,7 @@ fn provider_object_ingest_key(
         return Err(ResearchServiceError::IngestAuthorityMismatch);
     }
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/provider-object-ingest/v3");
+    digest.update(b"market-squawk/provider-object-ingest/v4");
     update_identity(&mut digest, object.source_id().as_str())?;
     update_identity(
         &mut digest,
@@ -127,8 +324,31 @@ fn provider_object_ingest_key(
         }
         None => digest.update([0]),
     }
+    match object.capture_identity() {
+        market_squawk_sources::SourceObjectCaptureIdentity::Standalone => digest.update([0]),
+        market_squawk_sources::SourceObjectCaptureIdentity::Paged {
+            content_digest,
+            page_count,
+            terminal,
+        } => {
+            digest.update([1]);
+            digest.update(content_digest.bytes());
+            digest.update(page_count.get().to_be_bytes());
+            digest.update(match terminal {
+                market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse => {
+                    b"standalone_response".as_slice()
+                }
+                market_squawk_sources::ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage => {
+                    b"exhausted_without_next_page".as_slice()
+                }
+                market_squawk_sources::ProviderCaptureTerminalDisposition::CompleteRequestGraph => {
+                    b"complete_request_graph".as_slice()
+                }
+            });
+        }
+    }
     Ok(format!(
-        "provider-object-v3-{}",
+        "provider-object-v4-{}",
         encode_lower_hex(digest.finalize().into())
     ))
 }
@@ -175,7 +395,60 @@ fn encode_lower_hex(bytes: [u8; 32]) -> String {
 /// Single application authority for local analytical storage and dataset construction.
 #[derive(Debug)]
 pub struct ResearchService {
-    analytical: AnalyticalDataService,
+    analytical: Arc<AnalyticalDataService>,
+    provider_captures: Arc<SealedResearchJournalStore>,
+    provider_capture_worker: ResearchIoWorker,
+    retained_read_worker: ResearchIoWorker,
+    retained_generation_worker: ResearchIoWorker,
+    financial_read_worker: ResearchIoWorker,
+    financial_preparation_worker: ResearchIoWorker,
+    retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
+    application_changes: market_squawk_runtime::ApplicationChanges,
+    history_publications: Arc<tokio::sync::Notify>,
+    market_display_calendar:
+        tokio::sync::watch::Sender<Option<market_squawk_data::DatasetManifestRef>>,
+}
+
+#[derive(Debug)]
+struct ResearchPublicationObserver {
+    changes: market_squawk_runtime::ApplicationChanges,
+    history: Arc<tokio::sync::Notify>,
+}
+
+impl market_squawk_data::DataPublicationObserver for ResearchPublicationObserver {
+    fn published(&self, publication: market_squawk_data::DataPublication) {
+        use market_squawk_data::DataPublication;
+        use market_squawk_services::ServiceDomain;
+
+        let domains: &[ServiceDomain] = match publication {
+            DataPublication::ResearchGeneration { market_history } => {
+                if market_history {
+                    self.history.notify_one();
+                }
+                &[
+                    ServiceDomain::Research,
+                    ServiceDomain::Fundamental,
+                    ServiceDomain::Macro,
+                    ServiceDomain::Market,
+                ]
+            }
+            DataPublication::MacroGeneration => &[ServiceDomain::Research, ServiceDomain::Macro],
+            DataPublication::MarketEvents => &[ServiceDomain::Market, ServiceDomain::Portfolio],
+            DataPublication::Reference | DataPublication::ResearchUseRevocation => &[
+                ServiceDomain::Source,
+                ServiceDomain::Market,
+                ServiceDomain::Research,
+                ServiceDomain::Fundamental,
+            ],
+            DataPublication::ChartProjection => &[ServiceDomain::Market],
+            DataPublication::DerivedGeneration => {
+                &[ServiceDomain::Research, ServiceDomain::Analysis]
+            }
+        };
+        for &domain in domains {
+            self.changes.record(domain);
+        }
+    }
 }
 
 impl ResearchService {
@@ -215,7 +488,107 @@ impl ResearchService {
             paths.artifacts()?.clone(),
             objects,
         )?;
-        Ok(Self { analytical })
+        Self::from_analytical(paths, Arc::new(analytical))
+    }
+
+    /// Opens or initializes a safe research and provider-onboarding service composition.
+    ///
+    /// The catalog writer is consumed inside this boundary and never returned to the caller.
+    pub fn open_or_initialize_with_provider_onboarding_service<S>(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_objects_per_generation: usize,
+        objects: ObjectStoreConfig,
+        secrets: Arc<S>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<
+        (
+            Self,
+            ProviderOnboardingService,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    >
+    where
+        S: SecretStore + 'static,
+    {
+        let (research, onboarding_catalog, publisher) =
+            Self::open_or_initialize_with_provider_onboarding(
+                paths,
+                catalog,
+                max_objects_per_generation,
+                objects,
+            )?;
+        let onboarding = ProviderOnboardingService::try_new_with_provider_rate(
+            onboarding_catalog,
+            secrets,
+            provider_rate,
+        )?;
+        Ok((research, onboarding, publisher))
+    }
+
+    /// Internal installed-composition boundary for the restricted onboarding facade.
+    ///
+    /// The [`ResearchService`] retains no onboarding writer, and its ordinary constructors do not
+    /// compose the facade.
+    pub(crate) fn open_or_initialize_with_provider_onboarding(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_objects_per_generation: usize,
+        objects: ObjectStoreConfig,
+    ) -> Result<
+        (
+            Self,
+            OnboardingCatalogCapability,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    > {
+        match Self::open_provider_onboarding_composition(
+            paths,
+            catalog.clone(),
+            max_objects_per_generation,
+            objects,
+        ) {
+            Ok(composition) => Ok(composition),
+            Err(ResearchServiceError::Ingest(IngestError::Catalog(
+                market_squawk_data::CatalogError::ArtifactRootAuthorityInitializationRequired,
+            ))) => Self::initialize_provider_onboarding_composition(
+                paths,
+                catalog,
+                max_objects_per_generation,
+                objects,
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn initialize_provider_onboarding_composition(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_objects_per_generation: usize,
+        objects: ObjectStoreConfig,
+    ) -> Result<
+        (
+            Self,
+            OnboardingCatalogCapability,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    > {
+        let authority = CatalogAuthority::open(catalog)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
+        let (analytical_composition, onboarding_catalog) =
+            AnalyticalDataService::initialize_with_provider_onboarding(
+                authority,
+                manifests,
+                paths.artifacts()?.clone(),
+                objects,
+            )?;
+        let (analytical, publisher) = analytical_composition.into_parts();
+        let service = Self::from_analytical(paths, Arc::new(analytical))?;
+        Ok((service, onboarding_catalog, publisher))
     }
 
     /// Reopens an already bound catalog and artifact root without implicit migration.
@@ -230,7 +603,458 @@ impl ResearchService {
             AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
         let analytical =
             AnalyticalDataService::open(authority, manifests, paths.artifacts()?.clone(), objects)?;
-        Ok(Self { analytical })
+        Self::from_analytical(paths, Arc::new(analytical))
+    }
+
+    fn open_provider_onboarding_composition(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_objects_per_generation: usize,
+        objects: ObjectStoreConfig,
+    ) -> Result<
+        (
+            Self,
+            OnboardingCatalogCapability,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    > {
+        let authority = CatalogAuthority::open(catalog)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
+        let (analytical_composition, onboarding_catalog) =
+            AnalyticalDataService::open_with_provider_onboarding(
+                authority,
+                manifests,
+                paths.artifacts()?.clone(),
+                objects,
+            )?;
+        let (analytical, publisher) = analytical_composition.into_parts();
+        let service = Self::from_analytical(paths, Arc::new(analytical))?;
+        Ok((service, onboarding_catalog, publisher))
+    }
+
+    /// Shares the catalog owner without opening another catalog writer.
+    pub(crate) fn from_analytical(
+        paths: &LocalPaths,
+        analytical: Arc<AnalyticalDataService>,
+    ) -> Result<Self, ResearchServiceError> {
+        let application_changes = market_squawk_runtime::ApplicationChanges::default();
+        let history_publications = Arc::new(tokio::sync::Notify::new());
+        Ok(Self {
+            analytical,
+            provider_captures: Arc::new(paths.sealed_research_journal_store()?),
+            provider_capture_worker: ResearchIoWorker::new(),
+            retained_read_worker: ResearchIoWorker::new(),
+            retained_generation_worker: ResearchIoWorker::new(),
+            financial_read_worker: ResearchIoWorker::new(),
+            financial_preparation_worker: ResearchIoWorker::new(),
+            retained_use_policies: retained_use::current_policies()?.into(),
+            application_changes,
+            history_publications,
+            market_display_calendar: tokio::sync::watch::channel(None).0,
+        })
+    }
+
+    /// Shares committed domain changes with the installed event journal and display actors.
+    pub(crate) fn application_changes(&self) -> market_squawk_runtime::ApplicationChanges {
+        self.application_changes.clone()
+    }
+
+    /// Installed composition binds once before starting any provider or publication worker.
+    /// Offline restore can create temporary read services without replacing this binding.
+    pub(crate) fn bind_application_changes(&self) -> Result<(), ResearchServiceError> {
+        self.analytical
+            .install_publication_observer(Arc::new(ResearchPublicationObserver {
+                changes: self.application_changes.clone(),
+                history: Arc::clone(&self.history_publications),
+            }))
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn history_publications(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.history_publications)
+    }
+
+    /// One reconstructible locator selected by display preparation, never calendar authority.
+    /// Readers reopen the exact persisted projection and recheck its original parents.
+    pub(crate) fn market_display_calendar_origin(
+        &self,
+    ) -> Option<market_squawk_data::DatasetManifestRef> {
+        self.market_display_calendar.borrow().clone()
+    }
+
+    pub(crate) fn set_market_display_calendar_origin(
+        &self,
+        origin: market_squawk_data::DatasetManifestRef,
+    ) {
+        let changed = self.market_display_calendar.send_if_modified(|current| {
+            if current.as_ref() == Some(&origin) {
+                return false;
+            }
+            *current = Some(origin);
+            true
+        });
+        if changed {
+            self.application_changes
+                .record(market_squawk_services::ServiceDomain::Market);
+        }
+    }
+
+    /// Creates a retained recovery cursor without scanning history or delaying startup.
+    pub(crate) fn create_provider_capture_recovery(
+        &self,
+    ) -> Result<market_squawk_data::ProviderCaptureRecovery, ResearchServiceError> {
+        self.analytical
+            .create_provider_capture_recovery(Arc::clone(&self.provider_captures))
+            .map_err(Into::into)
+    }
+
+    /// Consumes and seals one already validated provider capture without exposing store authority.
+    ///
+    /// The synchronous filesystem work runs on one application-owned blocking lane. Cancellation
+    /// and the monotonic deadline race both lane admission and completion; a late unreferenced
+    /// segment remains recoverable by incremental reconciliation.
+    pub(crate) async fn seal_provider_capture(
+        &self,
+        request: ProviderCaptureSealRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
+        self.seal_provider_capture_with_job_context(None, request, cancellation, deadline)
+            .await
+    }
+
+    /// Seals source input under this job's cancellation without claiming a job result publication.
+    pub(crate) async fn seal_provider_capture_for_job(
+        &self,
+        job: &market_squawk_jobs::JobRunContext,
+        request: ProviderCaptureSealRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
+        self.seal_provider_capture_with_job_context(Some(job), request, cancellation, deadline)
+            .await
+    }
+
+    async fn seal_provider_capture_with_job_context(
+        &self,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+        request: ProviderCaptureSealRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
+        let store = Arc::clone(&self.provider_captures);
+        let mut diagnostic = CaptureSealDiagnostic::new();
+        let phase = Arc::clone(&diagnostic.phase);
+        let physical_started = Arc::clone(&diagnostic.physical_started);
+        let result = self
+            .provider_capture_worker
+            .run_with_job_context(
+                job.map(|job| job.cancellation()),
+                deadline,
+                cancellation,
+                move |cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Err(IngestError::Cancelled.into());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(IngestError::DeadlineExceeded.into());
+                    }
+                    let _ = physical_started.set(Instant::now());
+                    phase.store(1, std::sync::atomic::Ordering::Relaxed);
+                    let result = request
+                        .seal(store.as_ref())
+                        .map_err(map_provider_capture_seal_error);
+                    phase.store(2, std::sync::atomic::Ordering::Relaxed);
+                    result
+                },
+            )
+            .await?;
+        diagnostic.completed = result.is_ok();
+        result
+    }
+
+    /// Physically verifies an original metadata seal on the existing supervised I/O owner.
+    pub(crate) async fn verify_provider_macro_metadata_capture(
+        &self,
+        receipt: market_squawk_sources::SealedProviderCaptureSetReceipt,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<market_squawk_data::ProviderMacroMetadataCapture, ResearchServiceError> {
+        let analytical = Arc::clone(&self.analytical);
+        let store = Arc::clone(&self.provider_captures);
+        self.retained_read_worker
+            .run(deadline, cancellation, move |worker_cancellation| {
+                analytical
+                    .verify_provider_macro_metadata_capture(
+                        receipt,
+                        store.as_ref(),
+                        deadline,
+                        &worker_cancellation,
+                    )
+                    .map_err(ResearchServiceError::from)
+            })
+            .await?
+    }
+
+    /// Runs synchronous capture, verification or source-preparation work on the existing lane.
+    ///
+    /// The closure must retain only the exact data capabilities it needs, never an Arc to this
+    /// service, and must check the supplied cancellation token and original deadline. Its typed
+    /// result normally follows the blocking handle; interruption leaves cleanup with the worker
+    /// owner. Use the joined variant when a caller-held lease must outlive that cleanup. Domain
+    /// errors carried by `T` remain separate from worker scheduling errors.
+    pub(crate) async fn run_owned_research_io<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.provider_capture_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Runs retained-evidence work independently of capture sealing and ingestion. The
+    /// original blocking handle remains owned through cancellation and shutdown. This
+    /// scheduling boundary grants no catalog authority; policy writes still require the
+    /// analytical operation lease and catalog writer held by their existing callers.
+    pub(crate) async fn run_owned_research_read<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.retained_read_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Holds the actual bulk-generation owner in the existing scheduling fixtures.
+    #[cfg(test)]
+    pub(crate) async fn run_owned_research_generation_read<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.retained_generation_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Runs company selection, financial snapshot construction and pages independently of
+    /// bulk original replay, capture and financial preparation. The original blocking handle
+    /// remains owned through interruption and shutdown. The closure must preserve evidence
+    /// checks and must not reacquire this lane or retain a ResearchService Arc.
+    pub(crate) async fn run_owned_financial_read<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.financial_read_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Prepares financial indexes without occupying workers used by visible retained reads.
+    /// The existing worker retains cancellation and shutdown custody of the original handle.
+    pub(crate) async fn run_owned_research_preparation<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.financial_preparation_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Runs one synchronous operation and drains its admitted handle before returning on
+    /// cancellation or deadline, keeping the caller's authority lease alive through completion.
+    pub(crate) async fn run_owned_research_io_joined<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.provider_capture_worker
+            .run_with_job_context(Some(cancellation), deadline, cancellation, operation)
+            .await
+    }
+
+    /// Closes admission and cancels original reads without discarding their blocking handles.
+    pub(crate) fn begin_owned_io_shutdown(&self) {
+        self.provider_capture_worker.begin_shutdown();
+        self.retained_read_worker.begin_shutdown();
+        self.retained_generation_worker.begin_shutdown();
+        self.financial_read_worker.begin_shutdown();
+        self.financial_preparation_worker.begin_shutdown();
+    }
+
+    /// Joins every original worker even if one fails; interrupted joins retain their owners.
+    pub(crate) async fn finish_owned_io_shutdown(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ResearchServiceError> {
+        self.begin_owned_io_shutdown();
+        let (capture, reads, generations, financial_reads, preparation) = tokio::join!(
+            self.provider_capture_worker.finish_shutdown(deadline),
+            self.retained_read_worker.finish_shutdown(deadline),
+            self.retained_generation_worker.finish_shutdown(deadline),
+            self.financial_read_worker.finish_shutdown(deadline),
+            self.financial_preparation_worker.finish_shutdown(deadline),
+        );
+        capture
+            .and(reads)
+            .and(generations)
+            .and(financial_reads)
+            .and(preparation)
+    }
+
+    /// Rejoins the fixed analytical selection to bounded original native/physical custody in the
+    /// same supervised worker used for retained provider reads. No independent task is detached.
+    pub(crate) async fn read_selected_provider_capture_evidence(
+        &self,
+        selection: market_squawk_data::SelectedProviderCaptureRows,
+        maximum_bytes: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<market_squawk_data::SelectedProviderCaptureEvidence, ResearchServiceError> {
+        let analytical = Arc::clone(&self.analytical);
+        let store = Arc::clone(&self.provider_captures);
+        self.retained_read_worker
+            .run_with_job_context(None, deadline, cancellation, move |worker_cancellation| {
+                analytical
+                    .selected_provider_capture_evidence_bounded(
+                        selection,
+                        maximum_bytes,
+                        store.as_ref(),
+                        deadline,
+                        &worker_cancellation,
+                    )
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
+    /// Reopens one original generation independently of compact retained reads. The callback
+    /// cannot mint publication authority or use another object store.
+    pub(crate) async fn read_provider_capture_generation<T, F>(
+        &self,
+        manifest: market_squawk_data::DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        read: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                market_squawk_data::GenerationOwnedProviderCaptureEvidence,
+                &SealedResearchJournalStore,
+                &dyn market_squawk_platform::ResearchObjectControl,
+                &AnalyticalDataService,
+                &CancellationToken,
+            ) -> Result<T, ResearchServiceError>
+            + Send
+            + 'static,
+    {
+        self.read_provider_capture_generation_with_job_context(
+            None,
+            manifest,
+            deadline,
+            cancellation,
+            read,
+        )
+        .await
+    }
+
+    /// Reopens the original generation on its owned worker and joins it on job cancellation.
+    pub(crate) async fn read_provider_capture_generation_with_job_context<T, F>(
+        &self,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+        manifest: market_squawk_data::DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        read: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                market_squawk_data::GenerationOwnedProviderCaptureEvidence,
+                &SealedResearchJournalStore,
+                &dyn market_squawk_platform::ResearchObjectControl,
+                &AnalyticalDataService,
+                &CancellationToken,
+            ) -> Result<T, ResearchServiceError>
+            + Send
+            + 'static,
+    {
+        use market_squawk_platform::{ResearchObjectControl as _, ResearchObjectControlPoint};
+        let analytical = Arc::clone(&self.analytical);
+        let store = Arc::clone(&self.provider_captures);
+        self.retained_generation_worker
+            .run_with_job_context(
+                job.map(|job| job.cancellation()),
+                deadline,
+                cancellation,
+                move |worker_cancellation| {
+                    let control = ProviderCaptureReadControl {
+                        deadline,
+                        cancellation: worker_cancellation,
+                    };
+                    control
+                        .checkpoint(ResearchObjectControlPoint::BeforeVerification)
+                        .map_err(SealedResearchJournalStoreError::ObjectControl)?;
+                    let evidence = analytical.generation_owned_provider_capture_evidence_bounded(
+                        &manifest,
+                        store.as_ref(),
+                        deadline,
+                        &control.cancellation,
+                    )?;
+                    control
+                        .checkpoint(ResearchObjectControlPoint::BeforeVerification)
+                        .map_err(SealedResearchJournalStoreError::ObjectControl)?;
+                    let result = read(
+                        evidence,
+                        store.as_ref(),
+                        &control,
+                        &analytical,
+                        &control.cancellation,
+                    )?;
+                    control
+                        .checkpoint(ResearchObjectControlPoint::BeforeCommit)
+                        .map_err(SealedResearchJournalStoreError::ObjectControl)?;
+                    Ok(result)
+                },
+            )
+            .await?
     }
 
     /// Executes one rights-reserved ingest through durable revision and publication authority.
@@ -239,66 +1063,152 @@ impl ResearchService {
         request: ResearchIngestRequest,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, ResearchServiceError> {
-        let reservation = self
+        let admission = self
             .analytical
-            .reserve_source_ingest(
-                &request.source,
-                request.registered_at,
-                request.rights,
-                &request.identity,
-                &cancellation,
-            )
+            .acquire_research_operation(&cancellation)
             .await?;
-        match (request.revisions, request.precommit_authority) {
-            (Some(revisions), Some(precommit_authority)) => self
-                .analytical
-                .ingest_with_revision_plan_and_precommit_authority(
-                    reservation,
-                    request.analytical_dataset,
-                    request.batch,
-                    revisions,
-                    cancellation,
-                    precommit_authority,
-                )
-                .await
-                .map_err(Into::into),
-            (Some(revisions), None) => self
-                .analytical
-                .ingest_with_revision_plan(
-                    reservation,
-                    request.analytical_dataset,
-                    request.batch,
-                    revisions,
-                    cancellation,
-                )
-                .await
-                .map_err(Into::into),
-            (None, Some(precommit_authority)) => self
-                .analytical
-                .ingest_with_precommit_authority(
-                    reservation,
-                    request.analytical_dataset,
-                    request.batch,
-                    cancellation,
-                    precommit_authority,
-                )
-                .await
-                .map_err(Into::into),
-            (None, None) => self
-                .analytical
-                .ingest(
-                    reservation,
-                    request.analytical_dataset,
-                    request.batch,
-                    cancellation,
-                )
-                .await
-                .map_err(Into::into),
+        Self::ingest_on(&admission, request, cancellation).await
+    }
+
+    /// Publishes a bounded source generation with optional job input controls.
+    /// This never claims a job's terminal result.
+    ///
+    /// The existing I/O slot owns the original future through runner cancellation or abort. Its
+    /// blocking worker uses the originating executor handle; no runtime, detached task, or service
+    /// ownership cycle is created. Only the analytical owner and original request cross the lane.
+    pub(crate) async fn ingest_with_job_context(
+        &self,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+        mut request: ResearchIngestRequest,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<CommittedDataset, ResearchServiceError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?;
+        let job_control = job.map(market_squawk_jobs::JobRunContext::cancellation);
+        let job_cancellation = job_control.unwrap_or(&cancellation).clone();
+        let caller_cancellation = cancellation.clone();
+        // Original-capture owners take analytical admission before this I/O lane. Follow that
+        // same order and carry the exact lease into the retained worker; never reacquire it.
+        let admission = tokio::select! {
+            biased;
+            () = job_cancellation.cancelled() => return Err(IngestError::Cancelled.into()),
+            () = cancellation.cancelled() => return Err(IngestError::Cancelled.into()),
+            () = tokio::time::sleep_until(deadline.into()) => return Err(IngestError::DeadlineExceeded.into()),
+            admission = self.analytical.acquire_research_operation(&cancellation) => admission?,
+        };
+        // The request retains its publication guard inside the original worker. A non-job
+        // caller may return on interruption while this owned slot finishes cancellation;
+        // job callers preserve the existing drain-before-return contract.
+        self.provider_capture_worker.run_with_job_context(
+            job_control, deadline, &cancellation, move |operation_cancellation| {
+                let authority = Arc::new(JobInputPrecommit {
+                    original: request.precommit_authority.take(),
+                    job_cancellation,
+                    caller_cancellation,
+                    operation_cancellation: operation_cancellation.clone(),
+                    deadline,
+                });
+                if let Err(error) = authority.validate_precommit() { return Err(error.into()); }
+                request.precommit_authority = Some(authority.clone());
+                runtime.block_on(async move {
+                    let operation = Self::ingest_on(&admission, request, operation_cancellation.clone());
+                    tokio::pin!(operation);
+                    // The owning lane's original deadline cancels operation_cancellation.
+                    // No timer/IO driver is needed by this retained storage continuation.
+                    let interrupted = tokio::select! {
+                        biased;
+                        () = authority.job_cancellation.cancelled() => IngestError::Cancelled,
+                        () = authority.caller_cancellation.cancelled() => IngestError::Cancelled,
+                        () = operation_cancellation.cancelled() => IngestError::Cancelled,
+                        result = &mut operation => {
+                            authority.validate_precommit()?;
+                            return result;
+                        }
+                    };
+                    operation_cancellation.cancel();
+                    // Keep polling the exact original ingest. Its existing native publication
+                    // path observes cancellation and joins its own Parquet worker before return.
+                    let _drained = operation.await;
+                    Err(interrupted.into())
+                })
+            },
+        ).await?
+    }
+
+    async fn ingest_on(
+        admission: &market_squawk_data::AdmittedAnalyticalOperation,
+        request: ResearchIngestRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, ResearchServiceError> {
+        let ResearchIngestRequest {
+            source,
+            registered_at,
+            rights,
+            identity,
+            analytical_dataset,
+            payload,
+            company_identity,
+            precommit_authority,
+        } = request;
+        let reservation = admission.reserve_source_ingest(
+            &source,
+            registered_at,
+            rights.clone(),
+            &identity,
+            &cancellation,
+        )?;
+        match payload {
+            ResearchIngestPayload::Provider {
+                sealed_capture,
+                revisions,
+            } => {
+                let implementation = sealed_capture.native_lineage().schema().implementation();
+                let mut publication = ProviderPublicationInput::try_new(sealed_capture, revisions)?
+                    .with_reobservation_rights(rights);
+                if implementation == ProviderNativeLineageImplementation::CensusTabularV1 {
+                    publication = publication
+                        .with_native_reobservation_validator(validate_census_reobservation);
+                }
+                if let Some(company_identity) = company_identity {
+                    publication = publication.with_company_identity(company_identity);
+                }
+                if let Some(precommit_authority) = precommit_authority {
+                    publication = publication.with_precommit_authority(precommit_authority);
+                }
+                admission
+                    .ingest_provider_publication(
+                        reservation,
+                        analytical_dataset,
+                        publication,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(Into::into)
+            }
+            ResearchIngestPayload::Local(batch) => {
+                if company_identity.is_some() {
+                    return Err(ResearchServiceError::IngestAuthorityMismatch);
+                }
+                admission
+                    .ingest_local(
+                        reservation,
+                        analytical_dataset,
+                        batch,
+                        cancellation,
+                        precommit_authority,
+                    )
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 
-    /// Builds one authorized, point-in-time feature/label generation.
-    pub async fn build_dataset(
+    /// Builds one authorized phase-one, point-in-time derived generation.
+    ///
+    /// The returned generation is immutable and restart-queryable by its exact manifest. It does
+    /// not carry product admission, model admission, or execution authority.
+    pub async fn build_phase_one_derived_generation(
         &self,
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
@@ -310,9 +1220,38 @@ impl ResearchService {
             .map_err(Into::into)
     }
 
+    /// Builds phase one while retaining exact caller authority through generation publication.
+    ///
+    /// The precommit authority is consumed only for this immutable analytical generation; no
+    /// product receipt or issuer authority is minted by this service boundary.
+    pub async fn build_phase_one_derived_generation_with_precommit_authority(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn DatasetBuildPrecommitAuthority>,
+    ) -> Result<FeatureLabelDataset, ResearchServiceError> {
+        self.analytical
+            .dataset_builder()
+            .build_with_precommit_authority(request, cancellation, precommit_authority)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Returns the manifest-pinned analytical service for bounded query composition.
-    pub const fn analytical(&self) -> &AnalyticalDataService {
+    pub(crate) fn analytical_service(&self) -> Arc<AnalyticalDataService> {
+        Arc::clone(&self.analytical)
+    }
+
+    pub fn analytical(&self) -> &AnalyticalDataService {
         &self.analytical
+    }
+
+    /// Shares the sole application-owned sealed store with typed restart-verification closures.
+    ///
+    /// This does not expose physical sealing to adapters; callers can only verify claims already
+    /// retained by an immutable provider generation.
+    pub(crate) fn provider_capture_store(&self) -> Arc<SealedResearchJournalStore> {
+        Arc::clone(&self.provider_captures)
     }
 
     /// Returns immutable bounded analytical metadata and fixed-template observation reads.
@@ -320,23 +1259,228 @@ impl ResearchService {
         self.analytical.analytical_reader()
     }
 
+    /// Reads and publishes source-bound chart projections through the existing catalog owner.
+    pub fn chart_projections(&self) -> market_squawk_data::ChartProjectionCatalogCapability {
+        self.analytical.chart_projections()
+    }
+
+    /// Publishes an authenticated source reference through the existing analytical owner.
+    pub(crate) async fn publish_market_data_source_reference(
+        &self,
+        input: market_squawk_data::MarketDataInstrumentSourceReferenceInput,
+        precommit: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        market_squawk_data::MarketDataInstrumentRecord,
+        market_squawk_data::MarketDataInstrumentCatalogError,
+    > {
+        self.analytical
+            .publish_market_data_source_reference(input, precommit, deadline, cancellation)
+            .await
+    }
+
+    /// Admits complete source-owned option references through the sole canonical identity writer.
+    pub(crate) async fn publish_alpaca_option_references(
+        &self,
+        input: market_squawk_data::AlpacaOptionReferenceAdmission,
+        precommit: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        market_squawk_data::AlpacaOptionReferencePublication,
+        market_squawk_data::MarketDataInstrumentCatalogError,
+    > {
+        self.analytical
+            .publish_alpaca_option_references(input, precommit, deadline, cancellation)
+            .await
+    }
+
+    /// Publishes one authenticated Alpaca asset reference through the existing catalog owner.
+    pub(crate) async fn publish_alpaca_asset_reference(
+        &self,
+        input: market_squawk_data::AlpacaAssetReferenceAdmission,
+        precommit: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        market_squawk_data::MarketDataInstrumentRecord,
+        market_squawk_data::MarketDataInstrumentCatalogError,
+    > {
+        self.analytical
+            .publish_alpaca_asset_reference(input, precommit, deadline, cancellation)
+            .await
+    }
+
+    /// Admits original issuer evidence through the analytical service's supervised catalog owner.
+    pub(crate) async fn publish_market_data_issuer_reference(
+        &self,
+        issuer: market_squawk_data::OfficialIssuerInstrumentReference,
+        listing: market_squawk_data::ListingReferenceRecord,
+        expected_current: Option<market_squawk_data::MarketDataInstrumentRecord>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        market_squawk_data::MarketDataInstrumentRecord,
+        market_squawk_data::MarketDataInstrumentCatalogError,
+    > {
+        self.analytical
+            .publish_market_data_issuer_reference(
+                issuer,
+                listing,
+                expected_current,
+                deadline,
+                cancellation,
+            )
+            .await
+    }
+
     /// Returns fair-value persistence authority over this service's sole catalog writer.
     pub fn fair_value_catalog(&self) -> FairValueCatalogCapability {
         self.analytical.fair_value_catalog()
-    }
-
-    /// Returns provider-onboarding authority over this service's sole catalog writer.
-    pub fn onboarding_catalog(&self) -> OnboardingCatalogCapability {
-        self.analytical.onboarding_catalog()
     }
 
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.
     pub fn instrument_definitions(&self) -> InstrumentDefinitionReadCapability {
         self.analytical.instrument_definitions()
     }
+
+    /// Returns bounded reads over repository-owned, explicitly non-executable market identities.
+    pub fn market_data_instruments(&self) -> MarketDataInstrumentReadCapability {
+        self.analytical.market_data_instruments()
+    }
+
+    /// Returns the sole atomic publisher for repository-owned market-data identities.
+    pub fn market_data_instrument_synchronization(
+        &self,
+    ) -> MarketDataInstrumentSynchronizationCapability {
+        self.analytical.market_data_instrument_synchronization()
+    }
+
+    /// Returns bounded company-identity reads over the canonical research catalog.
+    pub fn company_identities(&self) -> CompanyIdentityReadCapability {
+        self.analytical.company_identities()
+    }
+
+    /// Returns bounded authoritative company/security relationship reads.
+    ///
+    /// This capability owns no publication, identity inference, review, or execution authority.
+    pub fn company_security_identities(&self) -> CompanySecurityIdentityReadCapability {
+        self.analytical
+            .company_identities()
+            .security_relationships()
+    }
+
+    /// Returns the pure, narrow publisher for a fully evidenced company/security link.
+    ///
+    /// Desktop preview and confirmation workflow state is deliberately not owned here.
+    pub fn company_security_link_publication(&self) -> CompanySecurityLinkPublicationCapability {
+        self.analytical.company_security_link_publication()
+    }
+
+    /// Atomically reconciles validated code/config-owned definitions before product publication.
+    pub(crate) fn synchronize_configured_instruments(
+        &self,
+        instruments: &[InstrumentDefinition],
+        observed_at: Timestamp,
+        limit: CatalogLimit,
+    ) -> Result<usize, ResearchServiceError> {
+        self.analytical
+            .instrument_catalog()
+            .synchronize(instruments, observed_at, limit)
+            .map_err(Into::into)
+    }
 }
 
-/// Research composition, storage, ingestion, or dataset-construction failure.
+fn map_provider_capture_seal_error(
+    error: ProviderCaptureMaterialSealError,
+) -> ResearchServiceError {
+    match error {
+        ProviderCaptureMaterialSealError::Store(error) => {
+            ResearchServiceError::ProviderCaptureStore(error)
+        }
+        ProviderCaptureMaterialSealError::Capture(error) => {
+            ResearchServiceError::Ingest(IngestError::ProviderCapture(error))
+        }
+    }
+}
+
+/// Adds job input controls without replacing the exact account/source authority or claiming a
+/// terminal JobRunContext permit. Catalog validation delegates using the already-held writer.
+#[derive(Debug)]
+struct JobInputPrecommit {
+    original: Option<Arc<dyn IngestPrecommitAuthority>>,
+    job_cancellation: CancellationToken,
+    caller_cancellation: CancellationToken,
+    operation_cancellation: CancellationToken,
+    deadline: Instant,
+}
+
+impl JobInputPrecommit {
+    fn check(&self) -> Result<(), IngestError> {
+        if self.job_cancellation.is_cancelled()
+            || self.caller_cancellation.is_cancelled()
+            || self.operation_cancellation.is_cancelled()
+        {
+            Err(IngestError::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(IngestError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl IngestPrecommitAuthority for JobInputPrecommit {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        self.check()?;
+        if let Some(original) = &self.original {
+            original.validate_precommit()?;
+        }
+        self.check()
+    }
+
+    fn validate_catalog_precommit(&self, catalog: &CatalogAuthority) -> Result<(), IngestError> {
+        self.check()?;
+        if let Some(original) = &self.original {
+            original.validate_catalog_precommit(catalog)?;
+        }
+        self.check()
+    }
+
+    fn claim_sec_fund_job_commit(
+        &self,
+        binding_digest: market_squawk_domain::EvidenceDigest,
+    ) -> Result<Option<market_squawk_data::SecFundJobCommit>, IngestError> {
+        self.check()?;
+        match &self.original {
+            Some(original) => original.claim_sec_fund_job_commit(binding_digest),
+            None => Ok(None),
+        }
+    }
+}
+
+struct ProviderCaptureReadControl {
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl market_squawk_platform::ResearchObjectControl for ProviderCaptureReadControl {
+    fn checkpoint(
+        &self,
+        _point: market_squawk_platform::ResearchObjectControlPoint,
+    ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            Err(market_squawk_platform::ResearchObjectControlError::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(market_squawk_platform::ResearchObjectControlError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Research composition, storage, ingestion, or analytical-generation failure.
 #[derive(Debug, Error)]
 pub enum ResearchServiceError {
     /// Local controlled paths could not be resolved.
@@ -348,11 +1492,20 @@ pub enum ResearchServiceError {
     /// The immutable generation catalog could not be opened.
     #[error("research service manifest catalog failed: {0}")]
     Manifest(#[from] ManifestCatalogError),
+    /// The sealed exact-provider-response authority could not be opened or verified.
+    #[error("research service provider-capture store failed: {0}")]
+    ProviderCaptureStore(#[from] SealedResearchJournalStoreError),
+    /// The bounded provider-capture sealing worker could not be admitted or joined.
+    #[error("research service provider-capture sealing worker is unavailable")]
+    ProviderCaptureSealWorkerUnavailable,
     /// Analytical authority composition or ingestion failed.
     #[error("research service ingestion failed: {0}")]
     Ingest(#[from] IngestError),
-    /// Point-in-time dataset construction failed.
-    #[error("research service dataset build failed: {0}")]
+    /// The fully composed provider-onboarding service could not be constructed.
+    #[error("research provider-onboarding composition failed: {0}")]
+    ProviderOnboarding(#[from] ProviderOnboardingError),
+    /// Phase-one point-in-time derived-generation construction failed.
+    #[error("research service phase-one derived-generation build failed: {0}")]
     Dataset(#[from] DatasetBuildError),
     /// The composed source, rights, and exact extraction payload do not agree.
     #[error("research ingest source, rights, and batch evidence do not agree")]

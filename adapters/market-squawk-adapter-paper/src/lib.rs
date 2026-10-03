@@ -22,14 +22,18 @@ pub use adapter::{
 };
 pub use audit::{PaperAuditKind, PaperAuditReadError, PaperAuditReader, PaperAuditRecord};
 pub use checkpoint_repository::{
-    PaperAccountRecoverySnapshot, PaperAccountReplaySnapshot, PaperCheckpointReceipt,
-    PaperCheckpointRecovery, PaperCheckpointRepository, PaperCheckpointRepositoryError,
+    PaperAccountRecoverySnapshot, PaperAccountReplaySnapshot, PaperCheckpointBackup,
+    PaperCheckpointBackupLease, PaperCheckpointReceipt, PaperCheckpointRecovery,
+    PaperCheckpointRepository, PaperCheckpointRepositoryError, PaperPortfolioReplay,
 };
-pub use config::{PaperConfigError, PaperExecutionConfig, PaperExecutionConfigInput};
+pub use config::{
+    PaperConfigError, PaperExecutionConfig, PaperExecutionConfigInput, PaperExecutionSessionPolicy,
+};
 pub use fees::{FeeError, FeeSchedule, LiquidityRole};
 pub use ledger::{
-    PaperAccountBootstrap, PaperAccountRiskSnapshot, PaperCashBalance, PaperExposureValuation,
-    PaperFill, PaperLedger, PaperLedgerConfig, PaperLedgerError, PaperPosition,
+    PaperAccountBootstrap, PaperAccountRiskSnapshot, PaperCashBalance, PaperCashEntitlement,
+    PaperExecutableMark, PaperExposureValuation, PaperFill, PaperLedger, PaperLedgerConfig,
+    PaperLedgerError, PaperPosition,
 };
 pub use session::{
     MAX_PAPER_VENUE_SESSIONS, PaperSessionCalendarError, PaperVenueSession,
@@ -38,6 +42,6 @@ pub use session::{
 pub(crate) use snapshot::PaperCheckpointPersistenceEvidence;
 pub use snapshot::{
     PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionSnapshot, PaperFillSnapshot,
-    PaperOrderSnapshot,
+    PaperOrderSnapshot, PaperSimulationSnapshot,
 };
 pub use state::{PaperOrderLifecycle, PaperOrderState, PaperStateError};

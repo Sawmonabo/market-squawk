@@ -13,7 +13,7 @@ use market_squawk_platform::{
     raw_capture_channel, spawn_capture_writer,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, ConnectionLiveness,
+    AuthorizationHealth, BudgetHealth, ConnectionLiveness,
     CoverageHealth, DecodeOutcome, DecodedProviderBatch, DecoderEvidence, FreshnessPolicy,
     ProviderAggressorEvidence, ProviderChecksumEvidence, ProviderDecimalLexeme,
     ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
@@ -47,9 +47,10 @@ fn rule(name: &str) -> TestResult<IntegrityRule> {
 #[tokio::test]
 async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_current_batch()
 -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(
+    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+    let (mut registry, registered) = crate::common::register_fixture_source(
         direct_metadata("source-a", "revision-a", 0, None)?,
+        &[(instrument, "BTC-USD")],
         Timestamp::from_unix_nanos(1),
     )?;
     let session = registry.begin_session(
@@ -125,11 +126,15 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     )?;
     let validated = session.validate_live_frame(&frame)?;
     let evidence = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
-    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
     let observation = ProviderNormalizedObservation::try_new(
         source_identifier("trade-1")?,
         VenueId::try_from("coinbase")?,
         instrument,
+        market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+            market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+            market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+            market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+        ),
         ProviderTimestampEvidence::Provided {
             value: frame_at,
             rule: rule("coinbase-timestamp")?,
@@ -151,6 +156,7 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
                 Some(source_identifier("BUY")?),
                 rule("coinbase-aggressor")?,
             ),
+            taker_order_type: None,
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;

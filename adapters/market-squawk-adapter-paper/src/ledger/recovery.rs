@@ -24,6 +24,9 @@ type AccountRecoveryParts = (
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerRecoveryWire {
+    action_origin: Option<Box<super::PaperActionOrigin>>,
+    action_receipt: Option<super::PaperActionReceipt>,
+    cash_entitlements: Vec<super::PaperCashEntitlement>,
     accounts: Vec<AccountRiskRecoveryWire>,
     cash: Vec<CashRecoveryWire>,
     positions: Vec<PositionRecoveryWire>,
@@ -85,6 +88,9 @@ struct ReservationRecoveryWire {
 impl PaperLedger {
     pub(crate) fn recovery_wire(&self) -> LedgerRecoveryWire {
         LedgerRecoveryWire {
+            action_origin: self.action_origin.clone(),
+            action_receipt: self.action_receipt.clone(),
+            cash_entitlements: self.cash_entitlements.clone(),
             accounts: self
                 .accounts
                 .iter()
@@ -158,7 +164,12 @@ impl PaperLedger {
         config: PaperLedgerConfig,
         wire: LedgerRecoveryWire,
     ) -> Result<Self, PaperLedgerError> {
-        if wire.cash.len() > config.maximum_balances
+        if wire.cash_entitlements.len() > super::actions::MAXIMUM_ACTIONS
+            || wire
+                .action_origin
+                .as_ref()
+                .is_some_and(|origin| origin.accounts.len() > config.maximum_accounts)
+            || wire.cash.len() > config.maximum_balances
             || wire.accounts.len() > config.maximum_accounts
             || wire.positions.len() > config.maximum_positions
             || wire.marks.len() > config.maximum_positions
@@ -251,6 +262,64 @@ impl PaperLedger {
             return Err(PaperLedgerError::InvalidRecovery);
         }
         let mut ledger = Self::try_new(config, bootstraps)?;
+        if let Some(origin) = &wire.action_origin {
+            let original = Self::try_new(config, origin.accounts.clone())?;
+            if original.accounts.keys().ne(ledger.accounts.keys()) {
+                return Err(PaperLedgerError::InvalidRecovery);
+            }
+        }
+        if let Some(receipt) = &wire.action_receipt {
+            if receipt.applied_economics == [0;32] || receipt.covered_instruments.is_empty()
+                || receipt.covered_instruments.len() > 32
+                || receipt.covered_instruments.windows(2).any(|pair| pair[0] >= pair[1])
+                || receipt.covered_interval.0 > receipt.covered_interval.1
+                || super::actions::source_action_date(receipt.valued_at, receipt.us_equity_dates).map_or(true, |date| date > receipt.covered_interval.1)
+                || wire.action_origin.as_ref().is_none_or(|origin| super::actions::source_action_date(origin.opened_at, receipt.us_equity_dates).map_or(true, |date| date < receipt.covered_interval.0))
+                || receipt.source_reference.is_empty()
+                || receipt.source_reference.len() > 64 * 1024
+                || receipt.content == [0; 32]
+                || receipt.source == [0; 32]
+                || receipt.valued_at > receipt.knowledge_cutoff
+                || wire
+                    .action_origin
+                    .as_ref()
+                    .is_none_or(|origin| origin.opened_at > receipt.valued_at)
+            {
+                return Err(PaperLedgerError::InvalidRecovery);
+            }
+        } else if !wire.cash_entitlements.is_empty() {
+            return Err(PaperLedgerError::InvalidRecovery);
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for claim in &wire.cash_entitlements {
+            let receipt = wire
+                .action_receipt
+                .as_ref()
+                .ok_or(PaperLedgerError::InvalidRecovery)?;
+            let origin = wire
+                .action_origin
+                .as_ref()
+                .ok_or(PaperLedgerError::InvalidRecovery)?;
+            if claim.evidence == [0; 32]
+                || claim.entitled_at < origin.opened_at
+                || claim.entitled_at > receipt.valued_at
+                || !identities.insert((claim.account_id, claim.evidence))
+                || claim.settlement_at.is_some_and(|at| at < claim.entitled_at)
+                || claim.settled
+                    != claim
+                        .settlement_at
+                        .is_some_and(|at| at <= receipt.valued_at)
+                || ledger
+                    .accounts
+                    .get(&claim.account_id)
+                    .is_none_or(|account| account.currency != claim.amount.currency())
+            {
+                return Err(PaperLedgerError::InvalidRecovery);
+            }
+        }
+        ledger.action_origin = wire.action_origin;
+        ledger.action_receipt = wire.action_receipt;
+        ledger.cash_entitlements = wire.cash_entitlements;
         for mark in wire.marks {
             mark.validate_recovered()?;
             if ledger.marks.insert(mark.instrument_id(), mark).is_some() {

@@ -8,8 +8,9 @@ use std::{
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
-    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, MAX_DISCOVERY_OBJECTS, SourceMetadata,
-    SourceObject,
+    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, MAX_DISCOVERY_OBJECTS,
+    MAX_PROVIDER_CAPTURE_BYTES, ProviderCaptureMaterial, SourceMetadata, SourceObject,
+    SourceObjectCaptureIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -228,6 +229,8 @@ impl RetainedDiscoverySelections {
         rights: &ResearchRightsAuthority,
         admission: &ResearchProviderAdmission,
         discovery: DiscoveryBatch,
+        capture_material: Option<ProviderCaptureMaterial>,
+        bea: Option<super::bea::BeaRetainedDiscovery>,
         retention: Duration,
         observed_monotonic: Instant,
         observed_wall: Timestamp,
@@ -238,12 +241,52 @@ impl RetainedDiscoverySelections {
             .map_err(|_error| ServiceError::Unavailable)?;
         self.prune_expired(observed_monotonic, observed_wall);
         let object_count = discovery.objects().len();
+        if ((capture_material.is_some() || bea.is_some()) && object_count != 1)
+            || (capture_material.is_some() && bea.is_some())
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        if let Some(capture_material) = &capture_material {
+            let object = discovery
+                .objects()
+                .first()
+                .ok_or(ServiceError::InvalidResult)?;
+            let receipt = capture_material.receipt();
+            if receipt.source_id() != object.source_id()
+                || receipt.metadata_revision() != object.metadata_revision()
+                || receipt.dataset() != object.dataset()
+                || !SourceObjectCaptureIdentity::try_from_capture(receipt)
+                    .is_ok_and(|identity| identity == object.capture_identity())
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
+        if let Some(bea) = &bea {
+            if bea.admission.batch().request() != discovery.request()
+                || bea.admission.batch().objects() != discovery.objects()
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
         let retained_count = self
             .entries
             .len()
             .checked_add(object_count)
             .ok_or(ServiceError::ResourceExhausted)?;
         if retained_count > MAX_DISCOVERY_OBJECTS {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let existing_capture_bytes = self.entries.iter().try_fold(0_u64, |total, selection| {
+            retained_capture_bytes(selection.capture_material.as_ref(), selection.bea.as_ref())
+                .and_then(|bytes| total.checked_add(bytes))
+        });
+        let incoming_capture_bytes =
+            retained_capture_bytes(capture_material.as_ref(), bea.as_ref())
+                .ok_or(ServiceError::ResourceExhausted)?;
+        if existing_capture_bytes
+            .and_then(|total| total.checked_add(incoming_capture_bytes))
+            .is_none_or(|total| total > MAX_PROVIDER_CAPTURE_BYTES)
+        {
             return Err(ServiceError::ResourceExhausted);
         }
 
@@ -253,26 +296,26 @@ impl RetainedDiscoverySelections {
         let retention_wall_expiry = observed_wall
             .checked_add_nanos(retention_nanos)
             .map_err(|_error| ServiceError::Internal)?;
-        let receipt_expiry = rights
+        let rights_expiry = rights
             .authorization_expires_at
-            .map_or(retention_wall_expiry, |rights_expiry| {
-                rights_expiry.min(retention_wall_expiry)
+            .map_or(retention_wall_expiry, |expiry| {
+                expiry.min(retention_wall_expiry)
             });
-        if receipt_expiry <= observed_wall {
+        if rights_expiry <= observed_wall {
             return Err(ServiceError::Unauthorized);
         }
-        let monotonic_retention = match rights.authorization_expires_at {
-            Some(rights_expiry) => {
-                let rights_nanos = rights_expiry
-                    .unix_nanos()
-                    .checked_sub(observed_wall.unix_nanos())
-                    .ok_or(ServiceError::Unauthorized)?;
-                let rights_nanos =
-                    u64::try_from(rights_nanos).map_err(|_error| ServiceError::Unauthorized)?;
-                retention.min(Duration::from_nanos(rights_nanos))
-            }
-            None => retention,
-        };
+        let receipt_expiry = bea.as_ref().map_or(rights_expiry, |retained| {
+            retained.expires_at.min(rights_expiry)
+        });
+        if receipt_expiry <= observed_wall {
+            return Err(ServiceError::Unavailable);
+        }
+        let remaining_nanos = receipt_expiry
+            .unix_nanos()
+            .checked_sub(observed_wall.unix_nanos())
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .ok_or(ServiceError::Internal)?;
+        let monotonic_retention = retention.min(Duration::from_nanos(remaining_nanos));
         let monotonic_expiry = observed_monotonic
             .checked_add(monotonic_retention)
             .ok_or(ServiceError::Internal)?;
@@ -285,6 +328,8 @@ impl RetainedDiscoverySelections {
         objects
             .try_reserve_exact(object_count)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let mut capture_material = capture_material;
+        let mut bea = bea;
         for object in discovery.objects() {
             let receipt = Uuid::new_v4();
             if self
@@ -304,6 +349,8 @@ impl RetainedDiscoverySelections {
                 admission: admission.clone(),
                 request: discovery.request().clone(),
                 object: object.clone(),
+                capture_material: capture_material.take(),
+                bea: bea.take(),
                 monotonic_expiry,
                 wall_expiry: receipt_expiry,
             });
@@ -423,6 +470,8 @@ struct RetainedDiscoverySelection {
     admission: ResearchProviderAdmission,
     request: DiscoveryRequest,
     object: SourceObject,
+    capture_material: Option<ProviderCaptureMaterial>,
+    bea: Option<super::bea::BeaRetainedDiscovery>,
     monotonic_expiry: Instant,
     wall_expiry: Timestamp,
 }
@@ -443,6 +492,8 @@ pub(super) struct PreparedRetainedSelection {
     pub(super) authority: ExtractionAuthority,
     pub(super) object: SourceObject,
     pub(super) admission: ResearchProviderAdmission,
+    pub(super) capture_material: Option<ProviderCaptureMaterial>,
+    pub(super) bea: Option<super::bea::BeaRetainedDiscovery>,
 }
 
 impl CoordinatorAuthority {
@@ -508,6 +559,8 @@ impl CoordinatorAuthority {
             authority,
             object: selection.object,
             admission: selection.admission,
+            capture_material: selection.capture_material,
+            bea: selection.bea,
         })
     }
 }
@@ -518,4 +571,16 @@ fn parse_canonical_receipt(value: &str) -> Result<Uuid, ServiceError> {
         return Err(ServiceError::InvalidRequest);
     }
     Ok(receipt)
+}
+
+fn retained_capture_bytes(
+    raw: Option<&ProviderCaptureMaterial>,
+    bea: Option<&super::bea::BeaRetainedDiscovery>,
+) -> Option<u64> {
+    match (raw, bea) {
+        (Some(material), None) => Some(material.receipt().total_body_bytes()),
+        (None, Some(retained)) => retained.admission.retained_capture_bytes().ok(),
+        (None, None) => Some(0),
+        (Some(_), Some(_)) => None,
+    }
 }

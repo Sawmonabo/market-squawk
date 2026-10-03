@@ -1,1 +1,1 @@
-{"type":"match","trade_id":10,"sequence":50,"maker_order_id":"ac928c66-ca53-498f-9c13-a110027a60e8","taker_order_id":"132fb6ae-456b-4654-b4e0-d681ac05cea1","time":"2026-07-20T12:00:00.123456Z","product_id":"BTC-USD","size":"0.5000","price":"100.2500","side":"sell"}
+{"channel":"market_trades","client_id":"","timestamp":"2026-08-08T12:00:00.323456Z","sequence_num":2,"events":[{"type":"update","trades":[{"trade_id":"10","product_id":"BTC-USD","price":"100.2500","size":"0.5000","side":"SELL","time":"2026-08-08T12:00:00.323456Z"}]}]}

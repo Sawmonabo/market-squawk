@@ -8,13 +8,15 @@ use market_squawk_domain::{
 use rust_decimal::Decimal;
 
 use super::{
-    ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES,
-    CROSS_VENUE_COMMAND_SLOT_BYTES, CROSS_VENUE_INSTRUMENT_SLOT_BYTES,
-    CROSS_VENUE_VENUE_SLOT_BYTES, FEATURE_SET_SLOT_BYTES, HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES,
-    ROUTE_FIXED_BYTES, SNAPSHOT_NOTIFICATION_BYTES, SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES,
-    SNAPSHOT_STATUS_SORT_SCRATCH_BYTES, SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES,
-    add, all_shard_book_processing_bytes, book_processing_peak, estimate_peak_bytes, multiply,
-    persistent_stream_bytes, route_feature_owner_bytes, snapshot_publication_reader_peak,
+    ACTION_CONTROL_ROUTE_BYTES, ACTION_CONTROL_SHARD_BYTES, ACTOR_FIXED_BYTES,
+    CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES, CROSS_VENUE_COMMAND_SLOT_BYTES,
+    CROSS_VENUE_INSTRUMENT_SLOT_BYTES, CROSS_VENUE_VENUE_SLOT_BYTES, FEATURE_SET_SLOT_BYTES,
+    HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SNAPSHOT_NOTIFICATION_BYTES,
+    SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES, SNAPSHOT_STATUS_SORT_SCRATCH_BYTES,
+    SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES, add,
+    all_shard_book_processing_bytes, all_shard_feature_snapshot_scratch_bytes,
+    book_processing_peak, estimate_peak_bytes, multiply, persistent_stream_bytes,
+    route_feature_owner_bytes, snapshot_publication_reader_peak,
 };
 use crate::runtime::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
@@ -112,6 +114,10 @@ fn checked_arithmetic_accepts_exact_maximum_and_rejects_overflow() -> TestResult
         multiply(u64::MAX, 2),
         Err(LiveRuntimeConfigError::CapacityOverflow)
     ));
+    assert!(
+        crate::features::RouteFeatureState::snapshot_construction_scratch_bytes(usize::MAX)
+            .is_none()
+    );
     Ok(())
 }
 
@@ -126,13 +132,15 @@ fn route_state_nonce_source_stream_and_dual_book_terms_have_exact_deltas() -> Te
     let config = LiveRuntimeConfig::try_new(input()?)?;
     let processing_delta = all_shard_book_processing_bytes(&config, &both_routes)?
         - all_shard_book_processing_bytes(&config, std::slice::from_ref(&base_route))?;
+    let feature_scratch_delta = all_shard_feature_snapshot_scratch_bytes(&config, &both_routes)?
+        - all_shard_feature_snapshot_scratch_bytes(&config, std::slice::from_ref(&base_route))?;
     let expected_route = ROUTE_FIXED_BYTES
         + 8 * NONCE_SLOT_BYTES
         + 2 * SOURCE_ADMISSION_BYTES
         + 2 * persistent_stream_bytes(4)?
         + route_feature_owner_bytes(&config)?
-        + snapshot_publication_reader_peak(4_096, 2, 2)?.publication_count
-            * u64::from(config.maximum_feature_snapshot_bytes().get())
+        + ACTION_CONTROL_ROUTE_BYTES
+        + feature_scratch_delta
         + SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES
         + processing_delta;
     assert_eq!(with_second - base, expected_route);
@@ -234,20 +242,13 @@ fn one_more_shard_charges_mailbox_candidate_control_snapshot_and_actor() -> Test
         + 4 * CHANNEL_COMMAND_SLOT_BYTES
         + processing.shard_scratch_bytes
         + 2 * CONTROL_SLOT_BYTES
+        + ACTION_CONTROL_SHARD_BYTES
         + (expanded_snapshot.additional_bytes - base_snapshot.additional_bytes)
-        + (expanded_snapshot.publication_count - base_snapshot.publication_count)
-            * u64::from(configured_feature_snapshot_bytes()?)
         + 2 * (SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES)
         + ACTOR_FIXED_BYTES
         + SNAPSHOT_NOTIFICATION_BYTES;
     assert_eq!(three_shards - base, expected_delta);
     Ok(())
-}
-
-fn configured_feature_snapshot_bytes() -> TestResult<u32> {
-    Ok(LiveRuntimeConfig::try_new(input()?)?
-        .maximum_feature_snapshot_bytes()
-        .get())
 }
 
 #[test]
@@ -262,9 +263,12 @@ fn feature_owner_terms_have_exact_incremental_charges() -> TestResult {
 
     let mut feature_set = base_input.clone();
     feature_set.maximum_feature_sets_per_route += 1;
+    let expanded = LiveRuntimeConfig::try_new(feature_set.clone())?;
+    let original = LiveRuntimeConfig::try_new(base_input.clone())?;
     assert_eq!(
         estimate(feature_set, &routes)? - base,
-        FEATURE_SET_SLOT_BYTES
+        FEATURE_SET_SLOT_BYTES + all_shard_feature_snapshot_scratch_bytes(&expanded, &routes)?
+            - all_shard_feature_snapshot_scratch_bytes(&original, &routes)?
     );
 
     let mut hook_byte = base_input.clone();
@@ -296,10 +300,22 @@ fn feature_owner_terms_have_exact_incremental_charges() -> TestResult {
         2 * CROSS_VENUE_VENUE_SLOT_BYTES
     );
 
-    let publication_count = snapshot_publication_reader_peak(4_096, 2, 2)?.publication_count;
-    let mut snapshot_byte = base_input;
-    snapshot_byte.maximum_feature_snapshot_bytes += 1;
-    assert_eq!(estimate(snapshot_byte, &routes)? - base, publication_count);
+    // Increasing the feature sublimit cannot increase ownership beyond the unchanged enclosing
+    // shard budget. Even a large sublimit must start at the same exact runtime ceiling.
+    let mut snapshot_bytes = base_input;
+    snapshot_bytes.maximum_feature_snapshot_bytes = 64 * 1024 * 1024;
+    snapshot_bytes.maximum_runtime_bytes = base;
+    assert_eq!(estimate(snapshot_bytes, &routes)?, base);
+    assert!(all_shard_feature_snapshot_scratch_bytes(&original, &routes)? > 0);
+    assert_eq!(all_shard_feature_snapshot_scratch_bytes(&original, &[])?, 0);
+    let mut single_shard = input()?;
+    single_shard.shard_count = 1;
+    let single_shard = LiveRuntimeConfig::try_new(single_shard)?;
+    let both_routes = [routes[0].clone(), route(INSTRUMENT_TWO, 4, 8)?];
+    assert_eq!(
+        all_shard_feature_snapshot_scratch_bytes(&single_shard, &both_routes)?,
+        all_shard_feature_snapshot_scratch_bytes(&single_shard, &routes)?
+    );
     Ok(())
 }
 
@@ -416,7 +432,6 @@ fn snapshot_reader_and_health_terms_are_bounded_at_the_documented_scope() -> Tes
     assert_eq!(
         estimate(one_more_reader, &routes)? - base,
         expanded_snapshot.additional_bytes - base_snapshot.additional_bytes
-            + u64::from(configured_feature_snapshot_bytes()?)
     );
 
     let mut one_more_snapshot_byte = input()?;
@@ -496,8 +511,11 @@ fn all_shard_processing_and_worst_reader_generations_coexist_below_the_runtime_c
     let per_shard = book_processing_peak(512, 4)?;
     assert_eq!(processing, 2 * per_shard.additional_bytes);
     let snapshots = snapshot_publication_reader_peak(4_096, 2, 4)?;
+    let feature_scratch = all_shard_feature_snapshot_scratch_bytes(&config, &routes)?;
+    let one_shard_scratch = all_shard_feature_snapshot_scratch_bytes(&config, &routes[..1])?;
+    assert_eq!(feature_scratch, 2 * one_shard_scratch);
     let total = estimate_peak_bytes(&config, &routes)?.get();
-    assert!(total >= processing + snapshots.additional_bytes);
+    assert!(total >= processing + snapshots.additional_bytes + feature_scratch);
     Ok(())
 }
 

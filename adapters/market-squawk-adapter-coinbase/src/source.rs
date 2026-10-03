@@ -1,22 +1,29 @@
 //! One-generation Coinbase transport implementation.
 
-use std::{future::Future, time::Instant};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
-    LiveSourceGeneration, RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata,
-    SourceMetadataProvider, TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, LiveMarketSource, LiveSourceGeneration, RawMarketSink,
+    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
+use tokio_tungstenite::tungstenite::{
+    Error as WebSocketError, Message, error::CapacityError, protocol::WebSocketConfig,
+};
 use tokio_tungstenite::{WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 
 use crate::CoinbaseExchangeConfig;
 
-/// Production Coinbase Exchange one-generation source.
+/// Production Coinbase Advanced Trade public-market-data one-generation source.
 #[derive(Debug)]
 pub struct CoinbaseExchangeSource {
     config: CoinbaseExchangeConfig,
@@ -68,11 +75,27 @@ impl CoinbaseExchangeSource {
         Ok(())
     }
 
-    fn acquire_budget(&self) -> Result<BudgetPermit, SourceError> {
-        match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => Ok(permit),
-            BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
-            BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
+    fn reserve_budget(&self) -> Result<BudgetReservation, SourceError> {
+        match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => Ok(reservation),
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
+        }
+    }
+
+    fn commit_budget(reservation: BudgetReservation) -> Result<BudgetPermit, SourceError> {
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => Ok(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                Err(SourceError::BudgetWaitUntil { deadline })
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                Err(SourceError::BudgetUnavailable { reason })
+            }
         }
     }
 
@@ -91,7 +114,7 @@ impl CoinbaseExchangeSource {
             .network_policy()
             .authorize(self.config.endpoint())
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        let permit = self.acquire_budget()?;
+        let reservation = self.reserve_budget()?;
         let limits = self.config.transport_limits();
         let websocket_config = WebSocketConfig::default()
             .read_buffer_size(limits.max_frame_bytes().clamp(4 * 1024, 128 * 1024))
@@ -99,20 +122,24 @@ impl CoinbaseExchangeSource {
             .max_write_buffer_size(32 * 1024)
             .max_message_size(Some(limits.max_frame_bytes()))
             .max_frame_size(Some(limits.max_frame_bytes()));
+        let permit = Self::commit_budget(reservation)?;
         let connect =
             connect_async_with_config(self.config.endpoint(), Some(websocket_config), true);
-        let (socket, _response) =
-            await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
-                map_connect_error(error, &self.budget)
-            })
-            .await?;
+        let (socket, _response) = await_websocket(
+            "connect",
+            &cancellation,
+            limits.connect_timeout(),
+            connect,
+            |error| map_connect_error(error, &self.budget),
+        )
+        .await?;
         self.run_socket(socket, permit, sink, cancellation).await
     }
 
     async fn run_socket<S>(
         &mut self,
         mut socket: WebSocketStream<S>,
-        _permit: BudgetPermit,
+        permit: BudgetPermit,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError>
@@ -120,57 +147,80 @@ impl CoinbaseExchangeSource {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         self.validate_generation()?;
-        let limits = self.config.transport_limits();
-        send_with_deadline(
-            &mut socket,
-            Message::Text(self.config.subscription().into()),
-            &cancellation,
-            limits.io_timeout(),
-        )
-        .await?;
-        self.budget
-            .record_success()
-            .map_err(|_| SourceError::ProviderUnavailable)?;
-
-        loop {
-            let message =
-                read_with_deadline(&mut socket, sink, &cancellation, limits.io_timeout()).await?;
-            match message {
-                Message::Text(text) => {
-                    let payload = text.as_bytes();
-                    ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
-                    let frame = self
-                        .authority
-                        .frames_mut()?
-                        .try_frame(TransportFrameKind::Text, Bytes::copy_from_slice(payload))?;
-                    sink.try_publish(frame)?;
+        sink.bind_active_request_budget(permit.active_lease())?;
+        let result = async {
+            let limits = self.config.transport_limits();
+            for subscription in self.config.subscriptions() {
+                send_with_deadline(
+                    &mut socket,
+                    Message::Text(subscription.as_ref().into()),
+                    &cancellation,
+                    limits.io_timeout(),
+                )
+                .await?;
+            }
+            let mut provider_message_observed = false;
+            loop {
+                let message = read_with_deadline(
+                    &mut socket,
+                    sink,
+                    &cancellation,
+                    limits.io_timeout(),
+                    limits.max_frame_bytes(),
+                )
+                .await?;
+                match message {
+                    Message::Text(text) => {
+                        let payload = text.as_bytes();
+                        ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
+                        let frame = self
+                            .authority
+                            .frames_mut()?
+                            .try_frame(TransportFrameKind::Text, Bytes::copy_from_slice(payload))?;
+                        sink.try_publish(frame)?;
+                        record_first_provider_message(
+                            &self.budget,
+                            &mut provider_message_observed,
+                        )?;
+                    }
+                    Message::Binary(payload) => {
+                        ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
+                        let frame = self
+                            .authority
+                            .frames_mut()?
+                            .try_frame(TransportFrameKind::Binary, payload)?;
+                        sink.try_publish(frame)?;
+                        record_first_provider_message(
+                            &self.budget,
+                            &mut provider_message_observed,
+                        )?;
+                    }
+                    Message::Ping(payload) => {
+                        send_with_deadline(
+                            &mut socket,
+                            Message::Pong(payload),
+                            &cancellation,
+                            limits.io_timeout(),
+                        )
+                        .await?;
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(frame) => {
+                        let _provider_close = frame;
+                        flush_with_deadline(&mut socket, &cancellation, limits.io_timeout())
+                            .await?;
+                        return Err(SourceError::ProviderUnavailable);
+                    }
+                    Message::Frame(_) => return Err(SourceError::InvalidProtocolState),
                 }
-                Message::Binary(payload) => {
-                    ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
-                    let frame = self
-                        .authority
-                        .frames_mut()?
-                        .try_frame(TransportFrameKind::Binary, payload)?;
-                    sink.try_publish(frame)?;
-                }
-                Message::Ping(payload) => {
-                    send_with_deadline(
-                        &mut socket,
-                        Message::Pong(payload),
-                        &cancellation,
-                        limits.io_timeout(),
-                    )
-                    .await?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(frame) => {
-                    let _provider_close = frame;
-                    flush_with_deadline(&mut socket, &cancellation, limits.io_timeout()).await?;
-                    return Err(SourceError::ProviderUnavailable);
-                }
-                Message::Frame(_) => return Err(SourceError::InvalidProtocolState),
             }
         }
+        .await;
+        if matches!(result, Err(SourceError::Cancelled)) {
+            sink.finish_stream_cancellation().await?;
+        }
+        drop(permit);
+        result
     }
 
     #[cfg(test)]
@@ -188,7 +238,7 @@ impl CoinbaseExchangeSource {
             return Err(SourceError::Cancelled);
         }
         self.validate_generation()?;
-        let permit = self.acquire_budget()?;
+        let permit = Self::commit_budget(self.reserve_budget()?)?;
         self.run_socket(socket, permit, sink, cancellation).await
     }
 
@@ -215,6 +265,7 @@ impl LiveMarketSource for CoinbaseExchangeSource {
 }
 
 async fn await_websocket<T, E, F>(
+    stage: &'static str,
     cancellation: &CancellationToken,
     deadline: std::time::Duration,
     operation: impl Future<Output = Result<T, E>>,
@@ -228,8 +279,15 @@ where
         () = cancellation.cancelled() => Err(SourceError::Cancelled),
         result = tokio::time::timeout(deadline, operation) => match result {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(map_error(error)),
-            Err(_) => Err(SourceError::Network),
+            Ok(Err(error)) => {
+                let classified = map_error(error);
+                tracing::warn!(stage, error = %classified, "Coinbase transport operation failed");
+                Err(classified)
+            }
+            Err(_) => {
+                tracing::warn!(stage, "Coinbase transport deadline elapsed");
+                Err(SourceError::Network)
+            }
         }
     }
 }
@@ -243,9 +301,13 @@ async fn send_with_deadline<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    await_websocket(cancellation, deadline, socket.send(message), |_| {
-        SourceError::Network
-    })
+    await_websocket(
+        "send",
+        cancellation,
+        deadline,
+        socket.send(message),
+        |_error| SourceError::Network,
+    )
     .await
 }
 
@@ -257,7 +319,7 @@ async fn flush_with_deadline<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    await_websocket(cancellation, deadline, socket.flush(), |_| {
+    await_websocket("flush", cancellation, deadline, socket.flush(), |_| {
         SourceError::Network
     })
     .await
@@ -268,11 +330,13 @@ async fn read_with_deadline<S>(
     sink: &mut dyn RawMarketSink,
     cancellation: &CancellationToken,
     transport_timeout: std::time::Duration,
+    maximum_frame_bytes: usize,
 ) -> Result<Message, SourceError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let deadline = ReceiveDeadline::strictest(sink, transport_timeout)?;
+    let admitted = AtomicBool::new(false);
     let next = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Err(SourceError::Cancelled),
@@ -281,15 +345,44 @@ where
                 sink.poll_deadline(Instant::now())?;
                 return Err(SourceError::InvalidProtocolState);
             }
+            tracing::warn!(
+                stage = if admitted.load(Ordering::Relaxed) { "receive" } else { "publication_admission" },
+                "Coinbase receive deadline elapsed"
+            );
             return Err(SourceError::Network);
         }
-        result = socket.next() => result,
+        result = async {
+            sink.wait_for_capacity().await?;
+            admitted.store(true, Ordering::Relaxed);
+            Ok::<_, market_squawk_sources::SinkError>(socket.next().await)
+        } => result?,
     };
     match next {
         Some(Ok(message)) => Ok(message),
-        Some(Err(_)) => Err(SourceError::Network),
+        Some(Err(WebSocketError::Capacity(CapacityError::MessageTooLong { .. }))) => {
+            Err(SourceError::FrameTooLarge {
+                max: maximum_frame_bytes,
+            })
+        }
+        Some(Err(_error)) => {
+            tracing::warn!(stage = "receive", "Coinbase websocket read failed");
+            Err(SourceError::Network)
+        }
         None => Err(SourceError::ProviderUnavailable),
     }
+}
+
+fn record_first_provider_message(
+    budget: &SharedProviderBudget,
+    observed: &mut bool,
+) -> Result<(), SourceError> {
+    if !*observed {
+        budget
+            .record_success()
+            .map_err(|_| SourceError::ProviderUnavailable)?;
+        *observed = true;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

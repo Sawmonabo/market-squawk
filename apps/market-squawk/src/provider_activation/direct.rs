@@ -11,13 +11,14 @@ use market_squawk_sources::{AuthorizationMode, DataUseOperation, ProviderRateAut
 
 use crate::{ProviderActivationLease, ProviderOnboardingService};
 
+use super::CoinbaseMarketPublicationPackage;
 use super::specs::{
     COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
     CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
     ProviderAdapterActivationError,
 };
 
-const COINBASE_DIRECT_SURFACE: &str = "coinbase.exchange-direct-market-data";
+pub(super) const COINBASE_DIRECT_SURFACE: &str = "coinbase.exchange-direct-market-data";
 const COINBASE_DIRECT_PROVIDER: &str = "coinbase-exchange";
 const COINBASE_DIRECT_ACCOUNT_ROOT: &str = "coinbase-direct-account-authority";
 const COINBASE_DIRECT_ACCOUNT_SUBJECT_PREFIX: &str = "coinbase-direct-account-";
@@ -80,10 +81,15 @@ pub struct CoinbaseDirectAccountActivation {
     onboarding: Arc<ProviderOnboardingService>,
     app_config: AppConfig,
     _provider_rate: ProviderRateAuthority,
+    catalog_reader: market_squawk_data::MarketDataInstrumentReadCapability,
+    catalog_synchronizer: market_squawk_data::MarketDataInstrumentSynchronizationCapability,
+    research_service: Arc<crate::ResearchService>,
     account_subject: SourceIdentifier,
     admission: CoinbaseDirectRuntimeAdmission,
     product_count: usize,
     products: [Option<CoinbaseDirectProductActivation>; COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS],
+    publication_packages: Vec<CoinbaseMarketPublicationPackage>,
+    publication_cancellation: Option<tokio_util::sync::CancellationToken>,
     _account_authority: LocalAuthorityStateStore,
 }
 
@@ -145,11 +151,44 @@ impl CoinbaseDirectAccountActivation {
         &self._provider_rate
     }
 
+    pub(crate) fn catalog_reader(&self) -> market_squawk_data::MarketDataInstrumentReadCapability {
+        self.catalog_reader.clone()
+    }
+
+    pub(crate) fn catalog_synchronizer(&self) -> market_squawk_data::MarketDataInstrumentSynchronizationCapability {
+        self.catalog_synchronizer.clone()
+    }
+
+    pub(crate) fn research_service(&self) -> Arc<crate::ResearchService> {
+        Arc::clone(&self.research_service)
+    }
+
     pub(crate) fn take_products(
         &mut self,
     ) -> [Option<CoinbaseDirectProductActivation>; COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS] {
         self.product_count = 0;
         std::array::from_fn(|index| self.products[index].take())
+    }
+
+    pub(crate) fn take_market_publication(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<CoinbaseMarketPublicationPackage>,
+            tokio_util::sync::CancellationToken,
+        ),
+        ProviderAdapterActivationError,
+    > {
+        let cancellation = self
+            .publication_cancellation
+            .take()
+            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+        let packages = std::mem::take(&mut self.publication_packages);
+        if packages.is_empty() {
+            cancellation.cancel();
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok((packages, cancellation))
     }
 }
 
@@ -167,12 +206,25 @@ impl fmt::Debug for CoinbaseDirectAccountActivation {
     }
 }
 
+impl Drop for CoinbaseDirectAccountActivation {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.publication_cancellation.as_ref() {
+            cancellation.cancel();
+        }
+    }
+}
+
 pub(super) fn activate_coinbase_direct(
     onboarding: Arc<ProviderOnboardingService>,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
+    catalog_reader: market_squawk_data::MarketDataInstrumentReadCapability,
+    catalog_synchronizer: market_squawk_data::MarketDataInstrumentSynchronizationCapability,
+    research_service: Arc<crate::ResearchService>,
     lease: ProviderActivationLease,
     spec: CoinbaseDirectAdapterActivation,
+    publication_packages: Vec<CoinbaseMarketPublicationPackage>,
+    publication_cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<CoinbaseDirectAccountActivation, ProviderAdapterActivationError> {
     validate_direct_lease(&lease)?;
     let admission = checked_runtime_admission(&spec)?;
@@ -216,10 +268,15 @@ pub(super) fn activate_coinbase_direct(
         onboarding,
         app_config,
         _provider_rate: provider_rate,
+        catalog_reader,
+        catalog_synchronizer,
+        research_service,
         account_subject,
         admission,
         product_count,
         products,
+        publication_packages,
+        publication_cancellation: Some(publication_cancellation),
         _account_authority: account_authority,
     })
 }

@@ -23,6 +23,11 @@ use crate::{
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+use crate as sources;
+#[path = "../../tests/common/provider_identity.rs"]
+mod provider_identity;
+pub(super) use provider_identity::fixture_identity_authority;
+
 pub(super) fn source_identifier(value: &str) -> TestResult<SourceIdentifier> {
     Ok(SourceIdentifier::try_from(value)?)
 }

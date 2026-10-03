@@ -45,7 +45,10 @@ fn run_worker(mut reader: impl Read, mut writer: impl Write) -> Result<(), OnnxW
             return Ok(());
         }
     };
-    write_response(&mut writer, Ok(0.0))?;
+    let input_elements = initialization.input_elements;
+    let output_elements = initialization.output_elements;
+    drop(initialization);
+    write_response(&mut writer, Ok(&vec![0.0; output_elements]))?;
     loop {
         let mut opcode = [0_u8; 1];
         match reader.read_exact(&mut opcode) {
@@ -57,8 +60,7 @@ fn run_worker(mut reader: impl Read, mut writer: impl Write) -> Result<(), OnnxW
             return Err(OnnxWorkerProcessError::Protocol);
         }
         let count = read_u32(&mut reader)? as usize;
-        if count != initialization.input_elements || count > super::super::MAX_ONNX_REQUEST_ELEMENTS
-        {
+        if count != input_elements || count > super::super::MAX_ONNX_REQUEST_ELEMENTS {
             write_response(&mut writer, Err(WorkerError::Resource))?;
             return Ok(());
         }
@@ -75,7 +77,7 @@ fn run_worker(mut reader: impl Read, mut writer: impl Write) -> Result<(), OnnxW
             values.push(value);
         }
         let result = runner.run(&values);
-        write_response(&mut writer, result)?;
+        write_response(&mut writer, result.as_deref().map_err(|error| *error))?;
         if result.is_err() {
             return Ok(());
         }
@@ -94,9 +96,17 @@ fn build_runner(
         validate_typed_model(&model)?;
         let model = model.into_optimized().map_err(|_| WorkerError::Load)?;
         validate_typed_model(&model)?;
+        let stateless = model.nodes().iter().all(|node| node.op().is_stateless());
         let runnable = model.into_runnable().map_err(|_| WorkerError::Load)?;
+        let state = if stateless {
+            Some(TypedSimpleState::new(&runnable).map_err(|_| WorkerError::Load)?)
+        } else {
+            None
+        };
         return Ok(Box::new(TractRunner {
             runnable,
+            state,
+            output_elements: initialization.output_elements,
             input_shape: initialization.input_shape.clone(),
         }));
     }
@@ -109,29 +119,35 @@ fn build_runner(
 }
 
 trait RuntimeRunner {
-    fn run(&mut self, values: &[f32]) -> Result<f32, WorkerError>;
+    fn run(&mut self, values: &[f32]) -> Result<Vec<f32>, WorkerError>;
 }
 
 struct TractRunner {
     runnable: Arc<TypedRunnableModel>,
+    state: Option<TypedSimpleState>,
+    output_elements: usize,
     input_shape: Box<[usize]>,
 }
 
 impl RuntimeRunner for TractRunner {
-    fn run(&mut self, values: &[f32]) -> Result<f32, WorkerError> {
+    fn run(&mut self, values: &[f32]) -> Result<Vec<f32>, WorkerError> {
         let tensor =
             Tensor::from_shape(&self.input_shape, values).map_err(|_| WorkerError::Runtime)?;
-        let outputs = self
-            .runnable
-            .run(tvec!(tensor.into_tvalue()))
-            .map_err(|_| WorkerError::Runtime)?;
+        // SimpleState::run resets wires after success. Reuse only stateless
+        // optimized plans; stateful plans keep tract's fresh-state semantics.
+        let inputs = tvec!(tensor.into_tvalue());
+        let outputs = match &mut self.state {
+            Some(state) => state.run(inputs),
+            None => self.runnable.run(inputs),
+        }
+        .map_err(|_| WorkerError::Runtime)?;
         if outputs.len() != 1 {
             return Err(WorkerError::Runtime);
         }
         let output = outputs[0]
             .to_plain_array_view::<f32>()
             .map_err(|_| WorkerError::Runtime)?;
-        finite_scalar(output.iter().copied())
+        finite_output(output.iter().copied(), self.output_elements)
     }
 }
 
@@ -165,6 +181,7 @@ fn build_external_runner(
         .map_err(|_| WorkerError::Load)?;
     Ok(Box::new(ExternalRunner {
         session,
+        output_elements: initialization.output_elements,
         input_shape: initialization.input_shape.clone(),
         _runtime_image: runtime_image,
     }))
@@ -275,13 +292,14 @@ impl LinuxSealedRuntimeImage {
 #[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
 struct ExternalRunner {
     session: ort::session::Session,
+    output_elements: usize,
     input_shape: Box<[usize]>,
     _runtime_image: LinuxSealedRuntimeImage,
 }
 
 #[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
 impl RuntimeRunner for ExternalRunner {
-    fn run(&mut self, values: &[f32]) -> Result<f32, WorkerError> {
+    fn run(&mut self, values: &[f32]) -> Result<Vec<f32>, WorkerError> {
         let input = ort::value::TensorRef::from_array_view((&*self.input_shape, values))
             .map_err(|_| WorkerError::Runtime)?;
         let outputs = self
@@ -294,19 +312,28 @@ impl RuntimeRunner for ExternalRunner {
         let (_, output) = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(|_| WorkerError::Runtime)?;
-        finite_scalar(output.iter().copied())
+        finite_output(output.iter().copied(), self.output_elements)
     }
 }
 
-fn finite_scalar(mut values: impl ExactSizeIterator<Item = f32>) -> Result<f32, WorkerError> {
-    if values.len() != 1 {
+fn finite_output(
+    values: impl ExactSizeIterator<Item = f32>,
+    expected: usize,
+) -> Result<Vec<f32>, WorkerError> {
+    if values.len() != expected || expected == 0 {
         return Err(WorkerError::Runtime);
     }
-    let value = values.next().ok_or(WorkerError::Runtime)?;
-    value
-        .is_finite()
-        .then_some(value)
-        .ok_or(WorkerError::Runtime)
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected)
+        .map_err(|_| WorkerError::Resource)?;
+    for value in values {
+        if !value.is_finite() {
+            return Err(WorkerError::Runtime);
+        }
+        output.push(value);
+    }
+    Ok(output)
 }
 
 fn validate_typed_model(model: &TypedModel) -> Result<(), WorkerError> {
@@ -372,7 +399,7 @@ pub(super) fn compute_semantics_digest() -> [u8; 32] {
     bind_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-worker-compute-limits/v1",
+        b"market-squawk/onnx-worker-compute-limits/v2",
     );
     for (name, value) in [
         (

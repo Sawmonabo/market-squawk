@@ -1,6 +1,5 @@
 //! Capability-relative immutable artifact verification.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -12,11 +11,11 @@ use market_squawk_platform::ArtifactRoot;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
+use super::PhysicalArtifactEvidence;
 use super::{CatalogEvidenceSnapshot, EvidenceError, MAX_PARQUET_METADATA_BYTES};
-use crate::Sha256Digest;
 use crate::authority_transition::ArtifactInventoryDigest;
+use crate::{Catalog, DatasetSchemaRegistry, Sha256Digest};
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const PARQUET_FOOTER_BYTES: u64 = 8;
@@ -27,15 +26,17 @@ mod materialize;
 pub(crate) use materialize::MaterializedArtifactRoot;
 
 pub(crate) struct VerifiedArtifactInventory {
-    artifacts: Vec<VerifiedArtifact>,
+    source_root: ArtifactRoot,
+    snapshot: CatalogEvidenceSnapshot,
+    artifact_count: u64,
     total_bytes: u64,
     digest: ArtifactInventoryDigest,
     source_directory_identity: FileIdentity,
 }
 
 impl VerifiedArtifactInventory {
-    pub(crate) fn artifacts(&self) -> &[VerifiedArtifact] {
-        &self.artifacts
+    pub(crate) const fn artifact_count(&self) -> u64 {
+        self.artifact_count
     }
 
     pub(crate) const fn total_bytes(&self) -> u64 {
@@ -51,7 +52,7 @@ impl fmt::Debug for VerifiedArtifactInventory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VerifiedArtifactInventory")
-            .field("artifact_count", &self.artifacts.len())
+            .field("artifact_count", &self.artifact_count)
             .field("total_bytes", &self.total_bytes)
             .field("digest", &self.digest)
             .finish()
@@ -63,15 +64,8 @@ pub(crate) struct VerifiedArtifact {
     content_hash: Sha256Digest,
     size_bytes: u64,
     row_count: u64,
+    prepared_index: bool,
     file: File,
-}
-
-#[derive(Clone, Copy)]
-struct ExpectedPhysicalArtifact<'a> {
-    artifact_id: Uuid,
-    relative_reference: &'a str,
-    content_hash: Sha256Digest,
-    size_bytes: u64,
 }
 
 impl VerifiedArtifact {
@@ -93,7 +87,10 @@ impl fmt::Debug for VerifiedArtifact {
     }
 }
 
+/// The enclosing verified bundle retains the immutable catalog lease; this compact inventory
+/// retains its exact summary and the source directory capability, never a history of open files.
 pub(crate) fn verify_artifact_inventory(
+    connection: &rusqlite::Connection,
     root: &ArtifactRoot,
     snapshot: &CatalogEvidenceSnapshot,
     cancellation: &CancellationToken,
@@ -103,122 +100,120 @@ pub(crate) fn verify_artifact_inventory(
         .try_clone_directory()
         .map_err(|_| EvidenceError::UnsafeArtifact)?;
     let source_directory_identity = FileIdentity::from_metadata(&directory.dir_metadata()?);
-    let expected_rows = expected_rows(snapshot)?;
-    let mut artifacts = Vec::new();
-    artifacts
-        .try_reserve_exact(snapshot.physical_artifact_count())
-        .map_err(|_| EvidenceError::ResourceLimitExceeded)?;
-    let mut ordered = expected_physical_artifacts(snapshot)?;
-    ordered.sort_unstable_by(|left, right| left.relative_reference.cmp(right.relative_reference));
-    for artifact in ordered {
-        snapshot.check_cancellation(cancellation)?;
-        root.resolve(artifact.relative_reference)?;
-        let (parent, name) = open_parent_nofollow(&directory, artifact.relative_reference)?;
-        let named_before = parent.symlink_metadata(name)?;
-        validate_private_regular_file(&named_before, artifact.size_bytes)?;
-        let identity = FileIdentity::from_metadata(&named_before);
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        configure_nonblocking_read(&mut options);
-        let opened = parent.open_with(name, &options)?;
-        let opened_metadata = opened.metadata()?;
-        validate_private_regular_file(&opened_metadata, artifact.size_bytes)?;
-        if FileIdentity::from_metadata(&opened_metadata) != identity {
-            return Err(EvidenceError::UnsafeArtifact);
-        }
-        let mut file = opened.into_std();
-        let content_hash = hash_file(&mut file, cancellation)?;
-        if content_hash != artifact.content_hash {
-            return Err(EvidenceError::ArtifactMetadataMismatch);
-        }
-        let row_count = validate_parquet(
-            &mut file,
-            artifact.size_bytes,
+    let mut digest = inventory_digest(snapshot.physical_artifact_count());
+    Catalog::visit_physical_evidence(connection, snapshot, cancellation, |expected| {
+        root.resolve(expected.relative_reference())?;
+        let artifact = verify_one(
+            &directory,
+            &expected,
             snapshot.request().limits().max_parquet_metadata_bytes(),
+            cancellation,
         )?;
-        if expected_rows
-            .get(&artifact.artifact_id)
-            .is_some_and(|expected| *expected != row_count)
-        {
-            return Err(EvidenceError::ArtifactMetadataMismatch);
-        }
-        let named_after =
-            named_identity(&directory, artifact.relative_reference, artifact.size_bytes)?;
-        let opened_after = opened_file_metadata(&file)?;
-        validate_private_regular_file(&opened_after, artifact.size_bytes)?;
-        if named_after != identity || FileIdentity::from_metadata(&opened_after) != identity {
-            return Err(EvidenceError::UnsafeArtifact);
-        }
-        file.seek(SeekFrom::Start(0))?;
-        artifacts.push(VerifiedArtifact {
-            relative_reference: artifact.relative_reference.into(),
-            content_hash,
-            size_bytes: artifact.size_bytes,
-            row_count,
-            file,
-        });
-    }
-    root.try_clone_directory()
-        .map_err(|_| EvidenceError::UnsafeArtifact)?;
-    let total_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
-        total
-            .checked_add(artifact.size_bytes)
-            .ok_or(EvidenceError::ResourceLimitExceeded)
+        append_inventory_digest(&mut digest, &artifact)
     })?;
-    let digest = inventory_digest(&artifacts)?;
+    let revalidated = root
+        .try_clone_directory()
+        .map_err(|_| EvidenceError::UnsafeArtifact)?;
+    if FileIdentity::from_metadata(&revalidated.dir_metadata()?) != source_directory_identity {
+        return Err(EvidenceError::UnsafeArtifact);
+    }
     Ok(VerifiedArtifactInventory {
-        artifacts,
-        total_bytes,
-        digest,
+        source_root: root.clone(),
+        snapshot: snapshot.clone(),
+        artifact_count: snapshot.physical_artifact_count(),
+        total_bytes: snapshot.physical_artifact_bytes(),
+        digest: ArtifactInventoryDigest::try_new(digest.finalize().into())
+            .ok_or(EvidenceError::ArtifactMetadataMismatch)?,
         source_directory_identity,
     })
 }
 
-fn expected_physical_artifacts(
-    snapshot: &CatalogEvidenceSnapshot,
-) -> Result<Vec<ExpectedPhysicalArtifact<'_>>, EvidenceError> {
-    let mut expected = Vec::new();
-    expected
-        .try_reserve_exact(snapshot.physical_artifact_count())
-        .map_err(|_| EvidenceError::ResourceLimitExceeded)?;
-    expected.extend(
-        snapshot
-            .artifacts()
-            .iter()
-            .map(|artifact| ExpectedPhysicalArtifact {
-                artifact_id: artifact.artifact_id(),
-                relative_reference: artifact.relative_reference(),
-                content_hash: artifact.content_hash(),
-                size_bytes: artifact.size_bytes(),
-            }),
-    );
-    expected.extend(
-        snapshot
-            .query_artifacts()
-            .iter()
-            .map(|artifact| ExpectedPhysicalArtifact {
-                artifact_id: artifact.artifact_id(),
-                relative_reference: artifact.relative_reference(),
-                content_hash: artifact.content_hash(),
-                size_bytes: artifact.size_bytes(),
-            }),
-    );
-    Ok(expected)
+impl VerifiedArtifactInventory {
+    /// Recheck the entire bundle before restore makes any destination mutation.
+    pub(crate) fn revalidate(
+        &self,
+        connection: &rusqlite::Connection,
+        cancellation: &CancellationToken,
+    ) -> Result<(), EvidenceError> {
+        let current =
+            verify_artifact_inventory(connection, &self.source_root, &self.snapshot, cancellation)?;
+        if current.digest != self.digest
+            || current.source_directory_identity != self.source_directory_identity
+        {
+            return Err(EvidenceError::ArtifactMetadataMismatch);
+        }
+        Ok(())
+    }
 }
 
-fn expected_rows(snapshot: &CatalogEvidenceSnapshot) -> Result<BTreeMap<Uuid, u64>, EvidenceError> {
-    let mut expected = BTreeMap::new();
-    for generation in snapshot.generations() {
-        for object in generation.objects() {
-            if expected
-                .insert(object.artifact_id(), object.row_count())
-                .is_some_and(|previous| previous != object.row_count())
-            {
-                return Err(EvidenceError::GenerationSemanticMismatch);
-            }
+fn verify_one(
+    directory: &Dir,
+    artifact: &PhysicalArtifactEvidence,
+    max_metadata_bytes: u64,
+    cancellation: &CancellationToken,
+) -> Result<VerifiedArtifact, EvidenceError> {
+    if cancellation.is_cancelled() {
+        return Err(EvidenceError::Cancelled);
+    }
+    let (parent, name) = open_parent_nofollow(directory, artifact.relative_reference())?;
+    let named_before = parent.symlink_metadata(name)?;
+    validate_private_regular_file(&named_before, artifact.size_bytes())?;
+    let identity = FileIdentity::from_metadata(&named_before);
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    configure_nonblocking_read(&mut options);
+    let opened = parent.open_with(name, &options)?;
+    let opened_metadata = opened.metadata()?;
+    validate_private_regular_file(&opened_metadata, artifact.size_bytes())?;
+    if FileIdentity::from_metadata(&opened_metadata) != identity {
+        return Err(EvidenceError::UnsafeArtifact);
+    }
+    let mut file = opened.into_std();
+    let content_hash = hash_file(&mut file, cancellation)?;
+    if content_hash != artifact.content_hash() {
+        return Err(EvidenceError::ArtifactMetadataMismatch);
+    }
+    let prepared_index = matches!(artifact, PhysicalArtifactEvidence::PreparedIndex { .. });
+    let row_count = if prepared_index {
+        validate_sqlite_header(&mut file)?;
+        0
+    } else {
+        validate_parquet(&mut file, artifact.size_bytes(), max_metadata_bytes)?
+    };
+    if artifact
+        .expected_row_count()
+        .is_some_and(|expected| expected != row_count)
+    {
+        return Err(EvidenceError::ArtifactMetadataMismatch);
+    }
+    if let Some(schema) = artifact.schema() {
+        let expected = DatasetSchemaRegistry::local()
+            .resolve(schema)
+            .map_err(|_| EvidenceError::ArtifactMetadataMismatch)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file.try_clone()?)?;
+        if reader.schema().as_ref() != expected.as_ref() {
+            return Err(EvidenceError::ArtifactMetadataMismatch);
         }
     }
-    Ok(expected)
+    let named_after = named_identity(
+        directory,
+        artifact.relative_reference(),
+        artifact.size_bytes(),
+    )?;
+    let opened_after = opened_file_metadata(&file)?;
+    validate_private_regular_file(&opened_after, artifact.size_bytes())?;
+    if named_after != identity || FileIdentity::from_metadata(&opened_after) != identity {
+        return Err(EvidenceError::UnsafeArtifact);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(VerifiedArtifact {
+        relative_reference: artifact.relative_reference().into(),
+        content_hash,
+        size_bytes: artifact.size_bytes(),
+        row_count,
+        prepared_index,
+        file,
+    })
 }
 
 fn open_parent_nofollow<'a>(
@@ -381,29 +376,27 @@ fn validate_parquet(
     Ok(rows)
 }
 
-fn inventory_digest(
-    artifacts: &[VerifiedArtifact],
-) -> Result<ArtifactInventoryDigest, EvidenceError> {
+fn inventory_digest(count: u64) -> Sha256 {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/analytical-artifact-inventory/v1");
+    digest.update(count.to_be_bytes());
+    digest
+}
+
+fn append_inventory_digest(
+    digest: &mut Sha256,
+    artifact: &VerifiedArtifact,
+) -> Result<(), EvidenceError> {
     digest.update(
-        u64::try_from(artifacts.len())
+        u64::try_from(artifact.relative_reference.len())
             .map_err(|_| EvidenceError::ResourceLimitExceeded)?
             .to_be_bytes(),
     );
-    for artifact in artifacts {
-        digest.update(
-            u64::try_from(artifact.relative_reference.len())
-                .map_err(|_| EvidenceError::ResourceLimitExceeded)?
-                .to_be_bytes(),
-        );
-        digest.update(artifact.relative_reference.as_bytes());
-        digest.update(artifact.content_hash.bytes());
-        digest.update(artifact.size_bytes.to_be_bytes());
-        digest.update(artifact.row_count.to_be_bytes());
-    }
-    ArtifactInventoryDigest::try_new(digest.finalize().into())
-        .ok_or(EvidenceError::ArtifactMetadataMismatch)
+    digest.update(artifact.relative_reference.as_bytes());
+    digest.update(artifact.content_hash.bytes());
+    digest.update(artifact.size_bytes.to_be_bytes());
+    digest.update(artifact.row_count.to_be_bytes());
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -452,4 +445,16 @@ mod tests {
         ));
         Ok(())
     }
+}
+
+// Full content authentication above binds the immutable database verified at publication.
+// Reopening financial indexes additionally checks SQLite structure and derivation metadata.
+fn validate_sqlite_header(file: &mut File) -> Result<(), EvidenceError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header)?;
+    if &header != b"SQLite format 3\0" {
+        return Err(EvidenceError::ArtifactMetadataMismatch);
+    }
+    Ok(())
 }

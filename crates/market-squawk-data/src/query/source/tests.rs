@@ -53,7 +53,7 @@ async fn pinned_query_receipt_derives_exact_monetary_cell() -> TestResult {
     let (_directory, service, pinned) = published_dataset_fixture().await?;
     let manifest = pinned.manifest().clone();
     let engine = ResearchQueryEngine::from_pinned_dataset(
-        pinned,
+        pinned.clone(),
         "observations",
         service.object_store(),
         CancellationToken::new(),
@@ -77,7 +77,8 @@ async fn pinned_query_receipt_derives_exact_monetary_cell() -> TestResult {
             )?,
             CancellationToken::new(),
         )
-        .await?;
+        .await
+        .map_err(|error| format!("forged inline query: {error:?}"))?;
     assert!(matches!(forged.result(), QueryResult::Inline { .. }));
     let value = engine
         .canonical_research_monetary_value(
@@ -93,7 +94,8 @@ async fn pinned_query_receipt_derives_exact_monetary_cell() -> TestResult {
             )?,
             CancellationToken::new(),
         )
-        .await?;
+        .await
+        .map_err(|error| format!("canonical monetary query: {error:?}"))?;
 
     assert_eq!(value.manifest(), &manifest);
     assert_ne!(value.object_graph_digest().bytes(), [0; 32]);
@@ -119,6 +121,121 @@ async fn pinned_query_receipt_derives_exact_monetary_cell() -> TestResult {
     assert_eq!(value.revision(), 1);
     assert_eq!(value.data_quality(), DataQuality::OfficialDelayed);
     assert_ne!(value.payload_digest().bytes(), [0; 32]);
+    let limits = QueryLimits::try_new(
+        4,
+        128 * 1024 * 1024,
+        8 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(10),
+    )?;
+    let sql = "SELECT source_id FROM observations";
+    let inline = engine
+        .query_pinned(
+            QueryRequest::try_new(manifest.clone(), sql)?,
+            limits,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| format!("inline reference query: {error:?}"))?;
+    let mut consumed_rows = 0;
+    let consumed = engine
+        .query_pinned_consume(
+            QueryRequest::try_new(manifest.clone(), sql)?,
+            limits,
+            CancellationToken::new(),
+            |batch| {
+                consumed_rows += batch.num_rows();
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| format!("streamed reference query: {error:?}"))?;
+    assert_eq!(consumed.result_digest(), inline.result_digest());
+    assert_eq!(consumed.object_graph_digest(), inline.object_graph_digest());
+    assert_eq!(consumed_rows, 1);
+    assert!(matches!(
+        consumed.result(),
+        QueryResult::Consumed { row_count: 1, .. }
+    ));
+
+    let cancellation = CancellationToken::new();
+    let objects = service.object_store();
+    let mut cursor = objects.pinned_batch_cursor(&pinned, 1, 8 * 1024 * 1024, &cancellation)?;
+    let first = cursor.next_batch().await?.ok_or("missing pinned batch")?;
+    assert_eq!(first.num_rows(), 1);
+    let (object, row) = cursor.position();
+    let mut resumed = objects.pinned_batch_cursor_from(
+        &pinned,
+        object,
+        row,
+        1,
+        8 * 1024 * 1024,
+        &cancellation,
+    )?;
+    assert!(resumed.next_batch().await?.is_none());
+    assert!(cursor.next_batch().await?.is_none());
+    cancellation.cancel();
+    assert!(matches!(
+        cursor.next_batch().await,
+        Err(ParquetStoreError::Cancelled)
+    ));
+    // The ordered result is larger than its working-RAM budget. Its complete rows still cross
+    // the owned consumer and receive a receipt, with native external sorting enabled.
+    let ordered = format!(
+        "{} CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS f(value) ORDER BY a.value DESC",
+        ARTIFACT_QUERY.replacen("SELECT a.value", "SELECT a.value, b.value", 1)
+    );
+    let limits = QueryLimits::try_new(
+        1_000_000,
+        32 * 1024 * 1024,
+        8 * 1024 * 1024,
+        1,
+        512,
+        512,
+        Duration::from_secs(60),
+    )?
+    .with_test_required_spill();
+    let mut previous = i64::MAX;
+    let mut count = 0_usize;
+    let receipt = engine
+        .query_pinned_consume(
+            QueryRequest::try_new(manifest, ordered)?,
+            limits,
+            CancellationToken::new(),
+            |batch| {
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or(QueryError::InvalidSource)?;
+                for value in values.values() {
+                    if *value > previous {
+                        return Err(QueryError::InvalidSource);
+                    }
+                    previous = *value;
+                }
+                count += batch.num_rows();
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| format!("complete million-row external sort: {error:?}"))?;
+    assert_eq!(count, 1_000_000);
+    assert!(
+        matches!(receipt.result(), QueryResult::Consumed { row_count: 1_000_000, byte_count } if *byte_count > limits.max_memory_bytes())
+    );
+    assert_eq!(
+        std::fs::read_dir(
+            objects
+                .try_clone_artifact_root()?
+                .root()
+                .join("staging/operations")
+        )?
+        .count(),
+        0
+    );
     Ok(())
 }
 
@@ -366,7 +483,13 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
                 )
                 .await
         });
-        barrier.wait_until_entered().await?;
+        if let Err(error) = barrier.wait_until_entered().await {
+            let outcome = query.await?;
+            return Err(format!(
+                "query exited before {checkpoint:?} bind barrier ({error}): {outcome:?}"
+            )
+            .into());
+        }
         cancellation.cancel();
         barrier.release()?;
         let result = query.await?;
@@ -378,6 +501,31 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
             matches!(result, Err(QueryError::Cancelled)),
             !expect_receipt
         );
+        if let Ok(QueryResult::Artifact {
+            object,
+            artifact,
+            ownership,
+        }) = result
+        {
+            let publication = service.query_artifact_publication();
+            let cancellation = CancellationToken::new();
+            let mut cursor = publication.verified_batch_cursor(
+                &object,
+                &artifact,
+                &ownership,
+                257,
+                16 * 1024 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                &cancellation,
+            )?;
+            let mut rows = 0_u64;
+            while let Some(batch) = cursor.next_batch().await? {
+                assert!(batch.num_rows() <= 257);
+                rows += u64::try_from(batch.num_rows())?;
+            }
+            assert_eq!(rows, object.row_count());
+            assert_eq!(rows, 100_000);
+        }
     }
 
     let (_directory, service, pinned) = published_dataset_fixture().await?;
@@ -424,7 +572,12 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
             )
             .await
     });
-    barrier.wait_until_entered().await?;
+    if let Err(error) = barrier.wait_until_entered().await {
+        let outcome = query.await?;
+        return Err(
+            format!("query exited before deadline bind barrier ({error}): {outcome:?}").into(),
+        );
+    }
     barrier.release()?;
     let result = query.await?;
     assert!(

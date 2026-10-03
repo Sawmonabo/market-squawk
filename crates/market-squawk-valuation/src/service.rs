@@ -2,11 +2,12 @@
 
 mod memory;
 mod operations;
-mod queries;
+pub(crate) mod queries;
 mod recovery;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use market_squawk_data::{
@@ -250,6 +251,70 @@ impl FairValueAuditEvent {
     /// Returns the catalog-trusted append time.
     pub const fn occurred_at(&self) -> Timestamp {
         self.appended_at
+    }
+}
+
+/// Stable position immediately after one retained hash-chain audit event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FairValueAuditCursor {
+    sequence: NonZeroU64,
+    event_id: AuditEventId,
+}
+
+impl FairValueAuditCursor {
+    /// Creates a structurally valid cursor; the service validates it against retained state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FairValueError::InvalidAuditCursor`] for sequence zero.
+    pub fn try_new(sequence: u64, event_id: AuditEventId) -> Result<Self, FairValueError> {
+        let sequence = NonZeroU64::new(sequence).ok_or(FairValueError::InvalidAuditCursor)?;
+        Ok(Self { sequence, event_id })
+    }
+
+    fn after(event: &FairValueAuditEvent) -> Result<Self, FairValueError> {
+        Self::try_new(event.sequence(), event.id())
+    }
+
+    /// Returns the exact one-based event sequence.
+    pub const fn sequence(self) -> u64 {
+        self.sequence.get()
+    }
+
+    /// Returns the exact hash-chain event identity.
+    pub const fn event_id(self) -> AuditEventId {
+        self.event_id
+    }
+}
+
+/// One bounded oldest-to-newest audit page with exact retained counts and continuation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FairValueAuditPage {
+    events: Vec<Arc<FairValueAuditEvent>>,
+    total_count: usize,
+    available_from_cursor: usize,
+    next_cursor: Option<FairValueAuditCursor>,
+}
+
+impl FairValueAuditPage {
+    /// Returns immutable events in hash-chain order.
+    pub fn events(&self) -> &[Arc<FairValueAuditEvent>] {
+        &self.events
+    }
+
+    /// Returns the exact number of audit events retained by this service image.
+    pub const fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    /// Returns the exact number available after the submitted cursor, before page truncation.
+    pub const fn available_from_cursor(&self) -> usize {
+        self.available_from_cursor
+    }
+
+    /// Returns a cursor after the final returned event when another page exists.
+    pub const fn next_cursor(&self) -> Option<FairValueAuditCursor> {
+        self.next_cursor
     }
 }
 

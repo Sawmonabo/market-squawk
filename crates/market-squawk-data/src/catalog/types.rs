@@ -540,6 +540,10 @@ pub struct IngestReservation {
 }
 
 impl IngestReservation {
+    pub(crate) const fn catalog_id(&self) -> Uuid {
+        self.catalog_id
+    }
+
     /// Returns the opaque run identity used by downstream publication.
     pub const fn run_id(&self) -> Uuid {
         self.run_id
@@ -745,7 +749,9 @@ impl AuditEvent {
 
 /// The sole process-local writer for one catalog path.
 pub struct Catalog {
+    pub(crate) publication_observer: crate::ingest::DataPublicationObserverSlot,
     pub(super) connection: Connection,
+    pub(super) location: CatalogLocation,
     pub(super) _catalog_file: CatalogFileGuard,
     pub(super) _cross_process_writer: CatalogWriterGuard,
     pub(super) _writer_permit: WriterPermit,
@@ -754,6 +760,7 @@ pub struct Catalog {
     pub(super) result_bytes: CatalogResultLimits,
     pub(super) catalog_id: Uuid,
     pub(super) artifact_root_binding: [u8; 32],
+    pub(super) planner_maintenance_at: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl fmt::Debug for Catalog {
@@ -880,6 +887,9 @@ pub enum CatalogError {
     /// The supplied reservation was not sealed by this open catalog session.
     #[error("catalog ingest reservation is not valid for this session")]
     InvalidReservationCapability,
+    /// Shared composition authority is occupied by another operation.
+    #[error("catalog composition authority is busy")]
+    AuthorityBusy,
     /// Shared composition authority could not be locked.
     #[error("catalog composition authority lock is unavailable")]
     AuthorityLockPoisoned,
@@ -931,6 +941,18 @@ pub enum CatalogError {
     /// The caller's monotonic deadline elapsed while instrument definitions were being pinned.
     #[error("catalog instrument-definition read deadline elapsed")]
     InstrumentDefinitionReadDeadlineExceeded,
+    /// Cancellation was observed while bounded company identities were being read.
+    #[error("catalog company-identity read was cancelled")]
+    CompanyIdentityReadCancelled,
+    /// The caller's monotonic deadline elapsed while company identities were being read.
+    #[error("catalog company-identity read deadline elapsed")]
+    CompanyIdentityReadDeadlineExceeded,
+    /// Cancellation was observed while retained market routes or source revisions were read.
+    #[error("catalog market recovery read was cancelled")]
+    MarketRecoveryReadCancelled,
+    /// The caller's monotonic deadline elapsed during retained market recovery reads.
+    #[error("catalog market recovery read deadline elapsed")]
+    MarketRecoveryReadDeadlineExceeded,
     /// An append identity already names different immutable evidence.
     #[error("catalog append identity conflicts with retained evidence")]
     EvidenceConflict,
@@ -946,6 +968,24 @@ pub enum CatalogError {
     /// A publication did not name an active reserved run.
     #[error("catalog run is unknown or is not reserved")]
     RunStateConflict,
+    /// A sealed provider capture does not match its exact source object and ingest run.
+    #[error("provider capture does not match the source object or ingest run")]
+    ProviderCaptureMismatch,
+    /// A repeated provider-capture admission differs from retained immutable evidence.
+    #[error("provider capture conflicts with retained immutable evidence")]
+    ProviderCaptureConflict,
+    /// A sealed typed provider event does not match its raw frame evidence or ingest run.
+    #[error("provider event publication does not match its raw evidence or ingest run")]
+    ProviderEventMismatch,
+    /// A repeated typed event/composite admission differs from retained immutable evidence.
+    #[error("provider event publication conflicts with retained immutable evidence")]
+    ProviderEventConflict,
+    /// A sealed streamed logical publication does not match its source, run, or exact evidence.
+    #[error("provider logical publication does not match its source, run, or exact evidence")]
+    ProviderLogicalMismatch,
+    /// A repeated streamed logical publication differs from retained immutable evidence.
+    #[error("provider logical publication conflicts with retained immutable evidence")]
+    ProviderLogicalConflict,
     /// Backups are never overwritten.
     #[error("catalog backup destination already exists")]
     BackupAlreadyExists,

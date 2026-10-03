@@ -66,6 +66,38 @@ fn dynamic_api_rules_are_segment_and_query_structural() -> TestResult {
             Err(NetworkPolicyError::EndpointDenied { .. })
         ));
     }
+
+    let required_empty =
+        QueryParameterRule::try_new_exact_empty_public(source_identifier("lastObs")?)?;
+    let exact_format = QueryParameterRule::try_new_exact_public(
+        source_identifier("format")?,
+        source_identifier("json")?,
+    )?;
+    let rule = ApiEndpointRule::try_new(
+        "https://api.example.test/history",
+        PathScope::Exact,
+        vec![required_empty, exact_format],
+        3,
+        64,
+    )?;
+    let policy = EndpointPolicy::try_from_api_rules(vec![rule], HttpRequestBounds::default())?;
+    let wire = serde_json::to_string(&policy)?;
+    let policy: EndpointPolicy = serde_json::from_str(&wire)?;
+    policy.authorize_request("https://api.example.test/history?lastObs=&format=json")?;
+    for denied in [
+        "https://api.example.test/history?format=json",
+        "https://api.example.test/history?LastObs=&format=json",
+        "https://api.example.test/history?lastObs=value&format=json",
+        "https://api.example.test/history?lastObs=&lastObs=&format=json",
+    ] {
+        assert!(matches!(
+            policy.authorize_request(denied),
+            Err(NetworkPolicyError::EndpointDenied { .. })
+        ));
+    }
+    let invalid_wire = wire.replace("\"max_value_bytes\":0", "\"max_value_bytes\":1");
+    assert_ne!(invalid_wire, wire);
+    assert!(serde_json::from_str::<EndpointPolicy>(&invalid_wire).is_err());
     Ok(())
 }
 

@@ -3,12 +3,14 @@
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use market_squawk_domain::Timestamp;
 use rusqlite::{Connection, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
 
-use super::{Catalog, CatalogError};
+use super::{Catalog, CatalogAuthority, CatalogError};
 use crate::BackupReceipt;
 use crate::authority_transition::evidence::CatalogContentEvidenceDigest;
 use crate::authority_transition::{
@@ -19,6 +21,34 @@ use crate::authority_transition::{
     RestoreReceiptFields, RootEndpointIdentity, RootInstanceId, StableArtifactRootIdentity,
     TransitionId,
 };
+
+/// Acquires the catalog writer only within an owned blocking I/O operation.
+/// The caller preserves its typed deadline/cancellation checks before and after admission.
+pub(super) fn lock_catalog_writer<'a, E>(
+    authority: &'a Mutex<CatalogAuthority>,
+    deadline: Instant,
+    checkpoint: impl Fn() -> Result<(), E>,
+) -> Result<MutexGuard<'a, CatalogAuthority>, E>
+where
+    E: From<CatalogError>,
+{
+    loop {
+        checkpoint()?;
+        match authority.try_lock() {
+            Ok(guard) => {
+                checkpoint()?;
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(CatalogError::AuthorityLockPoisoned.into());
+            }
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
+}
 
 const AUTHORITY_EVENT_VERSION: i64 = 2;
 const MAX_AUTHORITY_EVENTS: usize = 16_384;
@@ -138,19 +168,95 @@ impl Catalog {
         &self,
         root_endpoint: RootEndpointIdentity,
     ) -> Result<AuthorityEvidenceDigest, CatalogError> {
-        let analytical_records: i64 = self.connection.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM artifacts)
-                 + (SELECT COUNT(*) FROM dataset_manifests)
-                 + (SELECT COUNT(*) FROM analytical_generations)
-                 + (SELECT COUNT(*) FROM analytical_generation_objects)
-                 + (SELECT COUNT(*) FROM query_artifact_results)",
-            [],
-            |row| row.get(0),
-        )?;
-        if analytical_records != 0 {
-            return Err(CatalogError::ArtifactRootAuthorityTransitionConflict);
+        // Keep one read snapshot without building a deep SQLite expression tree.
+        // Only emptiness matters, so stop at the first retained analytical record.
+        let transaction = self.connection.unchecked_transaction()?;
+        for table in [
+            "artifacts",
+            "model_inventory_series",
+            "model_inventory_records",
+            "forecast_inventory_vintages",
+            "forecast_inventory_outcomes",
+            "chart_projection_headers",
+            "chart_projection_rows",
+            "dataset_manifests",
+            "analytical_generations",
+            "analytical_generation_objects",
+            "query_artifact_results",
+            "sec_prepared_indexes",
+            "company_identity_observations",
+            "listing_reference_generations",
+            "listing_reference_files",
+            "listing_reference_values",
+            "listing_reference_memberships",
+            "market_data_instrument_identities",
+            "market_data_instrument_revisions",
+            "market_data_instrument_current",
+            "market_data_instrument_search_terms",
+            "company_security_link_events",
+            "company_security_link_current",
+            "official_options_reference_generations",
+            "official_options_reference_generation_sources",
+            "official_options_reference_objects",
+            "official_options_reference_values",
+            "official_options_reference_memberships",
+            "official_options_reference_alias_resolutions",
+            "official_options_reference_conflicts",
+            "provider_raw_observations",
+            "provider_raw_observation_pages",
+            "sealed_raw_objects",
+            "provider_raw_observation_objects",
+            "provider_raw_observation_frames",
+            "provider_capture_bindings",
+            "provider_capture_binding_native_lineage",
+            "provider_capture_binding_objects",
+            "provider_capture_binding_rows",
+            "provider_macro_plan_values",
+            "provider_macro_plan_value_chunks",
+            "provider_macro_plan_sessions",
+            "provider_macro_plan_staged_pages",
+            "provider_macro_plan_terminal_completions",
+            "provider_macro_plan_finalizations",
+            "provider_macro_plan_finalized_groups",
+            "provider_macro_plan_publications",
+            "provider_macro_plan_published_heads",
+            "provider_response_market_event_bindings",
+            "provider_response_market_event_binding_native_lineage",
+            "provider_response_market_event_binding_rows",
+            "provider_event_microbatches",
+            "provider_event_microbatch_frames",
+            "provider_event_microbatch_objects",
+            "provider_event_bindings",
+            "provider_event_binding_native_lineage",
+            "provider_event_binding_rows",
+            "provider_composite_response_event_bindings",
+            "provider_option_market_bindings",
+            "provider_option_market_binding_native_lineage",
+            "provider_option_market_binding_rows",
+            "provider_capture_originals",
+            "provider_logical_originals",
+            "provider_logical_original_objects",
+            "provider_logical_publication_bindings",
+            "provider_logical_publication_required_families",
+            "provider_logical_publication_objects",
+            "provider_logical_publication_partitions",
+            "provider_logical_publication_canonical_expectations",
+            "ingest_run_provider_capture_bindings",
+            "ingest_run_provider_publication_bindings",
+            "provider_market_event_selection_index",
+            "analytical_generation_provider_capture_bindings",
+            "analytical_generation_provider_publication_bindings",
+        ] {
+            let populated: bool = transaction.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                [],
+                |row| row.get(0),
+            )?;
+            if populated {
+                return Err(CatalogError::ArtifactRootAuthorityTransitionConflict);
+            }
         }
+        transaction.commit()?;
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/empty-analytical-authority-evidence/v2");
         digest.update(self.catalog_endpoint_identity()?.bytes());
@@ -950,14 +1056,8 @@ pub(crate) fn exact_catalog_file_binding(
     file: &File,
     path: &Path,
 ) -> Result<[u8; 32], CatalogError> {
-    use cap_fs_ext::MetadataExt as _;
-
-    let metadata = cap_std::fs::File::from_std(file.try_clone()?).metadata()?;
-    Ok(hash_catalog_file_identity(
-        path,
-        metadata.dev(),
-        metadata.ino(),
-    ))
+    let endpoint = market_squawk_platform::persistent_endpoint_identity(file, path)?;
+    Ok(hash_catalog_file_identity(path, endpoint))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -968,14 +1068,13 @@ pub(crate) fn exact_catalog_file_binding(
     Err(CatalogError::UnsafePath)
 }
 
-fn hash_catalog_file_identity(path: &Path, device: u64, inode: u64) -> [u8; 32] {
+fn hash_catalog_file_identity(path: &Path, endpoint: [u8; 32]) -> [u8; 32] {
     let path = path.as_os_str().as_encoded_bytes();
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/catalog-artifact-root-binding/v2");
     digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_be_bytes());
     digest.update(path);
-    digest.update(device.to_be_bytes());
-    digest.update(inode.to_be_bytes());
+    digest.update(endpoint);
     digest.finalize().into()
 }
 

@@ -1,0 +1,2321 @@
+//! Seal-first SEC submissions, Company Facts, and filing-XBRL publication with exact restart reads.
+//!
+//! The SEC adapter authors the canonical-row-to-captured-page map while it still owns the parsed
+//! request graph. This application leaf seals the exact graph in the sole raw store, consumes the
+//! one-use whole-capture token into common publication authority, and retains the immutable
+//! manifest plus source/native/raw/company evidence required for restart. Filing XBRL enters the
+//! same path only through the adapter's opaque accession/document/taxonomy capture graph.
+
+use std::io::{Read, Write};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::sync::Arc;
+use std::time::Instant;
+
+use market_squawk_adapter_sec::{
+    SecClientError, SecEdgarSource, SecExtractionResult, SecFilingXbrlCaptureHandoff,
+    SecResearchDataset, SecResearchDatasetKind, SecResearchExtractionStream,
+};
+use market_squawk_data::{
+    AnalyticalObservationOutput, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
+    AnalyticalReadError, CommittedDataset, CompanySecurityIdentityReadCapability, DatasetId,
+    DatasetManifestRef, IngestError, IngestPrecommitAuthority, ObservationKnowledgeRange,
+    PersistedProviderCaptureBindingEvidence, QueryLimits, SecFundamentalIdentityAvailability,
+    SecFundamentalIdentityQuery, SecFundamentalIdentitySelection, SecResearchFamily,
+    extraction_provider_payload_digest,
+};
+use market_squawk_domain::{
+    CompanyIdentityObservation, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest,
+    SourceIdentifier, Timestamp,
+};
+use market_squawk_services::ServiceError;
+use market_squawk_sources::{
+    DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionError, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSourceError, ProviderCaptureError, ProviderCaptureMaterial,
+    ProviderNativeLineageBatch, ProviderNativeLineageImplementation, ProviderWholeCaptureToken,
+    SealedProviderCaptureBinding, SealedProviderCaptureSetReceipt, SourceMetadata,
+    SourceMetadataProvider, SourceObjectCaptureIdentity,
+};
+use sha2::{Digest as _, Sha256};
+use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+use super::ResearchRightsAuthority;
+use super::provider_runtime::SecLiveFundCoordinatorSeal;
+use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
+
+/// Fixed typed operation for exact-manifest SEC filing candidate reads.
+pub(crate) const SEC_SUBMISSIONS_EXACT_GENERATION_OPERATION: &str =
+    "Research.GetSecFilingsExactGeneration";
+
+/// Fixed typed operation for exact-manifest SEC Company Facts candidate reads.
+pub(crate) const SEC_COMPANY_FACTS_EXACT_GENERATION_OPERATION: &str =
+    "Research.GetSecCompanyFactsExactGeneration";
+
+/// Fixed typed operation for exact-manifest filing-XBRL candidate reads.
+pub(crate) const SEC_FILING_XBRL_EXACT_GENERATION_OPERATION: &str =
+    "Research.GetSecFilingXbrlExactGeneration";
+
+/// The SEC research family carried by one exact sealed publication handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecFundamentalsFamily {
+    /// Complete submissions, including every provider-declared historical companion.
+    Submissions,
+    /// One complete Company Facts representation.
+    CompanyFacts,
+    /// One accession/document/taxonomy-bound filing XBRL extraction.
+    FilingXbrl,
+}
+
+impl From<SecResearchDatasetKind> for SecFundamentalsFamily {
+    fn from(value: SecResearchDatasetKind) -> Self {
+        match value {
+            SecResearchDatasetKind::Submissions => Self::Submissions,
+            SecResearchDatasetKind::CompanyFacts => Self::CompanyFacts,
+            SecResearchDatasetKind::FilingXbrl => Self::FilingXbrl,
+        }
+    }
+}
+
+/// Exact retained outcomes of the requested selected-company families.
+#[derive(Debug)]
+pub(crate) struct SecCompanyResearchPublication {
+    cik: SourceIdentifier,
+    submissions: Option<SecSubmissionsPublicationReceipt>,
+    company_facts: Option<SecResearchStreamPublication>,
+    filing: SecCompanyFilingPublication,
+    filing_selection: Option<SecCompanyFilingSelection>,
+    new_link_count: usize,
+}
+
+#[derive(Debug)]
+struct SecCompanyFilingSelection {
+    submissions_body_digest: EvidenceDigest,
+    received_at: Timestamp,
+    accession: Option<SourceIdentifier>,
+}
+
+#[derive(Debug)]
+enum SecCompanyFilingPublication {
+    NotRequested,
+    Published {
+        committed: CommittedDataset,
+        binding_digest: EvidenceDigest,
+        company_observation_digest: EvidenceDigest,
+    },
+    NoEligibleFiling,
+}
+
+impl SecCompanyResearchPublication {
+    pub(crate) fn cik(&self) -> &SourceIdentifier {
+        &self.cik
+    }
+
+    pub(crate) const fn new_link_count(&self) -> usize {
+        self.new_link_count
+    }
+
+    /// Exact parents to reopen through the existing security-identity selector.
+    pub(crate) fn company_parents(&self) -> Vec<(CompanyIdentitySurface, EvidenceDigest)> {
+        let mut parents = Vec::new();
+        if let Some(submissions) = &self.submissions {
+            parents.push((
+                CompanyIdentitySurface::SecSubmissions,
+                submissions.company_observation_digest(),
+            ));
+        }
+        if let Some(company_facts) = &self.company_facts {
+            parents.push((
+                CompanyIdentitySurface::SecCompanyFacts,
+                company_facts.company_observation_digest,
+            ));
+        }
+        if let SecCompanyFilingPublication::Published {
+            company_observation_digest,
+            ..
+        } = &self.filing
+        {
+            parents.push((
+                CompanyIdentitySurface::SecFilingXbrl,
+                *company_observation_digest,
+            ));
+        }
+        parents
+    }
+
+    pub(crate) fn value(&self) -> serde_json::Value {
+        use market_squawk_modeling::ForecastArtifactManifestRecord;
+        let submissions = self.submissions.as_ref().map_or_else(
+            || serde_json::json!({ "state": "not_requested" }),
+            |receipt| {
+                serde_json::json!({
+                    "state": "published",
+                    "manifest": ForecastArtifactManifestRecord::from_manifest(receipt.manifest()),
+                    "publicationBindingDigest": receipt.provider_binding_digest(),
+                    "companyObservationDigest": receipt.company_observation_digest(),
+                })
+            },
+        );
+        let company_facts = self.company_facts.as_ref().map_or_else(
+            || serde_json::json!({ "state": "not_requested" }),
+            |receipt| serde_json::json!({
+                "state": "published",
+                "manifest": ForecastArtifactManifestRecord::from_manifest(receipt.committed.manifest()),
+                "publicationBindingDigest": receipt.binding_digest,
+                "companyObservationDigest": receipt.company_observation_digest,
+            }),
+        );
+        let filing = match &self.filing {
+            SecCompanyFilingPublication::NotRequested => {
+                serde_json::json!({ "state": "not_requested" })
+            }
+            SecCompanyFilingPublication::Published {
+                committed,
+                binding_digest,
+                company_observation_digest,
+            } => serde_json::json!({
+                "state": "published",
+                "manifest": ForecastArtifactManifestRecord::from_manifest(committed.manifest()),
+                "publicationBindingDigest": binding_digest,
+                "companyObservationDigest": company_observation_digest,
+            }),
+            SecCompanyFilingPublication::NoEligibleFiling => {
+                serde_json::json!({ "state": "no_eligible_filing" })
+            }
+        };
+        let filing_selection = self.filing_selection.as_ref().map(|selection| {
+            serde_json::json!({
+                "currentSubmissionsBodyDigest": selection.submissions_body_digest,
+                "receivedAtUnixNanos": selection.received_at.unix_nanos().to_string(),
+                "accession": selection.accession,
+            })
+        });
+        serde_json::json!({
+            "submissions": submissions,
+            "companyFacts": company_facts,
+            "filingXbrl": filing,
+            "filingSelection": filing_selection,
+        })
+    }
+}
+
+/// Rejects empty or repeated families before any provider acquisition or publication.
+pub(super) fn validate_company_research_families(
+    families: &[SecResearchFamily],
+) -> Result<(), SecFundamentalsApplicationError> {
+    if families.is_empty()
+        || families
+            .iter()
+            .enumerate()
+            .any(|(index, family)| families[..index].contains(family))
+    {
+        return Err(SecFundamentalsApplicationError::InvalidSelection);
+    }
+    Ok(())
+}
+
+/// Application-owned bridge into the sole physical provider-response store.
+#[derive(Debug)]
+struct SecFundamentalsApplicationBridge {
+    research: Arc<ResearchService>,
+}
+
+/// Smallest SEC fundamentals closure that can be composed only from the coordinator-owned source
+/// registration. It owns no registry and accepts no caller-substitutable source or extraction
+/// authority after construction.
+#[derive(Debug)]
+pub(crate) struct SecFundamentalsCoordinatorClosure {
+    source: Arc<SecEdgarSource>,
+    extraction: ExtractionAuthority,
+    rights: ResearchRightsAuthority,
+    bridge: SecFundamentalsApplicationBridge,
+}
+
+impl SecFundamentalsCoordinatorClosure {
+    /// The coordinator runtime is the only module able to mint `seal`; its factory must obtain the
+    /// concrete source, extraction authority, and rights from one locked registered generation.
+    pub(super) fn from_coordinator(
+        _seal: SecLiveFundCoordinatorSeal,
+        source: Arc<SecEdgarSource>,
+        extraction: ExtractionAuthority,
+        rights: ResearchRightsAuthority,
+        research: Arc<ResearchService>,
+    ) -> Result<Self, SecFundamentalsApplicationError> {
+        if extraction.metadata() != source.metadata()
+            || rights.source_id() != source.metadata().source_id()
+        {
+            return Err(SecFundamentalsApplicationError::InvalidAuthority);
+        }
+        extraction.validate_current()?;
+        Ok(Self {
+            source,
+            extraction,
+            rights,
+            bridge: SecFundamentalsApplicationBridge::new(research),
+        })
+    }
+
+    /// Publishes only requested company API families and/or one selected financial-report filing.
+    /// The selected filing always comes from the exact captured current submissions document.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "selected identity, extraction limits, deadlines, and live precommit authority remain explicit"
+    )]
+    pub(super) async fn acquire_and_publish_company<F, Fut>(
+        &self,
+        cik: &str,
+        families: &[SecResearchFamily],
+        max_records: NonZeroU32,
+        max_bytes: NonZeroU64,
+        wall_deadline: Timestamp,
+        deadline: Instant,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        family_completed: &mut F,
+    ) -> Result<SecCompanyResearchPublication, SecFundamentalsApplicationError>
+    where
+        F: FnMut(Arc<dyn IngestPrecommitAuthority>, CancellationToken) -> Fut + Send,
+        Fut: std::future::Future<
+                Output = Result<
+                    usize,
+                    crate::application::company_security_resolution::CompanySecurityResolutionError,
+                >,
+            > + Send,
+    {
+        validate_company_research_families(families)?;
+        let submissions_dataset = SecResearchDataset::submissions(cik)?;
+        let company_cik = SourceIdentifier::try_from(submissions_dataset.cik())
+            .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?;
+        let mut new_link_count = 0usize;
+        let mut submissions_publication = None;
+        let mut facts_publication = None;
+        for (family, dataset) in [
+            (SecResearchFamily::Submissions, submissions_dataset),
+            (
+                SecResearchFamily::CompanyFacts,
+                SecResearchDataset::company_facts(cik)?,
+            ),
+        ] {
+            if !families.contains(&family) {
+                continue;
+            }
+            self.extraction.validate_current()?;
+            precommit.validate_precommit()?;
+            let discovery = DiscoveryRequest::try_new(
+                dataset.dataset().clone(),
+                None,
+                NonZeroU16::MIN,
+                wall_deadline,
+            )?;
+            let discovered = self
+                .source
+                .discover_with_capture(
+                    self.extraction.clone(),
+                    discovery,
+                    cancellation.child_token(),
+                )
+                .await?;
+            let (discovery, material) = discovered.into_parts();
+            let object = discovery
+                .objects()
+                .first()
+                .filter(|_| discovery.objects().len() == 1)
+                .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+                .clone();
+            let request =
+                ExtractionRequest::try_new(object, max_records, max_bytes, wall_deadline)?;
+            if dataset.kind() == SecResearchDatasetKind::CompanyFacts {
+                let (stream, material) = self
+                    .source
+                    .extract_company_facts_stream(
+                        self.extraction.clone(),
+                        request,
+                        material,
+                        cancellation.child_token(),
+                    )
+                    .await?;
+                let sealed = self
+                    .extract_and_seal_research_stream(
+                        SecResearchStreamPreparation::CompanyFacts { stream, material },
+                        cancellation.child_token(),
+                        deadline,
+                    )
+                    .await?;
+                if sealed.stream.company_identity().provider_company_id() != &company_cik {
+                    return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+                }
+                facts_publication = Some(
+                    Box::pin(self.publish_research_stream(
+                        sealed,
+                        Arc::clone(&precommit),
+                        cancellation.child_token(),
+                        deadline,
+                    ))
+                    .await?,
+                );
+            } else {
+                let sealed = self
+                    .extract_and_seal_selected(
+                        request,
+                        material,
+                        cancellation.child_token(),
+                        deadline,
+                    )
+                    .await?;
+                if sealed.cik() != &company_cik {
+                    return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+                }
+                let SecFundamentalsPublicationReceipt::Submissions(receipt) = self
+                    .publish(sealed, Arc::clone(&precommit), cancellation.child_token())
+                    .await?
+                else {
+                    return Err(SecFundamentalsApplicationError::InvalidSelection);
+                };
+                submissions_publication = Some(receipt);
+            }
+            if submissions_publication
+                .as_ref()
+                .is_some_and(|receipt| receipt.cik() != &company_cik)
+                || facts_publication
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.cik != company_cik)
+            {
+                return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+            }
+            // Only a genuinely committed (or exactly reused) family reaches this boundary.
+            // Its issuer relationship must not wait for a later provider family to succeed.
+            precommit.validate_precommit()?;
+            new_link_count = new_link_count
+                .checked_add(
+                    family_completed(Arc::clone(&precommit), cancellation.child_token()).await?,
+                )
+                .ok_or(SecFundamentalsApplicationError::AllocationFailed)?;
+            precommit.validate_precommit()?;
+        }
+        if !families.contains(&SecResearchFamily::FilingXbrl) {
+            return Ok(SecCompanyResearchPublication {
+                cik: company_cik,
+                submissions: submissions_publication,
+                company_facts: facts_publication,
+                filing: SecCompanyFilingPublication::NotRequested,
+                filing_selection: None,
+                new_link_count,
+            });
+        }
+        self.extraction.validate_current()?;
+        precommit.validate_precommit()?;
+        let submissions = self
+            .source
+            .fetch_submissions(&self.extraction, cik, cancellation.child_token())
+            .await?;
+        if submissions.document().cik() != &company_cik {
+            return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+        }
+        let selected = submissions
+            .document()
+            .filings()
+            .iter()
+            .filter(|filing| {
+                let form = filing
+                    .form()
+                    .as_str()
+                    .strip_suffix("/A")
+                    .unwrap_or(filing.form().as_str());
+                matches!(form, "10-K" | "10-Q" | "20-F" | "40-F")
+                    && (filing.is_inline_xbrl() || filing.is_xbrl())
+                    && filing.primary_document().is_some_and(|document| {
+                        let name = document.as_str();
+                        name.ends_with(".htm") || name.ends_with(".html") || name.ends_with(".xml")
+                    })
+            })
+            .max_by_key(|filing| {
+                (
+                    filing.filed_on(),
+                    filing.accepted_at(),
+                    filing.accession().as_str(),
+                )
+            });
+        let filing_selection = SecCompanyFilingSelection {
+            submissions_body_digest: submissions.raw().evidence(),
+            received_at: submissions.raw().received_at(),
+            accession: selected.map(|filing| filing.accession().clone()),
+        };
+        let Some(filing) = selected else {
+            // Any requested API families remain usable. This publishes no filing detail;
+            // the common point-in-time selector retains its existing typed availability.
+            return Ok(SecCompanyResearchPublication {
+                cik: company_cik,
+                submissions: submissions_publication,
+                company_facts: facts_publication,
+                filing: SecCompanyFilingPublication::NoEligibleFiling,
+                filing_selection: Some(filing_selection),
+                new_link_count,
+            });
+        };
+        let accession = filing.accession().clone();
+        let document = filing
+            .primary_document()
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+            .clone();
+        let filing = self
+            .source
+            .fetch_filing_document(
+                &self.extraction,
+                cik,
+                accession.as_str(),
+                document.as_str(),
+                cancellation.child_token(),
+            )
+            .await?;
+        let material = filing
+            .capture_material()?
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+        let (expected, request) = material.into_whole_seal_parts();
+        let sealed = self
+            .bridge
+            .research
+            .seal_provider_capture(request, &cancellation, deadline)
+            .await?;
+        let root = expected.try_rejoin(sealed)?.try_into_whole()?;
+        precommit.validate_precommit()?;
+        let handoff = self
+            .source
+            .fetch_filing_xbrl_capture(
+                &self.extraction,
+                submissions,
+                accession.as_str(),
+                filing,
+                root,
+                wall_deadline,
+                cancellation.child_token(),
+            )
+            .await?;
+        let sealed = self
+            .extract_and_seal_research_stream(
+                SecResearchStreamPreparation::FilingXbrl {
+                    handoff,
+                    max_records,
+                    max_bytes,
+                    wall_deadline,
+                },
+                cancellation.child_token(),
+                deadline,
+            )
+            .await?;
+        if sealed.stream.company_identity().provider_company_id() != &company_cik {
+            return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+        }
+        let filing = Box::pin(self.publish_research_stream(
+            sealed,
+            Arc::clone(&precommit),
+            cancellation.child_token(),
+            deadline,
+        ))
+        .await?;
+        if filing.cik != company_cik {
+            return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
+        }
+        precommit.validate_precommit()?;
+        new_link_count = new_link_count
+            .checked_add(
+                family_completed(Arc::clone(&precommit), cancellation.child_token()).await?,
+            )
+            .ok_or(SecFundamentalsApplicationError::AllocationFailed)?;
+        precommit.validate_precommit()?;
+        Ok(SecCompanyResearchPublication {
+            cik: company_cik,
+            submissions: submissions_publication,
+            company_facts: facts_publication,
+            filing: SecCompanyFilingPublication::Published {
+                committed: filing.committed,
+                binding_digest: filing.binding_digest,
+                company_observation_digest: filing.company_observation_digest,
+            },
+            filing_selection: Some(filing_selection),
+            new_link_count,
+        })
+    }
+
+    pub(crate) async fn extract_and_seal_selected(
+        &self,
+        request: ExtractionRequest,
+        capture_material: ProviderCaptureMaterial,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<SecFundamentalsSealedHandoff, SecFundamentalsApplicationError> {
+        self.extraction.validate_current()?;
+        self.bridge
+            .extract_and_seal_selected(
+                self.source.as_ref(),
+                self.extraction.clone(),
+                request,
+                capture_material,
+                cancellation,
+                deadline,
+            )
+            .await
+    }
+
+    /// Consumes the adapter's opaque accession/document/taxonomy graph on the bounded blocking
+    /// executor and seals the exact same raw graph before publication can proceed.
+    async fn extract_and_seal_research_stream(
+        &self,
+        preparation: SecResearchStreamPreparation,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<SecResearchStreamHandoff, SecFundamentalsApplicationError> {
+        self.extraction.validate_current()?;
+        if cancellation.is_cancelled() {
+            return Err(SecFundamentalsApplicationError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(SecFundamentalsApplicationError::DeadlineExceeded);
+        }
+        // The typed filing admission remains opaque; API facts retain their exact discovered
+        // capture identity. Both enter the same sealer and terminal publication owner.
+        let (provider_dataset, analytical_dataset) = match &preparation {
+            SecResearchStreamPreparation::FilingXbrl { handoff, .. } => {
+                let selection = handoff.dataset();
+                if selection.kind() != SecResearchDatasetKind::FilingXbrl
+                    || handoff.capture_material().receipt().dataset() != selection.dataset()
+                {
+                    return Err(SecFundamentalsApplicationError::InvalidSelection);
+                }
+                (
+                    selection.dataset().clone(),
+                    DatasetId::try_from(selection.analytical_dataset_identifier()?.as_str())
+                        .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?,
+                )
+            }
+            SecResearchStreamPreparation::CompanyFacts { stream, material } => {
+                let selection =
+                    SecResearchDataset::try_from_identifier(stream.request().object().dataset())?;
+                if stream.family() != SecResearchDatasetKind::CompanyFacts
+                    || selection.kind() != SecResearchDatasetKind::CompanyFacts
+                    || material.receipt().dataset() != selection.dataset()
+                {
+                    return Err(SecFundamentalsApplicationError::InvalidSelection);
+                }
+                (
+                    selection.dataset().clone(),
+                    DatasetId::try_from(selection.analytical_dataset_identifier()?.as_str())
+                        .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?,
+                )
+            }
+        };
+        let scratch = Arc::new(self.bridge.research.analytical().operation_scratch()?);
+        let worker_scratch = Arc::clone(&scratch);
+        let raw_store = self.bridge.research.provider_capture_store();
+        let worker_store = Arc::clone(&raw_store);
+        let authority = self.extraction.clone();
+        let worker_cancellation = cancellation.child_token();
+        let worker_token = worker_cancellation.clone();
+        let worker =
+            tokio::task::spawn_blocking(move || -> Result<_, SecFundamentalsApplicationError> {
+                let (stream, material) = match preparation {
+                    SecResearchStreamPreparation::FilingXbrl {
+                        handoff,
+                        max_records,
+                        max_bytes,
+                        wall_deadline,
+                    } => handoff.extract(
+                        authority,
+                        max_records,
+                        max_bytes,
+                        wall_deadline,
+                        worker_token.clone(),
+                        worker_scratch.path(),
+                    )?,
+                    SecResearchStreamPreparation::CompanyFacts { stream, material } => {
+                        (stream, material)
+                    }
+                };
+                let control = FilingStreamControl {
+                    cancellation: worker_token,
+                    deadline,
+                };
+                let mut objects = Vec::new();
+                for record in material.records() {
+                    let admission = filing_object_admission(record.payload().len() as u64)?;
+                    let mut pending = worker_store.begin_logical_object(admission)?;
+                    for bytes in record.payload().chunks(64 * 1024) {
+                        control.check()?;
+                        pending.write_all(bytes)?;
+                    }
+                    objects.push(worker_store.finish_logical_object(pending, &control)?);
+                }
+                Ok((stream, material, objects, worker_scratch))
+            });
+        tokio::pin!(worker);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let extracted = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                let _ = worker.as_mut().await;
+                return Err(SecFundamentalsApplicationError::Cancelled);
+            }
+            () = deadline_wait.as_mut() => {
+                worker_cancellation.cancel();
+                let _ = worker.as_mut().await;
+                return Err(SecFundamentalsApplicationError::DeadlineExceeded);
+            }
+            result = worker.as_mut() => {
+                result.map_err(|_| SecFundamentalsApplicationError::BlockingWorkerFailed)??
+            }
+        };
+        let (stream, material, objects, scratch) = extracted;
+        let object = stream.request().object();
+        let capture = material.receipt();
+        if object.dataset() != &provider_dataset
+            || capture.dataset() != &provider_dataset
+            || object.source_id() != self.source.metadata().source_id()
+            || object.metadata_revision() != self.source.metadata().revision()
+            || capture.source_id() != object.source_id()
+            || capture.metadata_revision() != object.metadata_revision()
+            || SourceObjectCaptureIdentity::try_from_capture(capture)? != object.capture_identity()
+        {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        let (expectation, request) = material.into_whole_seal_parts();
+        let sealed = self
+            .bridge
+            .research
+            .seal_provider_capture(request, &cancellation, deadline)
+            .await?;
+        let token = expectation.try_rejoin(sealed)?.try_into_whole()?;
+        let control = FilingStreamControl {
+            cancellation,
+            deadline,
+        };
+        let (objects, receipt) =
+            market_squawk_sources::SealedLogicalObjectInput::try_from_whole_capture(
+                token, objects, &control,
+            )?;
+        Ok(SecResearchStreamHandoff {
+            analytical_dataset,
+            stream,
+            objects,
+            receipt,
+            _scratch: scratch,
+        })
+    }
+
+    async fn publish_research_stream(
+        &self,
+        handoff: SecResearchStreamHandoff,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<SecResearchStreamPublication, SecFundamentalsApplicationError> {
+        use market_squawk_data::{IngestIdentity, SourceOperation};
+        use market_squawk_sources::{
+            ExtractionContentAccumulator, LogicalObjectRole, LogicalPartitionFamily,
+            LogicalPartitionSetAdmission, PendingLogicalPartitionSet, ProviderLogicalTerminalInput,
+            SealedLogicalObjectInput, SealedProviderLogicalPublicationBinding,
+        };
+        precommit.validate_precommit()?;
+        let SecResearchStreamHandoff {
+            analytical_dataset,
+            mut stream,
+            mut objects,
+            receipt,
+            _scratch,
+        } = handoff;
+        let source = self.source.metadata().clone();
+        let company_identity = stream.company_identity().clone();
+        let company_observation_digest = company_identity_digest(&company_identity)?;
+        let family = stream.family();
+        let companion_family = match family {
+            SecResearchDatasetKind::FilingXbrl => "sec_filing_capture",
+            SecResearchDatasetKind::CompanyFacts => "sec_company_facts_capture",
+            SecResearchDatasetKind::Submissions => {
+                return Err(SecFundamentalsApplicationError::InvalidSelection);
+            }
+        };
+        let cik = company_identity.provider_company_id().clone();
+        let total_records = stream.total_records();
+        let mut content = None;
+        let raw_store = self.bridge.research.provider_capture_store();
+        let control = FilingStreamControl {
+            cancellation: cancellation.clone(),
+            deadline,
+        };
+        let mut staging = self
+            .bridge
+            .research
+            .analytical()
+            .begin_provider_logical_stream(
+                analytical_dataset.clone(),
+                source.source_id().clone(),
+                &cancellation,
+            )?;
+        let partition_admission = LogicalPartitionSetAdmission::try_new(
+            filing_object_admission(32 * 1024 * 1024)?,
+            4096,
+            256,
+            128 * 1024,
+        )?;
+        let row_map_schema = filing_digest(b"market-squawk/sec-filing/logical-row-map/v1");
+        let mut native_partitions = None;
+        let mut row_partitions = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::CanonicalRowMap,
+            row_map_schema,
+            partition_admission,
+            0,
+        )?;
+        let mut expectations = Vec::new();
+        let mut native_descriptor = None;
+        loop {
+            control.check()?;
+            let token = cancellation.child_token();
+            let worker_token = token.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                let chunk = stream.next_chunk(&worker_token);
+                (stream, chunk)
+            });
+            let (returned, chunk) = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { token.cancel(); let _ = worker.await; return Err(SecFundamentalsApplicationError::Cancelled); }
+                _ = tokio::time::sleep_until(deadline.into()) => { token.cancel(); let _ = worker.await; return Err(SecFundamentalsApplicationError::DeadlineExceeded); }
+                result = &mut worker => result.map_err(|_| SecFundamentalsApplicationError::BlockingWorkerFailed)?,
+            };
+            stream = returned;
+            let Some(chunk) = chunk? else {
+                break;
+            };
+            let start = stream
+                .emitted_records()
+                .checked_sub(chunk.batch().records().len())
+                .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+            let (batch, _, native, page_ordinals) = chunk.into_parts();
+            let batch = batch.try_bind_provider_capture(receipt.capture())?;
+            if content.is_none() {
+                content = Some(ExtractionContentAccumulator::try_new(
+                    batch.request(),
+                    total_records,
+                )?);
+            }
+            native
+                .validate(&batch)
+                .map_err(|_| SecFundamentalsApplicationError::InvalidNativeLineage)?;
+            if native_partitions.is_none() {
+                native_partitions = Some(PendingLogicalPartitionSet::begin(
+                    LogicalPartitionFamily::ProviderNative,
+                    native.schema().fingerprint(),
+                    partition_admission,
+                    0,
+                )?);
+                let sidecar = native
+                    .batch_sidecar()
+                    .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?;
+                let object = match family {
+                    SecResearchDatasetKind::FilingXbrl => {
+                        let chunks = sidecar
+                            .chunks()
+                            .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?;
+                        let mut reader = chunks
+                            .reader()
+                            .map_err(|_| SecFundamentalsApplicationError::InvalidNativeLineage)?;
+                        let size = reader.metadata()?.len();
+                        let mut pending =
+                            raw_store.begin_logical_object(filing_object_admission(size)?)?;
+                        let mut buffer = [0u8; 64 * 1024];
+                        loop {
+                            control.check()?;
+                            let read = reader.read(&mut buffer)?;
+                            if read == 0 {
+                                break;
+                            }
+                            pending.write_all(&buffer[..read])?;
+                        }
+                        raw_store.finish_logical_object(pending, &control)?
+                    }
+                    SecResearchDatasetKind::CompanyFacts => {
+                        if sidecar.chunks().is_some() {
+                            return Err(SecFundamentalsApplicationError::InvalidNativeLineage);
+                        }
+                        let mut pending = raw_store.begin_logical_object(
+                            filing_object_admission(sidecar.semantic_payload().len() as u64)?,
+                        )?;
+                        pending.write_all(sidecar.semantic_payload())?;
+                        raw_store.finish_logical_object(pending, &control)?
+                    }
+                    SecResearchDatasetKind::Submissions => {
+                        return Err(SecFundamentalsApplicationError::InvalidSelection);
+                    }
+                };
+                objects.push(SealedLogicalObjectInput::try_from_verified(
+                    LogicalObjectRole::ProviderComponent,
+                    objects.len() as u32,
+                    sidecar.semantic_payload_digest(),
+                    object,
+                    &control,
+                )?);
+                native_descriptor = Some(sidecar.semantic_payload().to_vec());
+            }
+            let native_set = native_partitions
+                .as_mut()
+                .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?;
+            for (local, ((record, native_row), page)) in batch
+                .records()
+                .iter()
+                .zip(native.rows())
+                .zip(&page_ordinals)
+                .enumerate()
+            {
+                control.check()?;
+                let ordinal = u64::try_from(start + local)
+                    .map_err(|_| SecFundamentalsApplicationError::AllocationFailed)?;
+                content
+                    .as_mut()
+                    .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+                    .push(record)?;
+                native_set.stage_frame(
+                    &raw_store,
+                    &control,
+                    ordinal,
+                    native_row.semantic_payload(),
+                    native_row.semantic_payload_digest(),
+                )?;
+                let frame = receipt.row_frame(
+                    u32::try_from(ordinal)
+                        .map_err(|_| SecFundamentalsApplicationError::AllocationFailed)?,
+                    *page,
+                )?;
+                let mapping = serde_json::to_vec(&serde_json::json!({
+                    "canonical_row_ordinal": frame.canonical_row_ordinal(), "capture_page_ordinal": frame.capture_page_ordinal(),
+                    "segment_ordinal": frame.segment_ordinal(), "physical_frame_ordinal": frame.physical_frame_ordinal(),
+                    "page_body_digest": frame.page_body_digest(), "received_at": frame.received_at(), "source_sequence": frame.source_sequence(),
+                    "canonical_record_digest": record.evidence().content_digest(), "native_semantic_digest": native_row.semantic_payload_digest(),
+                }))?;
+                row_partitions.stage_frame(
+                    &raw_store,
+                    &control,
+                    ordinal,
+                    &mapping,
+                    filing_digest(&mapping),
+                )?;
+            }
+            native_set.seal_current_partition(&raw_store, &control)?;
+            row_partitions.seal_current_partition(&raw_store, &control)?;
+            let revisions = self.source.revision_plan(&batch)?;
+            expectations.push(
+                self.bridge
+                    .research
+                    .analytical()
+                    .stage_provider_logical_stream_chunk(
+                        &mut staging,
+                        batch,
+                        native,
+                        revisions,
+                        &receipt,
+                        &page_ordinals,
+                        &cancellation,
+                    )
+                    .await?,
+            );
+        }
+        if stream.emitted_records() != total_records {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        let whole_content = content
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+            .finish()?;
+        let companion = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "family": companion_family, "capture": receipt.capture(), "sealed_receipt_digest": receipt.receipt_digest(), "original_segment_claim": receipt.segment().claim(),
+            "company_identity": &company_identity, "native_descriptor": native_descriptor,
+            "extraction_content_identity": whole_content.digest(), "record_count": whole_content.record_count(),
+        }))?;
+        let mut pending =
+            raw_store.begin_logical_object(filing_object_admission(companion.len() as u64)?)?;
+        pending.write_all(&companion)?;
+        let object = raw_store.finish_logical_object(pending, &control)?;
+        objects.push(SealedLogicalObjectInput::try_from_verified(
+            LogicalObjectRole::ProviderComponent,
+            objects.len() as u32,
+            filing_digest(&companion),
+            object,
+            &control,
+        )?);
+        let mut partitions = native_partitions
+            .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?
+            .finish(&raw_store, &control)?
+            .into_partitions()
+            .into_vec();
+        partitions.extend(
+            row_partitions
+                .finish(&raw_store, &control)?
+                .into_partitions()
+                .into_vec(),
+        );
+        let total_logical_object_bytes = objects
+            .iter()
+            .try_fold(0u64, |total, object| {
+                total.checked_add(object.object().size_bytes())
+            })
+            .ok_or(SecFundamentalsApplicationError::AllocationFailed)?;
+        let binding = SealedProviderLogicalPublicationBinding::try_new(
+            ProviderLogicalTerminalInput {
+                source_id: source.source_id().clone(),
+                source_revision_digest: source
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest(),
+                execution_attempt_digest: Some(receipt.receipt_digest()),
+                provider_terminal_evidence_digest: whole_content.digest(),
+                total_decoded_events: 0,
+                total_canonical_rows: total_records as u64,
+                total_logical_object_bytes,
+            },
+            &[
+                LogicalPartitionFamily::ProviderNative,
+                LogicalPartitionFamily::CanonicalRowMap,
+            ],
+            objects,
+            partitions,
+            expectations,
+        )?;
+        let digest = binding.binding_digest();
+        let retrieved_at = receipt
+            .capture()
+            .pages()
+            .iter()
+            .map(|page| page.received_at())
+            .max()
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+        let rights = self.rights.decision(digest, retrieved_at)?;
+        let identity = IngestIdentity::try_new(
+            source.source_id().clone(),
+            digest,
+            SourceOperation::Persist,
+            format!(
+                "sec-research-logical:{}:{:x}",
+                analytical_dataset.as_str(),
+                Sha256::digest(digest.bytes())
+            ),
+        )?;
+        let reservation = self
+            .bridge
+            .research
+            .analytical()
+            .reserve_source_ingest(&source, retrieved_at, rights, &identity, &cancellation)
+            .await?;
+        precommit.validate_precommit()?;
+        let (committed, retained_digest) = self
+            .bridge
+            .research
+            .analytical()
+            .finish_provider_logical_stream(
+                staging,
+                reservation,
+                binding,
+                company_identity,
+                precommit,
+                cancellation,
+            )
+            .await?;
+        if retained_digest != digest {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        drop(_scratch);
+        Ok(SecResearchStreamPublication {
+            cik,
+            committed,
+            binding_digest: retained_digest,
+            company_observation_digest,
+        })
+    }
+
+    pub(crate) async fn publish(
+        &self,
+        handoff: SecFundamentalsSealedHandoff,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+    ) -> Result<SecFundamentalsPublicationReceipt, SecFundamentalsApplicationError> {
+        self.extraction.validate_current()?;
+        self.bridge
+            .publish(handoff, &self.rights, precommit_authority, cancellation)
+            .await
+    }
+
+    /// Reports the common exact-manifest SEC reader available after immutable publication.
+    ///
+    /// The caller must construct its read from the family-specific publication receipt; this
+    /// state does not grant a latest-generation or identity-inferred read.
+    pub(crate) const fn point_in_time_state(&self) -> SecFundamentalsPointInTimeState {
+        SecFundamentalsPointInTimeState::AvailableAfterPublication
+    }
+
+    pub(crate) const fn filing_xbrl_state(&self) -> SecFilingXbrlApplicationState {
+        SecFilingXbrlApplicationState::AvailableAfterCaptureAdmission
+    }
+}
+
+impl SecFundamentalsApplicationBridge {
+    const fn new(research: Arc<ResearchService>) -> Self {
+        Self { research }
+    }
+
+    /// Extracts one already selected SEC object, seals its complete exact response graph, and
+    /// returns the exclusive fail-closed canonical publication handoff.
+    ///
+    /// The caller remains responsible for registry selection, rights admission, and retaining its
+    /// provider-generation precommit lease. This method does not refetch, reconstruct, or weaken
+    /// those authorities.
+    async fn extract_and_seal_selected(
+        &self,
+        source: &SecEdgarSource,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        capture_material: ProviderCaptureMaterial,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<SecFundamentalsSealedHandoff, SecFundamentalsApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(SecFundamentalsApplicationError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(SecFundamentalsApplicationError::DeadlineExceeded);
+        }
+        let object = request.object();
+        let capture = capture_material.receipt();
+        let capture_identity = SourceObjectCaptureIdentity::try_from_capture(capture)?;
+        if object.source_id() != source.metadata().source_id()
+            || object.metadata_revision() != source.metadata().revision()
+            || capture.source_id() != object.source_id()
+            || capture.metadata_revision() != object.metadata_revision()
+            || capture.dataset() != object.dataset()
+            || capture_identity != object.capture_identity()
+        {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+
+        let extracted = source
+            .extract_with_company_identity(authority, request, cancellation.clone())
+            .await?;
+        self.seal_extracted(source, extracted, capture_material, cancellation, deadline)
+            .await
+    }
+
+    /// Seals an already extracted SEC result without exposing the physical store to the adapter.
+    ///
+    /// Filing XBRL uses the complete logical stream publication owner.
+    async fn seal_extracted(
+        &self,
+        source: &SecEdgarSource,
+        extracted: SecExtractionResult,
+        capture_material: ProviderCaptureMaterial,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<SecFundamentalsSealedHandoff, SecFundamentalsApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(SecFundamentalsApplicationError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(SecFundamentalsApplicationError::DeadlineExceeded);
+        }
+
+        let (batch, company_identity, native_lineage, row_capture_page_ordinals) =
+            extracted.into_parts();
+        let capture = capture_material.receipt();
+        let capture_identity = SourceObjectCaptureIdentity::try_from_capture(capture)?;
+        if batch.request().object().source_id() != source.metadata().source_id()
+            || batch.request().object().metadata_revision() != source.metadata().revision()
+            || capture.source_id() != batch.request().object().source_id()
+            || capture.metadata_revision() != batch.request().object().metadata_revision()
+            || capture.dataset() != batch.request().object().dataset()
+            || capture_identity != batch.request().object().capture_identity()
+        {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        let batch = batch.try_bind_provider_capture(capture)?;
+        let revisions = source.revision_plan(&batch)?;
+        let coordinates = SecFundamentalsCoordinates::try_from_extraction(
+            &batch,
+            company_identity.as_ref(),
+            &native_lineage,
+        )?;
+
+        let (expectation, seal_request) = capture_material.into_whole_seal_parts();
+        let sealed = self
+            .research
+            .seal_provider_capture(seal_request, &cancellation, deadline)
+            .await?;
+        let token = expectation.try_rejoin(sealed)?.try_into_whole()?;
+        if cancellation.is_cancelled() {
+            return Err(SecFundamentalsApplicationError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(SecFundamentalsApplicationError::DeadlineExceeded);
+        }
+
+        Ok(SecFundamentalsSealedHandoff {
+            deadline,
+            source: source.metadata().clone(),
+            coordinates,
+            batch,
+            company_identity,
+            native_lineage,
+            revisions,
+            row_capture_page_ordinals,
+            token,
+        })
+    }
+
+    /// Consumes one sealed SEC handoff into immutable canonical publication authority.
+    ///
+    /// The provider retrieval time is derived from the complete sealed capture rather than a
+    /// caller clock. The caller supplies only its previously admitted persistence-rights and
+    /// provider-generation precommit authorities.
+    async fn publish(
+        &self,
+        handoff: SecFundamentalsSealedHandoff,
+        rights: &ResearchRightsAuthority,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+    ) -> Result<SecFundamentalsPublicationReceipt, SecFundamentalsApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(SecFundamentalsApplicationError::Cancelled);
+        }
+        precommit_authority.validate_precommit()?;
+        let SecFundamentalsSealedHandoff {
+            deadline,
+            source,
+            coordinates,
+            batch,
+            company_identity,
+            native_lineage,
+            revisions,
+            row_capture_page_ordinals,
+            token,
+        } = handoff;
+        if coordinates.family == SecFundamentalsFamily::FilingXbrl
+            || rights.source_id() != source.source_id()
+            || batch.records().is_empty()
+            || revisions.len() != batch.records().len()
+            || !revisions.native_lineage_required()
+            || row_capture_page_ordinals.len() != batch.records().len()
+            || revisions.is_locally_observed()
+                != (coordinates.family == SecFundamentalsFamily::Submissions)
+        {
+            return Err(SecFundamentalsApplicationError::InvalidAuthority);
+        }
+        let company_identity =
+            company_identity.ok_or(SecFundamentalsApplicationError::InvalidCompanyIdentity)?;
+        validate_company_identity(
+            coordinates.family,
+            coordinates.cik.as_str(),
+            &batch,
+            Some(&company_identity),
+        )?;
+
+        let binding = SealedProviderCaptureBinding::try_whole(
+            token,
+            batch,
+            native_lineage,
+            row_capture_page_ordinals,
+        )?;
+        binding.validate()?;
+        if binding.native_lineage().schema().implementation()
+            != ProviderNativeLineageImplementation::SecEdgarV1
+        {
+            return Err(SecFundamentalsApplicationError::InvalidNativeLineage);
+        }
+        let retrieved_at = binding
+            .capture_evidence()
+            .pages()
+            .iter()
+            .map(|page| page.received_at())
+            .max()
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+        if !source.is_effective_at(retrieved_at) {
+            return Err(SecFundamentalsApplicationError::InvalidAuthority);
+        }
+        let payload_digest = extraction_provider_payload_digest(binding.batch());
+        let rights = rights.decision(payload_digest, retrieved_at)?;
+        let company_observation_digest = company_identity_digest(&company_identity)?;
+        let retained_identity = Arc::new(company_identity.clone());
+        let restart = SecFundamentalsRestartBinding::from_live_binding(
+            &source,
+            &coordinates,
+            retained_identity,
+            company_observation_digest,
+            &binding,
+        )?;
+        let ingest = ResearchIngestRequest::with_provider_publication(
+            source,
+            rights,
+            coordinates.analytical_dataset,
+            binding,
+            revisions,
+        )?
+        .with_company_identity(company_identity)?
+        .with_precommit_authority(precommit_authority);
+        let committed = self
+            .research
+            .ingest_with_job_context(None, ingest, cancellation.clone(), deadline)
+            .await?;
+        let original_binding = committed
+            .original_binding_for_reobservation(restart.binding_digest)
+            .unwrap_or(restart.binding_digest);
+        // A successful repeat keeps the first canonical generation and company observation.
+        // Reopen their exact creating input; the newly retained receipt is an independent
+        // reobservation, not the original generation's restart authority.
+        let restart = self
+            .research
+            .read_provider_capture_generation(
+                committed.manifest().clone(),
+                deadline,
+                &cancellation,
+                move |generation, _, _, analytical, worker_cancellation| {
+                    let company = analytical
+                        .provider_company_identity_for_binding(
+                            generation.pinned().manifest(),
+                            original_binding,
+                            deadline,
+                            worker_cancellation,
+                        )?
+                        .ok_or(IngestError::ReplayConflict)?;
+                    let object = generation
+                        .objects()
+                        .first()
+                        .filter(|_| generation.objects().len() == 1)
+                        .ok_or(IngestError::ReplayConflict)?;
+                    let original = object
+                        .inputs()
+                        .first()
+                        .filter(|_| object.inputs().len() == 1)
+                        .ok_or(IngestError::ReplayConflict)?
+                        .binding();
+                    if original.binding_digest() != original_binding
+                        || generation.source_id() != restart.source.source_id()
+                        || original.capture().dataset() != &restart.provider_dataset
+                        || original.capture().metadata_revision() != restart.source.revision()
+                        || original.record_count() != restart.expected_record_count
+                        || !company
+                            .observation()
+                            .same_source_representation(&restart.company_identity)
+                        || company.observation().ingested_at()
+                            > restart.company_identity.ingested_at()
+                    {
+                        return Err(IngestError::ReplayConflict.into());
+                    }
+                    let mut restart = restart;
+                    restart.company_identity = Arc::new(company.observation().clone());
+                    restart.company_observation_digest = company.observation_digest();
+                    restart.binding_digest = original.binding_digest();
+                    restart.extraction_content_identity = original.extraction_content_identity();
+                    restart.sealed_capture_receipt_digest =
+                        original.sealed_capture_receipt_digest();
+                    restart.native_schema_version = original.native_lineage().version();
+                    restart.native_schema_fingerprint = original.native_lineage().fingerprint();
+                    restart.native_batch_digest = original.native_lineage().batch_digest();
+                    restart.row_capture_page_ordinals = original
+                        .rows()
+                        .iter()
+                        .map(|row| row.capture_page_ordinal())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    Ok(restart)
+                },
+            )
+            .await?;
+        let restart = restart.with_manifest(committed.manifest().clone())?;
+        Ok(match restart.family {
+            SecFundamentalsFamily::Submissions => {
+                SecFundamentalsPublicationReceipt::Submissions(SecSubmissionsPublicationReceipt {
+                    committed,
+                    restart: SecSubmissionsRestartSelector { binding: restart },
+                })
+            }
+            SecFundamentalsFamily::CompanyFacts => {
+                SecFundamentalsPublicationReceipt::CompanyFacts(SecCompanyFactsPublicationReceipt {
+                    committed,
+                    restart: SecCompanyFactsRestartSelector { binding: restart },
+                })
+            }
+            SecFundamentalsFamily::FilingXbrl => {
+                return Err(SecFundamentalsApplicationError::InvalidAuthority);
+            }
+        })
+    }
+}
+
+/// Complete logical family receipt; intermediate chunks never constitute this outcome.
+#[derive(Debug)]
+struct SecResearchStreamPublication {
+    cik: SourceIdentifier,
+    committed: CommittedDataset,
+    binding_digest: EvidenceDigest,
+    company_observation_digest: EvidenceDigest,
+}
+
+enum SecResearchStreamPreparation {
+    FilingXbrl {
+        handoff: SecFilingXbrlCaptureHandoff,
+        max_records: NonZeroU32,
+        max_bytes: NonZeroU64,
+        wall_deadline: Timestamp,
+    },
+    CompanyFacts {
+        stream: SecResearchExtractionStream,
+        material: ProviderCaptureMaterial,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct SecResearchStreamHandoff {
+    analytical_dataset: DatasetId,
+    stream: SecResearchExtractionStream,
+    objects: Vec<market_squawk_sources::SealedLogicalObjectInput>,
+    receipt: SealedProviderCaptureSetReceipt,
+    _scratch: Arc<market_squawk_data::OperationScratchDirectory>,
+}
+struct FilingStreamControl {
+    cancellation: CancellationToken,
+    deadline: Instant,
+}
+impl FilingStreamControl {
+    fn check(&self) -> Result<(), std::io::Error> {
+        if self.cancellation.is_cancelled() || Instant::now() >= self.deadline {
+            return Err(std::io::Error::other(
+                "filing operation cancelled or deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+impl market_squawk_platform::ResearchObjectControl for FilingStreamControl {
+    fn checkpoint(
+        &self,
+        _: market_squawk_platform::ResearchObjectControlPoint,
+    ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            return Err(market_squawk_platform::ResearchObjectControlError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(market_squawk_platform::ResearchObjectControlError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+fn filing_object_admission(
+    bytes: u64,
+) -> Result<market_squawk_platform::ResearchObjectAdmission, SecFundamentalsApplicationError> {
+    // Physical chunk metadata follows exact object size. This is a format admission, not RAM.
+    Ok(market_squawk_platform::ResearchObjectAdmission::try_new(
+        bytes.max(1),
+        4095,
+    )?)
+}
+fn filing_digest(bytes: &[u8]) -> EvidenceDigest {
+    EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
+}
+
+#[derive(Debug)]
+struct SecFundamentalsCoordinates {
+    family: SecFundamentalsFamily,
+    cik: SourceIdentifier,
+    provider_dataset: SourceIdentifier,
+    analytical_dataset: DatasetId,
+}
+
+impl SecFundamentalsCoordinates {
+    fn try_from_extraction(
+        batch: &ExtractionBatch,
+        company_identity: Option<&CompanyIdentityObservation>,
+        native_lineage: &ProviderNativeLineageBatch,
+    ) -> Result<Self, SecFundamentalsApplicationError> {
+        let provider_dataset = batch.request().object().dataset().clone();
+        native_lineage
+            .validate(batch)
+            .map_err(|_| SecFundamentalsApplicationError::InvalidNativeLineage)?;
+        if native_lineage.schema().implementation()
+            != ProviderNativeLineageImplementation::SecEdgarV1
+        {
+            return Err(SecFundamentalsApplicationError::InvalidNativeLineage);
+        }
+        let selection = SecResearchDataset::try_from_identifier(&provider_dataset)?;
+        let family = selection.kind().into();
+        if selection.dataset() != &provider_dataset {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        validate_company_identity(family, selection.cik(), batch, company_identity)?;
+        let analytical_dataset = selection.analytical_dataset_identifier()?;
+        Ok(Self {
+            family,
+            cik: SourceIdentifier::try_from(selection.cik())
+                .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?,
+            provider_dataset,
+            analytical_dataset: DatasetId::try_from(analytical_dataset.as_str())
+                .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?,
+        })
+    }
+}
+
+fn validate_company_identity(
+    family: SecFundamentalsFamily,
+    cik: &str,
+    batch: &ExtractionBatch,
+    company_identity: Option<&CompanyIdentityObservation>,
+) -> Result<(), SecFundamentalsApplicationError> {
+    let expected_surface = match family {
+        SecFundamentalsFamily::Submissions => Some(CompanyIdentitySurface::SecSubmissions),
+        SecFundamentalsFamily::CompanyFacts => Some(CompanyIdentitySurface::SecCompanyFacts),
+        SecFundamentalsFamily::FilingXbrl => Some(CompanyIdentitySurface::SecFilingXbrl),
+    };
+    match (expected_surface, company_identity) {
+        (Some(expected_surface), Some(identity))
+            if identity.source_id() == batch.request().object().source_id()
+                && identity.provider_company_id().as_str() == cik
+                && identity.surface() == expected_surface
+                && identity.parent_ingest_payload_evidence().content_digest()
+                    == extraction_provider_payload_digest(batch) =>
+        {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err(SecFundamentalsApplicationError::InvalidCompanyIdentity),
+    }
+}
+
+fn company_identity_digest(
+    observation: &CompanyIdentityObservation,
+) -> Result<EvidenceDigest, SecFundamentalsApplicationError> {
+    let canonical = serde_json::to_vec(observation)?;
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(canonical).into(),
+    ))
+}
+
+/// Exclusive exact-response/canonical handoff awaiting generic immutable publication.
+///
+/// This value is intentionally non-cloneable and non-serializable. Its token can authorize at
+/// most one `SealedProviderCaptureBinding`; the adapter-authored row map cannot be replaced by an
+/// application inference.
+#[derive(Debug)]
+pub(crate) struct SecFundamentalsSealedHandoff {
+    deadline: Instant,
+    source: SourceMetadata,
+    coordinates: SecFundamentalsCoordinates,
+    batch: ExtractionBatch,
+    company_identity: Option<CompanyIdentityObservation>,
+    native_lineage: ProviderNativeLineageBatch,
+    revisions: ExtractionRevisionPlan,
+    row_capture_page_ordinals: Vec<u16>,
+    token: ProviderWholeCaptureToken,
+}
+
+impl SecFundamentalsSealedHandoff {
+    pub(crate) const fn family(&self) -> SecFundamentalsFamily {
+        self.coordinates.family
+    }
+
+    pub(crate) const fn cik(&self) -> &SourceIdentifier {
+        &self.coordinates.cik
+    }
+
+    pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.coordinates.provider_dataset
+    }
+
+    pub(crate) const fn analytical_dataset(&self) -> &DatasetId {
+        &self.coordinates.analytical_dataset
+    }
+
+    pub(crate) const fn source(&self) -> &SourceMetadata {
+        &self.source
+    }
+
+    pub(crate) const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    pub(crate) const fn company_identity(&self) -> Option<&CompanyIdentityObservation> {
+        self.company_identity.as_ref()
+    }
+
+    pub(crate) const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        &self.native_lineage
+    }
+
+    pub(crate) const fn revisions(&self) -> &ExtractionRevisionPlan {
+        &self.revisions
+    }
+
+    pub(crate) fn row_capture_page_ordinals(&self) -> &[u16] {
+        &self.row_capture_page_ordinals
+    }
+
+    pub(crate) fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
+        self.token.persisted_receipt()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SourceMetadata,
+        DatasetId,
+        ExtractionBatch,
+        Option<CompanyIdentityObservation>,
+        ProviderNativeLineageBatch,
+        ExtractionRevisionPlan,
+        Vec<u16>,
+        ProviderWholeCaptureToken,
+    ) {
+        (
+            self.source,
+            self.coordinates.analytical_dataset,
+            self.batch,
+            self.company_identity,
+            self.native_lineage,
+            self.revisions,
+            self.row_capture_page_ordinals,
+            self.token,
+        )
+    }
+}
+
+/// Closed SEC publication result with family-specific read authority.
+#[derive(Debug)]
+pub(crate) enum SecFundamentalsPublicationReceipt {
+    Submissions(SecSubmissionsPublicationReceipt),
+    CompanyFacts(SecCompanyFactsPublicationReceipt),
+}
+
+/// Immutable complete-submissions generation and its exact restart selector.
+#[derive(Debug)]
+pub(crate) struct SecSubmissionsPublicationReceipt {
+    committed: CommittedDataset,
+    restart: SecSubmissionsRestartSelector,
+}
+
+impl SecSubmissionsPublicationReceipt {
+    pub(crate) const fn committed(&self) -> &CommittedDataset {
+        &self.committed
+    }
+
+    pub(crate) const fn restart_selector(&self) -> &SecSubmissionsRestartSelector {
+        &self.restart
+    }
+
+    pub(crate) const fn cik(&self) -> &SourceIdentifier {
+        self.restart.binding.cik()
+    }
+
+    pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
+        self.restart.binding.provider_dataset()
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        self.restart.manifest()
+    }
+
+    pub(crate) const fn provider_binding_digest(&self) -> EvidenceDigest {
+        self.restart.binding_digest()
+    }
+
+    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.restart.company_observation_digest()
+    }
+
+    pub(crate) fn company_identity(&self) -> &CompanyIdentityObservation {
+        self.restart.binding.company_identity()
+    }
+}
+
+/// Immutable Company Facts generation and its exact restart selector.
+#[derive(Debug)]
+pub(crate) struct SecCompanyFactsPublicationReceipt {
+    committed: CommittedDataset,
+    restart: SecCompanyFactsRestartSelector,
+}
+
+impl SecCompanyFactsPublicationReceipt {
+    pub(crate) const fn committed(&self) -> &CommittedDataset {
+        &self.committed
+    }
+
+    pub(crate) const fn restart_selector(&self) -> &SecCompanyFactsRestartSelector {
+        &self.restart
+    }
+
+    pub(crate) const fn cik(&self) -> &SourceIdentifier {
+        self.restart.binding.cik()
+    }
+
+    pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
+        self.restart.binding.provider_dataset()
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        self.restart.manifest()
+    }
+
+    pub(crate) const fn provider_binding_digest(&self) -> EvidenceDigest {
+        self.restart.binding_digest()
+    }
+
+    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.restart.company_observation_digest()
+    }
+
+    pub(crate) fn company_identity(&self) -> &CompanyIdentityObservation {
+        self.restart.binding.company_identity()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SecPendingRestartBinding {
+    source: SourceMetadata,
+    family: SecFundamentalsFamily,
+    cik: SourceIdentifier,
+    provider_dataset: SourceIdentifier,
+    analytical_dataset: DatasetId,
+    company_identity: Arc<CompanyIdentityObservation>,
+    company_observation_digest: EvidenceDigest,
+    binding_digest: EvidenceDigest,
+    extraction_content_identity: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    expected_record_count: usize,
+    native_schema_version: u16,
+    native_schema_fingerprint: EvidenceDigest,
+    native_batch_digest: EvidenceDigest,
+    row_capture_page_ordinals: Box<[u16]>,
+}
+
+impl SecPendingRestartBinding {
+    fn with_manifest(
+        self,
+        manifest: DatasetManifestRef,
+    ) -> Result<SecFundamentalsRestartBinding, SecFundamentalsApplicationError> {
+        if manifest.dataset_id() != &self.analytical_dataset {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(SecFundamentalsRestartBinding {
+            source: self.source,
+            family: self.family,
+            cik: self.cik,
+            provider_dataset: self.provider_dataset,
+            company_identity: self.company_identity,
+            company_observation_digest: self.company_observation_digest,
+            manifest,
+            binding_digest: self.binding_digest,
+            extraction_content_identity: self.extraction_content_identity,
+            sealed_capture_receipt_digest: self.sealed_capture_receipt_digest,
+            expected_record_count: self.expected_record_count,
+            native_schema_version: self.native_schema_version,
+            native_schema_fingerprint: self.native_schema_fingerprint,
+            native_batch_digest: self.native_batch_digest,
+            row_capture_page_ordinals: self.row_capture_page_ordinals,
+        })
+    }
+}
+
+/// Common exact immutable SEC generation and raw/native/company restart coordinates.
+#[derive(Clone, Debug)]
+pub(crate) struct SecFundamentalsRestartBinding {
+    source: SourceMetadata,
+    family: SecFundamentalsFamily,
+    cik: SourceIdentifier,
+    provider_dataset: SourceIdentifier,
+    company_identity: Arc<CompanyIdentityObservation>,
+    company_observation_digest: EvidenceDigest,
+    manifest: DatasetManifestRef,
+    binding_digest: EvidenceDigest,
+    extraction_content_identity: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    expected_record_count: usize,
+    native_schema_version: u16,
+    native_schema_fingerprint: EvidenceDigest,
+    native_batch_digest: EvidenceDigest,
+    row_capture_page_ordinals: Box<[u16]>,
+}
+
+impl SecFundamentalsRestartBinding {
+    /// Reconstructs one restart selector solely from values retained in durable publication
+    /// coordinates. This grants read authority only after the exact catalog, raw-store, native,
+    /// identity, and family validations in [`Self::reopen`] succeed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every independently durable SEC publication coordinate is required"
+    )]
+    pub(crate) fn try_from_durable_coordinates(
+        source: SourceMetadata,
+        family: SecFundamentalsFamily,
+        cik: SourceIdentifier,
+        provider_dataset: SourceIdentifier,
+        company_identity: CompanyIdentityObservation,
+        company_observation_digest: EvidenceDigest,
+        manifest: DatasetManifestRef,
+        binding_digest: EvidenceDigest,
+        extraction_content_identity: EvidenceDigest,
+        sealed_capture_receipt_digest: EvidenceDigest,
+        expected_record_count: usize,
+        native_schema_version: u16,
+        native_schema_fingerprint: EvidenceDigest,
+        native_batch_digest: EvidenceDigest,
+        row_capture_page_ordinals: Vec<u16>,
+    ) -> Result<Self, SecFundamentalsApplicationError> {
+        if expected_record_count == 0
+            || row_capture_page_ordinals.len() != expected_record_count
+            || native_schema_version == 0
+            || [
+                company_observation_digest,
+                binding_digest,
+                extraction_content_identity,
+                sealed_capture_receipt_digest,
+                native_schema_fingerprint,
+                native_batch_digest,
+            ]
+            .into_iter()
+            .any(|digest| {
+                digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
+            })
+            || company_identity_digest(&company_identity)? != company_observation_digest
+            || company_identity.source_id() != source.source_id()
+            || company_identity.provider_company_id() != &cik
+            || expected_company_surface(family) != Some(company_identity.surface())
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        let provider_selection = SecResearchDataset::try_from_identifier(&provider_dataset)?;
+        let expected_analytical =
+            DatasetId::try_from(provider_selection.analytical_dataset_identifier()?.as_str())
+                .map_err(|_| SecFundamentalsApplicationError::RestartInvalid)?;
+        if SecFundamentalsFamily::from(provider_selection.kind()) != family
+            || provider_selection.cik() != cik.as_str()
+            || manifest.dataset_id() != &expected_analytical
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(Self {
+            source,
+            family,
+            cik,
+            provider_dataset,
+            company_identity: Arc::new(company_identity),
+            company_observation_digest,
+            manifest,
+            binding_digest,
+            extraction_content_identity,
+            sealed_capture_receipt_digest,
+            expected_record_count,
+            native_schema_version,
+            native_schema_fingerprint,
+            native_batch_digest,
+            row_capture_page_ordinals: row_capture_page_ordinals.into_boxed_slice(),
+        })
+    }
+
+    fn from_live_binding(
+        source: &SourceMetadata,
+        coordinates: &SecFundamentalsCoordinates,
+        company_identity: Arc<CompanyIdentityObservation>,
+        company_observation_digest: EvidenceDigest,
+        binding: &SealedProviderCaptureBinding,
+    ) -> Result<SecPendingRestartBinding, SecFundamentalsApplicationError> {
+        binding.validate()?;
+        let capture = binding.capture_evidence();
+        let native = binding.native_lineage();
+        if binding.record_count() == 0
+            || binding.record_count() != binding.row_frames().len()
+            || capture.source_id() != source.source_id()
+            || capture.metadata_revision() != source.revision()
+            || capture.dataset() != &coordinates.provider_dataset
+            || native.schema().implementation() != ProviderNativeLineageImplementation::SecEdgarV1
+        {
+            return Err(SecFundamentalsApplicationError::InvalidAuthority);
+        }
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(binding.record_count())
+            .map_err(|_| SecFundamentalsApplicationError::AllocationFailed)?;
+        for (ordinal, frame) in binding.row_frames().iter().enumerate() {
+            if frame.canonical_row_ordinal() != u32::try_from(ordinal).unwrap_or(u32::MAX) {
+                return Err(SecFundamentalsApplicationError::InvalidAuthority);
+            }
+            row_capture_page_ordinals.push(frame.capture_page_ordinal());
+        }
+        Ok(SecPendingRestartBinding {
+            source: source.clone(),
+            family: coordinates.family,
+            cik: coordinates.cik.clone(),
+            provider_dataset: coordinates.provider_dataset.clone(),
+            analytical_dataset: coordinates.analytical_dataset.clone(),
+            company_identity,
+            company_observation_digest,
+            binding_digest: binding.evidence_digest().evidence(),
+            extraction_content_identity: binding.content_identity().digest(),
+            sealed_capture_receipt_digest: binding.sealed_capture_receipt_digest(),
+            expected_record_count: binding.record_count(),
+            native_schema_version: native.schema().version(),
+            native_schema_fingerprint: native.schema().fingerprint(),
+            native_batch_digest: native.batch_digest(),
+            row_capture_page_ordinals: row_capture_page_ordinals.into_boxed_slice(),
+        })
+    }
+
+    const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding_digest
+    }
+
+    const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.company_observation_digest
+    }
+
+    const fn cik(&self) -> &SourceIdentifier {
+        &self.cik
+    }
+
+    const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+
+    fn company_identity(&self) -> &CompanyIdentityObservation {
+        self.company_identity.as_ref()
+    }
+
+    fn verify_persisted_binding(
+        &self,
+        research: &ResearchService,
+    ) -> Result<PersistedProviderCaptureBindingEvidence, SecFundamentalsApplicationError> {
+        let store = research.provider_capture_store();
+        let evidence = research.analytical().provider_capture_binding_evidence(
+            &self.manifest,
+            self.binding_digest,
+            store.as_ref(),
+        )?;
+        if evidence.binding_digest() != self.binding_digest
+            || evidence.capture().source_id() != self.source.source_id()
+            || evidence.capture().metadata_revision() != self.source.revision()
+            || evidence.capture().dataset() != &self.provider_dataset
+            || evidence.sealed_capture_receipt_digest() != self.sealed_capture_receipt_digest
+            || evidence.extraction_content_identity() != self.extraction_content_identity
+            || evidence.record_count() != self.expected_record_count
+            || evidence.native_lineage().implementation() != "sec_edgar_v1"
+            || evidence.native_lineage().version() != self.native_schema_version
+            || evidence.native_lineage().fingerprint() != self.native_schema_fingerprint
+            || evidence.native_lineage().batch_digest() != self.native_batch_digest
+            || evidence.scope() != "whole"
+            || evidence.layout() != "whole_single_segment"
+            || evidence.rows().len() != self.row_capture_page_ordinals.len()
+            || evidence
+                .rows()
+                .iter()
+                .zip(self.row_capture_page_ordinals.iter())
+                .enumerate()
+                .any(|(ordinal, (row, expected_page))| {
+                    row.canonical_row_ordinal() != u32::try_from(ordinal).unwrap_or(u32::MAX)
+                        || row.capture_page_ordinal() != *expected_page
+                })
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(evidence)
+    }
+
+    fn verify_company_identity(
+        &self,
+        identity_reader: &CompanySecurityIdentityReadCapability,
+        effective_at: Timestamp,
+        knowledge_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<SecCompanyIdentityRestartEvidence, SecFundamentalsApplicationError> {
+        let surface = expected_company_surface(self.family)
+            .ok_or(SecFundamentalsApplicationError::RestartInvalid)?;
+        if company_identity_digest(self.company_identity.as_ref())?
+            != self.company_observation_digest
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        let query = SecFundamentalIdentityQuery::try_new(
+            self.source.source_id().clone(),
+            self.cik.clone(),
+            surface,
+            self.company_observation_digest,
+            effective_at,
+            knowledge_at,
+        )?;
+        let selection =
+            identity_reader.sec_fundamental_identity_as_of(&query, deadline, cancellation)?;
+        if selection.company_observation_digest() != self.company_observation_digest
+            || selection.query_digest().bytes() == [0; 32]
+            || selection.receipt_digest().bytes() == [0; 32]
+            || (selection.availability() == SecFundamentalIdentityAvailability::Available)
+                != (selection.instrument_id().is_some()
+                    && selection.market_instrument_revision_digest().is_some()
+                    && selection.relationship().is_some())
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(SecCompanyIdentityRestartEvidence {
+            observation: Arc::clone(&self.company_identity),
+            selection,
+        })
+    }
+
+    async fn reopen(
+        &self,
+        template: AnalyticalObservationTemplate,
+        knowledge_range: Option<ObservationKnowledgeRange>,
+        research: &ResearchService,
+        identity_reader: &CompanySecurityIdentityReadCapability,
+        identity_effective_at: Timestamp,
+        knowledge_at: Timestamp,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecFundamentalsRestartReceipt, SecFundamentalsApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(SecFundamentalsApplicationError::Cancelled);
+        }
+        if Instant::now() >= deadline || template != self.family.observation_template() {
+            return Err(if Instant::now() >= deadline {
+                SecFundamentalsApplicationError::DeadlineExceeded
+            } else {
+                SecFundamentalsApplicationError::RestartInvalid
+            });
+        }
+        let evidence = self.verify_persisted_binding(research)?;
+        let generation =
+            research
+                .analytical_reader()
+                .exact(&self.manifest, deadline, &cancellation)?;
+        if generation.source_id() != self.source.source_id()
+            || generation.manifest() != &self.manifest
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        let company_identity = self.verify_company_identity(
+            identity_reader,
+            identity_effective_at,
+            knowledge_at,
+            deadline,
+            &cancellation,
+        )?;
+        let request = AnalyticalObservationReadRequest::try_new(
+            self.manifest.clone(),
+            template,
+            Vec::new(),
+            knowledge_range,
+        )?;
+        let observations = research
+            .analytical_reader()
+            .read_observations(request, limits, deadline, cancellation)
+            .await?;
+        if observations.source_id() != self.source.source_id()
+            || observations.request().manifest() != &self.manifest
+            || observations.request().template() != template
+            || !observations.request().instrument_ids().is_empty()
+            || observations.request().knowledge_range() != knowledge_range
+            || observations.output().manifest() != &self.manifest
+        {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(SecFundamentalsRestartReceipt {
+            evidence,
+            company_identity,
+            observations,
+        })
+    }
+}
+
+impl SecFundamentalsFamily {
+    const fn observation_template(self) -> AnalyticalObservationTemplate {
+        match self {
+            Self::Submissions => AnalyticalObservationTemplate::Filing,
+            Self::CompanyFacts | Self::FilingXbrl => AnalyticalObservationTemplate::Fundamental,
+        }
+    }
+}
+
+fn expected_company_surface(family: SecFundamentalsFamily) -> Option<CompanyIdentitySurface> {
+    match family {
+        SecFundamentalsFamily::Submissions => Some(CompanyIdentitySurface::SecSubmissions),
+        SecFundamentalsFamily::CompanyFacts => Some(CompanyIdentitySurface::SecCompanyFacts),
+        SecFundamentalsFamily::FilingXbrl => Some(CompanyIdentitySurface::SecFilingXbrl),
+    }
+}
+
+/// Exact immutable complete-submissions selector; Company Facts cannot be substituted.
+#[derive(Clone, Debug)]
+pub(crate) struct SecSubmissionsRestartSelector {
+    binding: SecFundamentalsRestartBinding,
+}
+
+impl SecSubmissionsRestartSelector {
+    pub(crate) fn try_from_durable_coordinates(
+        binding: SecFundamentalsRestartBinding,
+    ) -> Result<Self, SecFundamentalsApplicationError> {
+        if binding.family != SecFundamentalsFamily::Submissions {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(Self { binding })
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        self.binding.manifest()
+    }
+
+    pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding.binding_digest()
+    }
+
+    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.binding.company_observation_digest()
+    }
+
+    pub(crate) const fn cik(&self) -> &SourceIdentifier {
+        self.binding.cik()
+    }
+
+    /// Reopens the exact filings generation, raw graph, identity selection, and bounded candidates.
+    pub(crate) async fn reopen(
+        &self,
+        research: &ResearchService,
+        identity_reader: &CompanySecurityIdentityReadCapability,
+        identity_effective_at: Timestamp,
+        knowledge_at: Timestamp,
+        knowledge_range: Option<ObservationKnowledgeRange>,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecSubmissionsRestartReceipt, SecFundamentalsApplicationError> {
+        if self.binding.family != SecFundamentalsFamily::Submissions {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        self.binding
+            .reopen(
+                AnalyticalObservationTemplate::Filing,
+                knowledge_range,
+                research,
+                identity_reader,
+                identity_effective_at,
+                knowledge_at,
+                limits,
+                deadline,
+                cancellation,
+            )
+            .await
+            .map(|receipt| SecSubmissionsRestartReceipt { receipt })
+    }
+}
+
+/// Exact immutable Company Facts selector; submissions cannot be substituted.
+#[derive(Clone, Debug)]
+pub(crate) struct SecCompanyFactsRestartSelector {
+    binding: SecFundamentalsRestartBinding,
+}
+
+impl SecCompanyFactsRestartSelector {
+    pub(crate) fn try_from_durable_coordinates(
+        binding: SecFundamentalsRestartBinding,
+    ) -> Result<Self, SecFundamentalsApplicationError> {
+        if binding.family != SecFundamentalsFamily::CompanyFacts {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        Ok(Self { binding })
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        self.binding.manifest()
+    }
+
+    pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding.binding_digest()
+    }
+
+    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.binding.company_observation_digest()
+    }
+
+    pub(crate) const fn cik(&self) -> &SourceIdentifier {
+        self.binding.cik()
+    }
+
+    /// Reopens exact Company Facts, raw body, identity selection, and bounded candidates.
+    pub(crate) async fn reopen(
+        &self,
+        research: &ResearchService,
+        identity_reader: &CompanySecurityIdentityReadCapability,
+        identity_effective_at: Timestamp,
+        knowledge_at: Timestamp,
+        knowledge_range: Option<ObservationKnowledgeRange>,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecCompanyFactsRestartReceipt, SecFundamentalsApplicationError> {
+        if self.binding.family != SecFundamentalsFamily::CompanyFacts {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        self.binding
+            .reopen(
+                AnalyticalObservationTemplate::Fundamental,
+                knowledge_range,
+                research,
+                identity_reader,
+                identity_effective_at,
+                knowledge_at,
+                limits,
+                deadline,
+                cancellation,
+            )
+            .await
+            .map(|receipt| SecCompanyFactsRestartReceipt { receipt })
+    }
+}
+
+#[derive(Debug)]
+struct SecFundamentalsRestartReceipt {
+    evidence: PersistedProviderCaptureBindingEvidence,
+    company_identity: SecCompanyIdentityRestartEvidence,
+    observations: AnalyticalObservationOutput,
+}
+
+/// Exact persisted company observation recovered beside one SEC generation.
+#[derive(Debug)]
+pub(crate) struct SecCompanyIdentityRestartEvidence {
+    observation: Arc<CompanyIdentityObservation>,
+    selection: SecFundamentalIdentitySelection,
+}
+
+impl SecCompanyIdentityRestartEvidence {
+    pub(crate) fn observation(&self) -> &CompanyIdentityObservation {
+        self.observation.as_ref()
+    }
+
+    pub(crate) const fn observation_digest(&self) -> EvidenceDigest {
+        self.selection.company_observation_digest()
+    }
+
+    pub(crate) const fn identity_selection(&self) -> &SecFundamentalIdentitySelection {
+        &self.selection
+    }
+
+    pub(crate) const fn availability(&self) -> SecFundamentalIdentityAvailability {
+        self.selection.availability()
+    }
+}
+
+/// Exact raw/native/company and filing candidates reopened after restart.
+#[derive(Debug)]
+pub(crate) struct SecSubmissionsRestartReceipt {
+    receipt: SecFundamentalsRestartReceipt,
+}
+
+impl SecSubmissionsRestartReceipt {
+    pub(crate) const fn provider_evidence(&self) -> &PersistedProviderCaptureBindingEvidence {
+        &self.receipt.evidence
+    }
+
+    pub(crate) const fn company_identity(&self) -> &SecCompanyIdentityRestartEvidence {
+        &self.receipt.company_identity
+    }
+
+    pub(crate) const fn observations(&self) -> &AnalyticalObservationOutput {
+        &self.receipt.observations
+    }
+}
+
+/// Exact raw/native/company and fundamental candidates reopened after restart.
+#[derive(Debug)]
+pub(crate) struct SecCompanyFactsRestartReceipt {
+    receipt: SecFundamentalsRestartReceipt,
+}
+
+impl SecCompanyFactsRestartReceipt {
+    pub(crate) const fn provider_evidence(&self) -> &PersistedProviderCaptureBindingEvidence {
+        &self.receipt.evidence
+    }
+
+    pub(crate) const fn company_identity(&self) -> &SecCompanyIdentityRestartEvidence {
+        &self.receipt.company_identity
+    }
+
+    pub(crate) const fn observations(&self) -> &AnalyticalObservationOutput {
+        &self.receipt.observations
+    }
+}
+
+/// Filing-XBRL application capability at this adapter head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecFilingXbrlApplicationState {
+    /// The adapter/application opaque capture admission and immutable publication path are wired.
+    AvailableAfterCaptureAdmission,
+}
+
+/// Current SEC canonical point-in-time application capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecFundamentalsPointInTimeState {
+    /// The common reader requires an exact family, immutable manifest, provider binding, company
+    /// observation, and four-clock cutoff supplied from the publication receipt.
+    AvailableAfterPublication,
+}
+
+/// Fail-closed SEC fundamentals application-composition failure.
+#[derive(Debug, Error)]
+pub(crate) enum SecFundamentalsApplicationError {
+    #[error("SEC completed-family issuer relationship publication failed")]
+    CompanyResolution(
+        #[from] crate::application::company_security_resolution::CompanySecurityResolutionError,
+    ),
+    #[error(transparent)]
+    DataRights(#[from] market_squawk_data::RightsError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Parquet(#[from] market_squawk_data::ParquetStoreError),
+    #[error(transparent)]
+    Logical(#[from] market_squawk_sources::ProviderLogicalPublicationError),
+    #[error(transparent)]
+    RawStore(#[from] market_squawk_platform::SealedResearchJournalStoreError),
+
+    #[error("SEC fundamentals selection does not match the configured source and capture")]
+    InvalidSelection,
+    #[error("SEC fundamentals publication authority does not match the exact sealed handoff")]
+    InvalidAuthority,
+    #[error("SEC fundamentals company identity does not match the canonical extraction")]
+    InvalidCompanyIdentity,
+    #[error("SEC fundamentals native lineage does not match the selected family")]
+    InvalidNativeLineage,
+    #[error("SEC fundamentals exact restart evidence did not reproduce its immutable generation")]
+    RestartInvalid,
+    #[error("SEC fundamentals bounded allocation failed")]
+    AllocationFailed,
+    #[error("SEC fundamentals operation was cancelled")]
+    Cancelled,
+    #[error("SEC fundamentals operation deadline was exceeded")]
+    DeadlineExceeded,
+    #[error("SEC filing-XBRL blocking worker failed")]
+    BlockingWorkerFailed,
+    #[error(transparent)]
+    Sec(#[from] SecClientError),
+    #[error(transparent)]
+    Extraction(#[from] ExtractionError),
+    #[error(transparent)]
+    ExtractionAuthority(#[from] market_squawk_sources::ExtractionAuthorityError),
+    #[error(transparent)]
+    ExtractionSource(#[from] ExtractionSourceError),
+    #[error(transparent)]
+    Capture(#[from] ProviderCaptureError),
+    #[error(transparent)]
+    Ingest(#[from] IngestError),
+    #[error(transparent)]
+    Rights(#[from] ServiceError),
+    #[error(transparent)]
+    Research(#[from] ResearchServiceError),
+    #[error(transparent)]
+    AnalyticalRead(#[from] AnalyticalReadError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    CompanyIdentity(#[from] market_squawk_data::CompanySecurityIdentityCatalogError),
+}

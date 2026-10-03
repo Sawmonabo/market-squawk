@@ -5,6 +5,18 @@ use thiserror::Error;
 /// Bounded filing XBRL parse failure.
 #[derive(Debug, Error)]
 pub enum SecXbrlError {
+    #[error("XBRL indexed staging failed: {0}")]
+    Staging(#[from] rusqlite::Error),
+    #[error("XBRL staging I/O failed: {0}")]
+    StagingIo(#[from] std::io::Error),
+    #[error("XBRL staging payload failed: {0}")]
+    StagingPayload(#[from] serde_json::Error),
+    #[error("XBRL processing was cancelled")]
+    Cancelled,
+    #[error("XBRL taxonomy set is not a valid code-owned registry selection")]
+    InvalidTaxonomySet,
+    #[error("XBRL fact entity does not match the exact filing registrant CIK")]
+    EntityMismatch,
     #[error("XBRL input exceeds its decoded-byte bound")]
     ByteLimitExceeded,
     #[error("XBRL nesting exceeds its depth bound")]
@@ -43,10 +55,10 @@ pub enum SecXbrlError {
     NestedFact,
     #[error("XBRL capture structure is nested unexpectedly")]
     NestedCapture,
-    #[error("Inline XBRL continuation is nested unexpectedly")]
+    #[error("Inline XBRL continuation chain contains nested members")]
     NestedContinuation,
-    #[error("Inline XBRL exclusion is nested unexpectedly")]
-    NestedExclude,
+    #[error("Inline XBRL continuation is referenced by more than one element")]
+    ReusedContinuation,
     #[error("XBRL context is incomplete")]
     IncompleteContext,
     #[error("XBRL unit is incomplete")]
@@ -63,6 +75,8 @@ pub enum SecXbrlError {
     ContinuationCycle,
     #[error("Inline XBRL relationship references an unknown fact occurrence")]
     UnknownRelationshipReference,
+    #[error("Inline XBRL relationship mixes destination kinds or references its own origin")]
+    InvalidRelationshipGraph,
     #[error("XBRL fact has conflicting accuracy attributes")]
     ConflictingAccuracy,
     #[error("XBRL numeric fact is invalid or out of range")]

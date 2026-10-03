@@ -76,6 +76,11 @@ impl RouteFeatureState {
                 slot.reset(FeatureInvalidationReason::TradingHalt, input.observed_at)?;
                 Ok(FeatureUpdateDisposition::Unavailable)
             }
+            MarketEvent::MarketDataQuote(_)
+            | MarketEvent::MarketDataTrade(_)
+            | MarketEvent::MarketDataBook(_)
+            | MarketEvent::MarketDataChart(_)
+            | MarketEvent::MarketDataScreener(_) => Ok(FeatureUpdateDisposition::Unavailable),
             MarketEvent::Auction(_) | MarketEvent::InstrumentStatus(_) => {
                 Ok(FeatureUpdateDisposition::Updated)
             }

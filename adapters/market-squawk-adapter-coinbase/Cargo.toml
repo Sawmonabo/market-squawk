@@ -17,6 +17,7 @@ chrono.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-live.workspace = true
 market-squawk-sources.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -26,10 +27,14 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+market-squawk-data.workspace = true
+market-squawk-platform.workspace = true
 static_assertions.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

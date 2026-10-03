@@ -21,9 +21,29 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         .first()
         .ok_or("maximum-universe fixture must not be empty")?;
     covered_instruments.push(instrument);
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(
+    // Session admission requires native identity evidence for every enumerated instrument.
+    // Synthetic symbols preserve the maximum-coverage fixture without claiming provider products.
+    let native_symbols = covered_instruments
+        .iter()
+        .enumerate()
+        .map(|(index, covered)| {
+            if *covered == instrument {
+                "BTC-USD".to_owned()
+            } else if *covered == other_instrument {
+                "TEST-TWO-USD".to_owned()
+            } else {
+                format!("FIXTURE-{index}-USD")
+            }
+        })
+        .collect::<Vec<_>>();
+    let native_routes = covered_instruments
+        .iter()
+        .copied()
+        .zip(native_symbols.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let (mut registry, registered) = crate::common::register_fixture_source(
         direct_metadata_with_instruments("source-a", "revision-a", 0, None, covered_instruments)?,
+        &native_routes,
         Timestamp::from_unix_nanos(1),
     )?;
     let session = registry.begin_session(
@@ -112,6 +132,11 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         source_identifier("trade-1")?,
         VenueId::try_from("coinbase")?,
         instrument,
+        market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+            market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+            market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+            market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+        ),
         ProviderTimestampEvidence::Provided {
             value: first_frame_at,
             rule: rule("coinbase-timestamp")?,
@@ -133,6 +158,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                 Some(source_identifier("BUY")?),
                 rule("coinbase-aggressor")?,
             ),
+            taker_order_type: None,
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;
@@ -168,11 +194,23 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     );
     let current_payload_digest = current_evidence.payload_digest();
     let make_current_observation =
-        |instrument: InstrumentId, trade_id: &str, sequence: u64| -> TestResult<_> {
+        |route_instrument: InstrumentId, trade_id: &str, sequence: u64| -> TestResult<_> {
+            let symbol = if route_instrument == instrument {
+                "BTC-USD"
+            } else if route_instrument == other_instrument {
+                "TEST-TWO-USD"
+            } else {
+                return Err("unknown fixture instrument".into());
+            };
             Ok(ProviderNormalizedObservation::try_new(
                 source_identifier(trade_id)?,
                 VenueId::try_from("coinbase")?,
-                instrument,
+                route_instrument,
+                market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+                    market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+                    market_squawk_domain::ProviderInstrumentId::try_from(symbol)?,
+                    market_squawk_domain::VenueSymbol::try_from(symbol)?,
+                ),
                 ProviderTimestampEvidence::Provided {
                     value: current_frame_at,
                     rule: rule("coinbase-timestamp")?,
@@ -194,6 +232,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                         Some(source_identifier("BUY")?),
                         rule("coinbase-aggressor")?,
                     ),
+                    taker_order_type: None,
                 },
             )?)
         };
@@ -259,27 +298,23 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         coverage.metadata_revision().as_source_identifier().as_str(),
         "revision-a"
     );
+    let current_evidence = current_observation
+        .evidence()
+        .transport_frame()
+        .ok_or("current fixture lost transport-frame evidence")?;
+    assert_eq!(current_evidence.frame_id(), current_frame.frame_id());
     assert_eq!(
-        current_observation.frame_evidence().frame_id(),
-        current_frame.frame_id()
-    );
-    assert_eq!(
-        current_observation.frame_evidence().received_at(),
+        current_evidence.received_at(),
         current_frame.received_at()
     );
-    assert_eq!(
-        current_observation.frame_evidence().payload_digest(),
-        current_payload_digest
-    );
+    assert_eq!(current_evidence.payload_digest(), current_payload_digest);
     assert!(
-        current_observation
-            .frame_evidence()
+        current_evidence
             .binding()
             .shares_allocation_with(current_frame.binding())
     );
     assert_eq!(
-        current_observation
-            .frame_evidence()
+        current_evidence
             .decoder_rule()
             .provider_rule()
             .as_str(),

@@ -198,7 +198,10 @@ fn journal_sink_fixed_ledger_accepts_exact_and_refuses_one_under_before_creation
     assert_eq!(probe.buffer_capacity(), buffer_capacity.get());
     assert_eq!(
         exact_fixed,
-        std::mem::size_of::<JournalWriter>() + path.capacity() + probe.buffer_capacity()
+        std::mem::size_of::<JournalWriter>()
+            + path.capacity()
+            + probe.buffer_capacity()
+            + JournalWriter::SERIALIZATION_WORKSPACE_BYTES
     );
     drop(probe);
     std::fs::remove_file(&path)?;

@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -21,13 +21,13 @@ mod resources;
 pub use process::run_onnx_worker_process;
 use protocol::{WorkerInitialization, response_loop};
 
-const MAX_WORKER_PROGRAM_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GENERATION_STARTUP: Duration = Duration::from_secs(15);
+const MAX_GENERATION_TERMINATION: Duration = Duration::from_secs(1);
 const MAX_GENERATION_CLEANUP_OWNERS: usize = 16;
 const RESPONSE_QUEUE_CAPACITY: usize = 1;
 const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const CLEANUP_WAIT_RETRY: Duration = Duration::from_millis(10);
-const WORKER_RUNTIME_REVISION: u32 = 2;
+const WORKER_RUNTIME_REVISION: u32 = 5;
 
 static ACTIVE_GENERATION_CLEANUP_OWNERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -52,7 +52,7 @@ impl OnnxWorkerProgram {
     ///
     /// # Errors
     ///
-    /// Rejects a symlink, non-file, oversized, unreadable, changed, or digest-mismatched helper.
+    /// Rejects a symlink, non-file, unreadable, changed, or digest-mismatched helper.
     pub fn admit(
         executable: impl AsRef<Path>,
         expected_digest: [u8; 32],
@@ -75,11 +75,11 @@ impl OnnxWorkerProgram {
         let metadata = source
             .metadata()
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_WORKER_PROGRAM_BYTES {
+        if !metadata.is_file() || metadata.len() == 0 {
             return Err(OnnxWorkerProgramError::Invalid);
         }
-        let actual_digest = hash_open_file(&mut source, MAX_WORKER_PROGRAM_BYTES)
-            .map_err(|_| OnnxWorkerProgramError::Changed)?;
+        let actual_digest =
+            hash_open_file(&mut source).map_err(|_| OnnxWorkerProgramError::Changed)?;
         if actual_digest != expected_digest
             || source
                 .metadata()
@@ -110,16 +110,21 @@ impl OnnxWorkerProgram {
             .create_new(true)
             .open(&sealed_path)
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
-        io::copy(&mut source.take(MAX_WORKER_PROGRAM_BYTES + 1), &mut sealed)
-            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let copied = io::copy(
+            &mut source.take(metadata.len().saturating_add(1)),
+            &mut sealed,
+        )
+        .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if copied != metadata.len() {
+            return Err(OnnxWorkerProgramError::Changed);
+        }
         sealed
             .sync_all()
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
         set_worker_permissions(&sealed_path)?;
         let mut sealed =
             File::open(&sealed_path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
-        if hash_open_file(&mut sealed, MAX_WORKER_PROGRAM_BYTES)
-            .map_err(|_| OnnxWorkerProgramError::Changed)?
+        if hash_open_file(&mut sealed).map_err(|_| OnnxWorkerProgramError::Changed)?
             != expected_digest
         {
             return Err(OnnxWorkerProgramError::Changed);
@@ -148,8 +153,7 @@ impl OnnxWorkerProgram {
 
     fn verify(&self) -> Result<(), WorkerError> {
         let mut executable = File::open(&self.inner.executable).map_err(|_| WorkerError::Load)?;
-        let digest = hash_open_file(&mut executable, MAX_WORKER_PROGRAM_BYTES)
-            .map_err(|_| WorkerError::Load)?;
+        let digest = hash_open_file(&mut executable).map_err(|_| WorkerError::Load)?;
         (digest == self.inner.digest)
             .then_some(())
             .ok_or(WorkerError::Load)
@@ -184,6 +188,7 @@ pub(crate) struct OnnxWorker {
     #[cfg(feature = "onnx-runtime")]
     program: OnnxWorkerProgram,
     generation: Mutex<Option<OwnedGeneration>>,
+    termination_confirmed: AtomicBool,
     deadline: Duration,
     runtime_semantics_digest: [u8; 32],
 }
@@ -192,7 +197,7 @@ pub(crate) struct OnnxWorker {
 struct Generation {
     child: Child,
     stdin: Option<ChildStdin>,
-    responses: Receiver<Result<f32, WorkerError>>,
+    responses: Receiver<Result<Vec<f32>, WorkerError>>,
     reader: Option<JoinHandle<()>>,
     active_generations: Arc<WorkerProgramInner>,
 }
@@ -234,14 +239,32 @@ impl OwnedGeneration {
             .ok_or(WorkerError::Unavailable)
     }
 
-    fn handoff(mut self, writer: Option<WriterHandle>) -> TerminationDisposition {
+    fn handoff(self, writer: Option<WriterHandle>) -> TerminationDisposition {
+        self.handoff_until(writer, None)
+    }
+
+    fn handoff_confirmed(self, writer: Option<WriterHandle>) -> TerminationDisposition {
+        self.handoff_until(
+            writer,
+            Instant::now().checked_add(MAX_GENERATION_TERMINATION),
+        )
+    }
+
+    fn handoff_until(
+        mut self,
+        writer: Option<WriterHandle>,
+        deadline: Option<Instant>,
+    ) -> TerminationDisposition {
         let Some(state) = self.state.take() else {
             return TerminationDisposition::Uncertain;
         };
-        state.cleanup.handoff(ReapRequest {
-            generation: state.generation,
-            writer,
-        })
+        state.cleanup.handoff_until(
+            ReapRequest {
+                generation: state.generation,
+                writer,
+            },
+            deadline,
+        )
     }
 }
 
@@ -266,13 +289,26 @@ struct ReapRequest {
 
 impl ReapRequest {
     fn request_termination(&mut self) -> TerminationDisposition {
+        self.request_termination_until(None)
+    }
+
+    fn request_termination_until(&mut self, deadline: Option<Instant>) -> TerminationDisposition {
         self.generation.stdin.take();
-        match self.generation.child.kill() {
-            Ok(()) => TerminationDisposition::Confirmed,
-            Err(_) => match self.generation.child.try_wait() {
-                Ok(Some(_)) => TerminationDisposition::Confirmed,
-                Ok(None) | Err(_) => TerminationDisposition::Uncertain,
-            },
+        // A successful kill only accepts the signal. Reaping establishes that model memory
+        // can no longer overlap the next generation; deadline paths never wait beyond now.
+        let _ = self.generation.child.kill();
+        loop {
+            match self.generation.child.try_wait() {
+                Ok(Some(_)) => return TerminationDisposition::Confirmed,
+                Err(_) => return TerminationDisposition::Uncertain,
+                Ok(None) => {}
+            }
+            let Some(remaining) =
+                deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            else {
+                return TerminationDisposition::Uncertain;
+            };
+            thread::park_timeout(remaining.min(WRITER_POLL_INTERVAL));
         }
     }
 
@@ -344,8 +380,16 @@ impl GenerationCleanupOwner {
         Ok(Self { state, armed: true })
     }
 
-    fn handoff(mut self, mut request: ReapRequest) -> TerminationDisposition {
-        let disposition = request.request_termination();
+    fn handoff(self, request: ReapRequest) -> TerminationDisposition {
+        self.handoff_until(request, None)
+    }
+
+    fn handoff_until(
+        mut self,
+        mut request: ReapRequest,
+        deadline: Option<Instant>,
+    ) -> TerminationDisposition {
+        let disposition = request.request_termination_until(deadline);
         let mut command = match self.state.command.lock() {
             Ok(command) => command,
             Err(poisoned) => poisoned.into_inner(),
@@ -420,7 +464,7 @@ fn handoff_generation_failure(
     writer: Option<WriterHandle>,
     error: WorkerError,
 ) -> WorkerError {
-    match generation.handoff(writer) {
+    match generation.handoff_confirmed(writer) {
         TerminationDisposition::Confirmed => error,
         TerminationDisposition::Uncertain => WorkerError::TerminationUncertain,
     }
@@ -428,7 +472,7 @@ fn handoff_generation_failure(
 
 #[derive(Debug)]
 enum GenerationExecution {
-    Complete(f32),
+    Complete(Vec<f32>),
     RetainedFailure(WorkerError),
     TerminalFailure {
         error: WorkerError,
@@ -449,11 +493,12 @@ impl OnnxWorker {
         model_bytes: &[u8],
         input_shape: &[usize],
         input_elements: usize,
+        output_elements: usize,
         deadline: Duration,
-    ) -> Result<(Self, f32), WorkerError> {
+    ) -> Result<(Self, Vec<f32>), WorkerError> {
         Self::start(
             program,
-            WorkerInitialization::tract(model_bytes, input_shape, input_elements)?,
+            WorkerInitialization::tract(model_bytes, input_shape, input_elements, output_elements)?,
             deadline,
         )
     }
@@ -468,18 +513,20 @@ impl OnnxWorker {
         model_bytes: &[u8],
         input_shape: &[usize],
         input_elements: usize,
+        output_elements: usize,
         deadline: Duration,
         runtime_path: &Path,
         runtime_digest: [u8; 32],
         runtime_version: &str,
         runtime_platform: u8,
-    ) -> Result<(Self, f32), WorkerError> {
+    ) -> Result<(Self, Vec<f32>), WorkerError> {
         Self::start(
             program,
             WorkerInitialization::external(
                 model_bytes,
                 input_shape,
                 input_elements,
+                output_elements,
                 runtime_path,
                 runtime_digest,
                 runtime_version,
@@ -493,11 +540,12 @@ impl OnnxWorker {
         program: &OnnxWorkerProgram,
         initialization: WorkerInitialization,
         deadline: Duration,
-    ) -> Result<(Self, f32), WorkerError> {
+    ) -> Result<(Self, Vec<f32>), WorkerError> {
         let startup_deadline = Instant::now()
             .checked_add(MAX_GENERATION_STARTUP)
             .ok_or(WorkerError::Deadline)?;
         let input_elements = initialization.input_elements;
+        let output_elements = initialization.output_elements;
         program.verify()?;
         let runtime_semantics_digest = worker_runtime_semantics_digest(program, deadline);
         if Instant::now() >= startup_deadline {
@@ -558,7 +606,7 @@ impl OnnxWorker {
         };
         let reader = match thread::Builder::new()
             .name("market-squawk-onnx-response".to_owned())
-            .spawn(move || response_loop(stdout, responses_sender))
+            .spawn(move || response_loop(stdout, responses_sender, output_elements))
         {
             Ok(reader) => reader,
             Err(_) => {
@@ -625,6 +673,7 @@ impl OnnxWorker {
                     #[cfg(feature = "onnx-runtime")]
                     program: program.clone(),
                     generation: Mutex::new(Some(generation)),
+                    termination_confirmed: AtomicBool::new(false),
                     deadline,
                     runtime_semantics_digest,
                 };
@@ -646,7 +695,7 @@ impl OnnxWorker {
         &self,
         values: Vec<f32>,
         absolute_deadline: Instant,
-    ) -> Result<f32, WorkerError> {
+    ) -> Result<Vec<f32>, WorkerError> {
         self.execute_until_with_time_source(values, absolute_deadline, Instant::now)
     }
 
@@ -655,7 +704,7 @@ impl OnnxWorker {
         values: Vec<f32>,
         absolute_deadline: Instant,
         mut now: F,
-    ) -> Result<f32, WorkerError>
+    ) -> Result<Vec<f32>, WorkerError>
     where
         F: FnMut() -> Instant,
     {
@@ -670,7 +719,13 @@ impl OnnxWorker {
             if now() >= absolute_deadline {
                 return Err(WorkerError::Deadline);
             }
-            state.take().ok_or(WorkerError::Unavailable)?
+            state.take().ok_or_else(|| {
+                if self.termination_confirmed.load(Ordering::Acquire) {
+                    WorkerError::Unavailable
+                } else {
+                    WorkerError::TerminationUncertain
+                }
+            })?
         };
         let execution = {
             let inner = generation.generation_mut()?;
@@ -679,11 +734,7 @@ impl OnnxWorker {
         match execution {
             GenerationExecution::Complete(score) => {
                 if now() >= absolute_deadline {
-                    Err(handoff_generation_failure(
-                        generation,
-                        None,
-                        WorkerError::Deadline,
-                    ))
+                    Err(self.handoff_failure(generation, None, WorkerError::Deadline))
                 } else {
                     self.restore_generation(generation)?;
                     Ok(score)
@@ -696,7 +747,7 @@ impl OnnxWorker {
                 }
             }
             GenerationExecution::TerminalFailure { error, writer } => {
-                Err(handoff_generation_failure(generation, writer, error))
+                Err(self.handoff_failure(generation, writer, error))
             }
         }
     }
@@ -709,11 +760,7 @@ impl OnnxWorker {
         let displaced = state.replace(generation);
         drop(state);
         if let Some(generation) = displaced {
-            return Err(handoff_generation_failure(
-                generation,
-                None,
-                WorkerError::Unavailable,
-            ));
+            return Err(self.handoff_failure(generation, None, WorkerError::Unavailable));
         }
         Ok(())
     }
@@ -727,8 +774,47 @@ impl OnnxWorker {
             state.take()
         };
         generation.map_or(error, |generation| {
-            handoff_generation_failure(generation, None, error)
+            self.handoff_failure(generation, None, error)
         })
+    }
+
+    fn handoff_failure(
+        &self,
+        generation: OwnedGeneration,
+        writer: Option<WriterHandle>,
+        error: WorkerError,
+    ) -> WorkerError {
+        let outcome = match generation.handoff(writer) {
+            TerminationDisposition::Confirmed => error,
+            TerminationDisposition::Uncertain => WorkerError::TerminationUncertain,
+        };
+        if outcome != WorkerError::TerminationUncertain {
+            self.termination_confirmed.store(true, Ordering::Release);
+        }
+        outcome
+    }
+
+    pub(crate) fn retire(&self) -> Result<(), WorkerError> {
+        let generation = self
+            .generation
+            .lock()
+            .map_err(|_| WorkerError::TerminationUncertain)?
+            .take();
+        let Some(generation) = generation else {
+            // A missing generation may be executing or awaiting uncertain cleanup.
+            return if self.termination_confirmed.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(WorkerError::TerminationUncertain)
+            };
+        };
+        match generation.handoff_confirmed(None) {
+            TerminationDisposition::Confirmed => {
+                self.termination_confirmed.store(true, Ordering::Release);
+                Ok(())
+            }
+            TerminationDisposition::Uncertain => Err(WorkerError::TerminationUncertain),
+        }
     }
 
     pub(crate) const fn deadline(&self) -> Duration {
@@ -881,10 +967,10 @@ where
 }
 
 fn receive_until_with_time_source<F>(
-    responses: &Receiver<Result<f32, WorkerError>>,
+    responses: &Receiver<Result<Vec<f32>, WorkerError>>,
     deadline: Instant,
     now: &mut F,
-) -> Result<f32, WorkerError>
+) -> Result<Vec<f32>, WorkerError>
 where
     F: FnMut() -> Instant,
 {
@@ -910,7 +996,7 @@ fn worker_runtime_semantics_digest(
     bind_runtime_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-worker-runtime/v2",
+        b"market-squawk/onnx-worker-runtime/v3",
     );
     bind_runtime_u128(
         &mut digest,
@@ -935,12 +1021,12 @@ fn worker_runtime_semantics_digest(
     );
     for (name, value) in [
         (
-            b"maximum-worker-program-bytes".as_slice(),
-            u128::from(MAX_WORKER_PROGRAM_BYTES),
-        ),
-        (
             b"maximum-generation-startup-nanoseconds".as_slice(),
             MAX_GENERATION_STARTUP.as_nanos(),
+        ),
+        (
+            b"maximum-generation-termination-nanoseconds".as_slice(),
+            MAX_GENERATION_TERMINATION.as_nanos(),
         ),
         (
             b"inference-deadline-nanoseconds".as_slice(),
@@ -978,7 +1064,7 @@ fn worker_runtime_semantics_digest(
     bind_runtime_bytes(
         &mut digest,
         b"cleanup-semantics",
-        b"bounded-owner-before-spawn/drop-generation-stdin/kill-or-confirm-exited/async-wait-and-join/uncertain-denies-fallback/v2",
+        b"bounded-owner-before-spawn/drop-generation-stdin/kill-then-confirm-exited/bounded-explicit-retirement/immediate-deadline-handoff/async-wait-and-join/uncertain-denies-fallback/v3",
     );
     digest.finalize().into()
 }
@@ -995,13 +1081,13 @@ fn bind_runtime_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
     digest.update(value);
 }
 
-fn hash_open_file(file: &mut File, limit: u64) -> io::Result<[u8; 32]> {
+fn hash_open_file(file: &mut File) -> io::Result<[u8; 32]> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+    if !metadata.is_file() || metadata.len() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bounded file size",
+            "invalid file size",
         ));
     }
     let mut digest = Sha256::new();
@@ -1014,8 +1100,8 @@ fn hash_open_file(file: &mut File, limit: u64) -> io::Result<[u8; 32]> {
         }
         total = total
             .checked_add(u64::try_from(read).map_err(io::Error::other)?)
-            .filter(|value| *value <= limit)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bounded file size"))?;
+            .filter(|value| *value <= metadata.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file changed"))?;
         digest.update(&buffer[..read]);
     }
     if total != metadata.len() || file.metadata()?.len() != metadata.len() {
@@ -1060,6 +1146,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn response_protocol_preserves_all_horizons_and_rejects_shape_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut encoded = Vec::new();
+        protocol::write_response(&mut encoded, Ok(&[1.25, -3.5]))?;
+        let (sender, receiver) = mpsc::sync_channel(2);
+        protocol::response_loop(encoded.as_slice(), sender, 2);
+        assert_eq!(receiver.recv()?, Ok(vec![1.25, -3.5]));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        protocol::response_loop(encoded.as_slice(), sender, 1);
+        assert_eq!(receiver.recv()?, Err(WorkerError::Runtime));
+        Ok(())
+    }
+
+    #[test]
     fn post_take_expiry_preserves_the_retained_generation() -> Result<(), Box<dyn std::error::Error>>
     {
         let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
@@ -1095,6 +1195,7 @@ mod tests {
                 },
                 cleanup,
             ))),
+            termination_confirmed: AtomicBool::new(false),
             deadline: Duration::from_millis(10),
             runtime_semantics_digest: [1; 32],
         };
@@ -1160,6 +1261,7 @@ mod tests {
                 },
                 cleanup,
             ))),
+            termination_confirmed: AtomicBool::new(false),
             deadline: Duration::from_secs(1),
             runtime_semantics_digest: [1; 32],
         });
@@ -1171,10 +1273,10 @@ mod tests {
                 request_worker.execute_until(Vec::new(), Instant::now() + Duration::from_secs(1));
             let _ = result_sender.send(result);
         });
-        assert_eq!(
+        assert!(matches!(
             result_receiver.recv_timeout(Duration::from_secs(1))?,
-            Err(WorkerError::Unavailable)
-        );
+            Err(WorkerError::Unavailable | WorkerError::TerminationUncertain)
+        ));
         cleanup_release.send(())?;
         request.join().map_err(|_| "request thread panicked")?;
         drop(worker);
@@ -1248,7 +1350,7 @@ mod tests {
     fn response_wakeup_at_the_deadline_has_no_authority() -> Result<(), Box<dyn std::error::Error>>
     {
         let (sender, responses) = mpsc::sync_channel(1);
-        sender.send(Ok(1.0))?;
+        sender.send(Ok(vec![1.0]))?;
         let before_deadline = Instant::now();
         let deadline = before_deadline + Duration::from_millis(1);
         let after_deadline = deadline + Duration::from_millis(1);
@@ -1319,7 +1421,7 @@ mod tests {
             },
             cleanup,
         )
-        .handoff(None);
+        .handoff_confirmed(None);
 
         assert_eq!(disposition, TerminationDisposition::Confirmed);
         let cleanup_deadline = Instant::now() + Duration::from_secs(1);

@@ -9,8 +9,7 @@ recovery behavior.
 | Document type | Operations index |
 | Audience | Local operators, analysts, integrators, and incident responders |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-11 |
 
 ## Runbooks
 
@@ -18,6 +17,7 @@ recovery behavior.
 | --- | --- |
 | [Installation and bootstrap](installation-and-bootstrap.md) | Launch/package the desktop, build/install the headless bundle, prepare a data root, and prove the product composes |
 | [Configuration and secrets](configuration-and-secrets.md) | Compose validated configuration, inspect precedence, and understand the currently composed secret-store boundary |
+| [Provider accounts and credential preparation](provider-account-setup.md) | Create the target provider accounts/keys and fill the exact design-only direct-import template without confusing it with current runtime configuration |
 | [Source operations](source-operations.md) | Register, set up, activate, inspect, and recover supported live and research sources |
 | [Research ingestion](research-ingestion.md) | Admit local/provider research objects and publish provenance-bound observations |
 | [Datasets and query](datasets-and-query.md) | Build point-in-time datasets, inspect manifests, and run bounded DataFusion queries |
@@ -82,6 +82,8 @@ release acceptance work are tracked in the [delivery ledger](../plans/delivery-l
 - [Configuration keys and precedence](../reference/configuration.md)
 - [MCP tools and schemas](../reference/mcp.md)
 - [Source capability and coverage](../reference/source-coverage.md)
+- [Selected provider contracts](../reference/providers/README.md)
+- [Canonical market-data schemas](../reference/market-data-canonical-schemas.md)
 - [Data-quality classes and transitions](../reference/data-quality.md)
 - [Time and provenance fields](../reference/time-and-provenance.md)
 - [Deployment and on-disk layout](../architecture/deployment.md)

@@ -1,217 +1,717 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
-    AuthorizationBasis, ConnectionGeneration, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, MetadataRevision, RevisionBoundPayloadEvidence, SourceId,
-    SourceIdentifier, Timestamp,
+    AuthorizationBasis, ConnectionGeneration, Currency, Denomination, DigestAlgorithm,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentDefinitionRevision, InstrumentId, LotSize,
+    MetadataRevision, ProviderIdentityEvidence, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, TickSize, Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
+use market_squawk_sources::BudgetReservationDecision;
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy,
-    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource,
-    LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy, RawMarketFrame, RawMarketSink,
-    RegistryError, SessionId, SinkError, SourceError, SourceMetadataProvider,
+    ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
+    CurrentSourceSession, DecodeOutcome, FreshnessPolicy, LiveMarketSource, LiveSourceGeneration,
+    ProviderBudgetPolicy, ProviderChecksumEvidence, RawMarketFrame, RawMarketSink, RegistryError,
+    SessionId, SinkError, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
 };
+use rust_decimal::Decimal;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use super::{KrakenDecoderState, KrakenSource};
-use crate::{KrakenConfig, KrakenDepth, KrakenMarketDecoder, KrakenMetadataInput};
+use super::{
+    KrakenDecoderState, KrakenSocketDecodeControl, KrakenSocketHandoffConsumer, KrakenSource,
+    send_subscription,
+};
+use crate::{
+    KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenAuthenticatedDiscontinuity, KrakenBookTransition,
+    KrakenChecksumAvailability, KrakenConfig, KrakenControlOrDiscontinuityKind, KrakenDepth,
+    KrakenL3ClientTier, KrakenL3Config, KrakenL3CredentialAuthority, KrakenL3Decoder,
+    KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender, KrakenL3MetadataInput,
+    KrakenL3ProductMapping, KrakenL3SubscriptionDispatch, KrakenMarketContinuity,
+    KrakenMarketDecodeHandoff, KrakenMarketEventHandoff, KrakenMetadataInput,
+    KrakenReferenceSelectionEvidence, KrakenSubscriptionRequestEvidence,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug)]
-struct RecordingSink {
+struct RecordingSink<'a> {
     frames: Vec<RawMarketFrame>,
     limit: usize,
+    terminal_after_capture: bool,
+    session: Option<&'a CurrentSourceSession>,
+    decoder: Option<KrakenSocketHandoffConsumer>,
 }
 
-impl Default for RecordingSink {
+impl Default for RecordingSink<'_> {
     fn default() -> Self {
         Self {
             frames: Vec::with_capacity(2),
             limit: 2,
+            terminal_after_capture: false,
+            session: None,
+            decoder: None,
         }
     }
 }
 
-impl RawMarketSink for RecordingSink {
+impl RawMarketSink for RecordingSink<'_> {
     fn try_publish(&mut self, frame: RawMarketFrame) -> Result<(), SinkError> {
         if self.frames.len() == self.limit {
             return Err(SinkError::Saturated);
         }
-        self.frames.push(frame);
+        self.frames.push(frame.clone());
+        if self.terminal_after_capture {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        if let Some(decoder) = &mut self.decoder {
+            let session = self.session.ok_or(SinkError::CaptureIncomplete)?;
+            let validated = session
+                .validate_live_frame(&frame)
+                .map_err(|_| SinkError::CaptureIncomplete)?;
+            decoder
+                .consume(&validated)
+                .map_err(|_| SinkError::CaptureIncomplete)?;
+        }
         Ok(())
     }
 }
 
-const BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","warnings":["advisory"]},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#;
-const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
+const SUBSCRIPTION_REFUSAL: &str = r#"{"method":"subscribe","success":false,"error":"rate limit exceeded","time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25.010Z","req_id":1}"#;
+const PUBLIC_BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD"},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25.010Z","req_id":1}"#;
+const PUBLIC_RESET: &str = r#"{"channel":"status","type":"update","data":[{"system":"maintenance","api_version":"v2","connection_id":42,"version":"2.0.0","upcoming_maintenance":[],"emergency":[]}]}"#;
+const STATUS_ONLINE_WITH_ADVISORIES: &str = r#"{"channel":"status","type":"update","data":[{"system":"online","api_version":"v2","connection_id":42,"version":"2.0.0","upcoming_maintenance":[],"emergency":[]}]}"#;
+const LEVEL3_ACK: &str = r#"{"method":"subscribe","result":{"channel":"level3","depth":10,"snapshot":true,"symbol":"BTC/USD"},"success":true,"time_in":"2024-01-08T12:26:45.900000000Z","time_out":"2024-01-08T12:26:45.910000000Z","req_id":7}"#;
+const LEVEL3_INVALID: &str = r#"{"channel":"level3","type":"update","data":[{"symbol":"BTC/USD","timestamp":"2024-01-08T12:26:46.600000000Z","checksum":1,"bids":[{"event":"modify","order_id":"OJPMIN-NXZL5-SOWP6V","limit_price":"44937.1","order_qty":"0.01000000","timestamp":"2024-01-08T12:26:46.500000000Z"}]}]}"#;
 
 #[tokio::test]
-async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestResult {
+async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_atomic_recovery()
+-> TestResult {
+    assert_eq!(KRAKEN_L3_WEBSOCKET_ENDPOINT, "wss://ws-l3.kraken.com/v2");
+    assert_eq!(
+        crate::messages::status_system(
+            &STATUS_ONLINE_WITH_ADVISORIES
+                .replace("\"connection_id\":42,", "")
+                .into_bytes()
+        ),
+        Err(crate::messages::StatusValidationError::Malformed)
+    );
+    assert_eq!(
+        crate::messages::status_system(
+            &STATUS_ONLINE_WITH_ADVISORIES
+                .replace("\"connection_id\":42", "\"connection_id\":0")
+                .into_bytes()
+        ),
+        Err(crate::messages::StatusValidationError::InvalidState)
+    );
+    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+    let public_snapshot = include_bytes!("../fixtures/official_book_checksum.json");
+    let level3_snapshot = include_bytes!("../fixtures/official_level3_checksum.json");
+    let mut recovery_snapshot: serde_json::Value = serde_json::from_slice(level3_snapshot)?;
+    recovery_snapshot["data"][0]["timestamp"] =
+        serde_json::Value::String("2024-01-08T12:26:47.000000000Z".to_owned());
+    let recovery_snapshot = serde_json::to_vec(&recovery_snapshot)?;
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let server_recovery = recovery_snapshot.clone();
     let server = tokio::spawn(async move {
-        let mut first = accept_book_source(&listener).await?;
-        first.send(Message::Text(BOOK_ACK.into())).await?;
-        first
-            .send(Message::Text(UPDATE_BEFORE_SNAPSHOT.into()))
+        let mut public_socket = accept_subscription(&listener).await?;
+        public_socket
+            .send(Message::Text(PUBLIC_BOOK_ACK.into()))
             .await?;
-        drop(first);
+        public_socket
+            .send(Message::Text(STATUS_ONLINE_WITH_ADVISORIES.into()))
+            .await?;
+        public_socket
+            .send(Message::Text(std::str::from_utf8(public_snapshot)?.into()))
+            .await?;
+        public_socket
+            .send(Message::Text(PUBLIC_RESET.into()))
+            .await?;
 
-        let mut socket = accept_book_source(&listener).await?;
-        socket
-            .send(Message::Ping(b"health".as_slice().into()))
+        let mut level3_socket = accept_subscription(&listener).await?;
+        level3_socket.send(Message::Text(LEVEL3_ACK.into())).await?;
+        level3_socket
+            .send(Message::Text(STATUS_ONLINE_WITH_ADVISORIES.into()))
             .await?;
-        let Some(Ok(Message::Pong(payload))) =
-            tokio::time::timeout(Duration::from_secs(1), socket.next()).await?
-        else {
-            return Err("source did not answer the protocol ping".into());
-        };
-        if payload.as_ref() != b"health" {
-            return Err("source changed the protocol pong payload".into());
-        }
-        socket.send(Message::Text(BOOK_ACK.into())).await?;
-        socket
-            .send(Message::Text(
-                include_str!("../fixtures/official_book_checksum.json").into(),
-            ))
+        level3_socket
+            .send(Message::Text(std::str::from_utf8(level3_snapshot)?.into()))
             .await?;
-        socket.close(None).await?;
+        level3_socket
+            .send(Message::Text(LEVEL3_INVALID.into()))
+            .await?;
+        level3_socket
+            .send(Message::Text(String::from_utf8(server_recovery)?.into()))
+            .await?;
         TestResult::Ok(())
     });
 
-    let (config, mut registry, registered) =
+    let (public_config, mut public_registry, public_registered, _public_catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
-    let first_session = registry.begin_session(
-        &registered,
-        SessionId::new(SourceIdentifier::try_from("kraken-session-quarantined")?),
+    let public_session = public_registry.begin_session(
+        &public_registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-public-critical")?),
         ConnectionGeneration::new(1)?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let first_generation = live_generation(&mut registry, &first_session)?;
-    let (mut first_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let mut first_source = KrakenSource::try_new(config.clone(), first_generation)?;
-    let mut first_sink = RecordingSink::default();
+    let public_generation = live_generation(&mut public_registry, &public_session)?;
+    let mut public_authority = public_generation.try_start(public_config.metadata())?;
+    let public_budget = public_authority
+        .budget()?
+        .cloned()
+        .ok_or("public session has no coordinated budget")?;
+    let (public_decode_control, mut public_handoff_consumer) =
+        KrakenSocketHandoffConsumer::channel(&public_config, public_budget.clone())?;
+    let (mut public_socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
+    let public_request = public_config.try_subscription_request(public_authority.generation())?;
+    let (public_permit, public_written) = send_subscription(
+        &mut public_socket,
+        &mut public_authority,
+        &public_budget,
+        public_request,
+        &CancellationToken::new(),
+        Duration::from_secs(1),
+    )
+    .await?;
+    public_decode_control.install_subscription(public_permit, public_written)?;
+    let (acknowledgement, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
+    let (acknowledgement, acknowledgement_publication) = acknowledgement.into_parts();
+    assert!(matches!(
+        acknowledgement,
+        DecodeOutcome::Control(control)
+            if control.kind() == market_squawk_sources::ControlFrameKind::SubscriptionAcknowledgement
+    ));
+    assert!(acknowledgement_publication.is_some());
+    assert!(terminal.is_none());
+    assert!(public_decode_control.health().book_subscribed());
+
+    let (status, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
+    assert!(
+        matches!(status.into_parts().0, DecodeOutcome::Control(control)
+        if control.kind() == market_squawk_sources::ControlFrameKind::ProviderFlowControl)
+    );
+    assert!(terminal.is_none());
+    assert_eq!(public_decode_control.health().market_messages(), 0);
+
+    let (public_snapshot_handoff, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
+    let (public_snapshot, publication) = public_snapshot_handoff.into_parts();
+    let DecodeOutcome::Data(public_snapshot) = public_snapshot else {
+        return Err("public book escaped the capture-owned decoder".into());
+    };
+    assert!(public_snapshot.observations().iter().all(|observation| {
+        matches!(
+            observation.checksum(),
+            ProviderChecksumEvidence::Provided { value, .. }
+                if value.as_str() == "3310070434"
+        )
+    }));
+    let publication = publication.ok_or("public book lost its publication lineage")?;
+    assert_eq!(
+        publication.native_coordinates(),
+        public_config.native_coordinates()
+    );
+    assert!(terminal.is_none());
+    assert_eq!(public_decode_control.health().market_messages(), 1);
+
+    let (reset, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
+    let (reset, reset_publication) = reset.into_parts();
+    assert!(matches!(
+        reset,
+        DecodeOutcome::Resynchronize(recovery)
+            if recovery.reason()
+                == market_squawk_sources::ResynchronizationReason::ProviderRequestedReset
+    ));
+    assert!(reset_publication.is_some());
+    assert_eq!(terminal, Some(SourceError::InvalidProtocolState));
+    assert_eq!(
+        public_decode_control.health().state(),
+        KrakenDecoderState::Retired
+    );
+
+    let credential_record = SourceIdentifier::try_from("kraken-read-only-market-data-account")?;
+    let credential_authority = KrakenL3CredentialAuthority::new(
+        credential_record.clone(),
+        NonZeroU64::new(3).ok_or("zero authorization generation")?,
+    );
+    let level3_config = KrakenL3Config::try_new(
+        level3_metadata(instrument, credential_record.clone())?,
+        vec![KrakenL3ProductMapping::try_new("BTC/USD", instrument)?],
+        KrakenL3Depth::Ten,
+        KrakenL3ClientTier::Standard,
+        &credential_authority,
+        NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+    )?;
+    let foreign_authority = KrakenL3CredentialAuthority::new(
+        credential_record,
+        NonZeroU64::new(3).ok_or("zero authorization generation")?,
+    );
+    assert!(matches!(
+        level3_config.try_subscription_payload(
+            foreign_authority
+                .try_mint_subscription_capability("fixture-foreign-token".to_owned())?,
+            0,
+            Some(7),
+        ),
+        Err(crate::KrakenL3ConfigError::CredentialAuthorityMismatch)
+    ));
+
+    let level3_registry =
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+            Arc::new(FixtureAuthorizationSubject),
+        )?;
+    let (mut level3_registry, level3_registered, _level3_catalog, _, _) = selected_registry(
+        level3_registry,
+        level3_config.metadata(),
+        &public_definition(instrument)?,
+        SourceId::try_from("kraken")?,
+        ProviderInstrumentId::try_from("BTC/USD")?,
+    )?;
+    let level3_session = level3_registry.begin_session(
+        &level3_registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-level3-critical")?),
+        ConnectionGeneration::new(7)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let level3_generation = live_generation(&mut level3_registry, &level3_session)?;
+    let mut level3_authority = level3_generation.try_start(level3_config.metadata())?;
+    let level3_budget = level3_authority
+        .budget()?
+        .cloned()
+        .ok_or("level-3 session has no coordinated budget")?;
+    let (mut level3_socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
+    let level3_payload = level3_config.try_subscription_payload(
+        credential_authority
+            .try_mint_subscription_capability("fixture-ephemeral-token".to_owned())?,
+        0,
+        Some(7),
+    )?;
+    let mut level3_dispatch = KrakenL3EstablishedSessionSender::try_new(
+        &mut level3_authority,
+        &mut level3_socket,
+        &level3_budget,
+    )?
+    .send_subscription(
+        level3_payload,
+        &CancellationToken::new(),
+        Duration::from_secs(1),
+    )
+    .await?;
+    let mut level3_decoder = KrakenL3Decoder::try_new(&level3_config)?;
+    let level3_ack = receive_text(&mut level3_socket).await?;
+    decode_level3_frame(
+        &mut level3_authority,
+        &mut level3_decoder,
+        level3_ack,
+        Some(&mut level3_dispatch),
+    )?;
+    assert!(level3_dispatch.is_settled());
+    let status = decode_level3_frame(
+        &mut level3_authority,
+        &mut level3_decoder,
+        receive_text(&mut level3_socket).await?,
+        None,
+    )?;
+    assert!(matches!(
+        disposition_kind(&status)?,
+        KrakenControlOrDiscontinuityKind::AuthenticatedControl(crate::KrakenL3Control::Online)
+    ));
+    let level3_snapshot_handoff = decode_level3_frame(
+        &mut level3_authority,
+        &mut level3_decoder,
+        receive_text(&mut level3_socket).await?,
+        None,
+    )?;
+    let KrakenMarketEventHandoff::AuthenticatedLevel3(level3_snapshot_handoff) =
+        level3_snapshot_handoff
+    else {
+        return Err("level-3 book escaped the authenticated market handoff".into());
+    };
+    let Some(KrakenSubscriptionRequestEvidence::AuthenticatedSecretBearing { request_evidence }) =
+        level3_snapshot_handoff.connection().subscription_request()
+    else {
+        return Err("protected credential authority was absent from the L3 handoff".into());
+    };
+    assert_eq!(
+        request_evidence.credential_record_id(),
+        credential_authority.credential_record_id()
+    );
+    assert_eq!(
+        request_evidence.authorization_generation(),
+        credential_authority.authorization_generation()
+    );
+    let level3_identity = level3_snapshot_handoff.instrument_binding();
+    assert_eq!(level3_identity.native_symbol().as_str(), "BTC/USD");
+    assert_eq!(
+        level3_identity.provider_identity_key().source_id().as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        level3_identity
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(
+        level3_identity.venue_mapping().venue_id().as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        level3_identity.venue_mapping().venue_symbol().as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(level3_identity.externally_resolved_instrument(), instrument);
+    assert!(matches!(
+        level3_snapshot_handoff.continuity(),
+        KrakenMarketContinuity::AuthenticatedLevel3 {
+            transition: KrakenBookTransition::Snapshot,
+            checksum: KrakenChecksumAvailability::Validated(1_063_832_831),
+            local_generation_ordinal: 1,
+            ..
+        }
+    ));
+    let invalid = decode_level3_frame(
+        &mut level3_authority,
+        &mut level3_decoder,
+        receive_text(&mut level3_socket).await?,
+        None,
+    )?;
+    assert!(matches!(
+        disposition_kind(&invalid)?,
+        KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(
+            KrakenAuthenticatedDiscontinuity::Decode {
+                error: crate::KrakenL3DecodeError::ChecksumMismatch { expected: 1, .. },
+                ..
+            }
+        )
+    ));
+    assert_eq!(
+        level3_decoder.state("BTC/USD"),
+        Some(KrakenL3DecoderState::Quarantined)
+    );
+    decode_level3_frame(
+        &mut level3_authority,
+        &mut level3_decoder,
+        receive_text(&mut level3_socket).await?,
+        None,
+    )?;
+    assert_eq!(
+        level3_decoder.state("BTC/USD"),
+        Some(KrakenL3DecoderState::Healthy)
+    );
+    server.await??;
+    Ok(())
+}
+
+async fn accept_subscription(listener: &TcpListener) -> TestResult<WebSocketStream<TcpStream>> {
+    let (stream, _) = listener.accept().await?;
+    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+    let Some(Ok(Message::Text(subscription))) =
+        tokio::time::timeout(Duration::from_secs(1), socket.next()).await?
+    else {
+        return Err("session did not send a text subscription".into());
+    };
+    let request: FixtureSubscription<'_> = serde_json::from_str(&subscription)?;
+    if request.method != "subscribe" {
+        return Err("session sent a non-subscription request".into());
+    }
+    match request.params.channel {
+        "book" if request.request_id == 1 && request.params.token.is_none() => {}
+        "level3"
+            if request.request_id == 7
+                && request.params.token == Some("fixture-ephemeral-token") => {}
+        _ => return Err("session sent the wrong subscription contract".into()),
+    }
+    Ok(socket)
+}
+
+#[derive(serde::Deserialize)]
+struct FixtureSubscription<'a> {
+    method: &'a str,
+    params: FixtureSubscriptionParams<'a>,
+    #[serde(rename = "req_id")]
+    request_id: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct FixtureSubscriptionParams<'a> {
+    channel: &'a str,
+    #[serde(default)]
+    token: Option<&'a str>,
+}
+
+async fn receive_text<S>(socket: &mut WebSocketStream<S>) -> TestResult<Bytes>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(message) = socket.next().await else {
+        return Err("provider connection ended before the expected frame".into());
+    };
+    let Message::Text(text) = message? else {
+        return Err("provider sent a non-text fixture frame".into());
+    };
+    Ok(Bytes::copy_from_slice(text.as_bytes()))
+}
+
+fn decode_public_frame_through_socket_handoff(
+    authority: &mut ActiveLiveSourceGeneration,
+    payload: Bytes,
+    consumer: &mut KrakenSocketHandoffConsumer,
+    control: &KrakenSocketDecodeControl,
+) -> TestResult<(KrakenMarketDecodeHandoff, Option<SourceError>)> {
+    let frame = authority
+        .frames_mut()?
+        .try_frame(TransportFrameKind::Text, payload)?;
+    let frame_id = frame.frame_id();
+    let validated = authority.validate_live_frame(&frame)?;
+    let handoff = consumer.consume(&validated)?;
+    Ok((handoff, control.finish_frame(frame_id)?))
+}
+
+fn decode_level3_frame(
+    authority: &mut ActiveLiveSourceGeneration,
+    decoder: &mut KrakenL3Decoder,
+    payload: Bytes,
+    mut dispatch: Option<&mut KrakenL3SubscriptionDispatch>,
+) -> TestResult<KrakenMarketEventHandoff> {
+    let frame = authority
+        .frames_mut()?
+        .try_frame(TransportFrameKind::Text, payload)?;
+    let validated = authority.validate_live_frame(&frame)?;
+    if let Some(dispatch) = dispatch.as_deref_mut()
+        && let Some(sent) = dispatch.bind_to_frame(&validated)?
+    {
+        decoder.register_sent_subscription(sent)?;
+    }
+    let handoff = decoder.decode_captured(&validated)?;
+    if let Some(dispatch) = dispatch
+        && let KrakenMarketEventHandoff::ControlOrDiscontinuity(control) = &handoff
+        && let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = control.kind()
+    {
+        dispatch.apply_control(control)?;
+    }
+    Ok(handoff)
+}
+
+fn disposition_kind(
+    handoff: &KrakenMarketEventHandoff,
+) -> TestResult<&KrakenControlOrDiscontinuityKind> {
+    let KrakenMarketEventHandoff::ControlOrDiscontinuity(handoff) = handoff else {
+        return Err("expected a Kraken control or discontinuity handoff".into());
+    };
+    Ok(handoff.kind())
+}
+
+#[derive(Debug)]
+struct FixtureAuthorizationSubject;
+
+impl AuthorizationSubjectResolver for FixtureAuthorizationSubject {
+    fn resolve_subject_record(
+        &self,
+        mode: AuthorizationMode,
+        _evidence: EvidenceDigest,
+    ) -> Result<SourceIdentifier, AuthorizationSubjectResolutionError> {
+        if mode != AuthorizationMode::UserAuthorized {
+            return Err(AuthorizationSubjectResolutionError::UnsupportedMode);
+        }
+        SourceIdentifier::try_from("kraken-read-only-market-data-account")
+            .map_err(|_| AuthorizationSubjectResolutionError::EvidenceUnresolved)
+    }
+}
+
+fn level3_metadata(
+    instrument: InstrumentId,
+    credential_record: SourceIdentifier,
+) -> TestResult<SourceMetadata> {
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let authorization = AuthorizationGrant::new(
+        AuthorizationMode::UserAuthorized,
+        AuthorizationBasis::new(credential_record.clone()),
+        exact_evidence(2),
+        effective,
+    );
+    let budget = ProviderBudgetPolicy::try_new(
+        BudgetScope::with_authorization_account(
+            SourceIdentifier::try_from("kraken")?,
+            credential_record,
+        ),
+        NonZeroU32::new(1).ok_or("zero request budget")?,
+        NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
+        NonZeroU16::new(1).ok_or("zero concurrency")?,
+        BackoffPolicy::try_new(
+            NonZeroU64::new(100_000_000).ok_or("zero initial backoff")?,
+            NonZeroU64::new(30_000_000_000).ok_or("zero maximum backoff")?,
+            1_000,
+        )?,
+    )?;
+    Ok(KrakenL3MetadataInput::new(
+        SourceId::try_from("kraken-authenticated-level3-v2")?,
+        RevisionBoundPayloadEvidence::new(
+            MetadataRevision::new(SourceIdentifier::try_from("kraken-level3-policy-v1")?),
+            exact_evidence(1),
+        ),
+        authorization,
+        exact_evidence(3),
+        effective,
+        vec![instrument],
+        FreshnessPolicy::try_new(
+            5_000_000_000,
+            1_000_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            100_000_000,
+        )?,
+        budget,
+    )
+    .try_build()?)
+}
+
+fn exact_evidence(byte: u8) -> ExactPayloadEvidence {
+    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        [byte; 32],
+    ))
+}
+
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
+#[tokio::test]
+async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let mut socket = accept_book_source(&listener).await?;
+            socket
+                .send(Message::Text(SUBSCRIPTION_REFUSAL.into()))
+                .await?;
+            socket.close(None).await?;
+        }
+        TestResult::Ok(())
+    });
+
+    let endpoint = format!("ws://{address}");
+    let (first_config, mut first_registry, first_registered, _first_catalog) =
+        test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    let first_config = first_config.with_local_endpoint_for_test(&endpoint)?;
+    let first_session = first_registry.begin_session(
+        &first_registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-sink-rejected")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let first_generation = live_generation(&mut first_registry, &first_session)?;
+    let (mut first_source, first_decoder) =
+        KrakenSource::try_new_with_publication_handoff(first_config, first_generation)?;
+    let mut first_sink = RecordingSink {
+        terminal_after_capture: true,
+        session: Some(&first_session),
+        decoder: Some(first_decoder),
+        ..RecordingSink::default()
+    };
 
     let first_result = first_source
-        .run_established(&mut first_socket, &mut first_sink, CancellationToken::new())
+        .run(&mut first_sink, CancellationToken::new())
         .await;
 
-    assert_eq!(first_result, Err(SourceError::InvalidProtocolState));
     assert_eq!(
-        first_source.health().state(),
-        KrakenDecoderState::Quarantined
+        first_result,
+        Err(SourceError::Sink(SinkError::CaptureIncomplete))
     );
-    assert_eq!(first_source.health().captured_frames(), 2);
+    assert_eq!(first_source.health().captured_frames(), 0);
+    assert_eq!(first_source.health().control_messages(), 0);
     assert_eq!(first_source.health().market_messages(), 0);
-    let mut first_bridge = KrakenMarketDecoder::try_new(
-        first_source.metadata().clone(),
-        "BTC/USD",
-        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
-        KrakenDepth::Ten,
-    )?;
-    assert!(matches!(
-        first_bridge.decode(&first_session.validate_live_frame(&first_sink.frames[0])?)?,
-        DecodeOutcome::Control(_)
-    ));
-    assert!(matches!(
-        first_bridge.decode(&first_session.validate_live_frame(&first_sink.frames[1])?)?,
-        DecodeOutcome::Resynchronize(_)
-    ));
-    assert_eq!(first_bridge.state(), KrakenDecoderState::Quarantined);
-    registry.end_session(&first_session, Timestamp::from_unix_nanos(2))?;
-    assert!(
-        first_session
-            .validate_live_frame(&first_sink.frames[0])
-            .is_err()
-    );
+    assert!(!first_source.health().book_subscribed());
 
-    let successor_session = registry.begin_session(
+    let (config, mut registry, registered, _catalog) =
+        test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    let config = config.with_local_endpoint_for_test(&endpoint)?;
+    let session = registry.begin_session(
         &registered,
-        SessionId::new(SourceIdentifier::try_from("kraken-session-successor")?),
-        ConnectionGeneration::new(2)?,
-        Timestamp::from_unix_nanos(3),
+        SessionId::new(SourceIdentifier::try_from("kraken-refusal-admitted")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
     )?;
-    let successor_generation = live_generation(&mut registry, &successor_session)?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let budget = successor_session
+    let generation = live_generation(&mut registry, &session)?;
+    let budget = session
         .budget()
         .cloned()
         .ok_or("source session has no coordinated budget")?;
-    let mut source = KrakenSource::try_new(config, successor_generation)?;
-    let mut sink = RecordingSink::default();
-
-    let result = source
-        .run_established(&mut socket, &mut sink, CancellationToken::new())
-        .await;
-
-    assert_eq!(result, Err(SourceError::Network));
-    assert_eq!(source.health().state(), KrakenDecoderState::Quarantined);
-    assert_eq!(source.health().captured_frames(), 2);
-    assert_eq!(source.health().control_messages(), 1);
-    assert_eq!(source.health().market_messages(), 1);
-    assert!(source.health().book_subscribed());
-    assert!(source.health().last_market_timestamp().is_some());
-    assert_eq!(sink.frames.len(), 2);
-    let validated_ack = successor_session.validate_live_frame(&sink.frames[0])?;
-    let mut bridge = KrakenMarketDecoder::try_new(
-        source.metadata().clone(),
-        "BTC/USD",
-        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
-        KrakenDepth::Ten,
-    )?;
-    assert!(matches!(
-        bridge.decode(&validated_ack)?,
-        DecodeOutcome::Control(_)
-    ));
-    assert_eq!(bridge.state(), KrakenDecoderState::AwaitingSnapshot);
-    let validated_snapshot = successor_session.validate_live_frame(&sink.frames[1])?;
-    assert!(matches!(
-        bridge.decode(&validated_snapshot)?,
-        DecodeOutcome::Data(_)
-    ));
-    assert_eq!(bridge.state(), KrakenDecoderState::Healthy);
-    assert!(first_session.validate_live_frame(&sink.frames[1]).is_err());
-
-    let refusal = tokio_tungstenite::tungstenite::Error::Http(Box::new(
-        tokio_tungstenite::tungstenite::http::Response::builder()
-            .status(429)
-            .header(
-                tokio_tungstenite::tungstenite::http::header::RETRY_AFTER,
-                "1",
-            )
-            .body(None)?,
-    ));
-    let returned_deadline = match super::map_connect_error(refusal, &budget) {
-        SourceError::BudgetWaitUntil { deadline } => deadline,
-        error => return Err(format!("429 mapped to {error:?} instead of a budget wait").into()),
+    let (mut source, decoder) = KrakenSource::try_new_with_publication_handoff(config, generation)?;
+    let mut sink = RecordingSink {
+        session: Some(&session),
+        decoder: Some(decoder),
+        ..RecordingSink::default()
     };
+
+    let result = source.run(&mut sink, CancellationToken::new()).await;
+
+    let refusal_deadline = match result {
+        Err(SourceError::BudgetWaitUntil { deadline }) => deadline,
+        result => return Err(format!("provider refusal settled as {result:?}").into()),
+    };
+    assert_eq!(source.health().state(), KrakenDecoderState::Retired);
+    assert_eq!(source.health().captured_frames(), 1);
+    assert_eq!(source.health().control_messages(), 1);
     assert!(matches!(
-        budget.try_acquire(),
-        BudgetDecision::WaitUntil(recorded_deadline) if recorded_deadline == returned_deadline
+        budget.try_reserve_request(),
+        BudgetReservationDecision::WaitUntil(recorded_deadline)
+            if recorded_deadline == refusal_deadline
     ));
 
     server.await??;
     Ok(())
 }
 
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
 async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStream<TcpStream>> {
     let (stream, _) = listener.accept().await?;
     let mut socket = tokio_tungstenite::accept_async(stream).await?;
     let Some(Ok(Message::Text(subscription))) =
-        tokio::time::timeout(Duration::from_secs(1), socket.next()).await?
+        tokio::time::timeout(Duration::from_secs(2), socket.next()).await?
     else {
         return Err("source did not send a text subscription".into());
     };
     let request: serde_json::Value = serde_json::from_str(&subscription)?;
-    if request["method"] != "subscribe" || request["params"]["channel"] != "book" {
+    if request["method"] != "subscribe"
+        || request["req_id"] != 1
+        || request["params"]["channel"] != "book"
+    {
         return Err("source sent the wrong subscription".into());
     }
     Ok(socket)
@@ -219,7 +719,7 @@ async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStrea
 
 #[test]
 fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_sessions() -> TestResult {
-    let (config, mut registry, registered) =
+    let (config, mut registry, registered, _catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let first = registry.begin_session(
         &registered,
@@ -235,7 +735,7 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
         Timestamp::from_unix_nanos(2),
     )?;
     assert!(matches!(
-        KrakenSource::try_new(config.clone(), stale_generation),
+        KrakenSource::try_new_with_publication_handoff(config.clone(), stale_generation),
         Err(SourceError::SessionNotCurrent)
     ));
 
@@ -249,7 +749,7 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
         Err(RegistryError::RawFrameFactoryAlreadyTaken)
     ));
 
-    let (foreign_config, mut foreign_registry, foreign_registered) =
+    let (foreign_config, mut foreign_registry, foreign_registered, _foreign_catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     assert_eq!(
         foreign_config.metadata().source_id(),
@@ -278,7 +778,7 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
 
 #[tokio::test]
 async fn source_uses_the_session_budget_and_cannot_run_twice() -> TestResult {
-    let (config, mut registry, registered) =
+    let (config, mut registry, registered, _catalog) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let session = registry.begin_session(
         &registered,
@@ -291,7 +791,8 @@ async fn source_uses_the_session_budget_and_cannot_run_twice() -> TestResult {
         .cloned()
         .ok_or("source session has no coordinated budget")?;
     let generation = live_generation(&mut registry, &session)?;
-    let mut source = KrakenSource::try_new(config, generation)?;
+    let (mut source, _decoder) =
+        KrakenSource::try_new_with_publication_handoff(config, generation)?;
     assert!(source.budget.shares_allocation_with(&expected_budget));
 
     let cancellation = CancellationToken::new();
@@ -318,6 +819,114 @@ fn live_generation(
     Ok(registry.take_live_source_generation(session)?)
 }
 
+// Both public and authenticated fixture sessions must select genuine catalog identities before
+// registry admission. The caller retains the directory; the registry retains its reader owner.
+fn selected_registry(
+    registry: AuthoritativeSourceRegistry,
+    metadata: &SourceMetadata,
+    definition: &InstrumentDefinition,
+    namespace: SourceId,
+    native_id: ProviderInstrumentId,
+) -> TestResult<(
+    AuthoritativeSourceRegistry,
+    market_squawk_sources::RegisteredSource,
+    tempfile::TempDir,
+    KrakenReferenceSelectionEvidence,
+    Timestamp,
+)> {
+    use market_squawk_data::{
+        CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
+        MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
+        MarketDataInstrumentSynchronizationCapability, MarketDataProviderIdentityQuery,
+    };
+    use market_squawk_domain::{
+        MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+    };
+    let directory = tempfile::tempdir()?;
+    let paths = market_squawk_platform::LocalPaths::prepare(directory.path().join("catalog"))?;
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?)?));
+    let cancellation = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let writer = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(authority, deadline, &cancellation)?;
+    let original = &definition.provider_identities()[0];
+    let evidence = ExactPayloadEvidence::from_content_digest(original.evidence().content_digest());
+    let catalog_definition =
+        MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id: definition.instrument_id(),
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                original.metadata_revision().clone(),
+                evidence.clone(),
+            ),
+            effective_interval: original.validity(),
+            asset_class: definition.asset_class(),
+            display_name: None,
+            quote_currency: definition.quote_currency(),
+            quote_currency_evidence: evidence,
+            venue_mappings: definition.venue_mappings().to_vec(),
+            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: definition.instrument_id(),
+                source_id: namespace.clone(),
+                provider_instrument_id: native_id.clone(),
+                evidence: original.evidence().clone(),
+                source_timestamp: original.source_timestamp(),
+                observed_at: original.observed_at(),
+                metadata_revision: original.metadata_revision().clone(),
+                validity: original.validity(),
+                supersedes: None,
+            })],
+            identifiers: definition.identifiers().to_vec(),
+        })?;
+    writer.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![catalog_definition], 1)?,
+        deadline,
+        &cancellation,
+    )?;
+    let selected_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let selection = reader
+        .select_provider_identity_as_of(
+            MarketDataProviderIdentityQuery::try_new(
+                namespace.clone(),
+                native_id.clone(),
+                selected_at,
+                selected_at,
+            )?,
+            deadline,
+            &cancellation,
+        )?
+        .ok_or("fixture catalog did not select Kraken identity")?;
+    let exact = selection.exact_receipt()?;
+    let reference = KrakenReferenceSelectionEvidence::try_new(
+        exact.definition_reference_revision().clone(),
+        exact.definition_reference_payload_digest(),
+        exact.definition_revision_digest(),
+        exact.definition_revision_sequence(),
+        exact.definition_published_at(),
+        original.validity(),
+        selection.selection_digest(),
+    )?;
+    let request = market_squawk_sources::ProviderNativeIdentityRequest {
+        namespace,
+        provider_instrument_id: native_id,
+        instrument: definition.instrument_id(),
+        venue: definition.venue_mappings()[0].venue_id().clone(),
+        venue_symbol: definition.venue_mappings()[0].venue_symbol().clone(),
+        knowledge_at: selected_at,
+        effective_at: selected_at,
+    };
+    let mut registry = registry.with_provider_identity_authority(Arc::new(reader))?;
+    let registered = registry.register(metadata.clone(), selected_at)?;
+    registry.record_provider_identities(&registered, &[request], deadline, &cancellation)?;
+    Ok((registry, registered, directory, reference, selected_at))
+}
+
 fn test_source(
     source_id: &str,
     metadata_revision: &str,
@@ -325,6 +934,7 @@ fn test_source(
     KrakenConfig,
     AuthoritativeSourceRegistry,
     market_squawk_sources::RegisteredSource,
+    tempfile::TempDir,
 )> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let exact = |byte| {
@@ -342,9 +952,9 @@ fn test_source(
     );
     let budget = ProviderBudgetPolicy::try_new(
         BudgetScope::new(provider),
-        NonZeroU32::new(20).ok_or("zero request budget")?,
+        NonZeroU32::new(1).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(3).ok_or("zero concurrency")?,
+        NonZeroU16::new(1).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(10_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,
@@ -372,14 +982,61 @@ fn test_source(
         budget,
     )
     .try_build()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+    let definition = public_definition(instrument)?;
+    let identity = &definition.provider_identities()[0];
+    let provider_identity_key = identity.key();
+    let (registry, registered, catalog, reference_selection, selected_at) = selected_registry(
+        AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?,
+        &metadata,
+        &definition,
+        identity.source_id().clone(),
+        identity.provider_instrument_id().clone(),
+    )?;
     let config = KrakenConfig::try_new(
         metadata,
-        "BTC/USD",
-        instrument,
+        &definition,
+        &provider_identity_key,
+        &reference_selection,
+        selected_at,
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
-    Ok((config, registry, registered))
+    Ok((config, registry, registered, catalog))
+}
+
+fn public_definition(instrument: InstrumentId) -> TestResult<InstrumentDefinition> {
+    let usd = Currency::try_from("USD")?;
+    let provider_identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: SourceId::try_from("kraken-spot-v2")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("XBTUSD")?,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [4; 32],
+        )),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "kraken-instrument-identity-v1",
+        )?),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        supersedes: None,
+    });
+    Ok(InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: instrument,
+        definition_revision: InstrumentDefinitionRevision::try_from(1)?,
+        asset_class: market_squawk_domain::AssetClass::Crypto,
+        primary_denomination: Denomination::Currency(usd),
+        quote_currency: usd,
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::new(1, 8))?,
+        contract_multiplier: Decimal::ONE,
+        venue_mappings: vec![VenueMapping::new(
+            VenueId::try_from("kraken")?,
+            VenueSymbol::try_from("BTC/USD")?,
+        )],
+        provider_identities: vec![provider_identity],
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })?)
 }

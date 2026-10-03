@@ -17,6 +17,7 @@ path = "tests/harnesses/configuration_security.rs"
 [[test]]
 name = "capture_journal"
 path = "tests/harnesses/capture_journal.rs"
+required-features = ["capture-test"]
 
 [features]
 default = []
@@ -38,9 +39,11 @@ keyring = { workspace = true }
 libc = { workspace = true }
 market-squawk-domain = { workspace = true }
 memory-stats = { workspace = true, optional = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rust_decimal = { workspace = true }
+rustls.workspace = true
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -66,6 +69,11 @@ process-wrap = { workspace = true }
 
 [target.'cfg(market_squawk_loom)'.dependencies]
 loom = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL"] }
+security-framework = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 atomicwrites = { workspace = true }

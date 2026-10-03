@@ -1,3 +1,6 @@
+#[path = "../../../market-squawk-sources/tests/common/mod.rs"]
+mod source_fixture;
+
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::str::FromStr;
@@ -222,8 +225,14 @@ fn metadata(policy: FixturePolicy) -> TestResult<SourceMetadata> {
 }
 
 fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<CurrentFixture> {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(metadata(policy)?, Timestamp::from_unix_nanos(1))?;
+    let (mut registry, registered) = source_fixture::register_fixture_source(
+        metadata(policy)?,
+        &[(
+            market_squawk_domain::InstrumentId::from_str(INSTRUMENT)?,
+            "BTC-USD",
+        )],
+        Timestamp::from_unix_nanos(1),
+    )?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(id("session-1")?),
@@ -308,6 +317,11 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
             id("trade-1")?,
             VenueId::try_from("coinbase")?,
             market_squawk_domain::InstrumentId::from_str(INSTRUMENT)?,
+            market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+                market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+                market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+                market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+            ),
             ProviderTimestampEvidence::Provided {
                 value: frame_at,
                 rule: rule("coinbase-timestamp")?,
@@ -327,6 +341,7 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
                     Some(id("BUY")?),
                     rule("coinbase-aggressor")?,
                 ),
+                taker_order_type: None,
             },
         )?;
         let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
@@ -410,7 +425,7 @@ fn qualify(
         current,
         evidence,
         current
-            .frame_evidence()
+            .evidence()
             .received_at()
             .checked_add_nanos(EVALUATED_AT - FRAME_AT)
             .map_err(|_| QualificationBuildError::ExpiredWindow)?,
@@ -420,6 +435,7 @@ fn qualify(
                 PriceTicks::new(10_000),
                 QuantityLots::new(100).map_err(|_| MarketEventError::ZeroQuantity)?,
                 AggressorSide::Buy,
+                None,
             )?))
         },
     )
@@ -456,8 +472,24 @@ fn assessment_and_execution_digest_bind_exact_frame_ordinal_and_committed_revisi
     assert!(assessment_id.starts_with("live-v2-"));
     assert_eq!(assessment_id.len(), "live-v2-".len() + 64);
     assert_eq!(first.binding_digest.len(), 32);
-    assert_eq!(fixture.observations[0].frame_evidence().frame_id().get(), 1);
-    assert_eq!(fixture.observations[1].frame_evidence().frame_id().get(), 2);
+    assert_eq!(
+        fixture.observations[0]
+            .evidence()
+            .transport_frame()
+            .expect("fixture transport frame")
+            .frame_id()
+            .get(),
+        1
+    );
+    assert_eq!(
+        fixture.observations[1]
+            .evidence()
+            .transport_frame()
+            .expect("fixture transport frame")
+            .frame_id()
+            .get(),
+        2
+    );
     assert_ne!(first.binding_digest, second_frame.binding_digest);
     assert_ne!(
         first.assessment.assessment_id(),

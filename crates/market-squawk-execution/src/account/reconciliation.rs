@@ -20,6 +20,8 @@ struct AccountRiskReconciliationState {
     required_sequence: AtomicU64,
     applied_sequence: AtomicU64,
     publication_owned: AtomicBool,
+    portfolio_required: AtomicBool,
+    portfolio_sequence: AtomicU64,
 }
 
 /// Try-only linearization guard shared by reservation publication and backend financial fencing.
@@ -35,6 +37,8 @@ impl AccountRiskReconciliationFence {
                 required_sequence: AtomicU64::new(applied_sequence),
                 applied_sequence: AtomicU64::new(applied_sequence),
                 publication_owned: AtomicBool::new(false),
+                portfolio_required: AtomicBool::new(false),
+                portfolio_sequence: AtomicU64::new(0),
             }),
         }
     }
@@ -79,7 +83,34 @@ impl AccountRiskReconciliationFence {
 
     /// Reports whether authoritative risk state has caught up to every committed backend mutation.
     pub fn is_current(&self) -> bool {
-        self.applied_sequence() >= self.required_sequence()
+        let required = self.required_sequence();
+        self.applied_sequence() >= required
+            && (!self.state.portfolio_required.load(Ordering::Acquire)
+                || self.state.portfolio_sequence.load(Ordering::Acquire) >= required)
+    }
+
+    /// Called only by the non-cloneable configured portfolio publication owner.
+    pub(crate) fn bind_portfolio_publication(&self) -> Result<(), AccountReconciliationFenceError> {
+        let _guard = self.try_begin_reservation_publication()?;
+        self.state
+            .portfolio_required
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AccountReconciliationFenceError::PublicationBusy)?;
+        Ok(())
+    }
+    pub(crate) fn acknowledge_portfolio_publication(
+        &self,
+        sequence: u64,
+    ) -> Result<(), AccountReconciliationFenceError> {
+        if !self.state.portfolio_required.load(Ordering::Acquire)
+            || sequence < self.state.portfolio_sequence.load(Ordering::Acquire)
+        {
+            return Err(AccountReconciliationFenceError::SequenceMismatch);
+        }
+        self.state
+            .portfolio_sequence
+            .fetch_max(sequence, Ordering::AcqRel);
+        Ok(())
     }
 
     pub(crate) fn acknowledge(
@@ -154,6 +185,26 @@ mod tests {
             .map_err(|_| std::io::Error::other("fence worker panicked"))?;
         fence.require(NonZeroU64::MIN)?;
         assert!(!fence.is_current());
+
+        // The real paper publisher binds before hooks start. Catching the account up cannot
+        // release reservations while the portfolio still represents the previous worker state.
+        fence.bind_portfolio_publication()?;
+        fence.acknowledge(NonZeroU64::MIN)?;
+        assert!(!fence.is_current());
+        fence.acknowledge_portfolio_publication(1)?;
+        assert!(fence.is_current());
+        let second = NonZeroU64::new(2).ok_or("missing second sequence")?;
+        fence.require(second)?;
+        fence.acknowledge(second)?;
+        fence.acknowledge_portfolio_publication(1)?;
+        assert!(!fence.is_current());
+        fence.acknowledge_portfolio_publication(2)?;
+        assert!(fence.is_current());
+        assert_eq!(
+            fence.acknowledge_portfolio_publication(1),
+            Err(AccountReconciliationFenceError::SequenceMismatch)
+        );
+        assert!(fence.is_current());
         Ok(())
     }
 }

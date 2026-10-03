@@ -18,7 +18,27 @@ use crc32fast::Hasher;
 use fs2::FileExt as _;
 use thiserror::Error;
 
-use crate::{RawCaptureRecord, RawCaptureRecordError, raw_record::MAX_SERIALIZED_RECORD_BYTES};
+use crate::{
+    RawCaptureRecord, RawCaptureRecordError,
+    raw_record::{
+        MAX_SERIALIZED_RECORD_BYTES, RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES, write_json_buffered,
+    },
+};
+
+#[path = "journal/sealed.rs"]
+mod sealed;
+
+pub use sealed::{
+    PendingResearchObject, ResearchObjectAdmission, ResearchObjectCheckpointClaim,
+    ResearchObjectChunkReceipt, ResearchObjectClaim, ResearchObjectControl,
+    ResearchObjectControlError, ResearchObjectControlPoint, ResearchObjectReceipt,
+    SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
+    SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
+    SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRawObjectKind,
+    SealedResearchRecoveryAdmission, SealedResearchRecoverySession, SealedResearchRecoveryTurn,
+    VerifiedResearchObject,
+};
 
 const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";
 const MAX_RECORD_BYTES: usize = MAX_SERIALIZED_RECORD_BYTES;
@@ -26,6 +46,8 @@ const DEFAULT_MAX_RECORDS: usize = 1_000_000;
 const DEFAULT_MAX_AGGREGATE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_JOURNAL_BUFFER_CAPACITY_BYTES: usize = 64 * 1024;
 const DEFAULT_JOURNAL_RETAINED_BYTE_CEILING: usize = 1024 * 1024;
+const STARTUP_VALIDATION_CHUNK_BYTES: usize = 64 * 1024;
+const CONTROLLED_JOURNAL_WORK_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Separate fixed-storage limits for one journal sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,6 +274,156 @@ struct BoundedCrcForwardWriter<'a, W> {
     hasher: Hasher,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct WrittenJournalFrame {
+    pub(super) serialized_payload_bytes: usize,
+}
+
+pub(super) fn write_current_frame<W: Write>(
+    writer: &mut W,
+    record: &RawCaptureRecord,
+) -> Result<WrittenJournalFrame, JournalError> {
+    write_current_frame_inner(writer, record, None)
+}
+
+/// Writes the exact current frame while bounding caller-controlled serialization work chunks.
+pub(super) fn write_current_frame_with_checkpoint<W, F>(
+    writer: &mut W,
+    record: &RawCaptureRecord,
+    mut checkpoint: F,
+) -> Result<WrittenJournalFrame, JournalError>
+where
+    W: Write,
+    F: FnMut(u64) -> std::io::Result<()>,
+{
+    write_current_frame_inner(writer, record, Some(&mut checkpoint))
+}
+
+fn write_current_frame_inner<W: Write>(
+    writer: &mut W,
+    record: &RawCaptureRecord,
+    mut checkpoint: Option<&mut dyn FnMut(u64) -> std::io::Result<()>>,
+) -> Result<WrittenJournalFrame, JournalError> {
+    let mut first_pass = CountingCrcWriter::new(MAX_RECORD_BYTES);
+    let first_result = match checkpoint.as_deref_mut() {
+        Some(checkpoint) => {
+            let mut controlled = ControlledSerializationWriter::new(&mut first_pass, checkpoint, 0);
+            write_json_buffered(&mut controlled, record)
+        }
+        None => write_json_buffered(&mut first_pass, record),
+    };
+    if let Err(error) = first_result {
+        if first_pass.attempted_bytes > MAX_RECORD_BYTES {
+            return Err(JournalError::RecordTooLarge {
+                bytes: first_pass.attempted_bytes,
+                max: MAX_RECORD_BYTES,
+            });
+        }
+        return Err(JournalError::Json(error));
+    }
+    let (payload_bytes, crc) = first_pass.finish();
+    if payload_bytes > MAX_RECORD_BYTES {
+        return Err(JournalError::RecordTooLarge {
+            bytes: payload_bytes,
+            max: MAX_RECORD_BYTES,
+        });
+    }
+    let payload_bytes_u64 = u64::try_from(payload_bytes)?;
+    if let Some(checkpoint) = checkpoint.as_deref_mut() {
+        checkpoint(payload_bytes_u64).map_err(|source| {
+            JournalError::io("journal first serialization checkpoint failed", source)
+        })?;
+    }
+    let length = u32::try_from(payload_bytes)?;
+    writer
+        .write_all(&length.to_le_bytes())
+        .map_err(|source| JournalError::io("failed to write journal length", source))?;
+    writer
+        .write_all(&crc.to_le_bytes())
+        .map_err(|source| JournalError::io("failed to write journal checksum", source))?;
+    let mut second_pass = BoundedCrcForwardWriter::new(writer, payload_bytes);
+    let second_result = match checkpoint.as_deref_mut() {
+        Some(checkpoint) => {
+            let mut controlled =
+                ControlledSerializationWriter::new(&mut second_pass, checkpoint, payload_bytes_u64);
+            write_json_buffered(&mut controlled, record)
+        }
+        None => write_json_buffered(&mut second_pass, record),
+    };
+    if let Err(error) = second_result {
+        if error.is_io() {
+            let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+            return Err(JournalError::io(
+                "failed to write journal payload",
+                std::io::Error::new(kind, error),
+            ));
+        }
+        return Err(JournalError::Json(error));
+    }
+    let (written_bytes, written_crc) = second_pass.finish();
+    if written_bytes != payload_bytes || written_crc != crc {
+        return Err(JournalError::InvalidRecord(
+            "journal serialization passes produced different bytes".to_owned(),
+        ));
+    }
+    if let Some(checkpoint) = checkpoint.as_deref_mut() {
+        checkpoint(
+            payload_bytes_u64
+                .checked_mul(2)
+                .ok_or(JournalError::RecordTooLarge {
+                    bytes: payload_bytes,
+                    max: MAX_RECORD_BYTES,
+                })?,
+        )
+        .map_err(|source| {
+            JournalError::io("journal second serialization checkpoint failed", source)
+        })?;
+    }
+    Ok(WrittenJournalFrame {
+        serialized_payload_bytes: payload_bytes,
+    })
+}
+
+struct ControlledSerializationWriter<'writer, 'checkpoint, W> {
+    inner: &'writer mut W,
+    checkpoint: &'checkpoint mut dyn FnMut(u64) -> std::io::Result<()>,
+    offset: u64,
+}
+
+impl<'writer, 'checkpoint, W> ControlledSerializationWriter<'writer, 'checkpoint, W> {
+    fn new(
+        inner: &'writer mut W,
+        checkpoint: &'checkpoint mut dyn FnMut(u64) -> std::io::Result<()>,
+        offset: u64,
+    ) -> Self {
+        Self {
+            inner,
+            checkpoint,
+            offset,
+        }
+    }
+}
+
+impl<W: Write> Write for ControlledSerializationWriter<'_, '_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        (self.checkpoint)(self.offset)?;
+        let attempt = buffer.len().min(CONTROLLED_JOURNAL_WORK_CHUNK_BYTES);
+        let written = self.inner.write(&buffer[..attempt])?;
+        self.offset = self
+            .offset
+            .checked_add(u64::try_from(written).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("journal serialization offset overflowed"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl<'a, W> BoundedCrcForwardWriter<'a, W> {
     fn new(inner: &'a mut W, expected_bytes: usize) -> Self {
         Self {
@@ -331,6 +503,10 @@ impl ParentDirectorySync {
 }
 
 impl JournalWriter {
+    /// Fixed temporary serialization workspace included in this sink's byte admission.
+    /// The two checksum passes reuse this bound sequentially; it is not per payload byte.
+    pub const SERIALIZATION_WORKSPACE_BYTES: usize = RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES;
+
     pub(crate) fn validate_limits_for_path(
         path: &PathBuf,
         limits: JournalSinkLimits,
@@ -338,6 +514,7 @@ impl JournalWriter {
         let required = std::mem::size_of::<Self>()
             .checked_add(path.capacity())
             .and_then(|bytes| bytes.checked_add(limits.buffer_capacity()))
+            .and_then(|bytes| bytes.checked_add(RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES))
             .ok_or(JournalSinkConstructionError::ArithmeticOverflow)?;
         if required > limits.retained_byte_ceiling() {
             return Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
@@ -391,6 +568,7 @@ impl JournalWriter {
         let fixed_retained_bytes = std::mem::size_of::<Self>()
             .checked_add(path.capacity())
             .and_then(|bytes| bytes.checked_add(writer.capacity()))
+            .and_then(|bytes| bytes.checked_add(RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES))
             .ok_or(JournalSinkConstructionError::ArithmeticOverflow)?;
         if fixed_retained_bytes > limits.retained_byte_ceiling() {
             return Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
@@ -408,47 +586,7 @@ impl JournalWriter {
 
     /// Appends one CRC-framed compatibility record to the buffer.
     pub fn append(&mut self, record: &RawCaptureRecord) -> Result<(), JournalError> {
-        let mut first_pass = CountingCrcWriter::new(MAX_RECORD_BYTES);
-        if let Err(error) = serde_json::to_writer(&mut first_pass, record) {
-            if first_pass.attempted_bytes > MAX_RECORD_BYTES {
-                return Err(JournalError::RecordTooLarge {
-                    bytes: first_pass.attempted_bytes,
-                    max: MAX_RECORD_BYTES,
-                });
-            }
-            return Err(JournalError::Json(error));
-        }
-        let (payload_bytes, crc) = first_pass.finish();
-        if payload_bytes > MAX_RECORD_BYTES {
-            return Err(JournalError::RecordTooLarge {
-                bytes: payload_bytes,
-                max: MAX_RECORD_BYTES,
-            });
-        }
-        let length = u32::try_from(payload_bytes)?;
-        self.writer
-            .write_all(&length.to_le_bytes())
-            .map_err(|source| JournalError::io("failed to write journal length", source))?;
-        self.writer
-            .write_all(&crc.to_le_bytes())
-            .map_err(|source| JournalError::io("failed to write journal checksum", source))?;
-        let mut second_pass = BoundedCrcForwardWriter::new(&mut self.writer, payload_bytes);
-        if let Err(error) = serde_json::to_writer(&mut second_pass, record) {
-            if error.is_io() {
-                let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
-                return Err(JournalError::io(
-                    "failed to write journal payload",
-                    std::io::Error::new(kind, error),
-                ));
-            }
-            return Err(JournalError::Json(error));
-        }
-        let (written_bytes, written_crc) = second_pass.finish();
-        if written_bytes != payload_bytes || written_crc != crc {
-            return Err(JournalError::InvalidRecord(
-                "journal serialization passes produced different bytes".to_owned(),
-            ));
-        }
+        let _frame = write_current_frame(&mut self.writer, record)?;
         Ok(())
     }
 
@@ -468,7 +606,7 @@ impl JournalWriter {
         &self.path
     }
 
-    /// Returns the exact observed fixed Rust graph owned by this sink.
+    /// Returns the fixed sink graph plus its bounded temporary serialization workspace.
     pub const fn fixed_retained_bytes(&self) -> usize {
         self.fixed_retained_bytes
     }
@@ -514,6 +652,56 @@ impl JournalReader<File> {
     }
 }
 
+struct ControlledPayloadReader<'payload, 'checkpoint> {
+    payload: &'payload [u8],
+    offset: usize,
+    work_offset: u64,
+    checkpoint: &'checkpoint dyn Fn(u64) -> std::io::Result<()>,
+}
+
+impl<'payload, 'checkpoint> ControlledPayloadReader<'payload, 'checkpoint> {
+    fn new(
+        payload: &'payload [u8],
+        work_offset: u64,
+        checkpoint: &'checkpoint dyn Fn(u64) -> std::io::Result<()>,
+    ) -> Self {
+        Self {
+            payload,
+            offset: 0,
+            work_offset,
+            checkpoint,
+        }
+    }
+}
+
+impl Read for ControlledPayloadReader<'_, '_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.offset == self.payload.len() {
+            return Ok(0);
+        }
+        (self.checkpoint)(self.work_offset)?;
+        let remaining = self
+            .payload
+            .len()
+            .checked_sub(self.offset)
+            .ok_or_else(|| std::io::Error::other("journal payload offset overflowed"))?;
+        let count = remaining
+            .min(buffer.len())
+            .min(CONTROLLED_JOURNAL_WORK_CHUNK_BYTES);
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("journal payload offset overflowed"))?;
+        buffer[..count].copy_from_slice(&self.payload[self.offset..end]);
+        self.offset = end;
+        self.work_offset = self
+            .work_offset
+            .checked_add(u64::try_from(count).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("journal replay work offset overflowed"))?;
+        Ok(count)
+    }
+}
+
 impl<R: Read> JournalReader<R> {
     /// Wraps a readable journal stream.
     pub fn new(reader: R) -> Self {
@@ -550,6 +738,14 @@ impl<R: Read> JournalReader<R> {
     fn next_record_bounded(
         &mut self,
         max_framed_bytes: u64,
+    ) -> Result<Option<RawCaptureRecord>, JournalError> {
+        self.next_record_bounded_inner(max_framed_bytes, None)
+    }
+
+    fn next_record_bounded_inner(
+        &mut self,
+        max_framed_bytes: u64,
+        checkpoint: Option<&dyn Fn(u64) -> std::io::Result<()>>,
     ) -> Result<Option<RawCaptureRecord>, JournalError> {
         self.ensure_format()?;
         let mut length_bytes = [0_u8; 4];
@@ -588,7 +784,27 @@ impl<R: Read> JournalReader<R> {
             .map_err(|source| JournalError::io("truncated record payload", source))?;
         let expected_crc = u32::from_le_bytes(crc_bytes);
         let mut hasher = Hasher::new();
-        hasher.update(&payload);
+        let mut replay_work_bytes = 0_u64;
+        if let Some(checkpoint) = checkpoint {
+            checkpoint(replay_work_bytes).map_err(|source| {
+                JournalError::io("journal payload CRC checkpoint failed", source)
+            })?;
+            for chunk in payload.chunks(CONTROLLED_JOURNAL_WORK_CHUNK_BYTES) {
+                hasher.update(chunk);
+                replay_work_bytes = replay_work_bytes
+                    .checked_add(u64::try_from(chunk.len())?)
+                    .ok_or_else(|| {
+                        JournalError::InvalidRecord(
+                            "journal replay work offset overflow".to_owned(),
+                        )
+                    })?;
+                checkpoint(replay_work_bytes).map_err(|source| {
+                    JournalError::io("journal payload CRC checkpoint failed", source)
+                })?;
+            }
+        } else {
+            hasher.update(&payload);
+        }
         let actual_crc = hasher.finalize();
         if actual_crc != expected_crc {
             return Err(JournalError::InvalidRecord(format!(
@@ -600,7 +816,24 @@ impl<R: Read> JournalReader<R> {
             .offset
             .checked_add(framed_bytes)
             .ok_or_else(|| JournalError::InvalidRecord("journal offset overflow".to_owned()))?;
-        Ok(Some(serde_json::from_slice(&payload)?))
+        let record = if let Some(checkpoint) = checkpoint {
+            let controlled = ControlledPayloadReader::new(&payload, replay_work_bytes, checkpoint);
+            let buffered =
+                BufReader::with_capacity(CONTROLLED_JOURNAL_WORK_CHUNK_BYTES, controlled);
+            let validation_work_offset = replay_work_bytes
+                .checked_add(u64::try_from(payload.len())?)
+                .ok_or_else(|| {
+                    JournalError::InvalidRecord("journal replay work offset overflow".to_owned())
+                })?;
+            RawCaptureRecord::deserialize_committed_with_checkpoint(
+                buffered,
+                validation_work_offset,
+                checkpoint,
+            )?
+        } else {
+            serde_json::from_slice(&payload)?
+        };
+        Ok(Some(record))
     }
 
     /// Collects using conservative default record and byte limits.
@@ -609,12 +842,42 @@ impl<R: Read> JournalReader<R> {
     }
 
     /// Collects under explicit record-count and aggregate framed-byte limits.
+    /// Use the record visitor internally when retained replay bytes are unnecessary.
     pub fn read_all_bounded(
         mut self,
         max_records: usize,
         max_aggregate_bytes: u64,
     ) -> Result<Vec<RawCaptureRecord>, JournalError> {
         let mut records = Vec::new();
+        self.visit_bounded_with_checkpoint(
+            max_records,
+            max_aggregate_bytes,
+            None,
+            |_, _, _, record| {
+                records.try_reserve(1).map_err(|_| {
+                    JournalError::InvalidRecord("journal collection allocation failed".to_owned())
+                })?;
+                records.push(record);
+                Ok::<_, JournalError>(())
+            },
+        )?;
+        Ok(records)
+    }
+
+    /// Runs the sole bounded replay parser and releases each record after its visitor returns.
+    /// Offsets and frame lengths come from the decoded wire, not reserialized estimates.
+    pub(super) fn visit_bounded_with_checkpoint<E>(
+        &mut self,
+        max_records: usize,
+        max_aggregate_bytes: u64,
+        checkpoint: Option<&dyn Fn(u64) -> std::io::Result<()>>,
+        mut visit: impl FnMut(usize, u64, u64, RawCaptureRecord) -> Result<(), E>,
+    ) -> Result<usize, E>
+    where
+        E: From<JournalError>,
+    {
+        self.ensure_format()?;
+        let mut count = 0_usize;
         loop {
             let has_record = !self
                 .reader
@@ -622,17 +885,26 @@ impl<R: Read> JournalReader<R> {
                 .map_err(|source| JournalError::io("failed to inspect journal stream", source))?
                 .is_empty();
             if !has_record {
-                return Ok(records);
+                return Ok(count);
             }
-            if records.len() >= max_records {
-                return Err(JournalError::RecordLimitExceeded { limit: max_records });
+            if count >= max_records {
+                return Err(JournalError::RecordLimitExceeded { limit: max_records }.into());
             }
-            let consumed = self.offset.saturating_sub(4);
+            let offset = self.offset;
+            let consumed = offset.saturating_sub(4);
             let remaining = max_aggregate_bytes.saturating_sub(consumed);
-            let record = self.next_record_bounded(remaining)?.ok_or_else(|| {
-                JournalError::InvalidRecord("journal stream changed while reading".to_owned())
+            let record = self
+                .next_record_bounded_inner(remaining, checkpoint)?
+                .ok_or_else(|| {
+                    JournalError::InvalidRecord("journal stream changed while reading".to_owned())
+                })?;
+            let framed_bytes = self.offset.checked_sub(offset).ok_or_else(|| {
+                JournalError::InvalidRecord("journal frame offset overflow".to_owned())
             })?;
-            records.push(record);
+            visit(count, offset, framed_bytes, record)?;
+            count = count
+                .checked_add(1)
+                .ok_or(JournalError::RecordLimitExceeded { limit: max_records })?;
         }
     }
 }
@@ -651,7 +923,7 @@ fn validate_existing_reader<R: Read>(
     reader: &mut JournalReader<R>,
 ) -> Result<JournalFormat, JournalError> {
     let format = reader.ensure_format()?;
-    let mut records = 0_usize;
+    let mut chunk = [0_u8; STARTUP_VALIDATION_CHUNK_BYTES];
     loop {
         let has_record = !reader
             .reader
@@ -661,14 +933,59 @@ fn validate_existing_reader<R: Read>(
         if !has_record {
             break;
         }
-        let _record = reader.next_record()?.ok_or_else(|| {
-            JournalError::InvalidRecord("journal stream changed while validating".to_owned())
-        })?;
-        records = records.checked_add(1).ok_or_else(|| {
-            JournalError::InvalidRecord("journal record count overflow".to_owned())
-        })?;
+        validate_next_frame(reader, &mut chunk)?;
     }
     Ok(format)
+}
+
+fn validate_next_frame<R: Read>(
+    reader: &mut JournalReader<R>,
+    chunk: &mut [u8; STARTUP_VALIDATION_CHUNK_BYTES],
+) -> Result<(), JournalError> {
+    let mut length_bytes = [0_u8; 4];
+    reader
+        .reader
+        .read_exact(&mut length_bytes)
+        .map_err(|source| JournalError::io("truncated record length", source))?;
+    let mut crc_bytes = [0_u8; 4];
+    reader
+        .reader
+        .read_exact(&mut crc_bytes)
+        .map_err(|source| JournalError::io("truncated record checksum", source))?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    if length > MAX_RECORD_BYTES {
+        return Err(JournalError::InvalidRecord(format!(
+            "journal record at offset {} is too large: {length}",
+            reader.offset
+        )));
+    }
+    let framed_bytes = 8_u64
+        .checked_add(u64::try_from(length)?)
+        .ok_or_else(|| JournalError::InvalidRecord("journal frame length overflow".to_owned()))?;
+    let mut remaining = length;
+    let mut hasher = Hasher::new();
+    while remaining > 0 {
+        let count = remaining.min(chunk.len());
+        reader
+            .reader
+            .read_exact(&mut chunk[..count])
+            .map_err(|source| JournalError::io("truncated record payload", source))?;
+        hasher.update(&chunk[..count]);
+        remaining -= count;
+    }
+    let expected_crc = u32::from_le_bytes(crc_bytes);
+    let actual_crc = hasher.finalize();
+    if actual_crc != expected_crc {
+        return Err(JournalError::InvalidRecord(format!(
+            "journal checksum mismatch at offset {}: expected={expected_crc}, actual={actual_crc}",
+            reader.offset
+        )));
+    }
+    reader.offset = reader
+        .offset
+        .checked_add(framed_bytes)
+        .ok_or_else(|| JournalError::InvalidRecord("journal offset overflow".to_owned()))?;
+    Ok(())
 }
 
 #[cfg(test)]

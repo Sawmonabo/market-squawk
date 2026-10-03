@@ -1,6 +1,5 @@
 //! Fresh and exact-subset retry materialization for verified analytical objects.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 #[cfg(unix)]
 use std::path::{Component, Path};
@@ -13,11 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     EvidenceError, FileIdentity, HASH_BUFFER_BYTES, MAX_PARQUET_METADATA_BYTES, VerifiedArtifact,
-    VerifiedArtifactInventory, opened_file_metadata, validate_parquet,
-    validate_private_regular_file,
+    VerifiedArtifactInventory, append_inventory_digest, inventory_digest, named_identity,
+    opened_file_metadata, validate_parquet, validate_private_regular_file, validate_sqlite_header,
+    verify_one,
 };
-use crate::Sha256Digest;
 use crate::parquet_store::VerifiedRestoreControlSubset;
+use crate::{Catalog, Sha256Digest};
 
 pub(crate) struct MaterializedArtifactRoot {
     root: ArtifactRoot,
@@ -45,14 +45,23 @@ impl std::fmt::Debug for MaterializedArtifactRoot {
 impl VerifiedArtifactInventory {
     pub(crate) fn materialize_no_replace(
         &self,
+        connection: &rusqlite::Connection,
         destination: &ArtifactRoot,
         cancellation: &CancellationToken,
     ) -> Result<MaterializedArtifactRoot, EvidenceError> {
-        let (directory, identity) = self.prepare_destination(destination, cancellation)?;
+        let (directory, identity) =
+            prepare_destination(self.source_directory_identity, destination, cancellation)?;
         if directory.read_dir(".")?.next().transpose()?.is_some() {
             return Err(EvidenceError::DestinationNotFresh);
         }
-        self.materialize_verified_subset(destination, directory, identity, cancellation, None)
+        self.materialize_verified_subset(
+            connection,
+            destination,
+            directory,
+            identity,
+            cancellation,
+            None,
+        )
     }
 
     /// Resumes only an exact subset left by this already receipt-verified bundle.
@@ -62,13 +71,16 @@ impl VerifiedArtifactInventory {
     /// method never deletes, overwrites, or accepts an unexpected entry.
     pub(crate) fn resume_exact_subset_no_replace(
         &self,
+        connection: &rusqlite::Connection,
         destination: &ArtifactRoot,
         cancellation: &CancellationToken,
         controls: &VerifiedRestoreControlSubset,
     ) -> Result<MaterializedArtifactRoot, EvidenceError> {
-        let (directory, identity) = self.prepare_destination(destination, cancellation)?;
-        self.validate_exact_subset(&directory, false, cancellation, Some(controls))?;
+        let (directory, identity) =
+            prepare_destination(self.source_directory_identity, destination, cancellation)?;
+        self.validate_exact_subset(connection, &directory, false, cancellation, Some(controls))?;
         self.materialize_verified_subset(
+            connection,
             destination,
             directory,
             identity,
@@ -77,30 +89,13 @@ impl VerifiedArtifactInventory {
         )
     }
 
-    fn prepare_destination(
-        &self,
-        destination: &ArtifactRoot,
-        cancellation: &CancellationToken,
-    ) -> Result<(Dir, FileIdentity), EvidenceError> {
-        if cancellation.is_cancelled() {
-            return Err(EvidenceError::Cancelled);
-        }
-        let directory = destination
-            .try_clone_directory()
-            .map_err(|_| EvidenceError::DestinationNotFresh)?;
-        let metadata = directory.dir_metadata()?;
-        if !metadata.is_dir() {
-            return Err(EvidenceError::DestinationNotFresh);
-        }
-        let identity = FileIdentity::from_metadata(&metadata);
-        if identity == self.source_directory_identity {
-            return Err(EvidenceError::SameRootRestore);
-        }
-        Ok((directory, identity))
-    }
-
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "materialization binds source snapshot, destination identity, and exact retry controls"
+    )]
     fn materialize_verified_subset(
         &self,
+        connection: &rusqlite::Connection,
         destination: &ArtifactRoot,
         directory: Dir,
         identity: FileIdentity,
@@ -108,9 +103,11 @@ impl VerifiedArtifactInventory {
         controls: Option<&VerifiedRestoreControlSubset>,
     ) -> Result<MaterializedArtifactRoot, EvidenceError> {
         if self
-            .materialize_missing(&directory, cancellation)
-            .and_then(|()| self.validate_exact_subset(&directory, true, cancellation, controls))
-            .and_then(|()| synchronize_layout(&directory, &self.artifacts))
+            .materialize_missing(connection, &directory, cancellation)
+            .and_then(|()| {
+                self.validate_exact_subset(connection, &directory, true, cancellation, controls)
+            })
+            .and_then(|()| synchronize_layout(&directory))
             .is_err()
         {
             return Err(EvidenceError::DestinationMaterializationIndeterminate);
@@ -130,40 +127,113 @@ impl VerifiedArtifactInventory {
 
     fn materialize_missing(
         &self,
+        connection: &rusqlite::Connection,
         directory: &Dir,
         cancellation: &CancellationToken,
     ) -> Result<(), EvidenceError> {
+        let source = self
+            .source_root
+            .try_clone_directory()
+            .map_err(|_| EvidenceError::UnsafeArtifact)?;
+        if FileIdentity::from_metadata(&source.dir_metadata()?) != self.source_directory_identity {
+            return Err(EvidenceError::UnsafeArtifact);
+        }
         let objects = ensure_directory(directory, "objects")?;
         let sha256 = ensure_directory(&objects, "sha256")?;
-        let mut current_shard: Option<(&str, Dir)> = None;
-        for artifact in &self.artifacts {
-            if cancellation.is_cancelled() {
-                return Err(EvidenceError::Cancelled);
-            }
-            let (shard, filename) = object_components(&artifact.relative_reference)?;
-            if current_shard
-                .as_ref()
-                .is_none_or(|(current, _)| *current != shard)
-            {
-                current_shard = Some((shard, ensure_directory(&sha256, shard)?));
-            }
-            let shard_directory = current_shard
-                .as_ref()
-                .map(|(_, directory)| directory)
-                .ok_or(EvidenceError::ArtifactMetadataMismatch)?;
-            match shard_directory.symlink_metadata(filename) {
-                Ok(_) => verify_existing(shard_directory, filename, artifact, cancellation)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    materialize_one(shard_directory, filename, artifact, cancellation)?;
+        let mut current_shard: Option<(Box<str>, Dir)> = None;
+        let mut digest = inventory_digest(self.artifact_count);
+        Catalog::visit_physical_evidence(connection, &self.snapshot, cancellation, |expected| {
+            let artifact = verify_one(
+                &source,
+                &expected,
+                self.snapshot
+                    .request()
+                    .limits()
+                    .max_parquet_metadata_bytes(),
+                cancellation,
+            )?;
+            let source_identity =
+                FileIdentity::from_metadata(&opened_file_metadata(&artifact.file)?);
+            if artifact.prepared_index {
+                let filename = artifact
+                    .relative_reference
+                    .strip_prefix("sec-prepared/")
+                    .filter(|name| !name.contains('/'))
+                    .ok_or(EvidenceError::ArtifactMetadataMismatch)?;
+                let prepared = ensure_directory(directory, "sec-prepared")?;
+                match prepared.symlink_metadata(filename) {
+                    Ok(_) => {
+                        verify_one(
+                            directory,
+                            &expected,
+                            MAX_PARQUET_METADATA_BYTES,
+                            cancellation,
+                        )?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        materialize_one(&prepared, filename, &artifact, cancellation)?;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
+            } else {
+                let (shard, filename) = object_components(&artifact.relative_reference)?;
+                if current_shard
+                    .as_ref()
+                    .is_none_or(|(current, _)| current.as_ref() != shard)
+                {
+                    current_shard = Some((shard.into(), ensure_directory(&sha256, shard)?));
+                }
+                let shard_directory = current_shard
+                    .as_ref()
+                    .map(|(_, directory)| directory)
+                    .ok_or(EvidenceError::ArtifactMetadataMismatch)?;
+                match shard_directory.symlink_metadata(filename) {
+                    Ok(_) => {
+                        verify_one(
+                            directory,
+                            &expected,
+                            self.snapshot
+                                .request()
+                                .limits()
+                                .max_parquet_metadata_bytes(),
+                            cancellation,
+                        )?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        materialize_one(shard_directory, filename, &artifact, cancellation)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
+            let metadata = opened_file_metadata(&artifact.file)?;
+            validate_private_regular_file(&metadata, artifact.size_bytes)?;
+            if named_identity(&source, &artifact.relative_reference, artifact.size_bytes)?
+                != source_identity
+                || FileIdentity::from_metadata(&metadata) != source_identity
+            {
+                return Err(EvidenceError::UnsafeArtifact);
+            }
+            append_inventory_digest(&mut digest, &artifact)
+        })?;
+        let actual: [u8; 32] = digest.finalize().into();
+        if actual != self.digest.bytes() {
+            return Err(EvidenceError::ArtifactMetadataMismatch);
+        }
+        let revalidated = self
+            .source_root
+            .try_clone_directory()
+            .map_err(|_| EvidenceError::UnsafeArtifact)?;
+        if FileIdentity::from_metadata(&revalidated.dir_metadata()?)
+            != self.source_directory_identity
+        {
+            return Err(EvidenceError::UnsafeArtifact);
         }
         Ok(())
     }
 
     fn validate_exact_subset(
         &self,
+        connection: &rusqlite::Connection,
         directory: &Dir,
         require_complete: bool,
         cancellation: &CancellationToken,
@@ -172,8 +242,8 @@ impl VerifiedArtifactInventory {
         if cancellation.is_cancelled() {
             return Err(EvidenceError::Cancelled);
         }
-        let expected = expected_layout(&self.artifacts)?;
         let mut objects_present = false;
+        let mut prepared_present = false;
         let mut any_entry = false;
         for root_entry in directory.read_dir(".")? {
             let name = root_entry?.file_name();
@@ -183,6 +253,8 @@ impl VerifiedArtifactInventory {
                     return Err(EvidenceError::DestinationConflict);
                 }
                 objects_present = true;
+            } else if name == "sec-prepared" {
+                prepared_present = true;
             } else if !name
                 .to_str()
                 .is_some_and(|name| controls.is_some_and(|controls| controls.contains(name)))
@@ -191,7 +263,7 @@ impl VerifiedArtifactInventory {
             }
         }
         if !any_entry {
-            return if require_complete || !self.artifacts.is_empty() {
+            return if require_complete || self.artifact_count != 0 {
                 if require_complete {
                     Err(EvidenceError::DestinationConflict)
                 } else {
@@ -208,7 +280,9 @@ impl VerifiedArtifactInventory {
                 Ok(())
             };
         }
-        if controls.is_none() && directory.read_dir(".")?.count() != 1 {
+        if controls.is_none()
+            && directory.read_dir(".")?.count() != 1 + usize::from(prepared_present)
+        {
             return Err(EvidenceError::DestinationConflict);
         }
         let objects = directory
@@ -228,7 +302,38 @@ impl VerifiedArtifactInventory {
         let sha256 = objects
             .open_dir_nofollow("sha256")
             .map_err(|_| EvidenceError::DestinationConflict)?;
-        let mut observed = 0_usize;
+        let mut observed = 0_u64;
+        if prepared_present {
+            let prepared = directory.open_dir_nofollow("sec-prepared")?;
+            for entry in prepared.read_dir(".")? {
+                if cancellation.is_cancelled() {
+                    return Err(EvidenceError::Cancelled);
+                }
+                let name = entry?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| EvidenceError::DestinationConflict)?;
+                let reference = format!("sec-prepared/{name}");
+                let expected = Catalog::physical_evidence_by_reference(
+                    connection,
+                    &self.snapshot,
+                    &reference,
+                )?
+                .filter(|value| {
+                    matches!(value, super::PhysicalArtifactEvidence::PreparedIndex { .. })
+                })
+                .ok_or(EvidenceError::DestinationConflict)?;
+                verify_one(
+                    directory,
+                    &expected,
+                    MAX_PARQUET_METADATA_BYTES,
+                    cancellation,
+                )?;
+                observed = observed
+                    .checked_add(1)
+                    .ok_or(EvidenceError::ResourceLimitExceeded)?;
+            }
+        }
         for shard_entry in sha256.read_dir(".")? {
             if cancellation.is_cancelled() {
                 return Err(EvidenceError::Cancelled);
@@ -238,9 +343,9 @@ impl VerifiedArtifactInventory {
                 .file_name()
                 .into_string()
                 .map_err(|_| EvidenceError::DestinationConflict)?;
-            let expected_files = expected
-                .get(shard.as_str())
-                .ok_or(EvidenceError::DestinationConflict)?;
+            if !Catalog::physical_evidence_in_shard(connection, &self.snapshot, &shard)? {
+                return Err(EvidenceError::DestinationConflict);
+            }
             let shard_directory = sha256
                 .open_dir_nofollow(&shard)
                 .map_err(|_| EvidenceError::DestinationConflict)?;
@@ -252,38 +357,54 @@ impl VerifiedArtifactInventory {
                     .file_name()
                     .into_string()
                     .map_err(|_| EvidenceError::DestinationConflict)?;
-                let artifact = expected_files
-                    .get(filename.as_str())
-                    .ok_or(EvidenceError::DestinationConflict)?;
-                verify_existing(&shard_directory, &filename, artifact, cancellation)?;
+                let reference = format!("objects/sha256/{shard}/{filename}");
+                let artifact = Catalog::physical_evidence_by_reference(
+                    connection,
+                    &self.snapshot,
+                    &reference,
+                )?
+                .ok_or(EvidenceError::DestinationConflict)?;
+                verify_one(
+                    directory,
+                    &artifact,
+                    self.snapshot
+                        .request()
+                        .limits()
+                        .max_parquet_metadata_bytes(),
+                    cancellation,
+                )?;
                 observed = observed
                     .checked_add(1)
                     .ok_or(EvidenceError::ResourceLimitExceeded)?;
             }
         }
-        if require_complete && observed != self.artifacts.len() {
+        if require_complete && observed != self.artifact_count {
             return Err(EvidenceError::DestinationConflict);
         }
         Ok(())
     }
 }
 
-fn expected_layout(
-    artifacts: &[VerifiedArtifact],
-) -> Result<BTreeMap<&str, BTreeMap<&str, &VerifiedArtifact>>, EvidenceError> {
-    let mut layout = BTreeMap::new();
-    for artifact in artifacts {
-        let (shard, filename) = object_components(&artifact.relative_reference)?;
-        if layout
-            .entry(shard)
-            .or_insert_with(BTreeMap::new)
-            .insert(filename, artifact)
-            .is_some()
-        {
-            return Err(EvidenceError::DestinationConflict);
-        }
+fn prepare_destination(
+    source_identity: FileIdentity,
+    destination: &ArtifactRoot,
+    cancellation: &CancellationToken,
+) -> Result<(Dir, FileIdentity), EvidenceError> {
+    if cancellation.is_cancelled() {
+        return Err(EvidenceError::Cancelled);
     }
-    Ok(layout)
+    let directory = destination
+        .try_clone_directory()
+        .map_err(|_| EvidenceError::DestinationNotFresh)?;
+    let metadata = directory.dir_metadata()?;
+    if !metadata.is_dir() {
+        return Err(EvidenceError::DestinationNotFresh);
+    }
+    let identity = FileIdentity::from_metadata(&metadata);
+    if identity == source_identity {
+        return Err(EvidenceError::SameRootRestore);
+    }
+    Ok((directory, identity))
 }
 
 fn object_components(reference: &str) -> Result<(&str, &str), EvidenceError> {
@@ -354,8 +475,13 @@ fn materialize_one(
     if FileIdentity::from_metadata(&named) != target_identity
         || FileIdentity::from_metadata(&opened_metadata) != target_identity
         || hash_file(&mut target, cancellation)? != artifact.content_hash
-        || validate_parquet(&mut target, artifact.size_bytes, MAX_PARQUET_METADATA_BYTES)?
-            != artifact.row_count
+        || if artifact.prepared_index {
+            validate_sqlite_header(&mut target)?;
+            false
+        } else {
+            validate_parquet(&mut target, artifact.size_bytes, MAX_PARQUET_METADATA_BYTES)?
+                != artifact.row_count
+        }
     {
         return Err(EvidenceError::ArtifactMetadataMismatch);
     }
@@ -367,45 +493,6 @@ fn materialize_one(
         || FileIdentity::from_metadata(&opened_after) != target_identity
     {
         return Err(EvidenceError::ArtifactMetadataMismatch);
-    }
-    Ok(())
-}
-
-fn verify_existing(
-    parent: &Dir,
-    filename: &str,
-    artifact: &VerifiedArtifact,
-    cancellation: &CancellationToken,
-) -> Result<(), EvidenceError> {
-    if cancellation.is_cancelled() {
-        return Err(EvidenceError::Cancelled);
-    }
-    let named_before = parent.symlink_metadata(filename)?;
-    validate_private_regular_file(&named_before, artifact.size_bytes)?;
-    let identity = FileIdentity::from_metadata(&named_before);
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    configure_nonblocking_read(&mut options);
-    let opened = parent.open_with(filename, &options)?;
-    if FileIdentity::from_metadata(&opened.metadata()?) != identity {
-        return Err(EvidenceError::DestinationConflict);
-    }
-    let mut file = opened.into_std();
-    let digest = hash_file(&mut file, cancellation)?;
-    if digest != artifact.content_hash
-        || validate_parquet(&mut file, artifact.size_bytes, MAX_PARQUET_METADATA_BYTES)?
-            != artifact.row_count
-    {
-        return Err(EvidenceError::DestinationConflict);
-    }
-    let named_after = parent.symlink_metadata(filename)?;
-    validate_private_regular_file(&named_after, artifact.size_bytes)?;
-    let opened_after = opened_file_metadata(&file)?;
-    validate_private_regular_file(&opened_after, artifact.size_bytes)?;
-    if FileIdentity::from_metadata(&named_after) != identity
-        || FileIdentity::from_metadata(&opened_after) != identity
-    {
-        return Err(EvidenceError::DestinationConflict);
     }
     Ok(())
 }
@@ -430,19 +517,23 @@ fn hash_file(
     Ok(Sha256Digest::new(digest.finalize().into()))
 }
 
-fn synchronize_layout(
-    directory: &Dir,
-    artifacts: &[VerifiedArtifact],
-) -> Result<(), EvidenceError> {
-    let shards: BTreeSet<_> = artifacts
-        .iter()
-        .map(|artifact| object_components(&artifact.relative_reference).map(|(shard, _)| shard))
-        .collect::<Result<_, _>>()?;
-    for shard in shards {
-        sync_directory_at(directory, &format!("objects/sha256/{shard}"))?;
+fn synchronize_layout(directory: &Dir) -> Result<(), EvidenceError> {
+    match directory.open_dir_nofollow("sec-prepared") {
+        Ok(prepared) => sync_directory_at(&prepared, ".")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    sync_directory_at(directory, "objects/sha256")?;
-    sync_directory_at(directory, "objects")?;
+    let objects = directory.open_dir_nofollow("objects")?;
+    let sha256 = objects.open_dir_nofollow("sha256")?;
+    for shard in sha256.read_dir(".")? {
+        let shard = shard?
+            .file_name()
+            .into_string()
+            .map_err(|_| EvidenceError::DestinationConflict)?;
+        sync_directory_at(&sha256, &shard)?;
+    }
+    sync_directory_at(&sha256, ".")?;
+    sync_directory_at(&objects, ".")?;
     sync_directory_at(directory, ".")
 }
 
@@ -456,16 +547,6 @@ fn configure_private_creation(options: &mut OpenOptions) {
 
 #[cfg(not(unix))]
 fn configure_private_creation(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn configure_nonblocking_read(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
-}
-
-#[cfg(not(unix))]
-fn configure_nonblocking_read(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
 fn sync_directory_at(directory: &Dir, path: &str) -> Result<(), EvidenceError> {
@@ -505,8 +586,7 @@ mod tests {
     use market_squawk_platform::LocalPaths;
     use tokio_util::sync::CancellationToken;
 
-    use super::super::{FileIdentity, VerifiedArtifactInventory};
-    use crate::authority_transition::ArtifactInventoryDigest;
+    use super::super::FileIdentity;
     use crate::authority_transition::evidence::EvidenceError;
 
     #[test]
@@ -517,14 +597,11 @@ mod tests {
         let root = paths.artifacts()?;
         let directory = root.try_clone_directory()?;
         let metadata = directory.dir_metadata()?;
-        let inventory = VerifiedArtifactInventory {
-            artifacts: Vec::new(),
-            total_bytes: 0,
-            digest: ArtifactInventoryDigest::try_new([7; 32]).ok_or("invalid inventory digest")?,
-            source_directory_identity: FileIdentity::from_metadata(&metadata),
-        };
-
-        let result = inventory.materialize_no_replace(root, &CancellationToken::new());
+        let result = super::prepare_destination(
+            FileIdentity::from_metadata(&metadata),
+            root,
+            &CancellationToken::new(),
+        );
 
         assert!(matches!(result, Err(EvidenceError::SameRootRestore)));
         assert_eq!(directory.read_dir(".")?.count(), 0);

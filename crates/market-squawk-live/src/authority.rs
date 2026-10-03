@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use market_squawk_domain::{
     DataQuality, LiveEvidenceBinding, QualificationAssessmentId, Timestamp,
 };
-use market_squawk_sources::CurrentSourceAuthorityLease;
+use market_squawk_sources::{CurrentProviderIdentity, CurrentSourceAuthorityLease};
 use thiserror::Error;
 
 #[path = "authority/lease.rs"]
@@ -39,6 +39,7 @@ use nonce::{NonceError, NonceRegistry, NonceTicket};
 #[derive(Debug)]
 pub struct LiveExecutionCapability {
     source: CurrentSourceAuthorityLease,
+    provider_identity: CurrentProviderIdentity,
     generation: GenerationLease,
     shard: ShardLease,
     runtime: RuntimeLease,
@@ -60,6 +61,7 @@ pub struct LiveExecutionCapability {
 #[derive(Debug)]
 pub struct ConsumedLiveAuthority {
     source: CurrentSourceAuthorityLease,
+    provider_identity: CurrentProviderIdentity,
     generation: GenerationLease,
     shard: ShardLease,
     runtime: RuntimeLease,
@@ -116,6 +118,7 @@ impl ConsumedLiveAuthority {
     pub fn into_evidence(self) -> ConsumedLiveEvidence {
         let Self {
             source: _,
+            provider_identity: _,
             generation: _,
             shard: _,
             runtime: _,
@@ -142,6 +145,7 @@ impl ConsumedLiveAuthority {
     fn validate_at(&self, now: ClockReading) -> Result<(), AuthorityError> {
         validate_allocations(
             &self.source,
+            &self.provider_identity,
             &self.generation,
             &self.shard,
             &self.runtime,
@@ -292,6 +296,7 @@ impl TrustedClock for ScriptedTrustedClock {
 #[derive(Debug)]
 pub(crate) struct AppliedObservationAuthority {
     pub(crate) source: CurrentSourceAuthorityLease,
+    pub(crate) provider_identity: CurrentProviderIdentity,
     pub(crate) generation: GenerationLease,
     pub(crate) shard: ShardLease,
     pub(crate) runtime: RuntimeLease,
@@ -315,6 +320,7 @@ impl AppliedObservationAuthority {
     )]
     pub(crate) fn new(
         source: CurrentSourceAuthorityLease,
+        provider_identity: CurrentProviderIdentity,
         generation: GenerationLease,
         shard: ShardLease,
         runtime: RuntimeLease,
@@ -332,6 +338,7 @@ impl AppliedObservationAuthority {
     ) -> Self {
         Self {
             source,
+            provider_identity,
             generation,
             shard,
             runtime,
@@ -391,6 +398,7 @@ impl AuthorityGate {
         }
         Ok(LiveExecutionCapability {
             source: applied.source.clone(),
+            provider_identity: applied.provider_identity.clone(),
             generation: applied.generation.clone(),
             shard: applied.shard.clone(),
             runtime: applied.runtime.clone(),
@@ -424,6 +432,7 @@ impl AuthorityGate {
     ) -> Result<ConsumedLiveAuthority, AuthorityError> {
         let LiveExecutionCapability {
             source,
+            provider_identity,
             generation,
             shard,
             runtime,
@@ -442,6 +451,7 @@ impl AuthorityGate {
         } = capability;
         if let Err(error) = validate_allocations(
             &source,
+            &provider_identity,
             &generation,
             &shard,
             &runtime,
@@ -461,6 +471,7 @@ impl AuthorityGate {
             .consume(&ticket, binding_digest, monotonic_key(now.monotonic))?;
         validate_allocations(
             &source,
+            &provider_identity,
             &generation,
             &shard,
             &runtime,
@@ -475,6 +486,7 @@ impl AuthorityGate {
         )?;
         Ok(ConsumedLiveAuthority {
             source,
+            provider_identity,
             generation,
             shard,
             runtime,
@@ -502,6 +514,7 @@ fn validate_applied(
     }
     validate_allocations(
         &applied.source,
+        &applied.provider_identity,
         &applied.generation,
         &applied.shard,
         &applied.runtime,
@@ -522,6 +535,7 @@ fn validate_applied(
 )]
 fn validate_allocations(
     source: &CurrentSourceAuthorityLease,
+    provider_identity: &CurrentProviderIdentity,
     generation: &GenerationLease,
     shard: &ShardLease,
     runtime: &RuntimeLease,
@@ -535,7 +549,7 @@ fn validate_allocations(
     now: ClockReading,
 ) -> Result<(), AuthorityError> {
     source
-        .validate_at(now.wall)
+        .validate_provider_identity_at(provider_identity, now.wall)
         .map_err(|_| AuthorityError::SourceRevoked)?;
     generation.validate().map_err(AuthorityError::from)?;
     shard.validate().map_err(AuthorityError::from)?;

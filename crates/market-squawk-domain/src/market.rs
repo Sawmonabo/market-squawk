@@ -13,6 +13,27 @@ use crate::{
 
 #[path = "market/events.rs"]
 mod events;
+#[path = "market/market_data_quote.rs"]
+mod market_data_quote;
+pub use market_data_quote::{
+    MarketDataEventError, MarketDataQuoteEvent, MarketDataQuoteSide, MarketDataQuoteSize,
+    MarketDataReference, MarketDataReferenceIdentity,
+};
+
+#[path = "market/market_data_trade.rs"]
+mod market_data_trade;
+pub use market_data_trade::{MarketDataTradeEvent, MarketDataTradeQuantityUnit};
+
+#[path = "market/market_data_stream.rs"]
+mod market_data_stream;
+pub use market_data_stream::{
+    MAX_MARKET_DATA_BOOK_LEVELS, MAX_MARKET_DATA_BOOK_PARTICIPANTS,
+    MAX_MARKET_DATA_SCREENER_ITEMS, MarketDataBookEvent, MarketDataBookInput,
+    MarketDataBookLevel, MarketDataBookParticipant, MarketDataChartCompletion,
+    MarketDataChartEvent, MarketDataChartInput, MarketDataChartTimestampBasis,
+    MarketDataReported, MarketDataScreenerEvent, MarketDataScreenerInput,
+    MarketDataScreenerItem, MarketDataScreenerSort, MarketDataSizeUnit,
+};
 
 pub use events::{
     AuctionEvent, BookDeltaEvent, BookSnapshotEvent, CorporateActionEvent, InstrumentStatusEvent,
@@ -39,6 +60,19 @@ pub enum AggressorSide {
     Sell,
     /// Source does not establish the aggressor.
     Unknown,
+}
+
+/// Provider-authored order type of the taker that caused an executed trade.
+///
+/// This is market-data evidence, not an execution instruction or proof that Market Squawk can
+/// submit the same order type to the venue.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeTakerOrderType {
+    /// The taker used a limit order.
+    Limit,
+    /// The taker used a market order.
+    Market,
 }
 
 /// Venue auction phase.
@@ -288,6 +322,16 @@ pub enum MarketEvent {
     Trade(TradeEvent),
     /// One- or two-sided quote.
     Quote(QuoteEvent),
+    /// Exact decimal prices with canonical reference lineage and no execution terms.
+    MarketDataQuote(MarketDataQuoteEvent),
+    /// Exact source transaction price and economic size without execution terms.
+    MarketDataTrade(MarketDataTradeEvent),
+    /// Original decimal source book image without executable depth authority.
+    MarketDataBook(MarketDataBookEvent),
+    /// Observed chart update without completed historical-bar authority.
+    MarketDataChart(MarketDataChartEvent),
+    /// Whole ranked source cohort, including a genuinely empty observation.
+    MarketDataScreener(MarketDataScreenerEvent),
     /// Complete order-book image for a connection generation.
     BookSnapshot(BookSnapshotEvent),
     /// Incremental order-book changes.
@@ -324,8 +368,12 @@ pub enum MarketEventError {
         /// Side whose ordering is invalid.
         side: MarketSide,
     },
+    /// A snapshot side exceeds the fixed canonical level limit.
+    BookSnapshotLevelLimitExceeded,
     /// A delta contains no changes.
     EmptyBookDelta,
+    /// An atomic delta exceeds the fixed canonical change limit.
+    BookDeltaChangeLimitExceeded,
     /// A merger successor is the same stable instrument.
     SelfMerger,
     /// A spinoff distributes the same stable instrument.
@@ -358,7 +406,13 @@ impl fmt::Display for MarketEventError {
                     "{side:?} levels are not in strict canonical order"
                 )
             }
+            Self::BookSnapshotLevelLimitExceeded => {
+                formatter.write_str("book snapshot side exceeds the canonical level limit")
+            }
             Self::EmptyBookDelta => formatter.write_str("book delta requires at least one change"),
+            Self::BookDeltaChangeLimitExceeded => {
+                formatter.write_str("book delta exceeds the canonical change limit")
+            }
             Self::SelfMerger => {
                 formatter.write_str("merger successor must be a distinct instrument")
             }

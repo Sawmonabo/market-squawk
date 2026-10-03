@@ -1,0 +1,3158 @@
+//! Durable forecast generation, immutable vintages, and realized-outcome presentation.
+
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use market_squawk_data::{
+    AnalyticalReadCapability, DatasetManifestRef, FeatureLabelComponentSpec, Sha256Digest,
+};
+use market_squawk_domain::{
+    Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarObservation, SourceId,
+    Timestamp,
+};
+use market_squawk_modeling::{
+    CalibrationEvidence, ForecastCentralStatistic, ForecastCoverage, ForecastHorizon,
+    ForecastMeasurement, ForecastOutcome, ForecastOutputBinding, ForecastPath,
+    ForecastTargetMeaning, ForecastValue, ForecastVintage, ModelMetadata,
+};
+use market_squawk_services::{
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReadContext,
+    ArtifactReadRequest, ArtifactReference, ArtifactRepository, RequestContext, ServiceError,
+    TypedToolRequest, TypedToolResult,
+};
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+use persistence::{
+    ForecastIndex, ForecastIndexSelection, ForecastPayloadRecord, OutcomeRecord, VintageRecord,
+    digest_from_hex, hex,
+};
+
+use super::{
+    ForecastModelEvidenceProjection, ModelDomainService,
+    runtime::{ProductionModelRuntime, ProductionModelRuntimeError, RetainedRuntimeBackup},
+};
+
+mod chart_history;
+pub(crate) use chart_history::{
+    SavedForecastChart, authorize_projection_parents, chart_quality, chart_storage_error,
+    read_chart_display, read_chart_display_from_catalog, recheck_projection_parents,
+    replay_price_history_inputs,
+};
+mod current_input;
+mod distribution;
+pub(crate) use current_input::{
+    current_price_cohort_reference, current_price_coordinate_index, current_price_feature_values,
+    current_price_observed_point, current_price_session_origin, reopen_current_price_input,
+};
+mod generation;
+mod outcome;
+pub(crate) use outcome::EventOutcomePreparation;
+pub(super) use outcome::prepare_event as prepare_event_outcome;
+mod inventory;
+pub(in crate::application::model) mod persistence;
+use market_squawk_data::{
+    ForecastInventoryCatalogCapability, ForecastInventoryHead, ForecastInventoryLookup,
+};
+pub(super) use persistence::event_product_value;
+mod price;
+mod snapshot;
+pub(crate) use distribution::{SelectedForecastDistribution, SelectedForecastDistributionPoint};
+pub(crate) use generation::{
+    ForecastRecoveryCoordinates, financial_analysis_evidence, financial_coordinate_index,
+    financial_feature_values, forecast_recovery_coordinates, reopen_financial_input,
+    validate_forecast_request,
+};
+pub(crate) use outcome::{ForecastOutcomeMeasurement, ForecastOutcomePreparationOrigin};
+pub(crate) use snapshot::{
+    ForecastStudyRuntimeReference, HistoricalFinancialForecast, HistoricalPriceForecast,
+    SelectedForecastRuntime,
+};
+
+/// Job authority claimed at the existing durable forecast-index commit boundary.
+pub(crate) trait ForecastPrecommitAuthority: Send + Sync {
+    fn validate_precommit(&self) -> Result<(), ForecastApplicationError>;
+    fn commit_succeeded(&self);
+}
+
+/// Already validated terminal projection and the sole controlled forecast artifact.
+pub(crate) struct ForecastJobOutput {
+    pub(crate) result: TypedToolResult,
+    pub(crate) artifact: ArtifactReference,
+}
+
+/// Executes the same admitted forecast operation with an exact job publication fence.
+#[async_trait]
+pub(crate) trait ForecastJobExecutor: Send + Sync {
+    async fn recover_forecast_job_output(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<Option<ForecastJobOutput>, ServiceError>;
+
+    async fn replay_forecast_for_job(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        precommit: &dyn ForecastPrecommitAuthority,
+    ) -> Result<Option<ForecastJobOutput>, ServiceError>;
+
+    async fn generate_forecast_for_job(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        precommit: &dyn ForecastPrecommitAuthority,
+    ) -> Result<ForecastJobOutput, ServiceError>;
+
+    async fn read_forecast_job_result(
+        &self,
+        request: &TypedToolRequest,
+        artifact: &ArtifactReference,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError>;
+}
+
+/// Executes one already admitted forecast request inside the durable job runner.
+pub(super) const GENERATE_FORECAST: &str = "Model.GenerateForecast";
+/// Reads one exact immutable forecast vintage.
+pub const GET_FORECAST: &str = "Model.GetForecast";
+/// Selects and fully revalidates the newest nonexpired forecast for one exact instrument.
+pub const SELECT_LATEST_VALID_FORECAST: &str = "Model.SelectLatestValidForecast";
+/// Lists bounded immutable forecast-vintage summaries.
+pub const LIST_FORECASTS: &str = "Model.ListForecasts";
+/// Reads bounded immutable outcomes appended to one vintage.
+pub const GET_FORECAST_OUTCOMES: &str = "Model.GetForecastOutcomes";
+
+const FORECAST_PAYLOAD_SCHEMA_VERSION: u32 = 6;
+const MAXIMUM_DRIFT_OUTCOMES: usize = 4_096;
+pub(crate) const MAXIMUM_FORECAST_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const FORECAST_SELECTION_POLICY_REVISION: u32 = 5;
+
+const MAXIMUM_PRODUCT_INVESTMENT_NAME_BYTES: usize = 240;
+const MAXIMUM_PRODUCT_INVESTMENT_SYMBOL_BYTES: usize = 64;
+const MAXIMUM_PRODUCT_INVESTMENT_DESCRIPTION_BYTES: usize = 400;
+
+/// Provider-neutral investment identity frozen beside one exact point-in-time forecast input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastProductIdentity {
+    display_name: Box<str>,
+    canonical_symbol: Option<Box<str>>,
+    description: Box<str>,
+    quote_currency: Currency,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+}
+
+impl ForecastProductIdentity {
+    pub(crate) fn try_new(
+        display_name: impl Into<Box<str>>,
+        canonical_symbol: Option<impl Into<Box<str>>>,
+        description: impl Into<Box<str>>,
+        quote_currency: Currency,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+    ) -> Result<Self, ForecastApplicationError> {
+        let display_name = display_name.into();
+        let canonical_symbol = canonical_symbol.map(Into::into);
+        let description = description.into();
+        if !valid_product_text(&display_name, MAXIMUM_PRODUCT_INVESTMENT_NAME_BYTES)
+            || canonical_symbol.as_deref().is_some_and(|value| {
+                !valid_product_text(value, MAXIMUM_PRODUCT_INVESTMENT_SYMBOL_BYTES)
+            })
+            || !valid_product_text(&description, MAXIMUM_PRODUCT_INVESTMENT_DESCRIPTION_BYTES)
+            || effective_at > knowledge_at
+        {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(Self {
+            display_name,
+            canonical_symbol,
+            description,
+            quote_currency,
+            knowledge_at,
+            effective_at,
+        })
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub(crate) fn canonical_symbol(&self) -> Option<&str> {
+        self.canonical_symbol.as_deref()
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(crate) const fn quote_currency(&self) -> Currency {
+        self.quote_currency
+    }
+
+    pub(crate) const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    pub(crate) const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+}
+
+/// Closed investment-facing semantics derived only from one admitted forecast output binding.
+pub(crate) struct ForecastProductTarget {
+    label: Box<str>,
+    meaning: &'static str,
+    value_kind: &'static str,
+    unit_label: Box<str>,
+    currency_code: Option<Currency>,
+    event: Option<Value>,
+}
+
+impl ForecastProductTarget {
+    pub(crate) fn try_from_binding(
+        binding: &ForecastOutputBinding,
+    ) -> Result<Self, ForecastApplicationError> {
+        Self::try_from_admitted_parts(binding.measurement(), binding.target(), binding.label())
+    }
+
+    fn try_from_admitted_parts(
+        measurement: ForecastMeasurement,
+        target: ForecastTargetMeaning,
+        label: &FeatureLabelComponentSpec,
+    ) -> Result<Self, ForecastApplicationError> {
+        let (value_kind, unit_label, currency_code) = match measurement {
+            ForecastMeasurement::Price { currency } => {
+                ("market_price", currency.as_str().into(), Some(currency))
+            }
+            ForecastMeasurement::FinancialAmount { currency, .. } => {
+                ("financial_amount", currency.as_str().into(), Some(currency))
+            }
+            ForecastMeasurement::Return => ("percentage_return", "decimal return".into(), None),
+            ForecastMeasurement::Probability => ("probability", "probability".into(), None),
+            ForecastMeasurement::OtherRegression => {
+                return Err(ForecastApplicationError::Unavailable);
+            }
+        };
+        let meaning = match target {
+            ForecastTargetMeaning::FixedHorizonTerminal { .. } => {
+                "The modeled value at the end of the selected forecast horizon."
+            }
+            ForecastTargetMeaning::FixedHorizonEvent { event, .. } => match event {
+                market_squawk_data::ProbabilityEventTarget::PriceHigher => {
+                    "Probability that the split-adjusted terminal price is strictly higher at the selected horizon."
+                }
+                market_squawk_data::ProbabilityEventTarget::BenchmarkOutperformance { .. } => {
+                    "Probability that the subject price return strictly exceeds the selected benchmark price return at the same horizon."
+                }
+                market_squawk_data::ProbabilityEventTarget::ProfitAfterCosts { .. } => {
+                    "Probability that the original long round trip produces positive total wealth after costs, including distributions and unpaid entitlements."
+                }
+            },
+            ForecastTargetMeaning::FinancialPeriod { .. } => {
+                "The modeled financial amount for the selected native reporting period."
+            }
+            ForecastTargetMeaning::Unsupported => {
+                return Err(ForecastApplicationError::Unavailable);
+            }
+        };
+        Ok(Self {
+            label: product_label(label.name())?.into(),
+            meaning,
+            value_kind,
+            unit_label,
+            currency_code,
+            event: match target {
+                ForecastTargetMeaning::FixedHorizonEvent {
+                    horizon_nanos,
+                    origin_basis,
+                    event,
+                } => Some(event_product_value(horizon_nanos, origin_basis, event)),
+                _ => None,
+            },
+        })
+    }
+
+    pub(crate) fn event(&self) -> Option<&Value> {
+        self.event.as_ref()
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) const fn meaning(&self) -> &'static str {
+        self.meaning
+    }
+
+    pub(crate) const fn value_kind(&self) -> &'static str {
+        self.value_kind
+    }
+
+    pub(crate) fn unit_label(&self) -> &str {
+        &self.unit_label
+    }
+
+    pub(crate) fn currency_code(&self) -> Option<&str> {
+        self.currency_code.as_ref().map(Currency::as_str)
+    }
+}
+
+/// Plain-language horizon copy that never exposes storage or scheduler units.
+pub(crate) struct ForecastProductHorizon {
+    label: String,
+    description: String,
+    points: u16,
+}
+
+impl ForecastProductHorizon {
+    pub(crate) fn try_from_horizon(
+        horizon: ForecastHorizon,
+    ) -> Result<Self, ForecastApplicationError> {
+        const SECOND: u64 = 1_000_000_000;
+        const MINUTE: u64 = 60 * SECOND;
+        const HOUR: u64 = 60 * MINUTE;
+        const DAY: u64 = 24 * HOUR;
+
+        let points = horizon.points().get();
+        if let Some((cadence, periods)) = horizon.fiscal_periods() {
+            let unit = match cadence {
+                market_squawk_domain::FundamentalCadence::Annual => "annual",
+                market_squawk_domain::FundamentalCadence::Quarterly => "quarterly",
+                _ => return Err(ForecastApplicationError::InvalidRecord),
+            };
+            return Ok(Self { label: format!("{} {unit} reporting period(s)", periods.get()),
+                description: "Native fiscal periods after the observed reporting period; future dates are shown only when source-reported.".into(), points });
+        }
+        let total = horizon
+            .step_nanos()
+            .ok_or(ForecastApplicationError::InvalidRecord)?
+            .get()
+            .checked_mul(u64::from(points))
+            .ok_or(ForecastApplicationError::InvalidRecord)?;
+        let (amount, unit) = if total.is_multiple_of(DAY) {
+            (total / DAY, "day")
+        } else if total.is_multiple_of(HOUR) {
+            (total / HOUR, "hour")
+        } else if total.is_multiple_of(MINUTE) {
+            (total / MINUTE, "minute")
+        } else if total.is_multiple_of(SECOND) {
+            (total / SECOND, "second")
+        } else {
+            return Err(ForecastApplicationError::InvalidRecord);
+        };
+        if amount == 0 {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        let label = format!("{amount} {unit}{}", if amount == 1 { "" } else { "s" });
+        let description = format!(
+            "Estimate the modeled investment outcome {label} after the latest available evidence."
+        );
+        Ok(Self {
+            label,
+            description,
+            points,
+        })
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(crate) const fn points(&self) -> u16 {
+        self.points
+    }
+}
+
+fn product_label(value: &str) -> Result<String, ForecastApplicationError> {
+    if value == "research.fixed-horizon-forward-return" {
+        return Ok("Forward return".to_owned());
+    }
+    let leaf = value.rsplit('.').next().unwrap_or(value);
+    let mut label = String::new();
+    label
+        .try_reserve_exact(leaf.len())
+        .map_err(|_| ForecastApplicationError::Capacity)?;
+    let mut capitalize = true;
+    for character in leaf.chars() {
+        if matches!(character, '-' | '_') {
+            if !label.ends_with(' ') {
+                label.push(' ');
+            }
+            capitalize = true;
+        } else if capitalize {
+            label.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            label.push(character);
+        }
+    }
+    if !valid_product_text(&label, 200) {
+        return Err(ForecastApplicationError::InvalidRecord);
+    }
+    Ok(label)
+}
+
+fn valid_product_text(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_bytes
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+/// Exact separately admitted AnalysisV1 product generation that authorized one forecast request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastAnalysisEvidence {
+    manifest: DatasetManifestRef,
+    production_identity_sha256: Sha256Digest,
+    production_receipt_sha256: Sha256Digest,
+    pairing_sha256: Sha256Digest,
+}
+
+impl ForecastAnalysisEvidence {
+    pub(crate) fn try_new(
+        manifest: DatasetManifestRef,
+        production_identity_sha256: Sha256Digest,
+        production_receipt_sha256: Sha256Digest,
+        pairing_sha256: Sha256Digest,
+    ) -> Result<Self, ForecastApplicationError> {
+        if [
+            production_identity_sha256,
+            production_receipt_sha256,
+            pairing_sha256,
+        ]
+        .iter()
+        .any(|digest| digest.bytes() == [0; 32])
+        {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(Self {
+            manifest,
+            production_identity_sha256,
+            production_receipt_sha256,
+            pairing_sha256,
+        })
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub(crate) const fn production_identity_sha256(&self) -> Sha256Digest {
+        self.production_identity_sha256
+    }
+
+    pub(crate) const fn production_receipt_sha256(&self) -> Sha256Digest {
+        self.production_receipt_sha256
+    }
+
+    pub(crate) const fn pairing_sha256(&self) -> Sha256Digest {
+        self.pairing_sha256
+    }
+}
+
+/// Exact label-free current-PIT input evidence retained independently from historical OOS
+/// TrainingV1/AnalysisV1 calibration evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastServingEvidence {
+    manifest: DatasetManifestRef,
+    parent_manifests: Box<[DatasetManifestRef]>,
+    source_id: SourceId,
+    object_graph_sha256: Sha256Digest,
+    selection_sha256: Sha256Digest,
+    result_sha256: Sha256Digest,
+    knowledge_cutoff: Timestamp,
+    prior_observed_at: Option<Timestamp>,
+    observed_through: Option<Timestamp>,
+    feature_sha256: Sha256Digest,
+    origin_bar: Option<MarketBarObservation>,
+    financial_input: Option<market_squawk_modeling::ForecastFinancialServingRecord>,
+    current_price_input: Option<market_squawk_modeling::ForecastCurrentPriceServingRecord>,
+}
+
+impl ForecastServingEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "manifest, query, cutoff, temporal, and feature identities remain explicit"
+    )]
+    pub(crate) fn try_new(
+        manifest: DatasetManifestRef,
+        source_id: SourceId,
+        object_graph_sha256: Sha256Digest,
+        selection_sha256: Sha256Digest,
+        result_sha256: Sha256Digest,
+        knowledge_cutoff: Timestamp,
+        prior_observed_at: Timestamp,
+        observed_through: Timestamp,
+        feature_sha256: Sha256Digest,
+    ) -> Result<Self, ForecastApplicationError> {
+        if prior_observed_at >= observed_through
+            || observed_through > knowledge_cutoff
+            || [
+                object_graph_sha256,
+                selection_sha256,
+                result_sha256,
+                feature_sha256,
+            ]
+            .iter()
+            .any(|digest| digest.bytes() == [0; 32])
+        {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(Self {
+            parent_manifests: vec![manifest.clone()].into_boxed_slice(),
+            manifest,
+            source_id,
+            object_graph_sha256,
+            selection_sha256,
+            result_sha256,
+            knowledge_cutoff,
+            prior_observed_at: Some(prior_observed_at),
+            observed_through: Some(observed_through),
+            feature_sha256,
+            origin_bar: None,
+            financial_input: None,
+            current_price_input: None,
+        })
+    }
+
+    pub(crate) fn with_origin_bar(
+        mut self,
+        origin: Option<MarketBarObservation>,
+    ) -> Result<Self, ForecastApplicationError> {
+        if let Some(bar) = &origin {
+            validate_price_origin(
+                bar,
+                &self.source_id,
+                self.observed_through
+                    .ok_or(ForecastApplicationError::InvalidRecord)?,
+                self.knowledge_cutoff,
+            )?;
+        }
+        self.origin_bar = origin;
+        Ok(self)
+    }
+
+    pub(crate) const fn origin_bar(&self) -> Option<&MarketBarObservation> {
+        self.origin_bar.as_ref()
+    }
+
+    pub(crate) fn with_parent_manifests(
+        mut self,
+        parents: Vec<DatasetManifestRef>,
+    ) -> Result<Self, ForecastApplicationError> {
+        validate_serving_parent_manifests(&self.manifest, &parents)?;
+        self.parent_manifests = parents.into_boxed_slice();
+        Ok(self)
+    }
+
+    pub(crate) fn parent_manifests(&self) -> &[DatasetManifestRef] {
+        &self.parent_manifests
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(crate) const fn object_graph_sha256(&self) -> Sha256Digest {
+        self.object_graph_sha256
+    }
+
+    pub(crate) const fn selection_sha256(&self) -> Sha256Digest {
+        self.selection_sha256
+    }
+
+    pub(crate) const fn result_sha256(&self) -> Sha256Digest {
+        self.result_sha256
+    }
+
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    pub(crate) const fn prior_observed_at(&self) -> Option<Timestamp> {
+        self.prior_observed_at
+    }
+
+    pub(crate) const fn observed_through(&self) -> Option<Timestamp> {
+        self.observed_through
+    }
+
+    pub(crate) const fn feature_sha256(&self) -> Sha256Digest {
+        self.feature_sha256
+    }
+
+    pub(crate) const fn financial_input(
+        &self,
+    ) -> Option<&market_squawk_modeling::ForecastFinancialServingRecord> {
+        self.financial_input.as_ref()
+    }
+
+    pub(crate) fn from_financial_output(
+        output: &market_squawk_data::FeatureDatasetInputEpochOutput,
+        index: usize,
+    ) -> Result<Self, ForecastApplicationError> {
+        let coordinate = output
+            .coordinate(index)
+            .ok_or(ForecastApplicationError::InvalidRecord)?;
+        let epoch = coordinate.epoch();
+        let generation = coordinate.dataset().generation();
+        let query = output.query_output();
+        if query.manifest() != generation.manifest() || epoch.financial_period().is_none() {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        let parents = std::iter::once(generation.manifest().clone())
+            .chain(
+                generation
+                    .parents()
+                    .iter()
+                    .map(|parent| parent.manifest().clone()),
+            )
+            .collect::<Vec<_>>();
+        validate_serving_parent_manifests(generation.manifest(), &parents)?;
+        Ok(Self {
+            manifest: generation.manifest().clone(),
+            parent_manifests: parents.into_boxed_slice(),
+            source_id: generation.source_id().clone(),
+            object_graph_sha256: Sha256Digest::new(query.object_graph_digest().bytes()),
+            selection_sha256: Sha256Digest::new(query.query_identity().bytes()),
+            result_sha256: Sha256Digest::new(query.result_digest().bytes()),
+            knowledge_cutoff: epoch.source_selection_as_of(),
+            prior_observed_at: None,
+            observed_through: None,
+            feature_sha256:
+                market_squawk_modeling::ForecastFinancialServingRecord::feature_identity(coordinate)
+                    .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            origin_bar: None,
+            current_price_input: None,
+            financial_input: Some(
+                market_squawk_modeling::ForecastFinancialServingRecord::from_coordinate(coordinate)
+                    .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            ),
+        })
+    }
+
+    pub(crate) const fn current_price_input(
+        &self,
+    ) -> Option<&market_squawk_modeling::ForecastCurrentPriceServingRecord> {
+        self.current_price_input.as_ref()
+    }
+
+    pub(crate) fn from_current_price_output(
+        output: &market_squawk_data::FeatureDatasetInputEpochOutput,
+        index: usize,
+        cohort: Option<&crate::application::market_calendar::ForecastSessionCohortReference>,
+    ) -> Result<Self, ForecastApplicationError> {
+        let coordinate = output
+            .coordinate(index)
+            .ok_or(ForecastApplicationError::InvalidRecord)?;
+        let epoch = coordinate.epoch();
+        let generation = coordinate.dataset().generation();
+        let query = output.query_output();
+        if query.manifest() != generation.manifest() {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        let parents = std::iter::once(generation.manifest().clone())
+            .chain(
+                generation
+                    .parents()
+                    .iter()
+                    .map(|parent| parent.manifest().clone()),
+            )
+            .collect::<Vec<_>>();
+        validate_serving_parent_manifests(generation.manifest(), &parents)?;
+        let mut current =
+            market_squawk_modeling::ForecastCurrentPriceServingRecord::from_coordinate(coordinate)
+                .map_err(|_| ForecastApplicationError::InvalidRecord)?;
+        current.session_cohort_json = cohort
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| ForecastApplicationError::InvalidRecord)?;
+        Ok(Self {
+            manifest: generation.manifest().clone(),
+            parent_manifests: parents.into_boxed_slice(),
+            source_id: generation.source_id().clone(),
+            object_graph_sha256: Sha256Digest::new(query.object_graph_digest().bytes()),
+            selection_sha256: Sha256Digest::new(query.query_identity().bytes()),
+            result_sha256: Sha256Digest::new(query.result_digest().bytes()),
+            knowledge_cutoff: epoch.source_selection_as_of(),
+            prior_observed_at: None,
+            observed_through: epoch.target_origin(),
+            feature_sha256:
+                market_squawk_modeling::ForecastCurrentPriceServingRecord::feature_identity(
+                    coordinate,
+                )
+                .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            origin_bar: epoch.market_bar().cloned(),
+            financial_input: None,
+            current_price_input: Some(current),
+        })
+    }
+
+    pub(super) fn from_current_price_record(
+        record: market_squawk_modeling::ForecastServingArtifactRecord,
+    ) -> Result<Self, ForecastApplicationError> {
+        if !record.validate() || record.current_price_input.is_none() {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(Self {
+            manifest: record
+                .manifest
+                .typed()
+                .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            parent_manifests: record
+                .parent_manifests
+                .iter()
+                .map(|parent| {
+                    parent
+                        .typed()
+                        .map_err(|_| ForecastApplicationError::InvalidRecord)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            source_id: SourceId::try_from(record.source_id.as_str())
+                .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            object_graph_sha256: digest_from_hex(&record.object_graph_sha256)?,
+            selection_sha256: digest_from_hex(&record.selection_sha256)?,
+            result_sha256: digest_from_hex(&record.result_sha256)?,
+            knowledge_cutoff: Timestamp::from_unix_nanos(record.knowledge_cutoff_unix_nanos),
+            prior_observed_at: None,
+            observed_through: record
+                .observed_through_unix_nanos
+                .map(Timestamp::from_unix_nanos),
+            feature_sha256: digest_from_hex(&record.feature_sha256)?,
+            origin_bar: record.origin_bar,
+            financial_input: None,
+            current_price_input: record.current_price_input,
+        })
+    }
+
+    pub(super) fn from_financial_record(
+        record: market_squawk_modeling::ForecastServingArtifactRecord,
+    ) -> Result<Self, ForecastApplicationError> {
+        if !record.validate() || record.financial_input.is_none() {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(Self {
+            manifest: record
+                .manifest
+                .typed()
+                .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            parent_manifests: record
+                .parent_manifests
+                .iter()
+                .map(|parent| {
+                    parent
+                        .typed()
+                        .map_err(|_| ForecastApplicationError::InvalidRecord)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            source_id: SourceId::try_from(record.source_id.as_str())
+                .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+            object_graph_sha256: digest_from_hex(&record.object_graph_sha256)?,
+            selection_sha256: digest_from_hex(&record.selection_sha256)?,
+            result_sha256: digest_from_hex(&record.result_sha256)?,
+            knowledge_cutoff: Timestamp::from_unix_nanos(record.knowledge_cutoff_unix_nanos),
+            prior_observed_at: None,
+            observed_through: None,
+            feature_sha256: digest_from_hex(&record.feature_sha256)?,
+            origin_bar: None,
+            financial_input: record.financial_input,
+            current_price_input: None,
+        })
+    }
+}
+
+pub(super) fn validate_serving_parent_manifests(
+    primary: &DatasetManifestRef,
+    parents: &[DatasetManifestRef],
+) -> Result<(), ForecastApplicationError> {
+    if parents.is_empty()
+        || parents.len() > market_squawk_modeling::MAX_FORECAST_SERVING_PARENTS
+        || parents.iter().filter(|parent| *parent == primary).count() != 1
+        || parents.iter().enumerate().any(|(index, parent)| {
+            parent.content_hash().bytes() == [0; 32]
+                || parents[..index].iter().any(|prior| {
+                    prior.dataset_id() == parent.dataset_id()
+                        && prior.manifest_version() == parent.manifest_version()
+                })
+        })
+    {
+        return Err(ForecastApplicationError::InvalidRecord);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_price_origin(
+    bar: &MarketBarObservation,
+    source_id: &SourceId,
+    observed_through: Timestamp,
+    knowledge_cutoff: Timestamp,
+) -> Result<(), ForecastApplicationError> {
+    market_squawk_modeling::validate_forecast_price_origin(
+        bar,
+        source_id,
+        observed_through,
+        knowledge_cutoff,
+    )
+    .map_err(|_| ForecastApplicationError::InvalidRecord)
+}
+
+/// Stable newest-valid ordering used by the internal investment-workspace read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ForecastSelectionOrder {
+    /// Newest publication, then freshest observation/input, then the lowest immutable identity.
+    NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId,
+    /// Revalidates the named immutable vintage without selecting a replacement.
+    ExactVintageIdentity,
+}
+
+impl ForecastSelectionOrder {
+    const fn canonical_bytes(self) -> &'static [u8] {
+        match self {
+            Self::ExactVintageIdentity => b"exact_vintage_identity",
+            Self::NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId => {
+                b"newest_created_at_observed_through_available_at_then_lowest_vintage_id"
+            }
+        }
+    }
+
+    /// Stable operation-facing name included in the canonically identified receipt.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactVintageIdentity => "exact_vintage_identity",
+            Self::NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId => {
+                "newest_created_at_observed_through_available_at_then_lowest_vintage_id"
+            }
+        }
+    }
+}
+
+/// Exact evidence shape applied before newest-valid ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ForecastSelectionQualification {
+    /// Every valid, available, published, and nonexpired vintage is eligible.
+    AnyValid,
+    /// Only complete calibrated conditional-mean terminal-price evidence at one exact horizon.
+    ExactCalibratedConditionalMeanPrice { horizon_nanos: NonZeroU64 },
+}
+
+impl ForecastSelectionQualification {
+    fn update_receipt_digest(self, digest: &mut Sha256) -> Result<(), ForecastApplicationError> {
+        match self {
+            Self::AnyValid => {
+                update_receipt_digest_field(digest, b"qualification", b"any_valid")?;
+            }
+            Self::ExactCalibratedConditionalMeanPrice { horizon_nanos } => {
+                update_receipt_digest_field(
+                    digest,
+                    b"qualification",
+                    b"exact_calibrated_conditional_mean_price",
+                )?;
+                update_receipt_digest_field(
+                    digest,
+                    b"qualification_horizon_nanos",
+                    &horizon_nanos.get().to_be_bytes(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForecastSelectionReceiptBody {
+    policy_revision: u32,
+    selection_order: ForecastSelectionOrder,
+    qualification: ForecastSelectionQualification,
+    instrument_id: InstrumentId,
+    as_of_unix_nanos: i64,
+    considered_vintage_count: usize,
+    inventory_vintage_count: usize,
+    eligible_vintage_count: usize,
+    competing_eligible_vintage_count: usize,
+    selection_complete: bool,
+    selected_vintage_id: String,
+    selected_created_at_unix_nanos: i64,
+    selected_observed_through_unix_nanos: Option<i64>,
+    selected_available_at_unix_nanos: i64,
+    selected_expires_at_unix_nanos: i64,
+    selected_terminal_target_at_unix_nanos: Option<i64>,
+    selected_analysis_pairing_sha256: String,
+    selected_serving_feature_sha256: String,
+}
+
+/// Exact, canonically identified proof that the complete retained forecast set was considered.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForecastSelectionReceipt {
+    #[serde(flatten)]
+    body: ForecastSelectionReceiptBody,
+    receipt_digest: EvidenceDigest,
+}
+
+impl ForecastSelectionReceipt {
+    fn try_new(body: ForecastSelectionReceiptBody) -> Result<Self, ForecastApplicationError> {
+        let pairing = digest_from_hex(&body.selected_analysis_pairing_sha256)?;
+        let serving = digest_from_hex(&body.selected_serving_feature_sha256)?;
+        if pairing.bytes() == [0; 32] || serving.bytes() == [0; 32] {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let receipt_digest = forecast_selection_receipt_digest(&body)?;
+        Ok(Self {
+            body,
+            receipt_digest,
+        })
+    }
+
+    /// Code-owned selection-policy revision.
+    #[must_use]
+    pub(crate) const fn policy_revision(&self) -> u32 {
+        self.body.policy_revision
+    }
+
+    /// Exact deterministic ordering applied to every eligible vintage.
+    #[must_use]
+    pub(crate) const fn selection_order(&self) -> ForecastSelectionOrder {
+        self.body.selection_order
+    }
+
+    /// Exact evidence shape applied before newest-valid ordering.
+    #[must_use]
+    pub(crate) const fn qualification(&self) -> ForecastSelectionQualification {
+        self.body.qualification
+    }
+
+    /// Exact requested instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.body.instrument_id
+    }
+
+    /// Exact point-in-time selection cutoff.
+    #[must_use]
+    pub(crate) const fn as_of_unix_nanos(&self) -> i64 {
+        self.body.as_of_unix_nanos
+    }
+
+    /// Complete number of retained vintages examined before eligibility filtering.
+    #[must_use]
+    pub(crate) const fn considered_vintage_count(&self) -> usize {
+        self.body.considered_vintage_count
+    }
+
+    /// Exact immutable inventory population bound to this selection.
+    #[must_use]
+    pub(crate) const fn inventory_vintage_count(&self) -> usize {
+        self.body.inventory_vintage_count
+    }
+
+    /// Number of exact-instrument, available, published, nonexpired vintages satisfying the
+    /// recorded qualification.
+    #[must_use]
+    pub(crate) const fn eligible_vintage_count(&self) -> usize {
+        self.body.eligible_vintage_count
+    }
+
+    /// Other qualification-eligible vintages that lost the deterministic ordering comparison.
+    #[must_use]
+    pub(crate) const fn competing_eligible_vintage_count(&self) -> usize {
+        self.body.competing_eligible_vintage_count
+    }
+
+    /// Whether the receipt covers the complete retained set without truncation.
+    #[must_use]
+    pub(crate) const fn selection_complete(&self) -> bool {
+        self.body.selection_complete
+    }
+
+    /// Immutable identity selected by the recorded deterministic order.
+    #[must_use]
+    pub(crate) fn selected_vintage_id(&self) -> &str {
+        &self.body.selected_vintage_id
+    }
+
+    /// Exact selected publication time.
+    #[must_use]
+    pub(crate) const fn selected_created_at_unix_nanos(&self) -> i64 {
+        self.body.selected_created_at_unix_nanos
+    }
+
+    /// Exact selected effective observation cutoff.
+    #[must_use]
+    pub(crate) const fn selected_observed_through_unix_nanos(&self) -> Option<i64> {
+        self.body.selected_observed_through_unix_nanos
+    }
+
+    /// Exact selected conservative knowledge time.
+    #[must_use]
+    pub(crate) const fn selected_available_at_unix_nanos(&self) -> i64 {
+        self.body.selected_available_at_unix_nanos
+    }
+
+    /// Exact exclusive model-risk expiry.
+    #[must_use]
+    pub(crate) const fn selected_expires_at_unix_nanos(&self) -> i64 {
+        self.body.selected_expires_at_unix_nanos
+    }
+
+    /// Exact terminal target bound into an exact-horizon receipt, absent for newest-any reads.
+    #[must_use]
+    pub(crate) const fn selected_terminal_target_at_unix_nanos(&self) -> Option<i64> {
+        self.body.selected_terminal_target_at_unix_nanos
+    }
+
+    /// Exact TrainingV1→AnalysisV1 pairing selected with the immutable vintage.
+    pub(crate) fn selected_analysis_pairing_sha256(
+        &self,
+    ) -> Result<Sha256Digest, ForecastApplicationError> {
+        digest_from_hex(&self.body.selected_analysis_pairing_sha256)
+    }
+
+    /// Exact label-free current-PIT serving feature selected with the immutable vintage.
+    pub(crate) fn selected_serving_feature_sha256(
+        &self,
+    ) -> Result<Sha256Digest, ForecastApplicationError> {
+        digest_from_hex(&self.body.selected_serving_feature_sha256)
+    }
+
+    const fn is_exact_horizon_price_qualified(&self, requested_horizon_nanos: NonZeroU64) -> bool {
+        matches!(
+            self.body.qualification,
+            ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                horizon_nanos
+            } if horizon_nanos.get() == requested_horizon_nanos.get()
+        )
+    }
+
+    fn binds_live_terminal_target(&self, terminal_target: Timestamp) -> bool {
+        self.body.selected_terminal_target_at_unix_nanos == Some(terminal_target.unix_nanos())
+            && terminal_target.unix_nanos() > self.body.as_of_unix_nanos
+            && self.body.selected_expires_at_unix_nanos <= terminal_target.unix_nanos()
+    }
+
+    /// Versioned SHA-256 identity of every canonical receipt field.
+    #[must_use]
+    pub(crate) const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+}
+
+fn forecast_selection_receipt_digest(
+    body: &ForecastSelectionReceiptBody,
+) -> Result<EvidenceDigest, ForecastApplicationError> {
+    let mut digest = Sha256::new();
+    update_receipt_digest_field(
+        &mut digest,
+        b"domain",
+        b"market-squawk/forecast-selection-receipt/v5",
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"policy_revision",
+        &body.policy_revision.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selection_order",
+        body.selection_order.canonical_bytes(),
+    )?;
+    body.qualification.update_receipt_digest(&mut digest)?;
+    let instrument_id = body.instrument_id.as_uuid();
+    update_receipt_digest_field(&mut digest, b"instrument_id", instrument_id.as_bytes())?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"as_of_unix_nanos",
+        &body.as_of_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"considered_vintage_count",
+        body.considered_vintage_count,
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"inventory_vintage_count",
+        body.inventory_vintage_count,
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"eligible_vintage_count",
+        body.eligible_vintage_count,
+    )?;
+    update_receipt_digest_count(
+        &mut digest,
+        b"competing_eligible_vintage_count",
+        body.competing_eligible_vintage_count,
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selection_complete",
+        &[u8::from(body.selection_complete)],
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_vintage_id",
+        body.selected_vintage_id.as_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_created_at_unix_nanos",
+        &body.selected_created_at_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_observed_through_unix_nanos",
+        &serde_json::to_vec(&body.selected_observed_through_unix_nanos)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_available_at_unix_nanos",
+        &body.selected_available_at_unix_nanos.to_be_bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_expires_at_unix_nanos",
+        &body.selected_expires_at_unix_nanos.to_be_bytes(),
+    )?;
+    match body.selected_terminal_target_at_unix_nanos {
+        Some(target_at_unix_nanos) => {
+            update_receipt_digest_field(&mut digest, b"selected_terminal_target_present", &[1])?;
+            update_receipt_digest_field(
+                &mut digest,
+                b"selected_terminal_target_at_unix_nanos",
+                &target_at_unix_nanos.to_be_bytes(),
+            )?;
+        }
+        None => {
+            update_receipt_digest_field(&mut digest, b"selected_terminal_target_present", &[0])?
+        }
+    }
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_analysis_pairing_sha256",
+        &digest_from_hex(&body.selected_analysis_pairing_sha256)?.bytes(),
+    )?;
+    update_receipt_digest_field(
+        &mut digest,
+        b"selected_serving_feature_sha256",
+        &digest_from_hex(&body.selected_serving_feature_sha256)?.bytes(),
+    )?;
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn update_receipt_digest_count(
+    digest: &mut Sha256,
+    field: &[u8],
+    value: usize,
+) -> Result<(), ForecastApplicationError> {
+    let value = u64::try_from(value).map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+    update_receipt_digest_field(digest, field, &value.to_be_bytes())
+}
+
+fn update_receipt_digest_field(
+    digest: &mut Sha256,
+    field: &[u8],
+    value: &[u8],
+) -> Result<(), ForecastApplicationError> {
+    let field_length =
+        u64::try_from(field.len()).map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+    let value_length =
+        u64::try_from(value.len()).map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+    digest.update(field_length.to_be_bytes());
+    digest.update(field);
+    digest.update(value_length.to_be_bytes());
+    digest.update(value);
+    Ok(())
+}
+
+/// Whether the selected admitted forecast can supply governed price evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ForecastPriceEvidence {
+    /// Exact admitted conditional-mean terminal-price evidence.
+    Available(Box<SelectedPriceForecast>),
+    /// The selected vintage is valid forecast evidence, but cannot be interpreted as a price.
+    Unavailable(SelectedForecastPriceUnavailable),
+}
+
+/// Closed reason that one valid selected forecast cannot supply price evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForecastPriceUnavailableReason {
+    /// The admitted model predicts a dimensionless return rather than a price.
+    ReturnMeasurement,
+    /// The admitted model predicts a probability rather than a price.
+    ProbabilityMeasurement,
+    /// The admitted regression output is explicitly not a price.
+    OtherRegressionMeasurement,
+    /// Signed accounting output with a native fiscal target.
+    FinancialAmountMeasurement,
+    /// Exact rows do not prove one fixed positive terminal horizon.
+    TerminalHorizonUnavailable,
+    /// The sealed estimator output is not admitted as a conditional mean.
+    CentralStatisticUnavailable,
+}
+
+/// Exact selected identity retained when price interpretation is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedForecastPriceUnavailable {
+    vintage_id: Sha256Digest,
+    instrument_id: InstrumentId,
+    output_binding_identity: Sha256Digest,
+    analysis_evidence: ForecastAnalysisEvidence,
+    serving_evidence: ForecastServingEvidence,
+    reason: ForecastPriceUnavailableReason,
+}
+
+impl SelectedForecastPriceUnavailable {
+    /// Exact selected immutable forecast identity.
+    #[must_use]
+    pub(crate) const fn vintage_id(&self) -> Sha256Digest {
+        self.vintage_id
+    }
+
+    /// Exact instrument that was selected.
+    #[must_use]
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Exact admitted binding identity retained for every current measurement.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(&self) -> Sha256Digest {
+        self.output_binding_identity
+    }
+
+    /// Exact immutable AnalysisV1 and TrainingV1→AnalysisV1 pairing evidence.
+    #[must_use]
+    pub(crate) const fn analysis_evidence(&self) -> &ForecastAnalysisEvidence {
+        &self.analysis_evidence
+    }
+
+    /// Exact immutable label-free serving input and current-PIT selection evidence.
+    #[must_use]
+    pub(crate) const fn serving_evidence(&self) -> &ForecastServingEvidence {
+        &self.serving_evidence
+    }
+
+    /// Closed non-price reason; callers must surface this as unavailable, never as a price.
+    #[must_use]
+    pub(crate) const fn reason(&self) -> ForecastPriceUnavailableReason {
+        self.reason
+    }
+}
+
+/// One exact fixed-scale interval in the selected forecast currency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedPriceInterval {
+    lower: ForecastValue,
+    upper: ForecastValue,
+}
+
+impl SelectedPriceInterval {
+    /// Inclusive lower value.
+    #[must_use]
+    pub(crate) const fn lower(self) -> ForecastValue {
+        self.lower
+    }
+
+    /// Inclusive upper value.
+    #[must_use]
+    pub(crate) const fn upper(self) -> ForecastValue {
+        self.upper
+    }
+}
+
+/// Exact calibrated 50/80/95 price intervals for one future point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedPriceIntervals {
+    interval_50: SelectedPriceInterval,
+    interval_80: SelectedPriceInterval,
+    interval_95: SelectedPriceInterval,
+}
+
+impl SelectedPriceIntervals {
+    /// Realized-marginal 50-percent interval; not a per-observation guarantee.
+    #[must_use]
+    pub(crate) const fn interval_50(self) -> SelectedPriceInterval {
+        self.interval_50
+    }
+
+    /// Realized-marginal 80-percent interval; not a per-observation guarantee.
+    #[must_use]
+    pub(crate) const fn interval_80(self) -> SelectedPriceInterval {
+        self.interval_80
+    }
+
+    /// Realized-marginal 95-percent interval; not a per-observation guarantee.
+    #[must_use]
+    pub(crate) const fn interval_95(self) -> SelectedPriceInterval {
+        self.interval_95
+    }
+}
+
+/// One typed future price point from the selected immutable vintage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedPriceForecastPoint {
+    target_at: Timestamp,
+    central: ForecastValue,
+    intervals: Option<SelectedPriceIntervals>,
+}
+
+impl SelectedPriceForecastPoint {
+    /// Exact future effective time.
+    #[must_use]
+    pub(crate) const fn target_at(self) -> Timestamp {
+        self.target_at
+    }
+
+    /// Exact fixed-scale modeled price in the enclosing forecast currency.
+    #[must_use]
+    pub(crate) const fn central(self) -> ForecastValue {
+        self.central
+    }
+
+    /// Calibrated intervals when exact admitted calibration evidence exists.
+    #[must_use]
+    pub(crate) const fn intervals(self) -> Option<SelectedPriceIntervals> {
+        self.intervals
+    }
+}
+
+/// Complete typed price evidence from one selected and model-revalidated forecast vintage.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectedPriceForecast {
+    vintage_id: Sha256Digest,
+    instrument_id: InstrumentId,
+    currency: Currency,
+    central_statistic: ForecastCentralStatistic,
+    terminal_horizon_nanos: NonZeroU64,
+    observed_through: Timestamp,
+    available_at: Timestamp,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+    output_binding_identity: Sha256Digest,
+    price_derivation_identity: Sha256Digest,
+    analysis_evidence: ForecastAnalysisEvidence,
+    serving_evidence: ForecastServingEvidence,
+    model_metadata: ModelMetadata,
+    forecast_artifact: ArtifactReference,
+    points: Box<[SelectedPriceForecastPoint]>,
+    calibration: Option<CalibrationEvidence>,
+}
+
+impl SelectedPriceForecast {
+    /// Exact direct-price or origin-bound arithmetic-return transformation identity.
+    pub(crate) const fn price_derivation_identity(&self) -> Sha256Digest {
+        self.price_derivation_identity
+    }
+    /// Exact selected immutable forecast identity.
+    #[must_use]
+    pub(crate) const fn vintage_id(&self) -> Sha256Digest {
+        self.vintage_id
+    }
+
+    /// Exact forecasted instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Exact model-admitted quote currency for every returned point.
+    #[must_use]
+    pub(crate) const fn currency(&self) -> Currency {
+        self.currency
+    }
+
+    /// Exact admitted statistical meaning of every central point.
+    #[must_use]
+    pub(crate) const fn central_statistic(&self) -> ForecastCentralStatistic {
+        self.central_statistic
+    }
+
+    /// Exact positive effective-time offset of the terminal-price label.
+    #[must_use]
+    pub(crate) const fn terminal_horizon_nanos(&self) -> NonZeroU64 {
+        self.terminal_horizon_nanos
+    }
+
+    /// Effective cutoff of the source-qualified observed series.
+    #[must_use]
+    pub(crate) const fn observed_through(&self) -> Timestamp {
+        self.observed_through
+    }
+
+    /// Conservative knowledge time of the complete forecast input.
+    #[must_use]
+    pub(crate) const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+
+    /// Publication time of the immutable vintage.
+    #[must_use]
+    pub(crate) const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+
+    /// Exclusive model-risk expiry time used by selection.
+    #[must_use]
+    pub(crate) const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+
+    /// Versioned model-admission identity that authorizes price interpretation.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(&self) -> Sha256Digest {
+        self.output_binding_identity
+    }
+
+    /// Exact immutable AnalysisV1 and TrainingV1→AnalysisV1 pairing evidence.
+    #[must_use]
+    pub(crate) const fn analysis_evidence(&self) -> &ForecastAnalysisEvidence {
+        &self.analysis_evidence
+    }
+
+    /// Exact immutable label-free serving input and current-PIT selection evidence.
+    #[must_use]
+    pub(crate) const fn serving_evidence(&self) -> &ForecastServingEvidence {
+        &self.serving_evidence
+    }
+
+    /// Exact reloaded admitted model metadata matched against the durable payload.
+    #[must_use]
+    pub(crate) const fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
+    }
+
+    /// Exact path-free controlled forecast artifact reference.
+    #[must_use]
+    pub(crate) const fn forecast_artifact(&self) -> &ArtifactReference {
+        &self.forecast_artifact
+    }
+
+    /// Complete ordered future price path.
+    #[must_use]
+    pub(crate) fn points(&self) -> &[SelectedPriceForecastPoint] {
+        &self.points
+    }
+
+    /// Exact reconstructed admitted calibration evidence, when intervals exist.
+    #[must_use]
+    pub(crate) const fn calibration(&self) -> Option<&CalibrationEvidence> {
+        self.calibration.as_ref()
+    }
+}
+
+/// Complete selected typed forecast evidence and the authority-owned selection receipt.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LatestValidForecast {
+    price_evidence: ForecastPriceEvidence,
+    selection_receipt: ForecastSelectionReceipt,
+    model_metadata: ModelMetadata,
+    forecast_artifact: ArtifactReference,
+    distribution: Option<SelectedForecastDistribution>,
+}
+
+/// Exact typed reason one selected forecast cannot satisfy a requested price horizon.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactHorizonPriceForecastUnavailableReason {
+    /// The receipt came from the generic newest-valid research selector.
+    SelectionNotExactHorizonQualified,
+    /// The selected model binding is not admitted as conditional-mean terminal-price evidence.
+    PriceEvidenceUnavailable(ForecastPriceUnavailableReason),
+    /// The admitted model predicts a different exact terminal horizon.
+    HorizonMismatch { selected_horizon_nanos: NonZeroU64 },
+    /// The selected price forecast has no admitted interval-calibration evidence.
+    CalibrationUnavailable,
+}
+
+/// Identity-bound refusal to reinterpret a selected vintage at a caller-requested horizon.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactHorizonPriceForecastUnavailable {
+    requested_horizon_nanos: NonZeroU64,
+    vintage_id: Sha256Digest,
+    instrument_id: InstrumentId,
+    output_binding_identity: Sha256Digest,
+    selection_receipt_digest: EvidenceDigest,
+    reason: ExactHorizonPriceForecastUnavailableReason,
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl ExactHorizonPriceForecastUnavailable {
+    /// Exact positive horizon requested by the analysis policy.
+    #[must_use]
+    pub(crate) const fn requested_horizon_nanos(self) -> NonZeroU64 {
+        self.requested_horizon_nanos
+    }
+
+    /// Immutable selected vintage that could not satisfy the requested interpretation.
+    #[must_use]
+    pub(crate) const fn vintage_id(self) -> Sha256Digest {
+        self.vintage_id
+    }
+
+    /// Exact selected instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Model-admission identity retained even when the requested projection is unavailable.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(self) -> Sha256Digest {
+        self.output_binding_identity
+    }
+
+    /// Complete newest-valid selection identity.
+    #[must_use]
+    pub(crate) const fn selection_receipt_digest(self) -> EvidenceDigest {
+        self.selection_receipt_digest
+    }
+
+    /// Closed reason this vintage cannot be used at the requested horizon.
+    #[must_use]
+    pub(crate) const fn reason(self) -> ExactHorizonPriceForecastUnavailableReason {
+        self.reason
+    }
+}
+
+/// One exact calibrated conditional-mean terminal-price projection.
+///
+/// This is research evidence only. It grants no proposal, sizing, risk, order, or execution
+/// authority and does not reinterpret generic regression output or an approximate horizon.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExactHorizonPriceForecastProjection<'forecast> {
+    price: &'forecast SelectedPriceForecast,
+    selection_receipt: &'forecast ForecastSelectionReceipt,
+    terminal: SelectedPriceForecastPoint,
+    intervals: SelectedPriceIntervals,
+    calibration: &'forecast CalibrationEvidence,
+    coverage_evaluation: &'forecast market_squawk_modeling::CalibrationCoverageEvaluation,
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl ExactHorizonPriceForecastProjection<'_> {
+    pub(crate) const fn price_derivation_identity(self) -> Sha256Digest {
+        self.price.price_derivation_identity()
+    }
+
+    pub(crate) const fn source_knowledge_cutoff(self) -> Timestamp {
+        self.price.serving_evidence().knowledge_cutoff()
+    }
+    /// Exact immutable forecast-vintage identity.
+    #[must_use]
+    pub(crate) const fn vintage_id(self) -> Sha256Digest {
+        self.price.vintage_id()
+    }
+
+    /// Exact forecasted instrument.
+    #[must_use]
+    pub(crate) const fn instrument_id(self) -> InstrumentId {
+        self.price.instrument_id()
+    }
+
+    /// Quote currency of the modeled price and every interval bound.
+    #[must_use]
+    pub(crate) const fn currency(self) -> Currency {
+        self.price.currency()
+    }
+
+    /// Exact positive terminal horizon admitted by the model and requested by the caller.
+    #[must_use]
+    pub(crate) const fn terminal_horizon_nanos(self) -> NonZeroU64 {
+        self.price.terminal_horizon_nanos()
+    }
+
+    /// Exact future effective coordinate of the single terminal point.
+    #[must_use]
+    pub(crate) const fn terminal_at(self) -> Timestamp {
+        self.terminal.target_at()
+    }
+
+    /// Model-estimated conditional-mean terminal price.
+    #[must_use]
+    pub(crate) const fn terminal_mean(self) -> ForecastValue {
+        self.terminal.central()
+    }
+
+    /// Complete nested marginal-coverage intervals at 50, 80, and 95 percent.
+    #[must_use]
+    pub(crate) const fn intervals(self) -> SelectedPriceIntervals {
+        self.intervals
+    }
+
+    /// Complete admitted interval-calibration identity.
+    #[must_use]
+    pub(crate) const fn calibration_identity(self) -> Sha256Digest {
+        self.calibration.identity()
+    }
+
+    /// Model-output admission identity authorizing the price/mean/horizon interpretation.
+    #[must_use]
+    pub(crate) const fn output_binding_identity(self) -> Sha256Digest {
+        self.price.output_binding_identity()
+    }
+
+    /// Exact complete-set newest-valid selection identity.
+    #[must_use]
+    pub(crate) const fn selection_receipt_digest(self) -> EvidenceDigest {
+        self.selection_receipt.receipt_digest()
+    }
+
+    /// Exact point-in-time selection cutoff.
+    #[must_use]
+    pub(crate) const fn selected_as_of(self) -> Timestamp {
+        Timestamp::from_unix_nanos(self.selection_receipt.as_of_unix_nanos())
+    }
+
+    /// Effective cutoff of the source-qualified observed series.
+    #[must_use]
+    pub(crate) const fn observed_through(self) -> Timestamp {
+        self.price.observed_through()
+    }
+
+    /// Conservative knowledge time of the complete forecast input.
+    #[must_use]
+    pub(crate) const fn available_at(self) -> Timestamp {
+        self.price.available_at()
+    }
+
+    /// Immutable publication time.
+    #[must_use]
+    pub(crate) const fn created_at(self) -> Timestamp {
+        self.price.created_at()
+    }
+
+    /// Exclusive model-risk expiry used by selection.
+    #[must_use]
+    pub(crate) const fn expires_at(self) -> Timestamp {
+        self.price.expires_at()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+impl<'forecast> ExactHorizonPriceForecastProjection<'forecast> {
+    /// Complete authority-owned newest-valid selection receipt.
+    #[must_use]
+    pub(crate) const fn selection_receipt(self) -> &'forecast ForecastSelectionReceipt {
+        self.selection_receipt
+    }
+
+    /// Complete bundle-, artifact-, window-, residual-, band-, and coverage-bound calibration.
+    #[must_use]
+    pub(crate) const fn calibration(self) -> &'forecast CalibrationEvidence {
+        self.calibration
+    }
+
+    /// Untouched evaluation completed before this live evidence selection.
+    #[must_use]
+    pub(crate) const fn coverage_evaluation(
+        self,
+    ) -> &'forecast market_squawk_modeling::CalibrationCoverageEvaluation {
+        self.coverage_evaluation
+    }
+
+    /// Exact reloaded model metadata used to revalidate this vintage.
+    #[must_use]
+    pub(crate) const fn model_metadata(self) -> &'forecast ModelMetadata {
+        self.price.model_metadata()
+    }
+
+    /// Path-free controlled forecast artifact verified before selection returned.
+    #[must_use]
+    pub(crate) const fn forecast_artifact(self) -> &'forecast ArtifactReference {
+        self.price.forecast_artifact()
+    }
+}
+
+/// Exact calibrated terminal-price evidence or an identity-bound typed refusal.
+#[allow(
+    dead_code,
+    reason = "a generic analysis consumer uses this at the next composition seam"
+)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ExactHorizonPriceForecastEvidence<'forecast> {
+    Available(ExactHorizonPriceForecastProjection<'forecast>),
+    Unavailable(ExactHorizonPriceForecastUnavailable),
+}
+
+impl LatestValidForecast {
+    /// Exact selected distribution with its reopened native serving evidence.
+    pub(crate) const fn selected_distribution(&self) -> Option<&SelectedForecastDistribution> {
+        self.distribution.as_ref()
+    }
+
+    /// Typed price evidence or an explicit non-price/unavailable result.
+    #[must_use]
+    pub(crate) const fn price_evidence(&self) -> &ForecastPriceEvidence {
+        &self.price_evidence
+    }
+
+    /// Exact non-truncated selection proof.
+    #[must_use]
+    pub(crate) const fn selection_receipt(&self) -> &ForecastSelectionReceipt {
+        &self.selection_receipt
+    }
+
+    /// Exact reloaded model authority common to available and unavailable price evidence.
+    #[must_use]
+    pub(crate) const fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
+    }
+
+    /// Exact controlled artifact read and verified before either result variant is returned.
+    #[must_use]
+    pub(crate) const fn forecast_artifact(&self) -> &ArtifactReference {
+        &self.forecast_artifact
+    }
+
+    /// Projects only an exact calibrated conditional-mean price at the requested horizon.
+    ///
+    /// A different admitted horizon, a non-price model, or absent calibration remains explicitly
+    /// unavailable. Internal identity or chronology drift is treated as corrupt retained state.
+    #[allow(
+        dead_code,
+        reason = "a generic analysis consumer uses this at the next composition seam"
+    )]
+    pub(crate) fn exact_horizon_price_projection(
+        &self,
+        requested_horizon_nanos: NonZeroU64,
+    ) -> Result<ExactHorizonPriceForecastEvidence<'_>, ForecastApplicationError> {
+        let (vintage_id, instrument_id, output_binding_identity) = match &self.price_evidence {
+            ForecastPriceEvidence::Available(price) => (
+                price.vintage_id(),
+                price.instrument_id(),
+                price.output_binding_identity(),
+            ),
+            ForecastPriceEvidence::Unavailable(unavailable) => (
+                unavailable.vintage_id(),
+                unavailable.instrument_id(),
+                unavailable.output_binding_identity(),
+            ),
+        };
+        let unavailable = |reason| {
+            ExactHorizonPriceForecastEvidence::Unavailable(ExactHorizonPriceForecastUnavailable {
+                requested_horizon_nanos,
+                vintage_id,
+                instrument_id,
+                output_binding_identity,
+                selection_receipt_digest: self.selection_receipt.receipt_digest(),
+                reason,
+            })
+        };
+        if !self
+            .selection_receipt
+            .is_exact_horizon_price_qualified(requested_horizon_nanos)
+        {
+            let reason = match self.selection_receipt.qualification() {
+                ForecastSelectionQualification::AnyValid => {
+                    ExactHorizonPriceForecastUnavailableReason::SelectionNotExactHorizonQualified
+                }
+                ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                    horizon_nanos,
+                } => ExactHorizonPriceForecastUnavailableReason::HorizonMismatch {
+                    selected_horizon_nanos: horizon_nanos,
+                },
+            };
+            return Ok(unavailable(reason));
+        }
+        let ForecastPriceEvidence::Available(price) = &self.price_evidence else {
+            let ForecastPriceEvidence::Unavailable(price) = &self.price_evidence else {
+                return Err(ForecastApplicationError::CorruptIndex);
+            };
+            return Ok(unavailable(
+                ExactHorizonPriceForecastUnavailableReason::PriceEvidenceUnavailable(
+                    price.reason(),
+                ),
+            ));
+        };
+        if price.terminal_horizon_nanos() != requested_horizon_nanos {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let Some(calibration) = price.calibration() else {
+            return Ok(unavailable(
+                ExactHorizonPriceForecastUnavailableReason::CalibrationUnavailable,
+            ));
+        };
+        let Some(coverage_evaluation) =
+            price
+                .model_metadata()
+                .forecast_calibration()
+                .and_then(|artifacts| {
+                    artifacts.coverage_evaluation(Timestamp::from_unix_nanos(
+                        self.selection_receipt.as_of_unix_nanos(),
+                    ))
+                })
+        else {
+            return Ok(unavailable(
+                ExactHorizonPriceForecastUnavailableReason::CalibrationUnavailable,
+            ));
+        };
+        let [terminal] = price.points() else {
+            return Err(ForecastApplicationError::CorruptIndex);
+        };
+        let expected_target = price
+            .observed_through()
+            .checked_add_nanos(
+                i64::try_from(requested_horizon_nanos.get())
+                    .map_err(|_error| ForecastApplicationError::CorruptIndex)?,
+            )
+            .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        let intervals = terminal
+            .intervals()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        // Persistence already admitted this object through `verify_forecast_vintage_identity`,
+        // including its model/cutoff calibration match. Reconstruct it again here so this narrow
+        // projection independently rejects any locally retained calibration drift.
+        let revalidated_calibration = CalibrationEvidence::try_new(
+            price.model_metadata(),
+            calibration.method(),
+            calibration.window(),
+            calibration.policy_hash(),
+            calibration.residuals_hash(),
+            *calibration.bands(),
+            calibration.dependence_assumptions(),
+        )
+        .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        let nested = intervals.interval_95().lower() <= intervals.interval_80().lower()
+            && intervals.interval_80().lower() <= intervals.interval_50().lower()
+            && intervals.interval_50().lower() <= terminal.central()
+            && terminal.central() <= intervals.interval_50().upper()
+            && intervals.interval_50().upper() <= intervals.interval_80().upper()
+            && intervals.interval_80().upper() <= intervals.interval_95().upper();
+        if price.central_statistic() != ForecastCentralStatistic::ModelEstimatedConditionalMean
+            || terminal.target_at() != expected_target
+            || !self
+                .selection_receipt
+                .binds_live_terminal_target(terminal.target_at())
+            || !nested
+            || calibration.identity().bytes() == [0; 32]
+            || &revalidated_calibration != calibration
+            || !calibration.window().ends_by(price.observed_through())
+            || calibration.bands()[0].coverage() != ForecastCoverage::Fifty
+            || calibration.bands()[1].coverage() != ForecastCoverage::Eighty
+            || calibration.bands()[2].coverage() != ForecastCoverage::NinetyFive
+            || !self.selection_receipt.selection_complete()
+            || self.selection_receipt.instrument_id() != instrument_id
+            || self.selection_receipt.selected_vintage_id() != hex(vintage_id.bytes())
+            || self
+                .selection_receipt
+                .selected_observed_through_unix_nanos()
+                != Some(price.observed_through().unix_nanos())
+            || self.selection_receipt.selected_available_at_unix_nanos()
+                != price.available_at().unix_nanos()
+            || self.selection_receipt.selected_created_at_unix_nanos()
+                != price.created_at().unix_nanos()
+            || self.selection_receipt.selected_expires_at_unix_nanos()
+                != price.expires_at().unix_nanos()
+            || price.model_metadata().metadata_hash() != self.model_metadata.metadata_hash()
+            || price.forecast_artifact() != &self.forecast_artifact
+        {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(ExactHorizonPriceForecastEvidence::Available(
+            ExactHorizonPriceForecastProjection {
+                price,
+                selection_receipt: &self.selection_receipt,
+                terminal: *terminal,
+                intervals,
+                calibration,
+                coverage_evaluation,
+            },
+        ))
+    }
+}
+
+/// Least-authority lifecycle and complete-object ceiling for one typed forecast evidence read.
+#[derive(Clone, Debug)]
+pub(crate) struct ForecastEvidenceReadContext {
+    artifact: ArtifactReadContext,
+    maximum_artifact_bytes: NonZeroUsize,
+}
+
+impl ForecastEvidenceReadContext {
+    /// Binds service-owned cancellation/deadline authority to the admitted complete-object bound.
+    #[must_use]
+    pub(crate) const fn new(
+        artifact: ArtifactReadContext,
+        maximum_artifact_bytes: NonZeroUsize,
+    ) -> Self {
+        Self {
+            artifact,
+            maximum_artifact_bytes,
+        }
+    }
+
+    fn ensure_live(&self) -> Result<(), ArtifactError> {
+        self.artifact.ensure_live()
+    }
+}
+
+/// Exact saved binary forecast and original serving selection, reopened by the sole reader.
+pub(crate) struct ReopenedProbabilityForecast {
+    vintage: ForecastVintage,
+    model_metadata: ModelMetadata,
+    serving_evidence: ForecastServingEvidence,
+}
+impl ReopenedProbabilityForecast {
+    pub(crate) const fn vintage(&self) -> &ForecastVintage {
+        &self.vintage
+    }
+    pub(crate) const fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
+    }
+    pub(crate) fn source_knowledge_cutoff(&self) -> Timestamp {
+        self.serving_evidence.knowledge_cutoff()
+    }
+    pub(crate) fn source_selection_sha256(&self) -> Sha256Digest {
+        self.serving_evidence.selection_sha256()
+    }
+    pub(crate) fn source_feature_sha256(&self) -> Sha256Digest {
+        self.serving_evidence.feature_sha256()
+    }
+}
+
+/// Least-authority typed forecast read retained before model service trait erasure.
+#[async_trait]
+pub(crate) trait ForecastEvidenceReader: Send + Sync {
+    /// Reopens the exact content-addressed distribution and original serving artifact.
+    async fn exact_distribution_for_identity(
+        &self,
+        vintage_id: Sha256Digest,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+
+    /// Reopens the exact product token through the original content-addressed distribution.
+    async fn exact_distribution_for_vintage(
+        &self,
+        forecast_token: Uuid,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+
+    /// Reopens one original current source and exact target before later source acquisition.
+    async fn exact_probability_for_vintage(
+        &self,
+        forecast_token: Uuid,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<ReopenedProbabilityForecast, ForecastApplicationError>;
+
+    async fn outcome_preparation_origin(
+        &self,
+        forecast_token: Uuid,
+        analytical: &AnalyticalReadCapability,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<Option<ForecastOutcomePreparationOrigin>, ForecastApplicationError>;
+
+    /// Measures one matured vintage against exact source-owned historical bars and retains its evidence.
+    async fn measure_outcome(
+        &self,
+        forecast_token: Uuid,
+        outcome_manifest: DatasetManifestRef,
+        as_of: Timestamp,
+        source_action_reference: Option<&crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>,
+        analytical: &AnalyticalReadCapability,
+        source_actions: Option<&crate::application::research::corporate_actions::SourceAppliedCorporateActionReadCapability>,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<ForecastOutcomeMeasurement, ForecastApplicationError>;
+    /// Revalidates exactly the retained token at an explicit cutoff; never falls back to latest.
+    async fn exact_horizon_price_for_vintage(
+        &self,
+        forecast_token: Uuid,
+        instrument_id: InstrumentId,
+        requested_horizon_nanos: NonZeroU64,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+    /// Selects one exact nonexpired vintage and verifies its model and controlled artifact.
+    async fn latest_valid_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+
+    /// Selects the newest exact calibrated conditional-mean terminal-price vintage.
+    async fn latest_valid_exact_horizon_price_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        requested_horizon_nanos: NonZeroU64,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError>;
+}
+
+/// Sole append authority for durable immutable forecast records.
+pub struct ForecastApplicationService {
+    catalog: ForecastInventoryCatalogCapability,
+    charts: market_squawk_data::ChartProjectionCatalogCapability,
+    publication: Mutex<()>,
+    artifacts: Arc<dyn ArtifactRepository>,
+}
+
+/// Bounded collection content plus the complete logical population count.
+pub(super) struct ForecastCollection {
+    content: Value,
+    returned_items: usize,
+    available_items: usize,
+}
+
+impl ForecastCollection {
+    fn try_new(
+        content: Value,
+        returned_items: usize,
+        available_items: usize,
+    ) -> Result<Self, ForecastApplicationError> {
+        if returned_items > available_items {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(Self {
+            content,
+            returned_items,
+            available_items,
+        })
+    }
+
+    pub(super) fn into_parts(self) -> (Value, usize, usize) {
+        (self.content, self.returned_items, self.available_items)
+    }
+}
+
+pub(super) struct RetainedForecastBackup {
+    pub(super) runtime: RetainedRuntimeBackup,
+    /// Canonical immutable inventory fence, independent of history length.
+    pub(super) canonical_index: Box<[u8]>,
+    inventory: inventory::ForecastBackupInventory,
+}
+
+pub(super) struct ForecastBackupRecord {
+    pub(super) kind: u8,
+    pub(super) sequence: u64,
+    pub(super) record: Box<[u8]>,
+    pub(super) artifact: ArtifactReference,
+}
+
+impl ForecastBackupRecord {
+    pub(super) fn decode(
+        kind: u8,
+        sequence: u64,
+        record: Box<[u8]>,
+    ) -> Result<Self, ForecastApplicationError> {
+        if sequence == 0 {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let artifact = match kind {
+            1 => persistence::StoredVintageRecord::decode(&record)?.artifact_reference()?,
+            2 => {
+                let outcome: OutcomeRecord = serde_json::from_slice(&record)
+                    .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+                outcome.artifact_reference()?
+            }
+            _ => return Err(ForecastApplicationError::InvalidRecord),
+        };
+        Ok(Self {
+            kind,
+            sequence,
+            record,
+            artifact,
+        })
+    }
+}
+impl RetainedForecastBackup {
+    pub(super) fn page(
+        &self,
+        kind: u8,
+        after: u64,
+    ) -> Result<Vec<ForecastBackupRecord>, ForecastApplicationError> {
+        let page = match kind {
+            1 => self
+                .inventory
+                .catalog
+                .vintages(self.inventory.head, after, 32, false, None)?,
+            2 => self
+                .inventory
+                .catalog
+                .outcomes(self.inventory.head, after, 32, None)?,
+            _ => return Err(ForecastApplicationError::InvalidRecord),
+        };
+        page.into_iter()
+            .map(|(sequence, record)| ForecastBackupRecord::decode(kind, sequence, record))
+            .collect()
+    }
+}
+impl std::fmt::Debug for RetainedForecastBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedForecastBackup")
+            .field("runtime", &self.runtime)
+            .field("head", &self.inventory.head)
+            .finish()
+    }
+}
+
+impl ForecastApplicationService {
+    /// Opens the shared immutable forecast inventory; selected artifacts are verified on demand.
+    pub fn try_open(
+        catalog: ForecastInventoryCatalogCapability,
+        charts: market_squawk_data::ChartProjectionCatalogCapability,
+        artifacts: Arc<dyn ArtifactRepository>,
+    ) -> Result<Self, ForecastApplicationError> {
+        catalog.head()?;
+        Ok(Self {
+            catalog,
+            charts,
+            publication: Mutex::new(()),
+            artifacts,
+        })
+    }
+
+    pub(super) fn artifact_repository(&self) -> Arc<dyn ArtifactRepository> {
+        Arc::clone(&self.artifacts)
+    }
+
+    /// Publishes one complete path, then durably appends its immutable vintage record.
+    ///
+    /// The request digest makes an exact retry return the already committed vintage. Publication
+    /// is serialized so concurrent copies cannot create competing wall-clock vintages. The
+    /// artifact commits first; an index failure may leave an unreachable content-addressed object,
+    /// but never a vintage that references missing payload bytes.
+    pub(crate) async fn publish_vintage<T>(
+        &self,
+        request_hash: Sha256Digest,
+        path: ForecastPath,
+        product_identity: ForecastProductIdentity,
+        model_evidence: ForecastModelEvidenceProjection,
+        analysis_evidence: ForecastAnalysisEvidence,
+        serving_evidence: ForecastServingEvidence,
+        created_at: market_squawk_domain::Timestamp,
+        expires_at: market_squawk_domain::Timestamp,
+        context: ArtifactPublicationContext,
+        precommit: Option<&dyn ForecastPrecommitAuthority>,
+        project: impl FnOnce(Value, ArtifactReference) -> Result<T, ForecastApplicationError>,
+    ) -> Result<T, ForecastApplicationError> {
+        let _publication = tokio::select! {
+            biased;
+            _ = context.cancellation().cancelled() => return Err(ArtifactError::Cancelled.into()),
+            _ = tokio::time::sleep_until(context.deadline().into()) => {
+                return Err(ArtifactError::DeadlineExceeded.into());
+            }
+            guard = self.publication.lock() => guard,
+        };
+        context.ensure_live()?;
+        if let Some(existing) = self
+            .vintage_for_request(
+                request_hash,
+                &ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+            )
+            .await?
+        {
+            let artifact = self.read_vintage_artifact(&existing, &context).await?;
+            let content = self
+                .get_forecast_by_identity(
+                    &existing.vintage_id,
+                    &ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+                )
+                .await?;
+            let result = project(content, artifact)?;
+            context.ensure_live()?;
+            if let Some(precommit) = precommit {
+                precommit.validate_precommit()?;
+                precommit.commit_succeeded();
+            }
+            return Ok(result);
+        }
+        context.ensure_live()?;
+        let payload = ForecastPayloadRecord::from_path(
+            &path,
+            &product_identity,
+            &model_evidence,
+            &analysis_evidence,
+            &serving_evidence,
+            created_at,
+            expires_at,
+        )?;
+        let publication = ArtifactPublication::try_json(
+            serde_json::to_vec(&payload)
+                .map_err(|_error| ForecastApplicationError::InvalidRecord)?,
+        )?;
+        let artifact = self.artifacts.publish(publication, context.clone()).await?;
+        context.ensure_live()?;
+        let artifact_hash = digest_from_hex(artifact.sha256())?;
+        let vintage = ForecastVintage::try_new(path, created_at, expires_at, artifact_hash)
+            .map_err(|_error| ForecastApplicationError::InvalidRecord)?;
+        let record = VintageRecord::from_publication(request_hash, &vintage, payload, &artifact)?;
+        // Construct and bound the complete transport result before claiming terminal authority.
+        let index = self.index_for_vintage(record.clone())?;
+        let content = record.product_detail(drift_monitoring_value(&index, &record)?)?;
+        let result = project(content, artifact)?;
+        let chart = record.publish_chart(&self.charts, &context)?;
+        context.ensure_live()?;
+        if let Some(precommit) = precommit {
+            precommit.validate_precommit()?;
+        }
+        self.catalog.publish_vintage(
+            &persistence::StoredVintageRecord::from_vintage(&record, chart)?.envelope()?,
+        )?;
+        if let Some(precommit) = precommit {
+            precommit.commit_succeeded();
+        }
+        Ok(result)
+    }
+
+    /// Appends one realized outcome without mutating the referenced vintage.
+    async fn append_outcome(
+        &self,
+        outcome: &ForecastOutcome,
+        vintage: &VintageRecord,
+        measurement_artifact: &ArtifactReference,
+        recorded_at: Timestamp,
+    ) -> Result<(), ForecastApplicationError> {
+        let record =
+            OutcomeRecord::from_outcome(outcome, vintage, measurement_artifact, recorded_at)?;
+        let envelope = record.envelope()?;
+        OutcomeRecord::decode(&envelope.record, vintage)?;
+        self.catalog.publish_outcome(&envelope)?;
+        Ok(())
+    }
+
+    /// Returns an investment-facing projection for one opaque forecast token.
+    pub async fn get_forecast(
+        &self,
+        token: &str,
+        context: &ArtifactReadContext,
+    ) -> Result<Value, ForecastApplicationError> {
+        let parsed = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
+        if parsed.to_string() != token {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        self.stored_detail(ForecastInventoryLookup::Token(token), context)
+    }
+
+    pub(super) async fn list_forecasts(
+        &self,
+        maximum: NonZeroUsize,
+        cursor: Option<&str>,
+    ) -> Result<ForecastCollection, ForecastApplicationError> {
+        let (fence, mut after) = forecast_page_position(&self.catalog, cursor, None)?;
+        let mut values = Vec::new();
+        let maximum = maximum.get().min(100);
+        while values.len() < maximum {
+            let page = self.catalog.vintages(
+                fence,
+                after,
+                (maximum - values.len()).min(32),
+                true,
+                None,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for (sequence, bytes) in page {
+                after = sequence;
+                values.push(persistence::StoredVintageRecord::decode(&bytes)?.summary);
+            }
+        }
+        let next = if after > 1 && !values.is_empty() {
+            Some(forecast_page_cursor(fence, after, None)?)
+        } else {
+            None
+        };
+        let returned = values.len();
+        ForecastCollection::try_new(
+            json!({"forecasts":values,"nextCursor":next}),
+            returned,
+            returned,
+        )
+    }
+
+    pub(super) async fn get_forecast_outcomes(
+        &self,
+        token: &str,
+        maximum: NonZeroUsize,
+        cursor: Option<&str>,
+        context: &ArtifactReadContext,
+    ) -> Result<ForecastCollection, ForecastApplicationError> {
+        let parsed = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
+        let (fence, mut after) = forecast_page_position(&self.catalog, cursor, Some(token))?;
+        let bytes = self
+            .catalog
+            .get(fence, ForecastInventoryLookup::Token(token))?
+            .ok_or(ForecastApplicationError::NotFound)?;
+        context.ensure_live()?;
+        let vintage = persistence::StoredVintageRecord::decode(&bytes)?;
+        let maximum = maximum.get().min(100);
+        let mut values = Vec::new();
+        while values.len() < maximum {
+            context.ensure_live()?;
+            let page = self.catalog.outcomes(
+                fence,
+                after,
+                (maximum - values.len()).min(32),
+                Some(&vintage.vintage_id),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for (sequence, bytes) in page {
+                after = sequence;
+                let outcome = OutcomeRecord::decode_stored(&bytes)?;
+                values.push(vintage.product_outcome(&outcome)?);
+            }
+        }
+        let more = !self
+            .catalog
+            .outcomes(fence, after, 1, Some(&vintage.vintage_id))?
+            .is_empty();
+        let next = if more {
+            Some(forecast_page_cursor(fence, after, Some(token))?)
+        } else {
+            None
+        };
+        let returned = values.len();
+        ForecastCollection::try_new(
+            json!({"forecastToken":parsed,"outcomes":values,"nextCursor":next}),
+            returned,
+            returned,
+        )
+    }
+
+    async fn get_forecast_by_identity(
+        &self,
+        identity: &str,
+        context: &ArtifactReadContext,
+    ) -> Result<Value, ForecastApplicationError> {
+        self.stored_detail(ForecastInventoryLookup::Vintage(identity), context)
+    }
+
+    pub(super) async fn retain_backup_with_runtime(
+        &self,
+        runtime: Option<&ProductionModelRuntime>,
+    ) -> Result<RetainedForecastBackup, ForecastBackupCaptureError> {
+        let head = self
+            .catalog
+            .head()
+            .map_err(ForecastApplicationError::from)?;
+        let runtime = match runtime {
+            Some(runtime) => runtime.retain_backup()?,
+            None => ProductionModelRuntime::empty_backup()?,
+        };
+        let mut after = 0;
+        loop {
+            let page = self
+                .catalog
+                .vintages(head, after, 32, false, None)
+                .map_err(ForecastApplicationError::from)?;
+            if page.is_empty() {
+                break;
+            }
+            for (sequence, bytes) in page {
+                let stored = persistence::StoredVintageRecord::decode(&bytes)?;
+                let (model, bundle, version) = stored.model_coordinate();
+                if !runtime.contains(model, bundle, version)? {
+                    return Err(ForecastBackupCaptureError::ModelCoordinateMismatch);
+                }
+                after = sequence;
+            }
+        }
+        Ok(RetainedForecastBackup {
+            runtime,
+            canonical_index: serde_json::to_vec(&head)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?
+                .into_boxed_slice(),
+            inventory: inventory::ForecastBackupInventory {
+                catalog: self.catalog.clone(),
+                head,
+            },
+        })
+    }
+
+    pub(super) fn validate_backup_head(
+        catalog: &ForecastInventoryCatalogCapability,
+        bytes: &[u8],
+    ) -> Result<(), ForecastApplicationError> {
+        let head: ForecastInventoryHead =
+            serde_json::from_slice(bytes).map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        if serde_json::to_vec(&head).map_err(|_| ForecastApplicationError::CorruptIndex)? != bytes
+            || catalog.head()? != head
+        {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(())
+    }
+    pub(super) async fn stage_backup_record(
+        &self,
+        row: &ForecastBackupRecord,
+        context: &ArtifactReadContext,
+    ) -> Result<(), ForecastApplicationError> {
+        let head = self.catalog.head()?;
+        let page = match row.kind {
+            1 => self.catalog.vintages(
+                head,
+                row.sequence
+                    .checked_sub(1)
+                    .ok_or(ForecastApplicationError::CorruptIndex)?,
+                1,
+                false,
+                None,
+            )?,
+            _ => self.catalog.outcomes(
+                head,
+                row.sequence
+                    .checked_sub(1)
+                    .ok_or(ForecastApplicationError::CorruptIndex)?,
+                1,
+                None,
+            )?,
+        };
+        if page.first().is_none_or(|(sequence, bytes)| {
+            *sequence != row.sequence || bytes.as_ref() != row.record.as_ref()
+        }) {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        match row.kind {
+            1 => {
+                let stored = persistence::StoredVintageRecord::decode(&row.record)?;
+                if stored.artifact_reference()? != row.artifact {
+                    return Err(ForecastApplicationError::CorruptIndex);
+                }
+                self.read_stored(&stored, context).await?;
+                stored.verify_chart(&self.charts, context)?;
+            }
+            2 => {
+                let raw: OutcomeRecord = serde_json::from_slice(&row.record)
+                    .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+                let vintage = self
+                    .lookup_vintage(ForecastInventoryLookup::Vintage(&raw.vintage_id), context)
+                    .await?
+                    .ok_or(ForecastApplicationError::CorruptIndex)?;
+                let outcome = OutcomeRecord::decode(&row.record, &vintage)?;
+                if outcome.artifact_reference()? != row.artifact {
+                    return Err(ForecastApplicationError::CorruptIndex);
+                }
+            }
+            _ => return Err(ForecastApplicationError::InvalidRecord),
+        }
+        Ok(())
+    }
+
+    async fn vintage_for_request(
+        &self,
+        request_hash: Sha256Digest,
+        context: &ArtifactReadContext,
+    ) -> Result<Option<VintageRecord>, ForecastApplicationError> {
+        self.lookup_vintage(
+            ForecastInventoryLookup::Request(&hex(request_hash.bytes())),
+            context,
+        )
+        .await
+    }
+
+    async fn read_vintage_artifact(
+        &self,
+        vintage: &VintageRecord,
+        context: &ArtifactPublicationContext,
+    ) -> Result<ArtifactReference, ForecastApplicationError> {
+        let reference = vintage.artifact_reference()?;
+        let maximum = NonZeroUsize::new(MAXIMUM_FORECAST_ARTIFACT_BYTES)
+            .ok_or(ForecastApplicationError::InvalidLimits)?;
+        let artifact = self
+            .artifacts
+            .read(
+                ArtifactReadRequest::try_new(reference.clone(), maximum)?,
+                ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+            )
+            .await?;
+        context.ensure_live()?;
+        vintage.verify_artifact_read(&artifact)?;
+        Ok(reference)
+    }
+
+    async fn vintage_for_artifact(
+        &self,
+        artifact: &ArtifactReference,
+        context: &ArtifactReadContext,
+    ) -> Result<VintageRecord, ForecastApplicationError> {
+        let vintage = self
+            .lookup_vintage(ForecastInventoryLookup::Artifact(artifact.id()), context)
+            .await?
+            .ok_or(ForecastApplicationError::NotFound)?;
+        if vintage.artifact_reference()? != *artifact {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(vintage)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForecastPageCursor {
+    fence: ForecastInventoryHead,
+    after: u64,
+    token: Option<String>,
+}
+fn forecast_page_cursor(
+    fence: ForecastInventoryHead,
+    after: u64,
+    token: Option<&str>,
+) -> Result<String, ForecastApplicationError> {
+    serde_json::to_string(&ForecastPageCursor {
+        fence,
+        after,
+        token: token.map(str::to_owned),
+    })
+    .map_err(|_| ForecastApplicationError::CorruptIndex)
+}
+fn forecast_page_position(
+    catalog: &ForecastInventoryCatalogCapability,
+    cursor: Option<&str>,
+    token: Option<&str>,
+) -> Result<(ForecastInventoryHead, u64), ForecastApplicationError> {
+    match cursor {
+        None => {
+            let fence = catalog.head()?;
+            Ok((
+                fence,
+                if token.is_none() {
+                    fence
+                        .vintages
+                        .checked_add(1)
+                        .ok_or(ForecastApplicationError::Capacity)?
+                } else {
+                    0
+                },
+            ))
+        }
+        Some(value) if value.len() <= 256 => {
+            let position: ForecastPageCursor =
+                serde_json::from_str(value).map_err(|_| ForecastApplicationError::InvalidRecord)?;
+            if position.token.as_deref() != token
+                || forecast_page_cursor(position.fence, position.after, token)? != value
+                || position.after
+                    > if token.is_some() {
+                        position.fence.outcomes
+                    } else {
+                        position.fence.vintages.saturating_add(1)
+                    }
+            {
+                return Err(ForecastApplicationError::InvalidRecord);
+            }
+            Ok((position.fence, position.after))
+        }
+        Some(_) => Err(ForecastApplicationError::InvalidRecord),
+    }
+}
+
+#[async_trait]
+impl ForecastEvidenceReader for ModelDomainService {
+    async fn exact_distribution_for_identity(
+        &self,
+        vintage_id: Sha256Digest,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        let vintage = forecasts
+            .lookup_vintage(
+                ForecastInventoryLookup::Vintage(&hex(vintage_id.bytes())),
+                &context.artifact,
+            )
+            .await?
+            .ok_or(ForecastApplicationError::NotFound)?;
+        let mut index = ForecastIndex::default();
+        index.vintages.push(vintage);
+        let selected = index.exact_distribution_for_identity(
+            vintage_id,
+            instrument_id,
+            as_of,
+            NonZeroUsize::MIN,
+        )?;
+        let selected = read_forecast_index_selection(self, forecasts, selected, context).await?;
+        if selected.distribution.is_none() {
+            return Err(ForecastApplicationError::NotFound);
+        }
+        Ok(selected)
+    }
+
+    async fn exact_distribution_for_vintage(
+        &self,
+        forecast_token: Uuid,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        let index = forecasts
+            .selected_index(forecast_token, &context.artifact)
+            .await?;
+        let vintage = product_vintage(&index, forecast_token)?;
+        let selected = index.exact_distribution_for_identity(
+            digest_from_hex(&vintage.vintage_id)?,
+            instrument_id,
+            as_of,
+            NonZeroUsize::MIN,
+        )?;
+        let selected = read_forecast_index_selection(self, forecasts, selected, context).await?;
+        if selected.distribution.is_none() {
+            return Err(ForecastApplicationError::NotFound);
+        }
+        Ok(selected)
+    }
+
+    async fn exact_probability_for_vintage(
+        &self,
+        forecast_token: Uuid,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<ReopenedProbabilityForecast, ForecastApplicationError> {
+        let analytical = self
+            .forecast_analytical
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        outcome::exact_probability(self, forecast_token, as_of, analytical, &context).await
+    }
+
+    async fn outcome_preparation_origin(
+        &self,
+        forecast_token: Uuid,
+        analytical: &AnalyticalReadCapability,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<Option<ForecastOutcomePreparationOrigin>, ForecastApplicationError> {
+        outcome::read_preparation_origin(self, forecast_token, analytical, context).await
+    }
+
+    async fn measure_outcome(
+        &self,
+        forecast_token: Uuid,
+        outcome_manifest: DatasetManifestRef,
+        as_of: Timestamp,
+        source_action_reference: Option<&crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>,
+        analytical: &AnalyticalReadCapability,
+        source_actions: Option<&crate::application::research::corporate_actions::SourceAppliedCorporateActionReadCapability>,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<ForecastOutcomeMeasurement, ForecastApplicationError> {
+        outcome::measure(
+            self,
+            forecast_token,
+            outcome_manifest,
+            as_of,
+            source_action_reference,
+            analytical,
+            source_actions,
+            context,
+        )
+        .await
+    }
+    async fn exact_horizon_price_for_vintage(
+        &self,
+        forecast_token: Uuid,
+        instrument_id: InstrumentId,
+        requested_horizon_nanos: NonZeroU64,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        let index = forecasts
+            .selected_index(forecast_token, &context.artifact)
+            .await?;
+        let selected = index.exact_horizon_price_for_vintage(
+            forecast_token,
+            instrument_id,
+            requested_horizon_nanos,
+            as_of,
+            NonZeroUsize::MIN,
+        )?;
+        read_forecast_index_selection(self, forecasts, selected, context).await
+    }
+    async fn latest_valid_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        let selected = forecasts
+            .latest_selection(instrument_id, as_of, None, &context)
+            .await?;
+        read_forecast_index_selection(self, forecasts, selected, context).await
+    }
+
+    async fn latest_valid_exact_horizon_price_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        requested_horizon_nanos: NonZeroU64,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
+    ) -> Result<LatestValidForecast, ForecastApplicationError> {
+        let forecasts = self
+            .forecasts
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        context.ensure_live()?;
+        let selected = forecasts
+            .latest_selection(
+                instrument_id,
+                as_of,
+                Some(requested_horizon_nanos),
+                &context,
+            )
+            .await?;
+        read_forecast_index_selection(self, forecasts, selected, context).await
+    }
+}
+
+async fn read_forecast_index_selection(
+    service: &ModelDomainService,
+    forecasts: &ForecastApplicationService,
+    selected: ForecastIndexSelection,
+    context: ForecastEvidenceReadContext,
+) -> Result<LatestValidForecast, ForecastApplicationError> {
+    let image = service.read_image.load();
+    let (model_id, bundle_id, bundle_version) = selected.vintage.typed_model_coordinate()?;
+    let bundle = image
+        .registry
+        .get(&bundle_id, bundle_version)
+        .map_err(|_error| ForecastApplicationError::Unavailable)?
+        .ok_or(ForecastApplicationError::Unavailable)?;
+    let metadata = bundle.metadata();
+    if metadata.model_id() != model_id {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    let reference = selected.vintage.artifact_reference()?;
+    let artifact = forecasts
+        .artifacts
+        .read(
+            ArtifactReadRequest::try_new(reference.clone(), context.maximum_artifact_bytes)?,
+            context.artifact.clone(),
+        )
+        .await?;
+    context.ensure_live()?;
+    selected.vintage.verify_artifact_read(&artifact)?;
+    let price_evidence = selected.vintage.revalidated_price_evidence(&bundle)?;
+    let (selected_pairing, selected_serving_feature) = match &price_evidence {
+        ForecastPriceEvidence::Available(evidence) => (
+            evidence.analysis_evidence().pairing_sha256(),
+            evidence.serving_evidence().feature_sha256(),
+        ),
+        ForecastPriceEvidence::Unavailable(evidence) => (
+            evidence.analysis_evidence().pairing_sha256(),
+            evidence.serving_evidence().feature_sha256(),
+        ),
+    };
+    if selected.receipt.selected_analysis_pairing_sha256()? != selected_pairing
+        || selected.receipt.selected_serving_feature_sha256()? != selected_serving_feature
+    {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    let serving = selected.vintage.serving_evidence()?;
+    let financial_output = if serving.financial_input().is_some() {
+        let analytical = service
+            .forecast_analytical
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        let output = generation::reopen_financial_input(
+            analytical,
+            serving.manifest(),
+            context.artifact.deadline(),
+            context.artifact.cancellation().clone(),
+        )
+        .await
+        .map_err(|_| ForecastApplicationError::Unavailable)?;
+        let index = generation::financial_coordinate_index(&output, &serving)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        if ForecastServingEvidence::from_financial_output(&output, index)? != serving {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        if generation::financial_analysis_evidence(metadata, output.dataset())
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?
+            != selected.vintage.analysis_evidence()?
+        {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Some((output, index))
+    } else {
+        None
+    };
+    let current_price_output = if let Some(current) = serving.current_price_input() {
+        let analytical = service
+            .forecast_analytical
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
+        let output = current_input::reopen_current_price_input(
+            analytical,
+            serving.manifest(),
+            context.artifact.deadline(),
+            context.artifact.cancellation().clone(),
+        )
+        .await
+        .map_err(ForecastApplicationError::CurrentInputRead)?;
+        let index = current_input::current_price_coordinate_index(&output, &current.example_id)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        let coordinate = output
+            .coordinate(index)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        let cohort = current_input::current_price_cohort_reference(current)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        let original_calendar = service
+            .forecast_calendar
+            .as_ref()
+            .map(|calendar| calendar.retained());
+        current_input::current_price_session_origin(
+            original_calendar.as_ref(),
+            cohort.as_ref(),
+            coordinate,
+            context.artifact.deadline(),
+            context.artifact.cancellation().clone(),
+        )
+        .await
+        .map_err(ForecastApplicationError::CurrentInputRead)?;
+        current_input::current_price_feature_values(metadata, coordinate)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        if ForecastServingEvidence::from_current_price_output(&output, index, cohort.as_ref())?
+            != serving
+        {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Some((output, index))
+    } else {
+        None
+    };
+    let financial_coordinate = financial_output
+        .as_ref()
+        .and_then(|(output, index)| output.coordinate(*index));
+    let vintage = selected
+        .vintage
+        .revalidated_vintage(&bundle, financial_coordinate)?;
+    let distribution = distribution::project(
+        &price_evidence,
+        &selected.receipt,
+        &vintage,
+        &bundle,
+        artifact.content(),
+        financial_output.as_ref().and_then(|(output, index)| {
+            output
+                .coordinate(*index)
+                .map(|coordinate| (coordinate, output.query_output()))
+        }),
+        current_price_output.as_ref().and_then(|(output, index)| {
+            output
+                .coordinate(*index)
+                .map(|coordinate| (coordinate, output.query_output()))
+        }),
+    )?;
+    let selected = LatestValidForecast {
+        price_evidence,
+        selection_receipt: selected.receipt,
+        model_metadata: metadata.clone(),
+        forecast_artifact: reference,
+        distribution,
+    };
+    if let ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice { horizon_nanos } =
+        selected.selection_receipt().qualification()
+        && !matches!(
+            selected.exact_horizon_price_projection(horizon_nanos)?,
+            ExactHorizonPriceForecastEvidence::Available(_)
+        )
+    {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    Ok(selected)
+}
+
+fn drift_monitoring_value(
+    index: &ForecastIndex,
+    vintage: &VintageRecord,
+) -> Result<Value, ForecastApplicationError> {
+    drift_monitoring_parts(
+        &index.outcomes,
+        &vintage.vintage_id,
+        vintage
+            .decimal_scale()
+            .ok_or(ForecastApplicationError::CorruptIndex)?,
+        |value, scale| vintage.product_amount(value, scale),
+    )
+}
+
+fn drift_monitoring_parts(
+    outcomes: &[OutcomeRecord],
+    vintage_id: &str,
+    scale: u8,
+    product_amount: impl Fn(&str, u8) -> Result<Value, ForecastApplicationError>,
+) -> Result<Value, ForecastApplicationError> {
+    let mut observed = 0_usize;
+    let mut included = 0_usize;
+    let mut total_absolute_error = 0_i128;
+    for outcome in outcomes
+        .iter()
+        .filter(|outcome| outcome.vintage_id == vintage_id)
+    {
+        observed = observed
+            .checked_add(1)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        if included == MAXIMUM_DRIFT_OUTCOMES {
+            continue;
+        }
+        let absolute = outcome
+            .absolute_error_mantissa()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        if absolute.is_negative() {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        total_absolute_error = total_absolute_error
+            .checked_add(absolute)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        included = included
+            .checked_add(1)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+    }
+    let state = if observed == 0 {
+        "awaiting_outcomes"
+    } else {
+        "outcomes_available"
+    };
+    let mean_absolute_error = if included == 0 {
+        None
+    } else {
+        let mean = checked_decimal_mean(total_absolute_error, included, scale)?;
+        Some(json!({
+            "value": product_amount(&mean.mantissa.to_string(), mean.scale)?,
+            "rounding": {
+                "state": mean.state.as_str(),
+                "decimalPlaces": mean.scale,
+                "mode": "half_even",
+            },
+        }))
+    };
+    Ok(json!({
+        "state": state,
+        "observedCount": observed,
+        "includedCount": included,
+        "truncated": observed > included,
+        "meanAbsoluteError": mean_absolute_error,
+        "interpretation": "Observed outcome error is monitoring evidence, not a future-performance guarantee."
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum DecimalMeanState {
+    Exact,
+    Rounded,
+}
+
+impl DecimalMeanState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Rounded => "rounded",
+        }
+    }
+}
+
+struct DecimalMean {
+    mantissa: i128,
+    scale: u8,
+    state: DecimalMeanState,
+}
+
+fn checked_decimal_mean(
+    total_mantissa: i128,
+    count: usize,
+    input_scale: u8,
+) -> Result<DecimalMean, ForecastApplicationError> {
+    const MAXIMUM_EXTRA_DECIMAL_PLACES: u8 = 6;
+    if total_mantissa.is_negative() || count == 0 {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    let divisor = i128::try_from(count).map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    let integral = total_mantissa
+        .checked_div(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let remainder = total_mantissa
+        .checked_rem(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    if remainder == 0 {
+        return Ok(DecimalMean {
+            mantissa: integral,
+            scale: input_scale,
+            state: DecimalMeanState::Exact,
+        });
+    }
+    let count_digits = u8::try_from(count.to_string().len())
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    let extra_places = count_digits
+        .checked_add(2)
+        .ok_or(ForecastApplicationError::CorruptIndex)?
+        .min(MAXIMUM_EXTRA_DECIMAL_PLACES);
+    let scale = input_scale
+        .checked_add(extra_places)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let factor = 10_i128
+        .checked_pow(u32::from(extra_places))
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let scaled_remainder = remainder
+        .checked_mul(factor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let fractional = scaled_remainder
+        .checked_div(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let residual = scaled_remainder
+        .checked_rem(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let twice_residual = residual
+        .checked_mul(2)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let round_up =
+        twice_residual > divisor || (twice_residual == divisor && fractional.rem_euclid(2) == 1);
+    let mantissa = integral
+        .checked_mul(factor)
+        .and_then(|value| value.checked_add(fractional))
+        .and_then(|value| value.checked_add(if round_up { 1 } else { 0 }))
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    Ok(DecimalMean {
+        mantissa,
+        scale,
+        state: if residual == 0 {
+            DecimalMeanState::Exact
+        } else {
+            DecimalMeanState::Rounded
+        },
+    })
+}
+
+fn product_vintage(
+    index: &ForecastIndex,
+    token: Uuid,
+) -> Result<&VintageRecord, ForecastApplicationError> {
+    let mut matches =
+        index
+            .vintages
+            .iter()
+            .filter_map(|vintage| match vintage.matches_product_token(token) {
+                Ok(true) => Some(Ok(vintage)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            });
+    let selected = matches
+        .next()
+        .transpose()?
+        .ok_or(ForecastApplicationError::NotFound)?;
+    if matches.next().transpose()?.is_some() {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    Ok(selected)
+}
+
+impl std::fmt::Debug for ForecastApplicationService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForecastApplicationService")
+            .field("index", &"[DURABLE IMMUTABLE FORECAST INDEX]")
+            .field("artifacts", &"[CONTROLLED ARTIFACT AUTHORITY]")
+            .finish()
+    }
+}
+
+/// Durable forecast authority failure.
+#[derive(Debug, Error)]
+pub enum ForecastApplicationError {
+    /// Indexed immutable publication or integrity failure.
+    #[error(transparent)]
+    Inventory(#[from] market_squawk_data::ForecastInventoryError),
+
+    /// Reopening the original current feature input or source calendar failed.
+    #[error("forecast current input read failed: {0}")]
+    CurrentInputRead(#[source] ServiceError),
+    /// A configured hard bound is unsupported.
+    #[error("forecast application limits are invalid")]
+    InvalidLimits,
+    /// Durable index contents are invalid.
+    #[error("forecast index is corrupt")]
+    CorruptIndex,
+    /// A supplied vintage or outcome cannot be represented safely.
+    #[error("forecast record is invalid")]
+    InvalidRecord,
+    /// Retained count or bytes reached its hard ceiling.
+    #[error("forecast retained capacity is exhausted")]
+    Capacity,
+    /// Referenced immutable content does not exist.
+    #[error("forecast content was not found")]
+    NotFound,
+    /// The process-local writer or installed authority is unavailable.
+    #[error("forecast authority is unavailable")]
+    Unavailable,
+    /// Controlled forecast payload publication or verified access failed.
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
+}
+
+#[derive(Debug, Error)]
+pub(super) enum ForecastBackupCaptureError {
+    #[error(transparent)]
+    Forecast(#[from] ForecastApplicationError),
+    #[error(transparent)]
+    Runtime(#[from] ProductionModelRuntimeError),
+    #[error("forecast refers to a model generation outside the retained runtime")]
+    ModelCoordinateMismatch,
+}

@@ -162,6 +162,9 @@ pub enum FeatureDataType {
     StatisticalLocation,
     /// Statistical dispersion retaining its underlying unit and horizon/cadence.
     StatisticalDispersion,
+    /// Data-issued native fiscal period, ordinal, cadence and exact source/identity/anchor proof.
+    /// This describes the existing FinancialFiscalTargetBinding, not caller-authored dates.
+    FinancialPeriodEvidence,
 }
 
 /// Unit attached to an input or output field.
@@ -387,7 +390,7 @@ impl FeatureParameters {
     }
 }
 
-/// Event-time interpretation used by one feature version.
+/// Economic-time interpretation used by one feature version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeatureTimeSemantics {
     /// The output represents the triggering event's timestamp.
@@ -402,6 +405,9 @@ pub enum FeatureTimeSemantics {
         /// Maximum accepted skew between venue observations.
         maximum_skew_nanos: NonZeroU64,
     },
+    /// The amount belongs to the source's native fiscal period. Source knowledge remains a
+    /// separate timestamp; neither an event instant nor a fixed elapsed duration is invented.
+    NativeFinancialPeriod,
 }
 
 /// Warm-up requirement before a feature may become ready.
@@ -630,7 +636,7 @@ impl FeatureMetadata {
         &self.parameters
     }
 
-    /// Returns the event-time interpretation.
+    /// Returns the economic-time interpretation.
     #[must_use]
     pub const fn time_semantics(&self) -> FeatureTimeSemantics {
         self.time_semantics
@@ -809,6 +815,7 @@ const fn input_unit_is_compatible(data_type: FeatureDataType, unit: FeatureUnit)
         | FeatureDataType::InstrumentId
         | FeatureDataType::VenueId
         | FeatureDataType::CanonicalIdentifier
+        | FeatureDataType::FinancialPeriodEvidence
         | FeatureDataType::Boolean => matches!(unit, FeatureUnit::Unitless),
         FeatureDataType::SignedInteger | FeatureDataType::UnsignedInteger => {
             matches!(unit, FeatureUnit::Count | FeatureUnit::Nanoseconds)

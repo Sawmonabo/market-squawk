@@ -4,10 +4,12 @@ mod company_facts;
 mod submissions;
 
 use std::fmt;
+use std::mem::size_of;
 use std::str::FromStr as _;
+use std::sync::{Arc, Mutex};
 
-use chrono::{Datelike as _, NaiveDate, NaiveDateTime};
-use market_squawk_domain::{CalendarDate, SourceIdentifier, Timestamp};
+use chrono::{DateTime, Datelike as _, NaiveDate};
+use market_squawk_domain::{CalendarDate, FilingForm, SourceIdentifier, Timestamp};
 use serde::de;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
@@ -15,9 +17,199 @@ use tokio_util::sync::CancellationToken;
 
 pub use company_facts::{CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument};
 pub use submissions::{
-    SecFiling, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
+    SecFiling, SecFormerName, SecSubmissionCompanyMetadata, SecSubmissionsCompanion,
+    SecTickerExchangePair, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
     reconcile_submissions_with_cancellation,
 };
+pub(crate) use submissions::{
+    admit_document_allocations, reconcile_submissions_with_allocation_authority,
+    validate_companion_coverage,
+};
+
+/// Allocator-independent ceiling for one balanced-tree node's links, bookkeeping, and alignment.
+/// String and value payloads are charged separately from this per-entry allocation ceiling.
+const BTREE_NODE_OVERHEAD_CEILING: usize = 8 * size_of::<usize>();
+
+#[derive(Clone)]
+pub(crate) struct RetainedJsonBudget {
+    state: Arc<Mutex<RetainedJsonBudgetState>>,
+}
+
+struct RetainedJsonBudgetState {
+    admitted: usize,
+    limit: usize,
+}
+
+impl RetainedJsonBudget {
+    pub(crate) fn new(limits: SecParserLimits) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RetainedJsonBudgetState {
+                admitted: 0,
+                limit: limits.retained_output_bytes(),
+            })),
+        }
+    }
+
+    pub(crate) fn admitted_bytes(&self) -> Result<usize, SecParserError> {
+        self.state
+            .lock()
+            .map(|state| state.admitted)
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)
+    }
+
+    pub(crate) fn admit_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)?;
+        let admitted = state
+            .admitted
+            .checked_add(bytes)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        if admitted > state.limit {
+            return Err(SecParserError::RetainedOutputLimitExceeded);
+        }
+        state.admitted = admitted;
+        Ok(())
+    }
+
+    fn reserve_remaining(&self, minimum: usize) -> Result<usize, SecParserError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)?;
+        let remaining = state
+            .limit
+            .checked_sub(state.admitted)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        if minimum > remaining {
+            return Err(SecParserError::RetainedOutputLimitExceeded);
+        }
+        state.admitted = state.limit;
+        Ok(remaining)
+    }
+
+    pub(crate) fn release_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)?;
+        state.admitted = state
+            .admitted
+            .checked_sub(bytes)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        Ok(())
+    }
+
+    pub(crate) fn admit_btree_entry<K, V>(
+        &self,
+        dynamic_bytes: usize,
+    ) -> Result<(), SecParserError> {
+        let inline = size_of::<K>()
+            .checked_add(size_of::<V>())
+            .and_then(|bytes| bytes.checked_add(BTREE_NODE_OVERHEAD_CEILING))
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        self.admit_bytes(
+            inline
+                .checked_add(dynamic_bytes)
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )
+    }
+}
+
+pub(crate) fn try_reserve_exact_bounded<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let old_capacity = values.capacity();
+    let required = values
+        .len()
+        .checked_add(additional)
+        .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+    let requested_delta = required.saturating_sub(old_capacity);
+    let requested_bytes = requested_delta
+        .checked_mul(size_of::<T>())
+        .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+    if requested_bytes == 0 {
+        return Ok(());
+    }
+    // Rust deliberately does not promise the capacity selected by `try_reserve_exact`. Reserve
+    // every still-available byte in the aggregate authority before asking the allocator, then
+    // reconcile downward to its reported capacity. This makes no allocator growth assumption.
+    let admitted_bytes = retained.reserve_remaining(requested_bytes)?;
+    if let Err(_error) = values.try_reserve_exact(additional) {
+        retained.release_bytes(admitted_bytes)?;
+        return Err(SecParserError::AllocationFailed);
+    }
+    let actual_bytes = values
+        .capacity()
+        .saturating_sub(old_capacity)
+        .checked_mul(size_of::<T>())
+        .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+    if actual_bytes > admitted_bytes {
+        return Err(SecParserError::RetainedOutputLimitExceeded);
+    }
+    if actual_bytes < admitted_bytes {
+        retained.release_bytes(admitted_bytes - actual_bytes)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn owned_string_bounded(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<String, SecParserError> {
+    let mut owned = String::new();
+    if value.is_empty() {
+        return Ok(owned);
+    }
+    let admitted_bytes = retained.reserve_remaining(value.len())?;
+    if owned.try_reserve_exact(value.len()).is_err() {
+        retained.release_bytes(admitted_bytes)?;
+        return Err(SecParserError::AllocationFailed);
+    }
+    let capacity = owned.capacity();
+    if capacity > admitted_bytes {
+        return Err(SecParserError::RetainedOutputLimitExceeded);
+    }
+    if capacity < admitted_bytes {
+        retained.release_bytes(admitted_bytes - capacity)?;
+    }
+    owned.push_str(value);
+    Ok(owned)
+}
+
+pub(crate) fn admit_string_allocation(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let capacity_ceiling = if value.is_empty() {
+        0
+    } else {
+        value
+            .len()
+            .checked_next_power_of_two()
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?
+    };
+    retained.admit_bytes(capacity_ceiling)
+}
+
+pub(crate) fn source_identifier_bounded(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<SourceIdentifier, SecParserError> {
+    admit_string_allocation(value, retained)?;
+    SourceIdentifier::try_from(value).map_err(Into::into)
+}
+
+pub(crate) fn filing_form_bounded(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<FilingForm, SecParserError> {
+    admit_string_allocation(value, retained)?;
+    FilingForm::try_from(value).map_err(Into::into)
+}
 
 /// Production parser ceilings applied before canonical construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +227,7 @@ impl SecParserLimits {
     pub const fn production_defaults() -> Self {
         Self {
             max_decoded_bytes: 32 * 1024 * 1024,
-            max_records: 250_000,
+            max_records: market_squawk_domain::MAX_XBRL_OCCURRENCES,
             max_depth: 128,
             max_string_bytes: 256 * 1024,
             max_total_string_bytes: 24 * 1024 * 1024,
@@ -72,7 +264,7 @@ impl SecParserLimits {
         })
     }
 
-    /// Returns the aggregate retained-output ceiling for parsers that materialize owned results.
+    /// Returns the aggregate retained-allocation ceiling for decoded trees and owned results.
     pub const fn retained_output_bytes(self) -> usize {
         self.max_retained_output_bytes
     }
@@ -92,48 +284,114 @@ impl SecParserLimits {
     pub(crate) const fn string_bytes(self) -> usize {
         self.max_string_bytes
     }
+
+    pub(crate) const fn intersect(self, other: Self) -> Result<Self, SecParserError> {
+        Self::try_new(
+            if self.max_decoded_bytes < other.max_decoded_bytes {
+                self.max_decoded_bytes
+            } else {
+                other.max_decoded_bytes
+            },
+            if self.max_records < other.max_records {
+                self.max_records
+            } else {
+                other.max_records
+            },
+            if self.max_depth < other.max_depth {
+                self.max_depth
+            } else {
+                other.max_depth
+            },
+            if self.max_string_bytes < other.max_string_bytes {
+                self.max_string_bytes
+            } else {
+                other.max_string_bytes
+            },
+            if self.max_total_string_bytes < other.max_total_string_bytes {
+                self.max_total_string_bytes
+            } else {
+                other.max_total_string_bytes
+            },
+            if self.max_retained_output_bytes < other.max_retained_output_bytes {
+                self.max_retained_output_bytes
+            } else {
+                other.max_retained_output_bytes
+            },
+        )
+    }
+
+    pub(crate) fn with_retained_bytes(self, maximum: usize) -> Result<Self, SecParserError> {
+        Self::try_new(
+            self.max_decoded_bytes,
+            self.max_records,
+            self.max_depth,
+            self.max_string_bytes.min(maximum),
+            self.max_total_string_bytes.min(maximum),
+            self.max_retained_output_bytes.min(maximum),
+        )
+    }
 }
 
-pub(crate) fn parse_bounded_json_with_cancellation(
+pub(crate) fn parse_bounded_json_with_allocation_authority(
     bytes: &[u8],
     limits: SecParserLimits,
     cancellation: &CancellationToken,
+    retained: RetainedJsonBudget,
 ) -> Result<Value, SecParserError> {
     check_parser_cancelled(cancellation)?;
     if bytes.len() > limits.max_decoded_bytes {
         return Err(SecParserError::ByteLimitExceeded);
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let mut budget = JsonBudget::new(limits, cancellation.clone());
+    let mut budget = RawJsonParseAuthority::new(limits, cancellation.clone(), retained);
     let value = BoundedValueSeed {
         budget: &mut budget,
         depth: 1,
     }
-    .deserialize(&mut deserializer)?;
+    .deserialize(&mut deserializer)
+    .map_err(|error| budget.failure.take().unwrap_or_else(|| error.into()))?;
     deserializer.end()?;
     Ok(value)
 }
 
-struct JsonBudget {
+pub(crate) struct RawJsonParseAuthority {
     limits: SecParserLimits,
     total_string_bytes: usize,
     nodes: usize,
     max_nodes: usize,
     cancellation: CancellationToken,
+    retained: RetainedJsonBudget,
+    failure: Option<SecParserError>,
 }
 
-impl JsonBudget {
-    fn new(limits: SecParserLimits, cancellation: CancellationToken) -> Self {
+impl RawJsonParseAuthority {
+    pub(crate) fn new(
+        limits: SecParserLimits,
+        cancellation: CancellationToken,
+        retained: RetainedJsonBudget,
+    ) -> Self {
         Self {
             limits,
             total_string_bytes: 0,
             nodes: 0,
             max_nodes: limits.max_records.saturating_mul(16),
             cancellation,
+            retained,
+            failure: None,
         }
     }
 
-    fn charge_node(&mut self) -> Result<(), SecParserError> {
+    // Serde visitors must return the deserializer's error type. Retain the original authority
+    // failure separately so resource/cancellation failures survive without parsing error text.
+    fn serde_error<E: de::Error>(&mut self, error: SecParserError) -> E {
+        let external = E::custom(&error);
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+        external
+    }
+
+    pub(crate) fn charge_node(&mut self) -> Result<(), SecParserError> {
         check_parser_cancelled(&self.cancellation)?;
         self.nodes = self
             .nodes
@@ -146,7 +404,7 @@ impl JsonBudget {
         }
     }
 
-    fn charge_string(&mut self, text: &str) -> Result<(), SecParserError> {
+    pub(crate) fn charge_string(&mut self, text: &str) -> Result<(), SecParserError> {
         check_parser_cancelled(&self.cancellation)?;
         if text.len() > self.limits.max_string_bytes {
             return Err(SecParserError::StringLimitExceeded);
@@ -164,7 +422,7 @@ impl JsonBudget {
 }
 
 struct BoundedValueSeed<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
     depth: usize,
 }
 
@@ -176,9 +434,13 @@ impl<'de> DeserializeSeed<'de> for BoundedValueSeed<'_> {
         D: serde::Deserializer<'de>,
     {
         if self.depth > self.budget.limits.max_depth {
-            return Err(de::Error::custom(SecParserError::DepthLimitExceeded));
+            return Err(self
+                .budget
+                .serde_error::<D::Error>(SecParserError::DepthLimitExceeded));
         }
-        self.budget.charge_node().map_err(de::Error::custom)?;
+        self.budget
+            .charge_node()
+            .map_err(|error| self.budget.serde_error::<D::Error>(error))?;
         deserializer.deserialize_any(BoundedValueVisitor {
             budget: self.budget,
             depth: self.depth,
@@ -187,7 +449,7 @@ impl<'de> DeserializeSeed<'de> for BoundedValueSeed<'_> {
 }
 
 struct BoundedStringSeed<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
 }
 
 impl<'de> DeserializeSeed<'de> for BoundedStringSeed<'_> {
@@ -204,7 +466,7 @@ impl<'de> DeserializeSeed<'de> for BoundedStringSeed<'_> {
 }
 
 struct BoundedStringVisitor<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
 }
 
 impl Visitor<'_> for BoundedStringVisitor<'_> {
@@ -218,21 +480,30 @@ impl Visitor<'_> for BoundedStringVisitor<'_> {
     where
         E: de::Error,
     {
-        self.budget.charge_string(value).map_err(E::custom)?;
-        owned_string(value).map_err(E::custom)
+        self.budget
+            .charge_string(value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
+        owned_string_bounded(value, &self.budget.retained)
+            .map_err(|error| self.budget.serde_error::<E>(error))
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        self.budget.charge_string(&value).map_err(E::custom)?;
+        self.budget
+            .charge_string(&value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
+        self.budget
+            .retained
+            .admit_bytes(value.capacity())
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         Ok(value)
     }
 }
 
 struct BoundedValueVisitor<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
     depth: usize,
 }
 
@@ -261,22 +532,32 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     {
         Number::from_f64(value)
             .map(Value::Number)
-            .ok_or_else(|| E::custom(SecParserError::InvalidNumber))
+            .ok_or_else(|| self.budget.serde_error::<E>(SecParserError::InvalidNumber))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        self.budget.charge_string(value).map_err(E::custom)?;
-        owned_string(value).map(Value::String).map_err(E::custom)
+        self.budget
+            .charge_string(value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
+        owned_string_bounded(value, &self.budget.retained)
+            .map(Value::String)
+            .map_err(|error| self.budget.serde_error::<E>(error))
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        self.budget.charge_string(&value).map_err(E::custom)?;
+        self.budget
+            .charge_string(&value)
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
+        self.budget
+            .retained
+            .admit_bytes(value.capacity())
+            .map_err(|error| self.budget.serde_error::<E>(error))?;
         Ok(Value::String(value))
     }
 
@@ -303,23 +584,21 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     where
         A: SeqAccess<'de>,
     {
-        let child_depth = self
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| de::Error::custom(SecParserError::DepthLimitExceeded))?;
+        let child_depth = self.depth.checked_add(1).ok_or_else(|| {
+            self.budget
+                .serde_error::<A::Error>(SecParserError::DepthLimitExceeded)
+        })?;
         let initial = sequence.size_hint().unwrap_or(0).min(1_024);
         let mut values = Vec::new();
-        values
-            .try_reserve(initial)
-            .map_err(|_| de::Error::custom(SecParserError::AllocationFailed))?;
+        try_reserve_exact_bounded(&mut values, initial, &self.budget.retained)
+            .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
         while let Some(value) = sequence.next_element_seed(BoundedValueSeed {
             budget: self.budget,
             depth: child_depth,
         })? {
             if values.len() == values.capacity() {
-                values
-                    .try_reserve(1)
-                    .map_err(|_| de::Error::custom(SecParserError::AllocationFailed))?;
+                try_reserve_exact_bounded(&mut values, 1, &self.budget.retained)
+                    .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
             }
             values.push(value);
         }
@@ -330,17 +609,19 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let child_depth = self
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| de::Error::custom(SecParserError::DepthLimitExceeded))?;
+        let child_depth = self.depth.checked_add(1).ok_or_else(|| {
+            self.budget
+                .serde_error::<A::Error>(SecParserError::DepthLimitExceeded)
+        })?;
         let Some(first_key) = map.next_key_seed(BoundedStringSeed {
             budget: self.budget,
         })?
         else {
             return Ok(Value::Object(Map::new()));
         };
-        self.budget.charge_node().map_err(de::Error::custom)?;
+        self.budget
+            .charge_node()
+            .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
         if first_key == "$serde_json::private::Number" {
             let lexical = map.next_value_seed(BoundedStringSeed {
                 budget: self.budget,
@@ -354,18 +635,30 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
             budget: self.budget,
             depth: child_depth,
         })?;
+        self.budget
+            .retained
+            .admit_btree_entry::<String, Value>(0)
+            .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
         values.insert(first_key, first_value);
         while let Some(key) = map.next_key_seed(BoundedStringSeed {
             budget: self.budget,
         })? {
-            self.budget.charge_node().map_err(de::Error::custom)?;
+            self.budget
+                .charge_node()
+                .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
             if values.contains_key(&key) {
-                return Err(de::Error::custom(SecParserError::DuplicateKey));
+                return Err(self
+                    .budget
+                    .serde_error::<A::Error>(SecParserError::DuplicateKey));
             }
             let value = map.next_value_seed(BoundedValueSeed {
                 budget: self.budget,
                 depth: child_depth,
             })?;
+            self.budget
+                .retained
+                .admit_btree_entry::<String, Value>(0)
+                .map_err(|error| self.budget.serde_error::<A::Error>(error))?;
             values.insert(key, value);
         }
         Ok(Value::Object(values))
@@ -401,6 +694,25 @@ fn parse_cik(value: &Value) -> Result<SourceIdentifier, SecParserError> {
     Ok(SourceIdentifier::try_from(format!("{raw:0>10}"))?)
 }
 
+fn parse_cik_with_allocation_authority(
+    value: &Value,
+    retained: &RetainedJsonBudget,
+) -> Result<SourceIdentifier, SecParserError> {
+    let raw = match value {
+        Value::String(value) => value.as_str(),
+        Value::Number(value) => {
+            retained.admit_bytes(32)?;
+            return parse_cik(&Value::String(value.to_string()));
+        }
+        _ => return Err(SecParserError::InvalidCik),
+    };
+    if raw.len() > 10 || raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SecParserError::InvalidCik);
+    }
+    retained.admit_bytes(10)?;
+    Ok(SourceIdentifier::try_from(format!("{raw:0>10}"))?)
+}
+
 fn parse_date(value: &str) -> Result<CalendarDate, SecParserError> {
     let date =
         NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| SecParserError::InvalidDate)?;
@@ -411,14 +723,23 @@ fn parse_date(value: &str) -> Result<CalendarDate, SecParserError> {
     )?)
 }
 
-fn parse_acceptance_timestamp(value: &str) -> Result<Timestamp, SecParserError> {
-    let timestamp = NaiveDateTime::parse_from_str(value, "%Y-%m-%d%H%M%S")
+fn parse_rfc3339_timestamp(value: &str) -> Result<Timestamp, SecParserError> {
+    let timestamp = DateTime::parse_from_rfc3339(value)
         .map_err(|_| SecParserError::InvalidTimestamp)?
-        .and_utc();
-    let nanos = timestamp
         .timestamp_nanos_opt()
         .ok_or(SecParserError::InvalidTimestamp)?;
-    Ok(Timestamp::from_unix_nanos(nanos))
+    Ok(Timestamp::from_unix_nanos(timestamp))
+}
+
+fn validated_metadata_text(value: &str, max_bytes: usize) -> Result<String, SecParserError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(SecParserError::InvalidCompanyMetadata);
+    }
+    owned_string(value)
 }
 
 fn validate_accession(value: &str) -> Result<(), SecParserError> {
@@ -580,6 +901,8 @@ pub enum SecParserError {
     NodeLimitExceeded,
     ByteCountOverflow,
     AllocationFailed,
+    AllocationAuthorityPoisoned,
+    RetainedOutputLimitExceeded,
     DuplicateKey,
     InvalidNumber,
     MissingField,
@@ -588,15 +911,22 @@ pub enum SecParserError {
     InvalidCik,
     InvalidAccession,
     InvalidCompanionName,
+    InvalidCompanionCoverage,
     InvalidConcept,
     InvalidDate,
     InvalidTimestamp,
     InvalidPeriod,
+    InvalidFiscalContext,
     InvalidDecimal,
     NonNumericCompanyFact,
     ConflictingAccession,
+    InvalidCompanyMetadata,
+    MetadataAssociationLengthMismatch,
+    DuplicateMetadataAssociation,
+    ConflictingMetadataAssociation,
     Json(serde_json::Error),
     Identity(market_squawk_domain::IdentityError),
+    FilingForm(market_squawk_domain::FilingFormError),
     Time(market_squawk_domain::TimeError),
 }
 
@@ -617,6 +947,12 @@ impl From<serde_json::Error> for SecParserError {
 impl From<market_squawk_domain::IdentityError> for SecParserError {
     fn from(value: market_squawk_domain::IdentityError) -> Self {
         Self::Identity(value)
+    }
+}
+
+impl From<market_squawk_domain::FilingFormError> for SecParserError {
+    fn from(value: market_squawk_domain::FilingFormError) -> Self {
+        Self::FilingForm(value)
     }
 }
 

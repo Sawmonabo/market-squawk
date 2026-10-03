@@ -1,8 +1,12 @@
-# Kraken WebSocket v2 book-checksum contract
+# Kraken Spot WebSocket v2 public book-and-trade contract
 
-**Researched:** 2026-07-16
+**Researched:** 2026-07-16; refreshed 2026-08-14
 
-**Primary source:** [Kraken Developers — Book checksum (WebSocket v2)](https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2)
+**Primary sources:**
+
+- [Kraken Developers — Spot WebSocket v2 Book](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/book)
+- [Kraken Developers — Spot WebSocket v2 Trades](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade)
+- [Kraken Developers — Book checksum guide](https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2)
 
 ## Confirmed provider contract
 
@@ -21,6 +25,13 @@ deletes the price level. After applying the message, the local book is truncated
 depth; the provider does not promise a later zero-quantity deletion for a level that merely falls
 outside that retained depth.
 
+The public Spot WebSocket v2 `trade` channel is a separate subscription contract. It accepts an
+exact symbol list and optional snapshot flag, acknowledges the `trade` channel and each symbol,
+and emits snapshot or update batches. Each trade retains symbol, taker side, quantity, price,
+order type, provider timestamp, and a provider trade identifier that Kraken documents as a
+sequence number unique per book. That trade identifier does not sequence or repair L2 book
+updates, and the trade channel supplies no CRC32 book-integrity claim.
+
 ## Market Squawk implementation consequences
 
 - Parse and retain price/quantity lexemes without a binary floating-point round trip.
@@ -38,10 +49,18 @@ outside that retained depth.
 - Keep checksum success separate from source authorization, coverage, sequence, freshness,
   precision, trading status, and capture health; it is necessary evidence, not sufficient
   `DirectVerified` authority.
+- Configure `book` and `trade` as an exact required pair, but retain separate source metadata,
+  channel identities, subscription acknowledgements, capture journals, health, and integrity
+  semantics. Never copy book-checksum authority onto trades.
+- Require both channel generations to be current before the composite Kraken runtime is healthy.
+  A resynchronizing channel withdraws composite currentness without destroying a still-healthy
+  sibling; publication and reads resume only after the exact replacement generation is current.
+- Preserve the trade identifier as provider-scoped evidence and a stable trade identity. Never use
+  it as an L2 sequence, completeness proof, cross-pair identifier, or execution authorization.
 
 ## Scope note
 
-Task 7 owns the closed canonicalizer, transactional book primitive, and evidence contracts. The
-production Kraken transport/decoder and recorded-provider integration fixtures remain Stage 2 work,
-where this primary-source contract must be revalidated against the live channel schema and provider
-changelog before release qualification.
+The closed canonicalizer and transactional book primitive implement the checksum contract. The
+production runtime uses independent public book and trade supervisors under one atomic owner, and
+the existing critical vertical must revalidate both channel schemas, acknowledgements, native
+state, resynchronization, bounded shutdown, and restart before release qualification.

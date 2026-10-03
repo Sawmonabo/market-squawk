@@ -22,27 +22,29 @@ chrono = { workspace = true }
 datafusion = { workspace = true }
 futures-util = { workspace = true }
 libc = { workspace = true }
+market-squawk-adapter-alpaca = { workspace = true }
+market-squawk-adapter-federal-reserve = { workspace = true }
+market-squawk-adapter-tiingo = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-sources = { workspace = true }
 parquet = { workspace = true }
 rust_decimal = { workspace = true }
 rustix = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["cache"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 atomicwrites = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

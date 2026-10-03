@@ -199,16 +199,108 @@ WHEN NOT EXISTS (
     FROM analytical_generations AS generation
     JOIN dataset_manifests AS manifest
       ON manifest.manifest_id = generation.anchor_manifest_id
-    JOIN artifacts AS artifact
-      ON artifact.artifact_id = manifest.artifact_id
     JOIN ingest_runs AS run
-      ON run.run_id = artifact.run_id
+      ON run.run_id = manifest.run_id
     WHERE generation.generation_sequence = NEW.generation_sequence
       AND generation.generation_kind = 'ingest'
       AND run.run_id = NEW.run_id
       AND run.source_id = NEW.source_id
       AND run.rights_id = NEW.rights_id
       AND run.operation = 'persist'
+      AND (SELECT COUNT(*) FROM artifacts AS member
+           WHERE member.run_id = run.run_id) BETWEEN 1 AND 1024
+      AND manifest.artifact_id = (
+          SELECT member.artifact_id
+          FROM artifacts AS member
+          WHERE member.run_id = run.run_id
+          ORDER BY member.publication_ordinal DESC
+          LIMIT 1
+      )
+      AND (
+          (
+              generation.manifest_version = 1
+              AND generation.parent_count = 0
+              AND (SELECT COUNT(*)
+                   FROM analytical_generation_objects AS object
+                   WHERE object.dataset_id = generation.dataset_id
+                     AND object.manifest_version = generation.manifest_version) = (
+                  SELECT COUNT(*) FROM artifacts AS member
+                  WHERE member.run_id = run.run_id
+              )
+          ) OR (
+              generation.manifest_version > 1
+              AND generation.parent_count = 1
+              AND EXISTS (
+                  SELECT 1
+                  FROM analytical_generation_parents AS edge
+                  JOIN analytical_generations AS parent
+                    ON parent.generation_sequence = edge.parent_generation_sequence
+                   AND parent.dataset_id = edge.parent_dataset_id
+                   AND parent.manifest_version = edge.parent_manifest_version
+                  WHERE edge.child_dataset_id = generation.dataset_id
+                    AND edge.child_manifest_version = generation.manifest_version
+                    AND edge.ordinal = 0
+                    AND edge.relation = 'append_predecessor'
+                    AND parent.dataset_id = generation.dataset_id
+                    AND parent.manifest_version = generation.manifest_version - 1
+                    AND (SELECT COUNT(*)
+                         FROM analytical_generation_objects AS current_object
+                         WHERE current_object.dataset_id = generation.dataset_id
+                           AND current_object.manifest_version =
+                               generation.manifest_version) = (
+                        SELECT COUNT(*)
+                        FROM analytical_generation_objects AS parent_object
+                        WHERE parent_object.dataset_id = parent.dataset_id
+                          AND parent_object.manifest_version = parent.manifest_version
+                    ) + (
+                        SELECT COUNT(*) FROM artifacts AS member
+                        WHERE member.run_id = run.run_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM analytical_generation_objects AS parent_object
+                        LEFT JOIN analytical_generation_objects AS current_object
+                          ON current_object.dataset_id = generation.dataset_id
+                         AND current_object.manifest_version = generation.manifest_version
+                         AND current_object.ordinal = parent_object.ordinal
+                        WHERE parent_object.dataset_id = parent.dataset_id
+                          AND parent_object.manifest_version = parent.manifest_version
+                          AND (
+                              current_object.artifact_id IS NULL
+                              OR current_object.artifact_id <> parent_object.artifact_id
+                              OR current_object.content_hash <> parent_object.content_hash
+                              OR current_object.row_count <> parent_object.row_count
+                              OR current_object.size_bytes <> parent_object.size_bytes
+                              OR current_object.lineage_hash <> parent_object.lineage_hash
+                          )
+                    )
+              )
+          )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM artifacts AS member
+          LEFT JOIN analytical_generation_objects AS object
+            ON object.dataset_id = generation.dataset_id
+           AND object.manifest_version = generation.manifest_version
+           AND object.ordinal = (
+               SELECT COUNT(*)
+               FROM analytical_generation_objects AS retained
+               WHERE retained.dataset_id = generation.dataset_id
+                 AND retained.manifest_version = generation.manifest_version
+           ) - (
+               SELECT COUNT(*) FROM artifacts AS current_member
+               WHERE current_member.run_id = run.run_id
+           ) + member.publication_ordinal
+          WHERE member.run_id = run.run_id
+            AND (
+                object.artifact_id IS NULL
+                OR object.artifact_id <> member.artifact_id
+                OR member.content_algorithm <> 1
+                OR object.content_hash <> member.content_digest
+                OR object.size_bytes <> member.size_bytes
+            )
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation source input is invalid');
@@ -241,7 +333,8 @@ JOIN dataset_manifests AS manifest
 JOIN artifacts AS artifact
   ON artifact.artifact_id = manifest.artifact_id
 JOIN ingest_runs AS run
-  ON run.run_id = artifact.run_id
+  ON run.run_id = manifest.run_id
+ AND artifact.run_id = run.run_id
 WHERE generation.generation_kind = 'ingest'
 ORDER BY generation.generation_sequence;
 
@@ -436,9 +529,26 @@ WHEN NOT EXISTS (
         NEW.selection_outcome = 'selected' AND NOT EXISTS (
             SELECT 1
             FROM source_research_use_grants AS grant
+            JOIN source_rights AS current ON current.rights_id = grant.rights_id
+            JOIN source_rights AS original ON original.rights_id = NEW.rights_id
             WHERE grant.research_grant_id = NEW.selected_research_grant_id
-              AND grant.rights_id = NEW.rights_id
               AND grant.source_id = NEW.source_id
+              AND current.source_id = original.source_id
+              AND current.payload_algorithm = original.payload_algorithm
+              AND current.payload_digest = original.payload_digest
+              AND current.basis_kind = original.basis_kind
+              AND current.basis_reference = original.basis_reference
+              AND current.basis_algorithm = original.basis_algorithm
+              AND current.basis_digest = original.basis_digest
+              AND current.basis_root_algorithm IS original.basis_root_algorithm
+              AND current.basis_root_digest IS original.basis_root_digest
+              AND current.authorization_algorithm = original.authorization_algorithm
+              AND current.authorization_digest = original.authorization_digest
+              AND (original.operation_mask & current.operation_mask & CASE NEW.requested_use
+                      WHEN 'display' THEN 2
+                      WHEN 'local_analysis' THEN 4
+                      WHEN 'train' THEN 32
+                  END) <> 0
               AND (grant.use_mask & CASE NEW.requested_use
                       WHEN 'display' THEN 1
                       WHEN 'local_analysis' THEN 2
@@ -622,12 +732,14 @@ WHEN NOT (
         FROM research_use_decision_sources AS source
         JOIN source_research_use_grants AS grant
           ON grant.research_grant_id = source.selected_research_grant_id
-        JOIN source_rights AS rights ON rights.rights_id = source.rights_id
+        JOIN source_rights AS rights ON rights.rights_id = grant.rights_id
+        JOIN source_rights AS original ON original.rights_id = source.rights_id
         WHERE source.decision_id = NEW.decision_id
           AND source.selection_outcome = 'selected'
           AND (
               grant.admitted_at_ns > NEW.decided_at_ns
               OR rights.admitted_at_ns > NEW.decided_at_ns
+              OR original.admitted_at_ns > NEW.decided_at_ns
           )
     )
     AND (
@@ -643,7 +755,7 @@ WHEN NOT (
                 FROM research_use_decision_sources AS source
                 JOIN source_research_use_grants AS grant
                   ON grant.research_grant_id = source.selected_research_grant_id
-                JOIN source_rights AS rights ON rights.rights_id = source.rights_id
+                JOIN source_rights AS rights ON rights.rights_id = grant.rights_id
                 WHERE source.decision_id = NEW.decision_id
                   AND (
                       grant.admitted_at_ns > NEW.decided_at_ns
@@ -658,7 +770,21 @@ WHEN NOT (
                       )
                       OR EXISTS (
                           SELECT 1 FROM source_research_use_revocations AS revocation
-                          WHERE revocation.research_grant_id = grant.research_grant_id
+                          JOIN source_research_use_grants AS revoked_grant
+                            ON revoked_grant.research_grant_id = revocation.research_grant_id
+                          JOIN source_rights AS revoked_rights
+                            ON revoked_rights.rights_id = revoked_grant.rights_id
+                          WHERE revoked_rights.source_id = rights.source_id
+                            AND revoked_rights.payload_algorithm = rights.payload_algorithm
+                            AND revoked_rights.payload_digest = rights.payload_digest
+                            AND revoked_rights.basis_kind = rights.basis_kind
+                            AND revoked_rights.basis_reference = rights.basis_reference
+                            AND revoked_rights.basis_algorithm = rights.basis_algorithm
+                            AND revoked_rights.basis_digest = rights.basis_digest
+                            AND revoked_rights.basis_root_algorithm IS rights.basis_root_algorithm
+                            AND revoked_rights.basis_root_digest IS rights.basis_root_digest
+                            AND revoked_rights.authorization_algorithm = rights.authorization_algorithm
+                            AND revoked_rights.authorization_digest = rights.authorization_digest
                             AND revocation.revocation_sequence
                                 <= source.observed_revocation_sequence
                             AND revocation.effective_at_ns <= NEW.decided_at_ns
@@ -931,3 +1057,100 @@ WHERE EXISTS (
 );
 
 DROP TABLE research_use_authority_migration_guard;
+
+CREATE INDEX analytical_generation_source_inputs_by_run
+ON analytical_generation_source_inputs(run_id, source_id, generation_sequence);
+
+-- Availability is issued only after complete lineage and successful source/output runs.
+CREATE TABLE analytical_generation_source_availability_proofs (
+    generation_sequence INTEGER PRIMARY KEY REFERENCES analytical_generations(generation_sequence),
+    transaction_available_at_ns INTEGER NOT NULL,
+    direct_source_run_count INTEGER NOT NULL CHECK (direct_source_run_count BETWEEN 0 AND 1),
+    source_runs_completed_at_ns INTEGER NOT NULL,
+    effective_available_at_ns INTEGER NOT NULL,
+    CHECK (effective_available_at_ns = MAX(transaction_available_at_ns, source_runs_completed_at_ns))
+) STRICT;
+
+CREATE TRIGGER analytical_generation_source_availability_guarded_insert
+BEFORE INSERT ON analytical_generation_source_availability_proofs
+WHEN NOT EXISTS (
+    SELECT 1 FROM analytical_generations AS generation
+    JOIN dataset_manifests AS manifest ON manifest.manifest_id=generation.anchor_manifest_id
+    JOIN artifacts AS artifact ON artifact.artifact_id=manifest.artifact_id
+    WHERE generation.generation_sequence=NEW.generation_sequence
+      AND artifact.created_at_ns<=manifest.created_at_ns
+      AND manifest.created_at_ns<=generation.created_at_ns
+      AND generation.created_at_ns<=NEW.transaction_available_at_ns
+      AND NEW.source_runs_completed_at_ns<=NEW.transaction_available_at_ns
+      AND ((generation.generation_kind='ingest' AND EXISTS (
+          SELECT 1 FROM analytical_generation_source_inputs AS direct
+          WHERE direct.generation_sequence=generation.generation_sequence
+      )) OR generation.generation_kind IN ('compaction', 'derived'))
+      AND generation.parent_count=(
+          SELECT COUNT(*) FROM analytical_generation_parents AS edge
+          JOIN analytical_generation_source_availability_proofs AS parent
+            ON parent.generation_sequence=edge.parent_generation_sequence
+          WHERE edge.child_dataset_id=generation.dataset_id
+            AND edge.child_manifest_version=generation.manifest_version
+            AND parent.effective_available_at_ns<=NEW.transaction_available_at_ns
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM analytical_generation_objects AS member
+          JOIN artifacts AS output ON output.artifact_id=member.artifact_id
+          JOIN ingest_runs AS run ON run.run_id=output.run_id
+          WHERE member.dataset_id=generation.dataset_id
+            AND member.manifest_version=generation.manifest_version
+            AND (run.state<>'succeeded' OR run.completed_at_ns IS NULL
+                 OR run.completed_at_ns>NEW.transaction_available_at_ns
+                 OR output.created_at_ns>NEW.transaction_available_at_ns)
+      )
+)
+OR NEW.direct_source_run_count <> (
+    SELECT COUNT(*) FROM analytical_generation_source_inputs
+    WHERE generation_sequence=NEW.generation_sequence
+)
+OR EXISTS (
+    SELECT 1 FROM analytical_generation_source_inputs AS input
+    JOIN ingest_runs AS run USING (run_id)
+    WHERE input.generation_sequence=NEW.generation_sequence
+      AND (run.state<>'succeeded' OR run.completed_at_ns IS NULL)
+)
+OR NEW.source_runs_completed_at_ns IS NOT (
+    SELECT MAX(completed_at_ns) FROM (
+        SELECT run.completed_at_ns
+        FROM analytical_generation_source_inputs AS input
+        JOIN ingest_runs AS run USING (run_id)
+        WHERE input.generation_sequence=NEW.generation_sequence
+        UNION ALL
+        SELECT proof.source_runs_completed_at_ns
+        FROM analytical_generations AS child
+        JOIN analytical_generation_parents AS edge
+          ON edge.child_dataset_id=child.dataset_id
+         AND edge.child_manifest_version=child.manifest_version
+        JOIN analytical_generation_source_availability_proofs AS proof
+          ON proof.generation_sequence=edge.parent_generation_sequence
+        WHERE child.generation_sequence=NEW.generation_sequence
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'analytical generation source availability proof is invalid');
+END;
+
+CREATE TRIGGER analytical_generation_source_availability_immutable_update
+BEFORE UPDATE ON analytical_generation_source_availability_proofs BEGIN
+    SELECT RAISE(ABORT, 'analytical generation source availability proofs are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_source_availability_immutable_delete
+BEFORE DELETE ON analytical_generation_source_availability_proofs BEGIN
+    SELECT RAISE(ABORT, 'analytical generation source availability proofs are immutable');
+END;
+
+CREATE VIEW analytical_available_generations AS
+SELECT generation.*, availability.effective_available_at_ns AS available_at_ns
+FROM analytical_generations AS generation
+JOIN analytical_generation_source_availability_proofs AS availability USING (generation_sequence);
+
+-- Exact retained payload authorization must not scan unrelated source rights.
+CREATE INDEX source_rights_by_source_payload
+ON source_rights(source_id, payload_algorithm, payload_digest);

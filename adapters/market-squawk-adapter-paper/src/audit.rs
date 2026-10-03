@@ -16,6 +16,7 @@ use crate::PaperOrderState;
 #[serde(rename_all = "snake_case")]
 pub enum PaperAuditKind {
     MarketMarked,
+    CorporateActionsApplied,
     Accepted,
     Filled,
     ActivatedOrResting,

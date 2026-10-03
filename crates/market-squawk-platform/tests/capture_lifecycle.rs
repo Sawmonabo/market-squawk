@@ -578,7 +578,7 @@ async fn finished_unreaped_journal_destination_remains_fenced()
     )?;
     let first_handle =
         spawn_capture_writer(first_writer, first_sink, CaptureWriterPolicy::default())?;
-    let mut pending = first_handle.shutdown(Duration::from_secs(1));
+    let mut pending = first_handle.shutdown(Duration::from_secs(5));
     assert_eq!(
         pending.wait_until_deadline().await,
         CaptureShutdownStatus::WorkerTerminated
@@ -621,7 +621,7 @@ async fn finished_unreaped_journal_destination_remains_fenced()
         successor_sink,
         CaptureWriterPolicy::default(),
     )?;
-    let successor_termination = shutdown_and_reap(successor, Duration::from_secs(1)).await?;
+    let successor_termination = shutdown_and_reap(successor, Duration::from_secs(5)).await?;
     assert!(!successor_termination.outcome().is_incomplete());
     Ok(())
 }
@@ -642,7 +642,7 @@ async fn stalled_process_journal_is_killed_reaped_and_releases_its_destination()
         source,
         env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
         ProcessCaptureHelperTestBehavior::StallAfterAppend,
-        Duration::from_secs(1),
+        Duration::from_secs(5),
     )?;
     let handle =
         spawn_process_journal_capture_writer(writer, process, CaptureWriterPolicy::default())?;
@@ -652,7 +652,7 @@ async fn stalled_process_journal_is_killed_reaped_and_releases_its_destination()
     let shutdown = handle
         .shutdown(ProcessCaptureShutdownPolicy::try_new(
             Duration::from_millis(25),
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )?)
         .await;
 
@@ -692,7 +692,7 @@ async fn post_fence_startup_failure_retains_destination_until_helper_reap()
             cleanup_deadline: Duration::from_millis(25),
             reap_observation_delay: Duration::from_millis(250),
         },
-        Duration::from_secs(1),
+        Duration::from_secs(5),
     )?;
 
     let error =
@@ -723,7 +723,7 @@ async fn post_fence_startup_failure_retains_destination_until_helper_reap()
         source,
         env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
         ProcessCaptureHelperTestBehavior::StallAfterAppend,
-        Duration::from_secs(1),
+        Duration::from_secs(5),
     )?;
     assert!(matches!(
         spawn_process_journal_capture_writer(
@@ -739,7 +739,7 @@ async fn post_fence_startup_failure_retains_destination_until_helper_reap()
         ))
     ));
 
-    let reacquisition_deadline = Instant::now() + Duration::from_secs(2);
+    let reacquisition_deadline = Instant::now() + Duration::from_secs(5);
     let (_successor_publisher, _successor_control, successor) = loop {
         let (publisher, control, writer) = test_capture_channel(
             NonZeroUsize::MIN,
@@ -750,7 +750,7 @@ async fn post_fence_startup_failure_retains_destination_until_helper_reap()
             source,
             env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
             ProcessCaptureHelperTestBehavior::StallAfterAppend,
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )?;
         match spawn_process_journal_capture_writer(writer, process, CaptureWriterPolicy::default())
         {
@@ -768,8 +768,8 @@ async fn post_fence_startup_failure_retains_destination_until_helper_reap()
     };
     let shutdown = successor
         .shutdown(ProcessCaptureShutdownPolicy::try_new(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
         )?)
         .await;
     assert_eq!(

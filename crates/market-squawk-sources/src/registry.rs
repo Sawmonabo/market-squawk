@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
     ConnectionGeneration, CoverageConsolidation, CoverageDelay, DeliveryEvidence,
@@ -23,8 +24,8 @@ use crate::authority_time::{
 use crate::bounded::BoundedVec;
 use crate::policy::{
     AuthorityDurabilitySession, AuthorityPersistenceError, BudgetAvailabilityLease,
-    BudgetPolicyResolutionError, DurableBudgetGroup, PersistedProviderBudgetPolicy,
-    ProviderBudgetPool, ResolvedProviderBudgetPolicy,
+    BudgetPermitLease, BudgetPolicyResolutionError, DurableBudgetGroup,
+    PersistedProviderBudgetPolicy, ProviderBudgetPool, ResolvedProviderBudgetPolicy,
 };
 use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
@@ -49,14 +50,25 @@ struct ActiveSessionKey {
 struct SessionLeaseState {
     current: AtomicBool,
     terminal: AtomicBool,
-    live_qualified: AtomicBool,
-    health_epoch: AtomicU64,
-    valid_from_nanos: AtomicI64,
-    valid_until_nanos: AtomicI64,
+    health: ArcSwap<SessionHealthQualification>,
     last_health_observed_nanos: AtomicI64,
     frame_ordinal: AtomicU64,
     continuity: AuthorityTimeContinuity,
     started_at: TrustedRegistryTime,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HealthEpochInterval {
+    epoch: u64,
+    valid_from: Timestamp,
+    valid_until: Timestamp,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionHealthQualification {
+    epoch: u64,
+    current: Option<HealthEpochInterval>,
+    first_valid_epoch: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -83,10 +95,10 @@ impl RegistrationLeaseState {
 impl SessionLeaseState {
     fn invalidate(&self) {
         self.current.store(false, Ordering::Release);
-        self.live_qualified.store(false, Ordering::Release);
-        if self.advance_health_epoch().is_none() {
-            self.valid_until_nanos.store(i64::MIN, Ordering::Release);
-        }
+        self.health.rcu(|health| SessionHealthQualification {
+            epoch: health.epoch.saturating_add(1),
+            ..SessionHealthQualification::default()
+        });
     }
 
     fn is_current(&self) -> bool {
@@ -100,59 +112,73 @@ impl SessionLeaseState {
     }
 
     fn terminally_invalidate_health_authority(&self) {
-        self.live_qualified.store(false, Ordering::Release);
-        self.valid_from_nanos.store(i64::MAX, Ordering::Release);
-        self.valid_until_nanos.store(i64::MIN, Ordering::Release);
         self.current.store(false, Ordering::Release);
         self.terminal.store(true, Ordering::Release);
+        self.health.rcu(|health| SessionHealthQualification {
+            epoch: health.epoch,
+            ..SessionHealthQualification::default()
+        });
     }
 
     fn next_health_epoch(&self) -> Option<u64> {
         if self.is_terminal() {
             return None;
         }
-        self.health_epoch.load(Ordering::Acquire).checked_add(1)
+        self.health.load().epoch.checked_add(1)
     }
 
     fn commit_live_qualification(
         &self,
         epoch: u64,
         qualified: bool,
+        benign_renewal: bool,
         valid_from: Option<Timestamp>,
         valid_until: Option<Timestamp>,
     ) {
-        self.live_qualified.store(false, Ordering::Release);
-        self.valid_from_nanos.store(
-            valid_from.map_or(i64::MAX, Timestamp::unix_nanos),
-            Ordering::Release,
-        );
-        self.valid_until_nanos.store(
-            valid_until.map_or(i64::MIN, Timestamp::unix_nanos),
-            Ordering::Release,
-        );
-        self.health_epoch.store(epoch, Ordering::Release);
-        self.live_qualified.store(qualified, Ordering::Release);
+        let current = match (qualified, valid_from, valid_until) {
+            (true, Some(valid_from), Some(valid_until)) => Some(HealthEpochInterval {
+                epoch,
+                valid_from,
+                valid_until,
+            }),
+            _ => None,
+        };
+        // Keep a constant-size uninterrupted healthy run, not a count-limited queue window.
+        // Every retained lease still checks its own original wall/monotonic interval. A scope
+        // change, narrowing, gap or unhealthy update starts a new run and cannot revive old work.
+        let prior = self.health.load();
+        let first_valid_epoch = current.map(|next| {
+            if benign_renewal
+                && prior.current.is_some_and(|old| {
+                    old.valid_from <= next.valid_from && next.valid_from <= old.valid_until
+                })
+            {
+                prior.first_valid_epoch.unwrap_or(epoch)
+            } else {
+                epoch
+            }
+        });
+        self.health.store(Arc::new(SessionHealthQualification {
+            epoch,
+            current,
+            first_valid_epoch,
+        }));
     }
 
-    fn is_live_qualified(&self) -> bool {
-        self.live_qualified.load(Ordering::Acquire)
-    }
-
-    fn validate_health_epoch(&self, epoch: u64, at: Timestamp) -> bool {
+    // This checks continuity only. All callers separately check their captured original interval.
+    fn validate_health_epoch(&self, epoch: u64) -> bool {
+        let health = self.health.load();
         self.is_current()
-            && self.is_live_qualified()
-            && self.health_epoch.load(Ordering::Acquire) == epoch
-            && at.unix_nanos() >= self.valid_from_nanos.load(Ordering::Acquire)
-            && at.unix_nanos() <= self.valid_until_nanos.load(Ordering::Acquire)
+            && health.first_valid_epoch.is_some_and(|first| first <= epoch)
+            && health.current.is_some_and(|current| epoch <= current.epoch)
     }
 
-    fn advance_health_epoch(&self) -> Option<u64> {
-        self.health_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .ok()
-            .and_then(|previous| previous.checked_add(1))
+    fn shared_allocation_charge() -> Option<usize> {
+        let health = market_squawk_domain::checked_arc_value_allocation_bytes::<
+            SessionHealthQualification,
+        >(0)
+        .ok()?;
+        market_squawk_domain::checked_arc_value_allocation_bytes::<Self>(health).ok()
     }
 
     fn next_frame_id(&self) -> Result<crate::FrameId, crate::SourceError> {
@@ -193,9 +219,66 @@ struct CurrentHealthAuthority {
     valid_from: Timestamp,
     valid_until: Timestamp,
     valid_until_monotonic: RegistryMonotonicInstant,
+    permission_valid_until: Timestamp,
+    permission_valid_until_monotonic: RegistryMonotonicInstant,
     authorization: crate::AuthorizationHealth,
     coverage: crate::CoverageHealth,
     budget: CurrentBudgetAuthority,
+}
+
+/// Result of recording one exact-generation health observation.
+///
+/// An unqualified result never carries live-data authority. Its retained cause classification is
+/// intentionally opaque so callers cannot reconstruct or weaken the registry's qualification
+/// predicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum CurrentHealthRecording {
+    /// Every registry-owned current-data requirement was satisfied.
+    Qualified,
+    /// The observation was retained but issued no current-data authority.
+    Unqualified(CurrentHealthUnqualification),
+}
+
+/// Opaque reason set for a retained health observation that issued no current-data authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CurrentHealthUnqualification {
+    causes: u16,
+}
+
+impl CurrentHealthUnqualification {
+    const CAPTURE: u16 = 1 << 0;
+    const CONNECTION_FRESHNESS: u16 = 1 << 1;
+    const TRANSPORT_FRESHNESS: u16 = 1 << 2;
+    const MARKET_FRESHNESS: u16 = 1 << 3;
+    const SOURCE_FRESHNESS: u16 = 1 << 4;
+    const STREAM_INTEGRITY: u16 = 1 << 5;
+    const CAPTURE_INTEGRITY: u16 = 1 << 6;
+    const AUTHORIZATION: u16 = 1 << 7;
+    const COVERAGE: u16 = 1 << 8;
+    const SNAPSHOT_BUDGET: u16 = 1 << 9;
+    const REPORTER_BUDGET: u16 = 1 << 10;
+    const LAST_ERROR: u16 = 1 << 11;
+    const CURRENT_DATA_DEADLINE: u16 = 1 << 12;
+    const STATIC_DEADLINE: u16 = 1 << 13;
+    const OBSERVATION_TIME: u16 = 1 << 14;
+    const FRESHNESS: u16 = Self::CONNECTION_FRESHNESS
+        | Self::TRANSPORT_FRESHNESS
+        | Self::MARKET_FRESHNESS
+        | Self::SOURCE_FRESHNESS
+        | Self::CURRENT_DATA_DEADLINE;
+
+    const fn new(causes: u16) -> Self {
+        Self { causes }
+    }
+
+    /// Returns true only when every rejected dimension is a current-data freshness clock.
+    ///
+    /// Authorization, coverage, budget, capture, integrity, and provider-error failures can never
+    /// be classified as freshness-only, including when one also coexists with stale data.
+    pub const fn is_freshness_only(self) -> bool {
+        self.causes != 0 && self.causes & !Self::FRESHNESS == 0
+    }
 }
 
 #[derive(Debug)]
@@ -215,6 +298,7 @@ impl crate::AuthorizationSubjectResolver for UnconfiguredAuthorizationSubjectRes
 enum CurrentBudgetAuthority {
     NotRequired,
     Available(BudgetAvailabilityLease),
+    ActiveRequest(BudgetPermitLease),
     Unavailable,
 }
 
@@ -229,10 +313,22 @@ impl CurrentBudgetAuthority {
         }
     }
 
+    fn observe_active_request(
+        budget: Option<&SharedProviderBudget>,
+        lease: &BudgetPermitLease,
+    ) -> Result<Self, RegistryError> {
+        let budget = budget.ok_or(RegistryError::BudgetAuthorityMismatch)?;
+        if !lease.shares_allocation_with(budget) || !lease.is_current() {
+            return Err(RegistryError::BudgetAuthorityMismatch);
+        }
+        Ok(Self::ActiveRequest(lease.clone()))
+    }
+
     fn is_available(&self) -> bool {
         match self {
             Self::NotRequired => true,
             Self::Available(lease) => lease.is_available(),
+            Self::ActiveRequest(lease) => lease.is_current(),
             Self::Unavailable => false,
         }
     }
@@ -250,6 +346,9 @@ impl CurrentBudgetAuthority {
             Self::Available(lease) => lease
                 .shared_allocation_charge()
                 .ok_or(RegistryError::RetainedSizeOverflow),
+            Self::ActiveRequest(lease) => lease
+                .shared_allocation_charge()
+                .ok_or(RegistryError::RetainedSizeOverflow),
             Self::NotRequired | Self::Unavailable => Ok(0),
         }
     }
@@ -264,6 +363,7 @@ struct RegistryEntry {
     active: Option<ActiveSessionKey>,
     health_authority: Option<CurrentHealthAuthority>,
     universe_attestation: Option<InstrumentUniverseAttestation>,
+    provider_identities: Vec<CurrentProviderIdentity>,
     generation_high_water: Option<ConnectionGeneration>,
     used_revisions: Vec<MetadataRevision>,
 }
@@ -275,6 +375,184 @@ impl RegistryEntry {
             active.capture.mark_incomplete();
         }
         self.health_authority = None;
+    }
+}
+
+/// Native coordinates supplied to the catalog by trusted source composition.
+/// Values describe a requested route; constructing them grants no authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNativeIdentityRequest {
+    /// Identity namespace, independent of the live source identifier.
+    pub namespace: SourceId,
+    /// Exact identity in that namespace.
+    pub provider_instrument_id: market_squawk_domain::ProviderInstrumentId,
+    /// Exact canonical route expected by the application.
+    pub instrument: InstrumentId,
+    /// Source-metadata feed-route venue; it need not be a canonical trading venue.
+    pub venue: VenueId,
+    /// Explicit route symbol: either the byte-exact selected provider ID or a symbol proven by
+    /// the canonical definition's exact venue mapping. No inferred or normalized alias is admitted.
+    pub venue_symbol: market_squawk_domain::VenueSymbol,
+    /// Inclusive catalog knowledge cutoff.
+    pub knowledge_at: Timestamp,
+    /// Effective identity cutoff.
+    pub effective_at: Timestamp,
+}
+
+/// Replayable evidence only; a copied projection cannot mint a current registry mapping.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdentitySelectionEvidence {
+    /// Complete native and canonical coordinates and original selection cutoffs.
+    pub native: ProviderNativeIdentityRequest,
+    /// Exact immutable definition revision.
+    pub definition_digest: market_squawk_domain::EvidenceDigest,
+    /// Exact immutable definition position.
+    pub definition_sequence: u32,
+    /// Reference assertion revision.
+    pub reference_revision: MetadataRevision,
+    /// Reference assertion payload.
+    pub reference_payload_digest: market_squawk_domain::EvidenceDigest,
+    /// First durable publication time of the selected definition.
+    pub definition_published_at: Timestamp,
+    /// Definition validity; the end is exclusive.
+    pub definition_validity: EffectiveInterval,
+    /// Provider assertion revision.
+    pub provider_revision: MetadataRevision,
+    /// Provider assertion payload.
+    pub provider_payload_digest: market_squawk_domain::EvidenceDigest,
+    /// Provider assertion validity; the end is exclusive.
+    pub provider_validity: EffectiveInterval,
+    /// Digest of the original source-qualified catalog resolution.
+    pub resolution_digest: market_squawk_domain::EvidenceDigest,
+    /// Digest of the original opaque catalog selection.
+    pub selection_digest: market_squawk_domain::EvidenceDigest,
+}
+
+impl ProviderIdentitySelectionEvidence {
+    /// Checked retained dynamic bytes for this bounded evidence projection.
+    pub fn dynamic_retained_bytes(&self) -> Option<usize> {
+        [
+            self.native.namespace.retained_bytes(),
+            self.native.provider_instrument_id.retained_bytes(),
+            self.native.venue.retained_bytes(),
+            self.native.venue_symbol.retained_bytes(),
+            self.reference_revision
+                .as_source_identifier()
+                .retained_bytes(),
+            self.provider_revision
+                .as_source_identifier()
+                .retained_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+}
+
+/// Validation-only catalog selection installed by trusted application composition.
+///
+/// This open dependency-inversion seam is not a compiler-enforced proof against arbitrary
+/// composition code. Production installs the data catalog implementation once; adapters receive
+/// native coordinates, never a selectable verifier. Implementations must retain an opaque exact
+/// catalog selection, reject replacement/expiry, and perform no catalog I/O in `validate_at`.
+pub trait CurrentCatalogProviderIdentity: std::fmt::Debug + Send + Sync {
+    /// Immutable evidence describing the exact selection, not a minting input.
+    fn evidence(&self) -> &ProviderIdentitySelectionEvidence;
+    /// Rechecks revocation and half-open validity without catalog I/O.
+    fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError>;
+    /// Complete checked shared allocation charge, including retained selection evidence.
+    fn retained_bytes(&self) -> Result<usize, RegistryError>;
+}
+
+/// Catalog read authority fixed by composition before the registry registers any sources.
+pub trait CatalogProviderIdentityAuthority: std::fmt::Debug + Send + Sync {
+    /// Selects and verifies the exact current catalog route with bounded control-plane I/O.
+    fn select_current(
+        &self,
+        request: &ProviderNativeIdentityRequest,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<dyn CurrentCatalogProviderIdentity>, RegistryError>;
+}
+
+/// Opaque catalog selection bound privately to one exact source registration.
+///
+/// This is identity authority only. Current observations must also retain and validate their
+/// existing source session, account/authorization generation, health, capture, and budget lease.
+#[derive(Clone, Debug)]
+pub struct CurrentProviderIdentity {
+    source_id: SourceId,
+    source_revision: RevisionBoundPayloadEvidence,
+    registration: Arc<RegistrationLeaseState>,
+    selected: Arc<dyn CurrentCatalogProviderIdentity>,
+}
+
+impl CurrentProviderIdentity {
+    /// Returns replayable catalog evidence without exposing a constructor.
+    pub fn evidence(&self) -> &ProviderIdentitySelectionEvidence {
+        self.selected.evidence()
+    }
+
+    /// Returns the independently bound live source identifier.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact source metadata and authorization binding.
+    pub const fn source_revision(&self) -> &RevisionBoundPayloadEvidence {
+        &self.source_revision
+    }
+
+    /// Checks catalog replacement/expiry and source registration replacement/revocation.
+    pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
+        if !self.registration.is_current() {
+            return Err(RegistryError::StaleHandle);
+        }
+        self.selected.validate_at(at)
+    }
+
+    /// Earliest inclusive end of the catalog definition and provider assertion, when bounded.
+    /// Current source metadata, authorization, and health can only shorten this deadline.
+    pub fn inclusive_deadline(&self) -> Option<Timestamp> {
+        let evidence = self.evidence();
+        [
+            evidence.definition_validity.ends_at(),
+            evidence.provider_validity.ends_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .and_then(|end| end.checked_sub_nanos(1).ok())
+    }
+
+    /// Returns a conservative complete checked charge for retained identity authority.
+    pub fn retained_bytes(&self) -> Result<usize, RegistryError> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.source_id.retained_bytes())
+            .and_then(|size| {
+                size.checked_add(
+                    self.source_revision
+                        .metadata_revision()
+                        .as_source_identifier()
+                        .retained_bytes(),
+                )
+            })
+            .and_then(|size| {
+                size.checked_add(
+                    self.source_revision
+                        .payload_evidence()
+                        .dynamic_retained_bytes()?,
+                )
+            })
+            .and_then(|size| size.checked_add(std::mem::size_of::<RegistrationLeaseState>()))
+            .and_then(|size| {
+                size.checked_add(crate::conservative_arc_control_block_charge::<
+                    RegistrationLeaseState,
+                >())
+            })
+            .and_then(|size| size.checked_add(self.selected.retained_bytes().ok()?))
+            .ok_or(RegistryError::RetainedSizeOverflow)
     }
 }
 
@@ -360,6 +638,72 @@ pub struct RegistryAuthorityState {
     schema_version: SchemaVersion,
     sources: BoundedVec<PersistedSourceAuthority, MAX_AUTHORITY_SOURCES>,
     budget_policies: BoundedVec<PersistedProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
+}
+
+/// Canonical clean-restart image for registry tombstones and durable provider-budget checkpoints.
+///
+/// The opaque payload contains no registry handles, active sessions, request permits, health
+/// authority, runtime clock handles, or in-use run marker. It can only be minted after the live
+/// registry proves that every durable budget allocation has zero in-flight requests.
+pub(crate) struct RegistryCleanRestartBackup {
+    bytes: Box<[u8]>,
+}
+
+impl RegistryCleanRestartBackup {
+    /// Validates one canonical owner-issued clean-restart image.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, in-use, future-dated, or non-clean budget state.
+    pub(crate) fn try_from_bytes(bytes: &[u8]) -> Result<Self, RegistryError> {
+        let now = current_registry_wall_time()?;
+        let envelope = crate::policy::deserialize_clean_restart_backup(bytes, now)
+            .map_err(map_authority_persistence_error)?;
+        let canonical = crate::policy::serialize_clean_restart_backup(&envelope)
+            .map_err(map_authority_persistence_error)?;
+        Ok(Self {
+            bytes: canonical.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the exact canonical clean-restart bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Seeds an absent production store without opening registry or runtime authority.
+    ///
+    /// Normal startup must subsequently reconstruct the registry and adapters through their usual
+    /// constructors. Existing authority state is never overwritten.
+    pub(crate) fn restore_fresh(
+        &self,
+        store: market_squawk_platform::LocalAuthorityStateStore,
+    ) -> Result<(), RegistryError> {
+        if store
+            .load()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?
+            .is_some()
+        {
+            return Err(RegistryError::InvalidAuthorityState);
+        }
+        store
+            .store(&self.bytes)
+            .map_err(|_error| RegistryError::AuthorityPersistence)
+    }
+}
+
+impl std::fmt::Debug for RegistryCleanRestartBackup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryCleanRestartBackup")
+            .field("byte_length", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn current_registry_wall_time() -> Result<Timestamp, RegistryError> {
+    let clock = SealedRegistryClock::new(Arc::new(SystemRawRegistryClock::try_new()?));
+    clock.observe().map(TrustedRegistryTime::wall)
 }
 
 impl RegistryAuthorityState {
@@ -504,6 +848,7 @@ impl<'de> Deserialize<'de> for RegistryAuthorityState {
 include!("registry/catalog.rs");
 #[path = "registry/catalog/construction.rs"]
 mod catalog_construction;
+pub use catalog_construction::RESEARCH_SOURCE_AUTHORITY_DIRECTORY;
 #[path = "registry/catalog/persistence.rs"]
 mod catalog_persistence;
 include!("registry/health_authority.rs");

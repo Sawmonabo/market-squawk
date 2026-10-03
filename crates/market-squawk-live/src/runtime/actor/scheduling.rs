@@ -1,11 +1,11 @@
-//! Fair bounded selection across registration, market, snapshot, and cancellation work.
+//! Fair bounded selection across control, market, snapshot, and cancellation work.
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FairTurn {
-    Registration,
+    Control,
     Market,
     Snapshot,
 }
@@ -13,9 +13,9 @@ pub(super) enum FairTurn {
 impl FairTurn {
     pub(super) const fn next(self) -> Self {
         match self {
-            Self::Registration => Self::Market,
+            Self::Control => Self::Market,
             Self::Market => Self::Snapshot,
-            Self::Snapshot => Self::Registration,
+            Self::Snapshot => Self::Control,
         }
     }
 }
@@ -23,7 +23,7 @@ impl FairTurn {
 #[derive(Debug)]
 pub(super) enum FairEvent<R, M> {
     Cancelled,
-    Registration(Option<R>),
+    Control(Option<R>),
     Market(Option<M>),
     SnapshotDue,
     SnapshotPublish,
@@ -37,9 +37,9 @@ enum SnapshotSchedule {
 
 pub(super) struct FairSources<'a, R, M> {
     pub(super) cancellation: &'a CancellationToken,
-    pub(super) registrations: &'a mut mpsc::Receiver<R>,
+    pub(super) controls: &'a mut mpsc::Receiver<R>,
     pub(super) mailbox: &'a mut mpsc::Receiver<M>,
-    pub(super) registrations_open: bool,
+    pub(super) controls_open: bool,
     pub(super) mailbox_open: bool,
     pub(super) interval: &'a mut tokio::time::Interval,
 }
@@ -62,12 +62,12 @@ pub(super) async fn select_fair_event<R, M>(
     }
 
     match turn {
-        FairTurn::Registration => {
+        FairTurn::Control => {
             tokio::select! {
                 biased;
                 () = sources.cancellation.cancelled() => FairEvent::Cancelled,
-                command = sources.registrations.recv(), if sources.registrations_open => {
-                    FairEvent::Registration(command)
+                command = sources.controls.recv(), if sources.controls_open => {
+                    FairEvent::Control(command)
                 }
                 command = sources.mailbox.recv(), if sources.mailbox_open => {
                     FairEvent::Market(command)
@@ -89,8 +89,8 @@ pub(super) async fn select_fair_event<R, M>(
                     SnapshotSchedule::Due => FairEvent::SnapshotDue,
                     SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
                 },
-                command = sources.registrations.recv(), if sources.registrations_open => {
-                    FairEvent::Registration(command)
+                command = sources.controls.recv(), if sources.controls_open => {
+                    FairEvent::Control(command)
                 }
             }
         }
@@ -102,8 +102,8 @@ pub(super) async fn select_fair_event<R, M>(
                     SnapshotSchedule::Due => FairEvent::SnapshotDue,
                     SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
                 },
-                command = sources.registrations.recv(), if sources.registrations_open => {
-                    FairEvent::Registration(command)
+                command = sources.controls.recv(), if sources.controls_open => {
+                    FairEvent::Control(command)
                 }
                 command = sources.mailbox.recv(), if sources.mailbox_open => {
                     FairEvent::Market(command)
@@ -141,9 +141,9 @@ mod tests {
                 true,
                 FairSources {
                     cancellation: &cancellation,
-                    registrations: &mut registration_rx,
+                    controls: &mut registration_rx,
                     mailbox: &mut market_rx,
-                    registrations_open: true,
+                    controls_open: true,
                     mailbox_open: true,
                     interval: &mut interval,
                 },
@@ -152,7 +152,7 @@ mod tests {
             turn = turn.next();
             match event {
                 FairEvent::SnapshotPublish => {}
-                FairEvent::Registration(Some(11)) => saw_registration = true,
+                FairEvent::Control(Some(11)) => saw_registration = true,
                 FairEvent::Market(Some(22)) => saw_market = true,
                 other => unexpected = Some(format!("{other:?}")),
             }
@@ -180,9 +180,9 @@ mod tests {
                 true,
                 FairSources {
                     cancellation: &cancellation,
-                    registrations: &mut registration_rx,
+                    controls: &mut registration_rx,
                     mailbox: &mut market_rx,
-                    registrations_open: true,
+                    controls_open: true,
                     mailbox_open: true,
                     interval: &mut interval,
                 },

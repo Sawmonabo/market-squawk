@@ -1,0 +1,5 @@
+^https://(?:www\.)?sec\.gov/
+^https://(?:www\.)?bls\.gov/
+^https://fred\.stlouisfed\.org/
+^https://(?:www\.)?stlouisfed\.org/
+^https://(?:www\.)?fasb\.org/

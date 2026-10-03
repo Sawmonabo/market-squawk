@@ -68,6 +68,7 @@ pub struct PinnedQueryOutput {
     manifest: DatasetManifestRef,
     object_graph_digest: EvidenceDigest,
     query_identity: EvidenceDigest,
+    semantic_query_identity: EvidenceDigest,
     result_digest: EvidenceDigest,
     result: QueryResult,
 }
@@ -77,6 +78,7 @@ impl PinnedQueryOutput {
         manifest: DatasetManifestRef,
         object_graph_digest: EvidenceDigest,
         query_identity: EvidenceDigest,
+        semantic_query_identity: EvidenceDigest,
         result_digest: EvidenceDigest,
         result: QueryResult,
     ) -> Self {
@@ -84,6 +86,7 @@ impl PinnedQueryOutput {
             manifest,
             object_graph_digest,
             query_identity,
+            semantic_query_identity,
             result_digest,
             result,
         }
@@ -104,6 +107,12 @@ impl PinnedQueryOutput {
         self.query_identity
     }
 
+    /// Returns the exact manifest, row-schema, and SQL identity without execution limits.
+    /// Successful typed selections use this identity so retries retain the same evidence.
+    pub const fn semantic_query_identity(&self) -> EvidenceDigest {
+        self.semantic_query_identity
+    }
+
     /// Returns the exact Arrow IPC result digest.
     pub const fn result_digest(&self) -> EvidenceDigest {
         self.result_digest
@@ -112,6 +121,16 @@ impl PinnedQueryOutput {
     /// Returns the bounded query result.
     pub const fn result(&self) -> &QueryResult {
         &self.result
+    }
+
+    /// Transfers the result while preserving its sealed batch authority.
+    pub fn into_result(self) -> QueryResult {
+        self.result
+    }
+
+    pub(super) fn with_result(mut self, result: QueryResult) -> Self {
+        self.result = result;
+        self
     }
 
     /// Derives an exact monetary value from one inline Decimal128 mantissa, UInt8 scale, and UTF-8

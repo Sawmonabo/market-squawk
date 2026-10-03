@@ -6,7 +6,7 @@ pub struct CurrentBatchKey {
 }
 
 /// Exact receipt-validated raw-frame and decoder evidence shared across routed observations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentFrameEvidence(Arc<crate::DecoderEvidence>);
 
 impl CurrentFrameEvidence {
@@ -53,6 +53,188 @@ impl CurrentFrameEvidence {
     }
 }
 
+/// Exact bounded HTTP-response receipt and adapter normalization rule shared across observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentHttpResponseEvidence(Arc<CurrentHttpResponseEvidenceInner>);
+
+#[derive(Debug, Eq, PartialEq)]
+struct CurrentHttpResponseEvidenceInner {
+    receipt: crate::SegmentedHttpResponseReceipt,
+    normalization_rule: market_squawk_domain::IntegrityRule,
+}
+
+impl CurrentHttpResponseEvidence {
+    fn new(
+        receipt: crate::SegmentedHttpResponseReceipt,
+        normalization_rule: market_squawk_domain::IntegrityRule,
+    ) -> Self {
+        Self(Arc::new(CurrentHttpResponseEvidenceInner {
+            receipt,
+            normalization_rule,
+        }))
+    }
+
+    /// Returns the complete exact response receipt, including every retained segment coordinate.
+    pub fn receipt(&self) -> &crate::SegmentedHttpResponseReceipt {
+        &self.0.receipt
+    }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        let dynamic = self
+            .0
+            .receipt
+            .dynamic_retained_bytes()
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
+        std::mem::size_of::<CurrentHttpResponseEvidenceInner>()
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                CurrentHttpResponseEvidenceInner,
+            >())
+            .and_then(|bytes| bytes.checked_add(dynamic))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.0
+                        .normalization_rule
+                        .dynamic_retained_bytes()
+                        .unwrap_or(usize::MAX),
+                )
+            })
+            .ok_or(RegistryError::RetainedSizeOverflow)
+    }
+}
+
+/// Closed exact source coordinate for one provider-normalized current observation batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentObservationEvidence {
+    /// One exact captured transport frame plus its decoder evidence.
+    TransportFrame(CurrentFrameEvidence),
+    /// One complete bounded HTTP response plus its adapter normalization rule.
+    HttpResponse(CurrentHttpResponseEvidence),
+}
+
+impl CurrentObservationEvidence {
+    /// Returns the exact process-local source/session/generation binding.
+    pub fn binding(&self) -> &FrameSessionBinding {
+        match self {
+            Self::TransportFrame(evidence) => evidence.binding(),
+            Self::HttpResponse(evidence) => evidence.receipt().binding(),
+        }
+    }
+
+    /// Returns the trusted local receive time of the complete source object.
+    pub fn received_at(&self) -> Timestamp {
+        match self {
+            Self::TransportFrame(evidence) => evidence.received_at(),
+            Self::HttpResponse(evidence) => evidence.receipt().received_at(),
+        }
+    }
+
+    /// Returns the SHA-256 digest of the exact transport payload or complete response body.
+    pub fn payload_digest(&self) -> market_squawk_domain::EvidenceDigest {
+        match self {
+            Self::TransportFrame(evidence) => evidence.payload_digest(),
+            Self::HttpResponse(evidence) => evidence.receipt().body_digest(),
+        }
+    }
+
+    /// Returns the exact metadata-bound adapter rule used to normalize the source object.
+    pub fn normalization_rule(&self) -> &market_squawk_domain::IntegrityRule {
+        match self {
+            Self::TransportFrame(evidence) => evidence.decoder_rule(),
+            Self::HttpResponse(evidence) => &evidence.0.normalization_rule,
+        }
+    }
+
+    /// Returns frame evidence only for transport-frame observations.
+    pub const fn transport_frame(&self) -> Option<&CurrentFrameEvidence> {
+        match self {
+            Self::TransportFrame(evidence) => Some(evidence),
+            Self::HttpResponse(_) => None,
+        }
+    }
+
+    /// Returns complete response evidence only for HTTP-response observations.
+    pub const fn http_response(&self) -> Option<&CurrentHttpResponseEvidence> {
+        match self {
+            Self::TransportFrame(_) => None,
+            Self::HttpResponse(evidence) => Some(evidence),
+        }
+    }
+
+    /// Returns a domain-separated digest of the exact source-object coordinate.
+    pub fn coordinate_digest(&self) -> market_squawk_domain::EvidenceDigest {
+        use sha2::Digest as _;
+
+        let mut digest = sha2::Sha256::new();
+        match self {
+            Self::TransportFrame(evidence) => {
+                digest.update(b"market-squawk/current-transport-frame-coordinate/v1");
+                digest.update(evidence.frame_id().get().to_be_bytes());
+            }
+            Self::HttpResponse(evidence) => {
+                return evidence.receipt().coordinate_digest();
+            }
+        }
+        market_squawk_domain::EvidenceDigest::new(
+            market_squawk_domain::DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        )
+    }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        match self {
+            Self::TransportFrame(evidence) => evidence.shared_allocation_charge(),
+            Self::HttpResponse(evidence) => evidence.shared_allocation_charge(),
+        }
+    }
+}
+
+/// Bounded adapter-normalized observations derived from one exact complete HTTP response.
+#[derive(Debug)]
+pub struct NormalizedHttpResponseBatch {
+    receipt: crate::SegmentedHttpResponseReceipt,
+    normalization_rule: market_squawk_domain::IntegrityRule,
+    observations: BoundedVec<crate::ProviderNormalizedObservation, { crate::MAX_DECODED_EVENTS }>,
+}
+
+impl NormalizedHttpResponseBatch {
+    /// Binds normalized observations to one exact complete response without inventing frame evidence.
+    pub fn try_new(
+        receipt: crate::SegmentedHttpResponseReceipt,
+        normalization_rule: market_squawk_domain::IntegrityRule,
+        observations: Vec<crate::ProviderNormalizedObservation>,
+    ) -> Result<Self, crate::DecodeError> {
+        Ok(Self {
+            receipt,
+            normalization_rule,
+            observations: crate::decoder::bounded_provider_observations(observations)?,
+        })
+    }
+
+    /// Returns the complete response receipt.
+    pub const fn receipt(&self) -> &crate::SegmentedHttpResponseReceipt {
+        &self.receipt
+    }
+
+    /// Returns provider observations in response order.
+    pub fn observations(&self) -> &[crate::ProviderNormalizedObservation] {
+        self.observations.as_slice()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        crate::SegmentedHttpResponseReceipt,
+        market_squawk_domain::IntegrityRule,
+        Vec<crate::ProviderNormalizedObservation>,
+    ) {
+        (
+            self.receipt,
+            self.normalization_rule,
+            self.observations.into_vec(),
+        )
+    }
+}
+
 impl CurrentBatchKey {
     /// Returns exact venue routing identity.
     pub const fn venue(&self) -> &VenueId {
@@ -81,13 +263,88 @@ pub struct CurrentSourceAuthorityLease {
     trusted_valid_from: Timestamp,
     trusted_valid_from_monotonic: RegistryMonotonicInstant,
     valid_until_monotonic: RegistryMonotonicInstant,
+    permission_valid_until: Timestamp,
+    permission_valid_until_monotonic: RegistryMonotonicInstant,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
     budget: CurrentBudgetAuthority,
     clock: Arc<SealedRegistryClock>,
 }
 
+/// Opaque permission to persist an observation admitted while its live lease was valid.
+/// This receipt cannot admit a new observation or mint live/execution authority.
+#[derive(Clone, Debug)]
+pub struct CommittedSourceObservationAuthority {
+    source: CurrentSourceAuthorityLease,
+    identity: CurrentProviderIdentity,
+    admitted_at: Timestamp,
+}
+
+impl CommittedSourceObservationAuthority {
+    /// Returns the exact identity selected and validated at admission.
+    pub const fn provider_identity(&self) -> &CurrentProviderIdentity {
+        &self.identity
+    }
+
+    /// Revalidates original admission, continuing permission and revocation for durable storage.
+    /// Expired price freshness does not backdate or renew the committed observation.
+    pub fn validate_publication(&self) -> Result<(), RegistryError> {
+        let source = &self.source;
+        let trusted = source.clock.observe()?;
+        if trusted.monotonic() < source.trusted_valid_from_monotonic {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if trusted.wall() < source.trusted_valid_from
+            || trusted.wall() > source.permission_valid_until
+            || trusted.monotonic() > source.permission_valid_until_monotonic
+            || self.admitted_at < source.valid_from
+            || self.admitted_at > source.valid_until
+            || !source.lease.validate_health_epoch(source.health_epoch)
+            || !source.capture.is_healthy()
+            || !source.budget.is_available()
+        {
+            return Err(RegistryError::HealthNotQualified);
+        }
+        self.identity.validate_at(trusted.wall())?;
+        self.identity.validate_at(self.admitted_at)
+    }
+}
+
 impl CurrentSourceAuthorityLease {
+    /// Seals exact observation authority only while live admission and selected identity are valid.
+    /// The resulting receipt grants durable publication only, never new live admission.
+    pub fn commit_provider_observation(
+        &self,
+        identity: CurrentProviderIdentity,
+        admitted_at: Timestamp,
+    ) -> Result<CommittedSourceObservationAuthority, RegistryError> {
+        self.validate_provider_identity_at(&identity, admitted_at)?;
+        Ok(CommittedSourceObservationAuthority {
+            source: self.clone(),
+            identity,
+            admitted_at,
+        })
+    }
+
+    /// Revalidates a selected identity together with source, capture, health and budget authority.
+    /// A fresh sealed clock sample prevents a retained event timestamp from extending identity
+    /// validity. This does not grant observation or mutation authority to either input alone.
+    pub fn validate_provider_identity_at(
+        &self,
+        identity: &CurrentProviderIdentity,
+        at: Timestamp,
+    ) -> Result<(), RegistryError> {
+        if identity.source_id() != self.binding.source_id()
+            || identity.source_revision().metadata_revision() != self.binding.metadata_revision()
+        {
+            return Err(RegistryError::HandleTransplanted);
+        }
+        self.validate_at(at)?;
+        let trusted = self.clock.observe()?;
+        identity.validate_at(trusted.wall())?;
+        identity.validate_at(at)
+    }
+
     /// Revalidates current generation, health epoch, capture, and inclusive deadline in O(1).
     ///
     /// `at` is the processor-owned wall-clock projection for the event being admitted. The
@@ -96,24 +353,44 @@ impl CurrentSourceAuthorityLease {
     ///
     /// # Errors
     ///
-    /// Fails after rollover/revision/health/capture changes or deadline expiry.
+    /// Fails after rollover, revision or capture changes, degradation, a change or narrowing of
+    /// healthy authority, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
         if trusted.monotonic() < self.trusted_valid_from_monotonic {
             return Err(RegistryError::TrustedClockRegression);
         }
-        if trusted.wall() >= self.trusted_valid_from
-            && trusted.wall() <= self.valid_until
-            && trusted.monotonic() <= self.valid_until_monotonic
-            && at >= self.valid_from
-            && at <= self.valid_until
-            && self.lease.validate_health_epoch(self.health_epoch, at)
-            && self.capture.is_healthy()
-            && self.budget.is_available()
+        let trusted_wall_before_acceptance = trusted.wall() < self.trusted_valid_from;
+        let trusted_wall_expired = trusted.wall() > self.valid_until;
+        let trusted_monotonic_expired = trusted.monotonic() > self.valid_until_monotonic;
+        let event_before_valid_from = at < self.valid_from;
+        let event_after_valid_until = at > self.valid_until;
+        let epoch_or_session_invalid = !self.lease.validate_health_epoch(self.health_epoch);
+        let capture_unhealthy = !self.capture.is_healthy();
+        let budget_unavailable = !self.budget.is_available();
+        if trusted_wall_before_acceptance
+            || trusted_wall_expired
+            || trusted_monotonic_expired
+            || event_before_valid_from
+            || event_after_valid_until
+            || epoch_or_session_invalid
+            || capture_unhealthy
+            || budget_unavailable
         {
-            Ok(())
-        } else {
+            tracing::warn!(
+                trusted_wall_before_acceptance,
+                trusted_wall_expired,
+                trusted_monotonic_expired,
+                event_before_valid_from,
+                event_after_valid_until,
+                epoch_or_session_invalid,
+                capture_unhealthy,
+                budget_unavailable,
+                "queued source authority validation failed"
+            );
             Err(RegistryError::HealthNotQualified)
+        } else {
+            Ok(())
         }
     }
 
@@ -157,10 +434,7 @@ impl CurrentSourceAuthorityLease {
             .clock
             .shared_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
-        let session = std::mem::size_of::<SessionLeaseState>()
-            .checked_add(crate::conservative_arc_control_block_charge::<
-                SessionLeaseState,
-            >())
+        let session = SessionLeaseState::shared_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
         let capture = self
             .capture
@@ -352,7 +626,7 @@ fn current_routed_batch_retained_bytes(
     observation_count: usize,
     observation_unique_allocations: usize,
     authority_shared_allocation: usize,
-    frame_shared_allocation: usize,
+    evidence_shared_allocation: usize,
 ) -> Result<usize, RegistryError> {
     observation_count
         .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
@@ -360,7 +634,7 @@ fn current_routed_batch_retained_bytes(
         .and_then(|bytes| bytes.checked_add(batch_key_allocation))
         .and_then(|bytes| bytes.checked_add(observation_unique_allocations))
         .and_then(|bytes| bytes.checked_add(authority_shared_allocation))
-        .and_then(|bytes| bytes.checked_add(frame_shared_allocation))
+        .and_then(|bytes| bytes.checked_add(evidence_shared_allocation))
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
@@ -439,12 +713,8 @@ impl CurrentLivePolicy {
         } = self;
         stream_key
             .dynamic_retained_bytes()
-            .and_then(|bytes| {
-                bytes.checked_add(static_authorization.dynamic_retained_bytes()?)
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(runtime_authorization.dynamic_retained_bytes()?)
-            })
+            .and_then(|bytes| bytes.checked_add(static_authorization.dynamic_retained_bytes()?))
+            .and_then(|bytes| bytes.checked_add(runtime_authorization.dynamic_retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(coverage.dynamic_retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(runtime_coverage.dynamic_retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(rule.dynamic_retained_bytes()?))
@@ -464,21 +734,45 @@ impl CurrentLivePolicy {
 #[derive(Debug)]
 pub struct CurrentProviderObservation {
     key: CurrentBatchKey,
-    frame_evidence: CurrentFrameEvidence,
+    provider_identity: CurrentProviderIdentity,
+    row_ordinal: usize,
+    row_count: usize,
+    evidence: CurrentObservationEvidence,
     observation: crate::ProviderNormalizedObservation,
     policy: CurrentLivePolicy,
     authority: CurrentSourceAuthorityLease,
 }
 
 impl CurrentProviderObservation {
+    /// Revalidates both exact catalog identity and current source authority at use time.
+    pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
+        self.authority
+            .validate_provider_identity_at(&self.provider_identity, at)
+    }
+
+    /// Returns the opaque catalog-selected identity bound to this source registration.
+    pub const fn provider_identity(&self) -> &CurrentProviderIdentity {
+        &self.provider_identity
+    }
+
+    /// Returns the original normalized ordinal before route grouping.
+    pub const fn row_ordinal(&self) -> usize {
+        self.row_ordinal
+    }
+
+    /// Returns the complete normalized source-object count before route grouping.
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
     /// Returns the deterministic venue/instrument routing key.
     pub const fn key(&self) -> &CurrentBatchKey {
         &self.key
     }
 
-    /// Returns exact receipt-validated raw-frame and decoder evidence.
-    pub const fn frame_evidence(&self) -> &CurrentFrameEvidence {
-        &self.frame_evidence
+    /// Returns exact receipt-validated frame or complete-response evidence.
+    pub const fn evidence(&self) -> &CurrentObservationEvidence {
+        &self.evidence
     }
 
     pub const fn observation(&self) -> &crate::ProviderNormalizedObservation {
@@ -553,7 +847,16 @@ impl CurrentDecodedProviderBatch {
     /// Fails after source/capture degradation, generation rollover, health revision, or deadline
     /// expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
-        self.authority.validate_at(at)
+        self.authority.validate_at(at)?;
+        for observation in &self.observations {
+            observation.validate_at(at)?;
+        }
+        Ok(())
+    }
+
+    /// Borrows the exact routed observations without transferring their processing authority.
+    pub fn observations(&self) -> &[CurrentProviderObservation] {
+        &self.observations
     }
 
     /// Consumes the homogeneous routing batch in original provider wire order.

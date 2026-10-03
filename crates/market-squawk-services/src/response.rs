@@ -23,6 +23,19 @@ pub enum ResultCompleteness {
     Truncated,
 }
 
+/// Closed V1 presentation boundary for one otherwise identical typed service result.
+///
+/// Source coverage and data-quality evidence remain mandatory native result authority. Ordinary
+/// product transports publish only bounded completeness counts, while explicitly administrative
+/// transports may retain the native evidence envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultEnvelopeProjection {
+    /// Provider-neutral product envelope for ordinary Desktop, CLI, and MCP consumers.
+    ProductV1,
+    /// Native evidence envelope reserved for settings, logs, connections, and internal authority.
+    NativeEvidenceV1,
+}
+
 impl ResultCompleteness {
     const fn as_str(self) -> &'static str {
         match self {
@@ -176,21 +189,33 @@ impl ToolResultMetadata {
         }
     }
 
-    fn view(&self, returned_items: usize) -> SerializedMetadata<'_> {
-        SerializedMetadata {
+    fn view(
+        &self,
+        returned_items: usize,
+        projection: ResultEnvelopeProjection,
+    ) -> SerializedMetadata<'_> {
+        let completeness = SerializedCompleteness {
             completeness: self.completeness,
             returned_items,
             available_items: self.available_items.unwrap_or(returned_items),
-            source_coverage: &self.source_coverage,
-            data_quality: &self.data_quality,
+        };
+        match projection {
+            ResultEnvelopeProjection::ProductV1 => SerializedMetadata::Product(completeness),
+            ResultEnvelopeProjection::NativeEvidenceV1 => {
+                SerializedMetadata::Native(SerializedNativeEvidenceMetadata {
+                    completeness,
+                    source_coverage: &self.source_coverage,
+                    data_quality: &self.data_quality,
+                })
+            }
         }
     }
 
-    fn to_value(&self, returned_items: usize) -> Value {
-        self.clone().into_value(returned_items)
+    fn to_value(&self, returned_items: usize, projection: ResultEnvelopeProjection) -> Value {
+        self.clone().into_value(returned_items, projection)
     }
 
-    fn into_value(self, returned_items: usize) -> Value {
+    fn into_value(self, returned_items: usize, projection: ResultEnvelopeProjection) -> Value {
         let mut metadata = Map::new();
         metadata.insert(
             "completeness".to_owned(),
@@ -201,8 +226,10 @@ impl ToolResultMetadata {
             "availableItems".to_owned(),
             Value::from(self.available_items.unwrap_or(returned_items)),
         );
-        metadata.insert("sourceCoverage".to_owned(), self.source_coverage);
-        metadata.insert("dataQuality".to_owned(), self.data_quality);
+        if matches!(projection, ResultEnvelopeProjection::NativeEvidenceV1) {
+            metadata.insert("sourceCoverage".to_owned(), self.source_coverage);
+            metadata.insert("dataQuality".to_owned(), self.data_quality);
+        }
         Value::Object(metadata)
     }
 }
@@ -242,9 +269,6 @@ impl TypedToolResult {
         metadata: ToolResultMetadata,
         limits: ServiceLimits,
     ) -> Result<Self, ServiceContractError> {
-        if item_count == 0 && !structured_content.is_null() {
-            return Err(ServiceContractError::ZeroItemsForNonNullResult);
-        }
         if item_count > limits.maximum_result_items() {
             return Err(ServiceContractError::TooManyItems);
         }
@@ -254,8 +278,13 @@ impl TypedToolResult {
             limits.result_structure(),
             limits.maximum_result_bytes(),
         )?;
-        let encoded_bytes =
-            encoded_envelope_bytes(&structured_content, &metadata, item_count, limits)?;
+        let encoded_bytes = encoded_envelope_bytes(
+            &structured_content,
+            &metadata,
+            item_count,
+            ResultEnvelopeProjection::NativeEvidenceV1,
+            limits,
+        )?;
         Ok(Self {
             structured_content,
             metadata,
@@ -308,6 +337,7 @@ impl TypedToolResult {
             &self.structured_content,
             &self.metadata,
             self.item_count,
+            ResultEnvelopeProjection::NativeEvidenceV1,
             limits,
         )?;
         Ok(())
@@ -329,20 +359,40 @@ impl TypedToolResult {
         Ok(())
     }
 
-    /// Returns a small structured copy of completeness, coverage, and quality metadata.
+    /// Returns the exact projected metadata for an explicit V1 presentation boundary.
     #[must_use]
-    pub fn metadata_value(&self) -> Value {
-        self.metadata.to_value(self.item_count)
+    pub fn metadata_value(&self, projection: ResultEnvelopeProjection) -> Value {
+        self.metadata.to_value(self.item_count, projection)
     }
 
-    /// Consumes the result into the canonical transport-neutral envelope.
+    /// Returns the encoded size of the exact projected envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceContractError`] when the projected envelope exceeds the supplied result
+    /// ceiling or cannot be encoded.
+    pub fn projected_encoded_bytes(
+        &self,
+        projection: ResultEnvelopeProjection,
+        limits: ServiceLimits,
+    ) -> Result<usize, ServiceContractError> {
+        encoded_envelope_bytes(
+            &self.structured_content,
+            &self.metadata,
+            self.item_count,
+            projection,
+            limits,
+        )
+    }
+
+    /// Consumes the result into one explicit V1 presentation envelope.
     #[must_use]
-    pub fn into_envelope(self) -> Value {
+    pub fn into_envelope(self, projection: ResultEnvelopeProjection) -> Value {
         let mut envelope = Map::new();
         envelope.insert("data".to_owned(), self.structured_content);
         envelope.insert(
             "metadata".to_owned(),
-            self.metadata.into_value(self.item_count),
+            self.metadata.into_value(self.item_count, projection),
         );
         Value::Object(envelope)
     }
@@ -362,12 +412,26 @@ impl fmt::Debug for TypedToolResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SerializedMetadata<'value> {
+struct SerializedCompleteness {
     completeness: ResultCompleteness,
     returned_items: usize,
     available_items: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedNativeEvidenceMetadata<'value> {
+    #[serde(flatten)]
+    completeness: SerializedCompleteness,
     source_coverage: &'value Value,
     data_quality: &'value Value,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SerializedMetadata<'value> {
+    Product(SerializedCompleteness),
+    Native(SerializedNativeEvidenceMetadata<'value>),
 }
 
 #[derive(Serialize)]
@@ -380,11 +444,12 @@ fn encoded_envelope_bytes(
     structured_content: &Value,
     metadata: &ToolResultMetadata,
     item_count: usize,
+    projection: ResultEnvelopeProjection,
     limits: ServiceLimits,
 ) -> Result<usize, ServiceContractError> {
     let envelope = SerializedEnvelope {
         data: structured_content,
-        metadata: metadata.view(item_count),
+        metadata: metadata.view(item_count, projection),
     };
     let mut counter = BoundedCounter::new(limits.maximum_result_bytes());
     serde_json::to_writer(&mut counter, &envelope)
@@ -450,9 +515,6 @@ impl Write for BoundedCounter {
 /// Invalid service response construction.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ServiceContractError {
-    /// Non-null structured content must declare at least one logical item.
-    #[error("non-null service results must declare at least one logical item")]
-    ZeroItemsForNonNullResult,
     /// Logical result item count exceeded the request ceiling.
     #[error("service result item limit exceeded")]
     TooManyItems,
@@ -468,4 +530,28 @@ pub enum ServiceContractError {
     /// Structured JSON violated its depth, container, string, or encoded-byte ceiling.
     #[error("service result JSON contract failed: {0}")]
     Json(#[from] JsonContractError),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ResultEnvelopeProjection, ToolResultMetadata, TypedToolResult};
+    use crate::{JsonStructureLimits, ServiceLimits};
+
+    #[test]
+    fn complete_empty_page_reports_zero_items() -> Result<(), Box<dyn std::error::Error>> {
+        let structure = JsonStructureLimits::try_new(8, 1_024, 16, 16)?;
+        let limits = ServiceLimits::try_new(1_024, 16, 4_096, 16, structure)?;
+        let result = TypedToolResult::try_new(
+            json!({"items": []}),
+            0,
+            ToolResultMetadata::complete_not_applicable(),
+            limits,
+        )?;
+        let envelope = result.into_envelope(ResultEnvelopeProjection::ProductV1);
+        assert_eq!(envelope["metadata"]["returnedItems"], 0);
+        assert_eq!(envelope["metadata"]["availableItems"], 0);
+        Ok(())
+    }
 }

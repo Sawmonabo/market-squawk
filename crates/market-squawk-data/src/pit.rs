@@ -6,6 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "pit/canonical.rs"]
 mod canonical;
+#[path = "pit/disk.rs"]
+pub(crate) mod disk;
 #[path = "pit/model.rs"]
 mod model;
 #[path = "pit/result.rs"]
@@ -52,5 +54,16 @@ impl PointInTimeService {
     ) -> Result<PointInTimeSelection<'a>, PointInTimeError<'a>> {
         tokio::task::yield_now().await;
         select::select(request, candidates, cancellation, deadline)
+    }
+
+    /// Computes the exact canonical payload identity used by point-in-time evidence matching.
+    pub fn payload_identity<'a>(
+        &self,
+        candidate: &'a PointInTimeCandidate,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<crate::Sha256Digest, PointInTimeError<'a>> {
+        let mut control = retained::OperationControl::new(cancellation, deadline)?;
+        canonical::payload_identity(candidate, &mut control)
     }
 }

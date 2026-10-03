@@ -21,9 +21,8 @@ impl<T> EffectiveSettingView<T> {
 
 /// Complete redacted view of the validated effective local configuration.
 ///
-/// Secret material and secret locators are never represented. Source credentials are reported
-/// only as a configured/not-configured state so CLI, doctor, and protocol consumers can share one
-/// serialization boundary without gaining secret authority.
+/// Secret material and secret locators are never represented. CLI, doctor, and protocol consumers
+/// share this serialization boundary without gaining provider credential authority.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveConfigView<'config> {
@@ -39,7 +38,6 @@ pub struct EffectiveConfigView<'config> {
     capture_shutdown_ms: EffectiveSettingView<u128>,
     source_shutdown_ms: EffectiveSettingView<u128>,
     training_release_directory: EffectiveSettingView<Option<&'config Path>>,
-    source_secret_configured: EffectiveSettingView<bool>,
     coinbase_configured: EffectiveSettingView<bool>,
     kraken_configured: EffectiveSettingView<bool>,
 }
@@ -95,10 +93,6 @@ impl AppConfig {
             training_release_directory: EffectiveSettingView::new(
                 self.training_release_root(),
                 provenance.origin(ConfigSetting::TrainingReleaseDirectory),
-            ),
-            source_secret_configured: EffectiveSettingView::new(
-                self.source_secret().is_some(),
-                provenance.origin(ConfigSetting::SourceSecret),
             ),
             coinbase_configured: EffectiveSettingView::new(
                 self.coinbase().is_some(),

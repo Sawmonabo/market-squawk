@@ -6,19 +6,48 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_domain::{
     CapturePayload, CapturePayloadError, CaptureRetainedComponent, CaptureRetainedSizeError,
-    MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES, MAX_LIVE_CAPTURE_PAYLOAD_BYTES,
+    MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES, MAX_LIVE_CAPTURE_PAYLOAD_BYTES, RawCaptureFrameView,
     checked_arc_str_allocation_bytes,
 };
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{Error as _, IgnoredAny, SeqAccess, Visitor},
+    de::{DeserializeSeed, Error as _, IgnoredAny, SeqAccess, Visitor},
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Maximum serialized JSON body accepted by the committed journal frame.
-pub(crate) const MAX_SERIALIZED_RECORD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_SERIALIZED_RECORD_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMPATIBILITY_PAYLOAD_BYTES: usize = MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES;
+const CONTROLLED_COMPATIBILITY_CHUNK_BYTES: usize = 64 * 1024;
+
+// One temporary buffer per serialization pass; passes never retain it simultaneously.
+const SERIALIZATION_BUFFER_CAPACITY: usize = 8 * 1024;
+/// Maximum buffer allocation plus its inline owner, charged separately from the raw record.
+pub(crate) const RAW_RECORD_SERIALIZATION_WORKSPACE_BYTES: usize =
+    SERIALIZATION_BUFFER_CAPACITY + std::mem::size_of::<io::BufWriter<&mut dyn io::Write>>();
+
+/// Coalesces serde's byte-array fragments before downstream bounds, checksums and controls.
+/// `into_inner` drains this buffer without flushing the caller's file/pipe buffer. Disarming
+/// Drop on either error prevents an implicit retry from writing after a failed/cancelled pass.
+pub(crate) fn write_json_buffered<W: io::Write, T: Serialize + ?Sized>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), serde_json::Error> {
+    let mut buffered = io::BufWriter::with_capacity(SERIALIZATION_BUFFER_CAPACITY, writer);
+    if let Err(error) = serde_json::to_writer(&mut buffered, value) {
+        let (_writer, _unwritten) = buffered.into_parts();
+        return Err(error);
+    }
+    match buffered.into_inner() {
+        Ok(_writer) => Ok(()),
+        Err(error) => {
+            let (source, buffered) = error.into_parts();
+            let (_writer, _unwritten) = buffered.into_parts();
+            Err(serde_json::Error::io(source))
+        }
+    }
+}
 const MAX_LIVE_WORST_CASE_SERIALIZED_BYTES: usize =
     MAX_LIVE_CAPTURE_PAYLOAD_BYTES * 4 + RawCaptureRecord::MAX_LIVE_SOURCE_BYTES * 6 + 4_096;
 const _: () = assert!(MAX_LIVE_WORST_CASE_SERIALIZED_BYTES < MAX_SERIALIZED_RECORD_BYTES);
@@ -55,6 +84,50 @@ impl io::Write for BoundedCountingWriter {
         }
         self.bytes = next;
         Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ControlledBoundedCountingWriter<'checkpoint> {
+    inner: BoundedCountingWriter,
+    checkpoint: &'checkpoint dyn Fn(u64) -> io::Result<()>,
+    work_offset: u64,
+}
+
+impl<'checkpoint> ControlledBoundedCountingWriter<'checkpoint> {
+    fn new(
+        maximum: usize,
+        work_offset: u64,
+        checkpoint: &'checkpoint dyn Fn(u64) -> io::Result<()>,
+    ) -> Self {
+        Self {
+            inner: BoundedCountingWriter::new(maximum),
+            checkpoint,
+            work_offset,
+        }
+    }
+
+    fn finish(self) -> (usize, u64) {
+        (self.inner.bytes, self.work_offset)
+    }
+}
+
+impl io::Write for ControlledBoundedCountingWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        (self.checkpoint)(self.work_offset)?;
+        let attempt = buffer.len().min(CONTROLLED_COMPATIBILITY_CHUNK_BYTES);
+        let written = self.inner.write(&buffer[..attempt])?;
+        self.work_offset = self
+            .work_offset
+            .checked_add(u64::try_from(written).map_err(io::Error::other)?)
+            .ok_or_else(|| io::Error::other("raw compatibility work offset overflowed"))?;
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -186,6 +259,44 @@ impl RawCaptureRecordWireRef<'_> {
             .map_err(|_error| RawCaptureRecordError::CompatibilityBound)?;
         Ok(counter.bytes)
     }
+
+    fn validate_serialized_bound_with_checkpoint(
+        &self,
+        maximum: usize,
+        work_offset: u64,
+        checkpoint: &dyn Fn(u64) -> io::Result<()>,
+    ) -> Result<usize, RawCaptureRecordError> {
+        #[cfg(test)]
+        COMPATIBILITY_VALIDATION_PASSES.with(|passes| passes.set(passes.get().saturating_add(1)));
+        let mut counter = ControlledBoundedCountingWriter::new(maximum, work_offset, checkpoint);
+        serde_json::to_writer(&mut counter, self)
+            .map_err(|_error| RawCaptureRecordError::CompatibilityBound)?;
+        let (bytes, completed_work_offset) = counter.finish();
+        checkpoint(completed_work_offset)
+            .map_err(|_error| RawCaptureRecordError::CompatibilityBound)?;
+        Ok(bytes)
+    }
+}
+
+struct ControlledRawCaptureRecordSeed<'checkpoint> {
+    checkpoint: &'checkpoint dyn Fn(u64) -> io::Result<()>,
+    validation_work_offset: u64,
+}
+
+impl<'de> DeserializeSeed<'de> for ControlledRawCaptureRecordSeed<'_> {
+    type Value = RawCaptureRecord;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RawCaptureRecordWire::deserialize(deserializer)?;
+        let record = RawCaptureRecord::try_from_wire(wire).map_err(D::Error::custom)?;
+        record
+            .validate_compatibility_with_checkpoint(self.validation_work_offset, self.checkpoint)
+            .map_err(D::Error::custom)?;
+        Ok(record)
+    }
 }
 
 /// Validation failure for a newly captured live frame.
@@ -289,6 +400,53 @@ impl RawCaptureRecord {
         )
     }
 
+    /// Converts one exact normalized capture frame without copying or decoding its payload.
+    ///
+    /// This low-level bridge does not establish admission authority. Its caller must own the
+    /// nonnil event and connection identities. Source identity, receive time, and payload are
+    /// always taken from `frame`; provider sequence and exchange time remain absent because the
+    /// raw transport frame does not own either fact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RawCaptureRecordError`] when identities, source identity, receive time, retained
+    /// size, or exact payload-allocation preservation are invalid.
+    pub fn try_from_exact_capture_frame<Frame>(
+        event_id: Uuid,
+        connection_id: Uuid,
+        frame: &Frame,
+    ) -> Result<Self, RawCaptureRecordError>
+    where
+        Frame: RawCaptureFrameView,
+    {
+        if frame.payload() != frame.capture_payload().as_bytes() {
+            return Err(RawCaptureRecordError::InvalidPayloadSharing);
+        }
+        let nanos = frame.received_at().unix_nanos();
+        let seconds = nanos.div_euclid(1_000_000_000);
+        let subsecond = u32::try_from(nanos.rem_euclid(1_000_000_000))
+            .map_err(|_error| RawCaptureRecordError::InvalidReceivedAt)?;
+        let received_at = DateTime::from_timestamp(seconds, subsecond)
+            .ok_or(RawCaptureRecordError::InvalidReceivedAt)?;
+        let record = Self::try_new_live_payload(
+            event_id,
+            Arc::from(frame.source_id().as_str()),
+            connection_id,
+            None,
+            None,
+            received_at,
+            frame.capture_payload().clone(),
+        )?;
+        if !frame
+            .capture_payload()
+            .shares_allocation_with(record.capture_payload())
+        {
+            return Err(RawCaptureRecordError::InvalidPayloadSharing);
+        }
+        let _complete_retained_bytes = record.checked_retained_bytes()?;
+        Ok(record)
+    }
+
     pub(crate) fn try_new_live_payload(
         event_id: Uuid,
         source: Arc<str>,
@@ -385,6 +543,53 @@ impl RawCaptureRecord {
         Ok(())
     }
 
+    fn validate_compatibility_with_checkpoint(
+        &self,
+        work_offset: u64,
+        checkpoint: &dyn Fn(u64) -> io::Result<()>,
+    ) -> Result<(), RawCaptureRecordError> {
+        if self.source.len() > MAX_SERIALIZED_RECORD_BYTES
+            || self.payload.as_bytes().len() > MAX_COMPATIBILITY_PAYLOAD_BYTES
+        {
+            return Err(RawCaptureRecordError::CompatibilityBound);
+        }
+        self.as_wire_ref()
+            .validate_serialized_bound_with_checkpoint(
+                MAX_SERIALIZED_RECORD_BYTES,
+                work_offset,
+                checkpoint,
+            )?;
+        Ok(())
+    }
+
+    /// Decodes one committed seven-field wire under chunked parse and compatibility validation.
+    pub(crate) fn deserialize_committed_with_checkpoint<R: io::Read>(
+        reader: R,
+        validation_work_offset: u64,
+        checkpoint: &dyn Fn(u64) -> io::Result<()>,
+    ) -> Result<Self, serde_json::Error> {
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
+        let record = ControlledRawCaptureRecordSeed {
+            checkpoint,
+            validation_work_offset,
+        }
+        .deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        Ok(record)
+    }
+
+    fn try_from_wire(wire: RawCaptureRecordWire) -> Result<Self, CapturePayloadError> {
+        Ok(Self {
+            event_id: wire.event_id,
+            source: Arc::from(wire.source.0),
+            connection_id: wire.connection_id,
+            source_sequence: wire.source_sequence,
+            exchange_at: wire.exchange_at,
+            received_at: wire.received_at,
+            payload: CapturePayload::try_from_committed_wire(&wire.payload.0)?,
+        })
+    }
+
     fn wire_ref<'a>(
         event_id: Uuid,
         source: &'a str,
@@ -478,7 +683,11 @@ impl RawCaptureRecord {
         &self.payload
     }
 
-    pub(crate) fn checked_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
+    /// Returns the complete checked retained allocation, including the exact owned payload backing.
+    ///
+    /// Shared allocations are conservatively charged in full to each owning request.
+    /// Returns an error if the complete retained-size formula overflows.
+    pub fn checked_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
         std::mem::size_of::<Self>()
             .checked_add(self.checked_dynamic_retained_bytes()?)
             .ok_or(CaptureRetainedSizeError::Overflow {
@@ -521,16 +730,7 @@ impl<'de> Deserialize<'de> for RawCaptureRecord {
         D: Deserializer<'de>,
     {
         let wire = RawCaptureRecordWire::deserialize(deserializer)?;
-        let record = Self {
-            event_id: wire.event_id,
-            source: Arc::from(wire.source.0),
-            connection_id: wire.connection_id,
-            source_sequence: wire.source_sequence,
-            exchange_at: wire.exchange_at,
-            received_at: wire.received_at,
-            payload: CapturePayload::try_from_committed_wire(&wire.payload.0)
-                .map_err(D::Error::custom)?,
-        };
+        let record = Self::try_from_wire(wire).map_err(D::Error::custom)?;
         record.validate_compatibility().map_err(D::Error::custom)?;
         Ok(record)
     }
@@ -781,11 +981,34 @@ mod tests {
             Utc.timestamp_opt(0, 0)
                 .single()
                 .ok_or("invalid fixture time")?,
-            vec![0, 9, 10, 99, 100, 255],
+            [0, 9, 10, 99, 100, 255].repeat(super::SERIALIZATION_BUFFER_CAPACITY / 6 + 1),
         )?;
         let after_construction = COMPATIBILITY_VALIDATION_PASSES.with(std::cell::Cell::get);
         let encoded = serde_json::to_vec(&record)?;
-        assert!(!encoded.is_empty());
+        assert!(encoded.len() > super::SERIALIZATION_BUFFER_CAPACITY);
+        let mut buffered = Vec::new();
+        super::write_json_buffered(&mut buffered, &record)?;
+        assert_eq!(buffered, encoded);
+
+        // Exercise both a full-buffer drain during serialization and the final short drain.
+        // A failed write must return immediately, with no implicit BufWriter Drop retry.
+        struct RejectWrites(usize);
+        impl std::io::Write for RejectWrites {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(std::io::Error::other("fixture rejects buffered output"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut full = RejectWrites(0);
+        assert!(super::write_json_buffered(&mut full, &record).is_err());
+        assert_eq!(full.0, 1);
+        let mut tail = RejectWrites(0);
+        assert!(super::write_json_buffered(&mut tail, &0_u8).is_err());
+        assert_eq!(tail.0, 1);
         assert_eq!(
             COMPATIBILITY_VALIDATION_PASSES.with(std::cell::Cell::get),
             after_construction

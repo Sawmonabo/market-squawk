@@ -15,11 +15,16 @@ use crate::{FeeError, FeeSchedule, LiquidityRole};
 
 #[path = "ledger/account_state.rs"]
 mod account_state;
+#[path = "ledger/actions.rs"]
+mod actions;
 use account_state::PaperAccountRiskState;
 pub use account_state::{PaperAccountBootstrap, PaperAccountRiskSnapshot};
+pub use actions::PaperCashEntitlement;
+use actions::{PaperActionOrigin, PaperActionReceipt};
 #[path = "ledger/marks.rs"]
 mod marks;
 pub(crate) use marks::PaperMarkDisposition;
+pub use marks::PaperMarkEvidence as PaperExecutableMark;
 use marks::PaperMarkEvidence;
 #[path = "ledger/recovery.rs"]
 mod recovery;
@@ -136,6 +141,9 @@ impl PaperFill {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperLedger {
     config: PaperLedgerConfig,
+    action_origin: Option<Box<PaperActionOrigin>>,
+    action_receipt: Option<PaperActionReceipt>,
+    cash_entitlements: Vec<PaperCashEntitlement>,
     accounts: BTreeMap<AccountId, PaperAccountRiskState>,
     cash: BTreeMap<(AccountId, Currency), Decimal>,
     positions: BTreeMap<(AccountId, InstrumentId), i64>,
@@ -278,6 +286,9 @@ impl PaperLedger {
         position_cost_basis.retain(|key, _| positions.contains_key(key));
         Ok(Self {
             config,
+            action_origin: None,
+            action_receipt: None,
+            cash_entitlements: Vec::new(),
             accounts: account_states,
             cash,
             positions,
@@ -381,6 +392,30 @@ impl PaperLedger {
             valued_at,
             maximum_mark_age_nanos,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_checkpoint_fixture(
+        &mut self,
+        terms: InstrumentExecutionTerms,
+        observed_at: market_squawk_domain::Timestamp,
+        best_bid: PriceTicks,
+        best_ask: PriceTicks,
+    ) -> Result<(), PaperLedgerError> {
+        let mark = PaperMarkEvidence::try_new(marks::PaperMarkInput {
+            terms,
+            venue_digest: [7; 32],
+            connection_generation: market_squawk_domain::ConnectionGeneration::new(1)
+                .map_err(|_| PaperLedgerError::InvalidMark)?,
+            quality: market_squawk_domain::DataQuality::DirectVerified,
+            virtual_paper: false,
+            event_class: market_squawk_domain::LiveEventClass::Quote,
+            assessment_digest: [8; 32],
+            observed_at,
+            best_bid,
+            best_ask,
+        })?;
+        self.apply_mark(mark, observed_at, 1).map(|_| ())
     }
 
     pub(crate) fn cash_snapshot(&self) -> Vec<PaperCashBalance> {
@@ -707,21 +742,25 @@ impl PaperLedger {
             .checked_sub(current_cost_basis)
             .and_then(|exposure| exposure.checked_add(position_transition.next_cost_basis))
             .map_err(|_| PaperLedgerError::Overflow)?;
+        let accrued = self.unpaid_action_cash(reservation.account_id, currency)?;
+        let next_marked_equity = next_settled_capital
+            .checked_add(accrued)
+            .map_err(|_| PaperLedgerError::Overflow)?;
         let next_peak_capital =
-            if next_settled_capital.amount() > current_account.peak_marked_equity.amount() {
-                next_settled_capital
+            if next_marked_equity.amount() > current_account.peak_marked_equity.amount() {
+                next_marked_equity
             } else {
                 current_account.peak_marked_equity
             };
         let next_account = PaperAccountRiskState {
             revision: next_revision,
             settled_capital: next_settled_capital,
-            marked_equity: next_settled_capital,
+            marked_equity: next_marked_equity,
             peak_marked_equity: next_peak_capital,
             marked_gross_exposure: next_open_cost_exposure,
-            unrealized_pnl: Money::new(Decimal::ZERO, currency),
+            unrealized_pnl: accrued,
             drawdown: next_peak_capital
-                .checked_sub(next_settled_capital)
+                .checked_sub(next_marked_equity)
                 .map_err(|_| PaperLedgerError::Overflow)?,
             mark_digest: [0; 32],
             realized_loss: next_realized_loss,
@@ -1090,6 +1129,12 @@ pub enum PaperLedgerError {
     StaleMark,
     #[error("paper mark evidence regressed its venue generation or observation time")]
     MarkRegression,
+    #[error("paper corporate action lacks complete authentic source evidence")]
+    InvalidActionEvidence,
+    #[error("paper action inventory has fractional lots without cash-in-lieu authority")]
+    FractionalActionInventory,
+    #[error("paper action requires unsupported basis or successor-instrument authority")]
+    UnsupportedAction,
     #[error("paper recovery ledger violates accounting invariants")]
     InvalidRecovery,
     #[error(transparent)]

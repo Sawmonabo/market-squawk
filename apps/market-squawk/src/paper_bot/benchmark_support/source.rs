@@ -1,7 +1,7 @@
 mod metadata;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use market_squawk_domain::{
@@ -48,6 +48,8 @@ pub(super) struct ReleaseBenchmarkSource {
     _reporter: CurrentHealthReporter,
     ingress: BoundShardIngress,
     next_sequence: u64,
+    // Drop the catalog directory only after the registry releases its catalog reader.
+    _catalog_directory: tempfile::TempDir,
 }
 
 impl ReleaseBenchmarkSource {
@@ -56,9 +58,17 @@ impl ReleaseBenchmarkSource {
         route: ShardKey,
         cancellation: CancellationToken,
     ) -> Result<Self> {
+        let (catalog_directory, catalog_reader) = metadata::identity_catalog(&cancellation)?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
+            .with_provider_identity_authority(Arc::new(catalog_reader))?;
         let at = now()?;
-        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let registered = registry.register(metadata::source_metadata()?, at)?;
+        registry.record_provider_identities(
+            &registered,
+            &[metadata::native_identity_request(at)?],
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )?;
         let session = registry.begin_session(
             &registered,
             SessionId::new(metadata::identifier("release-performance-session")?),
@@ -118,6 +128,7 @@ impl ReleaseBenchmarkSource {
             _reporter: reporter,
             ingress,
             next_sequence: 1,
+            _catalog_directory: catalog_directory,
         })
     }
 
@@ -241,6 +252,7 @@ impl ReleaseBenchmarkSource {
                     Some(metadata::identifier("BUY")?),
                     metadata::rule("release-benchmark-aggressor")?,
                 ),
+                taker_order_type: None,
             },
             BatchKind::DispatchDelta => ProviderObservationPayload::book_delta(
                 MarketDepth::PriceLevel,
@@ -265,6 +277,7 @@ impl ReleaseBenchmarkSource {
             source_identifier,
             VenueId::try_from(metadata::VENUE_ID)?,
             metadata::INSTRUMENT_ID.parse()?,
+            metadata::native_identity()?,
             ProviderTimestampEvidence::Provided {
                 value: observed_at,
                 rule: metadata::rule("release-benchmark-timestamp")?,

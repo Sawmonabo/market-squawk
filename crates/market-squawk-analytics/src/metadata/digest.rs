@@ -117,6 +117,7 @@ fn update_time_semantics(hasher: &mut Sha256, semantics: FeatureTimeSemantics) {
             hasher.update([2]);
             hasher.update(maximum_skew_nanos.get().to_be_bytes());
         }
+        FeatureTimeSemantics::NativeFinancialPeriod => hasher.update([3]),
     }
 }
 
@@ -181,6 +182,7 @@ const fn data_type_tag(data_type: FeatureDataType) -> u8 {
         FeatureDataType::MonetaryValue => 18,
         FeatureDataType::StatisticalLocation => 19,
         FeatureDataType::StatisticalDispersion => 20,
+        FeatureDataType::FinancialPeriodEvidence => 21,
     }
 }
 

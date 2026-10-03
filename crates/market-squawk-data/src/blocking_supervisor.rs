@@ -159,15 +159,23 @@ impl BlockingIoSupervisor {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn drain(&self) {
+    /// Waits for this operation's workers to release their captured resources. The owner must
+    /// first stop admission and drop worker-result futures; unrelated supervisors are not joined.
+    pub(crate) async fn wait_idle(&self) {
         loop {
             let idle = self.inner.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
             if self.inner.active.load(Ordering::Acquire) == 0 {
-                break;
+                return;
             }
             idle.await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain(&self) {
+        self.wait_idle().await;
         BLOCKING_TASK_REAPER.drain().await;
     }
 
@@ -408,9 +416,11 @@ impl RangeTestBarrier {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use super::BlockingIoSupervisor;
+    use futures_util::FutureExt as _;
     use tokio_util::sync::CancellationToken;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -425,9 +435,12 @@ mod tests {
         let supervisor = BlockingIoSupervisor::new(CancellationToken::new());
         let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
         let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let resource = Arc::new(());
+        let resource_lifetime = Arc::downgrade(&resource);
         let task = runtime
             .block_on(async {
                 supervisor.spawn_blocking(move || {
+                    let _resource = resource;
                     let _ignored = entered_sender.send(());
                     let _ignored = release_receiver.recv();
                 })
@@ -440,10 +453,16 @@ mod tests {
         wait_until(Duration::from_secs(1), || {
             BlockingIoSupervisor::reaper_pending() == 1
         })?;
+        supervisor.cancel();
+        let mut idle = std::pin::pin!(supervisor.wait_idle());
+        assert!(idle.as_mut().now_or_never().is_none());
+        assert!(resource_lifetime.upgrade().is_some());
         release_sender.send(())?;
         wait_until(Duration::from_secs(1), || {
             BlockingIoSupervisor::reaper_pending() == 0 && supervisor.active() == 0
         })?;
+        assert_eq!(idle.as_mut().now_or_never(), Some(()));
+        assert!(resource_lifetime.upgrade().is_none());
         drop(serial);
         Ok(())
     }

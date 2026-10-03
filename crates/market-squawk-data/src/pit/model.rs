@@ -4,22 +4,24 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 use market_squawk_domain::{
-    InstrumentId, ResearchContext, ResearchObservation, ResearchTemporalCoordinate, RevisionNumber,
-    SourceId, SourceIdentifier, Timestamp,
+    BarTimestampBasis, CalendarDate, CompanyObservationSubject, Currency, FundNavValuationBasis,
+    FundamentalPeriod, InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence,
+    ProviderChannel, ProviderInstrumentId, ProviderProduct, ResearchContext, ResearchObservation,
+    ResearchTemporalCoordinate, RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 
 use super::PointInTimeError;
 use crate::DatasetManifestRef;
 
 /// Canonical identity schema used by this selector release.
-pub const POINT_IN_TIME_IDENTITY_SCHEMA_VERSION: u16 = 1;
-/// Fixed process ceiling for candidates examined by one selection.
+pub const POINT_IN_TIME_IDENTITY_SCHEMA_VERSION: u16 = 2;
+/// Default work allowance for candidates examined by one selection.
 pub const MAX_POINT_IN_TIME_CANDIDATES: usize = 1_000_000;
-/// Fixed process ceiling for distinct natural-identity families.
+/// Default work allowance for distinct natural-identity families.
 pub const MAX_POINT_IN_TIME_FAMILIES: usize = 1_000_000;
-/// Fixed process ceiling for divergent same-revision conflict groups.
+/// Default work allowance for divergent same-revision conflict groups.
 pub const MAX_POINT_IN_TIME_CONFLICTS: usize = 100_000;
-/// Fixed process ceiling for usable result rows.
+/// Default work allowance for usable result rows.
 pub const MAX_POINT_IN_TIME_RESULT_ROWS: usize = 1_000_000;
 /// Fixed process ceiling for selector-owned peak retained bytes.
 pub const MAX_POINT_IN_TIME_RETAINED_BYTES: usize = 512 * 1024 * 1024;
@@ -82,7 +84,7 @@ pub struct PointInTimeLimits {
 }
 
 impl PointInTimeLimits {
-    /// Constructs nonzero caller bounds within fixed process ceilings.
+    /// Constructs nonzero work bounds and a separately bounded resident working set.
     pub fn try_new(
         max_candidates: usize,
         max_families: usize,
@@ -91,13 +93,9 @@ impl PointInTimeLimits {
         max_retained_bytes: usize,
     ) -> Result<Self, PointInTimeError<'static>> {
         if max_candidates == 0
-            || max_candidates > MAX_POINT_IN_TIME_CANDIDATES
             || max_families == 0
-            || max_families > MAX_POINT_IN_TIME_FAMILIES
             || max_conflicts == 0
-            || max_conflicts > MAX_POINT_IN_TIME_CONFLICTS
             || max_result_rows == 0
-            || max_result_rows > MAX_POINT_IN_TIME_RESULT_ROWS
             || max_retained_bytes == 0
             || max_retained_bytes > MAX_POINT_IN_TIME_RETAINED_BYTES
         {
@@ -257,20 +255,49 @@ impl PointInTimeCandidate {
 pub enum ObservationFamilyKey {
     Filing {
         source_id: SourceId,
-        instrument_id: InstrumentId,
+        subject: CompanyObservationSubject,
         accession: SourceIdentifier,
     },
     Fundamental {
         source_id: SourceId,
-        instrument_id: InstrumentId,
-        source_record: SourceIdentifier,
+        subject: CompanyObservationSubject,
         concept: SourceIdentifier,
         unit: SourceIdentifier,
-        effective: ResearchTemporalCoordinate,
+        period: FundamentalPeriod,
     },
     Macro {
         source_id: SourceId,
         series: SourceIdentifier,
+        effective: ResearchTemporalCoordinate,
+    },
+    MarketBar {
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        venue_id: VenueId,
+        provider_instrument_id: ProviderInstrumentId,
+        feed: SourceIdentifier,
+        interval: SourceIdentifier,
+        adjustment: MarketBarAdjustment,
+        timestamp_basis: Option<BarTimestampBasis>,
+        session: Option<MarketBarSessionEvidence>,
+        nominal_ruleset: Option<SourceIdentifier>,
+        effective: ResearchTemporalCoordinate,
+    },
+    FundNav {
+        source_id: SourceId,
+        provider_product: ProviderProduct,
+        provider_channel: ProviderChannel,
+        instrument_id: InstrumentId,
+        provider_instrument_id: ProviderInstrumentId,
+        nav_date: CalendarDate,
+        valuation_basis: FundNavValuationBasis,
+        currency: Currency,
+    },
+    MarketCalendar {
+        source_id: SourceId,
+        venue_id: Option<VenueId>,
+        scope: market_squawk_domain::MarketCalendarScope,
+        coverage: bool,
         effective: ResearchTemporalCoordinate,
     },
     PortfolioPosition {
@@ -284,6 +311,10 @@ pub enum ObservationFamilyKey {
         instrument_id: Option<InstrumentId>,
         account_id: SourceIdentifier,
         source_record_id: SourceIdentifier,
+    },
+    CorporateActionSource {
+        source_id: SourceId,
+        source_record: SourceIdentifier,
     },
     CorporateAction {
         source_id: SourceId,
@@ -320,20 +351,58 @@ impl ObservationFamilyKey {
         match candidate.observation() {
             ResearchObservation::Filing(value) => Ok(Self::Filing {
                 source_id,
-                instrument_id: required_instrument()?,
+                subject: value.subject().clone(),
                 accession: value.accession().clone(),
             }),
             ResearchObservation::Fundamental(value) => Ok(Self::Fundamental {
                 source_id,
-                instrument_id: required_instrument()?,
-                source_record: provenance.source_identifier().clone(),
+                subject: value.subject().clone(),
                 concept: value.concept().clone(),
                 unit: value.unit().clone(),
-                effective,
+                period: value.fact_context().period(),
             }),
             ResearchObservation::Macro(value) => Ok(Self::Macro {
                 source_id,
                 series: value.series().clone(),
+                effective,
+            }),
+            ResearchObservation::MarketBar(value) => Ok(Self::MarketBar {
+                source_id,
+                instrument_id: required_instrument()?,
+                venue_id: provenance
+                    .venue_id()
+                    .cloned()
+                    .ok_or(PointInTimeError::CanonicalEncoding)?,
+                provider_instrument_id: value.provider_instrument_id().clone(),
+                feed: value.feed().clone(),
+                interval: value.interval().clone(),
+                adjustment: value.adjustment(),
+                timestamp_basis: value.time_semantics().timestamp_basis(),
+                session: value.time_semantics().session().cloned(),
+                nominal_ruleset: value
+                    .time_semantics()
+                    .nominal_daily_date()
+                    .map(|date| date.ruleset().clone()),
+                effective,
+            }),
+            ResearchObservation::FundNav(value) => Ok(Self::FundNav {
+                source_id,
+                provider_product: value.provider_product().clone(),
+                provider_channel: value.provider_channel().clone(),
+                instrument_id: required_instrument()?,
+                provider_instrument_id: value.provider_instrument_id().clone(),
+                nav_date: value.nav_date(),
+                valuation_basis: value.valuation_basis(),
+                currency: value.currency(),
+            }),
+            ResearchObservation::MarketCalendar(value) => Ok(Self::MarketCalendar {
+                source_id,
+                venue_id: provenance.venue_id().cloned(),
+                scope: value.scope().clone(),
+                coverage: matches!(
+                    value.payload(),
+                    market_squawk_domain::MarketCalendarPayload::Coverage { .. }
+                ),
                 effective,
             }),
             ResearchObservation::PortfolioPosition(value) => Ok(Self::PortfolioPosition {
@@ -347,6 +416,10 @@ impl ObservationFamilyKey {
                 instrument_id: provenance.instrument_id(),
                 account_id: value.account_id().clone(),
                 source_record_id: value.source_record_id().clone(),
+            }),
+            ResearchObservation::CorporateActionSource(_) => Ok(Self::CorporateActionSource {
+                source_id,
+                source_record: provenance.source_identifier().clone(),
             }),
             ResearchObservation::CorporateAction(_) => Ok(Self::CorporateAction {
                 source_id,
@@ -377,8 +450,12 @@ impl fmt::Display for ObservationFamilyKey {
             Self::Filing { .. } => "filing",
             Self::Fundamental { .. } => "fundamental",
             Self::Macro { .. } => "macro",
+            Self::MarketBar { .. } => "market_bar",
+            Self::FundNav { .. } => "fund_nav",
+            Self::MarketCalendar { .. } => "market_calendar",
             Self::PortfolioPosition { .. } => "portfolio_position",
             Self::Transaction { .. } => "transaction",
+            Self::CorporateActionSource { .. } => "corporate_action_source",
             Self::CorporateAction { .. } => "corporate_action",
             Self::UniverseMembership { .. } => "universe_membership",
             Self::AlternativeData { .. } => "alternative_data",
@@ -391,8 +468,12 @@ pub(super) const fn observation_context(observation: &ResearchObservation) -> &R
         ResearchObservation::Filing(value) => value.context(),
         ResearchObservation::Fundamental(value) => value.context(),
         ResearchObservation::Macro(value) => value.context(),
+        ResearchObservation::MarketBar(value) => value.context(),
+        ResearchObservation::FundNav(value) => value.context(),
+        ResearchObservation::MarketCalendar(value) => value.context(),
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
+        ResearchObservation::CorporateActionSource(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
         ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),

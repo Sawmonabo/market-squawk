@@ -201,23 +201,54 @@ impl ExternalOnnxRuntimeBackend {
             model_bytes,
             fallback.policy.input_shape(),
             input_elements,
+            fallback.policy.output_shape().iter().product(),
             fallback.policy.inference_deadline(),
             &runtime.library_path,
             runtime.library_digest,
             &runtime.runtime_version,
             runtime.platform.wire_id(),
         )
-        .map_err(|_| ExternalOnnxRuntimeError::WarmUp)?;
-        let tract_warm_up = fallback.evidence.warm_up_score();
-        let tolerance = 1.0e-5_f32 * tract_warm_up.abs().max(1.0);
-        if !warm_up.is_finite()
-            || (fallback.policy.output_semantics() == ModelOutputSemantics::BinaryProbability
-                && !(0.0..=1.0).contains(&warm_up))
-            || (warm_up - tract_warm_up).abs() > tolerance
-        {
-            return Err(ExternalOnnxRuntimeError::Parity);
+        .map_err(|error| match error {
+            WorkerError::TerminationUncertain => ExternalOnnxRuntimeError::TerminationUncertain,
+            _ => ExternalOnnxRuntimeError::WarmUp,
+        })?;
+        let validation = (|| {
+            let tract_values = fallback
+                .worker
+                .execute_until(
+                    vec![0.0; input_elements],
+                    Instant::now()
+                        .checked_add(fallback.policy.inference_deadline())
+                        .ok_or(ExternalOnnxRuntimeError::WarmUp)?,
+                )
+                .map_err(|error| match error {
+                    WorkerError::TerminationUncertain => {
+                        ExternalOnnxRuntimeError::TerminationUncertain
+                    }
+                    _ => ExternalOnnxRuntimeError::WarmUp,
+                })?;
+            if warm_up.len() != tract_values.len() {
+                return Err(ExternalOnnxRuntimeError::Parity);
+            }
+            for (warm_up, tract_warm_up) in warm_up.iter().zip(tract_values) {
+                let tolerance = 1.0e-5_f32 * tract_warm_up.abs().max(1.0);
+                if !warm_up.is_finite()
+                    || (fallback.policy.output_semantics()
+                        == ModelOutputSemantics::BinaryProbability
+                        && !(0.0..=1.0).contains(warm_up))
+                    || (*warm_up - tract_warm_up).abs() > tolerance
+                {
+                    return Err(ExternalOnnxRuntimeError::Parity);
+                }
+            }
+            runtime.revalidate()
+        })();
+        if let Err(error) = validation {
+            worker
+                .retire()
+                .map_err(|_| ExternalOnnxRuntimeError::TerminationUncertain)?;
+            return Err(error);
         }
-        runtime.revalidate()?;
         let output_identity = Arc::new(ModelOutputIdentity::from_metadata(fallback.metadata()));
         Ok(Self {
             fallback: Arc::clone(fallback),
@@ -235,17 +266,37 @@ impl ExternalOnnxRuntimeBackend {
 }
 
 impl InferenceBackend for ExternalOnnxRuntimeBackend {
+    fn retire(&self) -> Result<(), InferenceError> {
+        self.worker.retire().map_err(worker_inference_error)?;
+        self.fallback.retire()
+    }
+
+    fn infer_research(
+        &self,
+        input: &crate::native::ResearchForecastInput<'_>,
+    ) -> Result<crate::native::ResearchForecastOutput, InferenceError> {
+        self.fallback.infer_research(input)
+    }
+
     fn metadata(&self) -> &ModelMetadata {
         self.fallback.metadata()
     }
 
     fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError> {
+        if self.fallback.policy.forecast_horizons().is_some() {
+            return Err(InferenceError::OnnxRuntimeFailure);
+        }
         let normalized = normalize_input(self.metadata(), input)?;
         let deadlines = RuntimeDeadlines::from_budget(Instant::now(), self.worker.deadline())
             .ok_or(InferenceError::OnnxDeadlineExceeded)?;
         let fallback_input = normalized.clone();
         let score = match self.worker.execute_until(normalized, deadlines.external) {
-            Ok(score) => f64::from(score),
+            Ok(values) => {
+                let [score] = values.as_slice() else {
+                    return Err(InferenceError::OnnxRuntimeFailure);
+                };
+                f64::from(*score)
+            }
             Err(error) => {
                 authorize_optional_fallback(error)?;
                 return self
@@ -332,6 +383,8 @@ pub enum ExternalOnnxRuntimeError {
     Session,
     #[error("external ONNX Runtime warm-up failed")]
     WarmUp,
+    #[error("ONNX worker termination could not be confirmed")]
+    TerminationUncertain,
     #[error("external ONNX Runtime warm-up differs from tract")]
     Parity,
     #[error("common ONNX graph policy failed: {0}")]

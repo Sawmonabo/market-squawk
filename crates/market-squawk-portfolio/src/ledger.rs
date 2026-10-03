@@ -1,6 +1,12 @@
 //! Deterministic immutable portfolio revision publication.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+#[path = "snapshot.rs"]
+pub(crate) mod snapshot;
+use snapshot::LedgerSnapshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::evidence::{CorporateActionBinding, PortfolioRevision, RevisionEvidence, ValuationSet};
 use crate::publication::build_revision;
@@ -22,8 +28,7 @@ pub struct PortfolioLedger {
     pub(crate) account_id: AccountId,
     pub(crate) base_currency: Currency,
     pub(crate) limits: PortfolioLimits,
-    pub(crate) active_entries: BTreeMap<SourceIdentifier, LedgerEntry>,
-    pub(crate) seen_revisions: BTreeSet<(SourceIdentifier, u32)>,
+    pub(crate) snapshot: LedgerSnapshot,
     pub(crate) plan: Option<CorporateActionPlan>,
     pub(crate) history: Vec<PortfolioRevision>,
 }
@@ -46,8 +51,7 @@ impl PortfolioLedger {
             account_id,
             base_currency,
             limits,
-            active_entries: BTreeMap::new(),
-            seen_revisions: BTreeSet::new(),
+            snapshot: LedgerSnapshot::empty(),
             plan: None,
             history: Vec::new(),
         })
@@ -71,6 +75,17 @@ impl PortfolioLedger {
         valuation: ValuationSet,
         evidence: RevisionEvidence,
     ) -> Result<PortfolioRevision, PortfolioError> {
+        if let Some((scratch, spill_bytes)) = self.snapshot.disk_policy() {
+            return self.try_apply_stream(
+                entries.into_iter().map(Ok),
+                corporate_actions,
+                valuation,
+                evidence,
+                scratch,
+                spill_bytes,
+                &CancellationToken::new(),
+            );
+        }
         let candidate_plan = next_plan(self.plan.as_ref(), corporate_actions)?;
         self.validate_bindings(&entries, candidate_plan.as_ref(), &valuation, &evidence)?;
         if entries.len() > self.limits.max_transactions {
@@ -80,43 +95,71 @@ impl PortfolioLedger {
                 limit: self.limits.max_transactions,
             });
         }
-        entries.sort_unstable_by(|left, right| {
-            left.account_id
-                .cmp(&right.account_id)
-                .then_with(|| left.occurred_at.cmp(&right.occurred_at))
-                .then_with(|| left.source.cmp(&right.source))
-                .then_with(|| {
-                    left.transaction
-                        .transaction_id
-                        .cmp(&right.transaction.transaction_id)
-                })
-                .then_with(|| {
-                    left.transaction
-                        .revision
-                        .get()
-                        .cmp(&right.transaction.revision.get())
-                })
-        });
-        let mut candidate_entries = self.active_entries.clone();
-        let mut candidate_seen = self.seen_revisions.clone();
+        entries.sort_unstable_by(snapshot::compare_entries);
+        let (mut active, mut seen) = self.snapshot.memory_candidate()?;
         for entry in entries {
-            admit_entry(
-                &mut candidate_entries,
-                &mut candidate_seen,
-                entry,
-                self.limits,
-            )?;
+            admit_entry(&mut active, &mut seen, entry, self.limits)?;
         }
+        let candidate = LedgerSnapshot::from_memory(active, seen, self.limits)?;
+        self.publish(
+            candidate,
+            candidate_plan,
+            valuation,
+            evidence,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// Applies a fallible entry stream using private disk-backed transaction and revision indexes.
+    /// The complete immutable index stays owned by the returned revision and its restored ledger.
+    /// The original accounting engine and canonical revision hash are shared with `try_apply`.
+    ///
+    /// # Errors
+    /// Rejects the same financial/evidence errors as `try_apply`, input failures, cancellation,
+    /// exhausted temporary disk capacity, and corrupt or unavailable scratch storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_apply_stream(
+        &mut self,
+        entries: impl IntoIterator<Item = Result<LedgerEntry, PortfolioError>>,
+        corporate_actions: Option<&CorporateActionPlan>,
+        valuation: ValuationSet,
+        evidence: RevisionEvidence,
+        scratch: Arc<market_squawk_data::OperationScratchDirectory>,
+        max_spill_bytes: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<PortfolioRevision, PortfolioError> {
+        let candidate_plan = next_plan(self.plan.as_ref(), corporate_actions)?;
+        self.validate_bindings(&[], candidate_plan.as_ref(), &valuation, &evidence)?;
+        let candidate = self.snapshot.apply_disk(
+            entries,
+            self.account_id,
+            evidence.as_of,
+            self.limits,
+            scratch,
+            max_spill_bytes,
+            cancellation,
+        )?;
+        self.publish(candidate, candidate_plan, valuation, evidence, cancellation)
+    }
+
+    fn publish(
+        &mut self,
+        candidate: LedgerSnapshot,
+        candidate_plan: Option<CorporateActionPlan>,
+        valuation: ValuationSet,
+        evidence: RevisionEvidence,
+        cancellation: &CancellationToken,
+    ) -> Result<PortfolioRevision, PortfolioError> {
         let revision = build_revision(
             self.account_id,
             self.base_currency,
             self.limits,
-            &candidate_entries,
-            &candidate_seen,
+            &candidate,
             candidate_plan.as_ref(),
             self.history.last(),
             valuation,
             evidence,
+            cancellation,
         )?;
         if self.history.len() >= self.limits.max_history {
             return Err(PortfolioError::LimitExceeded {
@@ -125,8 +168,8 @@ impl PortfolioLedger {
                 limit: self.limits.max_history,
             });
         }
-        self.active_entries = candidate_entries;
-        self.seen_revisions = candidate_seen;
+        snapshot::check_cancelled(cancellation)?;
+        self.snapshot = candidate;
         self.plan = candidate_plan;
         self.history.push(revision.clone());
         Ok(revision)
@@ -198,8 +241,8 @@ impl PortfolioLedger {
             return Ok(None);
         };
         let current = self
-            .active_entries
-            .get(evidence.broker_transaction_id())
+            .snapshot
+            .get(evidence.broker_transaction_id())?
             .ok_or(PortfolioError::SupersessionMismatch)?;
         let current_evidence = current
             .normalized_evidence
@@ -211,6 +254,14 @@ impl PortfolioLedger {
             return Err(PortfolioError::SupersessionMismatch);
         }
         Ok(Some(current.transaction.revision))
+    }
+
+    /// Releases older full materializations after their immutable publication owner has retained
+    /// any readers. The exact latest predecessor and complete active transaction lineage remain.
+    pub fn retain_latest_materialization(&mut self) {
+        if self.history.len() > 1 {
+            self.history.drain(..self.history.len() - 1);
+        }
     }
 
     /// Returns immutable published revision history in publication order.
@@ -233,7 +284,7 @@ impl PortfolioLedger {
                 entry.account_id != self.account_id || entry.occurred_at > evidence.as_of
             })
             || plan.is_some_and(|candidate| {
-                candidate.knowledge_cutoff() > evidence.as_of
+                candidate.knowledge_cutoff() > evidence.knowledge_cutoff
                     || candidate.valuation_cutoff() > evidence.as_of
             })
         {
@@ -306,20 +357,30 @@ fn translate_task10(
             } else {
                 matches!(side, TradeSide::Sell | TradeSide::SellShort)
             };
-            let method_matches = match transaction.lot_method() {
-                Some(NormalizedPortfolioLotMethod::Fifo) => {
-                    matches!(lot_selection, crate::LotSelection::Fifo)
+            // Opening a long/short lot does not dispose any prior inventory. Its source lot
+            // method remains retained in normalized evidence, but it cannot require fabricated
+            // specific-lot identifiers; only a disposal applies the selection policy.
+            let method_matches = if matches!(side, TradeSide::Buy | TradeSide::SellShort) {
+                true
+            } else {
+                match transaction.lot_method() {
+                    Some(NormalizedPortfolioLotMethod::Fifo) => {
+                        matches!(lot_selection, crate::LotSelection::Fifo)
+                    }
+                    Some(NormalizedPortfolioLotMethod::SpecificIdentification) => {
+                        matches!(
+                            lot_selection,
+                            crate::LotSelection::SpecificIdentification(_)
+                        )
+                    }
+                    Some(NormalizedPortfolioLotMethod::Lifo) => {
+                        matches!(lot_selection, crate::LotSelection::Lifo)
+                    }
+                    Some(NormalizedPortfolioLotMethod::AverageCost) => {
+                        matches!(lot_selection, crate::LotSelection::AverageCost)
+                    }
+                    None => false,
                 }
-                Some(NormalizedPortfolioLotMethod::SpecificIdentification) => {
-                    matches!(
-                        lot_selection,
-                        crate::LotSelection::SpecificIdentification(_)
-                    )
-                }
-                Some(
-                    NormalizedPortfolioLotMethod::Lifo | NormalizedPortfolioLotMethod::AverageCost,
-                )
-                | None => false,
             };
             if !side_matches_sign || !method_matches {
                 return Err(PortfolioError::AmbiguousNormalizedRecord);
@@ -407,25 +468,12 @@ fn admit_entry(
     if !seen.insert(key) {
         return Err(PortfolioError::DuplicateTransactionRevision);
     }
-    match active.get(&entry.transaction.transaction_id) {
-        Some(current) => {
-            let current_revision = current.transaction.revision;
-            match entry.transaction.supersedes {
-                None => return Err(PortfolioError::SupersessionRequired),
-                Some(prior) if prior != current_revision => {
-                    return Err(PortfolioError::SupersessionMismatch);
-                }
-                Some(_) if entry.transaction.revision.get() <= current_revision.get() => {
-                    return Err(PortfolioError::NonIncreasingRevision);
-                }
-                Some(_) => {}
-            }
-        }
-        None if entry.transaction.supersedes.is_some() => {
-            return Err(PortfolioError::SupersessionMismatch);
-        }
-        None => {}
-    }
+    validate_supersession(
+        active
+            .get(&entry.transaction.transaction_id)
+            .map(|value| value.transaction.revision),
+        &entry,
+    )?;
     if active.len() >= limits.max_transactions
         && !active.contains_key(&entry.transaction.transaction_id)
     {
@@ -437,4 +485,22 @@ fn admit_entry(
     }
     active.insert(entry.transaction.transaction_id.clone(), entry);
     Ok(())
+}
+
+fn validate_supersession(
+    current: Option<market_squawk_domain::RevisionNumber>,
+    entry: &LedgerEntry,
+) -> Result<(), PortfolioError> {
+    match current {
+        Some(current) => match entry.transaction.supersedes {
+            None => Err(PortfolioError::SupersessionRequired),
+            Some(prior) if prior != current => Err(PortfolioError::SupersessionMismatch),
+            Some(_) if entry.transaction.revision.get() <= current.get() => {
+                Err(PortfolioError::NonIncreasingRevision)
+            }
+            Some(_) => Ok(()),
+        },
+        None if entry.transaction.supersedes.is_some() => Err(PortfolioError::SupersessionMismatch),
+        None => Ok(()),
+    }
 }

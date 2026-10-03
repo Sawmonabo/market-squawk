@@ -1,17 +1,19 @@
 //! Stable identities for build specifications, selectors, policies, and output rows.
 
 use market_squawk_domain::{
-    AvailabilityEvidence, EvidenceDigest, ResearchTemporalCoordinate, SourceId, SourceIdentifier,
+    AvailabilityEvidence, EvidenceDigest, FundamentalPeriod, ResearchTemporalCoordinate,
+    SourceIdentifier, Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::model::{
-    ComponentAdjustmentEvidence, ComponentValue, DatasetBuildInputs, DatasetBuildPolicy,
-    DatasetBuildRequest, DatasetExample, DatasetSplit, FeatureLabelComponentInput,
+    ComponentAdjustmentEvidence, ComponentValue, DatasetBuildInputs, DatasetBuildLimits,
+    DatasetBuildPolicy, DatasetBuildRequest, DatasetExample, DatasetOutputAuthorization,
+    DatasetSplit, FeatureLabelComponentInput,
 };
 use crate::{
     CorporateActionAdjustment, DatasetId, DatasetManifestRef, ObservationFamilyKey, ResearchUse,
-    Sha256Digest, UniverseMembership,
+    ResearchUseLimits, RightsBasis, Sha256Digest, UniverseMembership,
 };
 
 pub(super) fn family_key_digest(family: &ObservationFamilyKey) -> Sha256Digest {
@@ -24,8 +26,8 @@ pub(super) fn family_key_digest(family: &ObservationFamilyKey) -> Sha256Digest {
 pub(super) fn policy_digest(policy: &DatasetBuildPolicy) -> Sha256Digest {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/dataset-build-policy/v1");
-    for boundary in policy.split().boundaries() {
-        hash.update(boundary.unix_nanos().to_be_bytes());
+    for boundary in policy.split().native_boundaries() {
+        encode_temporal(&mut hash, &boundary);
     }
     hash.update(policy.point_in_time().version().get().to_be_bytes());
     hash.update([match policy.point_in_time().revision_mode() {
@@ -40,19 +42,48 @@ pub(super) fn policy_digest(policy: &DatasetBuildPolicy) -> Sha256Digest {
     }]);
     hash.update([policy.missing_values().tag()]);
     put_str(&mut hash, policy.implementation_revision().as_str());
+    if let Some(study) = policy.study_policy() {
+        hash.update([1]);
+        encode_study_policy(&mut hash, study);
+    } else {
+        hash.update([0]);
+    }
     Sha256Digest::new(hash.finalize().into())
 }
 
 pub(super) fn universe_contract_digest(inputs: &DatasetBuildInputs) -> Sha256Digest {
     let mut memberships = inputs
         .universe_memberships()
-        .iter()
+        .into_iter()
+        .flatten()
         .map(membership_digest)
         .collect::<Vec<_>>();
     memberships.sort_unstable();
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/dataset-universe-contract/v1");
     put_str(&mut hash, inputs.universe_id().as_str());
+    hash.update([inputs.population_basis() as u8]);
+    put_len(&mut hash, inputs.population_member_count());
+    if let Some(population) = inputs.current_population() {
+        hash.update(population.content_digest().bytes());
+        hash.update(population.audit_digest().bytes());
+        hash.update(population.research_use_digest().bytes());
+        hash.update(population.source_population_digest().bytes());
+        hash.update(population.source_cutoff().unix_nanos().to_be_bytes());
+        hash.update(population.membership_as_of().unix_nanos().to_be_bytes());
+        hash.update(population.financial_profile_digest().bytes());
+    }
+    if let Some(partition) = inputs.population_partition() {
+        hash.update([1]);
+        hash.update(partition.partition_digest());
+    } else {
+        hash.update([0]);
+    }
+    put_len(&mut hash, inputs.population_unavailable().len());
+    for value in inputs.population_unavailable() {
+        hash.update(value.instrument_id().as_uuid().as_bytes());
+        hash.update([value.reason() as u8]);
+    }
     put_len(&mut hash, memberships.len());
     for membership in memberships {
         hash.update(membership.bytes());
@@ -68,17 +99,27 @@ pub(super) fn build_spec_digest(
     output_dataset: &DatasetId,
     inputs: &DatasetBuildInputs,
     intended_use: ResearchUse,
-    output_source: &SourceId,
+    research_use_limits: ResearchUseLimits,
+    output_authorization: &DatasetOutputAuthorization,
+    limits: DatasetBuildLimits,
     policy_digest: Sha256Digest,
     universe_digest: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-build-spec/v2");
+    hash.update(b"market-squawk/feature-label-build-spec/v6");
+    if let Some(subject) = inputs.probability_subject() {
+        hash.update(b"probability-subject-composition/v1\0");
+        hash.update(subject.event.digest().bytes());
+        hash.update(subject.subject.as_uuid().as_bytes());
+        hash.update(subject.horizon_nanos.get().to_be_bytes());
+    }
     put_str(&mut hash, output_dataset.as_str());
-    put_str(&mut hash, output_source.as_str());
     hash.update(policy_digest.bytes());
     hash.update(universe_digest.bytes());
     hash.update([research_use_tag(intended_use)]);
+    encode_research_use_limits(&mut hash, research_use_limits);
+    encode_output_authorization(&mut hash, output_authorization);
+    encode_build_limits(&mut hash, limits);
     put_len(&mut hash, inputs.parents().len());
     for parent in inputs.parents() {
         encode_manifest(&mut hash, parent);
@@ -95,14 +136,129 @@ pub(super) fn build_spec_digest(
     for example in inputs.examples() {
         put_str(&mut hash, example.example_id());
         hash.update(example.instrument_id().as_uuid().as_bytes());
-        hash.update(example.cutoff_at().unix_nanos().to_be_bytes());
-        hash.update(example.label_cutoff_at().unix_nanos().to_be_bytes());
+        hash.update(example.source_selection_as_of().unix_nanos().to_be_bytes());
+        encode_optional_timestamp(&mut hash, example.label_selection_as_of());
+        encode_temporal(&mut hash, example.decision_coordinate());
+        encode_temporal(&mut hash, example.effective_cutoff());
+        encode_optional_temporal(&mut hash, example.label_effective_cutoff());
+        if let Some(financial) = example.financial_source() {
+            hash.update([1]);
+            hash.update(financial.binding.source_selection_digest().bytes());
+            hash.update(financial.binding.identity_receipt_digest().bytes());
+            hash.update(financial.binding.observed_ordinal().to_be_bytes());
+            hash.update(financial.binding.target_ordinal().to_be_bytes());
+            for row in financial.binding.duration_chain() {
+                hash.update(row.canonical_row_digest().bytes());
+            }
+        } else {
+            hash.update([0]);
+        }
+        encode_named_session_origin(&mut hash, example);
+        if let Some(source) = example.timestamp_history_source() {
+            hash.update(b"original-timestamp-history-example/v1");
+            hash.update(source.digest().bytes());
+        }
+        if let Some(derivation) = example.probability_derivation() {
+            hash.update(b"probability-event-derivation/v1");
+            hash.update(derivation.digest().bytes());
+        }
+        if let Some(plan) = example.source_price_plan() {
+            hash.update([1]);
+            hash.update(plan.content_hash().bytes());
+            hash.update(plan.audit_hash().bytes());
+            // The request constructor requires this original opaque source admission.
+            if let Some(coverage) = plan.source_split_admission() {
+                encode_evidence(&mut hash, coverage.evidence_digest());
+            }
+        } else {
+            hash.update([0]);
+        }
         put_len(&mut hash, example.components().len());
         for component in example.components() {
             encode_component(&mut hash, component);
         }
     }
     Sha256Digest::new(hash.finalize().into())
+}
+
+fn encode_research_use_limits(hash: &mut Sha256, limits: ResearchUseLimits) {
+    for value in [
+        limits.max_roots(),
+        limits.max_nodes(),
+        limits.max_edges(),
+        limits.max_sources(),
+        limits.max_retained_bytes(),
+    ] {
+        put_len(hash, value);
+    }
+    hash.update(limits.traversal_deadline().as_nanos().to_be_bytes());
+    hash.update(limits.permit_lifetime().as_nanos().to_be_bytes());
+}
+
+fn encode_output_authorization(hash: &mut Sha256, authorization: &DatasetOutputAuthorization) {
+    put_str(hash, authorization.source_id().as_str());
+    let basis = authorization.basis();
+    hash.update([match basis {
+        RightsBasis::ReviewedTerms(_) => 1,
+        RightsBasis::UserOwnedLocal(_) => 2,
+        RightsBasis::ImportedUserInput(_) => 3,
+    }]);
+    put_str(hash, basis.reference());
+    encode_evidence(hash, basis.digest());
+    match basis.root_identity_digest() {
+        Some(digest) => {
+            hash.update([1]);
+            encode_evidence(hash, digest);
+        }
+        None => hash.update([0]),
+    }
+    match basis.imported_user_input_evidence() {
+        Some(evidence) => {
+            hash.update([1]);
+            encode_evidence(hash, evidence.admitted_input_set_digest());
+            encode_evidence(hash, evidence.generated_manifest_digest());
+            encode_evidence(hash, evidence.local_admission_evidence());
+            encode_evidence(hash, evidence.workspace_receipt_evidence());
+            encode_evidence(hash, evidence.import_receipt_evidence());
+            encode_evidence(hash, evidence.binding_digest());
+        }
+        None => hash.update([0]),
+    }
+    encode_evidence(hash, authorization.authorization_evidence());
+    encode_optional_timestamp(hash, authorization.authorization_expires_at());
+}
+
+fn encode_build_limits(hash: &mut Sha256, limits: DatasetBuildLimits) {
+    for value in [
+        limits.max_input_rows(),
+        limits.max_examples(),
+        limits.max_components_per_example(),
+        limits.max_output_rows(),
+        limits.max_retained_bytes(),
+    ] {
+        put_len(hash, value);
+    }
+    hash.update(limits.max_spill_bytes().to_be_bytes());
+    hash.update(limits.max_duration().as_nanos().to_be_bytes());
+
+    let point_in_time = limits.point_in_time();
+    for value in [
+        point_in_time.max_candidates(),
+        point_in_time.max_families(),
+        point_in_time.max_conflicts(),
+        point_in_time.max_result_rows(),
+        point_in_time.max_retained_bytes(),
+    ] {
+        put_len(hash, value);
+    }
+
+    let universe = limits.universe();
+    put_len(hash, universe.max_candidates());
+    put_len(hash, universe.max_retained_bytes());
+
+    let corporate_actions = limits.corporate_actions();
+    put_len(hash, corporate_actions.max_actions().get());
+    put_len(hash, corporate_actions.max_retained_bytes().get());
 }
 
 #[allow(
@@ -123,14 +279,30 @@ pub(super) fn row_lineage_digest(
     action_audit: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-row-lineage/v2");
+    hash.update(b"market-squawk/feature-label-row-lineage/v3");
     hash.update(request.build_spec_digest().digest().bytes());
     hash.update(request.policy_digest().bytes());
     hash.update(request.universe_digest().bytes());
     put_str(&mut hash, example.example_id());
     hash.update(example.instrument_id().as_uuid().as_bytes());
-    hash.update(example.cutoff_at().unix_nanos().to_be_bytes());
-    hash.update(example.label_cutoff_at().unix_nanos().to_be_bytes());
+    hash.update(example.source_selection_as_of().unix_nanos().to_be_bytes());
+    encode_optional_timestamp(&mut hash, example.label_selection_as_of());
+    encode_temporal(&mut hash, example.decision_coordinate());
+    encode_temporal(&mut hash, example.effective_cutoff());
+    encode_optional_temporal(&mut hash, example.label_effective_cutoff());
+    if let Some(financial) = example.financial_source() {
+        hash.update([1]);
+        hash.update(financial.binding.source_selection_digest().bytes());
+        hash.update(financial.binding.identity_receipt_digest().bytes());
+        hash.update(financial.binding.observed_ordinal().to_be_bytes());
+        hash.update(financial.binding.target_ordinal().to_be_bytes());
+        for row in financial.binding.duration_chain() {
+            hash.update(row.canonical_row_digest().bytes());
+        }
+    } else {
+        hash.update([0]);
+    }
+    encode_named_session_origin(&mut hash, example);
     put_str(&mut hash, split.name());
     encode_component(&mut hash, component);
     hash.update(selection_content.bytes());
@@ -159,12 +331,20 @@ fn membership_digest(membership: &UniverseMembership) -> Sha256Digest {
     Sha256Digest::new(hash.finalize().into())
 }
 
-fn encode_component(hash: &mut Sha256, component: &FeatureLabelComponentInput) {
+pub(super) fn encode_component(hash: &mut Sha256, component: &FeatureLabelComponentInput) {
     hash.update([component.spec().kind().tag()]);
     hash.update([component.spec().scope().tag()]);
     hash.update([component.spec().corporate_actions().tag()]);
     put_str(hash, component.spec().name());
     hash.update(component.spec().version().get().to_be_bytes());
+    encode_temporal(hash, component.selection_effective_cutoff());
+    match component.label_selection_effective_cutoff() {
+        Some(label) => {
+            hash.update([1]);
+            encode_temporal(hash, label);
+        }
+        None => hash.update([0]),
+    }
     match component.value() {
         ComponentValue::Float {
             value,
@@ -219,33 +399,87 @@ fn encode_component(hash: &mut Sha256, component: &FeatureLabelComponentInput) {
     }
 }
 
+fn encode_company_subject(
+    hash: &mut Sha256,
+    subject: &market_squawk_domain::CompanyObservationSubject,
+) {
+    match subject {
+        market_squawk_domain::CompanyObservationSubject::Issuer(issuer) => {
+            hash.update([1]);
+            put_str(hash, issuer.as_str());
+        }
+        market_squawk_domain::CompanyObservationSubject::Instrument(instrument) => {
+            hash.update([2]);
+            hash.update(instrument.as_uuid().as_bytes());
+        }
+    }
+}
+
 fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
     match family {
+        ObservationFamilyKey::MarketCalendar {
+            source_id,
+            venue_id,
+            scope,
+            coverage,
+            effective,
+        } => {
+            hash.update([12]);
+            put_str(hash, source_id.as_str());
+            match venue_id {
+                Some(venue) => {
+                    hash.update([1]);
+                    put_str(hash, venue.as_str());
+                }
+                None => hash.update([0]),
+            }
+            put_str(hash, scope.provider_product.as_source_identifier().as_str());
+            put_str(hash, scope.provider_channel.as_source_identifier().as_str());
+            put_str(
+                hash,
+                scope
+                    .source_contract_revision
+                    .as_source_identifier()
+                    .as_str(),
+            );
+            encode_calendar_text(hash, &scope.native_market_type);
+            put_str(hash, scope.native_product.as_str());
+            encode_calendar_text(hash, &scope.requested_timezone);
+            hash.update([match scope.date_scope {
+                market_squawk_domain::MarketCalendarDateScope::RequestedRange { .. } => 1,
+                market_squawk_domain::MarketCalendarDateScope::ReturnedDate { .. } => 2,
+            }]);
+            for date in [scope.date_scope.start_date(), scope.date_scope.end_date()] {
+                hash.update(date.year().to_be_bytes());
+                hash.update([date.month(), date.day()]);
+            }
+            encode_evidence(hash, scope.request_evidence.content_digest());
+            hash.update([u8::from(*coverage)]);
+            encode_temporal(hash, effective);
+        }
         ObservationFamilyKey::Filing {
             source_id,
-            instrument_id,
+            subject,
             accession,
         } => {
             hash.update([1]);
             put_str(hash, source_id.as_str());
-            hash.update(instrument_id.as_uuid().as_bytes());
+            encode_company_subject(hash, subject);
             put_str(hash, accession.as_str());
         }
         ObservationFamilyKey::Fundamental {
             source_id,
-            instrument_id,
-            source_record,
+            subject,
             concept,
             unit,
-            effective,
+            period,
         } => {
             hash.update([2]);
             put_str(hash, source_id.as_str());
-            hash.update(instrument_id.as_uuid().as_bytes());
-            put_str(hash, source_record.as_str());
+            encode_company_subject(hash, subject);
             put_str(hash, concept.as_str());
             put_str(hash, unit.as_str());
-            encode_temporal(hash, effective);
+            encode_fundamental_period(hash, *period);
         }
         ObservationFamilyKey::Macro {
             source_id,
@@ -256,6 +490,95 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
             put_str(hash, source_id.as_str());
             put_str(hash, series.as_str());
             encode_temporal(hash, effective);
+        }
+        ObservationFamilyKey::MarketBar {
+            source_id,
+            instrument_id,
+            venue_id,
+            provider_instrument_id,
+            feed,
+            interval,
+            adjustment,
+            timestamp_basis,
+            session,
+            nominal_ruleset,
+            effective,
+        } => {
+            hash.update([9]);
+            put_str(hash, source_id.as_str());
+            hash.update(instrument_id.as_uuid().as_bytes());
+            put_str(hash, venue_id.as_str());
+            put_str(hash, provider_instrument_id.as_str());
+            put_str(hash, feed.as_str());
+            put_str(hash, interval.as_str());
+            hash.update([match adjustment {
+                market_squawk_domain::MarketBarAdjustment::Raw => 1,
+                market_squawk_domain::MarketBarAdjustment::Split => 2,
+                market_squawk_domain::MarketBarAdjustment::Dividend => 3,
+                market_squawk_domain::MarketBarAdjustment::SpinOff => 4,
+                market_squawk_domain::MarketBarAdjustment::All => 5,
+            }]);
+            match timestamp_basis {
+                Some(basis) => hash.update([
+                    1,
+                    match basis {
+                        market_squawk_domain::BarTimestampBasis::PeriodStart => 1,
+                        market_squawk_domain::BarTimestampBasis::PeriodEnd => 2,
+                    },
+                ]),
+                None => hash.update([0]),
+            }
+            match session {
+                Some(value) => {
+                    hash.update([
+                        1,
+                        match value.kind() {
+                            market_squawk_domain::MarketBarSessionKind::Regular => 1,
+                            market_squawk_domain::MarketBarSessionKind::Extended => 2,
+                            market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+                            market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+                        },
+                    ]);
+                    put_str(hash, value.ruleset().as_str());
+                    hash.update([match value.evidence().algorithm() {
+                        market_squawk_domain::DigestAlgorithm::Sha256 => 1,
+                        market_squawk_domain::DigestAlgorithm::Blake3 => 2,
+                    }]);
+                    hash.update(value.evidence().bytes());
+                }
+                None => hash.update([0]),
+            }
+            match nominal_ruleset {
+                Some(value) => {
+                    hash.update([1]);
+                    put_str(hash, value.as_str());
+                }
+                None => hash.update([0]),
+            }
+            encode_temporal(hash, effective);
+        }
+        ObservationFamilyKey::FundNav {
+            source_id,
+            provider_product,
+            provider_channel,
+            instrument_id,
+            provider_instrument_id,
+            nav_date,
+            valuation_basis,
+            currency,
+        } => {
+            hash.update([10]);
+            put_str(hash, source_id.as_str());
+            put_str(hash, provider_product.as_source_identifier().as_str());
+            put_str(hash, provider_channel.as_source_identifier().as_str());
+            hash.update(instrument_id.as_uuid().as_bytes());
+            put_str(hash, provider_instrument_id.as_str());
+            hash.update(nav_date.year().to_be_bytes());
+            hash.update([nav_date.month(), nav_date.day()]);
+            hash.update([match valuation_basis {
+                market_squawk_domain::FundNavValuationBasis::PerShare => 1,
+            }]);
+            put_str(hash, currency.as_str());
         }
         ObservationFamilyKey::PortfolioPosition {
             source_id,
@@ -286,6 +609,15 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
             }
             put_str(hash, account_id.as_str());
             put_str(hash, source_record_id.as_str());
+        }
+        ObservationFamilyKey::CorporateActionSource {
+            source_id,
+            source_record,
+        } => {
+            // Source query/disposition identity grants no instrument or accounting authority.
+            hash.update([15]);
+            put_str(hash, source_id.as_str());
+            put_str(hash, source_record.as_str());
         }
         ObservationFamilyKey::CorporateAction {
             source_id,
@@ -334,6 +666,21 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
     }
 }
 
+fn encode_calendar_text(
+    hash: &mut Sha256,
+    field: &market_squawk_domain::MarketCalendarField<market_squawk_domain::MarketSourceText>,
+) {
+    use market_squawk_domain::MarketCalendarField;
+    match field {
+        MarketCalendarField::Reported(value) => {
+            hash.update([1]);
+            put_str(hash, value.as_str());
+        }
+        MarketCalendarField::Missing => hash.update([2]),
+        MarketCalendarField::SourceNull => hash.update([3]),
+    }
+}
+
 fn encode_temporal(hash: &mut Sha256, coordinate: &ResearchTemporalCoordinate) {
     if let Some(timestamp) = coordinate.exact_timestamp() {
         hash.update([1]);
@@ -353,7 +700,24 @@ fn encode_temporal(hash: &mut Sha256, coordinate: &ResearchTemporalCoordinate) {
     }
 }
 
-fn encode_manifest(hash: &mut Sha256, manifest: &DatasetManifestRef) {
+fn encode_fundamental_period(hash: &mut Sha256, period: FundamentalPeriod) {
+    match period {
+        FundamentalPeriod::Instant { instant } => {
+            hash.update([1]);
+            hash.update(instant.year().to_be_bytes());
+            hash.update([instant.month(), instant.day()]);
+        }
+        FundamentalPeriod::Duration { start, end } => {
+            hash.update([2]);
+            hash.update(start.year().to_be_bytes());
+            hash.update([start.month(), start.day()]);
+            hash.update(end.year().to_be_bytes());
+            hash.update([end.month(), end.day()]);
+        }
+    }
+}
+
+pub(super) fn encode_manifest(hash: &mut Sha256, manifest: &DatasetManifestRef) {
     put_str(hash, manifest.dataset_id().as_str());
     hash.update(manifest.manifest_version().to_be_bytes());
     put_str(hash, manifest.schema().name());
@@ -435,4 +799,95 @@ fn put_str(hash: &mut Sha256, value: &str) {
 
 fn put_len(hash: &mut Sha256, value: usize) {
     hash.update(u64::try_from(value).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+pub(super) fn source_snapshot_digest(request: &DatasetBuildRequest) -> Option<Sha256Digest> {
+    Some(source_snapshot_from_parents(
+        request.policy().study_policy()?.snapshot_as_of(),
+        request.inputs().parents(),
+    ))
+}
+pub(super) fn source_snapshot_from_parents(
+    snapshot_as_of: Timestamp,
+    parents: &[DatasetManifestRef],
+) -> Sha256Digest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/dataset-source-snapshot/v1");
+    hash.update(snapshot_as_of.unix_nanos().to_be_bytes());
+    put_len(&mut hash, parents.len());
+    for parent in parents {
+        encode_manifest(&mut hash, parent);
+    }
+    Sha256Digest::new(hash.finalize().into())
+}
+
+pub(super) fn study_policy_digest(policy: &super::DatasetStudyPolicy) -> Sha256Digest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/dataset-study-policy/v1");
+    encode_study_policy(&mut hash, policy);
+    Sha256Digest::new(hash.finalize().into())
+}
+fn encode_study_policy(hash: &mut Sha256, policy: &super::DatasetStudyPolicy) {
+    hash.update([match policy.basis() {
+        market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown => 1,
+        market_squawk_domain::HistoricalStudyBasis::RetrospectiveFrozenSnapshot => 2,
+    }]);
+    hash.update([match policy.purpose() {
+        super::DatasetBuildPurpose::Training => 1,
+        super::DatasetBuildPurpose::StudyInputs => 2,
+    }]);
+    hash.update(policy.snapshot_as_of().unix_nanos().to_be_bytes());
+    if let Some(lag) = policy.decision_lag() {
+        hash.update([1]);
+        hash.update(lag.as_nanos().to_be_bytes());
+    } else {
+        hash.update([0]);
+    }
+    match policy.target_horizon() {
+        super::DatasetTargetHorizon::ExactElapsed(value) => {
+            hash.update([1]);
+            hash.update(value.as_nanos().to_be_bytes());
+        }
+        super::DatasetTargetHorizon::FiscalPeriods {
+            cadence,
+            periods_ahead,
+        } => {
+            hash.update([2]);
+            hash.update([match cadence {
+                market_squawk_domain::FundamentalCadence::Annual => 1,
+                market_squawk_domain::FundamentalCadence::Quarterly => 4,
+                _ => 0,
+            }]);
+            hash.update(periods_ahead.get().to_be_bytes());
+        }
+    }
+    put_len(hash, policy.limitations().len());
+    for limitation in policy.limitations() {
+        hash.update([match limitation {
+            market_squawk_domain::HistoricalStudyLimitation::HistoricalRevisionCoverageUnproven => {
+                1
+            }
+            market_squawk_domain::HistoricalStudyLimitation::LaterVintageInputs => 2,
+            market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort => 3,
+            market_squawk_domain::HistoricalStudyLimitation::SimulatedAvailability => 4,
+        }]);
+    }
+}
+
+fn encode_optional_temporal(hash: &mut Sha256, value: Option<&ResearchTemporalCoordinate>) {
+    if let Some(value) = value {
+        hash.update([1]);
+        encode_temporal(hash, value);
+    } else {
+        hash.update([0]);
+    }
+}
+
+fn encode_named_session_origin(hash: &mut Sha256, example: &DatasetExample) {
+    if let Some(origin) = example.named_session_origin() {
+        hash.update([1]);
+        hash.update(origin.digest().bytes());
+    } else {
+        hash.update([0]);
+    }
 }

@@ -77,11 +77,14 @@
         let mut harness = HealthHarness::new("trusted-time-health-epoch")?;
         harness.accept_health(10, 20, 30, 1_000)?;
         harness.set_time(40, 40)?;
-        harness
-            .session
-            .lease
-            .health_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        harness.session.lease.health.rcu(|health| {
+            let mut updated = (**health).clone();
+            updated.epoch = u64::MAX;
+            if let Some(current) = &mut updated.current {
+                current.epoch = u64::MAX;
+            }
+            updated
+        });
         let source_id = harness.session.source_id().clone();
         let health = harness
             .registry
@@ -159,11 +162,14 @@
     fn terminal_health_epoch_requires_new_source_epoch_and_generation_to_recover() -> TestResult {
         let mut harness = HealthHarness::new("terminal-health-recovery")?;
         harness.accept_health(10, 20, 30, 1_000)?;
-        harness
-            .session
-            .lease
-            .health_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        harness.session.lease.health.rcu(|health| {
+            let mut updated = (**health).clone();
+            updated.epoch = u64::MAX;
+            if let Some(current) = &mut updated.current {
+                current.epoch = u64::MAX;
+            }
+            updated
+        });
         let source_id = harness.session.source_id().clone();
         harness
             .registry
@@ -199,6 +205,12 @@
             harness.timestamp(50)?,
         )?;
         assert!(replacement.epoch > harness.registered.epoch);
+        harness.registry.record_provider_identities(
+            &replacement,
+            &harness.identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let successor = harness.registry.begin_session(
             &replacement,
             SessionId::new(SourceIdentifier::try_from("session-2")?),
@@ -234,11 +246,14 @@
         harness.accept_health(10, 20, 30, 1_000)?;
         harness.registered.epoch = u64::MAX;
         harness.session.epoch = u64::MAX;
-        harness
-            .session
-            .lease
-            .health_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        harness.session.lease.health.rcu(|health| {
+            let mut updated = (**health).clone();
+            updated.epoch = u64::MAX;
+            if let Some(current) = &mut updated.current {
+                current.epoch = u64::MAX;
+            }
+            updated
+        });
         let source_id = harness.session.source_id().clone();
         let entry = harness
             .registry
@@ -315,6 +330,49 @@
             current.try_current_lease(),
             Err(RegistryError::HealthNotQualified)
         ));
+        // Already-admitted observations remain publishable after price freshness expires,
+        // but cannot be newly admitted or outlive actual permission/revocation.
+        for termination in 0..3 {
+            let mut retained = HealthHarness::new_with_quality(
+                "committed-observation-permission",
+                DataQuality::DirectUnverified,
+            )?;
+            retained.accept_health(10, 20, 30, 2_000_000_000)?;
+            retained.set_time(40, 40)?;
+            let current = retained
+                .registry
+                .validate_current_authority(&retained.session)?;
+            let live = current.try_current_lease()?;
+            let identity = current.selected_provider_identity(
+                &VenueId::try_from("coinbase")?,
+                InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+            )?;
+            let admitted_at = retained.timestamp(40)?;
+            let committed = live.commit_provider_observation(identity.clone(), admitted_at)?;
+            retained.set_time(1_100_000_000, 1_100_000_000)?;
+            assert_eq!(
+                live.validate_at(admitted_at),
+                Err(RegistryError::HealthNotQualified)
+            );
+            assert!(
+                live.commit_provider_observation(identity, admitted_at)
+                    .is_err()
+            );
+            committed.validate_publication()?;
+            match termination {
+                0 => retained.set_time(2_000_000_001, 2_000_000_001)?,
+                // At the inclusive wall boundary, monotonic expiry independently rejects.
+                1 => retained.set_time(2_000_000_000, 2_000_000_001)?,
+                _ => {
+                    let at = retained.timestamp(1_100_000_000)?;
+                    retained.registry.end_session(&retained.session, at)?;
+                }
+            }
+            assert_eq!(
+                committed.validate_publication(),
+                Err(RegistryError::HealthNotQualified)
+            );
+        }
         Ok(())
     }
 

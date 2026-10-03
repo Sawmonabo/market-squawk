@@ -9,6 +9,7 @@ mod cross_venue;
 mod exact;
 mod factors;
 mod fundamentals;
+mod harmonics;
 mod liquidity;
 mod macro_features;
 mod metadata;
@@ -55,6 +56,16 @@ pub use fundamentals::{
     FundamentalPeriod, earnings_surprise, free_cash_flow_yield, fundamental_growth, margin,
     valuation_multiple,
 };
+pub use harmonics::{
+    HARMONIC_PATTERN_FEATURE_NAME, HARMONIC_PIVOT_CONFIRMATION_BARS, HARMONIC_PIVOT_COUNT,
+    HARMONIC_TARGET_COUNT, HarmonicBar, HarmonicCompletionZone, HarmonicConfidenceAuthority,
+    HarmonicDirection, HarmonicEvidenceBinding, HarmonicExecutionAuthority, HarmonicFraction,
+    HarmonicPatternError, HarmonicPatternEvidence, HarmonicPatternInput, HarmonicPatternKind,
+    HarmonicPatternQuality, HarmonicPatternRule, HarmonicPivotEvidence, HarmonicPivotKind,
+    HarmonicRatio, HarmonicRatioBand, HarmonicRatioConstraint, HarmonicRatioMeasurement,
+    HarmonicRatioMeasurements, MAX_HARMONIC_BARS, MAX_HARMONIC_PARENT_MANIFESTS, MIN_HARMONIC_BARS,
+    classify_harmonic_pattern,
+};
 pub use liquidity::{
     LiquidityBookView, LiquidityEstimate, LiquidityFeatureError, estimate_market_order,
 };
@@ -75,7 +86,9 @@ pub use registry::{
     LiveFeatureView, MAX_FEATURE_REGISTRY_ENTRIES, MAX_FEATURE_REGISTRY_RETAINED_BYTES,
     RegistrationOutcome,
 };
-pub use returns::{cumulative_return, simple_returns, total_returns};
+pub use returns::{
+    cash_distribution_holding_return, cumulative_return, simple_returns, total_returns,
+};
 pub use risk::{
     AlphaBetaResult, DrawdownResult, alpha_beta, correlation, discrete_expected_shortfall,
     historical_var, information_ratio, maximum_drawdown, parametric_var, sharpe_ratio,

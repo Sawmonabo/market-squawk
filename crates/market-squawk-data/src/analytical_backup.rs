@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::BackupReceipt;
 use crate::authority_transition::evidence::fs::{
-    MaterializedArtifactRoot, VerifiedArtifactInventory, verify_artifact_inventory,
+    VerifiedArtifactInventory, verify_artifact_inventory,
 };
 use crate::authority_transition::evidence::{
     CatalogContentEvidenceDigest, CatalogEvidenceSnapshot, EvidenceError, EvidenceLimits,
@@ -33,7 +33,8 @@ use crate::{
     CatalogError, ManifestCatalogError, ObjectStoreConfig, ParquetObjectStore, ParquetStoreError,
 };
 
-pub(crate) const MAX_RECEIPT_ARTIFACTS: u64 = 100_000;
+// The existing byte-claim ceiling bounds admitted backup/restore I/O, independently of
+// the number of retained objects. Callers can select a smaller total-byte budget.
 const MAX_RECEIPT_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 
 /// Retained local capabilities containing one exact analytical backup bundle.
@@ -70,24 +71,23 @@ impl AnalyticalBackupLocation {
     }
 }
 
-/// Caller-selected analytical backup resource limits, capped by fixed process ceilings.
+/// Caller-selected byte/Parquet parser budgets for single-row streamed verification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnalyticalBackupLimits {
     evidence: EvidenceLimits,
 }
 
 impl AnalyticalBackupLimits {
-    /// Constructs bounded catalog, artifact, and Parquet-metadata verification limits.
+    /// Constructs explicit verification budgets without a retained-history count limit.
+    ///
+    /// Total/object bytes bound admitted I/O; Parquet metadata bytes bound the parser allocation
+    /// for one object. Catalog traversal retains one row at a time.
     pub fn try_new(
-        max_artifacts: usize,
-        max_references: usize,
         max_total_bytes: u64,
         max_object_bytes: u64,
         max_parquet_metadata_bytes: u64,
     ) -> Result<Self, AnalyticalBackupError> {
         let evidence = EvidenceLimits::try_new(
-            max_artifacts,
-            max_references,
             max_total_bytes,
             max_object_bytes,
             max_parquet_metadata_bytes,
@@ -245,35 +245,94 @@ impl AnalyticalBackupService {
                 .authority
                 .lock()
                 .map_err(|_| AnalyticalBackupError::LockPoisoned)?;
-            let (source_authority, source_evidence) =
-                authority.analytical_evidence_snapshot(request)?;
-            require_source_composition(&source_authority, &self.objects)?;
-            (source_authority, source_evidence)
+            let snapshot = authority
+                .analytical_evidence_snapshot(request, cancellation)
+                .map_err(map_catalog_evidence_error)?;
+            require_source_composition(&snapshot.0, &self.objects)?;
+            snapshot
         };
-        let source_root = self.objects.try_clone_artifact_root()?;
-        let source_inventory =
-            verify_artifact_inventory(&source_root, &source_evidence, cancellation)
-                .map_err(AnalyticalBackupError::evidence)?;
+        // Freeze SQLite first while both operation and object-publication exclusion are held.
+        // Every subsequent physical scan uses this same immutable catalog, not live history.
         let catalog_receipt = self
             .authority
             .lock()
             .map_err(|_| AnalyticalBackupError::LockPoisoned)?
             .backup_to(destination.catalog())
             .map_err(map_catalog_backup_creation_error)?;
-        let materialized = source_inventory
-            .materialize_no_replace(destination.artifacts(), cancellation)
-            .map_err(|_| AnalyticalBackupError::BundleCreationIndeterminate)?;
-        verify_created_bundle(
+        self.finish_created_bundle(
             destination,
             catalog_receipt,
-            request,
             source_authority,
             source_evidence,
-            source_inventory,
-            materialized,
             cancellation,
         )
         .map_err(|_| AnalyticalBackupError::BundleCreationIndeterminate)
+    }
+
+    fn finish_created_bundle(
+        &self,
+        destination: AnalyticalBackupLocation,
+        catalog_receipt: BackupReceipt,
+        source_authority: AuthoritySnapshot,
+        source_evidence: CatalogEvidenceSnapshot,
+        cancellation: &CancellationToken,
+    ) -> Result<VerifiedAnalyticalBackup, AnalyticalBackupError> {
+        let request = source_evidence.request();
+        let source_catalog =
+            Catalog::verify_backup_retained(destination.catalog(), &catalog_receipt)?;
+        let source_root = self.objects.try_clone_artifact_root()?;
+        let (authority, evidence, inventory) = Catalog::verified_backup_evidence(
+            &source_catalog,
+            request,
+            cancellation,
+            |connection, snapshot| {
+                // Return physical errors as callback values so their typed cancellation and
+                // indeterminate meanings survive the catalog transaction boundary.
+                Ok((|| -> Result<VerifiedArtifactInventory, EvidenceError> {
+                    if snapshot.evidence_digest()? != source_evidence.evidence_digest()? {
+                        return Err(EvidenceError::InvalidCatalogEvidence);
+                    }
+                    let source = verify_artifact_inventory(
+                        connection,
+                        &source_root,
+                        snapshot,
+                        cancellation,
+                    )?;
+                    let _materialized = source.materialize_no_replace(
+                        connection,
+                        destination.artifacts(),
+                        cancellation,
+                    )?;
+                    let copied = verify_artifact_inventory(
+                        connection,
+                        destination.artifacts(),
+                        snapshot,
+                        cancellation,
+                    )?;
+                    if source.digest() != copied.digest()
+                        || source.total_bytes() != copied.total_bytes()
+                        || source.artifact_count() != copied.artifact_count()
+                    {
+                        return Err(EvidenceError::ArtifactMetadataMismatch);
+                    }
+                    Ok(copied)
+                })())
+            },
+        )?;
+        if authority != source_authority {
+            return Err(AnalyticalBackupError::BundleCreationIndeterminate);
+        }
+        require_source_composition(&authority, &self.objects)?;
+        let inventory = inventory.map_err(AnalyticalBackupError::evidence)?;
+        let receipt =
+            issue_verified_bundle_receipt(catalog_receipt, &authority, &evidence, &inventory)?;
+        let source_evidence =
+            validate_restore_evidence(receipt, authority, evidence, inventory, cancellation)
+                .map_err(AnalyticalBackupError::restore_validation)?;
+        Ok(VerifiedAnalyticalBackup {
+            source_catalog,
+            source_evidence,
+        })
     }
 
     /// Reopens and retains an existing exact bundle before any restore is allowed.
@@ -286,9 +345,21 @@ impl AnalyticalBackupService {
         let source_catalog =
             Catalog::verify_backup_retained(location.catalog(), receipt.catalog_backup())?;
         let request = limits.request(receipt.cutoff());
-        let (authority, evidence) = Catalog::verified_backup_evidence(&source_catalog, request)?;
-        let inventory = verify_artifact_inventory(location.artifacts(), &evidence, cancellation)
-            .map_err(AnalyticalBackupError::evidence)?;
+        let (authority, evidence, inventory) = Catalog::verified_backup_evidence(
+            &source_catalog,
+            request,
+            cancellation,
+            |connection, evidence| {
+                Ok(verify_artifact_inventory(
+                    connection,
+                    location.artifacts(),
+                    evidence,
+                    cancellation,
+                ))
+            },
+        )
+        .map_err(map_catalog_evidence_error)?;
+        let inventory = inventory.map_err(AnalyticalBackupError::evidence)?;
         let source_evidence =
             validate_restore_evidence(receipt, authority, evidence, inventory, cancellation)
                 .map_err(AnalyticalBackupError::restore_validation)?;
@@ -360,6 +431,9 @@ impl VerifiedAnalyticalBackup {
                     }
                 },
             )?;
+        self.source_evidence
+            .revalidate(&self.source_catalog, cancellation)
+            .map_err(AnalyticalBackupError::restore_validation)?;
         let catalog_location = target.catalog.location().clone();
         let target_root = ParquetObjectStore::restore_root_endpoint(&target.artifacts)
             .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)?;
@@ -416,62 +490,6 @@ impl fmt::Debug for VerifiedAnalyticalBackup {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the verifier compares every independently retained bundle component"
-)]
-fn verify_created_bundle(
-    destination: AnalyticalBackupLocation,
-    catalog_receipt: BackupReceipt,
-    request: EvidenceSnapshotRequest,
-    source_authority: AuthoritySnapshot,
-    source_evidence: CatalogEvidenceSnapshot,
-    source_inventory: VerifiedArtifactInventory,
-    _materialized: MaterializedArtifactRoot,
-    cancellation: &CancellationToken,
-) -> Result<VerifiedAnalyticalBackup, AnalyticalBackupError> {
-    let source_catalog = Catalog::verify_backup_retained(destination.catalog(), &catalog_receipt)?;
-    let (backup_authority, backup_evidence) =
-        Catalog::verified_backup_evidence(&source_catalog, request)?;
-    if source_authority != backup_authority
-        || source_evidence
-            .evidence_digest()
-            .map_err(AnalyticalBackupError::evidence)?
-            != backup_evidence
-                .evidence_digest()
-                .map_err(AnalyticalBackupError::evidence)?
-    {
-        return Err(AnalyticalBackupError::BundleCreationIndeterminate);
-    }
-    let backup_inventory =
-        verify_artifact_inventory(destination.artifacts(), &backup_evidence, cancellation)
-            .map_err(AnalyticalBackupError::evidence)?;
-    if source_inventory.digest() != backup_inventory.digest()
-        || source_inventory.total_bytes() != backup_inventory.total_bytes()
-        || source_inventory.artifacts().len() != backup_inventory.artifacts().len()
-    {
-        return Err(AnalyticalBackupError::BundleCreationIndeterminate);
-    }
-    let receipt = issue_verified_bundle_receipt(
-        catalog_receipt,
-        &backup_authority,
-        &backup_evidence,
-        &backup_inventory,
-    )?;
-    let source_evidence = validate_restore_evidence(
-        receipt,
-        backup_authority,
-        backup_evidence,
-        backup_inventory,
-        cancellation,
-    )
-    .map_err(AnalyticalBackupError::restore_validation)?;
-    Ok(VerifiedAnalyticalBackup {
-        source_catalog,
-        source_evidence,
-    })
-}
-
 fn require_source_composition(
     authority: &AuthoritySnapshot,
     objects: &ParquetObjectStore,
@@ -495,6 +513,14 @@ fn require_disjoint_endpoints(
         return Err(AnalyticalBackupError::InvalidConfiguration);
     }
     Ok(())
+}
+
+fn map_catalog_evidence_error(error: CatalogError) -> AnalyticalBackupError {
+    if matches!(error, CatalogError::AnalyticalEvidenceCancelled) {
+        AnalyticalBackupError::Cancelled
+    } else {
+        AnalyticalBackupError::Catalog(error)
+    }
 }
 
 fn map_catalog_backup_creation_error(error: CatalogError) -> AnalyticalBackupError {
@@ -563,14 +589,23 @@ pub enum AnalyticalBackupError {
 }
 
 impl AnalyticalBackupError {
-    fn evidence(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self::Evidence {
-            source: Box::new(error),
+    fn evidence(error: EvidenceError) -> Self {
+        if matches!(error, EvidenceError::Cancelled) {
+            Self::Cancelled
+        } else {
+            Self::Evidence {
+                source: Box::new(error),
+            }
         }
     }
 
     fn restore_validation(error: RestoreValidationError) -> Self {
-        if matches!(error, RestoreValidationError::Cancelled) {
+        if matches!(
+            error,
+            RestoreValidationError::Cancelled
+                | RestoreValidationError::Evidence(EvidenceError::Cancelled)
+                | RestoreValidationError::Catalog(CatalogError::AnalyticalEvidenceCancelled)
+        ) {
             Self::Cancelled
         } else {
             Self::RestorePreflight {
@@ -602,8 +637,7 @@ pub(crate) fn issue_verified_bundle_receipt(
     let catalog_content_evidence = evidence
         .evidence_digest()
         .map_err(|_| AnalyticalBackupReceiptError::InvalidMetadata)?;
-    let artifact_count = u64::try_from(inventory.artifacts().len())
-        .map_err(|_| AnalyticalBackupReceiptError::ResourceLimitExceeded)?;
+    let artifact_count = inventory.artifact_count();
     AnalyticalBackupBundleReceipt::try_from_parts(
         catalog_backup,
         prepared.target_catalog_identity(),
@@ -725,7 +759,7 @@ impl AnalyticalBackupBundleReceipt {
         if (artifact_count == 0) != (artifact_bytes == 0) {
             return Err(AnalyticalBackupReceiptError::InvalidMetadata);
         }
-        if artifact_count > MAX_RECEIPT_ARTIFACTS || artifact_bytes > MAX_RECEIPT_ARTIFACT_BYTES {
+        if artifact_bytes > MAX_RECEIPT_ARTIFACT_BYTES {
             return Err(AnalyticalBackupReceiptError::ResourceLimitExceeded);
         }
         let expected = bundle_digest(
@@ -1009,7 +1043,7 @@ mod tests {
     use super::{
         AnalyticalBackupBundleReceipt, AnalyticalBackupLimits, AnalyticalBackupLocation,
         AnalyticalBackupReceiptError, AnalyticalBackupService, AnalyticalRestoreMode,
-        AnalyticalRestoreTarget, MAX_RECEIPT_ARTIFACTS,
+        AnalyticalRestoreTarget, MAX_RECEIPT_ARTIFACT_BYTES,
     };
     use crate::authority_transition::evidence::CatalogContentEvidenceDigest;
     use crate::authority_transition::{
@@ -1045,13 +1079,8 @@ mod tests {
             backup_paths.catalog()?.clone(),
             backup_paths.artifacts()?.clone(),
         )?;
-        let limits = AnalyticalBackupLimits::try_new(
-            32,
-            128,
-            8 * 1024 * 1024,
-            8 * 1024 * 1024,
-            1024 * 1024,
-        )?;
+        let limits =
+            AnalyticalBackupLimits::try_new(8 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
         let created = source
             .backup_service()
             .create(
@@ -1087,13 +1116,8 @@ mod tests {
             backup_paths.catalog()?.clone(),
             backup_paths.artifacts()?.clone(),
         )?;
-        let limits = AnalyticalBackupLimits::try_new(
-            32,
-            128,
-            8 * 1024 * 1024,
-            8 * 1024 * 1024,
-            1024 * 1024,
-        )?;
+        let limits =
+            AnalyticalBackupLimits::try_new(8 * 1024 * 1024, 8 * 1024 * 1024, 1024 * 1024)?;
         let cancellation = CancellationToken::new();
         let created = source
             .backup_service()
@@ -1405,26 +1429,30 @@ mod tests {
     }
 
     #[test]
-    fn receipt_rejects_resource_claims_above_fixed_ceiling() -> TestResult {
-        let catalog = BackupReceipt::try_from_parts(BackupReceipt::VERSION, 8_192, [7; 32])?;
-        let result = AnalyticalBackupBundleReceipt::try_from_parts(
-            catalog,
-            CatalogEndpointIdentity::try_new([9; 32]).ok_or("invalid catalog identity")?,
-            AuthorityGeneration::try_new(4).ok_or("invalid authority generation")?,
-            AuthorityEventDigest::try_new([11; 32]).ok_or("invalid authority digest")?,
-            AuthorityEvidenceDigest::try_new([12; 32])
-                .ok_or("invalid authority evidence digest")?,
-            CatalogContentEvidenceDigest::try_new([14; 32])
-                .ok_or("invalid catalog content evidence digest")?,
-            StableArtifactRootIdentity::try_new([13; 32]).ok_or("invalid root identity")?,
-            Timestamp::from_unix_nanos(1_721_491_200_000_000_000),
-            MAX_RECEIPT_ARTIFACTS + 1,
-            24_576,
-            ArtifactInventoryDigest::try_new([17; 32]).ok_or("invalid inventory digest")?,
-        );
-
+    fn receipt_accepts_streamed_counts_and_retains_byte_budget() -> TestResult {
+        let original = receipt()?;
+        let with_bytes = |bytes| {
+            AnalyticalBackupBundleReceipt::try_from_parts(
+                *original.catalog_backup(),
+                original.source_catalog_identity(),
+                original.source_authority_generation(),
+                original.source_authority_event(),
+                original.source_authority_evidence(),
+                original.catalog_content_evidence(),
+                original.source_root_identity(),
+                original.cutoff(),
+                100_001,
+                bytes,
+                original.artifact_inventory_sha256(),
+            )
+        };
+        let large = with_bytes(100_001 * 8_192)?;
+        let round_trip: AnalyticalBackupBundleReceipt = from_value(to_value(large)?)?;
+        assert_eq!(round_trip, large);
+        assert_eq!(round_trip.artifact_count(), 100_001);
+        assert_eq!(round_trip.bundle_sha256(), large.bundle_sha256());
         assert!(matches!(
-            result,
+            with_bytes(MAX_RECEIPT_ARTIFACT_BYTES + 1),
             Err(AnalyticalBackupReceiptError::ResourceLimitExceeded)
         ));
         Ok(())

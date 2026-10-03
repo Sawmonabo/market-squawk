@@ -27,6 +27,8 @@ pub struct ResearchUseAuthorityEvidence {
 
 impl ResearchUseAuthorityEvidence {
     /// Constructs complete selected authority evidence without inferring any downstream use.
+    /// The source retains original publication rights; the fingerprint pins the independently
+    /// selected current authorization, whose exact policy/payload join is verified by the catalog.
     #[allow(
         clippy::too_many_arguments,
         reason = "all retained authority identities are mandatory"
@@ -42,7 +44,7 @@ impl ResearchUseAuthorityEvidence {
         grant_expires_at: Option<Timestamp>,
         revocation_frontier: u64,
     ) -> Result<Self, ResearchUseError> {
-        if rights_fingerprint != source.rights_id()
+        if rights_fingerprint == [0; 32]
             || rights_basis_digest == [0; 32]
             || research_grant_id == [0; 32]
         {

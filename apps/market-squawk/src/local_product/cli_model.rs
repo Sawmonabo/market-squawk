@@ -1,28 +1,20 @@
 //! Closed, bounded CLI admission for production model bundles.
 
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
-use market_squawk_data::{CatalogEndpointIdentity, Sha256Digest};
-use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
-    BundleError, BundleMetadataRef, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
-    ModelOutputSemantics, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError,
-    PythonDatasetAdmissionAuthority,
+    BundleError, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError, OnnxPolicyError,
 };
 use market_squawk_platform::{BoundedInput, InputFileError, UserAuthorizedInputRoot};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use super::LocalProduct;
 use crate::application::model::runtime::{
-    ModelAdmissionDisposition, ModelAdmissionRequest, ModelBackendAdmission,
-    ProductionModelRuntimeError,
+    ModelAdmissionDisposition, ModelAdmissionRequest, ProductionModelRuntimeError,
 };
 
 const MAXIMUM_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-const REQUEST_SCHEMA_VERSION: u16 = 1;
 
 /// CLI model-admission request, authority, policy, or runtime failure.
 #[derive(Debug, Error)]
@@ -88,30 +80,11 @@ pub(super) fn admit_model_bundle(
         .model_runtime()
         .ok_or(CliModelAdmissionError::RuntimeNotConfigured)?;
     let request_input = read_request(request_path)?;
-    let request: ModelAdmissionRequestDto = serde_json::from_slice(request_input.as_bytes())
-        .map_err(CliModelAdmissionError::RequestJson)?;
-    if request.schema_version != REQUEST_SCHEMA_VERSION {
-        return Err(CliModelAdmissionError::UnsupportedSchemaVersion);
-    }
-
-    let authority_sha256 = digest(&request.authority.sha256)?;
-    let metadata = BundleMetadataRef::try_new(
-        request.metadata.relative_path,
-        digest(&request.metadata.sha256)?,
-    )
-    .map_err(CliModelAdmissionError::Metadata)?;
-    let dataset = request.dataset.into_domain()?;
-    let backend = request.backend.into_domain()?;
-    let authority_bytes = read_authority(product, &request.authority.path)?;
-    let admission = ModelAdmissionRequest::try_new(
-        request.candidate_directory,
-        metadata,
-        authority_bytes,
-        authority_sha256,
-        dataset,
-        backend,
-    )
-    .map_err(CliModelAdmissionError::Admission)?;
+    let authority_path = ModelAdmissionRequest::authority_path_from_json(request_input.as_bytes())
+        .map_err(CliModelAdmissionError::Admission)?;
+    let authority_bytes = read_authority(product, &authority_path)?;
+    let admission = ModelAdmissionRequest::decode_json(request_input.as_bytes(), authority_bytes)
+        .map_err(CliModelAdmissionError::Admission)?;
     let receipt = runtime
         .admit(admission)
         .map_err(CliModelAdmissionError::Admission)?;
@@ -173,178 +146,6 @@ fn split_safe_absolute_file(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
         return None;
     }
     Some((path.parent()?, path.file_name()?))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ModelAdmissionRequestDto {
-    schema_version: u16,
-    candidate_directory: String,
-    metadata: MetadataReferenceDto,
-    authority: AuthorityReferenceDto,
-    dataset: DatasetAuthorityDto,
-    backend: BackendAdmissionDto,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MetadataReferenceDto {
-    relative_path: String,
-    sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AuthorityReferenceDto {
-    path: PathBuf,
-    sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DatasetAuthorityDto {
-    export_sha256: String,
-    as_of_unix_nanos: i64,
-    selection_sha256: String,
-    catalog_identity_sha256: String,
-}
-
-impl DatasetAuthorityDto {
-    fn into_domain(self) -> Result<PythonDatasetAdmissionAuthority, CliModelAdmissionError> {
-        let catalog_identity =
-            CatalogEndpointIdentity::try_from_bytes(parse_sha256(&self.catalog_identity_sha256)?)
-                .ok_or(ModelAdmissionError::InvalidDatasetAuthority)
-                .map_err(CliModelAdmissionError::Dataset)?;
-        PythonDatasetAdmissionAuthority::try_new(
-            digest(&self.export_sha256)?,
-            Timestamp::from_unix_nanos(self.as_of_unix_nanos),
-            digest(&self.selection_sha256)?,
-            catalog_identity,
-        )
-        .map_err(CliModelAdmissionError::Dataset)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum BackendAdmissionDto {
-    Native,
-    Onnx {
-        #[serde(rename = "modelSha256")]
-        model_sha256: String,
-        opset: u32,
-        #[serde(rename = "inputShape")]
-        input_shape: Vec<usize>,
-        #[serde(rename = "outputShape")]
-        output_shape: Vec<usize>,
-        #[serde(rename = "outputSemantics")]
-        output_semantics: Option<OnnxOutputSemanticsDto>,
-        #[serde(rename = "inferenceDeadlineMillis")]
-        inference_deadline_millis: u64,
-        fallback: OnnxFallbackDto,
-    },
-}
-
-impl BackendAdmissionDto {
-    fn into_domain(self) -> Result<ModelBackendAdmission, CliModelAdmissionError> {
-        match self {
-            Self::Native => Ok(ModelBackendAdmission::Native),
-            Self::Onnx {
-                model_sha256,
-                opset,
-                input_shape,
-                output_shape,
-                output_semantics,
-                inference_deadline_millis,
-                fallback,
-            } => {
-                let model_digest = digest(&model_sha256)?;
-                let inference_deadline = Duration::from_millis(inference_deadline_millis);
-                let fallback = fallback.into_domain();
-                let policy = if let Some(output_semantics) = output_semantics {
-                    OnnxModelPolicy::try_new_with_output_semantics(
-                        model_digest,
-                        opset,
-                        &input_shape,
-                        &output_shape,
-                        output_semantics.into_domain(),
-                        inference_deadline,
-                        fallback,
-                    )
-                } else {
-                    OnnxModelPolicy::try_new(
-                        model_digest,
-                        opset,
-                        &input_shape,
-                        &output_shape,
-                        inference_deadline,
-                        fallback,
-                    )
-                }
-                .map_err(CliModelAdmissionError::OnnxPolicy)?;
-                Ok(ModelBackendAdmission::Onnx(policy))
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum OnnxFallbackDto {
-    NoAction,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum OnnxOutputSemanticsDto {
-    Regression,
-    BinaryProbability,
-}
-
-impl OnnxOutputSemanticsDto {
-    const fn into_domain(self) -> ModelOutputSemantics {
-        match self {
-            Self::Regression => ModelOutputSemantics::Regression,
-            Self::BinaryProbability => ModelOutputSemantics::BinaryProbability,
-        }
-    }
-}
-
-impl OnnxFallbackDto {
-    const fn into_domain(self) -> OnnxFallbackPolicy {
-        match self {
-            Self::NoAction => OnnxFallbackPolicy::NoAction,
-        }
-    }
-}
-
-fn digest(value: &str) -> Result<Sha256Digest, CliModelAdmissionError> {
-    Ok(Sha256Digest::new(parse_sha256(value)?))
-}
-
-fn parse_sha256(value: &str) -> Result<[u8; 32], CliModelAdmissionError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(CliModelAdmissionError::InvalidDigest);
-    }
-    let mut output = [0_u8; 32];
-    for (target, pair) in output.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        let high = nibble(pair[0]).ok_or(CliModelAdmissionError::InvalidDigest)?;
-        let low = nibble(pair[1]).ok_or(CliModelAdmissionError::InvalidDigest)?;
-        *target = (high << 4) | low;
-    }
-    Ok(output)
-}
-
-const fn nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
 }
 
 fn encode_hex(bytes: [u8; 32]) -> String {

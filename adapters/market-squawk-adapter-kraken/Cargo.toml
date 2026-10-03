@@ -16,6 +16,7 @@ bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-live.workspace = true
 market-squawk-sources.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
@@ -29,6 +30,9 @@ url.workspace = true
 [dev-dependencies]
 market-squawk-adapter-paper.workspace = true
 market-squawk-execution.workspace = true
+market-squawk-data.workspace = true
+market-squawk-platform.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

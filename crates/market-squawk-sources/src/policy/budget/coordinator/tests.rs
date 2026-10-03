@@ -2,7 +2,8 @@
 mod coordinator_tests {
     use std::error::Error;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use market_squawk_domain::{
         AuthorizationBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
@@ -24,6 +25,177 @@ mod coordinator_tests {
 
         fn store(&self, _payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailFirstRegistrationStore {
+        writes: AtomicUsize,
+    }
+
+    impl AuthorityStateStore for FailFirstRegistrationStore {
+        fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
+            Ok(None)
+        }
+
+        fn store(&self, _payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+            if write == 2 {
+                Err(AuthorityStateStoreError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TrackingProviderRateStore {
+        commits: Arc<AtomicUsize>,
+        rollbacks: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct TrackingPreparedRegistrationBatch {
+        registrations: Box<[ProviderRateRegistration]>,
+        commits: Arc<AtomicUsize>,
+        rollbacks: Arc<AtomicUsize>,
+        finalized: bool,
+    }
+
+    impl PreparedProviderRateRegistrationBatch for TrackingPreparedRegistrationBatch {
+        fn registrations(&self) -> &[ProviderRateRegistration] {
+            &self.registrations
+        }
+
+        fn commit(mut self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            self.finalized = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for TrackingPreparedRegistrationBatch {
+        fn drop(&mut self) {
+            if !self.finalized {
+                self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl ProviderRateStore for TrackingProviderRateStore {
+        fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
+            Ok(ProviderRateRunId::from_bytes([1; 16]))
+        }
+
+        fn prepare_registration_batch(
+            &self,
+            _run_id: ProviderRateRunId,
+            declarations: &[ProviderRateDeclaration],
+            _now: Timestamp,
+        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
+        {
+            let registrations = declarations
+                .iter()
+                .map(|declaration| {
+                    ProviderRateRegistration::new(
+                        ProviderRateGroupId::from_bytes([2; 16]),
+                        declaration.policy_digest(),
+                        declaration.declaration_digest(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(Box::new(TrackingPreparedRegistrationBatch {
+                registrations,
+                commits: Arc::clone(&self.commits),
+                rollbacks: Arc::clone(&self.rollbacks),
+                finalized: false,
+            }))
+        }
+
+        fn try_reserve(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn commit_dispatch(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+            _now: Timestamp,
+        ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn cancel_reservation(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn release(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _permit_id: ProviderRatePermitId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn apply_retry_after(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _retry_after: RetryAfter,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn apply_refusal(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _jitter_sample_basis_points: u16,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn record_success(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn bind_authorization_subject(
+            &self,
+            _run_id: ProviderRateRunId,
+            _mode: crate::AuthorizationMode,
+            _evidence: EvidenceDigest,
+            _subject: &SourceIdentifier,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn resolve_authorization_subject(
+            &self,
+            _mode: crate::AuthorizationMode,
+            _evidence: EvidenceDigest,
+        ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError> {
+            Ok(None)
         }
     }
 
@@ -91,6 +263,65 @@ mod coordinator_tests {
     fn register_fresh(policy: ResolvedProviderBudgetPolicy) -> TestResult<SharedProviderBudget> {
         let mut pool = ProviderBudgetPool::new()?;
         Ok(pool.register(policy)?)
+    }
+
+    #[test]
+    fn system_clock_pairs_wall_before_monotonic_for_conservative_deadlines() -> TestResult {
+        let origin = Instant::now();
+        let order = AtomicU8::new(0);
+        let observation = observe_system_clocks(
+            origin,
+            || {
+                assert_eq!(order.swap(1, Ordering::SeqCst), 0);
+                UNIX_EPOCH + Duration::from_nanos(1_000)
+            },
+            || {
+                assert_eq!(order.swap(2, Ordering::SeqCst), 1);
+                origin + Duration::from_nanos(250)
+            },
+        )
+        .map_err(|reason| format!("clock observation failed: {reason:?}"))?;
+
+        assert_eq!(order.load(Ordering::SeqCst), 2);
+        assert_eq!(observation.wall_clock.unix_nanos(), 1_000);
+        assert_eq!(observation.monotonic, MonotonicInstant::from_nanos(250));
+        Ok(())
+    }
+
+    #[test]
+    fn local_registration_failure_rolls_back_the_prepared_provider_batch() -> TestResult {
+        let clock = SystemBudgetClock::new();
+        let observation = clock
+            .observation()
+            .map_err(|reason| format!("test clock unavailable: {reason:?}"))?;
+        let local_store = Arc::new(FailFirstRegistrationStore::default());
+        let session = AuthorityDurabilitySession::open(local_store, observation.wall_clock)?;
+        let provider_store = Arc::new(TrackingProviderRateStore::default());
+        let commits = Arc::clone(&provider_store.commits);
+        let rollbacks = Arc::clone(&provider_store.rollbacks);
+        let provider_rate = ProviderRateAuthority::try_new(provider_store)?;
+        let policies = [
+            resolved_policy("atomic-local-first", 2)?,
+            resolved_policy("atomic-local-second", 2)?,
+        ];
+        let mut coordinator = ProcessBudgetCoordinator::new(4);
+
+        assert!(matches!(
+            coordinator.coordinate_with_provider_rate(
+                &policies,
+                Some(DurableRegistration {
+                    session: &session,
+                    registry: &crate::RegistryAuthorityState::empty(),
+                }),
+                Some(&provider_rate),
+            ),
+            Err(BudgetPoolError::Persistence)
+        ));
+        assert!(coordinator.allocations.is_empty());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert!(!session.is_available());
+        Ok(())
     }
 
     fn durable_pool(
@@ -185,12 +416,52 @@ mod coordinator_tests {
     #[test]
     fn dropping_every_external_handle_preserves_refusal_disabled_and_terminal_state() -> TestResult
     {
-        let refusal_policy = resolved_policy("drop-reset-refusal-state", 2)?;
+        let refusal_policy = resolved_policy("drop-reset-refusal-state", 4)?;
         let refusal = register_fresh(refusal_policy.clone())?;
+        let mut transport = match refusal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        let request_lease = transport.active_lease();
+        assert!(request_lease.is_current());
+        transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        assert!(!request_lease.is_current());
+        let transport_lease = transport.active_lease();
+        let concurrent = match refusal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("upgrade retained request slot: {other:?}").into()),
+        };
+        assert!(transport_lease.is_current());
+        assert!(matches!(
+            refusal.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+        ));
+        assert!(transport_lease.is_current());
+        drop(concurrent);
+        drop(transport);
+        assert!(!transport_lease.is_current());
+        assert!(!request_lease.is_current());
+
+        let mut refused_transport = match refusal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        refused_transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        let refused_lease = refused_transport.active_lease();
+        assert!(refused_lease.is_current());
         let deadline = match refusal.apply_refusal(0) {
             BudgetDecision::WaitUntil(deadline) => deadline,
             other => return Err(format!("unexpected refusal decision: {other:?}").into()),
         };
+        assert!(!refused_lease.is_current());
+        drop(refused_transport);
+        drop(refused_lease);
+        drop(transport_lease);
+        drop(request_lease);
         let refusal_allocation = Arc::downgrade(&refusal.allocation);
         drop(refusal);
         let refusal_restored = register_fresh(refusal_policy)?;
@@ -206,10 +477,22 @@ mod coordinator_tests {
 
         let disabled_policy = resolved_policy("drop-reset-disabled-state", 2)?;
         let disabled = register_fresh(disabled_policy.clone())?;
+        let mut disabled_transport = match disabled.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        disabled_transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        let disabled_lease = disabled_transport.active_lease();
+        assert!(disabled_lease.is_current());
         assert!(matches!(
             disabled.disable(),
             BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
         ));
+        assert!(!disabled_lease.is_current());
+        drop(disabled_transport);
+        drop(disabled_lease);
         drop(disabled);
         let disabled_restored = register_fresh(disabled_policy)?;
         assert!(matches!(
@@ -219,6 +502,15 @@ mod coordinator_tests {
 
         let terminal_policy = resolved_policy("drop-reset-terminal-state", 2)?;
         let terminal = register_fresh(terminal_policy.clone())?;
+        let mut terminal_transport = match terminal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        terminal_transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        let terminal_lease = terminal_transport.active_lease();
+        assert!(terminal_lease.is_current());
         terminal
             .allocation
             .availability_generation
@@ -227,6 +519,9 @@ mod coordinator_tests {
             terminal.disable(),
             BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
+        assert!(!terminal_lease.is_current());
+        drop(terminal_transport);
+        drop(terminal_lease);
         drop(terminal);
         let terminal_restored = register_fresh(terminal_policy)?;
         assert!(matches!(
@@ -300,8 +595,7 @@ mod coordinator_tests {
                 NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
                 BackoffPolicy::try_new(
                     NonZeroU64::new(1_000_000).ok_or("backoff must be nonzero")?,
-                    NonZeroU64::new(60_000_000_000)
-                        .ok_or("backoff cap must be nonzero")?,
+                    NonZeroU64::new(60_000_000_000).ok_or("backoff cap must be nonzero")?,
                     0,
                 )?,
             )?;
@@ -316,7 +610,7 @@ mod coordinator_tests {
             );
             Ok(ResolvedProviderBudgetPolicy::try_new(
                 policy,
-                EndpointPolicy::try_new(["https://conjunction.example.test/path"] )?,
+                EndpointPolicy::try_new(["https://conjunction.example.test/path"])?,
                 authorization,
                 &NoAccountSubjects,
             )?)
@@ -335,18 +629,24 @@ mod coordinator_tests {
             )?,
         ];
         let exact = resolved_with_windows("conjunction-exact", &base)?;
-        let conflicting_windows = [base[0], ProviderBudgetWindow::try_new(
-            NonZeroU32::new(9).ok_or("request limit must be nonzero")?,
-            NonZeroU64::new(10_000).ok_or("window must be nonzero")?,
-            BudgetWindowSemantics::Tumbling,
-        )?];
+        let conflicting_windows = [
+            base[0],
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(9).ok_or("request limit must be nonzero")?,
+                NonZeroU64::new(10_000).ok_or("window must be nonzero")?,
+                BudgetWindowSemantics::Tumbling,
+            )?,
+        ];
         let conflicting = resolved_with_windows("conjunction-conflict", &conflicting_windows)?;
         let mut coordinator = ProcessBudgetCoordinator::new(2);
         let first = coordinator.coordinate(std::slice::from_ref(&exact), None)?;
         let repeated = coordinator.coordinate(std::slice::from_ref(&exact), None)?;
         assert!(Arc::ptr_eq(
             &first.first().ok_or("first allocation missing")?.allocation,
-            &repeated.first().ok_or("repeated allocation missing")?.allocation,
+            &repeated
+                .first()
+                .ok_or("repeated allocation missing")?
+                .allocation,
         ));
         assert!(matches!(
             coordinator.coordinate(std::slice::from_ref(&conflicting), None),

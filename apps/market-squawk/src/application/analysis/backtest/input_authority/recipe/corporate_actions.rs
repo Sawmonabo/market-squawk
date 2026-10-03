@@ -170,6 +170,8 @@ struct CorporateActionRecordWire {
     observation: CorporateActionObservation,
     source_manifest: ManifestWire,
     evidence_digest: EvidenceDigest,
+    #[serde(deserialize_with = "required_application")]
+    application: Option<market_squawk_data::CorporateActionApplication>,
 }
 
 impl CorporateActionRecordWire {
@@ -178,22 +180,29 @@ impl CorporateActionRecordWire {
             observation: record.observation().clone(),
             source_manifest: ManifestWire::from_manifest(record.source_manifest()),
             evidence_digest: record.evidence_digest(),
+            application: record.application().cloned(),
         }
     }
 
     fn to_record(&self) -> Result<CorporateActionRecord, RecipeError> {
-        Ok(CorporateActionRecord::new(
-            self.observation.clone(),
-            self.source_manifest.to_manifest()?,
-            self.evidence_digest,
-        ))
+        let record = CorporateActionRecord::new(self.observation.clone(), self.source_manifest.to_manifest()?, self.evidence_digest);
+        match self.application.clone() {
+            Some(application) => record.with_application(application).map_err(|_| RecipeError::Invalid),
+            None => Ok(record),
+        }
     }
 
     fn into_record(self) -> Result<CorporateActionRecord, RecipeError> {
-        Ok(CorporateActionRecord::new(
-            self.observation,
-            self.source_manifest.to_manifest()?,
-            self.evidence_digest,
-        ))
+        let record = CorporateActionRecord::new(self.observation, self.source_manifest.to_manifest()?, self.evidence_digest);
+        match self.application {
+            Some(application) => record.with_application(application).map_err(|_| RecipeError::Invalid),
+            None => Ok(record),
+        }
     }
+}
+
+// Null is meaningful for timestamp-native records; omission is not a second recovery format.
+fn required_application<'de, D: serde::Deserializer<'de>>(deserializer: D)
+    -> Result<Option<market_squawk_data::CorporateActionApplication>, D::Error> {
+    Option::<market_squawk_data::CorporateActionApplication>::deserialize(deserializer)
 }

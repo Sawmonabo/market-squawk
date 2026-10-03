@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use market_squawk_data::{
-    PythonDatasetRow, PythonDatasetSelection, PythonDatasetValue, PythonDatasetVerificationLimits,
-    Sha256Digest, verify_python_dataset,
+    FeatureDatasetProductContract, PythonDatasetRow, PythonDatasetSelection, PythonDatasetValue,
+    PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
 };
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{CalendarDate, ResearchTemporalCoordinate, Timestamp};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyFloat, PyInt, PyMapping, PyString, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyDate, PyFloat, PyInt, PyMapping, PyString, PyTuple};
 use uuid::Uuid;
 
 use super::{CONTROL_CHECK_INTERVAL, OperationContext, encode_hex, invalid_input};
@@ -77,6 +77,11 @@ impl DatasetReceipt {
     fn as_of_unix_nanos(&self) -> i64 {
         self.selection.as_of().unix_nanos()
     }
+
+    #[getter]
+    fn product_contract(&self) -> &'static str {
+        self.selection.product_contract().identity()
+    }
 }
 
 #[pyfunction]
@@ -84,6 +89,7 @@ fn open_dataset_admission(
     py: Python<'_>,
     local_root: &str,
     export_sha256: &str,
+    product_contract: &str,
     as_of_unix_nanos: i64,
     max_rows: usize,
     max_bytes: usize,
@@ -91,6 +97,8 @@ fn open_dataset_admission(
 ) -> PyResult<(DatasetReceipt, Py<PyBytes>)> {
     context.check()?;
     let export_sha256 = Sha256Digest::new(decode_hex(export_sha256)?);
+    let product_contract =
+        FeatureDatasetProductContract::from_identity(product_contract).ok_or_else(invalid_input)?;
     let limits = PythonDatasetVerificationLimits::try_new(max_rows, max_bytes)
         .map_err(|_| invalid_input())?;
     let operator_root = std::path::PathBuf::from(local_root);
@@ -107,6 +115,7 @@ fn open_dataset_admission(
         verify_python_dataset(
             &operator_root,
             export_sha256,
+            product_contract,
             Timestamp::from_unix_nanos(as_of_unix_nanos),
             limits,
             deadline,
@@ -135,7 +144,7 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         return Err(invalid_input());
     }
     let mapping = value.cast::<PyMapping>().map_err(|_| invalid_input())?;
-    if mapping.len().map_err(|_| invalid_input())? != 14 {
+    if mapping.len().map_err(|_| invalid_input())? != 21 {
         return Err(invalid_input());
     }
     let example_id = exact_string(
@@ -152,11 +161,47 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
     if instrument.to_string() != instrument_text {
         return Err(invalid_input());
     }
-    let cutoff = mapping.get_item("cutoff_at").map_err(|_| invalid_input())?;
-    if !exact_python_type(&cutoff, "market_squawk._data_validation", "UtcNanoseconds")? {
-        return Err(invalid_input());
-    }
-    let cutoff_at = exact_i64(&cutoff.getattr("unix_nanos").map_err(|_| invalid_input())?)?;
+    let source_selection_as_of = optional_utc_nanos(
+        &mapping
+            .get_item("source_selection_as_of")
+            .map_err(|_| invalid_input())?,
+    )?
+    .ok_or_else(invalid_input)?;
+    let label_selection_as_of = optional_utc_nanos(
+        &mapping
+            .get_item("label_selection_as_of")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let decision_at = optional_utc_nanos(
+        &mapping
+            .get_item("decision_at")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let decision_on = optional_calendar_date(
+        &mapping
+            .get_item("decision_on")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let decision_coordinate = match (decision_at, decision_on) {
+        (Some(value), None) => ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(value)),
+        (None, Some(value)) => ResearchTemporalCoordinate::calendar_date(value),
+        _ => return Err(invalid_input()),
+    };
+    let observed_effective_at = optional_utc_nanos(
+        &mapping
+            .get_item("observed_effective_at")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let label_effective_at = optional_utc_nanos(
+        &mapping
+            .get_item("label_effective_at")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let target_coordinate_kind = exact_u8(
+        &mapping
+            .get_item("target_coordinate_kind")
+            .map_err(|_| invalid_input())?,
+    )?;
     let split =
         match exact_string(&mapping.get_item("split").map_err(|_| invalid_input())?)?.as_str() {
             "train" => 1,
@@ -245,10 +290,28 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         .as_bytes()
         .try_into()
         .map_err(|_| invalid_input())?;
+    let epoch_value = mapping
+        .get_item("input_epoch_json")
+        .map_err(|_| invalid_input())?;
+    let input_epoch_json = if epoch_value.is_none() {
+        None
+    } else {
+        Some(
+            epoch_value
+                .cast_exact::<PyBytes>()
+                .map_err(|_| invalid_input())?
+                .as_bytes(),
+        )
+    };
     PythonDatasetRow::try_new(
         &example_id,
         instrument.into_bytes(),
-        Timestamp::from_unix_nanos(cutoff_at),
+        Timestamp::from_unix_nanos(source_selection_as_of),
+        label_selection_as_of.map(Timestamp::from_unix_nanos),
+        decision_coordinate,
+        observed_effective_at.map(Timestamp::from_unix_nanos),
+        label_effective_at.map(Timestamp::from_unix_nanos),
+        target_coordinate_kind,
         split,
         component_kind,
         &component_name,
@@ -257,7 +320,37 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         unit.as_deref(),
         currency.as_deref(),
         lineage,
+        input_epoch_json,
     )
+    .map_err(|_| invalid_input())
+}
+
+fn optional_utc_nanos(value: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if !exact_python_type(value, "market_squawk._data_validation", "UtcNanoseconds")? {
+        return Err(invalid_input());
+    }
+    exact_i64(&value.getattr("unix_nanos").map_err(|_| invalid_input())?).map(Some)
+}
+
+fn optional_calendar_date(value: &Bound<'_, PyAny>) -> PyResult<Option<CalendarDate>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    // Exact datetime.date only: datetime and user subclasses cannot supply an implicit time,
+    // timezone, or overridden field. Attribute access supports the crate's stable Python ABI.
+    let value = value.cast_exact::<PyDate>().map_err(|_| invalid_input())?;
+    let year = exact_i64(&value.getattr("year").map_err(|_| invalid_input())?)?;
+    let month = exact_u8(&value.getattr("month").map_err(|_| invalid_input())?)?;
+    let day = exact_u8(&value.getattr("day").map_err(|_| invalid_input())?)?;
+    CalendarDate::new(
+        u16::try_from(year).map_err(|_| invalid_input())?,
+        month,
+        day,
+    )
+    .map(Some)
     .map_err(|_| invalid_input())
 }
 

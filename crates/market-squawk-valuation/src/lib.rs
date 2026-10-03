@@ -53,6 +53,15 @@ macro_rules! digest_id {
 /// Typed construction, classification, workflow, and bounded-service failures.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum FairValueError {
+    /// Request cancellation ended the source read or recovery operation.
+    #[error("fair-value operation was cancelled")]
+    Cancelled,
+    /// The actual request deadline elapsed during source read or recovery.
+    #[error("fair-value operation deadline elapsed")]
+    DeadlineExceeded,
+    /// An underlying bounded authority exhausted capacity without reporting exact counts.
+    #[error("fair-value operation resource capacity is exhausted")]
+    ResourceExhausted,
     /// A bounded actor identity is empty, too long, or contains forbidden characters.
     #[error("fair-value actor identity is invalid")]
     InvalidActorId,
@@ -145,6 +154,9 @@ pub enum FairValueError {
         /// Configured maximum rows.
         limit: usize,
     },
+    /// An audit cursor is empty, stale, or does not identify the retained chain position.
+    #[error("fair-value audit cursor is invalid")]
+    InvalidAuditCursor,
     /// The local catalog rejected an otherwise validated fair-value operation.
     #[error("fair-value catalog persistence failed")]
     Persistence,
@@ -156,7 +168,9 @@ pub enum FairValueError {
 mod access;
 mod approval;
 mod assessment;
+mod automatic;
 mod evidence;
+mod macro_assumptions;
 mod measurement;
 mod persistence;
 mod rules;
@@ -168,23 +182,57 @@ pub use approval::{
     ValuationApproval, ValuationApprovalId, ValuationOverride,
 };
 pub use assessment::{InputUseAssessment, InputUseAssessmentHash};
+pub use automatic::{
+    AnnualEquityArithmetic, AnnualEquityPremiumArithmetic, AutomaticValuationAssumption,
+    AutomaticValuationAssumptionKind, AutomaticValuationAttemptAudit,
+    AutomaticValuationCalculation, AutomaticValuationConflict, AutomaticValuationError,
+    AutomaticValuationFailure, AutomaticValuationForecastPurpose,
+    AutomaticValuationForecastReadAudit, AutomaticValuationIdentity, AutomaticValuationInput,
+    AutomaticValuationInputSetIdentity, AutomaticValuationIntermediate,
+    AutomaticValuationIntermediateKind, AutomaticValuationMethod, AutomaticValuationMethodReceipt,
+    AutomaticValuationMethodSetAudit, AutomaticValuationRange,
+    AutomaticValuationRecommendationAudit, AutomaticValuationRecommendationOutcome,
+    AutomaticValuationResultAudit, AutomaticValuationStage, AutomaticValuationUnavailable,
+    AutomaticValuationUncertainty, CommonShareFilingEvidence, CommonShareValuationBasis,
+    ComparableCompaniesValuationRequest, ComparableCompanyInput, ComparablePeerArithmetic,
+    ComparableValueArithmetic, CurrentShareValuationProjection, DcfCashFlow,
+    DcfTerminalGrowthAudit, DcfTerminalGrowthPolicy, DiscountedCashFlowValuationRequest,
+    EQUITY_PREMIUM_ESTIMATOR, EQUITY_PREMIUM_SAMPLE_YEARS, ForecastDistributionPoint,
+    ForecastDistributionValuationRequest, ForecastOutcomeArithmetic, ForecastValueArithmetic,
+    ModeledGovernmentAnnualReturn, PointInTimeValuationInput, REPORTED_COMMON_SHARE_ASSUMPTION,
+    ResidualIncomePeriod, ResidualIncomeTerminalAudit, ResidualIncomeTerminalConvention,
+    ResidualIncomeTerminalReceipt, ResidualIncomeValuationRequest, ValuationArithmeticPolicy,
+    ValuationEventRightsAdmission, ValuationRightsReceipt, calculate_comparable_companies,
+    calculate_discounted_cash_flow, calculate_forecast_distribution, calculate_residual_income,
+};
 pub use evidence::{
     EvidenceOrigin, EvidenceVerification, FairValueEvidence, FairValueEvidenceHash,
+    ForecastValuationEvidence, ForecastValuationOriginIdentity, ForecastValuationReference,
+    ForecastValuationResolver, ForecastValuationSource, ForecastValuationValueSelection,
+};
+pub use macro_assumptions::{
+    FinancialModelMacroAssumptions, MacroRateMaturity, MacroRateReferenceEvidence,
+    automatic_assumptions_identity,
 };
 pub use measurement::{
     ActorId, CommittedMarketInputRequest, InputId, InputInstrumentRelation, InputObservability,
     InputSignificance, MarketAccess, MarketActivity, MarketActivityPolicy,
     MarketActivityPolicyHash, MarketPriceSelection, MeasurementId, PriceAdjustment,
-    ValuationAmount, ValuationInput, ValuationMeasurement, ValuationMeasurementSpec,
-    ValuationMethod,
+    ValuationAmount, ValuationAmountBasis, ValuationInput, ValuationMeasurement,
+    ValuationMeasurementSpec, ValuationMethod,
 };
 pub use rules::{
     ClassificationDecision, ClassificationRuleset, DecisionBasis, DecisionId, DecisionReason,
     DecisionReasonCode, Predicate, PredicateResult, RulesetHash,
 };
+pub use service::queries::{
+    FairValueSelectionDisposition, FairValueSelectionError, FairValueSelectionOrderEntry,
+    FairValueSelectionReceipt, FairValueSelectionReceiptHash, FairValueSelectionRequest,
+    SelectedFairValueEvidence,
+};
 pub use service::{
-    AuditEventId, AuditEventKind, FairValueAuditEvent, FairValueLimitInput, FairValueLimits,
-    FairValueService,
+    AuditEventId, AuditEventKind, FairValueAuditCursor, FairValueAuditEvent, FairValueAuditPage,
+    FairValueLimitInput, FairValueLimits, FairValueService,
 };
 
 pub(crate) struct CanonicalHasher(Sha256);

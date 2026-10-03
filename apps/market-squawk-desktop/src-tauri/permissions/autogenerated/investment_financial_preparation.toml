@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-investment-financial-preparation"
+description = "Enables the investment_financial_preparation command without any pre-configured scope."
+commands.allow = ["investment_financial_preparation"]
+
+[[permission]]
+identifier = "deny-investment-financial-preparation"
+description = "Denies the investment_financial_preparation command without any pre-configured scope."
+commands.deny = ["investment_financial_preparation"]

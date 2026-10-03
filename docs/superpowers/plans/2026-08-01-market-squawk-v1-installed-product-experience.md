@@ -20,10 +20,11 @@ duplicating the heavy product runtime. Durable jobs own training, backtest, inge
 and recovery lifecycles independently of client connections. The Tauri WebView receives only
 validated product read models and narrow commands through Rust.
 
-**Tech Stack:** Rust 1.97.1 and Edition 2024; Tokio; Axum 0.8.9/Tower 0.5.2/Hyper 1; RMCP 2.2;
+**Tech Stack:** Rust 1.97.1 and Edition 2024; Tokio 1.53.1/Tokio-util 0.7.19; Axum
+0.8.9/Tower 0.5.3/Tower HTTP 0.7.0/Hyper 1; RMCP 3.1 with explicit stable MCP `2026-07-28`;
 SQLite/rusqlite; Arrow 58.3, Parquet 58.3, and DataFusion 54; Tauri 2.11; React 19; TanStack Query
 5.101.4 and Table 8.21.3; Lightweight Charts 5.2.0 and Recharts 3.10.1; Python 3.14 managed by uv; PyArrow 25;
-scikit-learn 1.9.0; skforecast 0.23.0; ONNX 1.22.0 and skl2onnx 1.20.0; the existing
+scikit-learn 1.9.0; MAPIE 1.4.1; ONNX 1.22.0 and skl2onnx 1.20.0; PyPA packaging 26.2; the existing
 native/tract/ONNX Runtime
 inference paths; and the existing verified complete-release installer.
 
@@ -50,7 +51,7 @@ inference paths; and the existing verified complete-release installer.
   risk/execution authority, and release evidence. These files belong only to the integration owner.
 - The service owns exactly one active `LocalProduct`, `Application`, source/live authority,
   model/admission authority, paper controller, risk/dispatcher path, artifact authority, audit sink,
-  job authority, and active workspace. Transports, clients, sessions, relays, jobs, and UI code never
+  job authority, and active workspace. Transports, clients, relays, jobs, and UI code never
   mint or bypass these authorities.
 - Preserve the current working ingestion, point-in-time, Arrow/Parquet/DataFusion, finance,
   portfolio, fair-value, backtesting, paper, risk, execution, native inference, and ONNX inference
@@ -98,13 +99,13 @@ lockfile mutation.
 
 | Capability | Decision | Reason and source |
 | --- | --- | --- |
-| Loopback application API | Add exact Axum 0.8.9 and Tower 0.5.2 to the existing Hyper stack | Axum is Tokio-maintained, composes with Tower, provides typed routing/extractors/SSE, and can nest RMCP's Tower service. Use its stable APIs rather than hand-writing another HTTP router. [Axum docs](https://docs.rs/axum/latest/axum/), [SSE](https://docs.rs/axum/latest/axum/response/sse/) |
-| MCP | Extend existing exact RMCP 2.2.0 features for Streamable HTTP | RMCP is the official Rust SDK already used by the repository and supplies `StreamableHttpService`, session management, origin/host controls, cancellation, and resumable HTTP semantics. Do not implement MCP framing or sessions independently. [RMCP transports](https://docs.rs/rmcp/2.2.0/rmcp/transport/index.html), [StreamableHttpService](https://docs.rs/rmcp/2.2.0/rmcp/transport/streamable_http_server/tower/struct.StreamableHttpService.html), [MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) |
+| Loopback application API | Add exact Axum 0.8.9, Tower 0.5.3, and Tower HTTP 0.7.0 to the existing exact Hyper stack | Axum is Tokio-maintained, composes with Tower, provides typed routing/extractors/SSE, and can nest RMCP's Tower service. Tower HTTP supplies the admitted body/request-ID/sensitive-header/trace/validation policies. Use minimal direct features and omit the dependency if production code does not install its layers. [Axum 0.8.9](https://github.com/tokio-rs/axum/releases/tag/axum-v0.8.9), [Tower 0.5.3](https://github.com/tower-rs/tower/releases/tag/tower-0.5.3), [Tower HTTP 0.7.0](https://github.com/tower-rs/tower-http/releases/tag/tower-http-0.7.0) |
+| MCP | Upgrade to exact RMCP 3.1.0 behind a narrow stable-2026 protocol facade | RMCP is the maintained official Rust SDK and supplies the protocol transport/metadata machinery. Market Squawk explicitly selects `V_2026_07_28`, a singleton admitted-version set, stateless metadata, modern POST-only HTTP, and closed Host/Origin/auth/limit policy. It does not use RMCP's legacy/default lifecycle, implicit protocol sessions, GET/DELETE, or resumable `Last-Event-ID` state. Named-client legacy compatibility may exist only at the stateless stdio relay boundary. [RMCP 3.1.0](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.1.0), [stable MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic), [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) |
 | Durable jobs | Build one domain-specific authority over existing Tokio, SQLite, `CancellationToken`, `ProgressReporter`, and process supervision | Effectum is stable but its generic state model does not cover Market Squawk's authority snapshots, confirmation, immutable outputs, progress generations, and recovery rules. Apalis SQLite remained release-candidate quality during research. Adding either would create a second job authority. [Effectum](https://docs.rs/effectum/latest/effectum/), [Tokio TaskTracker](https://docs.rs/tokio-util/latest/tokio_util/task/struct.TaskTracker.html), [SQLite transactions](https://www.sqlite.org/lang_transaction.html), [SQLite WAL](https://sqlite.org/wal.html) |
 | Desktop server state | Add exact TanStack Query 5.101.4 and TanStack Table 8.21.3 | Query supplies cancellation, invalidation, bounded caching, mutation state, and reconnect/refetch semantics; Table supplies accessible headless table state without replacing the existing visual system. Do not adopt Table 9 beta. [TanStack Query](https://tanstack.com/query/v5/docs/framework/react/guides/queries), [TanStack Table](https://tanstack.com/table/latest/docs/introduction) |
 | Market/predictive charts | Add exact Lightweight Charts 5.2.0, Recharts 3.10.1, and `react-is` 19.2.8 | Lightweight Charts handles financial time series efficiently. Recharts covers portfolio/risk/scenario/attribution charts using React-native composition. Keep chart data bounded and provide equivalent text/tables. [Lightweight Charts](https://tradingview.github.io/lightweight-charts/docs/5.1), [Recharts](https://recharts.github.io/), [WAI complex images](https://www.w3.org/WAI/tutorials/images/complex/) |
 | Native desktop integration | Add exact Rust `tauri-plugin-dialog` 2.7.2; use Tauri `Channel` and current capability/CSP controls | The Rust side opens files and returns opaque staged tickets; the WebView never receives ambient filesystem authority or service credentials. The JS dialog binding is unnecessary and is not added. [Tauri dialog](https://v2.tauri.app/plugin/dialog/), [Tauri Channel](https://docs.rs/tauri/latest/tauri/ipc/struct.Channel.html), [Tauri capabilities](https://v2.tauri.app/security/capabilities/) |
-| Forecasting/training | Add exact scikit-learn 1.9.0, skforecast 0.23.0, skl2onnx 1.20.0, and ONNX 1.22.0 to the four-platform Python closure | These maintained libraries provide deterministic estimators, direct/recursive multi-step forecasting, temporal backtesting, exogenous inputs, conformal prediction intervals, and official sklearn-to-ONNX conversion. Do not add a second backtesting framework or MAPIE when skforecast already provides the required conformal path. [scikit-learn 1.9.0](https://pypi.org/project/scikit-learn/), [skforecast 0.23.0](https://pypi.org/project/skforecast/), [skl2onnx 1.20.0](https://pypi.org/project/skl2onnx/), [ONNX 1.22.0](https://pypi.org/project/onnx/) |
+| Forecasting/training | Add exact scikit-learn 1.9.0, MAPIE 1.4.1, skl2onnx 1.20.0, ONNX 1.22.0, and packaging 26.2 to the four-platform Python closure; implement bounded horizon orchestration over maintained primitives | `skforecast` 0.23.0 is rejected because its mandatory Numba/llvmlite chain has no CPython 3.14 Intel-macOS wheel. MLForecast is the best ready-made reduction framework but expands the closure to 26-28 distributions and introduces unnecessary Optuna/Tqdm licensing and runtime surface. Scikit-learn supplies estimator, direct/multi-output/chained, time-split, and quantile primitives. MAPIE adds the explicitly required time-series conformal calibration path with only one pure-Python package beyond that graph; its method assumptions and realized coverage remain visible evidence, never a guarantee. Market Squawk owns only domain-specific lag/horizon/cutoff/leakage/backtest coordination. Use packaging's public wheel-tag APIs instead of filename substrings. [scikit-learn 1.9.0](https://pypi.org/project/scikit-learn/), [MAPIE 1.4.1](https://pypi.org/project/mapie/), [skl2onnx 1.20.0](https://pypi.org/project/skl2onnx/), [ONNX 1.22.0](https://pypi.org/project/onnx/), [packaging 26.2](https://pypi.org/project/packaging/) |
 | Python dependency lock | Retain the exact sealed `requirements.lock`/wheel manifests and use pinned uv's universal `pip compile --generate-hashes` plus strict `pip sync`; do not introduce `uv.lock` | uv officially supports universal resolution, hash generation, exact `requirements.txt` output, target-platform resolution, and strict environment synchronization. Keeping one shipping lock authority avoids disagreement with `build_python_release.py`. [uv locking](https://docs.astral.sh/uv/pip/compile/), [uv resolution](https://docs.astral.sh/uv/concepts/resolution/), [uv command reference](https://docs.astral.sh/uv/reference/cli/) |
 | Search | Reuse `cmdk`, bounded SQLite/DataFusion queries, and in-memory indexing; do not add Tantivy/Nucleo initially | The product corpus is structured, authority-backed, and already queryable. A second persistent search index would duplicate storage, point-in-time, and recovery responsibilities. Add an external index only if measured V1 lookup acceptance fails after the structured implementation. [cmdk](https://github.com/dip/cmdk), [DataFusion SQL](https://datafusion.apache.org/library-user-guide/using-the-sql-api.html) |
 | Backup/update | Reuse `AnalyticalBackupService`, immutable installer generations, existing release hashes/attestations, and platform-native lifecycle; implement TUF-equivalent metadata admission in that authority | Do not add a competing repository engine, but do implement separated root/targets/snapshot/timestamp key roles, threshold verification, metadata expiry, monotonic version admission, consistent snapshots, and rollback/freeze protection before installer activation. Program-generation rollback remains a separate recovery feature. [SQLite backup](https://www.sqlite.org/backup.html), [TUF specification](https://theupdateframework.github.io/specification/latest/), [SLSA 1.2](https://slsa.dev/spec/v1.2/) |
@@ -125,7 +126,7 @@ and [backtest-overfitting control](https://doi.org/10.3905/jfds.2019.1.064).
 | --- | --- |
 | `crates/market-squawk-jobs/` | Transport-neutral durable job identities, states, events, repository, scheduler, cancellation, recovery, and controlled outputs |
 | `crates/market-squawk-runtime/` | Authority-neutral app protocol, authenticated loopback application router/client, rendezvous, credential registry, event hub, replay guard, and runtime limits |
-| `crates/market-squawk-mcp/` | Shared RMCP handler/session factory, Streamable HTTP service, stdio relay client, MCP resources/tasks/job projection, and MCP-specific limits/audit |
+| `crates/market-squawk-mcp/` | Shared RMCP handler/request factory, stateless Streamable HTTP service, stdio relay adapter, MCP resources/job projection, and MCP-specific limits/audit |
 | `apps/market-squawk/src/service/` | Installed-service composition that owns one `LocalProduct`, request dispatch, workspace/lifecycle coordination, and shutdown |
 | `apps/market-squawk/src/jobs/` | Application-specific job runners for training, backtest, ingestion, backup, update, recovery, forecasts, and scenarios |
 | `apps/market-squawk/src/application/` | Typed Job/Analysis/Model/Portfolio/FairValue/Source operations and read models over existing authorities |
@@ -359,7 +360,7 @@ commit subjects so history remains product/feature based rather than agent/works
 | --- | --- |
 | 2 | `feat(jobs): add durable operation authority` |
 | 3 | `feat(runtime): add authenticated per-user application protocol` |
-| 4 | `feat(mcp): serve shared sessions and stateless relays` |
+| 4 | `feat(mcp): serve stateless requests and client relays` |
 | 5 | `feat(service): centralize installed product ownership` |
 | 8 | `feat(application): expose durable product jobs` |
 | 9 | `feat(modeling): add governed training worker lifecycle` |
@@ -422,7 +423,7 @@ product commit scope and repeats the affected barrier or final candidate gate.
   stale baseline claim, uncovered capability, and rejected version in the Task 1 dependency note
   and tracking issue; do not silently reinterpret the design or begin parallel work with an
   unresolved refresh finding. In particular, resolve the repository's RMCP 2.2 line against the
-  current MCP transport/session specification before locking that dependency, and either prove the
+  current MCP transport/protocol specification before locking that dependency, and either prove the
   supported macOS 12 per-user service mechanism or explicitly revise the supported operating-system
   floor before native-package approval.
 
@@ -461,6 +462,10 @@ product commit scope and repeats the affected barrier or final candidate gate.
 - Create: `crates/market-squawk-runtime/src/lib.rs`
 - Create: `crates/market-squawk-runtime/src/contracts.rs`
 - Modify: `crates/market-squawk-mcp/Cargo.toml`
+- Modify: `crates/market-squawk-mcp/src/server.rs`
+- Modify: `crates/market-squawk-mcp/src/framing.rs`
+- Modify: `crates/market-squawk-mcp/src/isolation.rs`
+- Modify: affected existing `crates/market-squawk-mcp/tests/` fixtures and snapshots
 - Modify: `apps/market-squawk/Cargo.toml`
 - Modify: `apps/market-squawk-desktop/src-tauri/Cargo.toml`
 - Modify: `apps/market-squawk-installer/Cargo.toml`
@@ -479,12 +484,21 @@ product commit scope and repeats the affected barrier or final candidate gate.
 
 - [ ] **Step 2: Add crate/package identities and exact dependency features**
 
-  Add `market-squawk-jobs` and `market-squawk-runtime` as workspace dependencies. Enable only RMCP
-  server, stdio, and Streamable HTTP features actually used. Add Axum/Tower features required for
-  typed JSON, body limits, SSE, trace-safe request IDs, and graceful shutdown. Add the official
+  Add `market-squawk-jobs` and `market-squawk-runtime` as workspace dependencies. Upgrade RMCP to
+  exact 3.1.0 and enable only the server, stdio, and Streamable HTTP server features actually used.
+  The relay reuses `ApplicationClient`; do not add RMCP HTTP-client/Reqwest, OAuth, or TLS features.
+  Add Axum/Tower/Tower HTTP features required for typed JSON, body limits, SSE, trace-safe request
+  IDs, closed request validation, and graceful shutdown. Add the official
   Tauri dialog plugin without filesystem/shell plugins. Keep all workspace metadata/lints inherited.
   Add real documented crate roots and their smallest closed contract modules so both crates compile
   without placeholders. Tasks 2 and 3 extend these files rather than creating them.
+
+  Migrate the existing RMCP 2.2 source boundary in this serialized task: adopt the 3.1 response and
+  metadata types, remove `ProtocolVersion::LATEST`, explicitly select `V_2026_07_28`, override the
+  server's supported versions to the admitted singleton, and preserve the existing bounded tool,
+  framing, isolation, and stdio behavior. Do not advertise optional MCP capabilities that are not
+  implemented. Configure the shared HTTP seam as modern, stateless, and POST-only; legacy client
+  lifecycle handling belongs only to the later named-client relay adapter.
 
 - [ ] **Step 3: Confirm the crate DAG has no authority cycle**
 
@@ -493,7 +507,7 @@ product commit scope and repeats the affected barrier or final candidate gate.
   ```text
   domain/platform/services -> jobs
   domain/platform/services/jobs -> runtime
-  domain/platform/services/runtime -> mcp
+  domain/platform/services/jobs/runtime -> mcp
   domain engines/runtime/mcp -> market-squawk application composition
   market-squawk runtime client -> desktop Rust bridge
   ```
@@ -514,6 +528,8 @@ product commit scope and repeats the affected barrier or final candidate gate.
     -p market-squawk-mcp
   CARGO_INCREMENTAL=0 cargo check -p market-squawk-jobs -p market-squawk-runtime \
     -p market-squawk-mcp --locked
+  CARGO_INCREMENTAL=0 cargo test -p market-squawk-mcp --test lifecycle_protocol --locked
+  CARGO_INCREMENTAL=0 cargo test -p market-squawk-mcp --test hostile_boundaries --locked
   cargo tree -p market-squawk-runtime --edges normal
   cargo deny check
   python3 scripts/check_workspace_boundaries.py
@@ -526,7 +542,7 @@ product commit scope and repeats the affected barrier or final candidate gate.
 
   ```bash
   git add Cargo.toml Cargo.lock crates/market-squawk-jobs crates/market-squawk-runtime \
-    crates/market-squawk-mcp/Cargo.toml apps/market-squawk/Cargo.toml \
+    crates/market-squawk-mcp apps/market-squawk/Cargo.toml \
     apps/market-squawk-desktop/src-tauri/Cargo.toml \
     apps/market-squawk-installer/Cargo.toml \
     scripts/check_workspace_boundaries.py \
@@ -654,7 +670,7 @@ custody outside JSON/WebView state.
   cargo fmt --all --check
   ```
 
-### Task 4: Refactor MCP into shared sessions, HTTP service, resources, and relay
+### Task 4: Refactor MCP into stateless HTTP requests, resources, and compatible relays
 
 **Files:**
 
@@ -665,45 +681,54 @@ custody outside JSON/WebView state.
 - Create: `crates/market-squawk-mcp/src/handler.rs`
 - Create: `crates/market-squawk-mcp/src/http.rs`
 - Create: `crates/market-squawk-mcp/src/resources.rs`
-- Create: `crates/market-squawk-mcp/src/tasks.rs`
+- Create: `crates/market-squawk-mcp/src/jobs.rs`
 - Create: `crates/market-squawk-mcp/src/relay.rs`
 - Modify: `crates/market-squawk-mcp/src/lib.rs`
 - Modify: `crates/market-squawk-mcp/tests/lifecycle_protocol.rs`
 
-**Produces:** multiple isolated MCP sessions over one application/service owner; standard resources
-and task semantics where stable; a stateless relay compatible with stdio clients.
+**Produces:** independently authenticated stateless MCP requests over one application/service
+owner; stable resources and explicit durable Job compatibility; a stateless relay compatible with
+named stdio clients.
 
 - [ ] **Step 1: Extend one existing lifecycle test root**
 
-  Prove two credentials/two sessions can initialize, list tools/resources, run a bounded safe read,
-  and disconnect independently; one session cancellation/EOF must not stop the other, the durable
-  job, or the application. Prove missing/wrong auth and browser Origin fail before MCP dispatch.
+  Prove two credentials can independently discover/list tools/resources, run a bounded safe read,
+  and disconnect; one client's cancellation/EOF must not stop the other, a durable job, or the
+  application. Prove missing/wrong auth, Host/Origin, protocol metadata, version, and header/body
+  disagreement fail before MCP dispatch. Prove modern GET/DELETE return 405 and legacy
+  `Mcp-Session-Id`/`Last-Event-ID` never create shared-service state.
 
-- [ ] **Step 2: Split handler/session ownership from application ownership**
+- [ ] **Step 2: Split handler/request ownership from application ownership**
 
   Extract a reusable RMCP handler factory over shared `ToolServices`, artifacts, audit, limits, and
-  authenticated session identity. Delete session ownership of `Application::begin_shutdown`.
-  Session shutdown cancels/drains only that session's requests and progress bridges.
+  authenticated client/request identity. Delete MCP ownership of `Application::begin_shutdown`.
+  Request/relay shutdown cancels or drains only its own nondurable requests and progress bridges.
 
 - [ ] **Step 3: Mount RMCP Streamable HTTP without reimplementing the protocol**
 
-  Configure `StreamableHttpService` with closed host/origin rules, stateful session manager,
-  session expiry, global/per-client/session ceilings, cancellation, and bounded SSE resume. Preserve
-  the existing application schema projection, result bounds, artifact fallback, redaction, and audit
-  phases.
+  Configure RMCP 3.1 for exact `V_2026_07_28`, a singleton supported-version set, stateless
+  protocol metadata, legacy-session mode disabled, POST-only routing, closed Host/Origin rules,
+  global/per-credential/request ceilings, cancellation, and bounded request-scoped SSE. Preserve
+  the existing application schema projection, result bounds, artifact fallback, redaction, and
+  audit phases. Do not add a protocol session/event store or `Last-Event-ID` replay. Cross-call
+  product state uses explicit authenticated handles with independent expiry and bounds.
 
 - [ ] **Step 4: Add stable resources and job compatibility**
 
   Add bounded resource templates for service/workspace/source/model/job/artifact metadata and
-  `market-squawk://jobs/{job_id}` event/result inspection. Use standard MCP Tasks only behind a
-  negotiated capability while the specification feature remains experimental; always provide the
-  stable typed `Job.*` tools as the V1 compatibility path.
+  `market-squawk://jobs/{job_id}/generations/{generation}` event/result inspection. Do not advertise RMCP Tasks, MRTR,
+  input-required, subscriptions, or request-state capabilities unless a later task in this plan
+  implements and proves that exact stable capability. The typed `Job.*` tools/resources are the V1
+  durable-operation authority.
 
 - [ ] **Step 5: Implement the stateless stdio relay**
 
   The relay reads the rendezvous and its named client credential through native Rust/secret-store
-  authority, forwards one stdio MCP session to the shared HTTP service, enforces bounded frames and
-  teardown, and holds no `LocalProduct`, SQLite catalog, data engine, model runtime, or paper state.
+  authority, adapts one bounded stdio client connection to the shared modern service, and holds no
+  `LocalProduct`, SQLite catalog, data engine, model runtime, protocol-session store, or paper
+  state. Its client-facing lifecycle may admit legacy `2025-11-25` only for a named current Claude
+  or Codex compatibility requirement; it translates requests into independently authenticated
+  service calls and cannot transfer implicit legacy session authority.
 
 - [ ] **Step 6: Pass focused gates**
 
@@ -748,7 +773,7 @@ and task semantics where stable; a stateless relay compatible with stdio clients
   audit sink, source/live event adapter, loopback listener, credential registry, rendezvous, and
   active workspace. Compose the runtime application router and MCP `/mcp` service on that one
   listener. Publish the rendezvous only after every required authority is ready. On
-  shutdown: stop admission; drain requests/sessions; checkpoint/interrupt jobs; stop source/live
+  shutdown: stop admission; drain requests/client connections; checkpoint/interrupt jobs; stop source/live
   projections; reconcile/stop paper; run application shutdown; flush audit; remove only the matching
   rendezvous generation.
 
@@ -800,7 +825,7 @@ and task semantics where stable; a stateless relay compatible with stdio clients
 
 - [ ] **Step 3: Conduct the integration-owner focused review**
 
-  Review protocol/auth/session isolation, service ownership/shutdown, job crash/recovery/cancel,
+  Review protocol/auth/request/handle isolation, service ownership/shutdown, job crash/recovery/cancel,
   source/paper/risk authority, file staging, secret exposure, resource bounds, API documentation,
   and dependency admission. Close every substantiated Critical/Important/Minor finding, rerun the
   affected gates, then rerun the Wave gate on the remediated exact head. This is an internal
@@ -839,10 +864,12 @@ authority that cannot be confused with portfolio allocation or fair-value classi
 
 - [ ] **Step 1: Verify and lock the Python dependency graph**
 
-  Admit scikit-learn 1.9.0, skforecast 0.23.0, skl2onnx 1.20.0, ONNX 1.22.0, and the exact
+  Admit scikit-learn 1.9.0, MAPIE 1.4.1, skl2onnx 1.20.0, ONNX 1.22.0, packaging 26.2, and the exact
   compatible numpy/scipy/joblib transitive versions for all four supported Python 3.14
   targets. Reject any package without the required wheel, compatible license, maintained release,
   or reproducible hash. Do not silently build from source in the installer.
+  Refresh packaged uv from 0.12.0 to exact 0.12.1 and atomically replace every target archive and
+  executable identity, size, hash, release URL, component record, and builder version assertion.
 
 - [ ] **Step 2: Add `market-squawk-decisions`**
 
@@ -867,7 +894,7 @@ authority that cannot be confused with portfolio allocation or fair-value classi
   uv pip sync --python python/.venv/bin/python --require-hashes --strict \
     python/requirements.lock
   python/.venv/bin/python -c \
-    "import sklearn, skforecast, skl2onnx, onnx; print(sklearn.__version__)"
+    "import sklearn, mapie, skl2onnx, onnx, packaging; print(sklearn.__version__)"
   CARGO_INCREMENTAL=0 cargo check -p market-squawk-decisions
   CARGO_INCREMENTAL=0 cargo check -p market-squawk-decisions --locked
   python3 scripts/check_workspace_boundaries.py
@@ -882,6 +909,14 @@ authority that cannot be confused with portfolio allocation or fair-value classi
   second lock authority. The serialized owner updates every wheel URL/hash/platform inventory and
   complete-release manifest together. Each native package matrix lane later materializes its exact
   inventory offline through the existing builder.
+
+  Replace filename-substring compatibility checks with packaging 26.2's public
+  `parse_wheel_filename`, `Requirement`, `SpecifierSet`, `Marker.evaluate`, `cpython_tags`,
+  `compatible_tags`, and `mac_platforms` APIs plus an explicit supported-target and OS-floor tag
+  policy. Generate cross-target tags explicitly; `sys_tags()` is valid only for the running host.
+  Admit ordinary CPython ABI3 wheels such as ONNX's `cp312-abi3` on CPython 3.14 when the explicit
+  target tags allow them, and reject free-threaded `cp314t`, too-new macOS floors, bare/unsupported
+  Linux tags, wrong architectures, and source archives.
 
   The first decisions-crate check is the sole serialized Cargo lock resolution for this boundary;
   the immediately repeated locked check proves the written lock. Also add a separate
@@ -1039,9 +1074,15 @@ candidate evidence, and immediately consistent service-owned model reads.
 
 - [ ] **Step 3: Implement deterministic Python forecasting**
 
-  Use skforecast/scikit-learn for direct multi-step baseline models, exogenous admitted features,
-  rolling-origin temporal validation, and conformal intervals. Calculate proper loss/coverage and
-  backtest-selection evidence. Seed all stochastic components and record versions/parameters.
+  Use scikit-learn's direct/multi-output/chained estimator and time-split primitives plus MAPIE's
+  admitted time-series conformal path behind one bounded Market Squawk lag/horizon/cutoff adapter
+  for direct and recursive multi-step baselines,
+  exogenous admitted features, rolling-origin temporal validation, quantile bands, and conformal
+  intervals. Keep quantile and conformal outputs distinctly typed and labelled. Record the selected
+  conformal method, dependence assumptions, calibration window, target coverage, and realized
+  coverage; do not describe marginal empirical coverage as a per-observation guarantee. Calculate
+  proper loss/coverage and backtest-selection evidence.
+  Seed all stochastic components and record versions/parameters.
   Export the central path to admitted ONNX through sklearn-onnx; retain calibration residuals and
   interval policy as hashed bundle artifacts.
 
@@ -1242,9 +1283,6 @@ adds their shared application registry/contracts plus overview/lookup compositio
 
 - Modify: `apps/market-squawk-desktop/package.json`
 - Modify: `apps/market-squawk-desktop/pnpm-lock.yaml`
-- Modify: `Cargo.toml`
-- Modify: `Cargo.lock`
-- Modify: `apps/market-squawk-desktop/src-tauri/Cargo.toml`
 - Modify: `apps/market-squawk-desktop/src-tauri/src/lib.rs`
 - Modify: `apps/market-squawk-desktop/src-tauri/capabilities/main.json`
 - Create/Modify: generated Tauri permission files required by the exact command/plugin set
@@ -1268,7 +1306,8 @@ adds their shared application registry/contracts plus overview/lookup compositio
     lightweight-charts@5.2.0 recharts@3.10.1 react-is@19.2.8
   ```
 
-  Add exact Rust `tauri-plugin-dialog = "=2.7.2"`; do not add its JS binding because native Rust owns
+  Use the exact Rust `tauri-plugin-dialog = "=2.7.2"` dependency already admitted by Task 1; do not
+  resolve or edit a Rust manifest/lock again and do not add its JS binding because native Rust owns
   file selection and staging. Generate only required permission/capability entries. Do not add a
   generic state store, HTTP client in TypeScript, filesystem plugin, shell plugin, browser
   persistence library, or another chart suite.
@@ -1284,8 +1323,9 @@ adds their shared application registry/contracts plus overview/lookup compositio
 
 - [ ] **Step 4: Commit and push the serialized lock boundary**
 
-  Integration owner stages the two locks/manifests, capability/permission outputs, and dependency
-  note; commits `build(desktop): lock v1 dashboard dependencies`; then pushes.
+  Integration owner stages the frontend manifest/lock, capability/permission outputs, plugin
+  registration, and dependency note; commits `build(desktop): lock v1 dashboard dependencies`;
+  then pushes.
 
 ### Task 15: Implement the native Desktop service bridge and controlled input tickets
 
@@ -1402,6 +1442,35 @@ financial/time/quality presentation without duplicating business calculations.
 **Produces:** beginner-readable product truth, global lookup, live/research workflows, provider
 health/coverage, and reconnectable job control.
 
+**Binding V1 Markets expansion — approved 2026-08-09:** implement one unified Markets experience
+over a bounded federation of independently admitted providers. This is a release blocker, not a
+future enhancement. The implementation follows this dependency DAG:
+
+```mermaid
+flowchart LR
+    M1["Wave M1: capability, rights, budget, and selection contracts"]
+    M2A["Wave M2A: admitted crypto surfaces"]
+    M2B["Wave M2B: admitted equity/options surfaces"]
+    M2C["Wave M2C: reference and benchmark surfaces"]
+    M3["Wave M3: multi-provider registry and presentation read model"]
+    M4["Wave M4: unified desktop feed, search, and instrument journey"]
+    M5["Wave M5: installed restart and end-to-end proof"]
+
+    M1 --> M2A
+    M1 --> M2B
+    M1 --> M2C
+    M2A --> M3
+    M2B --> M3
+    M2C --> M3
+    M3 --> M4
+    M4 --> M5
+```
+
+Only the disjoint provider-adapter waves may run concurrently. Shared domain contracts, manifests,
+lockfiles, application composition, source selection, and desktop transport remain serialized.
+The evidence and acceptance boundary are maintained in
+[`Unified Markets provider ecosystem`](../../research/2026-08-08-unified-markets-provider-ecosystem.md).
+
 - [ ] **Step 1: Build the decision-oriented Overview**
 
   Render total portfolio/market truth with mark provenance; watchlist/candidate/target attention;
@@ -1418,10 +1487,20 @@ health/coverage, and reconnectable job control.
 
 - [ ] **Step 3: Build Markets and Sources**
 
-  Markets shows selected instruments, trade/quote/book summaries, freshness, quality, venue
-  coverage, chart, live features, and explicit no-data/degraded states. Sources reuses the guided
-  provider cards and displays credential state, coverage, budgets, lineage, connection generation,
-  freshness/integrity, and typed start/stop/retry/resync/verify/reconfigure/remove actions.
+  Replace the one-instrument/one-provider projection with a bounded concurrent provider registry,
+  locally searchable multi-asset universe, deterministic requirement/quality resolver, explicit
+  selection and downgrade receipts, and one presentation read model. Markets presents one feed,
+  one search, and one instrument journey containing market pulse, holdings/watchlists, ranked
+  opportunities, quotes/trades/books/bars, charts, features, forecasts, buy/add/trim/sell targets,
+  backtest evidence, fundamentals/filings, portfolio impact, risk, and `Data confidence`. It shows
+  best available depth without inventing free order-level coverage or index books. Sources retains
+  the advanced provider controls: credentials, exact coverage, budgets, lineage, connection
+  generation, freshness/integrity, and typed start/stop/retry/resync/verify/reconfigure/remove.
+
+  Reuse the existing test targets. Add only one consolidated critical path covering concurrent
+  source isolation, deterministic source selection, an explicit downgrade, restart restoration,
+  and the usable desktop journey. Do not add per-provider UI tests, screenshot tests, prose checks,
+  or a broad live-network matrix during implementation.
 
 - [ ] **Step 4: Build Research**
 
@@ -1728,7 +1807,7 @@ the serialized complete package manifest/build-script closure.
 - Modify: `apps/market-squawk/tests/production_mcp_composition.rs`
 
 **Produces:** idempotent owned setup for installed Claude Code and Codex; both clients and multiple
-sessions share one service without duplicate business runtimes.
+client connections share one service without duplicate business runtimes.
 
 - [ ] **Step 1: Discover supported clients without guessing config files**
 
@@ -1739,10 +1818,12 @@ sessions share one service without duplicate business runtimes.
 
 - [ ] **Step 2: Register distinct owned relay entries by default**
 
-  Use official CLI commands with user scope to register `market-squawk` as an stdio command invoking
-  `market-squawk-mcp-relay --client claude` or `--client codex`. Store each relay credential only in
-  the native secret store. Record exact owned-entry/client/version/command digest receipts. Do not
-  place secrets in argv, environment persisted by Market Squawk, URLs, config output, logs, or UI.
+  Use official CLI commands to register `market-squawk` as an stdio command invoking
+  `market-squawk-mcp-relay --client claude` or `--client codex`. Use Claude's explicit user scope;
+  Codex's host configuration is already user-level and must not receive Claude's flag. Store each
+  relay credential only in the native secret store. Record exact owned-entry/client/version/command
+  digest receipts. Do not place secrets in argv, environment persisted by Market Squawk, URLs,
+  config output, logs, or UI.
 
 - [ ] **Step 3: Handle idempotence and conflicts**
 
@@ -1752,15 +1833,15 @@ sessions share one service without duplicate business runtimes.
 
 - [ ] **Step 4: Perform a real protocol verification**
 
-  After registration, use the installed relay/client-compatible path to initialize, list tools and
-  resources, run one bounded safe read, verify distinct audit/session identities, and disconnect.
-  Desktop remains open. Two simultaneous sessions must share one service/application/job/model/data
-  authority and have independent request/session limits.
+  After registration, use the installed relay/client-compatible path to complete the client's
+  admitted handshake/discovery, list tools and resources, run one bounded safe read, verify distinct
+  audit/client identities, and disconnect. Desktop remains open. Two simultaneous clients must
+  share one service/application/job/model/data authority and have independent request/handle limits.
 
 - [ ] **Step 5: Replace the MCP status page**
 
   Show service/endpoint/workspace/resource facts, detected client state, owned/conflict receipts,
-  separate credential/session status, real verification result, rotate/revoke/disconnect/reconnect/
+  separate credential/client status, real verification result, rotate/revoke/disconnect/reconnect/
   repair actions, limits, and blockers. Remove `requiresDesktopExit` and generated raw JSON setup.
 
 - [ ] **Step 6: Pass focused gates**
@@ -1919,7 +2000,8 @@ working product. This task does not publish or merge it.
   python3 -I scripts/build_python_release.py \
     --refresh-source-closure --lock python/wheelhouse-lock.json
   python3 -m unittest \
-    scripts.tests.test_build_python_release.PythonReleaseBuilderContracts.test_repository_lock_admits_the_complete_source_closure
+    scripts.tests.test_build_python_release.PythonReleaseBuilderContracts.test_source_refresh_changes_only_the_complete_source_closure \
+    scripts.tests.test_build_python_release.PythonReleaseBuilderContracts.test_repository_source_closure_contains_required_inputs
   ```
 
   The mode uses the existing deterministic complete-source inventory and atomically writes only the
@@ -1942,7 +2024,7 @@ working product. This task does not publish or merge it.
 
 - [ ] **Step 7: Run installed smoke scenarios on each target**
 
-  Prove clean install, first service start/rendezvous, Desktop+CLI+two MCP sessions, public/free
+  Prove clean install, first service start/rendezvous, Desktop+CLI+two MCP clients, public/free
   provider setup or deterministic offline fixture, data ingest/query, forecast/targets/backtest,
   portfolio/paper/risk/fair value, restart/recovery, backup/restore preview, update preflight/rollback
   fixture, repair, and default data-preserving uninstall. Store bounded receipts/artifact references,
@@ -2058,7 +2140,7 @@ working product. This task does not publish or merge it.
   Bind the Task 25 Linux x64, Windows x64, Intel macOS, and Apple Silicon macOS native package
   receipts to the same `HEAD_SHA`, tree, component manifest, Python source closure, update trust
   metadata, and package digest. Each target proves clean install, service start, Desktop/CLI/two MCP
-  sessions, first useful data flow, forecast/backtest/portfolio/paper/risk/fair-value workflow,
+  clients, first useful data flow, forecast/backtest/portfolio/paper/risk/fair-value workflow,
   restart/recovery, backup/restore preview, update rollback fixture, repair, and data-preserving
   uninstall. Missing real platform evidence blocks the candidate; it is not replaced by a mocked
   local result.

@@ -1,9 +1,10 @@
 //! Registry-owned paired wall/monotonic time and permanent continuity authority.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwapOption;
 use market_squawk_domain::{
     CaptureRetainedComponent, CaptureRetainedSizeError, Timestamp,
     checked_arc_value_allocation_bytes,
@@ -11,8 +12,6 @@ use market_squawk_domain::{
 
 use crate::policy::AuthorityDurabilitySession;
 use crate::registry::RegistryError;
-
-const MAX_HIGH_WATER_SNAPSHOT_ATTEMPTS: usize = 16;
 
 /// Process-local monotonic observation represented without exposing caller-authored `Instant`s.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -95,9 +94,7 @@ impl TrustedRegistryTime {
 #[derive(Debug)]
 struct AuthorityTimeContinuityState {
     terminal: AtomicBool,
-    sequence: AtomicU64,
-    wall_high_water: AtomicI64,
-    monotonic_high_water: AtomicU64,
+    high_water: ArcSwapOption<TrustedRegistryTime>,
 }
 
 /// O(1)-clone permanent continuity latch shared by every live authority in one registry.
@@ -108,9 +105,7 @@ impl AuthorityTimeContinuity {
     fn new() -> Self {
         Self(Arc::new(AuthorityTimeContinuityState {
             terminal: AtomicBool::new(false),
-            sequence: AtomicU64::new(0),
-            wall_high_water: AtomicI64::new(i64::MIN),
-            monotonic_high_water: AtomicU64::new(0),
+            high_water: ArcSwapOption::empty(),
         }))
     }
 
@@ -129,57 +124,45 @@ impl AuthorityTimeContinuity {
     pub(crate) fn checked_shared_allocation_bytes(
         &self,
     ) -> Result<usize, CaptureRetainedSizeError> {
-        checked_arc_value_allocation_bytes::<AuthorityTimeContinuityState>(0).map_err(|_| {
-            CaptureRetainedSizeError::Overflow {
+        // Charge the shared paired snapshot even before initialization. Reader guards copy the
+        // pair immediately and never escape high_water; no receipt retains a historical snapshot.
+        checked_arc_value_allocation_bytes::<TrustedRegistryTime>(0)
+            .and_then(checked_arc_value_allocation_bytes::<AuthorityTimeContinuityState>)
+            .map_err(|_| CaptureRetainedSizeError::Overflow {
                 component: CaptureRetainedComponent::Continuity,
-            }
-        })
+            })
     }
 
     fn publish(&self, observed: TrustedRegistryTime) -> Result<(), RegistryError> {
         if !self.is_continuous() {
             return Err(RegistryError::AuthorityTimeDiscontinuous);
         }
-        let current = self.0.sequence.load(Ordering::Acquire);
-        let odd = current
-            .checked_add(1)
-            .ok_or(RegistryError::AuthorityTimeDiscontinuous)?;
-        let even = odd
-            .checked_add(1)
-            .ok_or(RegistryError::AuthorityTimeDiscontinuous)?;
-        self.0.sequence.store(odd, Ordering::Release);
-        self.0
-            .wall_high_water
-            .store(observed.wall().unix_nanos(), Ordering::Release);
-        self.0
-            .monotonic_high_water
-            .store(observed.monotonic().as_nanos(), Ordering::Release);
-        self.0.sequence.store(even, Ordering::Release);
-        Ok(())
+        // SealedRegistryClock's cursor serializes writers. Readers retain the prior coherent
+        // pair while its replacement is prepared, rather than failing on an in-progress write.
+        self.0.high_water.store(Some(Arc::new(observed)));
+        if self.is_continuous() {
+            Ok(())
+        } else {
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        }
     }
 
     fn high_water(&self) -> Result<TrustedRegistryTime, RegistryError> {
-        for _attempt in 0..MAX_HIGH_WATER_SNAPSHOT_ATTEMPTS {
-            if !self.is_continuous() {
-                return Err(RegistryError::AuthorityTimeDiscontinuous);
-            }
-            let before = self.0.sequence.load(Ordering::Acquire);
-            if before == 0 || before & 1 == 1 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let wall = self.0.wall_high_water.load(Ordering::Acquire);
-            let monotonic = self.0.monotonic_high_water.load(Ordering::Acquire);
-            let after = self.0.sequence.load(Ordering::Acquire);
-            if before == after && after & 1 == 0 {
-                return Ok(TrustedRegistryTime::new(
-                    Timestamp::from_unix_nanos(wall),
-                    RegistryMonotonicInstant::from_nanos(monotonic),
-                ));
-            }
-            std::hint::spin_loop();
+        if !self.is_continuous() {
+            return Err(RegistryError::AuthorityTimeDiscontinuous);
         }
-        Err(RegistryError::TrustedReceiptHighWaterUnavailable)
+        let observed = self
+            .0
+            .high_water
+            .load()
+            .as_ref()
+            .map(|observed| **observed)
+            .ok_or(RegistryError::TrustedReceiptHighWaterUnavailable)?;
+        if self.is_continuous() {
+            Ok(observed)
+        } else {
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        }
     }
 
     pub(crate) fn validate_receipt(
@@ -449,24 +432,29 @@ mod tests {
     #[test]
     fn paired_high_water_never_exposes_a_torn_wall_monotonic_sample() -> TestResult {
         let continuity = AuthorityTimeContinuity::new();
+        assert_eq!(
+            continuity.high_water(),
+            Err(RegistryError::TrustedReceiptHighWaterUnavailable)
+        );
         continuity.publish(time(1)?)?;
         let writer_continuity = continuity.clone();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let writer_start = Arc::clone(&start);
         let writer = std::thread::spawn(move || -> Result<(), RegistryError> {
+            writer_start.wait();
             for value in 2..10_000 {
                 writer_continuity.publish(time(value)?)?;
             }
             Ok(())
         });
-
+        start.wait();
+        let mut previous = 1;
         for _attempt in 0..10_000 {
-            match continuity.high_water() {
-                Ok(observed) => {
-                    let wall = u64::try_from(observed.wall().unix_nanos())?;
-                    assert_eq!(wall, observed.monotonic().as_nanos());
-                }
-                Err(RegistryError::TrustedReceiptHighWaterUnavailable) => {}
-                Err(error) => return Err(error.into()),
-            }
+            let observed = continuity.high_water()?;
+            let wall = u64::try_from(observed.wall().unix_nanos())?;
+            assert_eq!(wall, observed.monotonic().as_nanos());
+            assert!(wall >= previous);
+            previous = wall;
         }
         let writer_result = writer
             .join()
@@ -475,6 +463,15 @@ mod tests {
         let final_high_water = continuity.high_water()?;
         assert_eq!(final_high_water.wall().unix_nanos(), 9_999);
         assert_eq!(final_high_water.monotonic().as_nanos(), 9_999);
+        continuity.latch();
+        assert_eq!(
+            continuity.high_water(),
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        );
+        assert_eq!(
+            continuity.publish(time(10_000)?),
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        );
         Ok(())
     }
 

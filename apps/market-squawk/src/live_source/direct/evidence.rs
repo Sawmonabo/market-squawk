@@ -5,7 +5,9 @@ use market_squawk_domain::{
     AuthorizationBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     MetadataRevision, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier,
 };
-use market_squawk_sources::{AuthorizationGrant, AuthorizationMode, ProviderBudgetPolicy};
+use market_squawk_sources::{
+    AuthorizationGrant, AuthorizationMode, ProviderBudgetPolicy, SourceMetadata,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::ProviderActivationLease;
@@ -21,6 +23,35 @@ pub(super) fn try_build_product_spec(
     lease: &ProviderActivationLease,
     product: CoinbaseDirectProductActivation,
 ) -> Result<ProductRuntimeSpec, CoinbaseDirectProductRuntimeError> {
+    let route = product.route().clone();
+    let config = try_build_product_config(lease, &product)?;
+    Ok(ProductRuntimeSpec::new(slot, config, route))
+}
+
+/// Builds the exact order-level metadata set used to register Direct durable publication before
+/// any credential read or network access.
+pub(crate) fn try_build_product_metadata_set(
+    lease: &ProviderActivationLease,
+    products: &[CoinbaseDirectProductActivation],
+) -> Result<Vec<SourceMetadata>, CoinbaseDirectProductRuntimeError> {
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(products.len())
+        .map_err(|_error| CoinbaseDirectProductRuntimeError::ActivationBinding)?;
+    for product in products {
+        metadata.push(
+            try_build_product_config(lease, product)?
+                .metadata()
+                .clone(),
+        );
+    }
+    Ok(metadata)
+}
+
+fn try_build_product_config(
+    lease: &ProviderActivationLease,
+    product: &CoinbaseDirectProductActivation,
+) -> Result<CoinbaseDirectConfig, CoinbaseDirectProductRuntimeError> {
     let verification = lease
         .verification_evidence_digest()
         .ok_or(CoinbaseDirectProductRuntimeError::ActivationBinding)?;
@@ -46,7 +77,7 @@ pub(super) fn try_build_product_spec(
         ExactPayloadEvidence::from_content_digest(verification),
         effective,
     );
-    let metadata_digest = direct_metadata_digest(lease, &product, &budget)?;
+    let metadata_digest = direct_metadata_digest(lease, product, &budget)?;
     let source_id = SourceId::try_from(format!(
         "coinbase-exchange-direct-{}",
         product
@@ -66,7 +97,7 @@ pub(super) fn try_build_product_spec(
         ExactPayloadEvidence::from_content_digest(metadata_digest),
     );
     let terms = product.route().definition().execution_terms();
-    let config = CoinbaseDirectConfig::try_new(
+    let config = CoinbaseDirectConfig::try_new_order_level(
         source_id,
         revision_evidence,
         authorization,
@@ -78,11 +109,7 @@ pub(super) fn try_build_product_spec(
         budget,
         product.limits(),
     )?;
-    Ok(ProductRuntimeSpec::new(
-        slot,
-        config,
-        product.route().clone(),
-    ))
+    Ok(config)
 }
 
 fn direct_metadata_digest(
@@ -107,6 +134,7 @@ fn direct_metadata_digest(
     let book = limits.book();
     let mut hasher = Sha256::new();
     hasher.update(METADATA_EVIDENCE_DOMAIN);
+    hasher.update([1_u8]);
     hash_digest(&mut hasher, lease.capability_digest());
     hash_digest(&mut hasher, lease.rights_decision_digest());
     hash_digest(&mut hasher, lease.public_configuration_digest());

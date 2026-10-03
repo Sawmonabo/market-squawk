@@ -4,18 +4,22 @@ use std::str::FromStr;
 
 use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
-    BookDeltaEvent, BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
-    CorporateActionObservation, CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput,
-    DigestAlgorithm, EvidenceDigest, FilingObservation, FundamentalObservation, HaltTransition,
-    InstrumentId, InstrumentStatusEvent, LiveEventClass, LiveProvenance, MacroMissingValue,
-    MacroObservation, MarketDepth, MarketEvent, MarketEventError, MarketSide, MergerConsideration,
-    Money, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
-    NormalizedPortfolioTransactionError, NormalizedPortfolioTransactionEvidence,
-    NormalizedPortfolioTransactionEvidenceInput, PayloadReference, PositionObservation,
-    PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext, ResearchError,
-    ResearchObservation, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
-    SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent, TradingStatus,
-    TransactionObservation,
+    BookDeltaEvent, BookLevel, BookSnapshotEvent, CalendarDate, CompanyObservationSubject,
+    CorporateActionEvent, CorporateActionKind, CorporateActionObservation, CoverageStatus,
+    Currency, DataQuality, DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest, FilingForm,
+    FilingObservation, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
+    FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
+    FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
+    FundamentalRevisionOrder, HaltTransition, InstrumentId, InstrumentStatusEvent, LiveEventClass,
+    LiveProvenance, MacroMissingValue, MacroObservation, MarketDepth, MarketEvent,
+    MarketEventError, MarketSide, MergerConsideration, Money, NormalizedPortfolioLotMethod,
+    NormalizedPortfolioTransactionClass, NormalizedPortfolioTransactionError,
+    NormalizedPortfolioTransactionEvidence, NormalizedPortfolioTransactionEvidenceInput,
+    PayloadReference, PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent,
+    ResearchContext, ResearchError, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradeTakerOrderType,
+    TradingHaltEvent, TradingStatus, TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -72,6 +76,43 @@ fn research_context(instrument: bool) -> Result<ResearchContext, Box<dyn Error>>
     .map_err(Into::into)
 }
 
+fn fundamental_fixture() -> Result<(ResearchContext, FundamentalFactContext), Box<dyn Error>> {
+    let start = CalendarDate::new(2025, 1, 1)?;
+    let end = CalendarDate::new(2025, 12, 31)?;
+    let revision = RevisionNumber::new(1)?;
+    let context = ResearchContext::new(
+        research_context(false)?.provenance().clone(),
+        ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(end),
+            None,
+            revision,
+            None,
+        )?,
+    )?;
+    let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+        schema_version: SchemaVersion::CURRENT,
+        period: FundamentalPeriod::duration(start, end)?,
+        unit: SourceIdentifier::try_from("USD")?,
+        accession: SourceIdentifier::try_from("record-7")?,
+        filing_form: None,
+        amendment_status: FundamentalAmendmentStatus::Unavailable,
+        filed_on: None,
+        frame: None,
+        fiscal_year: None,
+        fiscal_period: None,
+        cadence: FundamentalCadence::Unavailable,
+        xbrl_context_id: None,
+        dimensions: FundamentalDimensionContext::unavailable(),
+        consolidation: FundamentalConsolidation::Unavailable,
+        revision_order: FundamentalRevisionOrder::new(
+            revision,
+            SourceIdentifier::try_from("historical-file-order-v1")?,
+        ),
+        restatement_status: FundamentalRestatementStatus::Unavailable,
+    })?;
+    Ok((context, fact_context))
+}
+
 #[test]
 fn trade_event_requires_positive_quantity_and_matching_live_identity() -> Result<(), Box<dyn Error>>
 {
@@ -81,6 +122,7 @@ fn trade_event_requires_positive_quantity_and_matching_live_identity() -> Result
             PriceTicks::new(10_000),
             QuantityLots::new(0)?,
             AggressorSide::Buy,
+            None,
         ),
         Err(MarketEventError::ZeroQuantity)
     ));
@@ -90,6 +132,7 @@ fn trade_event_requires_positive_quantity_and_matching_live_identity() -> Result
             PriceTicks::new(10_000),
             QuantityLots::new(1)?,
             AggressorSide::Buy,
+            None,
         ),
         Err(MarketEventError::ProvenanceEventClassMismatch)
     ));
@@ -150,12 +193,91 @@ fn delta_cannot_be_an_empty_marker_payload() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn canonical_book_payloads_reject_oversized_construction_and_json() -> Result<(), Box<dyn Error>> {
+    let quantity = QuantityLots::new(1)?;
+    let mut bids = Vec::with_capacity(BookSnapshotEvent::MAX_LEVELS_PER_SIDE);
+    for price in (1..=BookSnapshotEvent::MAX_LEVELS_PER_SIDE).rev() {
+        bids.push(BookLevel::new(
+            PriceTicks::new(i64::try_from(price)?),
+            quantity,
+        )?);
+    }
+    let snapshot = BookSnapshotEvent::new(
+        live_provenance(LiveEventClass::BookSnapshot)?,
+        MarketDepth::PriceLevel,
+        bids.clone(),
+        Vec::new(),
+        None,
+    )?;
+    assert_eq!(
+        serde_json::from_str::<BookSnapshotEvent>(&serde_json::to_string(&snapshot)?)?,
+        snapshot
+    );
+    let mut oversized_bids = bids;
+    oversized_bids.push(BookLevel::new(PriceTicks::new(0), quantity)?);
+    assert!(matches!(
+        BookSnapshotEvent::new(
+            live_provenance(LiveEventClass::BookSnapshot)?,
+            MarketDepth::PriceLevel,
+            oversized_bids,
+            Vec::new(),
+            None,
+        ),
+        Err(MarketEventError::BookSnapshotLevelLimitExceeded)
+    ));
+    let mut snapshot_wire = serde_json::to_value(&snapshot)?;
+    let bids_wire = snapshot_wire["bids"]
+        .as_array_mut()
+        .ok_or("snapshot bids must serialize as an array")?;
+    bids_wire.push(serde_json::to_value(BookLevel::new(
+        PriceTicks::new(0),
+        quantity,
+    )?)?);
+    assert!(
+        serde_json::from_str::<BookSnapshotEvent>(&serde_json::to_string(&snapshot_wire)?).is_err()
+    );
+
+    let change =
+        market_squawk_domain::BookChange::new(MarketSide::Bid, PriceTicks::new(100), quantity);
+    let changes = vec![change; BookDeltaEvent::MAX_CHANGES];
+    let delta = BookDeltaEvent::new(
+        live_provenance(LiveEventClass::BookDelta)?,
+        MarketDepth::PriceLevel,
+        changes.clone(),
+        None,
+    )?;
+    assert_eq!(
+        serde_json::from_str::<BookDeltaEvent>(&serde_json::to_string(&delta)?)?,
+        delta
+    );
+    let mut oversized_changes = changes;
+    oversized_changes.push(change);
+    assert!(matches!(
+        BookDeltaEvent::new(
+            live_provenance(LiveEventClass::BookDelta)?,
+            MarketDepth::PriceLevel,
+            oversized_changes,
+            None,
+        ),
+        Err(MarketEventError::BookDeltaChangeLimitExceeded)
+    ));
+    let mut delta_wire = serde_json::to_value(&delta)?;
+    let changes_wire = delta_wire["changes"]
+        .as_array_mut()
+        .ok_or("delta changes must serialize as an array")?;
+    changes_wire.push(serde_json::to_value(change)?);
+    assert!(serde_json::from_str::<BookDeltaEvent>(&serde_json::to_string(&delta_wire)?).is_err());
+    Ok(())
+}
+
+#[test]
 fn canonical_market_family_is_serializable() -> Result<(), Box<dyn Error>> {
     let event = MarketEvent::Trade(TradeEvent::new(
         live_provenance(LiveEventClass::Trade)?,
         PriceTicks::new(10_000),
         QuantityLots::new(3)?,
         AggressorSide::Sell,
+        Some(TradeTakerOrderType::Market),
     )?);
 
     let wire = serde_json::to_string(&event)?;
@@ -171,6 +293,7 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
         PriceTicks::new(100),
         QuantityLots::new(2)?,
         AggressorSide::Buy,
+        Some(TradeTakerOrderType::Limit),
     )?;
     let quote = QuoteEvent::new(
         live_provenance(LiveEventClass::Quote)?,
@@ -216,6 +339,7 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
     )?;
 
     assert_eq!(trade.aggressor_side(), AggressorSide::Buy);
+    assert_eq!(trade.taker_order_type(), Some(TradeTakerOrderType::Limit));
     assert_eq!(quote.provenance().quality(), DataQuality::DirectUnverified);
     assert_eq!(snapshot.depth(), MarketDepth::PriceLevel);
     assert_eq!(snapshot.sequence(), None);
@@ -235,15 +359,54 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
 #[test]
 fn canonical_research_family_has_non_marker_payloads() -> Result<(), Box<dyn Error>> {
     let filing = ResearchObservation::Filing(FilingObservation::new(
-        research_context(true)?,
-        SourceIdentifier::try_from("10-K")?,
+        research_context(false)?,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
+        FilingForm::try_from("SCHEDULE 13G/A")?,
         SourceIdentifier::try_from("0000320193-26-000001")?,
     )?);
+    let (fundamental_context, fact_context) = fundamental_fixture()?;
+    let mut context_wire = serde_json::to_value(&fact_context)?;
+    context_wire["filing_form"] = serde_json::json!("SC 13G/A");
+    context_wire["amendment_status"] = serde_json::json!("amendment");
+    let fact_context: FundamentalFactContext = serde_json::from_value(context_wire.clone())?;
+    assert_eq!(
+        fact_context.filing_form().map(FilingForm::as_str),
+        Some("SC 13G/A")
+    );
+    let filing_wire = serde_json::to_value(&filing)?;
+    for invalid in ["", " ", " SC 13G", "SC 13G ", "SC\t13G", "SC 13G\n"] {
+        assert!(FilingForm::try_from(invalid).is_err());
+        assert!(serde_json::from_value::<FilingForm>(serde_json::json!(invalid)).is_err());
+        let mut invalid_context = context_wire.clone();
+        invalid_context["filing_form"] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<FundamentalFactContext>(invalid_context).is_err());
+        let mut invalid_filing = filing_wire.clone();
+        invalid_filing["payload"]["form_type"] = serde_json::json!(invalid);
+        assert!(serde_json::from_value::<ResearchObservation>(invalid_filing).is_err());
+    }
+    let longest = "X".repeat(FilingForm::MAX_LENGTH);
+    let bounded_form = FilingForm::try_from(longest.clone())?;
+    assert_eq!(bounded_form.as_str(), longest);
+    assert_eq!(bounded_form.to_string(), longest);
+    assert!(bounded_form.retained_bytes() >= longest.len());
+    assert_eq!(
+        serde_json::to_value(&bounded_form)?,
+        serde_json::json!(longest)
+    );
+    let oversized = "X".repeat(FilingForm::MAX_LENGTH + 1);
+    assert!(FilingForm::try_from(oversized.clone()).is_err());
+    assert!(serde_json::from_value::<FilingForm>(serde_json::json!(oversized)).is_err());
+    assert!(serde_json::from_value::<FilingForm>(serde_json::json!(42)).is_err());
+    assert!(SourceIdentifier::try_from("SCHEDULE 13G").is_err());
+    let mut contradictory = context_wire;
+    contradictory["amendment_status"] = serde_json::json!("original");
+    assert!(serde_json::from_value::<FundamentalFactContext>(contradictory).is_err());
     let fundamental = ResearchObservation::Fundamental(FundamentalObservation::new(
-        research_context(true)?,
+        fundamental_context,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
         SourceIdentifier::try_from("Revenue")?,
         Decimal::new(1_234, 0),
-        SourceIdentifier::try_from("USD")?,
+        fact_context,
     )?);
     let macro_observation = ResearchObservation::Macro(MacroObservation::new(
         research_context(false)?,
@@ -368,11 +531,23 @@ fn normalized_portfolio_transaction_evidence_binds_raw_lineage_and_economic_scal
 fn research_instrument_payloads_reject_missing_identity() -> Result<(), Box<dyn Error>> {
     assert!(matches!(
         FilingObservation::new(
-            research_context(false)?,
-            SourceIdentifier::try_from("10-K")?,
+            research_context(true)?,
+            CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
+            FilingForm::try_from("10-K")?,
             SourceIdentifier::try_from("0000320193-26-000001")?,
         ),
-        Err(ResearchError::MissingInstrument)
+        Err(ResearchError::CompanySubjectMismatch)
+    ));
+    assert!(matches!(
+        FilingObservation::new(
+            research_context(false)?,
+            CompanyObservationSubject::Instrument(InstrumentId::from_str(
+                "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb"
+            )?),
+            FilingForm::try_from("10-K")?,
+            SourceIdentifier::try_from("0000320193-26-000001")?,
+        ),
+        Err(ResearchError::CompanySubjectMismatch)
     ));
     assert!(matches!(
         PositionObservation::new(
@@ -542,15 +717,18 @@ fn corporate_action_economic_terms_are_exact_and_validated() -> Result<(), Box<d
 #[test]
 fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box<dyn Error>> {
     let filing = FilingObservation::new(
-        research_context(true)?,
-        SourceIdentifier::try_from("10-Q")?,
+        research_context(false)?,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
+        FilingForm::try_from("10-Q")?,
         SourceIdentifier::try_from("accession-1")?,
     )?;
+    let (fundamental_context, fact_context) = fundamental_fixture()?;
     let fundamental = FundamentalObservation::new(
-        research_context(true)?,
+        fundamental_context,
+        CompanyObservationSubject::Issuer(SourceIdentifier::try_from("0000320193")?),
         SourceIdentifier::try_from("Assets")?,
         Decimal::new(42, 0),
-        SourceIdentifier::try_from("USD")?,
+        fact_context,
     )?;
     let macro_observation = MacroObservation::new(
         research_context(false)?,

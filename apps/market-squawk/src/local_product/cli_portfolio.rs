@@ -15,7 +15,8 @@ use market_squawk_platform::{
     ArtifactPathError, ArtifactRoot, LocalAuthorityStateStore, UserAuthorizedInputRoot,
 };
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits, TypedToolResult,
+    JsonStructureLimits, RequestContext, RequestId, ResultEnvelopeProjection, ServiceError,
+    ServiceLimits,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, CoverageDomain, FreshnessPolicy, HistoricalCapability,
@@ -183,7 +184,7 @@ pub(super) async fn import_portfolio_manifest(
         .invoke("Portfolio.Import", arguments, context)
         .await
         .map_err(CliPortfolioImportError::Application)?;
-    Ok(result_envelope(&result))
+    Ok(result.into_envelope(ResultEnvelopeProjection::ProductV1))
 }
 
 #[derive(Deserialize)]
@@ -388,22 +389,6 @@ fn json_object(value: Value) -> Result<Map<String, Value>, CliPortfolioImportErr
         .as_object()
         .cloned()
         .ok_or(CliPortfolioImportError::Serialization)
-}
-
-fn result_envelope(result: &TypedToolResult) -> Value {
-    let metadata = result.metadata();
-    json!({
-        "data": result.structured_content(),
-        "metadata": {
-            "completeness": metadata.completeness(),
-            "returnedItems": result.item_count(),
-            "availableItems": metadata.available_items().unwrap_or(result.item_count()),
-            "sourceCoverage": metadata.source_coverage(),
-            "dataQuality": metadata.data_quality(),
-            "sourceEvidence": metadata.source_evidence(),
-        },
-        "encodedBytes": result.encoded_bytes(),
-    })
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

@@ -1,1 +1,1 @@
-{"type":"heartbeat","sequence":90,"last_trade_id":20,"product_id":"BTC-USD","time":"2026-07-20T12:00:00.123456Z"}
+{"channel":"heartbeats","client_id":"","timestamp":"2026-08-08T12:00:00.423456Z","sequence_num":3,"events":[{"current_time":"2026-08-08 12:00:00.423456 +0000 UTC","heartbeat_counter":"90"}]}

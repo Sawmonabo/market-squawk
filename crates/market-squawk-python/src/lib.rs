@@ -191,8 +191,7 @@ fn add_public_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "market_squawk.training",
         &["TrainingProposal", "TrainingRun"],
     )?;
-    module.add("__all__", PyList::new(module.py(), PUBLIC_API)?)?;
-    module.add("__version__", env!("CARGO_PKG_VERSION"))
+    module.add("__all__", PyList::new(module.py(), PUBLIC_API)?)
 }
 
 #[pymodule]
@@ -200,6 +199,7 @@ fn market_squawk(module: &Bound<'_, PyModule>) -> PyResult<()> {
     if SEALED_PYTHON_BUILD {
         receipt::verify_at_import(module)?;
     }
+    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add(PYTHON_BUILD_IDENTITY_ATTRIBUTE, PYTHON_BUILD_IDENTITY)?;
     module.add_class::<OperationContext>()?;
     module.add_function(wrap_pyfunction!(expected_model_validator_sha256, module)?)?;

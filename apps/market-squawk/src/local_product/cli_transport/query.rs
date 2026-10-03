@@ -72,6 +72,11 @@ pub(super) async fn query_sql(
             batches,
             byte_count,
         } => (batches, byte_count),
+        QueryResult::Consumed { .. } | QueryResult::Spooled { .. } => {
+            return Err(CliProductError::Application(
+                market_squawk_services::ServiceError::InvalidResult,
+            ));
+        }
         QueryResult::Artifact {
             object,
             artifact,

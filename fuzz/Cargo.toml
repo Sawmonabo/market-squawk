@@ -23,6 +23,7 @@ coinbase = [
 ]
 kraken = [
     "dep:market-squawk-adapter-kraken",
+    "market-squawk-adapter-kraken/loopback-fixture",
     "dep:market-squawk-domain",
 ]
 mcp = ["dep:market-squawk-mcp"]

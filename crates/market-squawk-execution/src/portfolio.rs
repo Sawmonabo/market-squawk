@@ -100,6 +100,7 @@ fn transition_state(
     current: &PublishedPortfolioState,
     service: PortfolioService,
     max_retired_revisions: usize,
+    bounded_paper_retirement: bool,
 ) -> Result<Option<PublishedPortfolioState>, PortfolioReadError> {
     let heads = service
         .current_revisions()
@@ -160,7 +161,16 @@ fn transition_state(
         .checked_add(revoked.len())
         .ok_or(PortfolioReadError::PublicationHistoryExhausted)?;
     if retained_history > max_retired_revisions {
-        return Err(PortfolioReadError::PublicationHistoryExhausted);
+        if !bounded_paper_retirement || revoked.len() > max_retired_revisions {
+            return Err(PortfolioReadError::PublicationHistoryExhausted);
+        }
+        // The opaque revision must name the exact current predecessor (checked above), so an
+        // evicted old token cannot become a publishable head. This bounded lookup only improves
+        // stale-read diagnostics; old readers still fail the mandatory current-head equality.
+        // Explicit revocations remain retained and cannot be discarded by this policy.
+        while retired.len() > max_retired_revisions - revoked.len() {
+            retired.pop_first();
+        }
     }
     let generation = current
         .generation
@@ -179,6 +189,7 @@ fn transition_state(
 #[derive(Debug)]
 pub struct PortfolioServicePublisher {
     authority: Arc<PortfolioAuthority>,
+    financial_fence: Option<crate::AccountRiskReconciliationFence>,
 }
 
 impl PortfolioServicePublisher {
@@ -189,6 +200,41 @@ impl PortfolioServicePublisher {
     /// Rejects terminal capability revocation, revision rollback, lineage gaps, exhausted history,
     /// a poisoned publication owner, or generation overflow.
     pub fn publish(&self, service: PortfolioService) -> Result<(), PortfolioReadError> {
+        if self.financial_fence.is_some() {
+            return Err(PortfolioReadError::PublicationUnavailable);
+        }
+        self.publish_inner(service)
+    }
+    /// Adds the exact portfolio publication to the existing backend/account reconciliation fence.
+    pub fn bind_financial_fence(
+        &mut self,
+        fence: crate::AccountRiskReconciliationFence,
+    ) -> Result<(), PortfolioReadError> {
+        if self.financial_fence.is_some() {
+            return Err(PortfolioReadError::PublicationUnavailable);
+        }
+        fence
+            .bind_portfolio_publication()
+            .map_err(|_| PortfolioReadError::PublicationUnavailable)?;
+        self.financial_fence = Some(fence);
+        Ok(())
+    }
+    /// Advances portfolio readiness only after the actual immutable service is published.
+    pub fn publish_reconciled(
+        &self,
+        service: PortfolioService,
+        worker_sequence: u64,
+    ) -> Result<(), PortfolioReadError> {
+        let fence = self
+            .financial_fence
+            .as_ref()
+            .ok_or(PortfolioReadError::PublicationUnavailable)?;
+        self.publish_inner(service)?;
+        fence
+            .acknowledge_portfolio_publication(worker_sequence)
+            .map_err(|_| PortfolioReadError::PublicationUnavailable)
+    }
+    fn publish_inner(&self, service: PortfolioService) -> Result<(), PortfolioReadError> {
         if self.authority.revoked.load(Ordering::Acquire) {
             return Err(PortfolioReadError::RevokedCapability);
         }
@@ -201,7 +247,12 @@ impl PortfolioServicePublisher {
             return Err(PortfolioReadError::RevokedCapability);
         }
         let current = self.authority.state.load_full();
-        let Some(next) = transition_state(&current, service, self.authority.max_retired_revisions)?
+        let Some(next) = transition_state(
+            &current,
+            service,
+            self.authority.max_retired_revisions,
+            self.financial_fence.is_some(),
+        )?
         else {
             return Ok(());
         };
@@ -243,6 +294,7 @@ pub fn portfolio_execution_state(
     Ok((
         PortfolioServicePublisher {
             authority: Arc::clone(&authority),
+            financial_fence: None,
         },
         PortfolioReadCapability { authority, limits },
     ))
@@ -454,6 +506,10 @@ fn validate_order_snapshot(
         .unrealized_pnl()
         .complete()
         .ok_or(PortfolioReadError::IncompleteBasis)?;
+    let realized_loss = risk
+        .realized_loss()
+        .complete()
+        .ok_or(PortfolioReadError::IncompleteBasis)?;
     if snapshot.base_currency() != execution_currency
         || [
             risk.settlement_available_cash(),
@@ -461,7 +517,7 @@ fn validate_order_snapshot(
             risk.marked_equity(),
             risk.peak_marked_equity(),
             unrealized_pnl,
-            risk.realized_loss(),
+            realized_loss,
             risk.drawdown(),
         ]
         .into_iter()
@@ -502,12 +558,35 @@ fn snapshot_digest(snapshot: &PortfolioSnapshot, publication_generation: u64) ->
     digest.update(snapshot.account_id().as_uuid().as_bytes());
     let risk = snapshot.risk_projection();
     hash_money(&mut digest, snapshot.cash());
+    hash_money(&mut digest, snapshot.receivable_value());
+    digest.update((snapshot.cash_entitlements().len() as u64).to_be_bytes());
+    for entitlement in snapshot.cash_entitlements() {
+        digest.update(entitlement.action_evidence().bytes());
+        digest.update(entitlement.instrument().as_uuid().as_bytes());
+        digest.update(entitlement.entitled_at().unix_nanos().to_be_bytes());
+        hash_money(&mut digest, entitlement.amount());
+        hash_bytes(
+            &mut digest,
+            entitlement
+                .payable_date()
+                .map_or_else(String::new, |date| date.to_string())
+                .as_bytes(),
+        );
+        match entitlement.simulated_settlement_at() {
+            Some(at) => {
+                digest.update([1]);
+                digest.update(at.unix_nanos().to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+        digest.update([u8::from(entitlement.settled())]);
+    }
     hash_money(&mut digest, risk.settlement_available_cash());
     hash_money(&mut digest, risk.gross_exposure());
     hash_money(&mut digest, risk.marked_equity());
     hash_money(&mut digest, risk.peak_marked_equity());
     hash_basis(&mut digest, risk.unrealized_pnl());
-    hash_money(&mut digest, risk.realized_loss());
+    hash_basis(&mut digest, risk.realized_loss());
     hash_money(&mut digest, risk.drawdown());
     for position in snapshot.holdings() {
         digest.update(position.instrument_id().as_uuid().as_bytes());

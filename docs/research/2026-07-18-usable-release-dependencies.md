@@ -73,12 +73,30 @@ entities, ZIP bombs, Excel formulas, OFX ambiguity, and Parquet metadata are rej
 by Market Squawk-owned bounded adapters before domain construction. SQLite/database export support
 reads only operator-selected local files through controlled paths; it never accepts an arbitrary
 connection string or remote database endpoint. As of 2026-07-20, remote HTTP adapters pin
-`rustls = 0.23.42` with only `ring` and
+`rustls = 0.23.45` with only `ring` and
 `std`, call the project-owned install boundary before constructing a reqwest client, and consume the
 minted capability at construction. The boundary is idempotent for project callers and fails closed
 if another process component installed a provider first; see rustls's
-[`CryptoProvider`](https://docs.rs/rustls/0.23.42/rustls/crypto/struct.CryptoProvider.html)
+[`CryptoProvider`](https://docs.rs/rustls/0.23.45/rustls/crypto/struct.CryptoProvider.html)
 contract. This proves the selected in-process implementation, not any external provider identity.
+
+### `rust_decimal` archive dependency
+
+V1 pins `rust_decimal` 1.43.0 exactly with `serde-with-str`. Its
+[upstream release](https://github.com/paupino/rust-decimal/releases/tag/1.43.0)
+removed the obsolete `rkyv 0.7` feature bridge. The resolved workspace lockfile
+contains no `rkyv` package, so local policy verification and CI need no special
+exception for [`RUSTSEC-2026-0235`](https://rustsec.org/advisories/RUSTSEC-2026-0235.html).
+Archive serialization, if ever needed, requires its own reviewed dependency.
+This dependency update still requires focused financial arithmetic and
+serialization checks and the unchanged-head release gate.
+
+The pinned `rustls` 0.23.45 closes the
+[TLS 1.3 handshake advisory](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)
+affecting earlier 0.23 releases. The lockfile also selects `chacha20` 0.10.2
+instead of its yanked 0.10.1 predecessor. Dependency policy keeps yanked
+packages denied. The selected TLS provider remains `ring`; encrypted-store
+restart behavior remains subject to focused verification.
 
 ### XBRL semantic authorities
 

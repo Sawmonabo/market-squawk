@@ -10,6 +10,31 @@ use crate::{
     SourceIdentifier,
 };
 
+#[path = "research/corporate_action_source.rs"]
+mod corporate_action_source;
+pub use corporate_action_source::{
+    CorporateActionEconomicQueryContract, CorporateActionEconomicSourceScope,
+    CorporateActionEconomicTerms, CorporateActionEventInstrumentIdentity,
+    CorporateActionQueryInstrumentIdentity, CorporateActionSourceCategory,
+    CorporateActionSourceDates, CorporateActionSourceDisposition, CorporateActionSourceError,
+    CorporateActionSourceObservation, CorporateActionSourceObservationInput,
+    CorporateActionSourcePayload, CorporateActionSourceQueryContract, CorporateActionSourceScope,
+};
+
+#[path = "research/filing_form.rs"]
+mod filing_form;
+pub use filing_form::{FilingForm, FilingFormError};
+
+#[path = "research/fund_holdings.rs"]
+mod fund_holdings;
+#[path = "research/fund_nav.rs"]
+mod fund_nav;
+#[path = "research/fundamental_context.rs"]
+mod fundamental_context;
+#[path = "research/intraday_candle.rs"]
+mod intraday_candle;
+#[path = "research/market_calendar.rs"]
+mod market_calendar;
 #[path = "research/observations.rs"]
 mod observations;
 #[path = "research/portfolio_transactions.rs"]
@@ -17,10 +42,50 @@ mod portfolio_transactions;
 #[path = "research/xbrl.rs"]
 mod xbrl;
 
+pub use fund_holdings::{
+    FUND_HOLDING_SUPPLEMENT_TABLE_COUNT, FUND_HOLDINGS_SCHEMA_NAME, FUND_HOLDINGS_SCHEMA_VERSION,
+    FundAmendmentState, FundConflictState, FundCurrencyAmount, FundEtfMechanics,
+    FundEvidenceRecord, FundExchangeAssociation, FundFilingChronology, FundFilingIdentity,
+    FundHoldingAssociations, FundHoldingQuantity, FundHoldingSecurityIdentity,
+    FundHoldingSupplementEvidence, FundHoldingUnit, FundHoldingsError, FundLineageRowRange,
+    FundMissingState, FundPortfolioHoldingAttributes, FundPortfolioHoldingEvidence,
+    FundReleaseCoverage, FundReportAttributes, FundReportEvidence, FundReportedDecimal,
+    FundReportedValue, FundRevisionEvidence, FundRevisionLink, FundRevisionStatus,
+    FundSecurityIdentifier, FundShareClassAttributes, FundShareClassEvidence,
+    FundShareClassIdentity, FundSourceFamily, FundSourceLineage, FundSourceRowEvidence,
+    FundSourceTable, FundSourceText, FundSupplementDisposition, MAX_FUND_COMPETING_ACCESSIONS,
+    MAX_FUND_EXCHANGE_ASSOCIATIONS, MAX_FUND_SOURCE_ROWS,
+};
+pub use fund_nav::{
+    FundNavCompleteness, FundNavCorrectionState, FundNavDisposition, FundNavEntitlementEvidence,
+    FundNavFinality, FundNavLineage, FundNavMissingState, FundNavNativeSchema, FundNavObservation,
+    FundNavObservationInput, FundNavRevisionEvidence, FundNavValuationBasis, FundNavValue,
+};
+pub use fundamental_context::{
+    FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
+    FundamentalContextError, FundamentalDimensionContext, FundamentalFactContext,
+    FundamentalFactContextInput, FundamentalPeriod, FundamentalRestatementStatus,
+    FundamentalRevisionOrder,
+};
+pub use intraday_candle::{
+    CandleTimestampBasis, IntradayCandleFinality, IntradayCandleObservation,
+    IntradayCandleObservationInput, MAX_INTRADAY_CANDLE_INTERVAL_SECONDS, MarketSnapshotError,
+    MarketSnapshotVolume, MarketSnapshotVolumeUnit, MarketSourceText,
+};
+pub use market_calendar::{
+    MARKET_CALENDAR_DATE_MEMBERSHIP_DOMAIN, MAX_MARKET_CALENDAR_DAYS,
+    MAX_MARKET_CALENDAR_INTERVALS, MarketCalendarBoundary, MarketCalendarCompleteness,
+    MarketCalendarDateScope, MarketCalendarDay, MarketCalendarDayInput, MarketCalendarDayStatus,
+    MarketCalendarField, MarketCalendarInterval, MarketCalendarMetadata, MarketCalendarObservation,
+    MarketCalendarObservationError, MarketCalendarObservationInput, MarketCalendarPayload,
+    MarketCalendarScope, MarketCalendarSessionPresence, MarketCalendarSessionRole,
+};
 pub use observations::{
-    AlternativeDataObservation, CorporateActionObservation, FilingObservation,
-    FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
-    TransactionObservation, UniverseMembershipObservation,
+    AlternativeDataObservation, BarTimeSemantics, BarTimestampBasis, CompanyObservationSubject,
+    CorporateActionObservation, FilingObservation, FundamentalObservation, MacroMissingValue,
+    MacroObservation, MacroValue, MarketBarAdjustment, MarketBarObservation,
+    MarketBarSessionEvidence, MarketBarSessionKind, NominalDailyDate, PositionObservation,
+    TimestampedBarPeriod, TransactionObservation, UniverseMembershipObservation,
 };
 pub use portfolio_transactions::{
     NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
@@ -28,14 +93,42 @@ pub use portfolio_transactions::{
     NormalizedPortfolioTransactionEvidenceInput,
 };
 pub use xbrl::{
-    MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS, MAX_XBRL_RELATIONSHIPS,
-    MAX_XBRL_UNIT_MEASURES, XBRL_FACT_EVIDENCE_SCHEMA_VERSION, XbrlAccuracy, XbrlAccuracyValue,
-    XbrlContextGraph, XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember,
-    XbrlDuplicateClass, XbrlDuplicateEvidence, XbrlEntity, XbrlEvidenceError, XbrlFactEvidence,
-    XbrlFactEvidenceInput, XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName,
-    XbrlRelationshipEvidence, XbrlSign, XbrlTaxonomySet, XbrlTaxonomyStatus, XbrlText,
-    XbrlTypedMemberValidation, XbrlUnitExpression, XbrlXmlEvent,
+    MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_OCCURRENCES, MAX_XBRL_RELATIONSHIP_REFS,
+    MAX_XBRL_RELATIONSHIPS, MAX_XBRL_UNIT_MEASURES, XBRL_FACT_EVIDENCE_SCHEMA_VERSION,
+    XbrlAccuracy, XbrlAccuracyValue, XbrlContextGraph, XbrlDimensionEvidence,
+    XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass, XbrlDuplicateEvidence,
+    XbrlEntity, XbrlEvidenceError, XbrlFactEvidence, XbrlFactEvidenceInput,
+    XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName, XbrlRelationshipEvidence, XbrlSign,
+    XbrlTaxonomySet, XbrlTaxonomyStatus, XbrlText, XbrlTypedMemberValidation, XbrlUnitExpression,
+    XbrlXmlEvent,
 };
+
+/// Knowledge basis of a producer-qualified historical study.
+///
+/// This declaration does not itself establish source availability or admit a study. The
+/// dataset and analytical authorities bind it to retained inputs and actual source clocks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalStudyBasis {
+    /// Inputs were evidenced as available at each historical decision coordinate.
+    HistoricalAsKnown,
+    /// Simulated decisions use an immutable later-acquired snapshot with disclosed limitations.
+    RetrospectiveFrozenSnapshot,
+}
+
+/// A retained qualification on what a historical study can establish.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalStudyLimitation {
+    /// The retained sources do not establish complete historical revision coverage.
+    HistoricalRevisionCoverageUnproven,
+    /// Inputs may contain revisions or information from after the simulated decision.
+    LaterVintageInputs,
+    /// The study evaluates a predeclared present-day cohort, not a historical market universe.
+    PresentDayFixedCohort,
+    /// Decision-time availability is a simulation assumption, not source evidence.
+    SimulatedAvailability,
+}
 
 /// Direction of a nonzero portfolio position.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -62,12 +155,20 @@ pub enum ResearchObservation {
     Fundamental(FundamentalObservation),
     /// Macroeconomic series observation.
     Macro(MacroObservation),
+    /// Exact historical market bar with canonical instrument and venue identity.
+    MarketBar(MarketBarObservation),
+    /// Exact daily net asset value for one resolved fund/share class.
+    FundNav(FundNavObservation),
+    /// Source calendar coverage and its exact dated native session rows.
+    MarketCalendar(MarketCalendarObservation),
     /// Account position as of an effective time.
     PortfolioPosition(PositionObservation),
     /// Source transaction record.
     Transaction(TransactionObservation),
     /// Corporate action obtained through research ingestion.
     CorporateAction(CorporateActionObservation),
+    /// Source query summary or returned action disposition; independent of economic admission.
+    CorporateActionSource(CorporateActionSourceObservation),
     /// Source-authored historical instrument-universe membership.
     UniverseMembership(UniverseMembershipObservation),
     /// User-owned, licensed, or public alternative dataset observation.
@@ -86,6 +187,7 @@ impl ResearchObservation {
         match self {
             Self::Filing(value) => FilingObservation::new(
                 value.context().with_revision(revision),
+                value.subject().clone(),
                 value.form_type().clone(),
                 value.accession().clone(),
             )
@@ -93,16 +195,18 @@ impl ResearchObservation {
             Self::Fundamental(value) => match value.xbrl_evidence() {
                 Some(evidence) => FundamentalObservation::new_with_xbrl_evidence(
                     value.context().with_revision(revision),
+                    value.subject().clone(),
                     value.concept().clone(),
                     value.value(),
-                    value.unit().clone(),
+                    value.fact_context().clone(),
                     evidence.clone(),
                 ),
                 None => FundamentalObservation::new(
                     value.context().with_revision(revision),
+                    value.subject().clone(),
                     value.concept().clone(),
                     value.value(),
-                    value.unit().clone(),
+                    value.fact_context().clone(),
                 ),
             }
             .map(Self::Fundamental),
@@ -126,6 +230,38 @@ impl ResearchObservation {
                     Err(ResearchError::InvalidMacroValueState)
                 }
             }
+            Self::MarketBar(value) => MarketBarObservation::new(
+                value.context().with_revision(revision),
+                value.provider_instrument_id().clone(),
+                value.feed().clone(),
+                value.interval().clone(),
+                value.time_semantics().clone(),
+                value.adjustment(),
+                value.open(),
+                value.high(),
+                value.low(),
+                value.close(),
+                value.volume(),
+                value.trade_count(),
+                value.vwap(),
+            )
+            .map(Self::MarketBar),
+            Self::FundNav(value) => FundNavObservation::try_new(FundNavObservationInput {
+                context: value.context().with_revision(revision),
+                provider_instrument_id: value.provider_instrument_id().clone(),
+                instrument_reference_revision: value.instrument_reference_revision().clone(),
+                provider_product: value.provider_product().clone(),
+                provider_channel: value.provider_channel().clone(),
+                nav_date: value.nav_date(),
+                valuation_basis: value.valuation_basis(),
+                currency: value.currency(),
+                value: value.value(),
+                canonical_published_at: value.canonical_published_at(),
+                lineage: value.lineage().clone(),
+                revision_evidence: value.revision_evidence().clone(),
+            })
+            .map(Self::FundNav),
+            Self::MarketCalendar(value) => Ok(Self::MarketCalendar(value.with_revision(revision))),
             Self::PortfolioPosition(value) => PositionObservation::new(
                 value.context().with_revision(revision),
                 value.account_id().clone(),
@@ -139,6 +275,9 @@ impl ResearchObservation {
                 value.transaction_type().clone(),
                 value.source_record_id().clone(),
             ))),
+            Self::CorporateActionSource(value) => {
+                Ok(Self::CorporateActionSource(value.with_revision(revision)))
+            }
             Self::CorporateAction(value) => CorporateActionObservation::new(
                 value.context().with_revision(revision),
                 value.action().clone(),
@@ -166,6 +305,8 @@ impl ResearchObservation {
 /// A canonical research-payload invariant failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResearchError {
+    /// Explicit company subject disagrees with provenance security attribution.
+    CompanySubjectMismatch,
     /// Instrument-scoped research data lacks stable instrument identity.
     MissingInstrument,
     /// A venue-scoped research observation lacks venue identity.
@@ -174,6 +315,46 @@ pub enum ResearchError {
     ZeroPosition,
     /// A macro observation encoded both or neither observed and missing value state.
     InvalidMacroValueState,
+    /// Fundamental source context is internally inconsistent or disagrees with PIT evidence.
+    FundamentalContext(FundamentalContextError),
+    /// A market bar effective coordinate disagrees with its source time precision or value.
+    MarketBarEffectiveCoordinateMismatch,
+    /// A nominal daily bar has missing or mismatched exact native payload evidence.
+    InvalidNominalDailyDateEvidence,
+    /// A market-bar aggregation period is empty or reversed.
+    InvalidMarketBarTimeRange,
+    /// Market-bar session evidence carries no usable exact identity.
+    InvalidMarketBarSessionEvidence,
+    /// Canonical effective/provenance time disagrees with the declared provider boundary.
+    MarketBarProviderTimestampMismatch,
+    /// A market bar lacks conservative source availability evidence.
+    MarketBarRequiresConservativeAvailability,
+    /// Conservative point-in-time availability does not establish completed-bar knowledge.
+    MarketBarUnavailableBeforeCompletion,
+    /// A market bar price is zero or negative.
+    NonPositiveMarketBarPrice,
+    /// A market bar mixes price currencies.
+    MarketBarCurrencyMismatch,
+    /// A market bar violates its low/high envelope.
+    InvalidMarketBarRange,
+    /// A market bar volume is negative.
+    NegativeMarketBarVolume,
+    /// A fund NAV carried a venue and could be mistaken for a traded price.
+    FundNavMustNotHaveVenue,
+    /// The NAV date does not equal the exact calendar-date effective coordinate.
+    FundNavDateMismatch,
+    /// Source publication precision disagrees with the source timestamp.
+    FundNavSourcePublicationMismatch,
+    /// A NAV lacks conservative availability evidence.
+    FundNavRequiresConservativeAvailability,
+    /// Canonical publication precedes local receipt, availability, or ingestion.
+    FundNavCanonicalPublicationTooEarly,
+    /// Exact NAV value, currency, completeness, and disposition disagree.
+    InvalidFundNavValueState,
+    /// Fund NAV request/raw/schema lineage contains unusable exact evidence.
+    InvalidFundNavLineage,
+    /// Fund NAV correction predecessor/successor evidence is invalid.
+    InvalidFundNavRevisionEvidence,
     /// A merger successor is the same stable instrument.
     SelfMerger,
     /// A spinoff distributes the same stable instrument.
@@ -193,6 +374,9 @@ pub enum ResearchError {
 impl fmt::Display for ResearchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CompanySubjectMismatch => {
+                formatter.write_str("company observation subject disagrees with provenance")
+            }
             Self::MissingInstrument => {
                 formatter.write_str("research observation requires an instrument")
             }
@@ -202,6 +386,59 @@ impl fmt::Display for ResearchError {
             Self::ZeroPosition => formatter.write_str("portfolio position must be nonzero"),
             Self::InvalidMacroValueState => formatter
                 .write_str("macro observation requires exactly one observed or missing value"),
+            Self::FundamentalContext(error) => error.fmt(formatter),
+            Self::MarketBarEffectiveCoordinateMismatch => formatter.write_str(
+                "market bar effective coordinate must preserve its source time semantics",
+            ),
+            Self::InvalidNominalDailyDateEvidence => formatter
+                .write_str("nominal daily date requires matching nonzero native payload evidence"),
+            Self::InvalidMarketBarTimeRange => {
+                formatter.write_str("market bar aggregation period must have a positive duration")
+            }
+            Self::InvalidMarketBarSessionEvidence => {
+                formatter.write_str("market bar session evidence requires a nonzero identity")
+            }
+            Self::MarketBarProviderTimestampMismatch => formatter.write_str(
+                "market bar effective and source timestamps must equal the provider boundary",
+            ),
+            Self::MarketBarRequiresConservativeAvailability => formatter
+                .write_str("market bar requires conservative point-in-time availability evidence"),
+            Self::MarketBarUnavailableBeforeCompletion => formatter.write_str(
+                "market bar availability must conservatively establish period completion",
+            ),
+            Self::NonPositiveMarketBarPrice => {
+                formatter.write_str("market bar prices must be positive")
+            }
+            Self::MarketBarCurrencyMismatch => {
+                formatter.write_str("market bar prices must use one currency")
+            }
+            Self::InvalidMarketBarRange => {
+                formatter.write_str("market bar prices violate the low/high range")
+            }
+            Self::NegativeMarketBarVolume => {
+                formatter.write_str("market bar volume must not be negative")
+            }
+            Self::FundNavMustNotHaveVenue => {
+                formatter.write_str("fund NAV must not carry a trading venue")
+            }
+            Self::FundNavDateMismatch => formatter
+                .write_str("fund NAV date must equal its calendar-date effective coordinate"),
+            Self::FundNavSourcePublicationMismatch => formatter
+                .write_str("fund NAV source publication precision must match its source timestamp"),
+            Self::FundNavRequiresConservativeAvailability => formatter
+                .write_str("fund NAV requires conservative point-in-time availability evidence"),
+            Self::FundNavCanonicalPublicationTooEarly => formatter.write_str(
+                "fund NAV canonical publication cannot precede receipt, availability, or ingestion",
+            ),
+            Self::InvalidFundNavValueState => formatter.write_str(
+                "fund NAV value, currency, completeness, and disposition are inconsistent",
+            ),
+            Self::InvalidFundNavLineage => {
+                formatter.write_str("fund NAV lineage requires nonzero exact evidence")
+            }
+            Self::InvalidFundNavRevisionEvidence => {
+                formatter.write_str("fund NAV revision evidence is invalid")
+            }
             Self::SelfMerger => {
                 formatter.write_str("merger successor must be a distinct instrument")
             }
@@ -228,6 +465,12 @@ impl std::error::Error for ResearchError {}
 impl From<XbrlEvidenceError> for ResearchError {
     fn from(value: XbrlEvidenceError) -> Self {
         Self::XbrlEvidence(value)
+    }
+}
+
+impl From<FundamentalContextError> for ResearchError {
+    fn from(value: FundamentalContextError) -> Self {
+        Self::FundamentalContext(value)
     }
 }
 

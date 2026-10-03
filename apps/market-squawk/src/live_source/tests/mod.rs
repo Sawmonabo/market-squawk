@@ -11,6 +11,19 @@ use market_squawk_sources::{
 
 type SharedTestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+#[test]
+fn display_market_read_admission_cannot_reopen_after_revocation() {
+    let admission = super::display_market::DisplayMarketReadAdmission::closed();
+    let revoker = admission.clone();
+    assert!(!admission.is_admitted());
+    assert!(admission.admit());
+    assert!(admission.is_admitted());
+    revoker.revoke();
+    assert!(!admission.is_admitted());
+    assert!(!admission.admit());
+    assert!(!admission.is_admitted());
+}
+
 fn budget_free_metadata(metadata: &SourceMetadata) -> SharedTestResult<SourceMetadata> {
     Ok(SourceMetadata::try_new(SourceMetadataInput::new(
         metadata.schema_version(),

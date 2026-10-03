@@ -232,7 +232,15 @@ impl QuerySource {
                     max_memory_bytes,
                 )?;
                 let memory_pool = Arc::clone(&context.runtime_env().memory_pool);
-                let verified = store.capture_pinned_async(dataset, supervisor).await?;
+                let verified = store
+                    .capture_pinned_async(
+                        dataset,
+                        supervisor,
+                        input_memory.new_empty(),
+                        admission.capture_lease(),
+                        max_memory_bytes,
+                    )
+                    .await?;
                 PinnedRegistrationBundle::complete(
                     Arc::clone(schema),
                     verified,
@@ -273,6 +281,7 @@ fn map_capture_error(error: ParquetStoreError) -> QueryError {
 #[derive(Debug)]
 struct PinnedReadOnlyObjectStore {
     files: Arc<Box<[VerifiedPinnedObject]>>,
+    lookup: Box<[usize]>,
     memory_pool: Arc<dyn MemoryPool>,
     supervisor: BlockingIoSupervisor,
     _retained_metadata: Arc<RetainedPinnedMetadata>,
@@ -281,12 +290,14 @@ struct PinnedReadOnlyObjectStore {
 impl PinnedReadOnlyObjectStore {
     fn new_exact(
         files: Arc<Box<[VerifiedPinnedObject]>>,
+        lookup: Box<[usize]>,
         memory_pool: Arc<dyn MemoryPool>,
         supervisor: BlockingIoSupervisor,
         retained_metadata: Arc<RetainedPinnedMetadata>,
     ) -> Self {
         Self {
             files,
+            lookup,
             memory_pool,
             supervisor,
             _retained_metadata: retained_metadata,
@@ -339,10 +350,15 @@ impl ObjectStore for PinnedReadOnlyObjectStore {
         options: GetOptions,
     ) -> ObjectStoreResult<GetResult> {
         let pinned = self
-            .files
-            .binary_search_by(|candidate| candidate.relative_reference().cmp(location.as_ref()))
+            .lookup
+            .binary_search_by(|index| {
+                self.files[*index]
+                    .relative_reference()
+                    .cmp(location.as_ref())
+            })
             .ok()
-            .and_then(|index| self.files.get(index))
+            .and_then(|index| self.lookup.get(index))
+            .and_then(|index| self.files.get(*index))
             .ok_or_else(|| Self::not_found(location))?;
         let meta = pinned.object_meta().clone();
         options.check_preconditions(&meta)?;

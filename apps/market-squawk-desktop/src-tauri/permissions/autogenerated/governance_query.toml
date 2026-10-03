@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-governance-query"
+description = "Enables the governance_query command without any pre-configured scope."
+commands.allow = ["governance_query"]
+
+[[permission]]
+identifier = "deny-governance-query"
+description = "Denies the governance_query command without any pre-configured scope."
+commands.deny = ["governance_query"]

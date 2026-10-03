@@ -10,8 +10,7 @@ unmeasured target into a performance claim.
 | Document type | Quality-attribute architecture |
 | Audience | Maintainers, release reviewers, operators, security reviewers, and performance engineers |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-03 |
 
 ## Contents
 
@@ -39,11 +38,11 @@ Evidence has three distinct levels:
 | Accepted checkpoint evidence | A prior clean exact head passed its applicable grouped review and verification. |
 | Final release evidence | One clean, unchanged release head passes the complete demonstration, performance, fuzz, security, build, and review gate. |
 
-The reviewed source head includes the accepted Quarter 3 product code plus subsequent
-provider-activation and MCP corrections. The Quarter 3 full gate passed at
-`c6f0124c2b27c4777947de8c42b6a5f97868aaf5`; focused gates cover the later changes through the
-reviewed commit. A final unchanged-head release gate has not yet been recorded. Consequently, this
-page labels performance targets and final acceptance evidence as pending.
+This page records durable quality requirements, not a rolling status claim. The delivery ledger
+records the active candidate and any focused evidence. A final unchanged-head release gate and
+grouped Quarter 4 review remain the only basis for release approval; consequently, performance,
+package, signing, clean-machine installation, and final acceptance evidence remain pending until
+recorded there.
 
 ## Quality priorities
 
@@ -78,12 +77,13 @@ current evidence disposition.
 | QA-MODEL-01 | A bundle, runtime, graph, tensor, worker, warm-up, deadline, or output violates its admitted contract. | Reject or quarantine the model generation and produce typed no-action evidence. | Zero order intents from failed inference; `infer` uses only its admitted in-memory or prewarmed worker capability. | Implemented and accepted for native and tract ONNX paths; optional external runtime remains policy-gated. |
 | QA-PORT-01 | Portfolio import, corporate-action evidence, valuation set, or aggregate work is incomplete or exceeds a limit. | Reject publication/result or mark the financial measure explicitly incomplete; never synthesize an exact zero or overflow allocation. | Published revision identity binds reporting currency, schema, source, policy, and evidence; work/results stay under admitted limits. | Implemented and accepted in Quarter 3 portfolio remediation. |
 | QA-FV-01 | Delayed, adjusted, proxy, modeled, similar-instrument, stale, or inaccessible-market evidence is evaluated for Level 1. | Fail the Level 1 conjunction and retain Level 2, Level 3, or `Unclassified` as supported by evidence; never alter execution quality. | No Level 1 result without every code-owned predicate; no override can promote Level 1 or cure `Unclassified`. | Implemented and accepted in the fair-value closeout. |
-| QA-CTRL-01 | Desktop, CLI, or MCP submits unknown fields, excessive structure/results, an expired deadline, cancellation, or an unauthorized mutation. | Apply the same code-owned descriptor and application service with presentation-specific stricter limits; reject before domain mutation or publish a controlled artifact reference where supported. | Shared descriptors and domain authority remain unchanged; cancellation/deadline stops owned work; governed mutation has durable audit. | Implemented; complete 11-domain application composition and focused desktop/MCP/control-plane evidence exist. |
-| QA-DESKTOP-01 | A new operator launches the interactive product on a supported host. | Open the permanent Obsidian Signal shell, derive readiness from Rust authorities, preserve protected browser and CLI recovery, and retain keyboard/reflow/reduced-motion behavior. | Bundled assets only; five closed commands; three critical frontend behaviors pass; native package installs and launches on the supported matrix. | Source application and focused checks are implemented; hosted package, signing, install, and exact-head acceptance remain pending. |
+| QA-CTRL-01 | Desktop, CLI, or MCP submits unknown fields, excessive structure/results, a stale service generation, expired deadline, cancellation, replayed mutation, or unauthorized request. | The one per-user service applies the same code-owned descriptor and domain authority; reject before mutation or publish a controlled artifact reference where supported. | Service generation, workspace/client identity, descriptor authority, cancellation/deadline, and durable mutation audit remain bound; clients cannot create a second product owner. | Implemented architecture; focused evidence and final release approval are distinct records. |
+| QA-JOB-01 | A Desktop/CLI/MCP client disconnects, cancels, retries, confirms, or observes long-running work. | The durable job authority preserves the exact job/generation/event/authority snapshot and admits only valid lifecycle transitions. | A client loss does not silently publish partial work or abandon ownership; observation is bounded and recovery/terminal evidence is explicit. | Implemented architecture; final exact-head evidence remains pending. |
+| QA-DESKTOP-01 | A new operator launches the interactive product on a supported host. | Open the permanent Obsidian Signal shell, derive readiness from Rust authorities, use the service rendezvous, preserve protected browser and CLI recovery, and retain keyboard/reflow/reduced-motion behavior. | Bundled assets only; five closed commands; three critical frontend behaviors pass; any native package/install claim requires separate target-specific evidence. | Source application is implemented; package, signing, clean-machine installation, and exact-head acceptance remain pending unless the ledger records them. |
 | QA-REC-01 | Shutdown deadline, child/helper failure, or ambiguous persistence outcome occurs. | Stop admission, invalidate authority, preserve a terminal owner, and return incomplete/unavailable until reconciliation proves state. | No detached authority-bearing work; restart either resumes exact durable state or reports a typed recovery requirement. | Implemented across live, capture, execution, provider activation, model, portfolio, backtest, paper, and valuation lifecycles. |
-| QA-PRIV-01 | The product runs locally with normal logging and configured provider access. | Keep structured logs local, redact secret values/references, use stdio MCP, and publish artifacts under controlled roots. | Network inventory matches declared provider/onboarding traffic; logs/results contain no secret material; paths and SQL stay within their typed capabilities. | Implemented contracts and security gates exist; final exact-head credential/network audit remains pending. |
+| QA-PRIV-01 | The product runs locally with normal logging and configured provider access. | Keep structured logs local, redact secret values/references, expose MCP only through authenticated loopback, and publish artifacts under controlled roots. | Network inventory matches declared provider/onboarding traffic; logs/results contain no secret material; paths and SQL stay within their typed capabilities. | Implemented contracts and security gates exist; final exact-head credential/network audit remains pending. |
 | QA-BUILD-01 | Repeated development and verification builds produce generated Cargo state. | Use one worktree-local target, nonincremental approval gates, bounded debug profiles, and a hard disk ceiling. | Verification refuses a target over 20 GiB; source and release artifact size are reported separately from generated cache. | Enforced; accepted hardening gate peaked below 20 GiB and cleaned generated output afterward. |
-| QA-PERF-01 | A documented modern consumer host processes a warmed synthetic live pipeline under the fixed release fixture. | Sustain the required workload while preserving all validation, strategy/model, risk, and memory invariants. | At least 100,000 events/s and sub-millisecond warmed p99 internal event-to-decision latency, with p50/p95/p99/max and peak memory recorded. | **Target only; not yet accepted or claimed.** Task 20 owns final measurement. |
+| QA-PERF-01 | A documented modern consumer host processes a warmed synthetic live pipeline under the fixed release fixture. | Sustain the required workload while preserving all validation, strategy/model, risk, and memory invariants. | At least 100,000 events/s and sub-millisecond warmed p99 internal event-to-decision latency, with p50/p95/p99/max and peak memory recorded. | **Target only; not yet accepted or claimed.** Final exact-head measurement remains required. |
 | QA-PERF-02 | The same host runs analytical ingest/query fixtures. | Publish/read Arrow and Parquet and execute bounded DataFusion queries without bypassing manifest or memory authority. | Record rows/s or bytes/s, query latency, fixture identities, result cardinality, and peak memory on the exact release binary. | **Measurement pending.** Functional storage/query behavior is implemented. |
 
 ## Performance measurement contract
@@ -170,13 +170,13 @@ Audit records explain authority but do not recreate a current capability.
 
 The product uses stable Rust 1.97.1, Edition 2024, resolver 3, a committed lockfile, and local
 dependencies. Platform code contains explicit Unix and Windows path/process/security branches.
-The complete v1.0.0 release carries one standard-GIL CPython 3.14.6 product on macOS Apple
-Silicon, macOS Intel, Windows x64, and Linux x64.
+The installed-product design requires one managed Python product on macOS Apple Silicon, macOS
+Intel, Windows x64, and Linux x64, but exact package construction and installation evidence must be
+recorded for the frozen candidate before those targets are claimed as delivered.
 
-The desktop package matrix covers Ubuntu 24.04 x86-64, macOS 15 on Apple Silicon and Intel, and
-Windows Server 2025 x86-64. The system WebView and native package format remain platform-owned;
-successful bundle creation without a developer-identity signature is not signing or installation
-acceptance.
+The planned desktop package matrix covers Ubuntu x86-64, macOS on Apple Silicon and Intel, and
+Windows x86-64. The system WebView and native package format remain platform-owned; successful
+bundle creation without developer-identity evidence is neither signing nor installation acceptance.
 
 The accepted full-gate host recorded in project memory is Apple M1 Pro, macOS 26.5.1, 16 GiB RAM.
 This is evidence for that host, not proof of every conditional platform implementation. A release

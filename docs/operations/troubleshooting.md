@@ -8,14 +8,15 @@ source, research, portfolio, model, paper-execution, MCP, storage, and developme
 | Document type | Operations runbook |
 | Audience | Local operators, incident responders, integrators, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-08-03 |
+| Review basis | Current installed shared-service, durable-job, setup, and operations contracts; not release approval evidence |
 
 ## Contents
 
 - [Scope](#scope)
 - [First response](#first-response)
 - [Configuration and startup](#configuration-and-startup)
+- [Retrieve bounded redacted diagnostics](#retrieve-bounded-redacted-diagnostics)
 - [Sources and live integrity](#sources-and-live-integrity)
 - [Research, datasets, and queries](#research-datasets-and-queries)
 - [Models and Python](#models-and-python)
@@ -30,9 +31,11 @@ source, research, portfolio, model, paper-execution, MCP, storage, and developme
 ## Scope
 
 Use this page to identify the owning subsystem, preserve evidence, and select the corresponding
-recovery operation. It does not authorize manual changes to SQLite, immutable artifacts, authority
-state, audits, or paper checkpoints. Those files are inputs to application-owned recovery and must
-remain unchanged during diagnosis.
+recovery operation. The installed product has one active per-user service/workspace authority; the
+Desktop, CLI, and registered Claude Code/Codex clients reconnect to it rather than repair a local
+copy. This page does not authorize manual changes to SQLite, immutable artifacts, authority state,
+audits, jobs, backups, or paper checkpoints. Those are inputs to application-owned recovery and
+must remain unchanged during diagnosis.
 
 CLI success writes a result to stdout and exits `0`. Clap usage failures exit `2`. Configuration,
 admission, service, I/O, lifecycle, and shutdown failures exit `1` with a diagnostic chain on
@@ -73,6 +76,9 @@ market-squawk --config /absolute/path/market-squawk.toml \
 
 market-squawk --config /absolute/path/market-squawk.toml \
   --output json doctor
+
+market-squawk --output json setup status
+market-squawk --output json operations settings get
 ```
 
 For local diagnostic detail, add a temporary tracing filter and keep stdout separate from stderr:
@@ -91,6 +97,29 @@ still be sensitive.
 
 ## Configuration and startup
 
+Desktop shows its main window before installation checks and service connection. Those tasks run
+from its asynchronous bootstrap command on Tauri's blocking pool, leaving the shell responsive.
+While opening the workspace, pages share a loading state; startup failure offers **Try again** in
+that same window. Concurrent bootstrap calls serialize through the existing startup/reconnect
+owner. Quitting cancels pending service startup; a ready shared service remains independently owned.
+On macOS, clicking the Dock icon restores the existing window. Explicit background automation
+continues to keep its window hidden.
+
+This follows Tauri's [asynchronous command guidance](https://v2.tauri.app/develop/calling-rust/)
+and [asynchronous setup example](https://v2.tauri.app/learn/splashscreen/) (reviewed 2026-10-01),
+using the existing main window instead of introducing another startup window. Window visibility
+and workspace readiness are separate; a visible window does not establish successful data loading.
+
+After a workspace has opened, a matching-session event disconnect leaves its screens and cached
+results visible with an explicit reconnect notice. In-flight reads are cancelled back to their
+previous query state; successful reconnection refreshes active queries. Home and Markets preserve
+matching saved prices and original timestamps when refresh fails, marking freshness as unverified.
+A replacement workspace/session or invalid event receipt still requires fresh admission. Cached
+display values do not authorize analysis or simulated execution. This uses the existing TanStack
+Query [cache](https://tanstack.com/query/latest/docs/framework/react/guides/caching) and
+[cancellation](https://tanstack.com/query/latest/docs/framework/react/guides/query-cancellation)
+behavior (reviewed 2026-10-01); no second client-side data store is introduced.
+
 | Symptom | Likely boundary | Action |
 | --- | --- | --- |
 | Clap exits `2` | Command spelling, enum, required flag, or option placement | Use `market-squawk --help` and the command-specific `--help`; correct syntax before domain diagnosis |
@@ -100,9 +129,48 @@ still be sensitive.
 | Product construction reports a catalog writer lock | Another process owns the same prepared root | Identify and gracefully stop that owner; do not remove `.catalog.writer.lock` to defeat an active OS lock |
 | Prepared root identity changed | The configured root was renamed, replaced, linked, or its identity changed after opening | Stop all users, restore the exact directory identity/ownership, or recover a complete backup into a fresh root |
 | Durable model admissions require the signed training release | Restored model authority exists but `training_release_root` is absent or mismatched | Install and configure the exact verified training release before reopening those admissions |
+| Desktop/CLI/MCP says its service or workspace generation is stale | A restart, update, restore, or workspace switch fenced the prior client view | Reconnect the client, perform its normal bounded bootstrap/health read, and discard old mutation previews, job handles, and request IDs |
+| Setup status shows a blocker or incomplete step | A selected plan records intent but the required evidence was not produced | Read the step's blocker/recovery/action; complete the owning provider, model, portfolio, paper, MCP, or backup workflow rather than marking it complete manually |
+| Typed settings change/rollback rejects | Expected revision, retained target, setting range, or one-use preview no longer matches | Reread `operations settings get`, correct the closed setting values, then create and apply a fresh preview |
 
 Configuration is immutable for a process lifetime. After correction, start a new command; there is
 no hot reload.
+
+## Retrieve bounded redacted diagnostics
+
+Use the service-owned structured-log operation when `doctor`, a job, or a client identifies an
+operational failure. It is a bounded redacted query/export surface, not a raw log tail or a path
+browser.
+
+```bash
+market-squawk --output json operations logs query \
+  --domain lifecycle \
+  --minimum-severity warn \
+  --limit 250
+```
+
+Optionally narrow the query with inclusive `--from`/`--through` RFC 3339 bounds, an exact
+`--source-id`, `--job-id`, or `--correlation-id`, a bounded `--search`, and `--after-sequence`.
+The limit is `1..=1000`. Record the selected filters, returned sequence range, service/workspace
+generation, and associated job/backup/operation identity; those are the success evidence for a
+bounded diagnostic read.
+
+To retain support evidence, review the same selection first, then explicitly publish its redacted
+controlled artifact:
+
+```bash
+market-squawk --output json operations logs export \
+  --domain lifecycle \
+  --minimum-severity warn \
+  --limit 250 \
+  --confirm
+```
+
+Success is a returned controlled-artifact identity, not a local output filename. If the query is
+rejected, oversized, unavailable, or the export fails, preserve the command, filters, error class,
+and any prior bounded result; narrow the selection or restore the named service/storage authority.
+Never bypass redaction by opening service log files, copying an audit file, or attaching raw logs to
+a public issue without data-handling review.
 
 ## Sources and live integrity
 
@@ -118,8 +186,8 @@ Use `kraken.spot-public-market-data` or another exact registered profile identif
 
 | Symptom | Interpretation | Recovery |
 | --- | --- | --- |
-| Provider not found or not ready | Registration/onboarding/activation is incomplete | Resume `source setup`, complete the local portal evidence, then run the exact confirmed activation request |
-| Setup browser did not open | Browser launch failed, not necessarily the portal | Use the loopback URL printed by the command before its bounded lifetime expires |
+| Provider not found or not ready | Registration/onboarding/activation is incomplete | Open Settings → Connections and verify or resume the saved connection; keep its existing credential and data selection |
+| Connection setup is interrupted | Installed authority retained an incomplete verification or publication | Reconnect Settings, inspect the saved state, and use the offered resume action; no local setup website exists |
 | Activation recipe is rejected at restart | Durable recipe, rights, secret, endpoint, or adapter identity no longer matches | Refresh the evidence and perform an explicit activation; do not edit the recipe |
 | Public Coinbase or Kraken is connected but `DirectUnverified` | Public adapter metadata and runtime qualification retain the lower ceiling | This is the expected public-source status, not a freshness bug; use an admitted Coinbase Direct session when execution-quality evidence is required |
 | Coinbase Direct status becomes `failed` with `requiresStop: true` | The run token was cancelled or its account supervisor lost current liveness | Issue `Bot.Stop` through the owning MCP process, preserve the first source/credential/integrity failure, repair it, and start a new exact session/generation |
@@ -148,7 +216,7 @@ market-squawk --output json query dataset <DATASET_ID> --maximum-rows 100
 | FRED durable ingest is denied | Exact written St. Louis Fed service permission with a current local review, or independent exact-series authority, is absent or stale | Treat it as the tracked release blocker; an API key, contact receipt, or successful ephemeral extraction is not durable authority |
 | Dataset not found | No current catalog/manifest authority exists for that identity | Confirm ingest/build publication and use the exact returned dataset identity |
 | Point-in-time build rejects the request | Knowledge cutoff, revision, source closure, universe, corporate action, or fixed resource contract failed | Correct the governed request or inputs; do not remove cutoff/revision semantics to obtain output |
-| Query is truncated | Result ceiling is below available rows or bytes | Narrow time/instrument scope or deliberately raise `--maximum-rows` within the fixed process limits |
+| Dataset read exceeds a resource limit | The complete result or execution exceeds its admitted row, byte, or work ceiling; no partial dataset is returned | `query dataset --maximum-rows` must cover the full result. Deliberately raise it within fixed process limits, or use explicit `LIMIT` through the local-only SQL path for a preview; artifact spill does not bypass the row ceiling |
 | DataFusion query is rejected | SQL is not read-only/single-dataset or exceeds SQL, plan, work, time, memory, or result bounds | Reduce the statement against the pinned dataset; SQL is CLI-only |
 | Artifact publication is interrupted | Staged bytes did not become current authority | Restart through the owning service; orphan/publication recovery validates exact object and catalog evidence |
 
@@ -182,26 +250,30 @@ Python is a research/training boundary and is not called from the live event-to-
 | Performance says `insufficient_history` | Fewer than two comparable admitted revisions exist | Import genuine later point-in-time revisions; do not synthesize history |
 | `bot start` is unavailable | Provider config, runtime composition, checkpoint, audit, or lifecycle admission failed | Validate config/source state, check single-writer ownership and disk, then retry only after the first cause is resolved |
 | Paper run has zero orders/fills | Current strategy emits no intents and provider data is not execution eligible | Expected current behavior; this does not prove a broken matching engine |
-| Separate CLI `bot status` shows stopped | CLI processes do not attach to another process's controller | Use the same persistent stdio MCP session for status/execution calls, or inspect foreground run result and durable audits |
+| Client sees stale or unavailable paper status after a service transition | The client still carries the previous workspace/service generation, or the runtime is recovering | Reconnect, reread `Bot.GetStatus`, and follow its lifecycle/reconciliation state; never start a parallel controller |
 | Reconciliation required | Orders/fills/balances/positions are not current as one state | Keep action stopped and invoke same-owner execution reconciliation before terminal shutdown |
 | Paper checkpoint reports an unclean prior run | A complete terminal checkpoint was not durably established | Preserve audits/checkpoint, recover exact state, reconcile, and publish a clean terminal checkpoint |
 
 See the [portfolio and paper-execution runbook](portfolio-and-paper-execution.md) before operating
 these mutations.
 
-## MCP
+## MCP and shared-service reconnection
 
-MCP uses stdio. Stdout is reserved for protocol frames; local tracing belongs on stderr.
+The installed service owns the active workspace and authenticated loopback MCP endpoint; registered
+Claude Code and Codex clients use their named relay/credential path and must not be repaired by
+editing client configuration files directly. The compatibility CLI relay uses stdio, where stdout
+is reserved for protocol frames and tracing belongs on stderr.
 
 | Symptom | Interpretation | Action |
 | --- | --- | --- |
-| Client receives no tools | Initialization handshake or `tools/list` did not complete | Send a supported initialize request, initialized notification, then `tools/list` in order |
+| Client receives no tools or cannot reach the service | Service/rendezvous/credential/client registration is unavailable or stale | Use the MCP page or owned setup repair to inspect the exact registration and service health; reconnect after the service reports its current generation |
 | JSON parse/frame failure | A non-protocol writer contaminated stdout or the frame exceeded bounds | Remove wrapper output from stdout, preserve stderr separately, and restart a fresh session |
 | Unknown tool | Name differs from the exact 63-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
 | Tool argument rejected | Closed JSON schema, identifier, range, confirmation, or result limit failed | Correct the typed arguments; unknown fields are not accepted as extensions |
 | Mutation is unavailable after valid schema | Durable audit admission, local confirmation, domain authority, or risk failed | Repair the owning authority; transport validity does not grant mutation authority |
 | Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain the complete reference and read bounded chunks with `Analysis.ReadArtifact` or `query artifact`; never derive or open a filesystem path |
 | Session shutdown is incomplete | One domain/helper failed its bounded drain | Preserve stderr and audit evidence, reconcile the named domain, and start a fresh session only after ownership is resolved |
+| Restore, workspace switch, or update just completed | Existing clients/handles are fenced to the old generation | Reconnect Desktop/CLI/Claude Code/Codex, repeat discovery/health and safe reads, and never replay an old mutation, preview, or token-bearing command |
 
 Do not send ordinary CLI output through an MCP client's protocol stdout stream.
 
@@ -223,8 +295,74 @@ du -sh /absolute/path/to/.market-squawk
 | Stale-looking lock file | Determine whether an OS lock is active; the persistent file itself is not proof and should not be manually removed during diagnosis |
 | Interrupted immutable object | Let exact publication/orphan recovery decide whether it is current, staged, or removable |
 
-Use [Backup and recovery](backup-and-recovery.md) for the complete cold-backup and fresh-restore
-procedure.
+Use [Backup and recovery](backup-and-recovery.md) for the service-owned backup, verification,
+preview-bound fresh-workspace restore, workspace-switch, update, and program-rollback procedure.
+
+## Background native Desktop checks
+
+The optional `desktop-automation` Cargo feature embeds WebdriverIO's WebDriver server in the
+actual development Desktop. This follows the current [Tauri recommendation](https://v2.tauri.app/develop/tests/webdriver/)
+and [WebdriverIO plugin setup](https://webdriver.io/docs/desktop-testing/tauri/plugin-setup/).
+It uses the real WebView, Tauri commands and installed service; it does not substitute a browser
+mock or synthetic backend. The dependency is pinned to `tauri-plugin-wdio-webdriver` 1.4.0.
+
+Build once through the lead's serialized compiler queue:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 nice -n 19 cargo build --locked \
+  -p market-squawk-desktop --features desktop-automation
+```
+
+With the normal frontend development server and service available, launch against the selected
+development data and installation roots:
+
+```bash
+target/debug/market-squawk-desktop --webdriver-port 4445 \
+  --data-dir /absolute/development/data \
+  --installation-data-root /absolute/development/installation
+```
+
+The explicit port enables a loopback-only WebDriver endpoint, keeps the native window hidden and
+skips foreground activation. On macOS this hidden mode uses accessory activation policy. To inspect
+the single visible development Desktop, add `--webdriver-visible` alongside `--webdriver-port`.
+Its initial launch follows normal visible startup and can take focus; subsequent standard WebDriver
+WebView requests do not use global keystrokes. The visibility option requires a port and is available
+only with the same development feature/debug configuration. Standard WebDriver session, element,
+script and screenshot requests operate within the native WebView.
+On macOS 14+, this explicit automation mode also disables WebKit background throttling through
+[Tauri's supported configuration](https://v2.tauri.app/reference/config/#backgroundthrottling)
+(reviewed 2026-10-02). Otherwise an occluded window can report loaded chart data while its canvas
+has not painted. Ordinary launches keep the platform scheduling policy; automation screenshots
+and instrumented resource use are separate from final installed acceptance.
+
+Do not infer a rendering failure or a visual pass from a hidden-window snapshot alone. In the
+2026-10-02 native check, `document.visibilityState` remained `hidden` and a newly mounted chart
+retained blank, default-sized canvas buffers despite automation throttling being disabled.
+[WebKit documents that inactive pages can stop animation frames](https://webkit.org/blog/8970/how-web-content-can-affect-power-usage/).
+The locked Lightweight Charts5.2.0 implementation schedules drawing on animation frames; its
+[public `takeScreenshot()` API](https://tradingview.github.io/lightweight-charts/docs/api/interfaces/IChartApi#takescreenshot)
+flushes pending drawing synchronously. Invoking that API on the existing chart produced the
+actual retained MSFT price line and axes without taking focus or changing data. This distinguishes
+loaded/drawable chart data from unattended compositor paint; it does not prove ordinary visible
+first-paint timing, gestures or every chart layer. Record the capture method and visibility state,
+and separately verify visible rendering when the app is naturally visible. Do not disable normal
+power-saving behavior or replace charts with images to make an audit pass.
+
+For coordinated development, pass both options to the existing `scripts/develop.mjs` invocation
+instead of starting an additional Desktop. An already running process without a port has no
+WebDriver endpoint to attach to; the lead must replace that single supervised instance before
+inspection. Two full Desktop processes cannot simultaneously compose the same workspace's
+exclusive MCP-registration receipt authority.
+Check `http://127.0.0.1:4445/status`, then create a session with `POST /session` and
+`{"capabilities":{"alwaysMatch":{}}}`. Delete the session when finished. Keep the endpoint local
+and stop the development process when the check is complete.
+
+The feature is off by default; both options and plugin registration are compiled only with
+debug assertions. A feature-enabled development binary without the port follows normal visible
+startup. Release builds cannot activate this endpoint. Do not use an instrumented build for final
+whole-application resource acceptance. Background WebView interaction does not establish support
+for native file pickers, OS security dialogs or external OAuth pages; those require separate
+evidence. Do not fall back to global keystrokes or foreground automation while the owner works.
 
 ## Maintainer build diagnostics
 
@@ -238,6 +376,44 @@ Full variable-level debugging is opt-in through `cargo build --profile debugging
 The tracked VS Code workspace settings disable rust-analyzer's automatic on-save
 workspace/all-target flycheck and incremental analyzer builds; use focused on-demand diagnostics so
 editor background work does not duplicate release gates or silently expand `target/`.
+Automatic Cargo project reload and build-script rebuild-on-save are also disabled: manifest
+changes previously started background workspace checks despite flycheck being disabled. After a
+dependency change, refresh the analyzer project deliberately when no scheduled Cargo command is
+running. Build-script and procedural-macro support remain enabled. These are the upstream
+[rust-analyzer configuration controls](https://rust-analyzer.github.io/book/configuration),
+verified against the installed extension on 2026-09-29.
+
+These settings must belong to the folder actually opened in VS Code. If a parent folder lists
+this repository in `rust-analyzer.linkedProjects`, its workspace settings control the analyzer;
+the nested repository's `.vscode/settings.json` does not. Apply the same on-demand settings to
+that parent workspace and confirm the effective values in the rust-analyzer extension log.
+
+Routine development uses the existing coordinated watcher: React/CSS changes use Vite refresh,
+while Rust edits share one serialized compilation and replace the running staged programs only
+on success. Do not run a second manual build merely to display the console. Batch the relevant
+critical checks before the next native generation; avoid new target directories, one-off profile
+variants and executable copies for ordinary verification.
+
+Cargo's [automatic cache cleaning](https://doc.rust-lang.org/cargo/reference/config.html#cache)
+currently covers downloaded global caches, not this workspace's build output (checked 2026-10-03).
+On macOS, unpacked debug information also retains object files beside the executable. An old
+file's age alone does not prove it is unused. At each accepted integration checkpoint, inspect
+obsolete build variants and remove verified superseded output while the watcher is held and no
+compiler is active. Retain the current build/test artifacts and the running staged generation.
+For a deliberate reset of workspace-package output, use supported Cargo cleanup, previewing first:
+
+```bash
+cargo clean --workspace --profile dev --dry-run --verbose
+cargo clean --workspace --profile dev
+```
+
+This preserves third-party dependency output but forces workspace packages to rebuild; it is not
+a hook to run after every save. There is no automatic target-pruning hook configured.
+Do not install `cargo-sweep` as an assumed maintained solution: its upstream README currently
+marks it unmaintained. Do not accumulate new recovery executable copies for routine builds.
+Current recovery data must have a concrete restoration dependency; remove it when that dependency
+is closed or the owner explicitly authorizes its deletion. Managed Python diagnostics must use
+`-I -B`; isolated mode ignores the environment variable that ordinarily disables bytecode writes.
 
 Monitor generated storage at meaningful integration boundaries:
 

@@ -6,16 +6,31 @@ mod decision;
 mod derived;
 mod graph;
 mod identity;
+mod market_event;
 mod model;
+pub use market_event::{AuthorizedMarketEventUse, MarketEventUseInput, MarketEventUseRequest};
+pub(crate) use market_event::{
+    authorize_current_market_event_use_in_snapshot, authorize_market_event_use_in_snapshot,
+    recheck_market_event_use_in_snapshot,
+};
 mod permit;
 mod persistence;
+pub(crate) use persistence::{
+    RetainedSourceUseGrant, SourceGrantSelection, select_source_use_grant, source_use_frontier,
+};
 mod publication;
+mod read;
+pub use read::AuthorizedResearchRead;
+pub(crate) use read::{
+    authorize_current_research_use_in_snapshot, recheck_research_use_in_snapshot,
+};
 mod traversal;
 
 pub use self::catalog::{
     AuthorizedResearchUse, DerivedOutputObjectInput, PublishedDerivedGeneration,
     RegisteredResearchUseGrant, ResearchUseCatalogError, ResearchUseGrantInput, ResearchUseRequest,
     ResearchUseRevocationInput, ResearchUseRevocationReason, ResearchUseRevocationReceipt,
+    RetainedResearchUsePolicy,
 };
 pub use self::decision::{
     ResearchUseAuthorityEvidence, ResearchUseDecisionInput, ResearchUseDecisionOutcome,

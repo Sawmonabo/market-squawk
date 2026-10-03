@@ -28,15 +28,14 @@ market-squawk-portfolio.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 rust_decimal.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

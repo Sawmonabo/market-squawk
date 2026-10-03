@@ -42,6 +42,13 @@ CREATE TABLE analytical_generations (
                 X'0000000000000000000000000000000000000000000000000000000000000000'
         )
     ),
+    atomic_provider_macro_plan_json TEXT CHECK (
+        atomic_provider_macro_plan_json IS NULL OR (
+            generation_kind = 'ingest'
+            AND length(CAST(atomic_provider_macro_plan_json AS BLOB)) BETWEEN 1 AND 4096
+            AND json_valid(atomic_provider_macro_plan_json)
+        )
+    ),
     created_at_ns INTEGER NOT NULL,
     UNIQUE (dataset_id, manifest_version),
     UNIQUE (dataset_id, content_hash),
@@ -113,7 +120,7 @@ ORDER BY dataset_id, manifest_version;
 CREATE TABLE analytical_generation_objects (
     dataset_id TEXT NOT NULL,
     manifest_version INTEGER NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 1023),
     artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
     content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
     row_count INTEGER NOT NULL CHECK (row_count > 0),

@@ -1,0 +1,636 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_platform::JobDatabaseLocation;
+use rusqlite::{Connection, OptionalExtension as _, params};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::task::TaskTracker;
+use uuid::Uuid;
+
+mod backup;
+mod codec;
+mod engine;
+mod start;
+
+pub use backup::{
+    JOBS_AND_RECEIPTS_BACKUP_SCHEMA, JobsAndReceiptsBackupBinding, JobsAndReceiptsBackupExport,
+    JobsAndReceiptsBackupReceipt,
+};
+
+use codec::{decode_event, decode_snapshot};
+use engine::{
+    decode_cursor, initialize, map_path, map_sql, open_reader, read_snapshot, sql_u64, sql_usize,
+    writer_loop,
+};
+
+use crate::{
+    AdmittedJobSpec, JobEvent, JobEventPage, JobEventPageLimit, JobEventSequence, JobGeneration,
+    JobId, JobListCursor, JobListPage, JobListPageLimit, JobRecoveryPage, JobRepository,
+    JobRepositoryError, JobSnapshot, JobStartAdmission, JobStartBinding, JobStartReconciliation,
+    JobState, RecoveryCursor, RecoveryPageLimit,
+};
+
+const SCHEMA_VERSION: i64 = 1;
+const JOB_DATABASE_APPLICATION_ID: i64 = 0x4d53_514a;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounded SQLite writer configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobRepositoryConfig {
+    busy_timeout: Duration,
+    writer_queue_capacity: usize,
+}
+
+impl JobRepositoryConfig {
+    /// Admits a positive busy timeout no longer than five seconds and a bounded writer queue.
+    pub fn try_new(
+        busy_timeout: Duration,
+        writer_queue_capacity: usize,
+    ) -> Result<Self, JobRepositoryError> {
+        if busy_timeout.is_zero()
+            || busy_timeout > Duration::from_secs(5)
+            || writer_queue_capacity == 0
+            || writer_queue_capacity > 4_096
+        {
+            return Err(JobRepositoryError::InvalidState);
+        }
+        Ok(Self {
+            busy_timeout,
+            writer_queue_capacity,
+        })
+    }
+}
+
+/// SQLite-backed durable job repository with one bounded writer task.
+#[derive(Clone, Debug)]
+pub struct SqliteJobRepository {
+    inner: Arc<RepositoryInner>,
+}
+
+#[derive(Debug)]
+struct RepositoryInner {
+    cursor_epoch: Uuid,
+    location: JobDatabaseLocation,
+    config: JobRepositoryConfig,
+    writer: mpsc::Sender<WriteCommand>,
+    committed_changes: watch::Receiver<()>,
+    tracker: TaskTracker,
+    closing: AtomicBool,
+}
+
+#[derive(Debug)]
+enum WriteCommand {
+    BeginStart {
+        binding: JobStartBinding,
+        reply: oneshot::Sender<Result<JobStartAdmission, JobRepositoryError>>,
+    },
+    CancelStart {
+        binding: JobStartBinding,
+        reply: oneshot::Sender<Result<JobStartReconciliation, JobRepositoryError>>,
+    },
+    Create {
+        spec: AdmittedJobSpec,
+        reply: oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>,
+    },
+    Append {
+        id: JobId,
+        generation: JobGeneration,
+        expected: JobEventSequence,
+        event: JobEvent,
+        reply: oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>,
+    },
+    Recover {
+        orphaned: Box<JobSnapshot>,
+        at: Timestamp,
+        reply: oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>,
+    },
+    Retry {
+        failed: Box<JobSnapshot>,
+        at: Timestamp,
+        reply: oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>,
+    },
+    Snapshot {
+        binding: JobsAndReceiptsBackupBinding,
+        backup_id: JobId,
+        backup_generation: JobGeneration,
+        backup_kind: SourceIdentifier,
+        reply: oneshot::Sender<Result<JobsAndReceiptsBackupExport, JobRepositoryError>>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+impl SqliteJobRepository {
+    /// Opens or creates the owned database, verifies WAL/foreign-key mode, then starts one writer.
+    pub async fn open(
+        location: JobDatabaseLocation,
+        config: JobRepositoryConfig,
+    ) -> Result<Self, JobRepositoryError> {
+        let database_file = location.prepare_database_file().map_err(map_path)?;
+        let writer_guard = location.acquire_writer().map_err(map_path)?;
+        let initialize_location = location.clone();
+        tokio::task::spawn_blocking(move || initialize(&initialize_location, config))
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)??;
+        database_file.validate_identity().map_err(map_path)?;
+        location.validate_sqlite_sidecars().map_err(map_path)?;
+
+        let (writer, receiver) = mpsc::channel(config.writer_queue_capacity);
+        // Only the writer owns the sender, so subscribers close with the actual writer.
+        let (committed, committed_changes) = watch::channel(());
+        let tracker = TaskTracker::new();
+        let writer_location = location.clone();
+        tracker.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                writer_loop(
+                    writer_location,
+                    config,
+                    receiver,
+                    database_file,
+                    writer_guard,
+                    committed,
+                );
+            })
+            .await;
+            if result.is_err() {
+                // A closed writer channel makes every later mutation fail closed.
+            }
+        });
+        Ok(Self {
+            inner: Arc::new(RepositoryInner {
+                cursor_epoch: Uuid::new_v4(),
+                location,
+                config,
+                writer,
+                committed_changes,
+                tracker,
+                closing: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    /// Coalesced invalidation after committed job snapshot changes; not an event journal.
+    ///
+    /// The retained receiver is never marked seen, so startup recovery commits remain pending
+    /// for a later service subscriber. Read durable snapshots/events for authoritative state.
+    /// The channel closes when the sole writer exits, including after ordered shutdown.
+    pub fn committed_changes(&self) -> watch::Receiver<()> {
+        self.inner.committed_changes.clone()
+    }
+
+    /// Reads only model activity through the existing transaction-fenced job authority.
+    pub async fn list_model_activity(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+    ) -> Result<JobListPage, JobRepositoryError> {
+        self.list_scope(
+            cursor,
+            limit,
+            "model",
+            &["model.training.v1", "model.forecast-generation.v1"],
+        )
+        .await
+    }
+
+    /// Reads only backtest activity through the existing transaction-fenced job authority.
+    pub async fn list_backtest_activity(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+    ) -> Result<JobListPage, JobRepositoryError> {
+        self.list_scope(cursor, limit, "backtest", &["analysis.backtest.v1"])
+            .await
+    }
+
+    /// Mints the same exact product identity retained by the backtest lookup index.
+    pub fn backtest_product_token(id: JobId, generation: JobGeneration) -> Uuid {
+        engine::backtest_product_token(id, generation)
+    }
+
+    /// Opens one exact backtest job generation through its persisted product identity.
+    pub async fn get_product_backtest(
+        &self,
+        token: Uuid,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        self.read(move |connection| {
+            let bytes = connection.query_row("SELECT job.snapshot_json FROM job_backtest_tokens AS token
+                JOIN jobs AS job ON job.job_id=token.job_id AND job.generation=token.generation WHERE token.token=?1",
+                params![token.as_bytes().as_slice()], |row| row.get::<_,Vec<u8>>(0)).optional().map_err(map_sql)?
+                .ok_or(JobRepositoryError::NotFound)?;
+            let snapshot = decode_snapshot(&bytes)?;
+            if snapshot.spec().kind().as_str() != "analysis.backtest.v1"
+                || engine::backtest_product_token(snapshot.id(), snapshot.generation()) != token {
+                return Err(JobRepositoryError::InvalidState);
+            }
+            Ok(snapshot)
+        }).await
+    }
+
+    async fn list_scope(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+        scope: &'static str,
+        kinds: &'static [&'static str],
+    ) -> Result<JobListPage, JobRepositoryError> {
+        let epoch = self.inner.cursor_epoch;
+        let cursor = cursor
+            .map(|value| {
+                let text = value.as_source_identifier().as_str();
+                let parts = text.split(':').collect::<Vec<_>>();
+                let ["v2", cursor_epoch, revision, cursor_scope, id] = parts.as_slice() else {
+                    return Err(JobRepositoryError::InvalidState);
+                };
+                if *cursor_scope != scope {
+                    return Err(JobRepositoryError::InvalidState);
+                }
+                if *cursor_epoch != epoch.to_string() {
+                    return Err(JobRepositoryError::Conflict);
+                }
+                let revision = revision
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value > 0 && value.to_string() == *revision)
+                    .ok_or(JobRepositoryError::InvalidState)?;
+                let id = JobId::try_from_str(id).map_err(|_| JobRepositoryError::InvalidState)?;
+                Ok((revision, id))
+            })
+            .transpose()?;
+        self.read(move |connection| {
+            let transaction = connection.unchecked_transaction().map_err(map_sql)?;
+            let revision = transaction.query_row("SELECT revision FROM job_list_revision WHERE singleton = 1", [],
+                |row| row.get::<_, i64>(0)).map_err(map_sql)?;
+            if cursor.as_ref().is_some_and(|(expected, _)| *expected != revision) {
+                return Err(JobRepositoryError::Conflict);
+            }
+            let cursor = cursor.map_or_else(Vec::new, |(_, id)| id.as_uuid().as_bytes().to_vec());
+            let fetch = limit.get().saturating_add(1);
+            let sql = if kinds.is_empty() {
+                "SELECT current.snapshot_json FROM jobs AS current
+                 WHERE current.job_id > ?1 AND current.generation = (
+                    SELECT MAX(candidate.generation) FROM jobs AS candidate WHERE candidate.job_id=current.job_id)
+                 ORDER BY current.job_id LIMIT ?2"
+            } else {
+                "SELECT current.snapshot_json FROM jobs AS current
+                 WHERE json_extract(CAST(current.snapshot_json AS TEXT), '$.kind') IN (?3,?4)
+                 AND current.job_id > ?1 AND current.generation = (
+                    SELECT MAX(candidate.generation) FROM jobs AS candidate WHERE candidate.job_id=current.job_id)
+                 ORDER BY current.job_id LIMIT ?2"
+            };
+            let mut statement = transaction.prepare(sql).map_err(map_sql)?;
+            let mut rows = if kinds.is_empty() {
+                statement.query(params![cursor,sql_usize(fetch)?]).map_err(map_sql)?
+            } else {
+                statement.query(params![cursor,sql_usize(fetch)?,kinds[0],kinds.get(1).copied().unwrap_or(kinds[0])]).map_err(map_sql)?
+            };
+            let mut snapshots = Vec::with_capacity(fetch);
+            while let Some(row) = rows.next().map_err(map_sql)? {
+                snapshots.push(decode_snapshot(&row.get::<_,Vec<u8>>(0).map_err(map_sql)?)?);
+            }
+            let next = if snapshots.len() > limit.get() {
+                Some(JobListCursor::new(
+                    SourceIdentifier::try_from(
+                        format!("v2:{epoch}:{revision}:{scope}:{}", snapshots[limit.get() - 1].id().as_uuid()),
+                    )
+                    .map_err(|_| JobRepositoryError::InvalidState)?,
+                ))
+            } else {
+                None
+            };
+            snapshots.truncate(limit.get());
+            JobListPage::try_new(snapshots, next, limit)
+                .map_err(|_| JobRepositoryError::InvalidState)
+        })
+        .await
+    }
+
+    /// Stops admission, drains the one writer, and releases its cross-process lease only afterward.
+    pub async fn shutdown(&self) -> Result<(), JobRepositoryError> {
+        if !self.inner.closing.swap(true, Ordering::AcqRel) {
+            let (reply, receiver) = oneshot::channel();
+            self.inner
+                .writer
+                .send(WriteCommand::Shutdown { reply })
+                .await
+                .map_err(|_| JobRepositoryError::Unavailable)?;
+            tokio::time::timeout(SHUTDOWN_TIMEOUT, receiver)
+                .await
+                .map_err(|_| JobRepositoryError::Unavailable)?
+                .map_err(|_| JobRepositoryError::Unavailable)?;
+        }
+        self.inner.tracker.close();
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, self.inner.tracker.wait())
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        Ok(())
+    }
+
+    async fn send(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>) -> WriteCommand,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.inner
+            .writer
+            .send(command(reply))
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
+    async fn read<T, F>(&self, operation: F) -> Result<T, JobRepositoryError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, JobRepositoryError> + Send + 'static,
+    {
+        let location = self.inner.location.clone();
+        let config = self.inner.config;
+        tokio::task::spawn_blocking(move || {
+            let connection = open_reader(&location, config)?;
+            operation(&connection)
+        })
+        .await
+        .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
+    pub(crate) async fn retain_logical_snapshot(
+        &self,
+        binding: JobsAndReceiptsBackupBinding,
+        backup_id: JobId,
+        backup_generation: JobGeneration,
+        backup_kind: SourceIdentifier,
+    ) -> Result<(JobsAndReceiptsBackupExport, RepositorySnapshotFence), JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        self.inner
+            .writer
+            .send(WriteCommand::Snapshot {
+                binding,
+                backup_id,
+                backup_generation,
+                backup_kind,
+                reply,
+                release: release_receiver,
+            })
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        let export = receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)??;
+        Ok((export, RepositorySnapshotFence(Some(release))))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RepositorySnapshotFence(Option<std::sync::mpsc::Sender<()>>);
+
+impl RepositorySnapshotFence {
+    pub(crate) fn release(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for RepositoryInner {
+    fn drop(&mut self) {
+        self.tracker.close();
+    }
+}
+
+#[async_trait]
+impl JobRepository for SqliteJobRepository {
+    async fn begin_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartAdmission, JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.inner
+            .writer
+            .send(WriteCommand::BeginStart {
+                binding: binding.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
+    async fn reconcile_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartReconciliation, JobRepositoryError> {
+        let binding = binding.clone();
+        self.read(move |connection| start::reconcile(connection, &binding))
+            .await
+    }
+
+    async fn cancel_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartReconciliation, JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.inner
+            .writer
+            .send(WriteCommand::CancelStart {
+                binding: binding.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
+    async fn create(&self, spec: &AdmittedJobSpec) -> Result<JobSnapshot, JobRepositoryError> {
+        let spec = spec.clone();
+        self.send(|reply| WriteCommand::Create { spec, reply })
+            .await
+    }
+
+    async fn append(
+        &self,
+        id: JobId,
+        generation: JobGeneration,
+        expected: JobEventSequence,
+        event: JobEvent,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        self.send(|reply| WriteCommand::Append {
+            id,
+            generation,
+            expected,
+            event,
+            reply,
+        })
+        .await
+    }
+
+    async fn request_cancellation(
+        &self,
+        id: JobId,
+        generation: JobGeneration,
+        expected: JobEventSequence,
+        at: Timestamp,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        let event = JobEvent::try_new(JobState::Cancelling, at, None, None, None)
+            .map_err(|_| JobRepositoryError::InvalidState)?;
+        self.append(id, generation, expected, event).await
+    }
+
+    async fn begin_recovery(
+        &self,
+        orphaned: &JobSnapshot,
+        at: Timestamp,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        let orphaned = Box::new(orphaned.clone());
+        self.send(|reply| WriteCommand::Recover {
+            orphaned,
+            at,
+            reply,
+        })
+        .await
+    }
+
+    async fn begin_retry(
+        &self,
+        failed: &JobSnapshot,
+        at: Timestamp,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        let failed = Box::new(failed.clone());
+        self.send(|reply| WriteCommand::Retry { failed, at, reply })
+            .await
+    }
+
+    async fn get(
+        &self,
+        id: JobId,
+        generation: JobGeneration,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        self.read(move |connection| read_snapshot(connection, id, generation))
+            .await
+    }
+
+    async fn list(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+    ) -> Result<JobListPage, JobRepositoryError> {
+        self.list_scope(cursor, limit, "all", &[]).await
+    }
+
+    async fn events_after(
+        &self,
+        id: JobId,
+        generation: JobGeneration,
+        after: JobEventSequence,
+        limit: JobEventPageLimit,
+    ) -> Result<JobEventPage, JobRepositoryError> {
+        self.read(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT sequence, event_json FROM job_events
+                     WHERE job_id = ?1 AND generation = ?2 AND sequence > ?3
+                     ORDER BY sequence LIMIT ?4",
+                )
+                .map_err(map_sql)?;
+            let fetch = limit.get().saturating_add(1);
+            let generation_sql = sql_u64(generation.get())?;
+            let after_sql = sql_u64(after.get())?;
+            let fetch_sql = sql_usize(fetch)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        id.as_uuid().as_bytes().as_slice(),
+                        generation_sql,
+                        after_sql,
+                        fetch_sql
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .map_err(map_sql)?;
+            let mut events = Vec::with_capacity(fetch);
+            for row in rows {
+                let (sequence, bytes) = row.map_err(map_sql)?;
+                let sequence =
+                    u64::try_from(sequence).map_err(|_| JobRepositoryError::InvalidState)?;
+                events.push((JobEventSequence::new(sequence), decode_event(&bytes)?));
+            }
+            let next = (events.len() > limit.get()).then(|| events[limit.get() - 1].0);
+            events.truncate(limit.get());
+            JobEventPage::try_new(events, next, limit).map_err(|_| JobRepositoryError::InvalidState)
+        })
+        .await
+    }
+
+    async fn recover_nonterminal(
+        &self,
+        cursor: Option<&RecoveryCursor>,
+        limit: RecoveryPageLimit,
+    ) -> Result<JobRecoveryPage, JobRepositoryError> {
+        let cursor = cursor.map(|value| value.as_source_identifier().as_str().to_owned());
+        self.read(move |connection| {
+            let cursor_id = decode_cursor(cursor.as_deref())?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT current.snapshot_json FROM jobs AS current
+                     WHERE current.state IN (0, 1, 2, 3, 4, 9)
+                       AND current.job_id > ?1
+                       AND current.generation = (
+                         SELECT MAX(candidate.generation) FROM jobs AS candidate
+                         WHERE candidate.job_id = current.job_id
+                       )
+                     ORDER BY current.job_id LIMIT ?2",
+                )
+                .map_err(map_sql)?;
+            let fetch = limit.get().saturating_add(1);
+            let fetch_sql = sql_usize(fetch)?;
+            let rows = statement
+                .query_map(params![cursor_id, fetch_sql], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .map_err(map_sql)?;
+            let mut snapshots = Vec::with_capacity(fetch);
+            for row in rows {
+                snapshots.push(decode_snapshot(&row.map_err(map_sql)?)?);
+            }
+            let next = if snapshots.len() > limit.get() {
+                let last = &snapshots[limit.get() - 1];
+                Some(RecoveryCursor::new(
+                    SourceIdentifier::try_from(last.id().as_uuid().to_string())
+                        .map_err(|_| JobRepositoryError::InvalidState)?,
+                ))
+            } else {
+                None
+            };
+            snapshots.truncate(limit.get());
+            JobRecoveryPage::try_new(snapshots, next, limit)
+                .map_err(|_| JobRepositoryError::InvalidState)
+        })
+        .await
+    }
+}

@@ -536,7 +536,7 @@ fn resolve_entry(
         }
         ProducerReceipt::Analytics(value) => {
             if value.instrument_id() != request.instrument_id()
-                || value.cutoff_at() > request.measurement_at()
+                || value.source_selection_as_of() > request.measurement_at()
             {
                 return Err(FairValueInputResolutionError::InvalidReference);
             }

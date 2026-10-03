@@ -4,14 +4,17 @@ use arrow::array::{
     Array as _, Decimal128Array, FixedSizeBinaryArray, Float64Array, UInt8Array, UInt32Array,
 };
 use arrow::record_batch::RecordBatch;
-use market_squawk_domain::{Currency, InstrumentId, SourceIdentifier};
+use market_squawk_domain::{Currency, FUND_HOLDINGS_SCHEMA_NAME, InstrumentId, SourceIdentifier};
 use uuid::Uuid;
 
 use super::ArrowConversionError;
 use crate::schema::{
     BUILD_DIGEST_KEY, DATASET_KEY, DatasetSchemaRef, DatasetSchemaRegistry,
-    FEATURE_LABEL_SCHEMA_NAME, POLICY_DIGEST_KEY, REQUEST_DIGEST_KEY, RESEARCH_SCHEMA_NAME,
-    UNIVERSE_DIGEST_KEY, decode_hex, schema_ref_from_metadata,
+    FEATURE_LABEL_SCHEMA_NAME, FUND_HOLDINGS_LINEAGE_DIGEST_KEY,
+    FUND_HOLDINGS_PUBLICATION_DIGEST_KEY, MARKET_EVENT_SCHEMA_NAME, OPTION_MARKET_SCHEMA_NAME,
+    POLICY_DIGEST_KEY, PROVIDER_PUBLICATION_DIGEST_KEY, PROVIDER_PUBLICATION_KIND_KEY,
+    REQUEST_DIGEST_KEY, RESEARCH_SCHEMA_NAME, UNIVERSE_DIGEST_KEY, decode_hex,
+    schema_ref_from_metadata,
 };
 
 /// A nonempty Arrow record batch validated against one exact registered dataset schema.
@@ -86,6 +89,16 @@ fn validate_batch_metadata(
             UNIVERSE_DIGEST_KEY,
             POLICY_DIGEST_KEY,
         ],
+        MARKET_EVENT_SCHEMA_NAME | OPTION_MARKET_SCHEMA_NAME => &[
+            DATASET_KEY,
+            PROVIDER_PUBLICATION_DIGEST_KEY,
+            PROVIDER_PUBLICATION_KIND_KEY,
+        ],
+        FUND_HOLDINGS_SCHEMA_NAME => &[
+            DATASET_KEY,
+            FUND_HOLDINGS_PUBLICATION_DIGEST_KEY,
+            FUND_HOLDINGS_LINEAGE_DIGEST_KEY,
+        ],
         _ => return Err(ArrowConversionError::UnexpectedDatasetSchema),
     };
     let stable_count = DatasetSchemaRegistry::local()
@@ -110,7 +123,7 @@ fn validate_batch_metadata(
     for key in dynamic_keys
         .iter()
         .copied()
-        .filter(|key| *key != DATASET_KEY)
+        .filter(|key| !matches!(*key, DATASET_KEY | PROVIDER_PUBLICATION_KIND_KEY))
     {
         if metadata
             .get(key)
@@ -119,6 +132,25 @@ fn validate_batch_metadata(
         {
             return Err(ArrowConversionError::InvalidSchemaMetadata);
         }
+    }
+    if schema_ref.name() == MARKET_EVENT_SCHEMA_NAME
+        && !metadata
+            .get(PROVIDER_PUBLICATION_KIND_KEY)
+            .is_some_and(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "response_market_event" | "event_microbatch" | "composite_response_event"
+                )
+            })
+    {
+        return Err(ArrowConversionError::InvalidSchemaMetadata);
+    }
+    if schema_ref.name() == OPTION_MARKET_SCHEMA_NAME
+        && !metadata
+            .get(PROVIDER_PUBLICATION_KIND_KEY)
+            .is_some_and(|kind| matches!(kind.as_str(), "option_snapshots" | "option_expirations"))
+    {
+        return Err(ArrowConversionError::InvalidSchemaMetadata);
     }
     Ok(())
 }
@@ -188,6 +220,8 @@ fn validate_feature_label_batch(batch: &RecordBatch) -> Result<(), ArrowConversi
             units.is_null(row) || padded_text(units, row).is_ok_and(canonical_unit);
         let missing_is_canonical = !has_missing
             || padded_text(missing, row).is_ok_and(|value| canonical_identifier(value, 256));
+        crate::python_dataset::canonical_row(batch, row)
+            .map_err(|_| ArrowConversionError::InvalidFeatureLabelRow)?;
         if !canonical_identifier(example_id, 256)
             || !instrument_is_canonical
             || !canonical_identifier(component_name, 256)

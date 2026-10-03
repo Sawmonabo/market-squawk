@@ -1,5 +1,6 @@
 //! Capability-confined immutable inventory and content-addressed publication.
 
+use sha2::Digest as _;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
@@ -21,21 +22,21 @@ use super::cohort::{
 };
 use super::model::{
     BacktestArtifact, ExperimentLimits, TrialCompletion, TrialCompletionInput, TrialFailure,
-    TrialId, TrialIdentityVersion, TrialRecord, TrialSpec, TrialStatus,
+    TrialId, TrialRecord, TrialSpec, TrialStatus,
 };
 use super::wire::{
     decode_reservation, decode_terminal, digest_bytes, encode_hex, encode_reservation,
     encode_terminal,
 };
 
-const NAMESPACE: &str = "backtesting/v1";
-const RESERVATIONS: &str = "backtesting/v1/reservations";
-const TERMINALS: &str = "backtesting/v1/terminals";
-const ATTEMPTS: &str = "backtesting/v1/attempts";
-const PENDING: &str = "backtesting/v1/pending";
-const COHORTS: &str = "backtesting/v1/cohorts";
-const ARTIFACTS: &str = "backtesting/v1/artifacts/sha256";
-const AUTHORITY_LOCK: &str = "backtesting/v1/inventory.lock";
+const NAMESPACE: &str = "backtesting/v3";
+const RESERVATIONS: &str = "backtesting/v3/reservations";
+const TERMINALS: &str = "backtesting/v3/terminals";
+const ATTEMPTS: &str = "backtesting/v3/attempts";
+const PENDING: &str = "backtesting/v3/pending";
+const COHORTS: &str = "backtesting/v3/cohorts";
+const ARTIFACTS: &str = "backtesting/v3/artifacts/sha256";
+const AUTHORITY_LOCK: &str = "backtesting/v3/inventory.lock";
 const DEFAULT_LEASE_NANOS: i64 = 60 * 60 * 1_000_000_000;
 const MAX_ATTEMPTS_PER_TRIAL: usize = 1_024;
 const MAX_STAGE_NAME_ATTEMPTS: usize = 32;
@@ -92,7 +93,7 @@ impl ExperimentInventory {
             ATTEMPTS,
             PENDING,
             COHORTS,
-            "backtesting/v1/artifacts",
+            "backtesting/v3/artifacts",
             ARTIFACTS,
         ] {
             ensure_directory(&root, Path::new(path))?;
@@ -122,9 +123,6 @@ impl ExperimentInventory {
         acquired_at: Timestamp,
         lease_nanos: i64,
     ) -> Result<TrialReservation, ExperimentError> {
-        if spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::InvalidSpec);
-        }
         if lease_nanos <= 0 {
             return Err(ExperimentError::InvalidLease);
         }
@@ -144,20 +142,6 @@ impl ExperimentInventory {
             return Err(ExperimentError::LimitExceeded);
         }
         publish_immutable(&self.root, &path, &bytes, ExistingPolicy::AcceptExact)?;
-        if read_optional_bounded(
-            &self.root,
-            &legacy_terminal_path(spec.id()),
-            self.limits.max_record_bytes,
-        )?
-        .is_some()
-        {
-            return Err(match spec.identity_version() {
-                TrialIdentityVersion::V1 | TrialIdentityVersion::V2 => {
-                    ExperimentError::TrialAlreadyExists
-                }
-                TrialIdentityVersion::V3 => ExperimentError::CorruptRecord,
-            });
-        }
         self.acquire_attempt(spec, digest_bytes(&bytes), acquired_at, lease_nanos)
     }
 
@@ -165,17 +149,43 @@ impl ExperimentInventory {
         &self,
         bytes: &[u8],
     ) -> Result<BacktestArtifact, ExperimentError> {
-        if bytes.is_empty() || bytes.len() > self.limits.max_artifact_bytes {
+        self.prepare_artifact_reader(&mut std::io::Cursor::new(bytes))
+    }
+
+    pub(crate) fn prepare_artifact_reader(
+        &self,
+        reader: &mut (impl std::io::Read + std::io::Seek),
+    ) -> Result<BacktestArtifact, ExperimentError> {
+        let (byte_count, digest) = reader_identity(reader, self.limits.max_artifact_bytes as u64)?;
+        if byte_count == 0 {
             return Err(ExperimentError::LimitExceeded);
         }
-        let digest = digest_bytes(bytes);
-        let hex = encode_hex(digest.bytes());
-        let prefix = hex.get(..2).ok_or(ExperimentError::Encoding)?;
         Ok(BacktestArtifact {
-            reference: format!("{ARTIFACTS}/{prefix}/{hex}.json").into_boxed_str(),
+            reference: artifact_reference(digest)?.into_boxed_str(),
             digest,
-            byte_count: u64::try_from(bytes.len()).map_err(|_| ExperimentError::LimitExceeded)?,
+            byte_count,
         })
+    }
+
+    /// Reads one content-addressed backtest report through the inventory's confined artifact root.
+    ///
+    /// The caller supplies only the immutable digest and exact retained byte count. The inventory
+    /// derives the capability-relative location, refuses oversized or mismatched content, and
+    /// never returns a filesystem path.
+    pub fn read_artifact(
+        &self,
+        digest: Sha256Digest,
+        byte_count: u64,
+    ) -> Result<Vec<u8>, ExperimentError> {
+        let artifact = BacktestArtifact {
+            reference: artifact_reference(digest)?.into_boxed_str(),
+            digest,
+            byte_count,
+        };
+        let (path, maximum) = self.validate_artifact_authority(&artifact)?;
+        let bytes = read_bounded(&self.root, &path, maximum)?;
+        validate_artifact_bytes(&bytes, &artifact)?;
+        Ok(bytes)
     }
 
     pub(crate) fn publish_cohort_evaluation(
@@ -218,10 +228,20 @@ impl ExperimentInventory {
         completion: TrialCompletion,
         artifact_bytes: &[u8],
     ) -> Result<TrialRecord, ExperimentError> {
-        if reservation.spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::CorruptRecord);
-        }
-        let expected_artifact = self.prepare_artifact(artifact_bytes)?;
+        self.complete_reader(
+            reservation,
+            completion,
+            &mut std::io::Cursor::new(artifact_bytes),
+        )
+    }
+
+    pub(crate) fn complete_reader(
+        &self,
+        reservation: TrialReservation,
+        completion: TrialCompletion,
+        reader: &mut (impl std::io::Read + std::io::Seek),
+    ) -> Result<TrialRecord, ExperimentError> {
+        let expected_artifact = self.prepare_artifact_reader(reader)?;
         if completion.artifact() != &expected_artifact {
             return Err(ExperimentError::InvalidCompletion);
         }
@@ -241,12 +261,7 @@ impl ExperimentInventory {
             &self.root,
             pending_path.parent().ok_or(ExperimentError::Encoding)?,
         )?;
-        publish_or_confirm_exact(
-            &self.root,
-            &pending_path,
-            artifact_bytes,
-            ExistingPolicy::AcceptExact,
-        )?;
+        publish_artifact_reader(&self.root, &pending_path, reader, &expected_artifact)?;
         self.validate_active_attempt(&reservation)?;
 
         let terminal_path = attempt_terminal_path(reservation.spec.id(), reservation.attempt);
@@ -263,12 +278,7 @@ impl ExperimentInventory {
             &self.root,
             artifact_path.parent().ok_or(ExperimentError::Encoding)?,
         )?;
-        publish_or_confirm_exact(
-            &self.root,
-            artifact_path,
-            artifact_bytes,
-            ExistingPolicy::AcceptExact,
-        )?;
+        publish_artifact_reader(&self.root, artifact_path, reader, &expected_artifact)?;
         cleanup_optional(&self.root, &pending_path);
         let id = reservation.spec.id();
         drop(_guard);
@@ -280,9 +290,6 @@ impl ExperimentInventory {
         reservation: &TrialReservation,
         input: TrialCompletionInput,
     ) -> Result<TrialCompletion, ExperimentError> {
-        if reservation.spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::CorruptRecord);
-        }
         let completion = TrialCompletion::try_new(input, self.limits)?;
         let terminal = encode_terminal(
             reservation.spec.id(),
@@ -319,7 +326,6 @@ impl ExperimentInventory {
             return Err(ExperimentError::CorruptRecord);
         }
         let reservation_digest = digest_bytes(&reservation);
-        let identity_version = spec.identity_version();
         let latest = latest_attempt(
             &self.root,
             id,
@@ -329,63 +335,18 @@ impl ExperimentInventory {
         let attempt_terminal = authoritative_attempt_terminal(
             &self.root,
             id,
-            identity_version,
             latest.as_ref(),
             self.limits.max_record_bytes,
         )?;
-        let legacy = read_optional_bounded(
-            &self.root,
-            &legacy_terminal_path(id),
-            self.limits.max_record_bytes,
-        )?;
-        let status = match identity_version {
-            TrialIdentityVersion::V1 | TrialIdentityVersion::V2 => {
-                if let Some(bytes) = legacy {
-                    let decoded = decode_terminal(
-                        &bytes,
-                        id,
-                        identity_version.terminal_schema_version(),
-                        self.limits,
-                    )?;
-                    self.validate_published_terminal(decoded)?
-                } else {
-                    TrialStatus::Reserved
-                }
+        let status = match (latest, attempt_terminal) {
+            (Some(attempt), Some(bytes)) => {
+                let decoded = decode_terminal(&bytes, id, self.limits)?;
+                self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
             }
-            TrialIdentityVersion::V3 => {
-                if legacy.is_some() {
-                    return Err(ExperimentError::CorruptRecord);
-                }
-                match (latest, attempt_terminal) {
-                    (Some(attempt), Some(bytes)) => {
-                        let decoded = decode_terminal(
-                            &bytes,
-                            id,
-                            identity_version.terminal_schema_version(),
-                            self.limits,
-                        )?;
-                        self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
-                    }
-                    (Some(_), None) | (None, None) => TrialStatus::Reserved,
-                    (None, Some(_)) => return Err(ExperimentError::CorruptRecord),
-                }
-            }
+            (Some(_), None) | (None, None) => TrialStatus::Reserved,
+            (None, Some(_)) => return Err(ExperimentError::CorruptRecord),
         };
         Ok(TrialRecord { spec, status })
-    }
-
-    fn validate_published_terminal(
-        &self,
-        decoded: super::wire::DecodedTerminal,
-    ) -> Result<TrialStatus, ExperimentError> {
-        let TrialStatus::Completed(completion) = &decoded.status else {
-            return Ok(decoded.status);
-        };
-        let (final_path, maximum) = self.validate_artifact_authority(completion.artifact())?;
-        let final_bytes = read_optional_bounded(&self.root, &final_path, maximum)?
-            .ok_or(ExperimentError::CorruptRecord)?;
-        validate_artifact_bytes(&final_bytes, completion.artifact())?;
-        Ok(decoded.status)
     }
 
     fn reconcile_terminal_artifact(
@@ -398,30 +359,20 @@ impl ExperimentInventory {
             return Ok(decoded.status);
         };
         let artifact = completion.artifact();
-        let (final_path, maximum) = self.validate_artifact_authority(artifact)?;
+        let (final_path, _) = self.validate_artifact_authority(artifact)?;
         let pending_path = pending_artifact_path(id, attempt);
-        let final_bytes = read_optional_bounded(&self.root, &final_path, maximum)?;
-        let pending_bytes = read_optional_bounded(&self.root, &pending_path, maximum)?;
-        if let Some(bytes) = &final_bytes {
-            validate_artifact_bytes(bytes, artifact)?;
-            if let Some(pending) = &pending_bytes {
-                validate_artifact_bytes(pending, artifact)?;
-            }
+        let final_file = verified_artifact_file(&self.root, &final_path, artifact)?;
+        let pending_file = verified_artifact_file(&self.root, &pending_path, artifact)?;
+        if final_file.is_some() {
             cleanup_optional(&self.root, &pending_path);
             return Ok(decoded.status);
         }
-        let pending = pending_bytes.ok_or(ExperimentError::CorruptRecord)?;
-        validate_artifact_bytes(&pending, artifact)?;
+        let mut pending = pending_file.ok_or(ExperimentError::CorruptRecord)?;
         ensure_directory(
             &self.root,
             final_path.parent().ok_or(ExperimentError::Encoding)?,
         )?;
-        publish_or_confirm_exact(
-            &self.root,
-            &final_path,
-            &pending,
-            ExistingPolicy::AcceptExact,
-        )?;
+        publish_artifact_reader(&self.root, &final_path, &mut pending, artifact)?;
         cleanup_optional(&self.root, &pending_path);
         Ok(decoded.status)
     }
@@ -447,9 +398,6 @@ impl ExperimentInventory {
         reservation: TrialReservation,
         status: TrialStatus,
     ) -> Result<TrialRecord, ExperimentError> {
-        if reservation.spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::CorruptRecord);
-        }
         let _guard = self
             .writer
             .lock()
@@ -709,6 +657,114 @@ fn validate_artifact_bytes(
     Ok(())
 }
 
+fn reader_identity(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    maximum: u64,
+) -> Result<(u64, Sha256Digest), ExperimentError> {
+    reader.rewind()?;
+    let mut hash = sha2::Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        count = count
+            .checked_add(n as u64)
+            .filter(|count| *count <= maximum)
+            .ok_or(ExperimentError::LimitExceeded)?;
+        hash.update(&buffer[..n]);
+    }
+    reader.rewind()?;
+    Ok((count, Sha256Digest::new(hash.finalize().into())))
+}
+
+fn verified_artifact_file(
+    root: &Dir,
+    path: &Path,
+    artifact: &BacktestArtifact,
+) -> Result<Option<cap_std::fs::File>, ExperimentError> {
+    let mut file = match root.open_with(path, &read_options()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() != artifact.byte_count()
+        || reader_identity(&mut file, artifact.byte_count())?
+            != (artifact.byte_count(), artifact.digest())
+    {
+        return Err(ExperimentError::CorruptRecord);
+    }
+    Ok(Some(file))
+}
+
+/// Same private-stage, fsync, hard-link publication as small inventory records, with bounded IO.
+fn publish_artifact_reader(
+    root: &Dir,
+    path: &Path,
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    artifact: &BacktestArtifact,
+) -> Result<(), ExperimentError> {
+    if verified_artifact_file(root, path, artifact)?.is_some() {
+        return Ok(());
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_creation(&mut options);
+    let (stage_path, mut stage) =
+        create_unique_stage(root, path, &artifact.digest().bytes(), &options)?;
+    let result = (|| -> Result<(), ExperimentError> {
+        reader.rewind()?;
+        let mut hash = sha2::Sha256::new();
+        let mut count = 0u64;
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            count = count
+                .checked_add(n as u64)
+                .filter(|count| *count <= artifact.byte_count())
+                .ok_or(ExperimentError::CorruptRecord)?;
+            hash.update(&buffer[..n]);
+            stage.write_all(&buffer[..n])?;
+        }
+        if count != artifact.byte_count()
+            || Sha256Digest::new(hash.finalize().into()) != artifact.digest()
+        {
+            return Err(ExperimentError::CorruptRecord);
+        }
+        stage.sync_all()?;
+        match root.hard_link(&stage_path, root, path) {
+            Ok(()) => {
+                stage.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verified_artifact_file(root, path, artifact)?
+                    .ok_or(ExperimentError::CorruptRecord)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        synchronize_parent(root, path)?;
+        verified_artifact_file(root, path, artifact)?.ok_or(ExperimentError::CorruptRecord)?;
+        Ok(())
+    })();
+    drop(stage);
+    remove_stage(root, &stage_path)?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match verified_artifact_file(root, path, artifact) {
+            Ok(Some(_)) => Ok(()),
+            _ => Err(error),
+        },
+    }
+}
+
 fn artifact_reference(digest: Sha256Digest) -> Result<String, ExperimentError> {
     let hex = encode_hex(digest.bytes());
     let prefix = hex.get(..2).ok_or(ExperimentError::Encoding)?;
@@ -906,10 +962,6 @@ fn reservation_path(id: TrialId) -> std::path::PathBuf {
     Path::new(RESERVATIONS).join(format!("{}.json", encode_hex(id.digest().bytes())))
 }
 
-fn legacy_terminal_path(id: TrialId) -> std::path::PathBuf {
-    Path::new(TERMINALS).join(format!("{}.json", encode_hex(id.digest().bytes())))
-}
-
 fn terminal_attempt_parent(id: TrialId) -> PathBuf {
     Path::new(TERMINALS).join(encode_hex(id.digest().bytes()))
 }
@@ -939,7 +991,6 @@ fn attempt_path(id: TrialId, attempt: u64) -> PathBuf {
 fn authoritative_attempt_terminal(
     root: &Dir,
     id: TrialId,
-    identity_version: TrialIdentityVersion,
     latest_attempt: Option<&AttemptRecord>,
     maximum: usize,
 ) -> Result<Option<Vec<u8>>, ExperimentError> {
@@ -971,7 +1022,7 @@ fn authoritative_attempt_terminal(
     if count == 0 {
         return Ok(None);
     }
-    if identity_version != TrialIdentityVersion::V3 || invalid {
+    if invalid {
         return Err(ExperimentError::CorruptRecord);
     }
     let number = candidate.ok_or(ExperimentError::CorruptRecord)?;

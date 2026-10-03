@@ -135,6 +135,39 @@ impl Timestamp {
         self.0
     }
 
+    /// Returns the Gregorian UTC calendar date containing this exact instant.
+    ///
+    /// The conversion uses floor division at the Unix-day boundary, so negative timestamps map
+    /// to the preceding civil date rather than being truncated toward the epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimeError::InvalidCalendarDate`] if the represented date cannot be expressed by
+    /// [`CalendarDate`]. Every currently representable signed Unix-nanosecond timestamp is within
+    /// that range.
+    pub fn utc_calendar_date(self) -> Result<CalendarDate, TimeError> {
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+        let unix_days = self.0.div_euclid(NANOS_PER_DAY);
+        let shifted_days = unix_days.checked_add(719_468).ok_or(TimeError::Overflow)?;
+        let era = shifted_days.div_euclid(146_097);
+        let day_of_era = shifted_days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let mut year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_prime = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+        let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+        year += i64::from(month <= 2);
+
+        CalendarDate::new(
+            u16::try_from(year).map_err(|_| TimeError::InvalidCalendarDate)?,
+            u8::try_from(month).map_err(|_| TimeError::InvalidCalendarDate)?,
+            u8::try_from(day).map_err(|_| TimeError::InvalidCalendarDate)?,
+        )
+    }
+
     /// Adds a signed nanosecond offset using checked arithmetic.
     ///
     /// # Errors

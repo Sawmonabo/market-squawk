@@ -8,12 +8,100 @@ This file preserves project-level decisions that must survive context compaction
 and later implementation sessions. It is not a transient progress report. Root
 [`AGENTS.md`](../AGENTS.md) requires future agents to read and follow it.
 
+## Owner correction: workflow completion and execution ownership — 2026-09-29
+
+The current V1 objective is the finite [owner-test goal](plans/v1-owner-test-goal.md): complete
+working Everyday/Advanced investment workflows, all agreed providers and shared Desktop/CLI/MCP
+behavior, followed by installed owner-test evidence. It supersedes conflicting historical
+execution, agent-model, scope-expansion and stopping instructions. Public publication and merging
+into main/release are outside this goal. Current execution status and the single assignment table
+belong only in the [delivery ledger](plans/delivery-ledger.md); document edits do not resume work.
+
+Before additional engineering, name the acceptance item, concrete failure or missing behavior,
+and smallest complete fix. Necessary financial correctness, credential/data protection,
+persistence/recovery and existing substantiated finding remediation remain mandatory. Speculative
+hardening, hypothetical future scale and general cleanup do not create new completion blockers.
+Report functional completion separately from final verification and release readiness.
+
+Use the existing feature branch and primary worktree. No new branch/worktree without explicit
+owner approval. Agents own disjoint files; the lead owns shared contracts, schemas, composition,
+manifests, lockfiles, Git and build/test scheduling. Integrate producer and consumer changes,
+verify the coherent slice, commit/push and release ownership before accumulating replacements.
+Start with provider integration, financial workflow and Desktop lanes when execution resumes;
+expand only where dependencies and ownership permit. No agents are authorized by this note alone.
+
+Keep local builds serialized and single-job. Use existing critical checks, adding a case only for
+an uncovered critical failure. No blanket TDD or per-task CI/review rounds. Existing grouped
+quarter reviews and remediation remain required; ordinary integration checkpoints are not final
+approval and need not repeat that ceremony. Final whole-app measurement follows complete workflows.
+
+The owner approved background native Desktop checks on 2026-09-30 so work does not take the Mac's
+focus or screen. Use the optional development-only embedded WebDriver path documented in
+[troubleshooting](operations/troubleshooting.md#background-native-desktop-checks), with the real
+service. Do not resume global keystrokes or foreground automation while the owner works. Native
+dialog and external OAuth interaction require separate evidence; WebView checks do not prove them.
+
+## Owner correction: ordinary data interaction and concise copy — 2026-10-02
+
+Opening an investment or financial tab loads its required information automatically. Changing
+its history range reads and loads that range without a separate Load/Update confirmation.
+Keep price history visible. Shared loading must preserve exact request recovery and must not
+silently retry cancelled or failed work on remount; show Retry only when recovery needs it.
+Analysis, saved changes and virtual orders remain deliberate actions.
+
+Use concise product labels and existing date/number formatters throughout screens, menus,
+details and tooltips. Rounded values expose full precision on hover/keyboard focus without an
+“Exact value” disclosure or rounding explanation. “Last trade” with its original timestamp needs
+no extra “Last known” label. These presentation choices never grant freshness or execution rights.
+Keep real uncertainty and missing inputs honest; diagnostics belong in explicit system details.
+The recursive findings and remaining contract gaps are in the
+[product-copy audit](reports/2026-10-02-desktop-product-copy-audit.md); current status stays in the ledger.
+
+## Owner correction: application lock is opt-in — 2026-09-30
+
+A configured personal installation opens and reuses its saved provider credentials/sessions without
+an application-password prompt, including after service restart or development rebuild. Do not
+force the encrypted-file unlock workflow merely because the executable is a development build.
+The owner permits use of their local credential configuration file; older one-time-import-only
+instructions do not require repeated interactive import or unlock. Preserve private filesystem
+access and secret redaction; never embed a default password or expose credentials to React/logs.
+
+Application locking is an explicit user choice. When enabled, support remembered OS-secured access,
+explicit Lock/Forget controls and an optional user-selected reauthentication interval; impose no
+arbitrary interval by default. Locking provider secrets must leave ordinary screens and saved
+results usable. Provider OAuth expiry, revocation and key replacement remain connection-specific
+recovery, separate from application locking. This is required behavior, not implementation evidence.
+
+## Owner correction: whole-application memory and complete capability — 2026-09-28
+
+The owner clarified the intended RAM range as **500 MB to 1.5 GB, with a 2 GB maximum**
+for the complete single-user application. This supersedes every earlier 500 MB maximum in
+handoffs, goal attachments and historical ledger entries. It is a measurement objective, not a
+runtime admission rule; lower usage is welcome, not a required minimum allocation.
+
+Do not hard-code data, model, workflow, startup or feature restrictions merely to satisfy a
+resource target. A run that rejects required normal data, drops required evidence, omits a
+capability or avoids the representative workload does not pass performance acceptance. Existing
+limits are implementation choices requiring evidence, not authoritative product requirements.
+Preserve genuine integrity and resource-exhaustion protection; correct unjustified restrictions
+through appropriate processing, storage, scheduling and ownership changes. Do not simply raise
+all limits or replace them with a new 2 GB application kill switch.
+
+Measure the installed Desktop/WebView, shared service and active analytical/model/Python helpers
+together, including concurrent CLI/MCP use when active. Record idle, active and peak usage,
+platform counters, units and the complete exercised workload. No whole-app RAM acceptance is
+currently established. The ongoing limit audit must report its scope and unresolved paths honestly.
+
+The owner subsequently directed that whole-application RAM measurement wait until the complete
+application and workflows are ready. It does not block the current resource-remediation commit;
+that batch requires critical correctness checks, commit and push, then a pause.
+
 ## Product and quality posture
 
-Market Squawk is implemented as hardened local production infrastructure. "Production-ready" is an
-evidence standard: invariant-preserving contracts, fail-closed authority, bounded ownership,
-checked financial arithmetic, deterministic lifecycle control, durable audit/recovery semantics,
-adversarial tests, and verification at the exact reviewed commit.
+The V1 delivery objective is a complete working investment product for owner testing. Correct financial
+arithmetic, credential/data protection, durable recovery and honest evidence are essential to that
+outcome. Production hardening is not an open-ended prerequisite: apply the scope rule above and
+reserve consolidated approval evidence for the final unchanged owner-test candidate.
 
 Market Squawk's product category is **self-hosted**: operators install and run it on infrastructure
 they control, application and analytical data remain local by default, and external provider
@@ -34,6 +122,23 @@ critical and demonstrates correct optimized Rust lowering to a release-mode cras
 No release, benchmark, checkpoint, or approval evidence may be produced with 1.97.0. A later
 toolchain change requires current primary-source research, a recorded decision, exact CI/toolchain
 pins, inherited workspace MSRV enforcement, and a fresh locked all-feature verification run.
+
+## Native connection setup — owner correction, 2026-09-08
+
+Connection setup belongs entirely in Desktop Settings → Onboarding, using the embedded Connections workspace.
+Remove the separate localhost setup website, server, CLI command, and browser-launch fallback;
+keeping that website as an explicit option does not satisfy the owner correction. Reuse saved
+credentials and exact saved data selections. A prepared credential file is a one-time native
+import input, not a second startup configuration authority. Genuine official provider OAuth may
+retain its required authorization handoff and bounded callback transport. Earlier dated portal
+references below remain historical evidence and do not authorize an active setup website.
+
+## Find ordering — owner decision, 2026-09-16
+
+After the existing data and risk checks, Find orders completed investment results by higher
+estimated gains first. Evidence strength remains clearly visible; this ordering does not loosen
+eligibility checks or treat an unavailable estimate as zero. SPY is the main performance scorecard,
+with VTI alongside it. Estimates are decision support, not promised returns.
 
 ## Current upstream research before unfamiliar fixes
 
@@ -105,6 +210,22 @@ documentation checker scripts, prose tests, or new Rust test targets for documen
 
 ## Maximum-safe parallelism
 
+### Agent model and effort — owner correction, 2026-09-29
+
+For every future assignment, use `gpt-6.1-sol` with High effort wherever older goals, plans,
+handoffs or briefs specify GPT-6 Sol (`gpt-6-sol`) or unversioned Sol. Historical execution
+records retain the model actually used; they do not authorize the superseded selection.
+Astra remains `gpt-6-astra` with High effort under the same task boundaries below.
+This model substitution changes no scope, ownership, review or execution/pause rule.
+
+Use GPT-6 Astra High for advanced forecasting/modeling, harmonics, financial algorithms,
+backtesting, difficult debugging and advanced optimization. Use GPT-6.1 Sol High for other tasks.
+Use bounded briefs with `fork_turns="none"`, explicit dependencies, exclusive files and a
+finishable outcome. This supersedes older Astra Medium and xhigh instructions. If the task changes
+category, coordinate a bounded ownership handoff rather than silently expanding the lane.
+Inspect actual changes and relevant evidence before acceptance; a worker's completion message
+alone is insufficient. Preserve unique work and do not dispatch replacements for completed work.
+
 Parallelism follows dependencies and ownership, not raw agent count.
 
 Before dispatch, publish a wave table containing:
@@ -154,14 +275,21 @@ Normal developer `dev` and `test` builds remain incremental with line-table debu
 non-workspace dependencies carry no debug information. The opt-in `debugging` profile provides full
 workspace debug information with incremental compilation disabled. Agent, CI, benchmark, and
 approval commands export `CARGO_INCREMENTAL=0` so their evidence does not depend on incremental
-state. VS Code rust-analyzer on-save flycheck is disabled for this workspace because its default
-workspace/all-target invocation duplicates explicit gates; analyzer-owned Cargo invocations also
-disable incremental state. Run focused diagnostics or the repository verification entry point on
-demand. The verification entry point enforces a 20 GiB hard ceiling on its local `target/` before
-and after the gate. Reclaim only ignored reproducible Cargo output after checking active processes
-and preserving every dirty or unique worktree state.
+state. Ordinary non-authoritative build scripts must not watch Git metadata merely to embed the
+current commit: Cargo's shipping-input graph owns compilation invalidation, while exact commit and
+tree identity belongs in external verification and package evidence. An explicitly requested,
+clean authoritative benchmark may bind and watch the exact Git head because that head is part of
+the measurement evidence. VS Code rust-analyzer on-save flycheck is disabled for this workspace
+because its default workspace/all-target invocation duplicates explicit gates; analyzer-owned Cargo
+invocations also disable incremental state. Run focused diagnostics or the repository verification
+entry point on demand. The verification entry point enforces a 20 GiB hard ceiling on its local
+`target/` before and after the gate. Reclaim only ignored reproducible Cargo output after checking
+active processes and preserving every dirty or unique worktree state.
 
 ### Worktree lifecycle
+
+New worktrees require explicit owner approval under the current single-worktree rule. The
+following cleanup rules apply only to historical or explicitly approved exceptions.
 
 An isolated lane worktree is temporary execution infrastructure, not a permanent archive. Remove it
 promptly after all of its commits and follow-up artifacts are integrated or otherwise handed off,
@@ -183,6 +311,24 @@ branches after proving their commits are merged, patch-equivalent, or superseded
 integration. Preserve active branches, open dependency-update branches, and any unique unintegrated
 commit until its disposition is explicit.
 
+Unique historical code is not evidence that it belongs in the current product. Before integrating
+or retiring a branch, compare its intended behavior with the current V1 contract, later owner
+corrections, rejected findings, and the accepted replacement design. Record each change as still
+required, already replaced, obsolete/rejected, or unresolved with specific evidence. Do not restore
+an abandoned design merely because its patch differs from the current tree. Preserve the evidence
+and unique WIP while making that disposition; preservation does not imply product acceptance.
+This applies equally to local and remote `codex/`, `dependabot/`, and other lane branches. Report
+actual removals separately from inventories and outstanding reconciliation; an audit alone does
+not complete cleanup.
+
+Historical cleanup must not orphan current agent work. Keep one current integration queue with
+each task's owner, exact candidate and base, dependencies, review/integration status, next action,
+and branch/worktree retirement trigger. The lead owns acceptance and serialized shared-file/Git
+integration; a delegated coordinator may track readiness but cannot substitute a completion report
+for inspected changes and relevant verification. Reconcile completed candidates before dispatching
+replacement work, explicitly disposition superseded packets, and close the associated worktree
+lifecycle after integration instead of letting finished lanes accumulate.
+
 Update the README only when runnable or release-blocking product truth changes. Update the local
 delivery ledger at every integration barrier with the exact pushed heads, active worktree, open
 blocker, next release event, issue state, and cleanup disposition. Repository prose is tracking and
@@ -203,7 +349,7 @@ or another historical task label.
 ## Four-quarter review policy
 
 Fresh independent specialist reviews are grouped at four delivery-quarter checkpoints, not repeated
-after every ordinary task. Lane workers still perform TDD, self-review, focused verification, and
+after every ordinary task. Lane workers still perform self-review, existing critical verification, and
 blast-radius inspection before handoff. The canonical plan maps every Stage and Wave into exactly one
 of those four checkpoints; it must never invent Q5 or a higher-numbered quarter.
 
@@ -264,9 +410,15 @@ There are three distinct evidence levels:
 
 | Evidence | Meaning | May claim approval? |
 | --- | --- | --- |
-| Focused lane tests | The bounded lane behavior works in its isolated branch. | No |
+| Focused lane tests | The bounded lane behavior works in the shared candidate. | No |
 | Dirty candidate gate | The reviewed intended diff passes before commit. | No |
 | Clean exact-head gate | The committed, integrated, unchanged head passes every required local gate. | Only with completed review and no unresolved findings |
+
+Ordinary coherent checkpoints may be committed and pushed after relevant critical verification
+and inspection without a new quarter review. They must not retain unresolved substantiated
+findings in the behavior being accepted. Unrelated incomplete acceptance items stay explicit in
+the ledger; they do not require one enormous all-product commit. Existing findings still block
+final approval until corrected or retracted with evidence.
 
 Never call a pre-commit run, cached run from another head, or isolated-lane result "exact-head"
 evidence. After an approval review, any further commit—even documentation or style—invalidates the
@@ -352,31 +504,30 @@ contract that could stop before Python/modeling, complete MCP, and other mandato
 The old halfway criteria are retained in repository history only; they have no authority to pause or
 terminate active delivery. Progress weighting is status information, not a stopping gate.
 
-## Usable complete-release terminal condition
+## Current owner-test terminal condition
 
-Active delivery continues through a usable complete local release. It does not stop at 50 percent,
-at the end of a numbered Stage, or when only contracts, schemas, mocks, synthetic sources,
-diagnostic paths, plans, or focused lane tests exist.
+Complete the finite functional checklist in the [owner-test goal](plans/v1-owner-test-goal.md).
+Contracts, scaffolding, mocks, diagnostic paths and isolated checks do not establish complete
+working workflows. The functional milestone is distinct from final owner-test acceptance.
 
-The terminal condition requires all of the following at one clean, unchanged exact head:
+After functional completion, finish the agreed installed journeys and four-platform package
+proofs, whole-app resource measurements, existing consolidated deterministic/network/fuzz/security
+and dependency checks, and applicable Quarter 4 grouped review/remediation against one clean,
+unchanged final candidate. Preserve every required substantiated finding; do not invent additional
+review quarters or publication-specific work. No per-task full gate is required.
 
-1. Every mandatory live, research, adapter, storage, point-in-time, analytics, Python/modeling,
-   backtesting, portfolio, execution/risk, valuation, CLI, and MCP capability is a working bounded
-   producer-to-consumer vertical slice.
-2. The integrated local demonstration exercises the required CLI and complete typed MCP surfaces
-   without a mandatory paid API, cloud service, external database, container runtime, or telemetry
-   service.
-3. Deterministic tests, separately gated authorized network smokes, parser/model/MCP fuzz targets,
-   measured performance, and security, dependency, vulnerability, license, credential, and
-   generated-artifact checks provide fresh exact-head evidence.
-4. The Quarter 4 of 4 grouped independent review approves the same frozen commit with no unresolved
-   substantiated Critical, Important, or Minor finding.
-5. The exact commit is clean, pushed to `origin`, reported on the active pull request with truthful
-   local and hosted evidence, and every completed lane worktree is safely removed after handoff.
+The final owner-test handoff includes pushed candidate/package identities, instructions and PR #43
+evidence, with no public publication or merge into main/release. Explicit owner pauses control at
+any point. Only mark the goal complete when functional and final owner-test obligations are proven.
 
-Only then may implementation stop for complete-release handoff. A user-approved scope change may
-alter the product contract, but progress percentage or elapsed time cannot waive a mandatory
-capability or release gate.
+## Historical checkpoint records
+
+The dated records below preserve their original evidence and decisions. Their branch counts,
+active assignments, package versions, model choices, permission blockers and release/publication
+instructions apply to their audit anchors, not current execution. Use current corrections, the
+owner-test goal and delivery ledger before acting; do not resurrect superseded work or reopen
+settled personal-use permissions. Still-applicable technical requirements and substantiated
+findings remain in force until satisfied or explicitly superseded with evidence.
 
 ## 2026-07-21 Task 11 research vertical closeout
 
@@ -1450,3 +1601,265 @@ completed Tauri's maintained `app,dmg` bundler, verified and mounted the DMG, pa
 product and 63-tool MCP smoke, collected the closed artifacts, and uploaded them. That candidate is
 not a release candidate because its separate Windows package job failed at the staging command
 corrected after the run.
+
+## 2026-08-01 installed-product candidate authority
+
+The approved
+[`2026-08-01-market-squawk-v1-installed-product-experience.md`](superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md)
+supersedes the earlier `release/*`-only platform-dispatch and public-release sequence for its
+defined scope. Task 25 may explicitly dispatch platform verification for the exact pushed and
+frozen `feature/v1-installed-product-experience` candidate. The dispatch must remain fail-closed,
+must identify that exact feature ref and commit, and must produce controlled workflow artifacts
+without creating a GitHub Release. Ordinary feature pushes still do not build native packages.
+
+Task 26 freezes and verifies that unchanged feature candidate, runs the existing final Quarter 4
+grouped review, and hands controlled artifact references to the owner through the draft PR and
+project. It does not authorize public release creation, stable curl hosting, release-branch or
+`main` integration, signing/notarization claims, or a release declaration. Those actions require a
+separate user-authorized workflow after owner testing.
+
+Historical version, component, package, and checkpoint facts above remain valid only for their
+dated audit anchors. Current candidate version, component identities, head/tree, package receipts,
+review state, blockers, issue state, and cleanup disposition live only in
+[`docs/plans/delivery-ledger.md`](plans/delivery-ledger.md); this memory is not a second mutable
+ledger.
+
+## 2026-08-09 unified Markets V1 contract
+
+The V1 installed-product goal includes one unified, non-technical Markets feed, search surface,
+and instrument workspace as a release-blocking product capability. Users select investments and
+questions, not upstream providers. A Market Squawk-owned resolver chooses the richest admitted
+observation that meets the requested asset, timing, depth, quality, operation, health, budget, and
+rights requirements while preserving an exact source-selection and downgrade receipt.
+
+The simple product view sits above independently governed provider surfaces. One per-user service
+owns bounded provider connections, subscriptions, budgets, caches, cursors, and recovery
+generations for Desktop, CLI, MCP, models, and jobs. Provider-native snapshot, sequencing,
+checksum, reconnect, and quarantine state remains isolated. A fallback never inherits another
+source's quality, coverage, venue, depth, or execution eligibility.
+
+The full admitted multi-asset universe is searchable locally; live subscriptions prioritize
+holdings, positions and paper orders, watchlists, active screens, the currently viewed instrument,
+and a bounded benchmark set. The desktop combines market pulse, personalized opportunities,
+quotes/trades/books/bars, features, forecasts, buy/add/trim/sell targets, backtests,
+fundamentals/filings, portfolio impact, and risk. Plain availability labels lead; exact provider,
+venue, timing, depth, quality, and coverage remain expandable under Data confidence.
+
+The installation retains no mandatory paid data requirement and provides the best available depth
+from admitted sources. Order-level depth is shown only where the exact provider supplies it;
+universal free order-level US equity/options/futures/FX/crypto coverage is not a V1 claim, and a
+calculated index never receives an invented order book. Separately licensed sources can improve
+coverage through the same contracts but cannot bypass rights, quality, source integrity, or central
+risk authority.
+
+The binding evidence, provider posture, reuse constraints, implementation DAG, and thin critical
+acceptance path are maintained in
+[`docs/research/2026-08-08-unified-markets-provider-ecosystem.md`](research/2026-08-08-unified-markets-provider-ecosystem.md),
+the installed-product design and plan, and issue `#45`. Public README content remains product-
+focused; mutable head, progress, blocker, verification, and issue state remains only in the delivery
+ledger.
+
+## 2026-08-11 selected market-data and data-first resumption contract
+
+The V1 goal remains paused until the owner explicitly resumes it. On resume, data handling is the
+first implementation barrier because the Console workflows cannot be accepted over credentials or
+adapters alone. The binding target authorities are the
+[provider architecture](architecture/market-data-provider-architecture.md),
+[selected-provider contracts](reference/providers/README.md),
+[canonical schema and evidence contract](reference/market-data-canonical-schemas.md),
+[provider setup runbook](operations/provider-account-setup.md), credential-only
+[`market-squawk-provider-credentials/v1`](reference/market-squawk-provider-credentials.env.example)
+template, paused goal attachment, and current delivery-ledger entry.
+
+The selected sources are complementary: Alpaca Paper Only/Basic supplies the no-live-brokerage IEX
+current-data and stock-history core; public Coinbase Advanced Trade and public Kraken Spot remain
+no-key crypto specialists for venue-qualified books and trades; optional owner-enabled Coinbase
+Exchange Direct remains a distinct authenticated crypto market-data complement; owner-authorized
+Schwab supplies an optional read-only multi-asset REST and Streamer complement; Yahoo/yfinance is
+explicit-demand experimental enrichment; IEX HIST is a selected feed/date T+1 cold lane; Nasdaq
+Trader, OCC, and Cboe supply reference identity; SEC supplies company/fund evidence; FRED/ALFRED
+and the selected direct government sources supply macro, rates, fiscal, labor, national-account,
+demographic/trade, and energy evidence; and Tiingo is the optional supported mutual-fund NAV/EOD
+lane. The Coinbase and Kraken sources add crypto coverage only; they do not supply the stock, ETF,
+index, bond, mutual-fund, or REIT breadth assigned to the rest of the stack. Tradier remains outside
+the selected stack and does not participate in new credential import, activation, scheduling,
+fallback, product composition, or release gates. Tiingo NAV uses the closed
+`ResearchObservation::FundNav(FundNavObservation)` research variant with exact fund/share-class,
+NAV date/value-or-missing state, availability, revision, and PIT evidence; EOD remains a separate
+bar family. Only those selected sources participate in new
+credential import, activation, scheduling, fallback, product composition, and release gates.
+
+No frontend calls a provider. Every source must complete
+`configured -> entitled -> producing -> durably published -> queryable -> workflow-composed ->
+restart/release-proven` through the existing protected secret store, provider-rate authority,
+bounded raw capture, closed canonical families, Arrow validation, transactional SQLite active-event
+microbatches, immutable Parquet for bulk/cold analytical data, point-in-time selectors, and bounded
+typed application operations. The owner-approved 2026-10-01 storage decision keeps logical event
+evidence independent of physical placement; bounded archive handoff/reclamation remains required.
+The delivery ledger distinguishes implemented storage from verified continuous-ingestion behavior.
+Schwab uses only the code-owned market-data route allowlist plus minimum read-only User Preference
+bootstrap; it grants no account, position, transaction, or order use. The credential file remains a
+32-field one-time import/probe-intent format and must not become another provider, adapter, crate,
+service, configuration system, or endpoint/rate-policy surface.
+
+Provider capacity is accepted from requests and actual observations separately. Requested symbols,
+chain calls, pages, and decoded frames are not successful rows. Retained evidence must report valid
+returned components, missing/invalid dispositions, complete option contracts and non-null Greeks,
+accepted stream events, complete local bars, SEC/fund/macro manifest rows, and bytes written. FRED
+contracts remain version-specific: v1 uses offset pages up to 100,000 rows with no reviewed numeric
+v1 request-rate ceiling; v2 release observations use cursor pages up to 500,000 rows and a documented
+2-request/second throttle. One conservative 1-request/second shared application queue is the current
+policy, without conflating either version's pagination or provider facts.
+
+The implementation sequence is data-to-workflow vertical: thin credential import and doctors;
+reference identity plus Alpaca IEX into Markets; optional owner-enabled Schwab through the same
+publication/selection path; complete Alpaca/Schwab history into charts and exact analytical
+generations; SEC/macro/fund/options lanes; Yahoo and IEX HIST specialized lanes; then generated
+recommendations, portfolio/risk, and virtual paper over those same typed reads. An enabled flag,
+successful HTTP response, or published dataset cannot enable a workflow until its typed read,
+frontend composition, degradation behavior, and focused restart journey pass.
+
+## 2026-08-31 source-completion vocabulary and first completed product vertical
+
+Source status must never again collapse durable data delivery and complete product delivery into
+one ambiguous word. Every progress report, delivery decision, and review uses these two explicit
+levels:
+
+1. **Durable data-source complete** means the source is configured and entitled where required,
+   produces real official data, seals bounded raw evidence, publishes closed canonical rows into an
+   immutable Parquet generation and manifest, supports the required point-in-time or exact selector,
+   and returns the same typed data after process restart.
+2. **Full product vertical complete** means the durable source above also flows through the
+   provider-neutral rich store or selector, its intended feature/model/forecast/valuation/backtest
+   and recommendation or research consumers, provider-neutral Desktop/CLI/MCP operations, and an
+   installed shutdown/restart journey. Provider names, retry state, quotas, endpoints, adapter
+   terminology, and technical readiness language remain confined to setup, settings, logs, and
+   diagnostics.
+
+A report must state both levels separately. It must not say that no source is complete when a
+source has crossed the durable data-source boundary, and it must not call an adapter, HTTP probe,
+credential check, published dataset, or restartable dataset a complete product vertical.
+
+At the accepted 2026-08-31 audit base `9f5a45d673b6ef44278398c8db79505df2ab07fa`,
+Federal Reserve Board H.15 is the first durable data-source-complete baseline: official live pull,
+sealed raw capture, immutable canonical/Parquet publication, typed application read, and read after
+restart are established. H.15 is not yet a full product vertical. Its remaining provider-neutral
+macro/rates selection, regime/valuation/backtest evidence, Desktop/CLI/MCP composition, and
+installed restart journey are mandatory last-mile work.
+
+H.15 owns the first full-product-completion lane until that last mile is accepted. Disjoint provider
+foundation and remediation lanes may continue in parallel, but they may not repeatedly displace the
+H.15 last-mile lane or turn another provider into the sole global agenda. If a shared application,
+manifest, or Desktop hotspot conflicts with that lane, serialize the hotspot and finish the H.15
+product edge first unless a substantiated correctness or authority defect makes progress unsafe.
+Always keep at least one source on a last-mile product-completion path; do not allow every active
+lane to end at an adapter, catalog, contract, or review checkpoint.
+
+The selected providers' personal-use permission and credential-use decisions are settled for this
+goal. Do not reopen licensing, permission, or resale analysis absent new provider-specific evidence,
+a material scope change beyond personal use, or an explicit owner request. Implementation still
+retains exact provenance, source quality, capacity, point-in-time, and rights evidence; those
+technical facts do not authorize repeated policy churn.
+
+## 2026-08-31 forecasting, financial-modeling, signal, and harmonic-evidence contract
+
+The complete V1 investment workflow must do more than collect and chart data. It must turn exact
+provider-neutral, point-in-time generations into versioned features, multi-horizon forecasts,
+method-specific financial-model and valuation scenarios, cost-adjusted out-of-sample backtests,
+portfolio/liquidity/risk context, and an immutable `Buy`, `Add`, `Hold`, `Trim`, `Sell`, or
+`Abstain` decision. The plain-language result includes the decision horizon, entry range, expected
+price/return ranges where admitted, target/trim/sell range, sizing or portfolio impact where
+supported, reasons, risks, assumptions, expiry, invalidators, evidence coverage, calibration, and
+uncertainty. A model score, valuation output, or chart pattern alone is never confidence or an
+execution instruction.
+
+Harmonic price-pattern analysis is a required provider-neutral derived-feature family. Its initial
+closed taxonomy includes `AB=CD`, Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, and Shark
+patterns. Detection is backend-owned and deterministic over the exact selected adjusted-bar
+generation. Each result retains instrument and timeframe, causal pivot identities, direction,
+ratio measurements and tolerances, pattern-completion zone, observation and confirmation cutoffs,
+expiry, invalidation level, implementation identity, parent manifests, and an evidence digest.
+Ordinary product pages describe this as price-pattern evidence; exact ratios and algorithm evidence
+belong in an expandable provider-neutral analysis view, never in provider plumbing or frontend
+calculations.
+
+Harmonic evidence must be point-in-time safe. A detector may use only bars and pivot confirmations
+available at the decision cutoff; it may not backdate a pattern using a later-confirmed pivot.
+Adjustment, split, dividend, session, calendar, missing-bar, liquidity, and stale-data semantics
+remain explicit. Pattern rules and tolerances are selected on training/validation periods and
+measured on a separate chronological out-of-sample period with realistic fees, spread, slippage,
+latency, turnover, capacity, and delisting/survivorship treatment. If sample size, calibration,
+coverage, marketability, or conflicting fundamental/forecast/valuation/risk evidence is
+insufficient, the product returns low confidence, unavailable, or `Abstain` rather than forcing a
+trade.
+
+Forecasts must produce horizon-aligned central paths or conditional means plus calibrated ranges
+and retained rolling-origin evidence. Financial modeling must bind exact PIT fundamentals, macro
+and rate assumptions, model/method identity, currency, scenario inputs, sensitivity, and valuation
+range. The decision engine combines those independent evidence families with current market,
+options/liquidity where available, portfolio impact, and central risk; no provider and no single
+analytical family may feed a recommendation directly.
+
+In current V1, “signal execution” means an actionable entry/exit plan and execution through the
+isolated virtual-paper ledger only. A recommendation does not implicitly become an order. A user-
+approved or explicitly configured paper strategy must still pass supported-instrument, current-
+market, sizing, liquidity, and central-risk authority before a simulated order can be created,
+filled, reconciled, checkpointed, and recovered. Real brokerage orders, account trading, money
+movement, and recommendation-to-live-order authority remain outside this read-only product.
+
+The provider-neutral Desktop, CLI, and MCP must expose the same typed opportunity, investment-
+analysis, forecast/model, backtest, recommendation, and virtual-paper capabilities. Full product
+completion requires one thin critical journey from an exact immutable PIT input set through
+harmonic and non-harmonic features, forecast, financial model/valuation, realistic backtest,
+calibrated decision, virtual-paper action or honest abstention, clean shutdown, and identical
+restart reads. Do not create a broad pattern fixture matrix or a second analytical stack; extend
+the existing feature, forecast, decision, backtest, and paper authorities in place.
+
+## 2026-09-23 owner decision: three probabilities and selectable comparison
+
+V1 must provide all three distinct probabilities over the same selected horizon: price rising,
+outperforming the selected benchmark, and profit after modeled trading costs. Each needs its own
+genuine outcome labels, chronological evaluation, calibration and evidence availability. Missing
+evidence is unavailable, never zero probability. Expected gain and price ranges remain separate
+from event probabilities; an event percentage is not an estimated percentage return.
+
+SPY remains the default main comparison, with VTI alongside it. The benchmark is configurable
+through admitted canonical instruments, with clear S&P 500, total U.S. market and Nasdaq choices
+where corresponding evidence exists. Distinguish an index from its tracking fund: SPY tracks the
+S&P 500 and must not be presented as a separate independent index. A Nasdaq choice must identify
+the actual selected index or fund, not an ambiguous invented symbol.
+
+The financial implementation keeps price-change and benchmark price-return comparisons on the
+same split-adjusted basis and dates. After-cost profit uses existing realistic simulation and
+total-wealth accounting, including supported distributions and entitlements. Explain these
+different meanings plainly. Models must retain exact benchmark and cost assumptions with saved
+results and restart reads. This decision defines required work; it is not completion evidence.
+
+## 2026-09-23 owner requirement: interactive investment forecast chart
+
+The complete V1 investment view includes an interactive market and forecast chart, integrated into
+the existing Obsidian Signal Desktop design. Hover or an accessible equivalent reveals the exact
+date, historical or predicted price, and available forecast bounds. Users can select timeframes
+and show or hide history, central forecast, calibrated uncertainty ranges, benchmark comparison
+and supported buy/trim/sell levels. Selecting a recommendation or price-pattern marker exposes its
+plain-language explanation and original evidence. Historical and forecast segments must be
+visually distinct; forecast uncertainty is explicit, not a guarantee or an invented scenario.
+
+Reuse existing chart components and dependencies. React renders backend-authoritative series and
+action ranges; it must not derive financial forecasts, confidence or recommendation levels.
+Benchmark comparisons use a backend-defined comparable basis rather than placing incomparable
+nominal prices on one scale. The three separately evidenced probabilities accompany the selected
+forecast horizon. Missing series are explained honestly, never filled with demonstration curves.
+These controls and their data connections are part of the full V1 owner-test acceptance journey,
+including saved analysis and restart. They are required delivery work, not a later design idea.
+
+Harmonic visuals are explicitly included in that chart requirement. A selectable Price patterns
+layer renders backend-supplied causal pivot points and pattern geometry for the required AB=CD,
+Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher and Shark families. Hovering or selecting evidence
+reveals formation and confirmation dates, completion or potential reversal zone, invalidation
+level, supported forming/confirmed/invalidated status, and relevant historical evaluation.
+Show how the pattern supports or conflicts with the wider forecast, valuation and risk evidence.
+Never infer a buy instruction, probability or confirmed pattern from geometry alone. Preserve
+original observation/confirmation cutoffs in historical views; do not draw later knowledge as if
+it were available earlier. Missing geometry or status must be explained rather than synthesized
+in React. Wire these visuals through the saved investment analysis and its restart reads.

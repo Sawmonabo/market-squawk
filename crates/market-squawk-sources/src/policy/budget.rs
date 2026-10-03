@@ -20,7 +20,7 @@ use budget_coordinator::BudgetClock;
 pub(in crate::policy) use budget_coordinator::CleanShutdownProof;
 pub(in crate::policy) use budget_coordinator::SystemBudgetClock;
 pub(crate) use budget_coordinator::{BudgetAvailabilityLease, ProviderBudgetPool};
-pub use budget_coordinator::{BudgetPermit, BudgetPoolError};
+pub use budget_coordinator::{BudgetPermit, BudgetPermitLease, BudgetPoolError, BudgetReservation};
 pub(in crate::policy) use budget_identity::BudgetCollisionMergeError;
 pub use budget_identity::{
     BackoffPolicy, BudgetScope, BudgetWindowSemantics, ProviderBudgetPolicy, ProviderBudgetWindow,
@@ -40,7 +40,8 @@ pub(in crate::policy) use budget_runtime_types::{
     BudgetAllocation, BudgetDurabilityBinding, BudgetState, ClockObservation,
 };
 pub use budget_runtime_types::{
-    BudgetDecision, BudgetUnavailableReason, MonotonicInstant, RetryAfter,
+    BudgetDecision, BudgetDispatchDecision, BudgetReservationDecision, BudgetUnavailableReason,
+    MonotonicInstant, RetryAfter,
 };
 pub(in crate::policy) use persistence::lifecycle::AuthorityOperationAdmission;
 pub(crate) use persistence::{
@@ -48,3 +49,7 @@ pub(crate) use persistence::{
     DurableBudgetGroup,
 };
 pub(crate) use persistence::{AuthorityPersistenceError, AuthorityStateStore};
+pub(in crate::policy) use persistence::{
+    DurableBudgetRegistrationGroup, DurableBudgetRegistrationTarget,
+};
+pub(crate) use persistence::{deserialize_clean_restart_backup, serialize_clean_restart_backup};

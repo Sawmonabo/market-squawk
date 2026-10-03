@@ -10,13 +10,17 @@ use market_squawk_data::{
     Sha256Digest,
 };
 use market_squawk_domain::{
-    AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CorporateActionKind,
-    CorporateActionObservation, DataQuality, DigestAlgorithm, EffectiveInterval, FilingObservation,
-    FundamentalObservation, InstrumentId, MacroObservation, PayloadHash, PayloadReference,
-    PositionObservation, PositionSide, QuantityLots, ResearchContext, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
-    RevisionNumber, SourceId, SourceIdentifier, Timestamp, TransactionObservation,
-    UniverseMembershipObservation,
+    AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CompanyObservationSubject,
+    CorporateActionKind, CorporateActionObservation, DataQuality, DigestAlgorithm,
+    EffectiveInterval, FilingForm, FilingObservation, FundamentalAmendmentStatus,
+    FundamentalCadence, FundamentalConsolidation, FundamentalDimensionContext,
+    FundamentalFactContext, FundamentalFactContextInput, FundamentalObservation, FundamentalPeriod,
+    FundamentalRestatementStatus, FundamentalRevisionOrder, InstrumentId, MacroObservation,
+    PayloadHash, PayloadReference, PositionObservation, PositionSide, QuantityLots,
+    ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
+    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SchemaVersion, SourceId,
+    SourceIdentifier, Timestamp, TransactionObservation, UniverseMembershipObservation,
+    XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember, XbrlQualifiedName,
 };
 use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use rust_decimal::Decimal;
@@ -91,18 +95,181 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
             ResearchTime::try_new_with_coordinates(exact(50), None, RevisionNumber::new(1)?, None)?,
         )?)
     };
-    let observations = vec![
+    let fundamental_end = CalendarDate::new(2025, 12, 31)?;
+    let fundamental = |source_record: &str,
+                       accession: &str,
+                       revision: u32,
+                       value: Decimal,
+                       dimensions: FundamentalDimensionContext,
+                       consolidation: FundamentalConsolidation,
+                       restatement_status: FundamentalRestatementStatus|
+     -> Result<ResearchObservation, Box<dyn Error>> {
+        let revision = RevisionNumber::new(revision)?;
+        let fundamental_context = ResearchContext::new(
+            context(source_record, Some(instrument))?
+                .provenance()
+                .clone(),
+            ResearchTime::try_new_with_coordinates(
+                ResearchTemporalCoordinate::calendar_date(fundamental_end),
+                None,
+                revision,
+                None,
+            )?,
+        )?;
+        let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+            schema_version: SchemaVersion::CURRENT,
+            period: FundamentalPeriod::instant(fundamental_end),
+            unit: SourceIdentifier::try_from("USD")?,
+            accession: SourceIdentifier::try_from(accession)?,
+            filing_form: None,
+            amendment_status: FundamentalAmendmentStatus::Unavailable,
+            filed_on: None,
+            frame: None,
+            fiscal_year: None,
+            fiscal_period: None,
+            cadence: FundamentalCadence::Unavailable,
+            xbrl_context_id: Some(SourceIdentifier::try_from(format!("xbrl-{source_record}"))?),
+            dimensions,
+            consolidation,
+            revision_order: FundamentalRevisionOrder::new(
+                revision,
+                SourceIdentifier::try_from("canonical-fixture-order-v1")?,
+            ),
+            restatement_status,
+        })?;
+        Ok(ResearchObservation::Fundamental(
+            FundamentalObservation::new(
+                fundamental_context,
+                CompanyObservationSubject::Instrument(instrument),
+                SourceIdentifier::try_from("us-gaap:Assets")?,
+                value,
+                fact_context,
+            )?,
+        ))
+    };
+    let empty_dimensions = FundamentalDimensionContext::try_source_reported(&[])?;
+    let segment_dimension = XbrlDimensionEvidence::new(
+        XbrlQualifiedName::try_new(
+            "us-gaap:StatementBusinessSegmentsAxis",
+            "https://fasb.org/us-gaap/2025",
+        )?,
+        XbrlDimensionMember::Explicit {
+            member: XbrlQualifiedName::try_new(
+                "example:ConsumerSegmentMember",
+                "https://example.test/taxonomy/2025",
+            )?,
+        },
+        XbrlDimensionLocation::Segment,
+    );
+    let base_fundamental = fundamental(
+        "fundamental-base",
+        "0000000000-25-000001",
+        1,
+        Decimal::new(12_345, 2),
+        empty_dimensions.clone(),
+        FundamentalConsolidation::Unavailable,
+        FundamentalRestatementStatus::Unavailable,
+    )?;
+    let later_occurrence = fundamental(
+        "fundamental-amendment",
+        "0000000000-25-000002",
+        2,
+        Decimal::new(12_500, 2),
+        empty_dimensions.clone(),
+        FundamentalConsolidation::Unavailable,
+        FundamentalRestatementStatus::SourceReported {
+            restated: true,
+            source_status: SourceIdentifier::try_from("source-restatement-v1")?,
+        },
+    )?;
+    let dimensioned_fundamental = fundamental(
+        "fundamental-segment",
+        "0000000000-25-000001",
+        1,
+        Decimal::new(4_000, 2),
+        FundamentalDimensionContext::try_source_reported(&[segment_dimension])?,
+        FundamentalConsolidation::Unavailable,
+        FundamentalRestatementStatus::Unavailable,
+    )?;
+    let nonconsolidated_fundamental = fundamental(
+        "fundamental-nonconsolidated",
+        "0000000000-25-000001",
+        1,
+        Decimal::new(8_345, 2),
+        empty_dimensions,
+        FundamentalConsolidation::SourceReportedNonConsolidated,
+        FundamentalRestatementStatus::Unavailable,
+    )?;
+    let base_family = CanonicalObservationFamily::try_from_observation(&base_fundamental)?;
+    assert_eq!(
+        base_family,
+        CanonicalObservationFamily::try_from_observation(&later_occurrence)?,
+        "occurrence and revision evidence must not split a fundamental family"
+    );
+    assert_ne!(
+        base_family,
+        CanonicalObservationFamily::try_from_observation(&dimensioned_fundamental)?,
+        "dimensional scope must remain in a fundamental family"
+    );
+    assert_ne!(
+        base_family,
+        CanonicalObservationFamily::try_from_observation(&nonconsolidated_fundamental)?,
+        "consolidation scope must remain in a fundamental family"
+    );
+    // Identical concepts, periods and accession text from different issuers must not
+    // become revisions of one another merely because both have no instrument.
+    // Keep their native effective coordinates in the calendar-date domain selected below.
+    let ResearchObservation::Fundamental(base_fact) = &base_fundamental else {
+        return Err("expected fundamental fixture".into());
+    };
+    let mut issuer_observations = Vec::new();
+    for issuer in ["0000320193", "0000789019"] {
+        let subject = CompanyObservationSubject::Issuer(SourceIdentifier::try_from(issuer)?);
+        issuer_observations.push(ResearchObservation::Filing(FilingObservation::new(
+            ResearchContext::new(
+                context("issuer-filing", None)?.provenance().clone(),
+                base_fact.context().time().clone(),
+            )?,
+            subject.clone(),
+            FilingForm::try_from("10-K")?,
+            SourceIdentifier::try_from("same-provider-accession")?,
+        )?));
+        issuer_observations.push(ResearchObservation::Fundamental(
+            FundamentalObservation::new(
+                ResearchContext::new(
+                    context("issuer-fundamental", None)?.provenance().clone(),
+                    base_fact.context().time().clone(),
+                )?,
+                subject,
+                base_fact.concept().clone(),
+                base_fact.value(),
+                base_fact.fact_context().clone(),
+            )?,
+        ));
+    }
+    for (first, second) in [(0, 2), (1, 3)] {
+        assert_ne!(
+            CanonicalObservationFamily::try_from_observation(&issuer_observations[first])?,
+            CanonicalObservationFamily::try_from_observation(&issuer_observations[second])?,
+        );
+        assert_ne!(
+            PointInTimeCandidate::new(issuer_observations[first].clone(), manifest(1, 1)?)
+                .family_key()?,
+            PointInTimeCandidate::new(issuer_observations[second].clone(), manifest(1, 1)?)
+                .family_key()?,
+        );
+    }
+    let mut observations = vec![
         ResearchObservation::Filing(FilingObservation::new(
             context("filing-record", Some(instrument))?,
-            SourceIdentifier::try_from("10-K")?,
+            CompanyObservationSubject::Instrument(instrument),
+            FilingForm::try_from("10-K")?,
             SourceIdentifier::try_from("0000000000-24-000001")?,
         )?),
-        ResearchObservation::Fundamental(FundamentalObservation::new(
-            context("fundamental-record", Some(instrument))?,
-            SourceIdentifier::try_from("us-gaap:Assets")?,
-            Decimal::new(12_345, 2),
-            SourceIdentifier::try_from("USD")?,
-        )?),
+        base_fundamental,
+        later_occurrence,
+        dimensioned_fundamental,
+        nonconsolidated_fundamental,
         ResearchObservation::Macro(MacroObservation::new(
             context("macro-record", None)?,
             SourceIdentifier::try_from("GDP")?,
@@ -138,6 +305,7 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
             None,
         )),
     ];
+    observations.extend(issuer_observations);
     let candidates = observations
         .into_iter()
         .enumerate()
@@ -153,9 +321,9 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
         &PointInTimeService::new(),
         &request(
             policy(PointInTimeRevisionMode::LatestKnown)?,
-            timestamp(100),
+            timestamp(1_800_000_000_000_000_000),
             None,
-            exact(100),
+            ResearchTemporalCoordinate::calendar_date(fundamental_end),
             None,
             limits(16, 16, 4, 16, 1 << 20)?,
         )?,
@@ -163,8 +331,29 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
     )
     .await?;
 
-    assert_eq!(selection.records().len(), candidates.len());
-    for record in selection.records() {
+    assert_eq!(
+        selection
+            .records()
+            .iter()
+            .filter(|record| match record.candidate().observation() {
+                ResearchObservation::Filing(value) => value.subject().issuer_id().is_some(),
+                ResearchObservation::Fundamental(value) => value.subject().issuer_id().is_some(),
+                _ => false,
+            })
+            .count(),
+        4,
+        "each issuer's filing and fact must survive selection"
+    );
+    assert_eq!(
+        selection.records().len() + selection.exclusions().len(),
+        candidates.len()
+    );
+    for record in selection.records().iter().copied().chain(
+        selection
+            .exclusions()
+            .iter()
+            .map(|excluded| excluded.record()),
+    ) {
         let observation = record.candidate().observation();
         let family = CanonicalObservationFamily::try_from_observation(observation)?;
         let payload = CanonicalObservationPayload::try_from_observation(observation)?;
