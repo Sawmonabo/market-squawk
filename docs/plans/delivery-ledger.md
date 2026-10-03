@@ -2,14 +2,31 @@
 
 ## Current execution — 2026-10-02
 
-Latest integration: `68221dde` pushed the native-verified navigation correction. Watchlist is
-compact and all nine saved histories were verified in the preceding pushed batch. Lead owns the
-current measured market-selection correction; Astra's manifest query handoff is inspected/frozen.
-The final existing publication/recovery test PASS1/1 (11.20s, compile51.07s), including unrestricted
-source and native/cohort separation. No extra harness, CI or review round. The single matched
-service/Desktop rebuild is running; final native concurrency evidence remains pending. Source
-changes retain every completeness, authority, time and exclusion check and add no workload cap.
-Options doctor-renewal recovery remains the next saved-MSFT workflow dependency, not completed.
+Latest pushed code: `a463ab39` (market selector) and `68221dde` (navigation). Primary worktree
+only; lead owns continuation, all agent edits are integrated and ownership released.
+
+**Implemented and critically verified:** compact ticker/price/change rows with hover/focus removal;
+automatic history and navigation scroll correction; indexed exact-key selection before publication
+joins plus SQLite planner maintenance. Existing publication/recovery test PASS1/1 (11.20s,
+compile51.07s), preserving clocks, exclusions, source separation and restart evidence.
+
+**Native verification:** final matched build PASS6m34s; service53066/Desktop53116 run the new
+source. Home returns all nine prices and changes without a read-error alert or layout overflow.
+All nine saved history reads succeed after restart: eight have251 bars, IWM21. QQQ/DIA/IWM/VTI/
+AAPL/MSFT/NVDA/TSLA reads308–644ms; first SPY read2411ms. Screenshot and query evidence:
+`watchlist-final-native.png`, `watchlist-final-native-state.json`,
+`native-watchlist-history-final-results.json` in `.agents/tmp/v1-first-stock/`.
+An actual QQQ link click reached successful history with the chart mounted in4074ms observation
+time, no alerts or overflow (`qqq-final-native-state.json`/PNG). Background canvas painting does
+not establish foreground visual quality.
+
+**Not complete:** a deliberately overlapping collection read now succeeds but takes14640ms;
+normal Home succeeds, yet slow cold startup and concurrent read latency remain open. Earlier
+direct diagnostic probes added a second request alongside Home; they were not proof of duplicate
+frontend ownership. No instant-loading or complete startup-performance claim. Further correction
+must measure actual remaining work without dropping evidence or raising deadlines.
+The saved-MSFT workflow still needs the diagnosed option doctor-renewal recovery. Whole V1,
+installed lifecycle and final resource acceptance remain open. No CI, new worktree or RAM gate.
 
 ### Execution evidence and ownership history
 
