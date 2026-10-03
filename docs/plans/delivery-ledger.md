@@ -16,15 +16,18 @@ insufficient evidence of foreground chart quality. Full V1 acceptance is still o
 
 **Remaining defect / next dependency:** one final Market.GetCollection refresh timed out after
 14.9s at `retained_routes_and_events`; the next identical request succeeded. The earlier current-grant
-snapshot authorization correction is already implemented and must not be repeated. Astra
-`stock_workflow_trace` owns read-only diagnosis of current `paper/market/durable_product.rs`,
-`load_retained_display_evidence` and retained-selection/authorization callees. Its output is a local
-report, with no product edits/builds/runtime calls/Git. Lead owns all implementation, native probes,
-integration and build scheduling. No new worktrees, CI, quarter review or RAM measurement.
+snapshot authorization correction is already implemented and must not be repeated. Astra completed
+read-only diagnosis and released ownership. Its route-query deduplication comparison preserved
+results and saved 0.6–0.7s across nine instruments, insufficient to explain the 14.9s timeout; no
+speculative performance patch was applied. The next diagnostic is precise phase timing within
+`load_retained_display_evidence` and its batch read/authorization boundaries if the failure recurs.
+Report: `.agents/tmp/v1-first-stock/collection-deadline-diagnosis.md`. Lead owns continuation.
+No new worktrees, CI, quarter review or RAM measurement. PR43 comment5963999384 records this batch.
 
 Evidence: `.agents/tmp/v1-first-stock/starter-history-first-open-results.json`,
 `spy-history-after-calendar-fix.json`, `spy-history-reopen-native.json`,
-`native-watchlist-history-results.json`, `compact-watchlist-native-final.png`.
+`native-watchlist-history-results.json`, `watchlist-after-history-verification.png`.
+The final native watchlist screenshot was inspected: all nine compact rows visible, no overflow.
 
 ### Prior execution notes
 
