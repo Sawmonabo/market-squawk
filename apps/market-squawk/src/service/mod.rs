@@ -650,6 +650,7 @@ impl InstalledService {
                 .map_err(map_workspace_selector_startup)?;
             let workspace_paths = selected_workspace_guard.workspace_paths().clone();
             let config = config.bind_selected_workspace(workspace_paths.root().to_path_buf());
+            let product_started = Instant::now();
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             let product = match board_fixture {
                 Some(fixture) => {
@@ -680,6 +681,8 @@ impl InstalledService {
                 installation_id,
             )
             .await?;
+            tracing::info!(phase = "local_product", elapsed_ms = %product_started.elapsed().as_millis(), "workspace startup phase completed");
+            let operations_started = Instant::now();
             if let Err(error) = product.admit_source_startup(CLIENT_TIMEOUT) {
                 tracing::warn!(
                     error = %error,
@@ -727,6 +730,7 @@ impl InstalledService {
                     return Err(composition_stage(error, "operations binding"));
                 }
             };
+            tracing::info!(phase = "installed_operations", elapsed_ms = %operations_started.elapsed().as_millis(), "workspace startup phase completed");
             if let Err(error) = operations.reconcile_settings_startup() {
                 cleanup_startup(&product, &jobs).await;
                 return Err(composition_stage(error, "settings startup reconciliation"));

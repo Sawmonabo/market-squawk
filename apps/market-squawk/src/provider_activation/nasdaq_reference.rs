@@ -2,13 +2,13 @@
 //!
 //! Nasdaq Trader's current directory is useful symbology, not a quote, book, trading-status, or
 //! execution source. The service seals the complete two-file request graph before publishing one
-//! immutable listing-reference generation. Restart reads reopen that generation without network
-//! reacquisition; canonical `InstrumentId` approval remains a separate authority.
+//! immutable listing-reference generation. Restart reads reuse a fresh retained generation;
+//! canonical `InstrumentId` approval remains a separate authority.
 
 use std::cmp::Ordering;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use market_squawk_adapter_nasdaq_symbols::{
@@ -145,7 +145,7 @@ pub(crate) struct NasdaqReferenceUniverseService {
     registry: StdMutex<Option<AuthoritativeSourceRegistry>>,
     durable: Option<DurableListingReference>,
     snapshot: RwLock<Option<Arc<ReferenceUniverseSnapshot>>>,
-    refresh: Mutex<()>,
+    refresh: Mutex<Option<Instant>>,
     lifecycle: CancellationToken,
 }
 
@@ -203,7 +203,7 @@ impl NasdaqReferenceUniverseService {
             registry: StdMutex::new(Some(registry)),
             durable,
             snapshot: RwLock::new(None),
-            refresh: Mutex::new(()),
+            refresh: Mutex::new(None),
             lifecycle: CancellationToken::new(),
         })
     }
@@ -224,7 +224,9 @@ impl NasdaqReferenceUniverseService {
         cancellation: &CancellationToken,
     ) -> Result<Arc<ReferenceUniverseSnapshot>, NasdaqReferenceUniverseError> {
         ensure_open(deadline, cancellation, &self.lifecycle)?;
-        if let Some(snapshot) = self.snapshot.read().await.as_ref().cloned() {
+        if let Some(snapshot) = self.snapshot.read().await.as_ref().cloned()
+            && snapshot.is_fresh_at(self.source.metadata(), system_timestamp()?)
+        {
             return Ok(snapshot);
         }
 
@@ -232,7 +234,7 @@ impl NasdaqReferenceUniverseService {
         if remaining.is_zero() {
             return Err(NasdaqReferenceUniverseError::DeadlineExceeded);
         }
-        let refresh = tokio::select! {
+        let mut refresh = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(NasdaqReferenceUniverseError::Cancelled),
             () = self.lifecycle.cancelled() => return Err(NasdaqReferenceUniverseError::ShuttingDown),
@@ -240,10 +242,31 @@ impl NasdaqReferenceUniverseService {
                 result.map_err(|_| NasdaqReferenceUniverseError::DeadlineExceeded)?
             }
         };
-        if let Some(snapshot) = self.snapshot.read().await.as_ref().cloned() {
+        if let Some(snapshot) = self.snapshot.read().await.as_ref().cloned()
+            && snapshot.is_fresh_at(self.source.metadata(), system_timestamp()?)
+        {
             drop(refresh);
             return Ok(snapshot);
         }
+        if refresh.is_some_and(|retry_after| Instant::now() < retry_after) {
+            return Err(NasdaqReferenceUniverseError::RefreshDeferred);
+        }
+
+        // A failed or unchanged directory must not be fetched again on every account-health
+        // tick. This local refresh admission uses the registered source policy; each actual
+        // request still passes through the shared provider rate authority.
+        let budget = self
+            .source
+            .metadata()
+            .budget_policy()
+            .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?;
+        let delay =
+            Duration::from_nanos(budget.window_nanos().max(budget.backoff().maximum_nanos()));
+        *refresh = Some(
+            Instant::now()
+                .checked_add(delay)
+                .ok_or(NasdaqReferenceUniverseError::Clock)?,
+        );
 
         let operation = self.lifecycle.child_token();
         let loaded = tokio::select! {
@@ -257,10 +280,21 @@ impl NasdaqReferenceUniverseService {
                 Err(NasdaqReferenceUniverseError::ShuttingDown)
             }
             result = self.load_snapshot(deadline, operation.clone()) => result,
-        }?;
+        };
+        // Also retain the full cooldown after a slow failure or unchanged response.
+        *refresh = Some(
+            Instant::now()
+                .checked_add(delay)
+                .ok_or(NasdaqReferenceUniverseError::Clock)?,
+        );
+        let loaded = loaded?;
         ensure_open(deadline, cancellation, &self.lifecycle)?;
+        if !loaded.is_fresh_at(self.source.metadata(), system_timestamp()?) {
+            return Err(NasdaqReferenceUniverseError::StaleDirectory);
+        }
         let loaded = Arc::new(loaded);
         *self.snapshot.write().await = Some(Arc::clone(&loaded));
+        *refresh = None;
         drop(refresh);
         Ok(loaded)
     }
@@ -338,7 +372,9 @@ impl NasdaqReferenceUniverseService {
         cancellation: CancellationToken,
     ) -> Result<ReferenceUniverseSnapshot, NasdaqReferenceUniverseError> {
         if let Some(durable) = &self.durable {
-            if let Some(snapshot) = self.load_catalog_snapshot(durable, deadline, &cancellation)? {
+            if let Some(snapshot) = self.load_catalog_snapshot(durable, deadline, &cancellation)?
+                && snapshot.is_fresh_at(self.source.metadata(), system_timestamp()?)
+            {
                 return Ok(snapshot);
             }
             self.publish_current_directory(durable, deadline, cancellation.clone())
@@ -448,9 +484,7 @@ impl NasdaqReferenceUniverseService {
         {
             return Err(NasdaqReferenceUniverseError::DuplicateIdentity);
         }
-        Ok(ReferenceUniverseSnapshot {
-            records: records.into_boxed_slice(),
-        })
+        ReferenceUniverseSnapshot::try_new(records.into_boxed_slice(), self.source.metadata())
     }
 
     fn load_catalog_snapshot(
@@ -525,9 +559,8 @@ impl NasdaqReferenceUniverseService {
         {
             return Err(NasdaqReferenceUniverseError::DuplicateIdentity);
         }
-        Ok(Some(ReferenceUniverseSnapshot {
-            records: records.into_boxed_slice(),
-        }))
+        ReferenceUniverseSnapshot::try_new(records.into_boxed_slice(), self.source.metadata())
+            .map(Some)
     }
 
     async fn publish_current_directory(
@@ -599,6 +632,20 @@ impl NasdaqReferenceUniverseService {
         .await
         .map_err(|_| NasdaqReferenceUniverseError::SealTask)??;
         ensure_operation(deadline, &cancellation)?;
+        let now = system_timestamp()?;
+        for component in sealed.components() {
+            if !self.source.metadata().is_effective_at(now)
+                || component.received_at() > now
+                || now
+                    >= reference_fresh_until(
+                        component.source_last_modified_at(),
+                        component.received_at(),
+                        self.source.metadata().freshness_policy(),
+                    )?
+            {
+                return Err(NasdaqReferenceUniverseError::StaleDirectory);
+            }
+        }
         let input = listing_reference_generation_input(
             self.source.metadata().clone(),
             expected_previous_generation,
@@ -730,6 +777,67 @@ impl MarketReferenceSearchAuthority for NasdaqReferenceUniverseService {
 #[derive(Debug)]
 struct ReferenceUniverseSnapshot {
     records: Box<[ReferenceUniverseRecord]>,
+    observed_at: Timestamp,
+    fresh_until: Timestamp,
+}
+
+impl ReferenceUniverseSnapshot {
+    fn try_new(
+        records: Box<[ReferenceUniverseRecord]>,
+        metadata: &SourceMetadata,
+    ) -> Result<Self, NasdaqReferenceUniverseError> {
+        let first = records
+            .first()
+            .ok_or(NasdaqReferenceUniverseError::IncompleteDirectory)?;
+        let mut observed_at = first.listing.observed_at;
+        let mut fresh_until = reference_fresh_until(
+            first.listing.source_timestamp,
+            first.listing.observed_at,
+            metadata.freshness_policy(),
+        )?;
+        for record in records.iter().skip(1) {
+            observed_at = observed_at.max(record.listing.observed_at);
+            fresh_until = fresh_until.min(reference_fresh_until(
+                record.listing.source_timestamp,
+                record.listing.observed_at,
+                metadata.freshness_policy(),
+            )?);
+        }
+        Ok(Self {
+            records,
+            observed_at,
+            fresh_until,
+        })
+    }
+
+    fn is_fresh_at(&self, metadata: &SourceMetadata, at: Timestamp) -> bool {
+        metadata.is_effective_at(at) && self.observed_at <= at && at < self.fresh_until
+    }
+}
+
+fn reference_fresh_until(
+    source_timestamp: Timestamp,
+    observed_at: Timestamp,
+    policy: FreshnessPolicy,
+) -> Result<Timestamp, NasdaqReferenceUniverseError> {
+    if source_timestamp > observed_at {
+        return Err(NasdaqReferenceUniverseError::SourceBinding);
+    }
+    let mut fresh_until = Timestamp::from_unix_nanos(i64::MAX);
+    for (clock, age) in [
+        (source_timestamp, policy.max_source_age_nanos()),
+        (observed_at, policy.max_transport_age_nanos()),
+        (observed_at, policy.max_market_age_nanos()),
+    ] {
+        let age =
+            i64::try_from(age).map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?;
+        fresh_until = fresh_until.min(
+            clock
+                .checked_add_nanos(age)
+                .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?,
+        );
+    }
+    Ok(fresh_until)
 }
 
 #[derive(Debug)]
@@ -1320,6 +1428,10 @@ pub(crate) enum NasdaqReferenceUniverseError {
     SourceBinding,
     #[error("Nasdaq reference files did not form one complete directory")]
     IncompleteDirectory,
+    #[error("Nasdaq reference directory is outside its source freshness interval")]
+    StaleDirectory,
+    #[error("Nasdaq reference refresh is deferred by the registered source retry policy")]
+    RefreshDeferred,
     #[error("Nasdaq reference directory contains a duplicate listing identity")]
     DuplicateIdentity,
     #[error("Nasdaq reference memory capacity is unavailable")]
@@ -1352,4 +1464,46 @@ pub(crate) enum NasdaqReferenceUniverseError {
     Ingest(#[from] IngestError),
     #[error(transparent)]
     Rights(#[from] RightsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_refresh_preserves_source_clock_and_exclusive_freshness() {
+        let metadata = source_metadata().expect("valid source metadata");
+        let policy = metadata.freshness_policy();
+        let source = Timestamp::from_unix_nanos(1_000_000_000);
+        let expiry = source
+            .checked_add_nanos(i64::try_from(DAY_NANOS).expect("bounded day"))
+            .expect("bounded expiry");
+        let before_expiry = expiry.checked_add_nanos(-1).expect("bounded clock");
+        let mut snapshot = ReferenceUniverseSnapshot {
+            records: Box::new([]),
+            observed_at: source,
+            fresh_until: reference_fresh_until(source, source, policy)
+                .expect("valid source clocks"),
+        };
+        assert!(snapshot.is_fresh_at(&metadata, before_expiry));
+        assert!(!snapshot.is_fresh_at(&metadata, expiry));
+
+        // Fetching an unchanged file later does not renew its original source timestamp.
+        let refreshed_at = expiry.checked_add_nanos(1).expect("bounded refresh");
+        snapshot.observed_at = refreshed_at;
+        snapshot.fresh_until = reference_fresh_until(source, refreshed_at, policy)
+            .expect("old source clock remains valid evidence");
+        assert_eq!(snapshot.fresh_until, expiry);
+        assert!(!snapshot.is_fresh_at(&metadata, refreshed_at));
+
+        // A genuinely newer source file can replace the expired snapshot.
+        snapshot.fresh_until = reference_fresh_until(refreshed_at, refreshed_at, policy)
+            .expect("fresh replacement clocks");
+        assert!(snapshot.is_fresh_at(&metadata, refreshed_at));
+        assert!(!snapshot.is_fresh_at(&metadata, expiry));
+        assert!(matches!(
+            reference_fresh_until(refreshed_at, source, policy),
+            Err(NasdaqReferenceUniverseError::SourceBinding)
+        ));
+    }
 }
