@@ -4,6 +4,24 @@
 
 ### Current native barrier — investment dataset cursor admission
 
+Pushed cursor source/checkpoint: **`67ddcd0b`**; PR #43 evidence comment 5973141567. Coordinated
+watcher resumed and is compiling one matching development generation; the current visible app
+remains running. Do not retry the stock workflow merely because this primitive passes.
+
+Owner cleanup correction: prior recovery folders may be removed once no longer needed and the
+new workspace is verified working. That condition is not met: the saved stock analysis remains
+blocked. Preserve the two earlier workspace roots and their unique evidence until the new live
+workflow/restart succeeds and retention is reconciled; no new permission is required once those
+conditions are established. Original session retention remains unchanged.
+
+Next independent diagnostic owner: Astra `workflow_job_resume`, read-only only, report
+`provider-identity-selection-deadline.md`: isolate why live catalog identity selection exhausts
+its 30-second attempt during ordinary native use, from exact writer/snapshot/caller ownership.
+No source/build/runtime/provider/DB/Git changes; existing logs/retained state only. Lead owns
+stock source-reference handoff, current build, integration and checks. This provider dependency
+must be resolved before claiming new annual-history preparation or a complete dataset.
+
+
 Cursor correction is implemented with the existing Parquet offset index: output admission uses
 pages intersecting requested batches, while decoder/dictionary scratch remains conservative.
 Exact schema, hashes, complete rows, cancellation and insufficient-budget rejection remain.
