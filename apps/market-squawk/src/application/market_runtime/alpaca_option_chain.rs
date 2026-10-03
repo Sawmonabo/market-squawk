@@ -467,7 +467,24 @@ impl Worker {
                 caller.clone(),
             )
             .await
-            .map_err(|_| OptionChainDemandError::Identity)?;
+            .map_err(|error| {
+                use market_squawk_data::MarketDataInstrumentCatalogError as E;
+                let failure = match error {
+                    E::SourceIdentityConflict => "source-identity-conflict",
+                    E::PublicationAuthority(_) => "publication-authority",
+                    E::AuthorityUnavailable => "catalog-unavailable",
+                    E::DeadlineExceeded => "deadline",
+                    E::Cancelled => "cancelled",
+                    E::InvalidInput => "invalid-input",
+                    _ => "other",
+                };
+                tracing::warn!(
+                    stage = "option-reference-publication",
+                    failure,
+                    "option reference admission failed"
+                );
+                OptionChainDemandError::Identity
+            })?;
         let mut records = vec![underlying_record];
         let mut references = vec![underlying.clone()];
         let mut contracts = Vec::new();

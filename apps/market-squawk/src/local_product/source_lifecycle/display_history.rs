@@ -3,10 +3,17 @@
 use super::ProductionSourceLifecycleAuthority;
 use crate::application::AlpacaHistoricalRuntimeCapability;
 use crate::application::{map_market_definition_read_error, map_source_research_error};
+use chrono::{DateTime, Utc};
+use chrono_tz::America::New_York;
+use market_squawk_domain::Timestamp;
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
 };
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeSet,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -50,6 +57,7 @@ impl ProductionSourceLifecycleAuthority {
     ) {
         let mut pending = None;
         let mut attempted_generation = None;
+        let mut next_day: Option<tokio::time::Instant> = None;
         let history_publications = self.research.history_publications();
         loop {
             let (request, retained_only) = if let Some(request) = pending.take() {
@@ -65,6 +73,12 @@ impl ProductionSourceLifecycleAuthority {
                         false
                     }
                     () = history_publications.notified() => true,
+                    () = async {
+                        match next_day {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => false,
                 };
                 // A publication wake must not consume an activation racing with it: that
                 // activation still owns its one acquisition pass on the next iteration.
@@ -74,6 +88,7 @@ impl ProductionSourceLifecycleAuthority {
                     requests.borrow_and_update().clone()
                 };
                 let Some(request) = request else {
+                    next_day = None;
                     continue;
                 };
                 (request, retained_only)
@@ -82,9 +97,25 @@ impl ProductionSourceLifecycleAuthority {
                 return;
             }
             if request.runtime.is_revoked() {
+                next_day = None;
                 continue;
             }
-            let generation = request.runtime.group_generation();
+            let (native_day, until_next_day) = match display_native_day_now() {
+                Ok(day) => day,
+                Err(error) => {
+                    next_day = None;
+                    record_history_outcome(Err(error));
+                    continue;
+                }
+            };
+            next_day = tokio::time::Instant::now().checked_add(until_next_day);
+            let generation = (request.runtime.group_generation(), native_day);
+            // A publication racing the midnight timer still owes this generation its new
+            // native-day preparation; resetting the timer must not skip that acquisition.
+            let retained_only = retained_only
+                && !attempted_generation.is_some_and(|(previous_generation, previous_day)| {
+                    previous_generation == generation.0 && previous_day != native_day
+                });
             if !retained_only && attempted_generation == Some(generation) {
                 continue;
             }
@@ -213,6 +244,10 @@ impl ProductionSourceLifecycleAuthority {
         if Instant::now() >= deadline {
             return Err(ServiceError::DeadlineExceeded);
         }
+        let calendar = self
+            .display_history
+            .prepare_market_display_calendar(retained_only, deadline, cancellation)
+            .await?;
         let mut first_failure = None;
         for record in &records {
             if cancellation.is_cancelled() {
@@ -232,7 +267,13 @@ impl ProductionSourceLifecycleAuthority {
             );
             let result = self
                 .display_history
-                .prepare_market_display_history(runtime, record, retained_only, &context)
+                .prepare_market_display_history(
+                    runtime,
+                    record,
+                    retained_only,
+                    calendar.as_ref(),
+                    &context,
+                )
                 .await;
             if cancellation.is_cancelled() || result == Err(ServiceError::Cancelled) {
                 return Err(ServiceError::Cancelled);
@@ -246,6 +287,13 @@ impl ProductionSourceLifecycleAuthority {
                 first_failure.get_or_insert(error);
             }
         }
+        // Only this owner publishes the locator, after actual current-coverage selection and
+        // preparation. An unrelated historical calendar publication cannot replace it.
+        if let Some(calendar) = calendar {
+            self.research.set_market_display_calendar_origin(
+                calendar.source_action_calendar().manifest().clone(),
+            );
+        }
         first_failure.map_or(Ok(()), Err)
     }
 }
@@ -255,5 +303,64 @@ fn record_history_outcome(result: Result<(), ServiceError>) {
         && error != ServiceError::Cancelled
     {
         tracing::warn!(?error, "starter market history preparation is unavailable");
+    }
+}
+
+/// The Alpaca display/history owner uses the admitted provider's New York civil-day rule.
+/// This timer only schedules finite preparation; it does not assign financial session dates.
+fn display_native_day(at: Timestamp) -> Result<(chrono::NaiveDate, Duration), ServiceError> {
+    let local = DateTime::<Utc>::from_timestamp_nanos(at.unix_nanos()).with_timezone(&New_York);
+    let day = local.date_naive();
+    let next = day
+        .succ_opt()
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .and_then(|midnight| midnight.and_local_timezone(New_York).single())
+        .and_then(|midnight| midnight.timestamp_nanos_opt())
+        .ok_or(ServiceError::Internal)?;
+    let remaining = next
+        .checked_sub(at.unix_nanos())
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .filter(|nanos| *nanos > 0)
+        .ok_or(ServiceError::Internal)?;
+    Ok((day, Duration::from_nanos(remaining)))
+}
+
+fn display_native_day_now() -> Result<(chrono::NaiveDate, Duration), ServiceError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .ok_or(ServiceError::Internal)?;
+    display_native_day(Timestamp::from_unix_nanos(nanos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_refresh_uses_native_midnight_and_dst_without_reconnect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let at = |text: &str| -> Result<Timestamp, Box<dyn std::error::Error>> {
+            Ok(Timestamp::from_unix_nanos(
+                DateTime::parse_from_rfc3339(text)?
+                    .timestamp_nanos_opt()
+                    .ok_or("timestamp")?,
+            ))
+        };
+        let (friday, wait) = display_native_day(at("2026-10-03T00:00:00Z")?)?;
+        assert_eq!(friday.to_string(), "2026-10-02");
+        assert_eq!(wait, Duration::from_secs(4 * 3600));
+        let (saturday, _) = display_native_day(at("2026-10-03T04:00:00Z")?)?;
+        assert_ne!(friday, saturday); // The same runtime generation admits the new native day.
+        assert_eq!(
+            display_native_day(at("2026-03-08T05:00:00Z")?)?.1,
+            Duration::from_secs(23 * 3600)
+        );
+        assert_eq!(
+            display_native_day(at("2026-11-01T04:00:00Z")?)?.1,
+            Duration::from_secs(25 * 3600)
+        );
+        Ok(())
     }
 }

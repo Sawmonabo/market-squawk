@@ -279,11 +279,19 @@ impl MarketDomainService {
         // Read the whole selected page once; raw snapshot bars are never close authority.
         progress.enter("previous_close", None);
         let closes = match self
-            .previous_close_product_rows(&records, &instrument_ids, reference_at, context)
+            .market_history
+            .read_latest_previous_closes(
+                &self.product_research,
+                &instrument_ids,
+                reference_at,
+                context,
+            )
             .await
         {
             Ok(closes) => closes,
-            Err(ServiceError::Unavailable | ServiceError::Unauthorized) => Vec::new(),
+            Err(ServiceError::Unavailable | ServiceError::Unauthorized) => {
+                instrument_ids.iter().map(|_| None).collect()
+            }
             Err(error @ (ServiceError::Cancelled | ServiceError::DeadlineExceeded)) => {
                 return Err(error);
             }
@@ -292,9 +300,36 @@ impl MarketDomainService {
                 // quote/trade evidence. The failed close supplies neither fallback nor change.
                 tracing::warn!(request_id = ?context.request_id(), ?error,
                     "supplementary previous close unavailable for product market read");
-                Vec::new()
+                instrument_ids.iter().map(|_| None).collect()
             }
         };
+        if closes.len() != instrument_ids.len() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let mut close_rows = Vec::new();
+        for (instrument_id, close) in instrument_ids.iter().copied().zip(&closes) {
+            let Some(close) = close else {
+                continue;
+            };
+            let record = records
+                .binary_search_by_key(&instrument_id, |record| record.definition().instrument_id())
+                .ok()
+                .and_then(|index| records.get(index))
+                .ok_or(ServiceError::InvalidResult)?;
+            if close.instrument_id() != instrument_id
+                || close.currency() != record.definition().quote_currency()
+                || close.session_close() > reference_at
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            close_rows.push(json!({
+                "instrumentId": instrument_id.to_string(), "availability": "end_of_day",
+                "currentPrice": {"value": close.close().amount().normalize().to_string(),
+                    "basis": "previous_close", "currency": close.currency().as_str(),
+                    "observedAt": timestamp_value(close.session_close()),
+                    "currentThrough": timestamp_value(close.session_close())},
+            }));
+        }
         // Other instruments may have required retained reads after the actor snapshot.
         // Keep its observation details, but never return an expired observation as current.
         let projected_at = system_timestamp()?;
@@ -324,12 +359,9 @@ impl MarketDomainService {
                 row["currentPrice"] = Value::Null;
                 row["availability"] = json!("stale");
             }
-            let close = closes
+            let close = close_rows
                 .iter()
                 .find(|close| row_instrument(close) == row_instrument(row));
-            if let Some(close) = close {
-                row["previousClose"] = close["previousClose"].clone();
-            }
             if !has_current_price(row) {
                 if let Some(price) = product::retained_display_price(row, close, projected_at)? {
                     row["currentPrice"] = price;
@@ -339,6 +371,73 @@ impl MarketDomainService {
                     row["availability"] = close["availability"].clone();
                 }
             }
+        }
+        // Baselines are chosen only after the actual trade/midpoint/close has been selected.
+        // The original observation clock, never this read's date, determines its session.
+        let observations = instrument_ids
+            .iter()
+            .map(|instrument| {
+                let Some(row) = rows
+                    .iter()
+                    .find(|row| row_instrument(row) == Some(*instrument))
+                else {
+                    return Err(ServiceError::InvalidResult);
+                };
+                let Some(price) = row.get("currentPrice").filter(|price| !price.is_null()) else {
+                    return Ok(None);
+                };
+                let observed = price
+                    .get("observedAt")
+                    .and_then(Value::as_str)
+                    .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                    .and_then(|at| at.timestamp_nanos_opt())
+                    .map(Timestamp::from_unix_nanos)
+                    .ok_or(ServiceError::InvalidResult)?;
+                Ok(Some((observed, price["basis"] == "previous_close")))
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        let comparisons = match self
+            .market_history
+            .read_daily_price_comparisons(
+                &self.product_research,
+                &closes,
+                &observations,
+                projected_at,
+                context,
+            )
+            .await
+        {
+            Ok(comparisons) => comparisons,
+            Err(error @ (ServiceError::Cancelled | ServiceError::DeadlineExceeded)) => {
+                return Err(error);
+            }
+            Err(error) => {
+                tracing::warn!(request_id = ?context.request_id(), ?error, "daily comparison unavailable");
+                instrument_ids.iter().map(|_| None).collect()
+            }
+        };
+        for (instrument, comparison) in instrument_ids.iter().zip(comparisons) {
+            let Some(comparison) = comparison else {
+                continue;
+            };
+            let row = rows
+                .iter_mut()
+                .find(|row| row_instrument(row) == Some(*instrument))
+                .ok_or(ServiceError::InvalidResult)?;
+            let (starts_at, ends_at) = comparison.price_session_period();
+            row["priceSession"] = json!({
+                "date": comparison.price_session_date().to_string(),
+                "startsAt": timestamp_value(starts_at), "endsAt": timestamp_value(ends_at),
+                "observedAt": row["currentPrice"]["observedAt"],
+                "value": row["currentPrice"]["value"], "basis": row["currentPrice"]["basis"],
+            });
+            row["previousClose"] = json!({
+                "instrumentId": comparison.instrument_id().to_string(),
+                "value": comparison.close().amount().normalize().to_string(),
+                "currency": comparison.close().currency().as_str(),
+                "sessionDate": comparison.native_date().to_string(),
+                "asOf": timestamp_value(comparison.session_close()), "adjustment": "raw",
+            });
         }
         progress.enter("page_projection", None);
         let available = page.available();
@@ -385,59 +484,6 @@ impl MarketDomainService {
         progress.finish(product::product_result(
             content, available, has_more, limits,
         ))
-    }
-
-    /// Completed daily closes are presentation evidence, never current mark authority.
-    async fn previous_close_product_rows(
-        &self,
-        records: &[MarketDataInstrumentRecord],
-        instruments: &[InstrumentId],
-        reference_at: Timestamp,
-        context: &RequestContext,
-    ) -> Result<Vec<Value>, ServiceError> {
-        ensure_live(context)?;
-        let closes = self
-            .market_history
-            .read_latest_previous_closes(&self.product_research, instruments, reference_at, context)
-            .await?;
-        ensure_live(context)?;
-        if closes.len() != instruments.len() {
-            return Err(ServiceError::InvalidResult);
-        }
-        let mut rows = Vec::new();
-        for (instrument_id, close) in instruments.iter().copied().zip(closes) {
-            let Some(close) = close else {
-                continue;
-            };
-            let record = records
-                .binary_search_by_key(&instrument_id, |record| record.definition().instrument_id())
-                .ok()
-                .and_then(|index| records.get(index))
-                .ok_or(ServiceError::InvalidResult)?;
-            if close.instrument_id() != instrument_id
-                || close.currency() != record.definition().quote_currency()
-                || close.session_close() > reference_at
-            {
-                return Err(ServiceError::InvalidResult);
-            }
-            rows.push(json!({
-                "instrumentId": instrument_id.to_string(), "availability": "end_of_day",
-                "currentPrice": {"value": close.close().amount().normalize().to_string(),
-                    "basis": "previous_close",
-                    "currency": close.currency().as_str(),
-                    "observedAt": timestamp_value(close.session_close()),
-                    "currentThrough": timestamp_value(close.session_close())},
-                "previousClose": {
-                    "instrumentId": instrument_id.to_string(),
-                    "value": close.close().amount().normalize().to_string(),
-                    "currency": close.currency().as_str(),
-                    "sessionDate": close.native_date().to_string(),
-                    "asOf": timestamp_value(close.session_close()),
-                    "adjustment": "raw",
-                },
-            }));
-        }
-        Ok(rows)
     }
 
     async fn product_display_rows(

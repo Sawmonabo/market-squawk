@@ -398,6 +398,9 @@ impl CompletedMarketSessionReadCapability {
             job,
         )
         .await?;
+        // Calendar refresh uses the existing display-preparation owner. That worker treats
+        // publication wakes as retained-only, so this cannot recursively acquire calendars.
+        self.research.history_publications().notify_one();
         Ok(Some(reference(
             published.manifest(),
             published.binding_digest(),
@@ -405,7 +408,8 @@ impl CompletedMarketSessionReadCapability {
     }
 
     /// Selects once for the original cutoff from genuine creating generations, newest first.
-    /// A missing source or exhausted candidate budget cannot produce partial coverage authority.
+    /// Pages are bounded, but an unrelated recent history calendar cannot hide a covering
+    /// current calendar. The existing deadline/cancellation bounds the preparation traversal.
     pub(crate) async fn select(
         &self,
         as_of: Timestamp,
@@ -417,54 +421,63 @@ impl CompletedMarketSessionReadCapability {
             return Ok(None);
         };
         let dataset = DatasetId::try_from("alpaca-market-calendar-iex").map_err(invalid)?;
-        let (candidates, _has_more) = self
-            .research
-            .analytical_reader()
-            .provider_capture_origin_candidates(
-                &dataset,
-                as_of,
-                None,
-                AnalyticalReadLimit::try_new(MAXIMUM_ORIGIN_CANDIDATES).map_err(invalid)?,
-                deadline,
-                &cancellation,
-            )
-            .inspect_err(|error| calendar_read_failure("calendar-origin-candidates", error))
-            .map_err(|_| controlled_error(deadline, &cancellation))?;
-        for manifest in candidates {
-            check(deadline, &cancellation)?;
-            match self
-                .read_origin(
-                    runtime.clone(),
-                    manifest,
-                    None,
-                    true,
+        let mut before_version = None;
+        loop {
+            let (candidates, has_more) = self
+                .research
+                .analytical_reader()
+                .provider_capture_origin_candidates(
+                    &dataset,
                     as_of,
+                    before_version,
+                    AnalyticalReadLimit::try_new(MAXIMUM_ORIGIN_CANDIDATES).map_err(invalid)?,
                     deadline,
                     &cancellation,
-                    None,
                 )
-                .await
-            {
-                Ok(Some(read)) => return Ok(Some(read)),
-                Ok(None) => {}
-                Err(CompletedMarketSessionError::Unavailable) => {
-                    tracing::warn!(
-                        stage = "calendar-origin-read",
-                        "completed market calendar selection unavailable"
-                    );
-                    return Ok(None);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        stage = "calendar-origin-selection",
-                        "completed market calendar selection unavailable"
-                    );
-                    return Err(error);
+                .inspect_err(|error| calendar_read_failure("calendar-origin-candidates", error))
+                .map_err(|_| controlled_error(deadline, &cancellation))?;
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            before_version = candidates.last().map(DatasetManifestRef::manifest_version);
+            for manifest in candidates {
+                check(deadline, &cancellation)?;
+                match self
+                    .read_origin(
+                        runtime.clone(),
+                        manifest,
+                        None,
+                        true,
+                        as_of,
+                        deadline,
+                        &cancellation,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some(read)) => return Ok(Some(read)),
+                    Ok(None) => {}
+                    Err(CompletedMarketSessionError::Unavailable) => {
+                        tracing::warn!(
+                            stage = "calendar-origin-read",
+                            "completed market calendar selection unavailable"
+                        );
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            stage = "calendar-origin-selection",
+                            "completed market calendar selection unavailable"
+                        );
+                        return Err(error);
+                    }
                 }
             }
+            if !has_more {
+                return Ok(None);
+            }
         }
-        Ok(None)
     }
 
     /// Reopens only the original content/binding pair. It never substitutes a newer calendar.

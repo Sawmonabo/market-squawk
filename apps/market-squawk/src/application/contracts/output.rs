@@ -2219,7 +2219,7 @@ fn market_product_row() -> Value {
             nullable(closed_complete(vec![
                 (
                     "priceBasis",
-                    enumeration(&["last_trade", "bid_ask_midpoint"]),
+                    enumeration(&["last_trade", "bid_ask_midpoint", "previous_close"]),
                 ),
                 ("priceAsOf", canonical_market_timestamp()),
                 (

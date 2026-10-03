@@ -2,7 +2,59 @@
 
 ## Current execution — 2026-10-03
 
-### Active wave — selected filing transform completion
+
+### Active wave — session-correct daily changes and first complete stock analysis
+
+Refresh base `1dbb5f54`, clean single feature worktree; source checkpoint `4f92916c` runs as
+service 76207 with Desktop 5863. Previous goal turn made progress: pushed filing/ratio fixes,
+actual completed TSLA acquisition, MSFT/TSLA financial reads and automatic service reconnect.
+Acceptance 2/5/6: nine starter cards still lack daily changes because terminal close and prior-session
+comparison are conflated; the complete stock analytical workflow also remains unproved.
+
+| Owner | Disjoint ownership / dependency | Smallest completion evidence |
+| --- | --- | --- |
+| Astra High `closed_session_change` | `application/research/market_history/previous_close.rs`; `application/paper/market/{durable_product,product}.rs`; `application/market_calendar/read.rs`; `application/research/corporate_actions/preflight/display_history.rs`; `local_product/source_lifecycle/display_history.rs` (all under app `src/`) | Refresh existing diagnosis, implement exact native-session comparison and same-owner calendar/day refresh using existing storage/lifecycle; existing product fixture plus minimal uncovered producer/rollover proof |
+| Astra High `stock_preparation_deadline` | Read-only trace of `service/market_evidence*`, analytical workflow host/driver and existing job infrastructure; no edits/builds | Diagnose actual 15-second preparation failure and identify smallest existing-job integration, cancellation/recovery and shared-contract changes |
+| Astra `options_original_recovery` | Read-only refresh of the actual corrected-workspace option-identity failure; existing report, no source/runtime/Git changes | Identify exact guard and proposed narrow producer/identity fix; preserve pending originals |
+| Lead | Shared output contracts, exports and parent-module visibility; `research_service.rs` single reconstructible display-calendar locator; fixed-class option-publication diagnostic in `application/market_runtime/alpaca_option_chain.rs`; Git/build/runtime; actual stock analysis | Native MSFT analysis using already configured account/profile, retain original workflow and first failed edge; integrate producer/consumer changes, critical checks, commit/push and native daily-change proof |
+
+DAG A: exact original history/calendar → compact latest/prior/successor evidence → comparison for
+actual displayed price → existing worker day/calendar wake → synchronized shared clients → critical
+check → matched build/live cards. DAG B runs independently on current stable runtime: native Analyze
+MSFT → actual workflow progress/result or concrete failed edge. No branch/worktree, migration,
+arbitrary lookback shortcut or UTC-day inference. Source edits pause the one watcher; current app
+stays open. Builds remain serialized with one job. No full CI/review round or RAM measurement.
+
+Native MSFT workflow `workflow_cf5ef0fe12425ee18f52b84010fdad43` reached evidence gathering and
+paused after 15 seconds at `Market.PrepareInvestmentEvidence` with `deadline_exceeded`; service
+76207 and Desktop 5863 remained alive. Both original authority-envelope/payload digests were
+verified. The pending request and acknowledged profile receipt remain intact. Exact slow acquisition
+substage is unproved. Evidence: `corrected-msft-analysis-{start,progress,failed-edge}.json` under
+`.agents/tmp/v1-first-stock/`. The completed bounded diagnosis `stock-preparation-deadline.md` in the
+same directory specifies the next dependency: change the canonical preparation operation to existing
+installed-job admission/result/status/cancellation, preserving original request reconciliation,
+initial/final preparation and Find-member binding. No deadline increase or second executor.
+A diagnostic resume of the same workflow then failed at `option_context` with `invalid_result`: the
+current log reports "exact canonical option identity is missing or ambiguous". This is an additional
+source-admission failure, not evidence that managed job custody alone fixes the complete journey.
+The completed option diagnosis confirms restored original pages encounter a renewed source identity while the catalog retains the prior expired identity. The first rejecting runtime guard is not yet proved; the next matched build adds fixed-class diagnostics without changing admission authority.
+This is a concrete failed full-analysis edge, not functional completion. Implement after integrating
+the independently useful daily-change checkpoint; do not reset the current workspace or workflow.
+
+The daily-change implementation is integrated and agent ownership released. It persists the latest
+completed close and immediate native predecessor, rejects gaps, and selects the baseline for the
+actual displayed observation rather than the query date. The existing display worker prepares one
+covering calendar and rechecks on native-day rollover; normal reads use its exact projection locator,
+not a growing calendar scan. Completed prices remain display-only, with no current/execution rights.
+Three focused checks passed: existing product DTO/search fixture (1/1, 0.44s), persisted comparison
+restart/gap fixture (1/1, 0.49s), and native midnight/DST scheduling (1/1, <0.01s). The first single-job
+compile took 4m23s; subsequent checks reused it. Frontend TypeScript build passed. Logs are
+`daily-comparison-{critical,restart-critical,rollover-critical}.log` under
+`.agents/tmp/v1-first-stock/`. The restart fixture checks the persisted comparison shape and calculation;
+it does not alone prove original-source admission. Matched native nine-card/restart evidence remains
+the next barrier. No CI, new review round, schema migration or RAM measurement ran.
+
+### Integrated wave — selected filing transform completion
 
 Base `970d0b56` pushed; acceptance 1/2/5. On the matching service 93334/Desktop 93392,
 TSLA preparation `c2315ed5-f951-432f-b186-e33cda22285f` acquired submissions and Company Facts,

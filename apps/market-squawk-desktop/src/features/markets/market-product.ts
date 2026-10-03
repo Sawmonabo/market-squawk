@@ -63,7 +63,7 @@ export const marketProductRowSchema = z.object({
   quote: marketQuoteSchema.nullable(),
   changePercent: exactDecimalSchema.nullable(),
   changeBasis: z.object({
-    priceBasis: z.enum(["last_trade", "bid_ask_midpoint"]),
+    priceBasis: z.enum(["last_trade", "bid_ask_midpoint", "previous_close"]),
     priceAsOf: productInstantSchema,
     previousClose: moneySchema.extend({ sessionDate: z.iso.date(), asOf: productInstantSchema }).strict(),
     adjustment: z.literal("raw"),

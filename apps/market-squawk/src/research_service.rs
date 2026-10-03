@@ -404,6 +404,8 @@ pub struct ResearchService {
     retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
     application_changes: market_squawk_runtime::ApplicationChanges,
     history_publications: Arc<tokio::sync::Notify>,
+    market_display_calendar:
+        tokio::sync::watch::Sender<Option<market_squawk_data::DatasetManifestRef>>,
 }
 
 #[derive(Debug)]
@@ -648,6 +650,7 @@ impl ResearchService {
             retained_use_policies: retained_use::current_policies()?.into(),
             application_changes,
             history_publications,
+            market_display_calendar: tokio::sync::watch::channel(None).0,
         })
     }
 
@@ -669,6 +672,31 @@ impl ResearchService {
 
     pub(crate) fn history_publications(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.history_publications)
+    }
+
+    /// One reconstructible locator selected by display preparation, never calendar authority.
+    /// Readers reopen the exact persisted projection and recheck its original parents.
+    pub(crate) fn market_display_calendar_origin(
+        &self,
+    ) -> Option<market_squawk_data::DatasetManifestRef> {
+        self.market_display_calendar.borrow().clone()
+    }
+
+    pub(crate) fn set_market_display_calendar_origin(
+        &self,
+        origin: market_squawk_data::DatasetManifestRef,
+    ) {
+        let changed = self.market_display_calendar.send_if_modified(|current| {
+            if current.as_ref() == Some(&origin) {
+                return false;
+            }
+            *current = Some(origin);
+            true
+        });
+        if changed {
+            self.application_changes
+                .record(market_squawk_services::ServiceDomain::Market);
+        }
     }
 
     /// Creates a retained recovery cursor without scanning history or delaying startup.

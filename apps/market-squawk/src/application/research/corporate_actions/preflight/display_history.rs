@@ -67,6 +67,43 @@ impl SourceActionPreparationCapability {
         Ok(history)
     }
 
+    /// One shared calendar admission for the existing display worker, before its instrument
+    /// loop. Publication-only wakes never acquire source data; native-day/activation work can
+    /// recover genuinely missing current coverage through the existing calendar producer.
+    pub(crate) async fn prepare_market_display_calendar(
+        &self,
+        retained_only: bool,
+        deadline: Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<CompletedMarketSessionRead>, ServiceError> {
+        let at = now()?;
+        let selected = self
+            .calendars
+            .select(at, deadline, cancellation.clone())
+            .await
+            .map_err(map_calendar_error);
+        match selected {
+            Ok(Some(calendar)) => return Ok(Some(calendar)),
+            Ok(None) | Err(ServiceError::Unavailable) => {}
+            Err(error) => return Err(error),
+        }
+        if retained_only {
+            return Ok(None);
+        }
+        let Some(reference) = self
+            .calendars
+            .preflight_current_session(deadline, cancellation.clone())
+            .await
+            .map_err(map_calendar_error)?
+        else {
+            return Ok(None);
+        };
+        self.calendars
+            .read_reference(&reference, now()?, deadline, cancellation.clone())
+            .await
+            .map_err(map_calendar_error)
+    }
+
     /// Warms display evidence only. A missing instrument gets one ordinary raw daily
     /// acquisition through the existing canonical publisher; successful publications survive a
     /// later failure. The lifecycle caller retains ownership of the healthy source connection.
@@ -75,6 +112,7 @@ impl SourceActionPreparationCapability {
         runtime: &AlpacaHistoricalRuntimeCapability,
         instrument: &MarketDataInstrumentRecord,
         retained_only: bool,
+        calendar: Option<&CompletedMarketSessionRead>,
         context: &RequestContext,
     ) -> Result<(), ServiceError> {
         let started = Instant::now();
@@ -92,9 +130,10 @@ impl SourceActionPreparationCapability {
                 // It never turns a data-change notification into another provider acquisition.
                 if retained_only {
                     if let Some(retained) = history
-                        .prepare_latest_previous_close(
+                        .prepare_daily_price_comparison(
                             &self.research,
                             instrument_id,
+                            calendar,
                             now()?,
                             context,
                         )
@@ -108,18 +147,8 @@ impl SourceActionPreparationCapability {
                     }
                     return Ok(false);
                 }
-                stage = "current-calendar-selection";
                 let analysis_at = now()?;
-                let calendar = self
-                    .calendars
-                    .select(
-                        analysis_at,
-                        context.deadline(),
-                        context.cancellation().clone(),
-                    )
-                    .await
-                    .map_err(map_calendar_error)?
-                    .ok_or(ServiceError::Unavailable)?;
+                let calendar = calendar.ok_or(ServiceError::Unavailable)?;
                 stage = "current-calendar-venue";
                 if calendar.venue_id().as_str() != "iex" {
                     return Err(ServiceError::InvalidResult);
@@ -138,9 +167,10 @@ impl SourceActionPreparationCapability {
                 let latest_session = latest_session.ok_or(ServiceError::Unavailable)?;
                 stage = "retained-close-read";
                 if let Some(retained) = history
-                    .prepare_latest_previous_close(
+                    .prepare_daily_price_comparison(
                         &self.research,
                         instrument_id,
+                        Some(calendar),
                         analysis_at,
                         context,
                     )
@@ -162,7 +192,13 @@ impl SourceActionPreparationCapability {
                     .await?;
                 stage = "published-close-read";
                 let retained = history
-                    .prepare_latest_previous_close(&self.research, instrument_id, now()?, context)
+                    .prepare_daily_price_comparison(
+                        &self.research,
+                        instrument_id,
+                        Some(calendar),
+                        now()?,
+                        context,
+                    )
                     .await?
                     .ok_or(ServiceError::Unavailable)?;
                 if retained.instrument_id() != instrument_id

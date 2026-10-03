@@ -365,30 +365,39 @@ fn product_price_change(
     current_price: Option<&serde_json::Map<String, Value>>,
     availability: &str,
 ) -> Result<ProductPriceChange, ServiceError> {
-    let Some(price) =
-        current_price.filter(|_| matches!(availability, "current" | "delayed" | "last_known"))
-    else {
+    let Some(price) = current_price.filter(|_| {
+        matches!(
+            availability,
+            "current" | "delayed" | "last_known" | "previous_close"
+        )
+    }) else {
         return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
     };
     let price_basis = exact_text(price, "basis")?;
-    let (fresh_field, value_field, time_field) = match price_basis {
-        "last_trade" => ("lastFresh", "lastPrice", "lastObservedAt"),
-        "bid_ask_midpoint" => ("quoteFresh", "midPrice", "quoteObservedAt"),
-        _ => return Ok(ProductPriceChange::unavailable("current_price_unavailable")),
-    };
-    let quote = row.get("quote");
-    if availability != "last_known"
-        && quote
-            .and_then(|quote| quote.get(fresh_field))
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
-    }
-    if quote.and_then(|quote| quote.get(value_field)) != price.get("value")
-        || quote.and_then(|quote| quote.get(time_field)) != price.get("observedAt")
-    {
-        return Ok(ProductPriceChange::unavailable("incompatible_basis"));
+    if price_basis == "previous_close" {
+        if availability != "previous_close" {
+            return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
+        }
+    } else {
+        let (fresh_field, value_field, time_field) = match price_basis {
+            "last_trade" => ("lastFresh", "lastPrice", "lastObservedAt"),
+            "bid_ask_midpoint" => ("quoteFresh", "midPrice", "quoteObservedAt"),
+            _ => return Ok(ProductPriceChange::unavailable("current_price_unavailable")),
+        };
+        let quote = row.get("quote");
+        if availability != "last_known"
+            && quote
+                .and_then(|quote| quote.get(fresh_field))
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Ok(ProductPriceChange::unavailable("current_price_unavailable"));
+        }
+        if quote.and_then(|quote| quote.get(value_field)) != price.get("value")
+            || quote.and_then(|quote| quote.get(time_field)) != price.get("observedAt")
+        {
+            return Ok(ProductPriceChange::unavailable("incompatible_basis"));
+        }
     }
     let Some(close) = row.get("previousClose").filter(|value| !value.is_null()) else {
         return Ok(ProductPriceChange::unavailable(
@@ -416,16 +425,38 @@ fn product_price_change(
     if session.to_string() != session_date {
         return Err(ServiceError::InvalidResult);
     }
-    // Display observations do not carry exchange-session affiliation. Require
-    // an earlier native close date than the canonical UTC source date, plus an earlier
-    // actual close. The result retains both dates rather than claiming a session return.
+    // The admitted calendar/history producer binds this exact observation to a native
+    // session. Never infer that date from UTC or from when the user opened the card.
+    let Some(price_session) = row.get("priceSession").and_then(Value::as_object) else {
+        return Ok(ProductPriceChange::unavailable("incompatible_basis"));
+    };
+    let price_session_date = exact_text(price_session, "date")?;
+    let price_session_date = chrono::NaiveDate::parse_from_str(price_session_date, "%Y-%m-%d")
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let start = canonical_time(
+        price_session
+            .get("startsAt")
+            .ok_or(ServiceError::InvalidResult)?,
+    )?;
+    let end = canonical_time(
+        price_session
+            .get("endsAt")
+            .ok_or(ServiceError::InvalidResult)?,
+    )?;
+    let start = DateTime::parse_from_rfc3339(&start).map_err(|_| ServiceError::InvalidResult)?;
+    let end = DateTime::parse_from_rfc3339(&end).map_err(|_| ServiceError::InvalidResult)?;
     if row.get("instrumentId") != close.get("instrumentId")
         || currency != currency_text(close, "currency")?
         || exact_text(close, "adjustment")? != "raw"
         || price_value <= Decimal::ZERO
         || close_value <= Decimal::ZERO
         || closed >= observed
-        || session >= observed.date_naive()
+        || session >= price_session_date
+        || price_session.get("observedAt") != price.get("observedAt")
+        || price_session.get("value") != price.get("value")
+        || price_session.get("basis") != price.get("basis")
+        || start >= end
+        || (price_basis != "previous_close" && (observed < start || observed >= end))
     {
         return Ok(ProductPriceChange::unavailable("incompatible_basis"));
     }
@@ -956,6 +987,11 @@ mod tests {
             "sessionDate": "2026-08-08", "asOf": "2026-08-08T20:00:00.000000000Z",
             "adjustment": "raw",
         });
+        quote_row["priceSession"] = json!({
+            "date": "2026-08-09", "startsAt": "2026-08-09T04:00:00.000000000Z",
+            "endsAt": "2026-08-10T04:00:00.000000000Z",
+            "observedAt": observed, "value": "68000.15", "basis": "bid_ask_midpoint",
+        });
         let changed = product_row(identity, &quote_row)?;
         assert_eq!(changed["changePercent"], "6.250234375");
         assert_eq!(changed["changeBasis"]["priceBasis"], "bid_ask_midpoint");
@@ -971,6 +1007,7 @@ mod tests {
         declining["quote"]["midPrice"] = json!("63999.99");
         declining["quote"]["bidPrice"] = json!("63999.98");
         declining["quote"]["askPrice"] = json!("64000");
+        declining["priceSession"]["value"] = json!("63999.99");
         assert_eq!(
             product_row(identity, &declining)?["changePercent"],
             "-0.000015625"
@@ -1020,10 +1057,7 @@ mod tests {
         assert_eq!(closed["quote"], projected["quote"]);
         assert!(closed["changePercent"].is_null());
         assert!(closed["changeBasis"].is_null());
-        assert_eq!(
-            closed["changeUnavailableReason"],
-            "current_price_unavailable"
-        );
+        assert_eq!(closed["changeUnavailableReason"], "incompatible_basis");
         quote_row["quote"]["quoteFresh"] = json!(false);
         let retained = product_row(identity, &quote_row)?;
         assert_eq!(retained["priceBasis"], "previous_close");
@@ -1061,6 +1095,12 @@ mod tests {
         historical["currentPrice"] = retained_display_price(&historical, Some(&close), read_at)?
             .ok_or("missing retained price")?;
         historical["availability"] = json!("last_known");
+        historical["priceSession"] = json!({
+            "date": "2026-10-02", "startsAt": "2026-10-02T04:00:00.000000000Z",
+            "endsAt": "2026-10-03T04:00:00.000000000Z",
+            "observedAt": historical["currentPrice"]["observedAt"],
+            "value": historical["currentPrice"]["value"], "basis": "last_trade",
+        });
         let historical_result = product_row(identity, &historical)?;
         assert_eq!(historical_result["availability"], "last_known");
         assert_eq!(historical_result["price"]["value"], "517.13");
@@ -1106,6 +1146,41 @@ mod tests {
             future["quote"][field] = json!("2026-10-03T20:00:00.000000000Z");
         }
         assert!(retained_display_price(&future, Some(&close), read_at)?.is_none());
+        // A completed Friday price has its own admitted basis; daily change still compares
+        // Thursday, without requiring a fresh quote or manufacturing a current-mark lease.
+        let mut closing = historical.clone();
+        closing["availability"] = json!("end_of_day");
+        closing["currentPrice"]["basis"] = json!("previous_close");
+        closing["currentPrice"]["observedAt"] = json!("2026-10-02T20:00:00.000000000Z");
+        closing["priceSession"]["basis"] = json!("previous_close");
+        closing["priceSession"]["observedAt"] = closing["currentPrice"]["observedAt"].clone();
+        let closing_result = product_row(identity, &closing)?;
+        assert_eq!(closing_result["availability"], "previous_close");
+        assert_eq!(
+            closing_result["changeBasis"]["priceBasis"],
+            "previous_close"
+        );
+        assert_eq!(
+            closing_result["changePercent"],
+            historical_result["changePercent"]
+        );
+        assert_eq!(closing_result["quote"]["lastFresh"], false);
+        // UTC midnight does not create a new native session. The admitted original Friday
+        // day continues until 04:00Z; a Saturday read keeps the Thursday daily comparator.
+        let mut late = historical.clone();
+        for object in ["currentPrice", "priceSession"] {
+            late[object]["observedAt"] = json!("2026-10-03T00:00:00.000000000Z");
+        }
+        late["quote"]["lastObservedAt"] = late["currentPrice"]["observedAt"].clone();
+        assert_eq!(
+            product_row(identity, &late)?["changePercent"],
+            historical_result["changePercent"]
+        );
+        late["previousClose"]["sessionDate"] = json!("2026-10-02");
+        assert_eq!(
+            product_row(identity, &late)?["changeUnavailableReason"],
+            "incompatible_basis"
+        );
         historical["previousClose"]["sessionDate"] = json!("2026-10-02");
         historical["previousClose"]["asOf"] = json!("2026-10-02T20:00:00.000000000Z");
         assert_eq!(
