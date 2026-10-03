@@ -3045,6 +3045,7 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
     drop(lease);
     let option_admission = |underlying, namespace| AlpacaOptionReferenceAdmission {
         source: option_source.clone(),
+        origin: None,
         rights: vec![option_rights.clone()],
         originals: originals.clone(),
         contracts: Arc::clone(&contracts),

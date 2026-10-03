@@ -104,6 +104,7 @@ pub struct AlpacaOptionChainPublicationRequest {
     underlying_reference: MarketDataReference,
     contracts: Vec<AlpacaOptionChainContractAuthority>,
     original_contracts: AlpacaOptionContractReferenceSet,
+    reference_origin: Option<market_squawk_sources::OptionReferenceOrigin>,
     currency: Currency,
     entitlement_evidence: EvidenceDigest,
     capability_evidence: EvidenceDigest,
@@ -173,10 +174,20 @@ impl AlpacaOptionChainPublicationRequest {
             underlying_reference,
             contracts,
             original_contracts,
+            reference_origin: None,
             entitlement_evidence,
             capability_evidence,
             ingested_at,
         })
+    }
+
+    /// Preserves historical references under separately admitted current doctor authority.
+    pub fn with_reference_origin(
+        mut self,
+        origin: market_squawk_sources::OptionReferenceOrigin,
+    ) -> Self {
+        self.reference_origin = Some(origin);
+        self
     }
 }
 
@@ -554,7 +565,13 @@ impl AlpacaOptionChainSealRejoin {
             &self.provider_channel,
             batch.row_count(),
         )?;
-        let reference_dependencies = request.original_contracts.dependencies_for(&batch)?;
+        let mut reference_dependencies = request.original_contracts.dependencies_for(&batch)?;
+        if let Some(origin) = request.reference_origin {
+            let first = reference_dependencies
+                .first_mut()
+                .ok_or(AlpacaError::CaptureMaterial)?;
+            *first = first.clone().with_origin(origin);
+        }
         Ok(AlpacaPreparedOptionMarketPublication {
             parts: AlpacaOptionMarketPublicationParts {
                 authority,

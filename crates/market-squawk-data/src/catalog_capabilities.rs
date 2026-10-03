@@ -719,6 +719,26 @@ impl OnboardingCatalogCapability {
         self.lock()?.resume_provider_onboarding(session_id)
     }
 
+    /// Reads a validated historical doctor chain without issuing runtime authority.
+    pub fn retained_alpaca_doctor_renewal_chain(
+        &self,
+        session_id: Uuid,
+        generation: SecretGeneration,
+        original_verified_at: Timestamp,
+    ) -> Result<
+        (
+            ResumedProviderOnboarding,
+            market_squawk_sources::AlpacaDoctorRenewalChain,
+        ),
+        CatalogError,
+    > {
+        self.lock()?.retained_alpaca_doctor_renewal_chain(
+            session_id,
+            generation,
+            original_verified_at,
+        )
+    }
+
     /// Returns newest-first durable sessions within one global row and byte bound.
     pub fn provider_onboarding_sessions(
         &self,

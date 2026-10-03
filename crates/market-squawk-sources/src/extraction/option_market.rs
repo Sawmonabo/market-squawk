@@ -936,12 +936,107 @@ impl ProviderOptionContractReferenceRow {
     }
 }
 
-/// Physically verified original reference dependency with exact term-row associations.
-/// This value is evidence only; catalog custody and rights remain separate commit authority.
+/// Historical relation between original option references and a renewed acquisition.
+/// Catalog custody and current publication permission remain separate authorities.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionReferenceOrigin {
+    source: SourceId,
+    original_revision: MetadataRevision,
+    current_revision: MetadataRevision,
+    renewal: crate::AlpacaDoctorRenewalChain,
+}
+
+impl OptionReferenceOrigin {
+    /// Joins retained acquisition metadata to a separately admitted same-credential renewal.
+    pub fn try_new(
+        original: &crate::SourceMetadata,
+        current: &crate::SourceMetadata,
+        renewal: crate::AlpacaDoctorRenewalChain,
+    ) -> Result<Self, ProviderCaptureError> {
+        let value = Self {
+            source: original.source_id().clone(),
+            original_revision: original.revision().clone(),
+            current_revision: current.revision().clone(),
+            renewal,
+        };
+        value.validate_metadata(original, current)?;
+        Ok(value)
+    }
+
+    /// Checks the exact immutable catalog metadata against the retained doctor clocks.
+    pub fn validate_metadata(
+        &self,
+        original: &crate::SourceMetadata,
+        current: &crate::SourceMetadata,
+    ) -> Result<(), ProviderCaptureError> {
+        let prior = self.renewal.original();
+        let next = self.renewal.current();
+        if original.source_id() != &self.source
+            || current.source_id() != &self.source
+            || original.revision() != &self.original_revision
+            || current.revision() != &self.current_revision
+            || original.provider().as_str() != "alpaca-market-data"
+            || current.provider() != original.provider()
+            || original.authorization().effective_interval().starts_at() != prior.verified_at()
+            || original.authorization().effective_interval().ends_at()
+                != Some(prior.exclusive_expires_at())
+            || current.authorization().effective_interval().starts_at() != next.verified_at()
+            || current.authorization().effective_interval().ends_at()
+                != Some(next.exclusive_expires_at())
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validates original acquisition and fresh observation independently, preserving both clocks.
+    pub fn validate_capture_pair(
+        &self,
+        original: &super::capture::ProviderCaptureSetReceipt,
+        current: &super::capture::ProviderCaptureSetReceipt,
+    ) -> Result<(), ProviderCaptureError> {
+        if original.source_id() != &self.source
+            || current.source_id() != &self.source
+            || original.metadata_revision() != &self.original_revision
+            || current.metadata_revision() != &self.current_revision
+            || original.pages().is_empty()
+            || current.pages().is_empty()
+            || original
+                .pages()
+                .iter()
+                .any(|page| !self.renewal.original().is_current_at(page.received_at()))
+            || current
+                .pages()
+                .iter()
+                .any(|page| !self.renewal.current().is_current_at(page.received_at()))
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns immutable historical renewal evidence, never live publication permission.
+    pub const fn renewal(&self) -> &crate::AlpacaDoctorRenewalChain {
+        &self.renewal
+    }
+
+    /// Exact serialized relationship commitment included in the existing option binding digest.
+    pub fn evidence_digest(&self) -> Result<EvidenceDigest, ProviderCaptureError> {
+        Ok(sha256(&serialize_bounded(
+            self,
+            MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
+            MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
+        )?))
+    }
+}
+
+/// One physically sealed original page and its exact canonical term associations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderOptionContractReferenceDependency {
     capture: SealedProviderCaptureSetReceipt,
     rows: Box<[ProviderOptionContractReferenceRow]>,
+    origin: Option<OptionReferenceOrigin>,
 }
 impl ProviderOptionContractReferenceDependency {
     /// Binds all canonical rows that consume this exact original reference page.
@@ -977,7 +1072,17 @@ impl ProviderOptionContractReferenceDependency {
         Ok(Self {
             capture,
             rows: rows.into_boxed_slice(),
+            origin: None,
         })
+    }
+    /// Attaches the complete shared original-session relationship to its first page only.
+    pub fn with_origin(mut self, origin: OptionReferenceOrigin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+    /// Returns the shared historical relationship carried only by the first page.
+    pub const fn origin(&self) -> Option<&OptionReferenceOrigin> {
+        self.origin.as_ref()
     }
     /// Returns the complete original raw/physical capture evidence.
     pub const fn capture(&self) -> &SealedProviderCaptureSetReceipt {
@@ -1127,7 +1232,18 @@ fn validate_reference_dependencies(
     let mut captures = BTreeSet::new();
     let mut previous_at = None;
     let mut relationship_bytes = 2_usize;
-    for dependency in dependencies {
+    let origin = dependencies
+        .first()
+        .and_then(ProviderOptionContractReferenceDependency::origin);
+    if let Some(origin) = origin {
+        relationship_bytes += serialize_bounded(
+            origin,
+            MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
+            MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
+        )?
+        .len();
+    }
+    for (ordinal, dependency) in dependencies.iter().enumerate() {
         // The catalog wire adds one 64-byte digest and fixed field names per page.
         relationship_bytes = relationship_bytes
             .checked_add(128)
@@ -1147,7 +1263,13 @@ fn validate_reference_dependencies(
         let capture = dependency.capture.capture();
         let at = capture.pages()[0].received_at();
         if capture.source_id() != batch.scope().source_id()
-            || capture.metadata_revision() != batch.scope().metadata_revision()
+            || (ordinal != 0 && dependency.origin.is_some())
+            || match origin {
+                Some(origin) => origin
+                    .validate_capture_pair(capture, authority.persisted_receipt().capture())
+                    .is_err(),
+                None => capture.metadata_revision() != batch.scope().metadata_revision(),
+            }
             || at > first_market_at
             || previous_at.is_some_and(|previous| previous > at)
             || !captures.insert(capture.observation_digest().bytes())
@@ -1478,6 +1600,9 @@ fn option_market_binding_digest(
             &mut digest,
             dependency.capture.capture().observation_digest(),
         );
+        if let Some(origin) = &dependency.origin {
+            hash_digest(&mut digest, origin.evidence_digest()?);
+        }
         hash_length(&mut digest, dependency.rows.len())?;
         for row in &dependency.rows {
             digest.update(row.canonical_row_ordinal.to_be_bytes());

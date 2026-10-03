@@ -2228,7 +2228,7 @@ fn validate_retained_source_revisions(
     capture: &ProviderCaptureSetReceipt,
 ) -> Result<(), CatalogError> {
     for (source_id, metadata_revision) in capture_source_authorities(capture) {
-        validate_retained_source_revision(
+        load_retained_source_revision(
             connection,
             &source_id,
             &MetadataRevision::new(metadata_revision),
@@ -2254,11 +2254,11 @@ fn capture_source_authorities(
     authorities
 }
 
-fn validate_retained_source_revision(
+pub(in crate::catalog) fn load_retained_source_revision(
     connection: &Connection,
     source_id: &SourceId,
     metadata_revision: &MetadataRevision,
-) -> Result<(), CatalogError> {
+) -> Result<SourceMetadata, CatalogError> {
     let mut statement = connection.prepare(
         "SELECT revision_digest, metadata_json
          FROM source_revisions
@@ -2284,7 +2284,7 @@ fn validate_retained_source_revision(
     if source.source_id() != source_id || source.revision() != metadata_revision {
         return Err(CatalogError::CorruptCatalog);
     }
-    Ok(())
+    Ok(source)
 }
 
 fn row_mapping_digest(

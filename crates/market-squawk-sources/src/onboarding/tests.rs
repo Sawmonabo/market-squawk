@@ -1090,7 +1090,7 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
         capability,
         OnboardingEvent::RuntimeVerified {
             generation: Some(generation),
-            evidence: alpaca_runtime_evidence(initial_receipt),
+            evidence: alpaca_runtime_evidence(initial_receipt.clone()),
         },
         Timestamp::from_unix_nanos(1_100),
     )?;
@@ -1167,6 +1167,17 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
             Some(predecessor),
         )?)?;
         assert!(
+            AlpacaDoctorRenewalChain::try_new(vec![initial_receipt.clone(), rejected.clone()])
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AlpacaDoctorRenewalChain>(serde_json::json!([
+                initial_receipt,
+                rejected
+            ]))
+            .is_err()
+        );
+        assert!(
             pending_renewal
                 .apply(
                     capability,
@@ -1198,6 +1209,15 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
         Some(initial_digest),
     )?)?;
     let refreshed_digest = refreshed.receipt_sha256();
+    let historical =
+        AlpacaDoctorRenewalChain::try_new(vec![initial_receipt.clone(), refreshed.clone()])?;
+    assert_eq!(historical.original(), &initial_receipt);
+    assert_eq!(historical.current(), &refreshed);
+    assert!(!historical.original().is_current_at(pending_verified_at));
+    assert_eq!(
+        serde_json::from_slice::<AlpacaDoctorRenewalChain>(&serde_json::to_vec(&historical)?)?,
+        historical
+    );
     assert_eq!(
         pending_renewal.apply(
             capability,

@@ -293,6 +293,61 @@ impl ResearchProviderRuntimeGeneration {
         )
     }
 
+    /// Reconstructs acquisition identity only; this value cannot register or reactivate a runtime.
+    /// The caller must compare the result with the digest sealed into the original custody context.
+    pub(crate) fn retained_option_generation_digest(
+        &self,
+        metadata: SourceMetadata,
+        renewal: &market_squawk_sources::AlpacaDoctorRenewalChain,
+    ) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
+        let current = RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(Box::new(
+            renewal.current().clone(),
+        ));
+        if self.runtime_verification.as_ref() != Some(&current)
+            || self.metadata.source_id() != metadata.source_id()
+            || self.session_id.to_string() != renewal.original().session_identifier().as_str()
+            || self.credential_generation != Some(renewal.original().generation())
+            || self.capability_revision != renewal.original().capability_revision()
+            || self.capability_digest != renewal.original().capability_digest()
+            || self.rights.parent_authorization_evidence
+                != renewal.original().rights_decision_digest()
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let mut original = self.clone();
+        original.authority_effective_at = renewal.original().verified_at();
+        original.runtime_verification =
+            Some(RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(
+                Box::new(renewal.original().clone()),
+            ));
+        original.metadata = metadata;
+        if !original
+            .metadata
+            .is_effective_at(original.authority_effective_at)
+            || (self.generation_digest()? != original.generation_digest()?
+                && !self.is_same_credential_option_renewal_of(&original))
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        original.generation_digest()
+    }
+
+    fn is_same_credential_option_renewal_of(&self, original: &Self) -> bool {
+        self.profile == original.profile
+            && self.session_id == original.session_id
+            && self.credential_generation == original.credential_generation
+            && self.secret_reference == original.secret_reference
+            && self.capability_revision == original.capability_revision
+            && self.capability_digest == original.capability_digest
+            && self.rights.parent_authorization_evidence
+                == original.rights.parent_authorization_evidence
+            && self.rights.authorization_evidence == original.rights.authorization_evidence
+            && self.rights.basis == original.rights.basis
+            && self.rights.permitted_operations == original.rights.permitted_operations
+            && self.rights.exact_subjects == original.rights.exact_subjects
+            && self.has_renewed_runtime_verification(original)
+    }
+
     fn is_exact_successor_of(
         &self,
         expected: &Self,

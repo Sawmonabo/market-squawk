@@ -519,6 +519,39 @@ impl ProviderOnboardingService {
         })
     }
 
+    /// Validates current access separately from the original doctor's historical chain.
+    pub(crate) fn retained_alpaca_doctor_renewal_chain(
+        &self,
+        expected: &ProviderActivationLease,
+        original_verified_at: Timestamp,
+    ) -> Result<market_squawk_sources::AlpacaDoctorRenewalChain, ProviderOnboardingError> {
+        let generation = expected
+            .generation()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let (resumed, chain) = self.catalog.retained_alpaca_doctor_renewal_chain(
+            expected.session_id(),
+            generation,
+            original_verified_at,
+        )?;
+        let profile = self.current_profile_for(&resumed)?;
+        let current = match self.lease_from_resumed(&resumed, profile) {
+            Ok(lease) => lease,
+            Err(ProviderOnboardingError::ActivationUnavailable) => {
+                self.prepared_lease_from_resumed(&resumed, profile)?
+            }
+            Err(error) => return Err(error),
+        };
+        require_same_active_lease(&current, expected)?;
+        if expected
+            .runtime_verification_evidence()
+            .alpaca_paper_iex_receipt()
+            != Some(chain.current())
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        Ok(chain)
+    }
+
     pub(crate) fn discard_prepared_activation_at_startup(
         &self,
         prepared: &ProviderActivationLease,

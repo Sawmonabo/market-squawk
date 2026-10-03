@@ -30,7 +30,7 @@ use market_squawk_domain::{
     ProviderInstrumentId, Timestamp,
 };
 use market_squawk_services::ServiceError;
-use market_squawk_sources::HttpRequestBounds;
+use market_squawk_sources::{HttpRequestBounds, OptionReferenceOrigin};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -320,14 +320,7 @@ impl Worker {
         if let Some(original) = pending {
             let saved: OriginalContext = serde_json::from_slice(original.context())
                 .map_err(|error| custody_error("resume.context", Some(0), &error))?;
-            if saved.version != 1
-                || saved.source != *self.authority.metadata().source_id()
-                || saved.generation
-                    != self
-                        .generation
-                        .generation_digest()
-                        .map_err(|_| OptionChainDemandError::Authority)?
-            {
+            if saved.version != 1 || saved.source != *self.authority.metadata().source_id() {
                 return Err(OptionChainDemandError::PendingOriginalDemand);
             }
             // Finish exactly the retained scope before admitting a different current demand.
@@ -387,7 +380,7 @@ impl Worker {
                 .await
                 .map_err(|error| custody_error("original.lease", None, &error))?,
         );
-        let (originals, original_receipts) = self
+        let (originals, original_receipts, reference_origin) = self
             .originals(
                 demand,
                 &reference_request,
@@ -458,6 +451,7 @@ impl Worker {
             .publish_alpaca_option_references(
                 market_squawk_data::AlpacaOptionReferenceAdmission {
                     source: operation.source().clone(),
+                    origin: reference_origin.clone(),
                     rights: original_rights,
                     originals: original_receipts,
                     contracts: Arc::clone(&originals),
@@ -545,7 +539,7 @@ impl Worker {
             .map_err(|error| custody_error("chain.seal", None, &error))?;
         ensure_active(deadline, caller)?;
         let observed_at = timestamp()?;
-        let request = AlpacaOptionChainPublicationRequest::try_new(
+        let mut request = AlpacaOptionChainPublicationRequest::try_new(
             underlying,
             contracts,
             originals,
@@ -554,6 +548,9 @@ impl Worker {
             observed_at,
         )
         .map_err(|_| OptionChainDemandError::Identity)?;
+        if let Some(origin) = reference_origin {
+            request = request.with_reference_origin(origin);
+        }
         let binding = rejoin
             .try_rejoin(sealed, request)
             .and_then(|prepared| prepared.try_into_binding())
@@ -605,6 +602,7 @@ impl Worker {
         (
             AlpacaOptionContractReferenceSet,
             Vec<ProviderCaptureOriginalReceipt>,
+            Option<OptionReferenceOrigin>,
         ),
         OptionChainDemandError,
     > {
@@ -618,15 +616,10 @@ impl Worker {
             .await
             .map_err(|error| custody_error("original.pending.worker", None, &error))?
             .map_err(|error| custody_error("original.pending.catalog", None, &error))?;
-        let (context, originals) = if let Some(first) = pending {
+        let (context, originals, origin) = if let Some(first) = pending {
             let context: OriginalContext = serde_json::from_slice(first.context())
                 .map_err(|error| custody_error("original.context", Some(0), &error))?;
             if context.version != 1
-                || context.generation
-                    != self
-                        .generation
-                        .generation_digest()
-                        .map_err(|_| OptionChainDemandError::Authority)?
                 || context.demand != *demand
                 || context.request != *request
                 || context.source != *self.authority.metadata().source_id()
@@ -634,6 +627,9 @@ impl Worker {
             {
                 return Err(OptionChainDemandError::PendingOriginalDemand);
             }
+            let origin = self
+                .original_origin(&context, &first, deadline, caller)
+                .await?;
             let data = self.research.analytical_service();
             let session = first.session();
             let count = first.expected_count();
@@ -663,7 +659,7 @@ impl Worker {
                 })
                 .await
                 .map_err(|error| custody_error("original.load.worker", None, &error))??;
-            (context, originals)
+            (context, originals, origin)
         } else {
             let research = Arc::clone(&self.research);
             let page_lease = Arc::clone(&lease);
@@ -767,12 +763,72 @@ impl Worker {
                 })
                 .await
                 .map_err(|error| custody_error("original.retain.worker", None, &error))??;
-            (context, originals)
+            (context, originals, None)
         };
         let proof = self
             .replay(context, originals.clone(), lease, deadline, caller)
             .await?;
-        Ok((proof, originals))
+        Ok((proof, originals, origin))
+    }
+
+    async fn original_origin(
+        &self,
+        context: &OriginalContext,
+        original: &ProviderCaptureOriginalReceipt,
+        deadline: Instant,
+        caller: &CancellationToken,
+    ) -> Result<Option<OptionReferenceOrigin>, OptionChainDemandError> {
+        let current = self
+            .generation
+            .generation_digest()
+            .map_err(|_| OptionChainDemandError::Authority)?;
+        if context.generation == current {
+            return Ok(None);
+        }
+        let data = self.research.analytical_service();
+        let capture = original.capture().clone();
+        let original_metadata = self
+            .research
+            .run_owned_research_io(deadline, caller, move |worker| {
+                let at = capture
+                    .pages()
+                    .first()
+                    .ok_or(OptionChainDemandError::Custody)?
+                    .received_at();
+                data.retained_source_metadata(
+                    capture.source_id(),
+                    capture.metadata_revision(),
+                    at,
+                    deadline,
+                    &worker,
+                )
+                .map_err(|_| OptionChainDemandError::Custody)?
+                .ok_or(OptionChainDemandError::Custody)
+            })
+            .await
+            .map_err(|_| OptionChainDemandError::Custody)??;
+        let original_at = original_metadata
+            .authorization()
+            .effective_interval()
+            .starts_at();
+        let renewal = tokio::select! { biased;
+            () = caller.cancelled() => return Err(OptionChainDemandError::Cancelled),
+            () = self.cancellation.cancelled() => return Err(OptionChainDemandError::Revoked),
+            () = tokio::time::sleep_until(deadline.into()) => return Err(OptionChainDemandError::Deadline),
+            result = self.authority.retained_alpaca_doctor_renewal_chain(original_at) =>
+                result.map_err(map_acquisition)?,
+        };
+        if self
+            .generation
+            .retained_option_generation_digest(original_metadata.clone(), &renewal)
+            .map_err(|_| OptionChainDemandError::IncompatibleOriginalAuthority)?
+            != context.generation
+        {
+            return Err(OptionChainDemandError::IncompatibleOriginalAuthority);
+        }
+        OptionReferenceOrigin::try_new(&original_metadata, self.generation.metadata(), renewal)
+            .map(Some)
+            .map_err(|_| OptionChainDemandError::IncompatibleOriginalAuthority)
     }
     async fn replay(
         &self,
@@ -1043,6 +1099,8 @@ pub(crate) enum OptionChainDemandError {
     Custody,
     #[error("a retained option request must be resumed before a different request")]
     PendingOriginalDemand,
+    #[error("retained option evidence belongs to a different provider authority")]
+    IncompatibleOriginalAuthority,
     #[error("exact canonical option identity is missing or ambiguous")]
     Identity,
     #[error("option publication failed")]

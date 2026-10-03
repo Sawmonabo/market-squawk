@@ -25,6 +25,8 @@ type Error = MarketDataInstrumentCatalogError;
 pub struct AlpacaOptionReferenceAdmission {
     /// Exact registered Alpaca source generation.
     pub source: SourceMetadata,
+    /// Historical same-credential relationship, while `source` remains current permission.
+    pub origin: Option<market_squawk_sources::OptionReferenceOrigin>,
     /// One current rights decision for each original page, in original page order.
     pub rights: Vec<RightsDecisionInput>,
     /// Exact catalog-owned original custody receipts, in complete session order.
@@ -159,6 +161,17 @@ impl CatalogAuthority {
                 let [page] = capture.capture().pages() else {
                     return Err(Error::InvalidInput);
                 };
+                let original_source = super::super::provider_option::retained_option_source(
+                    &transaction,
+                    capture.capture(),
+                )?;
+                if let Some(origin) = &input.origin {
+                    origin
+                        .validate_metadata(&original_source, &input.source)
+                        .map_err(|_| Error::SourceIdentityConflict)?;
+                } else if original_source != input.source {
+                    return Err(Error::SourceIdentityConflict);
+                }
                 if retained != *original
                     || original.ordinal() as usize != index
                     || usize::from(original.expected_count()) != input.originals.len()
@@ -168,14 +181,14 @@ impl CatalogAuthority {
                     || original.physical().sealed_capture_receipt_digest()
                         != capture.receipt_digest()
                     || capture.capture().source_id() != input.source.source_id()
-                    || capture.capture().metadata_revision() != input.source.revision()
+                    || capture.capture().metadata_revision() != original_source.revision()
                     || decision.source_id != *input.source.source_id()
                     || decision.payload_digest != capture.capture().observation_digest()
                     || decision.retrieved_at != page.received_at()
                     || !matches!(&decision.basis, crate::RightsBasis::ReviewedTerms(_))
                     || page.http_status() != 200
                     || page.received_at() > admitted_at
-                    || !input.source.is_effective_at(page.received_at())
+                    || !original_source.is_effective_at(page.received_at())
                 {
                     return Err(Error::SourceIdentityConflict);
                 }

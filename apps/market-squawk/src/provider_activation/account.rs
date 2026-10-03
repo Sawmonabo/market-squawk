@@ -243,6 +243,25 @@ impl ProviderAccountRuntimeCurrentness {
         })
     }
 
+    /// Reopens retained doctor evidence under the same current account admission.
+    pub(crate) async fn retained_alpaca_doctor_renewal_chain(
+        &self,
+        original_verified_at: market_squawk_domain::Timestamp,
+    ) -> Result<market_squawk_sources::AlpacaDoctorRenewalChain, crate::ProviderOnboardingError>
+    {
+        let authority = self
+            .authority
+            .upgrade()
+            .ok_or(crate::ProviderOnboardingError::ActivationUnavailable)?;
+        let _admission = authority
+            .onboarding
+            .acquire_owned_runtime_read_authority()
+            .await;
+        authority
+            .onboarding
+            .retained_alpaca_doctor_renewal_chain(&authority.lease, original_verified_at)
+    }
+
     /// Returns whether the exact retained account lease is still active.
     pub(crate) async fn is_active(&self) -> bool {
         let Some(authority) = self.authority.upgrade() else {

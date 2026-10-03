@@ -532,6 +532,66 @@ impl CatalogAuthority {
         Ok(loaded.into_public())
     }
 
+    /// Reopens an original Alpaca doctor and its validated renewal successors.
+    /// The returned history grants no activation or publication authority.
+    pub fn retained_alpaca_doctor_renewal_chain(
+        &self,
+        session_id: Uuid,
+        generation: SecretGeneration,
+        original_verified_at: Timestamp,
+    ) -> Result<
+        (
+            ResumedProviderOnboarding,
+            market_squawk_sources::AlpacaDoctorRenewalChain,
+        ),
+        CatalogError,
+    > {
+        let transaction = self.catalog().connection.unchecked_transaction()?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
+        let resumed =
+            load_session(&transaction, self.session_id(), session_id, &mut budget)?.into_public();
+        let current = resumed
+            .lifecycle()
+            .generation_runtime_evidence(generation)
+            .and_then(market_squawk_sources::RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
+            .ok_or(CatalogError::InvalidRecord)?;
+        let chain = {
+            // load_session validated this entire event stream in the same snapshot.
+            let mut statement = transaction.prepare(
+                "SELECT event_json FROM provider_onboarding_events
+                 WHERE session_id=?1 AND credential_generation=?2 AND event_kind='runtime_verified'
+                 ORDER BY sequence",
+            )?;
+            let mut rows = statement.query(params![
+                session_id.to_string(),
+                to_sql_u64(generation.get())?
+            ])?;
+            let mut doctors = Vec::new();
+            while let Some(row) = rows.next()? {
+                let json: Vec<u8> = row.get(0)?;
+                budget.charge([json.len()])?;
+                if let OnboardingEvent::RuntimeVerified {
+                    generation: Some(saved_generation),
+                    evidence: market_squawk_sources::RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(doctor),
+                } = OnboardingEvent::try_from_json(&json).map_err(|_| CatalogError::CorruptCatalog)? {
+                    if saved_generation != generation {
+                        return Err(CatalogError::CorruptCatalog);
+                    }
+                    if doctor.verified_at() >= original_verified_at {
+                        doctors.push(*doctor);
+                    }
+                }
+            }
+            market_squawk_sources::AlpacaDoctorRenewalChain::try_new(doctors)
+                .map_err(|_| CatalogError::InvalidRecord)?
+        };
+        if chain.original().verified_at() != original_verified_at || chain.current() != current {
+            return Err(CatalogError::InvalidRecord);
+        }
+        transaction.commit()?;
+        Ok((resumed, chain))
+    }
+
     /// Returns newest-first durable sessions within one global row and byte bound.
     pub fn provider_onboarding_sessions(
         &self,

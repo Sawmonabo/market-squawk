@@ -822,6 +822,60 @@ impl AlpacaPaperIexDoctorReceiptV1 {
     }
 }
 
+/// Historical same-credential doctor succession. This evidence grants no runtime authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct AlpacaDoctorRenewalChain(Vec<AlpacaPaperIexDoctorReceiptV1>);
+
+impl AlpacaDoctorRenewalChain {
+    /// Validates every doctor and exact predecessor without extending any validity interval.
+    pub fn try_new(
+        receipts: Vec<AlpacaPaperIexDoctorReceiptV1>,
+    ) -> Result<Self, RuntimeVerificationEvidenceError> {
+        if receipts.is_empty() {
+            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
+        }
+        for receipt in &receipts {
+            receipt.revalidate()?;
+            if !receipt.admits_source_start() {
+                return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
+            }
+        }
+        for pair in receipts.windows(2) {
+            let [prior, next] = pair else {
+                return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
+            };
+            if !next.same_authority_as(prior)
+                || next.predecessor_digest() != Some(prior.receipt_sha256())
+                || next.verified_at() <= prior.verified_at()
+                || next.exclusive_expires_at() < prior.exclusive_expires_at()
+            {
+                return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
+            }
+        }
+        Ok(Self(receipts))
+    }
+
+    /// Returns the original historical doctor, without activating its expired authority.
+    pub fn original(&self) -> &AlpacaPaperIexDoctorReceiptV1 {
+        &self.0[0]
+    }
+
+    /// Returns the terminal doctor; live permission must still be checked independently.
+    pub fn current(&self) -> &AlpacaPaperIexDoctorReceiptV1 {
+        &self.0[self.0.len() - 1]
+    }
+}
+
+impl<'de> Deserialize<'de> for AlpacaDoctorRenewalChain {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_new(Vec::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 impl<'de> Deserialize<'de> for AlpacaPaperIexDoctorReceiptV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

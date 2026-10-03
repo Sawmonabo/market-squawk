@@ -100,7 +100,7 @@ pub use option_market::{
     OptionExpirationRange, OptionMarketBatchDisposition, OptionMarketBatchKind,
     OptionMarketCompleteness, OptionMarketCompletenessInput, OptionMarketCursorState,
     OptionMarketRequestFilter, OptionMarketRequestScope, OptionMarketRequestScopeInput,
-    OptionStrikeRange, PROVIDER_OPTION_MARKET_SCHEMA_VERSION,
+    OptionReferenceOrigin, OptionStrikeRange, PROVIDER_OPTION_MARKET_SCHEMA_VERSION,
     ProviderOptionContractReferenceDependency, ProviderOptionContractReferenceRow,
     ProviderOptionMarketBatch, ProviderOptionMarketBindingDigest,
     ProviderOptionMarketContentIdentity, ProviderOptionMarketNativeLineageBatch,

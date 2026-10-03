@@ -608,6 +608,9 @@ pub(in crate::catalog) fn validate_option_dependencies(
     };
     let mut session = None;
     let mut predecessor = None;
+    let origin = dependencies
+        .first()
+        .and_then(|dependency| dependency.origin());
     for (ordinal, dependency) in dependencies.iter().enumerate() {
         let mut statement = connection.prepare(
             "SELECT session_digest, ordinal FROM provider_capture_originals
@@ -639,7 +642,18 @@ pub(in crate::catalog) fn validate_option_dependencies(
             || original.physical != *dependency.physical()
             || original.predecessor != predecessor
             || original.capture.source_id() != evidence.capture().source_id()
-            || original.capture.metadata_revision() != evidence.capture().metadata_revision()
+            || match origin {
+                Some(origin) => super::super::provider_option::validate_retained_option_origin(
+                    connection,
+                    origin,
+                    &original.capture,
+                    evidence.capture(),
+                )
+                .is_err(),
+                None => {
+                    original.capture.metadata_revision() != evidence.capture().metadata_revision()
+                }
+            }
             || original.decoded_at > evidence.capture().pages()[0].received_at()
             || (published && original.published != Some(evidence.binding_digest()))
             || (!published && original.published.is_some())
@@ -647,13 +661,16 @@ pub(in crate::catalog) fn validate_option_dependencies(
             return Err(CatalogError::ProviderCaptureConflict);
         }
         {
+            // Custody was acquired under the original grant. Fresh publication permission is
+            // independently checked by the current run and transaction-bound precommit owner.
             let rights: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM provider_capture_originals AS original
                 JOIN source_rights AS rights ON rights.rights_id=original.rights_id
                 WHERE original.session_digest=?1 AND original.ordinal=?2 AND rights.source_id=?3
                  AND rights.payload_algorithm=1 AND rights.payload_digest=?4 AND (rights.operation_mask & 4)<>0
-                 AND rights.admitted_at_ns<=?5 AND (rights.authorization_expires_at_ns IS NULL OR rights.authorization_expires_at_ns>?5))",
+                 AND rights.admitted_at_ns<=CASE WHEN ?6 THEN original.retained_at_ns ELSE ?5 END
+                 AND (rights.authorization_expires_at_ns IS NULL OR rights.authorization_expires_at_ns>CASE WHEN ?6 THEN original.retained_at_ns ELSE ?5 END))",
                 params![selected_session.bytes(),i64::from(selected_ordinal),original.capture.source_id().as_str(),
-                    original.capture.observation_digest().bytes(),admitted_at.unix_nanos()],|row| row.get(0))?;
+                    original.capture.observation_digest().bytes(),admitted_at.unix_nanos(),origin.is_some()],|row| row.get(0))?;
             if !rights {
                 return Err(CatalogError::InvalidRightsCapability);
             }

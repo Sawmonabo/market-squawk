@@ -120,6 +120,7 @@ impl PersistedProviderOptionMarketNativeLineage {
 pub struct PersistedOptionContractReferenceDependency {
     metadata: ProviderMetadataCaptureEvidence,
     rows: Vec<ProviderOptionContractReferenceRow>,
+    origin: Option<market_squawk_sources::OptionReferenceOrigin>,
 }
 impl PersistedOptionContractReferenceDependency {
     /// Returns the original reference capture, including the original observation cutoff.
@@ -140,6 +141,10 @@ impl PersistedOptionContractReferenceDependency {
     pub fn rows(&self) -> &[ProviderOptionContractReferenceRow] {
         &self.rows
     }
+    /// Historical renewal relationship shared by the complete ordered original session.
+    pub const fn origin(&self) -> Option<&market_squawk_sources::OptionReferenceOrigin> {
+        self.origin.as_ref()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -147,6 +152,8 @@ impl PersistedOptionContractReferenceDependency {
 struct OptionReferenceDependencyWire {
     dependency_digest: String,
     rows: Vec<ProviderOptionContractReferenceRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<market_squawk_sources::OptionReferenceOrigin>,
 }
 
 /// Historical option publication evidence that cannot recreate live publication authority.
@@ -388,6 +395,7 @@ impl PreparedProviderOptionMarketBinding {
             reference_dependencies.push(PersistedOptionContractReferenceDependency {
                 metadata: ProviderMetadataCaptureEvidence::from_receipt(dependency.capture())?,
                 rows: dependency.rows().to_vec(),
+                origin: dependency.origin().cloned(),
             });
         }
         let evidence = PersistedProviderOptionMarketBindingEvidence {
@@ -945,6 +953,7 @@ fn encode_option_reference_closure(
         .map(|dependency| OptionReferenceDependencyWire {
             dependency_digest: lower_hex(dependency.metadata.digest.bytes()),
             rows: dependency.rows.clone(),
+            origin: dependency.origin.clone(),
         })
         .collect();
     let json = serde_json::to_string(&wire)?;
@@ -986,6 +995,7 @@ fn decode_option_reference_closure(
         dependencies.push(PersistedOptionContractReferenceDependency {
             metadata: metadata::load(connection, digest)?.ok_or(CatalogError::CorruptCatalog)?,
             rows: entry.rows,
+            origin: entry.origin,
         });
     }
     Ok(dependencies)
@@ -1008,7 +1018,11 @@ fn validate_option_reference_closure(
     let mut seen = std::collections::BTreeSet::new();
     let mut captures = std::collections::BTreeSet::new();
     let mut previous_at = None;
-    for dependency in &evidence.reference_dependencies {
+    let origin = evidence
+        .reference_dependencies
+        .first()
+        .and_then(PersistedOptionContractReferenceDependency::origin);
+    for (ordinal, dependency) in evidence.reference_dependencies.iter().enumerate() {
         dependency.metadata.validate()?;
         let capture = &dependency.metadata.capture;
         let at = capture.pages()[0].received_at();
@@ -1017,7 +1031,13 @@ fn validate_option_reference_closure(
             || capture.terminal()
                 != market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
             || capture.source_id() != evidence.capture.source_id()
-            || capture.metadata_revision() != evidence.capture.metadata_revision()
+            || (ordinal != 0 && dependency.origin.is_some())
+            || match origin {
+                Some(origin) => origin
+                    .validate_capture_pair(capture, &evidence.capture)
+                    .is_err(),
+                None => capture.metadata_revision() != evidence.capture.metadata_revision(),
+            }
             || at > evidence.capture.pages()[0].received_at()
             || previous_at.is_some_and(|previous| previous > at)
             || !captures.insert(capture.observation_digest().bytes())
@@ -1043,6 +1063,48 @@ fn validate_option_reference_closure(
     }
     encode_option_reference_closure(&evidence.reference_dependencies)?;
     Ok(())
+}
+
+/// Reopens the immutable metadata that actually admitted one original response.
+pub(in crate::catalog) fn retained_option_source(
+    connection: &Connection,
+    capture: &ProviderCaptureSetReceipt,
+) -> Result<market_squawk_sources::SourceMetadata, CatalogError> {
+    if capture.pages().is_empty() {
+        return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    let metadata = super::provider_capture::load_retained_source_revision(
+        connection,
+        capture.source_id(),
+        capture.metadata_revision(),
+    )?;
+    if metadata.source_id() != capture.source_id()
+        || metadata.revision() != capture.metadata_revision()
+        || capture
+            .pages()
+            .iter()
+            .any(|page| !metadata.is_effective_at(page.received_at()))
+    {
+        return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    Ok(metadata)
+}
+
+pub(in crate::catalog) fn validate_retained_option_origin(
+    connection: &Connection,
+    origin: &market_squawk_sources::OptionReferenceOrigin,
+    original: &ProviderCaptureSetReceipt,
+    current: &ProviderCaptureSetReceipt,
+) -> Result<(), CatalogError> {
+    origin
+        .validate_capture_pair(original, current)
+        .map_err(|_| CatalogError::ProviderCaptureMismatch)?;
+    origin
+        .validate_metadata(
+            &retained_option_source(connection, original)?,
+            &retained_option_source(connection, current)?,
+        )
+        .map_err(|_| CatalogError::ProviderCaptureMismatch)
 }
 fn lower_hex(bytes: [u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -1118,6 +1180,14 @@ fn option_binding_digest(
             &mut digest,
             dependency.metadata.capture.observation_digest(),
         );
+        if let Some(origin) = &dependency.origin {
+            hash_digest(
+                &mut digest,
+                origin
+                    .evidence_digest()
+                    .map_err(|_| CatalogError::ProviderCaptureMismatch)?,
+            );
+        }
         hash_length(&mut digest, dependency.rows.len())?;
         for row in &dependency.rows {
             digest.update(row.canonical_row_ordinal().to_be_bytes());

@@ -91,6 +91,19 @@ impl AlpacaOptionChainRuntimeAuthority {
         &self.metadata
     }
 
+    /// Reads historical renewal evidence under this exact current account lease.
+    pub(crate) async fn retained_alpaca_doctor_renewal_chain(
+        &self,
+        original_verified_at: market_squawk_domain::Timestamp,
+    ) -> Result<market_squawk_sources::AlpacaDoctorRenewalChain, AlpacaOptionChainRuntimeError>
+    {
+        self.ensure_accepting()?;
+        self.currentness
+            .retained_alpaca_doctor_renewal_chain(original_verified_at)
+            .await
+            .map_err(|_| AlpacaOptionChainRuntimeError::Stale)
+    }
+
     /// Acquires all REST pages under one deadline and the process-wide account budget.
     ///
     /// A successfully received response is returned for sealing without a post-response

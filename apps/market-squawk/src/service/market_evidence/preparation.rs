@@ -367,6 +367,7 @@ impl InstalledInvestmentSourcePreparation {
                 }
                 crate::application::OptionChainDemandError::Authority
                 | crate::application::OptionChainDemandError::PendingOriginalDemand
+                | crate::application::OptionChainDemandError::IncompatibleOriginalAuthority
                 | crate::application::OptionChainDemandError::Identity
                 | crate::application::OptionChainDemandError::Custody
                 | crate::application::OptionChainDemandError::Publication
