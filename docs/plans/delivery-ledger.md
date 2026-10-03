@@ -20,6 +20,17 @@ publication check → coherent commit/push → matching native analysis. Agent m
 ownership transfer if necessary, without adding a new generic scheduler or increasing deadlines.
 No branch, worktree, migration, failed-job reset or background build. Current visible app stays open.
 
+Agent correction inspected and frozen: option publication now reuses existing
+`catalog::authority::lock_catalog_writer`. The shared helper checks cancellation/deadline before
+and after acquisition and sleeps briefly on contention; poison remains a distinct catalog error.
+Existing lock order and borrowed-catalog final precommit remain. The thin existing option fixture
+now holds the real writer, verifies exact replay after release, and verifies revocation after waiting.
+Critical check passed (1/1, 1.78s; 43.74s single-job compile), log
+`.agents/tmp/v1-first-stock/option-writer-admission-critical.log`. Shared helper cancellation,
+deadline and poison coverage was inspected in the existing native-reference fixture; no duplicate
+matrix added. Next barrier is matching deployment and a new recorded native analysis. No live
+publication success is inferred from the fixture.
+
 ### Integrated wave — compose onboarding reads inside option publication
 
 Base `b69970a2`, clean primary feature worktree. Acceptance 1/2/6: native managed preparation

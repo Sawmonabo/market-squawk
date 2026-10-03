@@ -3300,6 +3300,62 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
     drop(publisher);
     drop(onboarding);
     drop(service);
+
+    // A different catalog owner may finish between preflight and writer admission. Reuse the
+    // exact retained option graph; contention must wait, then revalidate before replay commits.
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
+    let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+    for revoke_after_wait in [false, true] {
+        let precommit = Precommit {
+            checks: AtomicUsize::new(0),
+            revoke_on: if revoke_after_wait { 2 } else { usize::MAX },
+        };
+        std::thread::scope(|scope| -> TestResult {
+            let guard = authority.lock().map_err(|_| "catalog writer poisoned")?;
+            let (started, started_rx) = std::sync::mpsc::sync_channel(1);
+            let (finished, finished_rx) = std::sync::mpsc::sync_channel(1);
+            let input = option_admission(created.clone(), source.source_id().clone());
+            let publisher = &publisher;
+            let precommit = &precommit;
+            let cancellation = &cancellation;
+            let publication = scope.spawn(move || {
+                let _ = started.send(());
+                let result = publisher.publish_alpaca_option_references(
+                    input,
+                    precommit,
+                    deadline(),
+                    cancellation,
+                );
+                let _ = finished.send(());
+                result
+            });
+            started_rx.recv_timeout(Duration::from_secs(2))?;
+            let held = finished_rx.recv_timeout(Duration::from_millis(20));
+            drop(guard);
+            assert!(matches!(
+                held,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            let result = publication
+                .join()
+                .map_err(|_| "option publication worker panicked")?;
+            if revoke_after_wait {
+                assert!(matches!(
+                    result,
+                    Err(MarketDataInstrumentCatalogError::PublicationAuthority(_))
+                ));
+                assert_eq!(precommit.checks.load(Ordering::SeqCst), 2);
+            } else {
+                let replayed = result?;
+                assert_eq!(replayed.inserted(), 0);
+                assert_eq!(replayed.replayed(), 1);
+            }
+            Ok(())
+        })?;
+    }
+    drop(publisher);
+    drop(authority);
+
     let (service, onboarding) = reopen()?;
     let resumed = onboarding.resume_provider_onboarding(reservation.session_id())?;
     assert_eq!(

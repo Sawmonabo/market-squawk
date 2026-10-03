@@ -68,10 +68,13 @@ impl MarketDataInstrumentSynchronizationCapability {
         precommit
             .validate_precommit()
             .map_err(reference_precommit_error)?;
-        self.authority
-            .try_lock()
-            .map_err(|_| Error::AuthorityUnavailable)?
-            .publish_alpaca_option_references(input, precommit, deadline, cancellation)
+        // This runs in the existing owned blocking publication worker. A concurrent writer
+        // delays admission; only deadline, cancellation or poisoned authority rejects the wait.
+        let authority =
+            super::super::authority::lock_catalog_writer(&self.authority, deadline, || {
+                check_operation(deadline, cancellation)
+            })?;
+        authority.publish_alpaca_option_references(input, precommit, deadline, cancellation)
     }
 }
 
