@@ -44,7 +44,7 @@ Artifacts under `.agents/tmp/v1-first-stock/`: `fixed-zero-tsla-{job-start,durin
 `fixed-zero-msft-concurrent-tabs.json`. No schema/data reset, migration, full gate or RAM measurement.
 Daily-change, complete financial coverage and full product/installed acceptance remain open.
 
-### Active correction — explicit financial ratio bases
+### Integrated correction — explicit financial ratio bases
 
 Acceptance 1/2/5; base `bf616223`. Completed TSLA acquisition now exposes real ratio rows,
 including 24 first-page conflicts. Diagnosis is complete: all 24 conflicts combine different revenue/income concepts; no same-concept
@@ -68,7 +68,22 @@ unchanged exact-envelope pagination and shared Desktop/CLI/MCP rendering contrac
 (single-job compile 5m16s; `.agents/tmp/v1-first-stock/ratio-basis-critical.log`). The uncovered
 failure was legitimate alternative revenue/income concepts being treated as conflicting observations. Selected-concept conflicts still block output. The
 reference contract records the explicit financial basis and primary FASB/filing sources.
-Matched native ratio verification remains pending; no complete-coverage claim.
+Source `4f92916c` is pushed. The coordinated service-only build passed in 7m19s and replaced
+service 5814 with 76207; Desktop 5863 stayed open and reconnected automatically without an app
+password. Native TSLA ratios now show 30 reported and two missing-input rows on the same 32-row
+first page, versus six reported/24 conflicting/two missing before the fix. H1 gross margin is
+18.71%, operating margin 2.65% and parent-attributable net margin 3.14%, consistent with retained
+inputs. MSFT first-page ratios return 32 reported rows, zero query errors; its first values remain
+1.23x current ratio, 67.94% gross, 46.78% operating and 40.31% parent-attributable net margin.
+Captures: `ratio-basis-service-replaced.json`, `ratio-basis-tsla-live.json`,
+`ratio-basis-msft-live.json` and inspected `ratio-basis-tsla-live.png`, under
+`.agents/tmp/v1-first-stock/`. The background screenshot still paints the Facts tab highlight
+while the actual selected tab and content are Ratios; visual-quality acceptance is not claimed.
+No provider reacquisition, schema migration or workspace reset was needed for corrected reads.
+This proves the selected live financial correction and automatic development-service reconnect,
+not full financial coverage, installed lifecycle, complete UI quality or instant-response acceptance.
+Next previously diagnosed product dependency: closed-session price-change baseline selection;
+full stock analysis and remaining selected provider/workflow obligations remain open.
 
 
 ### Integrated wave — keep reads available during financial preparation
