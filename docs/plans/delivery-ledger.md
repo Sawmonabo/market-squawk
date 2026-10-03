@@ -4,6 +4,29 @@
 
 ### Current native barrier — investment dataset cursor admission
 
+Additional owner-requested `~/dev` cleanup: removed unused July 29 fixtures
+`.market-squawk-dmg-home-a0e4f01`, `.market-squawk-installer-home-a0e4f01`,
+`.market-squawk-installer-smoke-a0e4f01`, and the empty `market-squawk-worktrees` parent.
+Each fixture had no open files; only owner-directory write permissions were restored to remove
+read-only installed test trees. Reclaimed another 1.36 GiB; observed free space 57 GiB.
+Receipt: `dev-directory-cleanup-20261003.json`. Active repo and historical handoff, preservation
+bundles and owner-verification evidence remain pending the stated recovery-retention condition.
+
+
+Next implementation ownership (after current build freezes): Astra `stock_native_dataset` owns
+`application/research/dataset_preparation.rs`, its `history.rs`, and a cohesive stock preparation
+leaf if necessary. Outcome: selected-stock training/serving datasets use the exact retained
+source-action/history reference, the validated profile and existing current-listed fixed cohort;
+reuse native-session mapping, all macro features, retrospective annual split/purge and existing
+publication. Remove the global catalog scan from this selected-stock path. No unrelated provider
+fix, new storage schema, feature dropping, invented clocks, new budget or replacement publisher.
+Lead owns operation contracts, workflow driver, service handoff and critical composition check.
+Agent may read/design now but waits for lead release before editing the compiling source.
+Provider deadline diagnosis remains independent/read-only. DAG: frozen cursor build → disjoint
+consumer implementation + lead exact source handoff → single critical integration check → native
+preparation/recovery, once the provider prerequisite is restored.
+
+
 Pushed cursor source/checkpoint: **`67ddcd0b`**; PR #43 evidence comment 5973141567. Coordinated
 watcher resumed and is compiling one matching development generation; the current visible app
 remains running. Do not retry the stock workflow merely because this primitive passes.
