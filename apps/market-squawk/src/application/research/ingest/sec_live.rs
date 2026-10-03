@@ -285,20 +285,20 @@ impl SecLiveFundSource {
             let bytes =
                 NonZeroU64::new(market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
                     .ok_or(SecLiveFundApplicationError::RequestMismatch)?;
-            let published = self
-                .fundamentals
-                .acquire_and_publish_company(
-                    cik,
-                    families,
-                    records,
-                    bytes,
-                    wall_deadline,
-                    deadline,
-                    Arc::clone(&precommit),
-                    cancellation.child_token(),
-                    &mut family_completed,
-                )
-                .await?;
+            // Keep the large company-publication future off every enclosing activation
+            // future's inline state while retaining this operation's ownership and lease.
+            let published = Box::pin(self.fundamentals.acquire_and_publish_company(
+                cik,
+                families,
+                records,
+                bytes,
+                wall_deadline,
+                deadline,
+                Arc::clone(&precommit),
+                cancellation.child_token(),
+                &mut family_completed,
+            ))
+            .await?;
             precommit.validate_precommit()?;
             // Family links are retained; only completion of every requested family reaches here.
             self.validate_current()?;

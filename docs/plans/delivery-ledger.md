@@ -2,46 +2,65 @@
 
 ## Current execution — 2026-10-03
 
-Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
-Calendar correction pushed as `dec65cdd`, following `3d078ba5` financial autoload and `262a0274`
-saved-analysis research. Origin has those three intended branches plus active, unmerged Dependabot
-PR55. No branch or worktree was created; recovery refs and unique work are preserved.
+Branch `feature/v1-installed-product-experience`; one primary worktree, three local branches.
+Pushed: SEC/schema `44b9f583`, calendar `dec65cdd`, financial autoload `3d078ba5`,
+saved-analysis research `262a0274`. Origin retains the three intended branches plus the active,
+unmerged Dependabot PR55. No branches/worktrees were created; recovery refs remain preserved.
 
-**This checkpoint:** SEC standard LinkbaseRef roles corrected in place. The extended existing
-mixed-source graph/publication/restart check exposed SQL incorrectly discarding distinct logical
-documents with identical content-addressed bytes. The canonical V1 table now permits those
-occurrences while preserving ordinal uniqueness, sealed-object foreign keys, hashes and counts.
-Object-insert idempotency applies only to the ordinal primary key. The existing schema identity
-is synchronized; no migration version or compatibility path was added.
+**Owner-approved deployment:** the complete former workspace
+`.market-squawk/v1-owner-test-financial-detail-2026-10-02` remains untouched recovery evidence
+following graceful shutdown. No database migration, deletion or old-row alteration occurred.
+The active fresh V1 root is `.market-squawk/v1-owner-test-fresh-2026-10-03`.
+Receipt: `.agents/tmp/v1-first-stock/fresh-workspace-preservation.json`.
+Original MSFT workflow `workflow_96bca8b553dd5278afa3e9a2a4040af5`, its three pending captures,
+and all prior saved evidence remain in the old root. Its calendar step advanced9→10; exact option
+identity admission remained blocked, with zero saved analysis results.
 
-**Critical evidence:** `captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation`
-PASS1/1,2.29s (compile1m01s), including all five standard roles, malformed role rejection,
-normalized publication and physical restart. Log: `.agents/tmp/v1-first-stock/sec-standard-linkbase-critical-verified.log`.
-Earlier failures are retained: generic publication rejection, duplicate physical-claim diagnosis,
-and an intermediate schema-registry mismatch corrected by updating its digest. Existing authorities
-were not weakened. Standard roles follow [XBRL2.1 §4.3.4 Table2](https://www.xbrl.org/Specification/XBRL-2.1/REC-2003-12-31/XBRL-2.1-REC-2003-12-31%2Bcorrected-errata-2013-02-20.html).
+**Current checkpoint:** three large SEC child futures are heap-pinned in the existing coordinator
+and live-source modules. Same-task cancellation, leases, deadlines and terminal results are
+unchanged; no stack limit, data limit, schema or shared dispatch change was introduced.
+This follows Rust Clippy's [documented large-future correction](https://rust-lang.github.io/rust-clippy/master/index.html#large_futures).
+The exact original macOS crash traced SEC activation rather than Tiingo or recursive provenance
+JSON. Twelve measured caller frames consumed1,983,712bytes before remaining serde/runtime frames.
+The rebuilt same frames consume1,558,736bytes, a424,976byte reduction (21.4%). Binary UUID:
+`1BD4EAD4-301C-3A80-8954-20AB3CD46945`. Diagnostic report:
+`.agents/tmp/v1-first-stock/fresh-activation-stack.md`.
 
-**Live evidence:** calendar regression PASS1/1,19.22s (8,130 inherited rows; all2,709 selected
-original rows); matched calendar app build PASS5m17s. Running service2667/Desktop2701 retain
-that calendar build. Original MSFT workflow advanced9→10 preparation steps, then failed exact
-canonical option identity admission; zero saved results. Native AAPL previously autostarted
-financial preparation but failed taxonomy parsing. The new SEC/schema checkpoint is not live verified.
+**Verification:** scoped rustfmt and `git diff --check` pass. One coordinated single-job build
+passed in5m32s. Native SEC activation passed the previous decoding crash point and returned a
+structured setup error in2.7s; service26924 remained alive and Desktop22413 stayed connected/ready.
+It now fails later with `Application(Fundamentals(Research(Ingest(RevisionAuthority(Conflict)))))`.
+This is crash-fix evidence, **not successful SEC setup or complete financial data**. Captures:
+`fresh-v1-sec-stack-fixed-activation.json`, `fresh-v1-after-sec-stack-fixed.json`, and
+`fresh-v1-dev.log` under `.agents/tmp/v1-first-stock/`.
 
-**Deployment boundary:** current owner-test catalog pins the prior schema21 digest and retains
-41 logical object occurrences. Do not restart the current workspace with the changed schema until
-the owner chooses a fresh V1 workspace (preserving the entire old workspace) or explicitly permits
-a one-time backed-up development-database update. The question is pending because no-migrations
-and evidence-preservation instructions both apply. No existing data or schema was changed.
-Watcher99703 is temporarily stopped; current Desktop/service remain running. No second launcher.
+**Fresh workspace evidence:** configured credentials imported privately, Alpaca verified and
+activated, and nine starter prices appeared. The workspace reopened without an application
+password; both native contexts were ready and events connected. After the latest service-only
+replacement, nine prices remain visible but the captured watchlist changes show unavailable;
+full market-display acceptance is not established. Tiingo's restored onboarding session is blocked
+and its imported credential generation tombstoned; this is separate from the SEC crash.
+The initial fresh full service startup took about15seconds; no instant-start claim is made.
+One coordinated supervisor21852/watcher22254 remains running; source changes replace the service
+while retaining the Desktop window. No full CI or whole-app RAM gate ran.
 
-**Active owner:** Astra `options_original_recovery` finishes read-only diagnosis of the next option
-identity barrier; lead owns integration/build/Git and runtime. SEC implementation/debugging ownership
-is released. Next: deployment choice, matched build and native AAPL retry; then original option
-recovery and the first complete saved analysis. Startup still about28seconds; remaining screens,
-providers, analytical workflows, installed lifecycle and full V1 acceptance remain incomplete.
+**Previously verified schema checkpoint:** the existing
+`captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation` passed1/1 in2.29s,
+covering all five standard LinkbaseRef roles, malformed-role rejection, duplicate-byte logical
+document occurrences, normalized publication and restart. Log:
+`.agents/tmp/v1-first-stock/sec-standard-linkbase-critical-verified.log`.
+It does not cover the additional live application activation stack. The calendar regression
+passed1/1 in19.22s with8,130 inherited rows and all2,709 selected original rows retained.
 
-[Saved-analysis storage research](../research/2026-10-02-saved-analysis-storage.md) is a proposal;
-no direct-result storage replacement is implemented. No full CI or whole-app RAM gate was run.
+**Ownership and next dependency:** lead owns integration/Git/build/runtime; Astra
+`fresh_activation_stack` has handed off the two SEC source files and measured diagnosis.
+No other active implementation ownership. Next: diagnose exact SEC revision conflict without
+weakening immutable evidence, reconcile Tiingo recovery, complete financial-page verification,
+then option renewal and the first saved analysis. Option diagnosis remains at
+`.agents/tmp/v1-first-stock/options-identity-after-calendar.md`.
+[Saved-analysis storage research](../research/2026-10-02-saved-analysis-storage.md) remains a proposal.
+No direct-result storage replacement is implemented. Remaining screens/providers/analytical and
+installed workflows, final measurements and complete V1 acceptance are still incomplete.
 
 ### Shared integration — identical captured document occurrences
 

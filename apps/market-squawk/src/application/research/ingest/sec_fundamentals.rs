@@ -344,12 +344,12 @@ impl SecFundamentalsCoordinatorClosure {
                     return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
                 }
                 facts_publication = Some(
-                    self.publish_research_stream(
+                    Box::pin(self.publish_research_stream(
                         sealed,
                         Arc::clone(&precommit),
                         cancellation.child_token(),
                         deadline,
-                    )
+                    ))
                     .await?,
                 );
             } else {
@@ -504,14 +504,13 @@ impl SecFundamentalsCoordinatorClosure {
         if sealed.stream.company_identity().provider_company_id() != &company_cik {
             return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
         }
-        let filing = self
-            .publish_research_stream(
-                sealed,
-                Arc::clone(&precommit),
-                cancellation.child_token(),
-                deadline,
-            )
-            .await?;
+        let filing = Box::pin(self.publish_research_stream(
+            sealed,
+            Arc::clone(&precommit),
+            cancellation.child_token(),
+            deadline,
+        ))
+        .await?;
         if filing.cik != company_cik {
             return Err(SecFundamentalsApplicationError::InvalidCompanyIdentity);
         }
