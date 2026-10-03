@@ -3362,6 +3362,7 @@ mod tests {
         for reason in [
             "automatic-alpaca-source-recovery",
             "alpaca-doctor-proof-expired",
+            "alpaca-publication-deadline",
         ] {
             let cancellation = CancellationToken::new();
             let command = saved_source_retry_command(

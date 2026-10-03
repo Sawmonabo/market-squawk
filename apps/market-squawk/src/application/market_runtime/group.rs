@@ -20,8 +20,7 @@ use uuid::Uuid;
 use crate::{
     ProviderActivationLease,
     live_source::{
-        KrakenLevel3LiveRuntime,
-        ProductionCatalogSelection,
+        KrakenLevel3LiveRuntime, ProductionCatalogSelection,
         display_market::{
             DisplayMarketActorLimits, DisplayMarketDirectory, DisplayMarketReadAdmission,
             runtime::ProductionDisplaySourceRuntime,
@@ -286,27 +285,30 @@ impl AccountMarketRuntimeGroup {
             PreparedAccountMarketRuntimeStart::Standard(
                 PreparedMarketProviderConfiguration::AlpacaBasic(prepared),
             ) => Box::pin(async move {
-                let (runtime, descriptors, currentness, metadata, routes, durable_reads) = start_alpaca(
-                    prepared,
-                    generation,
-                    provider_activation,
-                    app_config,
-                    provider_rate,
-                    display_directory,
-                    limits.display_actor,
-                    read_admission,
-                    group_cancellation,
-                    deadline,
-                    cancellation,
-                )
-                .await?;
+                let (runtime, descriptors, currentness, metadata, routes, durable_reads) =
+                    start_alpaca(
+                        prepared,
+                        generation,
+                        provider_activation,
+                        app_config,
+                        provider_rate,
+                        display_directory,
+                        limits.display_actor,
+                        read_admission,
+                        group_cancellation,
+                        deadline,
+                        cancellation,
+                    )
+                    .await?;
                 Ok(StartedAccountMarketRuntime {
                     runtime: AccountMarketRuntime::Alpaca(runtime),
                     descriptors,
                     kraken_descriptor: None,
                     currentness,
                     currentness_mode: AccountCurrentnessMode::PreparedOrActiveUntilAdmission,
-                    metadata, routes, durable_reads,
+                    metadata,
+                    routes,
+                    durable_reads,
                 })
             }),
             PreparedAccountMarketRuntimeStart::Standard(
@@ -523,6 +525,33 @@ impl AccountMarketRuntimeGroup {
         !lifecycle_cancelled && !currentness_monitor_finished && runtime_healthy
     }
 
+    pub(super) fn has_local_alpaca_publication_deadline_failure(&self) -> bool {
+        // Explicit stop, expired/revoked authority and an unadmitted startup cannot restart.
+        if self.lifecycle.is_cancelled()
+            || self.currentness_monitor.is_finished()
+            || !self.reads_are_admitted()
+        {
+            return false;
+        }
+        let AccountMarketRuntime::Alpaca(runtime) = &self.runtime else {
+            return false;
+        };
+        let iex_deadline = runtime.iex.has_local_publication_deadline_failure();
+        let options_deadline = runtime
+            .options
+            .as_ref()
+            .is_some_and(ProductionDisplaySourceRuntime::has_local_publication_deadline_failure);
+        (iex_deadline || options_deadline)
+            && (iex_deadline || runtime.iex.is_healthy())
+            && runtime.options.as_ref().is_none_or(|options| {
+                options.is_healthy() || options.has_local_publication_deadline_failure()
+            })
+            && runtime
+                .option_chain
+                .as_ref()
+                .is_none_or(|chain| chain.is_healthy())
+    }
+
     pub(super) const fn activation_lease(&self) -> &ProviderActivationLease {
         &self.activation_lease
     }
@@ -673,18 +702,26 @@ impl AccountMarketRuntimeGroup {
     ) -> Option<Arc<crate::provider_activation::SchwabMarketDataAccountActivation>> {
         match &self.runtime {
             AccountMarketRuntime::Schwab(runtime)
-                if matches!(&runtime.current, SchwabCurrentRuntime::Streamer(_)) => {
+                if matches!(&runtime.current, SchwabCurrentRuntime::Streamer(_)) =>
+            {
                 Some(Arc::clone(&runtime._account_owner))
             }
             _ => None,
         }
     }
 
-    pub(super) fn option_chain_demand_handle(&self) -> Option<super::alpaca_option_chain::OptionChainDemandHandle> {
-        if !self.is_published_healthy() { return None; }
+    pub(super) fn option_chain_demand_handle(
+        &self,
+    ) -> Option<super::alpaca_option_chain::OptionChainDemandHandle> {
+        if !self.is_published_healthy() {
+            return None;
+        }
         match &self.runtime {
-            AccountMarketRuntime::Alpaca(runtime) => runtime.option_chain.as_ref()
-                .filter(|child| child.is_healthy()).map(|child| child.demand_handle()),
+            AccountMarketRuntime::Alpaca(runtime) => runtime
+                .option_chain
+                .as_ref()
+                .filter(|child| child.is_healthy())
+                .map(|child| child.demand_handle()),
             _ => None,
         }
     }
@@ -738,7 +775,7 @@ impl AccountMarketRuntimeGroup {
                     .drain_exact(parent, deadline, cancellation)
                     .await
                     .map_err(|error| {
-                        tracing::error!(%error, "retained account history drain failed");
+                        tracing::error!(%error, stage = "history-publication", "retained account history drain failed");
                         if cancellation.is_cancelled() {
                             ServiceError::Cancelled
                         } else if Instant::now() >= deadline {
@@ -765,7 +802,11 @@ impl AccountMarketRuntimeGroup {
                 deadline,
                 cancellation,
             )
-            .await,
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, stage = "currentness-monitor",
+                    "retained account child remains incomplete");
+            }),
         );
         retain_shutdown_error(
             &mut failure,
@@ -918,7 +959,12 @@ impl AlpacaRuntimeGroup {
             .options
             .as_ref()
             .is_none_or(ProductionDisplaySourceRuntime::is_healthy);
-        iex_healthy && options_healthy && self.option_chain.as_ref().is_none_or(|runtime| runtime.is_healthy())
+        iex_healthy
+            && options_healthy
+            && self
+                .option_chain
+                .as_ref()
+                .is_none_or(|runtime| runtime.is_healthy())
     }
 
     fn historical_capability(
@@ -932,9 +978,13 @@ impl AlpacaRuntimeGroup {
     }
 
     fn begin_shutdown(&self) {
-        if let Some(chain) = &self.option_chain { chain.begin_shutdown(); }
+        if let Some(chain) = &self.option_chain {
+            chain.begin_shutdown();
+        }
         self.iex.begin_shutdown();
-        if let Some(options) = &self.options { options.begin_shutdown(); }
+        if let Some(options) = &self.options {
+            options.begin_shutdown();
+        }
         self.historical.begin_shutdown();
     }
 
@@ -947,18 +997,32 @@ impl AlpacaRuntimeGroup {
         self.begin_shutdown();
         let mut failure = await_before(deadline, cancellation, self.historical.finish_shutdown())
             .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, stage = "historical-operations",
+                    "retained account child remains incomplete");
+            })
             .err();
         if let Some(options) = self.options.as_mut() {
             retain_shutdown_error(
                 &mut failure,
-                options.finish_shutdown_before(deadline, cancellation).await,
+                options
+                    .finish_shutdown_before(deadline, cancellation)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, stage = "options-display",
+                        "retained account child remains incomplete");
+                    }),
             );
         }
         retain_shutdown_error(
             &mut failure,
             self.iex
                 .finish_shutdown_before(deadline, cancellation)
-                .await,
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(%error, stage = "iex-display",
+                        "retained account child remains incomplete");
+                }),
         );
         if let Some(chain) = &mut self.option_chain {
             retain_shutdown_error(&mut failure, chain.finish_shutdown_before(deadline).await);

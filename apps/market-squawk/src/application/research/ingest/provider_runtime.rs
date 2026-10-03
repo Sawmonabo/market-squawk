@@ -589,7 +589,41 @@ pub(crate) struct ResearchProviderPublicationOperation {
     source_registered_at: Timestamp,
     publication: Arc<ResearchProviderPublicationLease>,
     cancellation: CancellationToken,
+    cancellation_cause: Arc<AtomicU8>,
+    upstream_cancellation: [CancellationToken; 3],
     watcher: JoinHandle<()>,
+}
+
+/// The first signal observed by the existing publication-operation watcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ProviderPublicationCancellationCause {
+    Caller = 1,
+    Shutdown = 2,
+    Revoked = 3,
+    Deadline = 4,
+}
+
+fn spawn_publication_cancellation_watcher(
+    signal: CancellationToken,
+    cause: Arc<AtomicU8>,
+    caller: CancellationToken,
+    shutdown: CancellationToken,
+    revoked: CancellationToken,
+    deadline: Instant,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let observed = tokio::select! {
+            biased;
+            () = caller.cancelled() => ProviderPublicationCancellationCause::Caller,
+            () = shutdown.cancelled() => ProviderPublicationCancellationCause::Shutdown,
+            () = revoked.cancelled() => ProviderPublicationCancellationCause::Revoked,
+            () = tokio::time::sleep_until(deadline.into()) => ProviderPublicationCancellationCause::Deadline,
+        };
+        // Publish the reason before waking any consumer of the operation token.
+        cause.store(observed as u8, Ordering::Release);
+        signal.cancel();
+    })
 }
 
 /// Application-minted, exact-generation authority for one crypto canonical-publication lane.
@@ -668,6 +702,25 @@ impl ResearchProviderPublicationOperation {
 
     pub(crate) const fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    pub(crate) fn cancellation_cause(&self) -> Option<ProviderPublicationCancellationCause> {
+        match self.cancellation_cause.load(Ordering::Acquire) {
+            1 => Some(ProviderPublicationCancellationCause::Caller),
+            2 => Some(ProviderPublicationCancellationCause::Shutdown),
+            3 => Some(ProviderPublicationCancellationCause::Revoked),
+            4 => Some(ProviderPublicationCancellationCause::Deadline),
+            _ => None,
+        }
+    }
+
+    /// A concurrent source stop/revocation always vetoes local-timeout recovery.
+    pub(crate) fn has_local_deadline_failure(&self) -> bool {
+        self.cancellation_cause() == Some(ProviderPublicationCancellationCause::Deadline)
+            && !self
+                .upstream_cancellation
+                .iter()
+                .any(CancellationToken::is_cancelled)
     }
 
     pub(crate) fn precommit_authority(&self) -> Arc<dyn IngestPrecommitAuthority> {
@@ -2273,21 +2326,17 @@ impl ProductionResearchIngestCoordinator {
             )
         };
         let cancellation = CancellationToken::new();
-        let signal = cancellation.clone();
         let shutdown = self.lifecycle.shutdown_token().clone();
         let revoked = admission.cancellation().clone();
-        let watched_caller = caller.clone();
-        let watched_shutdown = shutdown.clone();
-        let watched_revoked = revoked.clone();
-        let watcher = tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                () = watched_caller.cancelled() => signal.cancel(),
-                () = watched_shutdown.cancelled() => signal.cancel(),
-                () = watched_revoked.cancelled() => signal.cancel(),
-                () = tokio::time::sleep_until(deadline.into()) => signal.cancel(),
-            }
-        });
+        let cancellation_cause = Arc::new(AtomicU8::new(0));
+        let watcher = spawn_publication_cancellation_watcher(
+            cancellation.clone(),
+            Arc::clone(&cancellation_cause),
+            caller.clone(),
+            shutdown.clone(),
+            revoked.clone(),
+            deadline,
+        );
         let lease = admission.acquire_publication_lease();
         tokio::pin!(lease);
         let publication = tokio::select! {
@@ -2313,6 +2362,8 @@ impl ProductionResearchIngestCoordinator {
             source_registered_at,
             publication,
             cancellation,
+            cancellation_cause,
+            upstream_cancellation: [caller, shutdown, revoked],
             watcher,
         };
         operation.validate_precommit()?;
@@ -2985,21 +3036,85 @@ mod tests {
         changed_rights.rights.parent_authorization_evidence = digest(36);
         assert!(!changed_rights.is_exact_successor_of(&prior)?);
 
-        let admission = ResearchProviderAdmission::new(Some(&prior))?;
-        let publication = admission.acquire_publication_lease().await?;
-        let cancellation = admission.cancellation().clone();
-        let revoking = admission.clone();
-        let drain = tokio::spawn(async move {
-            revoking.revoke_and_drain().await;
-        });
-
-        cancellation.cancelled().await;
-        assert!(!drain.is_finished());
-        assert!(publication.validate_precommit().is_err());
-
-        drop(publication);
-        tokio::time::timeout(Duration::from_secs(1), drain).await??;
-        assert!(admission.revocation_drained());
+        for expected in [
+            ProviderPublicationCancellationCause::Deadline,
+            ProviderPublicationCancellationCause::Caller,
+            ProviderPublicationCancellationCause::Shutdown,
+            ProviderPublicationCancellationCause::Revoked,
+        ] {
+            let admission = ResearchProviderAdmission::new(Some(&prior))?;
+            let publication = Arc::new(admission.acquire_publication_lease().await?);
+            let caller = CancellationToken::new();
+            let shutdown = CancellationToken::new();
+            let revoked = admission.cancellation().clone();
+            match expected {
+                ProviderPublicationCancellationCause::Caller => caller.cancel(),
+                ProviderPublicationCancellationCause::Shutdown => shutdown.cancel(),
+                ProviderPublicationCancellationCause::Revoked => admission.revoke(),
+                ProviderPublicationCancellationCause::Deadline => {}
+            }
+            let cancellation = CancellationToken::new();
+            let cancellation_cause = Arc::new(AtomicU8::new(0));
+            // The deadline is ready for every case: explicit signals must win this race.
+            let watcher = spawn_publication_cancellation_watcher(
+                cancellation.clone(),
+                Arc::clone(&cancellation_cause),
+                caller.clone(),
+                shutdown.clone(),
+                revoked.clone(),
+                Instant::now(),
+            );
+            let operation = ResearchProviderPublicationOperation {
+                generation: prior.clone(),
+                source: prior.metadata.clone(),
+                rights: prior.rights.clone(),
+                source_registered_at: prior.authority_effective_at,
+                publication,
+                cancellation,
+                cancellation_cause,
+                upstream_cancellation: [caller.clone(), shutdown.clone(), revoked.clone()],
+                watcher,
+            };
+            tokio::time::timeout(Duration::from_secs(1), operation.cancellation().cancelled())
+                .await?;
+            assert_eq!(operation.cancellation_cause(), Some(expected));
+            assert_eq!(
+                operation.has_local_deadline_failure(),
+                expected == ProviderPublicationCancellationCause::Deadline
+            );
+            if expected == ProviderPublicationCancellationCause::Deadline {
+                assert!(!caller.is_cancelled());
+                assert!(!shutdown.is_cancelled());
+                assert!(admission.ensure_live().is_ok());
+            }
+            let revoking = admission.clone();
+            let mut drain = tokio::spawn(async move {
+                revoking.revoke_and_drain().await;
+            });
+            revoked.cancelled().await;
+            assert!(!operation.has_local_deadline_failure());
+            assert!(operation.publication.validate_precommit().is_err());
+            // A timed-out cleanup waiter must retain the original publication lease/join.
+            assert!(
+                tokio::time::timeout(Duration::ZERO, &mut drain)
+                    .await
+                    .is_err()
+            );
+            assert!(!admission.revocation_drained());
+            drop(operation);
+            tokio::time::timeout(Duration::from_secs(1), drain).await??;
+            assert!(admission.revocation_drained());
+            // Current-doctor recovery can mint a new admission for the same provider authority.
+            let restored = ResearchProviderAdmission::new(Some(&prior))?;
+            assert!(restored.admits_generation(&prior)?);
+            assert!(
+                restored
+                    .acquire_publication_lease()
+                    .await?
+                    .validate_precommit()
+                    .is_ok()
+            );
+        }
         let successor = ResearchProviderAdmission::new(Some(&renewed))?;
         assert!(successor.admits_generation(&renewed)?);
         assert!(!successor.admits_generation(&prior)?);

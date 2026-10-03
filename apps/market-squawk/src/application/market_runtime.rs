@@ -3045,8 +3045,13 @@ impl MarketRuntimeRegistry {
     ) -> Result<(), ServiceError> {
         let deadline = self.cleanup_deadline()?;
         let cleanup = CancellationToken::new();
-        let _mutation =
-            bounded_lock(&self.mutation, deadline, &self.account_health_cancellation).await?;
+        let _mutation = bounded_lock(&self.mutation, deadline, &self.account_health_cancellation)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, stage = "registry-mutation",
+                        generation = ?snapshot.group_generation.digest(),
+                        "account generation drain did not acquire ownership");
+            })?;
         {
             let entries = bounded_lock(&self.entries, deadline, &cleanup).await?;
             if !entries.iter().any(|entry| {
@@ -3918,6 +3923,11 @@ async fn run_account_health_drain(
                 tracing::error!(%error, "retained account startup remains incomplete");
             }
         }
+        // Waiting for a constructor must not spend the retained-stop pass's shutdown budget.
+        let deadline = match registry.cleanup_deadline() {
+            Ok(deadline) => deadline,
+            Err(_) => break,
+        };
         let mutation = bounded_lock(&registry.mutation, deadline, &cancellation).await;
         if let Ok(mutation) = mutation {
             if let Err(error) = registry
@@ -3929,6 +3939,11 @@ async fn run_account_health_drain(
                 }
             }
             drop(mutation);
+        } else if !cancellation.is_cancelled() {
+            tracing::warn!(
+                stage = "registry-mutation",
+                "retained account cleanup could not acquire ownership before its deadline"
+            );
         }
         registry
             .recover_unhealthy_account_groups(&cancellation)

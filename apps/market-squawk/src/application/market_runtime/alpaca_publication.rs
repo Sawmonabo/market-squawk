@@ -4,7 +4,10 @@ use crate::live_source::AlpacaCapturedPublicationReceiver;
 use market_squawk_services::ServiceError;
 use std::{
     error::Error,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -15,6 +18,7 @@ pub(crate) struct AlpacaPublicationRuntime {
     cancellation: CancellationToken,
     worker: Option<tokio::task::JoinHandle<AlpacaPublicationWorkerOutcome>>,
     run_failure: Option<AlpacaPublicationRuntimeError>,
+    local_deadline_failure: Arc<AtomicBool>,
     result: Option<Result<(), ServiceError>>,
 }
 impl AlpacaPublicationRuntime {
@@ -27,9 +31,15 @@ impl AlpacaPublicationRuntime {
         let input = Arc::new(input);
         let owned = Arc::clone(&input);
         let stop = cancellation.clone();
+        let local_deadline_failure = Arc::new(AtomicBool::new(false));
+        let worker_deadline_failure = Arc::clone(&local_deadline_failure);
         let worker = tokio::spawn(async move {
             let _cancel_on_exit = stop.clone().drop_guard();
-            let mut outcome = AlpacaPublicationWorkerOutcome::default();
+            let mut outcome = AlpacaPublicationWorkerOutcome {
+                failure: None,
+                cleanup_failed: false,
+                local_deadline_failure: worker_deadline_failure,
+            };
             loop {
                 let next = if stop.is_cancelled() {
                     owned.begin_shutdown();
@@ -70,7 +80,9 @@ impl AlpacaPublicationRuntime {
                 drop(item._bytes);
                 drop(item._frame);
                 if let Err(error) = result {
-                    outcome.record_failure(error);
+                    let source_admitted =
+                        !stop.is_cancelled() && owned.admits_publication_deadline_recovery();
+                    outcome.record_failure(error, source_admitted);
                     owned.begin_shutdown();
                     stop.cancel();
                     receiver.close_admission();
@@ -86,8 +98,12 @@ impl AlpacaPublicationRuntime {
             cancellation,
             worker: Some(worker),
             run_failure: None,
+            local_deadline_failure,
             result: None,
         }
+    }
+    pub(crate) fn has_local_deadline_failure(&self) -> bool {
+        self.local_deadline_failure.load(Ordering::Acquire)
     }
     pub(crate) fn is_healthy(&self) -> bool {
         self.run_failure.is_none()
@@ -141,10 +157,11 @@ impl AlpacaPublicationRuntime {
 struct AlpacaPublicationWorkerOutcome {
     failure: Option<AlpacaPublicationRuntimeError>,
     cleanup_failed: bool,
+    local_deadline_failure: Arc<AtomicBool>,
 }
 
 impl AlpacaPublicationWorkerOutcome {
-    fn record_failure(&mut self, error: AlpacaPublicationRuntimeError) {
+    fn record_failure(&mut self, error: AlpacaPublicationRuntimeError, source_admitted: bool) {
         log_publication_failure(&error);
         // Every other publication error occurs after the original capture was sealed. The
         // worker still drains queued captures and revokes publication admission before joining.
@@ -157,7 +174,31 @@ impl AlpacaPublicationWorkerOutcome {
                 )
         );
         if self.failure.is_none() {
+            self.local_deadline_failure.store(
+                source_admitted
+                    && matches!(
+                        &error,
+                        AlpacaPublicationRuntimeError::Publication(
+                            AlpacaMarketPublicationError::LocalPublicationDeadline
+                                | AlpacaMarketPublicationError::Ingest(
+                                    market_squawk_data::IngestError::DeadlineExceeded
+                                )
+                                | AlpacaMarketPublicationError::Service(
+                                    ServiceError::DeadlineExceeded
+                                )
+                                | AlpacaMarketPublicationError::Research(
+                                    crate::ResearchServiceError::Ingest(
+                                        market_squawk_data::IngestError::DeadlineExceeded
+                                    )
+                                )
+                        )
+                    ),
+                Ordering::Release,
+            );
             self.failure = Some(error);
+        }
+        if self.cleanup_failed {
+            self.local_deadline_failure.store(false, Ordering::Release);
         }
     }
 }
@@ -169,7 +210,7 @@ fn joined_publication_outcome(
         Ok(outcome) => outcome,
         Err(error) => {
             let mut outcome = AlpacaPublicationWorkerOutcome::default();
-            outcome.record_failure(AlpacaPublicationRuntimeError::Join(error));
+            outcome.record_failure(AlpacaPublicationRuntimeError::Join(error), false);
             outcome
         }
     }
@@ -232,12 +273,64 @@ mod tests {
 
     #[tokio::test]
     async fn joined_publication_failure_preserves_custody_cleanup_authority() {
-        let mut outcome = AlpacaPublicationWorkerOutcome::default();
-        outcome.record_failure(AlpacaPublicationRuntimeError::Publication(
-            AlpacaMarketPublicationError::Ingest(market_squawk_data::IngestError::Manifest(
-                market_squawk_data::ManifestCatalogError::AnchorMismatch,
+        for error in [
+            AlpacaMarketPublicationError::LocalPublicationDeadline,
+            AlpacaMarketPublicationError::Ingest(market_squawk_data::IngestError::DeadlineExceeded),
+            AlpacaMarketPublicationError::Service(ServiceError::DeadlineExceeded),
+            AlpacaMarketPublicationError::Research(crate::ResearchServiceError::Ingest(
+                market_squawk_data::IngestError::DeadlineExceeded,
             )),
-        ));
+        ] {
+            let mut deadline = AlpacaPublicationWorkerOutcome::default();
+            let notification = Arc::clone(&deadline.local_deadline_failure);
+            deadline.record_failure(AlpacaPublicationRuntimeError::Publication(error), true);
+            // Classification is available while original queued captures still await sealing.
+            assert!(notification.load(Ordering::Acquire));
+            assert!(!deadline.cleanup_failed);
+            deadline.record_failure(
+                AlpacaPublicationRuntimeError::Publication(AlpacaMarketPublicationError::Custody(
+                    crate::ResearchServiceError::ProviderCaptureSealWorkerUnavailable,
+                )),
+                false,
+            );
+            assert!(!notification.load(Ordering::Acquire));
+            assert!(joined_publication_outcome(Ok(deadline)).cleanup_failed);
+        }
+        let mut stopped = AlpacaPublicationWorkerOutcome::default();
+        stopped.record_failure(
+            AlpacaPublicationRuntimeError::Publication(
+                AlpacaMarketPublicationError::LocalPublicationDeadline,
+            ),
+            false,
+        );
+        assert!(!stopped.local_deadline_failure.load(Ordering::Acquire));
+        let mut unclassified = AlpacaPublicationWorkerOutcome::default();
+        unclassified.record_failure(
+            AlpacaPublicationRuntimeError::Publication(AlpacaMarketPublicationError::Ingest(
+                market_squawk_data::IngestError::Cancelled,
+            )),
+            true,
+        );
+        assert!(!unclassified.local_deadline_failure.load(Ordering::Acquire));
+
+        let mut outcome = AlpacaPublicationWorkerOutcome::default();
+        outcome.record_failure(
+            AlpacaPublicationRuntimeError::Publication(AlpacaMarketPublicationError::Ingest(
+                market_squawk_data::IngestError::Manifest(
+                    market_squawk_data::ManifestCatalogError::AnchorMismatch,
+                ),
+            )),
+            true,
+        );
+        assert!(!outcome.local_deadline_failure.load(Ordering::Acquire));
+        // A later deadline cannot reclassify the original integrity failure as recoverable.
+        outcome.record_failure(
+            AlpacaPublicationRuntimeError::Publication(
+                AlpacaMarketPublicationError::LocalPublicationDeadline,
+            ),
+            true,
+        );
+        assert!(!outcome.local_deadline_failure.load(Ordering::Acquire));
         let mut joined = joined_publication_outcome(Ok(outcome));
         assert!(!joined.cleanup_failed);
         assert!(matches!(
@@ -249,11 +342,12 @@ mod tests {
 
         // A later queued item's custody failure must still block cleanup even when the
         // first retained error describes a canonical publication failure.
-        joined.record_failure(AlpacaPublicationRuntimeError::Publication(
-            AlpacaMarketPublicationError::Custody(
+        joined.record_failure(
+            AlpacaPublicationRuntimeError::Publication(AlpacaMarketPublicationError::Custody(
                 crate::ResearchServiceError::ProviderCaptureSealWorkerUnavailable,
-            ),
-        ));
+            )),
+            false,
+        );
         assert!(joined.cleanup_failed);
         assert!(matches!(
             joined.failure,
@@ -263,7 +357,7 @@ mod tests {
         ));
 
         let mut unsealed = AlpacaPublicationWorkerOutcome::default();
-        unsealed.record_failure(AlpacaPublicationRuntimeError::Bounds);
+        unsealed.record_failure(AlpacaPublicationRuntimeError::Bounds, false);
         assert!(joined_publication_outcome(Ok(unsealed)).cleanup_failed);
 
         let worker = tokio::spawn(std::future::pending::<AlpacaPublicationWorkerOutcome>());

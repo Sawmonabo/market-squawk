@@ -5,6 +5,21 @@ use crate::application::AccountMarketRuntimeReconnect;
 use crate::provider_onboarding::{ProviderPortalActivationError, SchwabOAuthLifecycleAction};
 use market_squawk_services::ServiceError;
 
+#[derive(Clone, Copy)]
+enum AlpacaReconnectCause {
+    DoctorExpired,
+    LocalPublicationDeadline,
+}
+
+impl AlpacaReconnectCause {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::DoctorExpired => "alpaca-doctor-proof-expired",
+            Self::LocalPublicationDeadline => "alpaca-publication-deadline",
+        }
+    }
+}
+
 #[async_trait]
 impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
     async fn reconnect_public(
@@ -194,7 +209,13 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         let surface = request.surface();
         if surface == AccountMarketSurface::AlpacaBasic {
             return self
-                .reconnect_expired_alpaca(request, generation, deadline, cancellation)
+                .reconnect_alpaca(
+                    request,
+                    generation,
+                    AlpacaReconnectCause::DoctorExpired,
+                    deadline,
+                    cancellation,
+                )
                 .await;
         }
         if surface != AccountMarketSurface::SchwabMarketData {
@@ -269,13 +290,36 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
             .map_err(reconnect_error)?;
         Ok(())
     }
-}
 
-impl ProductionSourceLifecycleAuthority {
-    async fn reconnect_expired_alpaca(
+    async fn reconnect_alpaca_publication_deadline(
         &self,
         request: PreparedMarketProviderConfigurationRequest,
         generation: MarketRuntimeGroupGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError> {
+        if request.surface() != AccountMarketSurface::AlpacaBasic {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let deadline = Instant::now()
+            .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+            .ok_or(ServiceError::Unavailable)?;
+        self.reconnect_alpaca(
+            request,
+            generation,
+            AlpacaReconnectCause::LocalPublicationDeadline,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+}
+
+impl ProductionSourceLifecycleAuthority {
+    async fn reconnect_alpaca(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+        cause: AlpacaReconnectCause,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError> {
@@ -303,21 +347,36 @@ impl ProductionSourceLifecycleAuthority {
             {
                 return Ok(());
             }
-            // The registry supplied only an exact expired-doctor allocation. Recheck the saved
-            // target before creating intent; a rejected/revoked credential cannot be renewed.
-            let _current_lease = self
+            // A concurrent explicit stop/removal is rejected above. Recheck the saved target
+            // before creating intent; a rejected/revoked credential cannot be recovered.
+            let current_lease = self
                 .alpaca_retry_admission(
                     &record,
                     request.onboarding_session_id(),
                     request.expected_public_configuration_digest(),
                 )
                 .map_err(reconnect_error)?;
+            if matches!(cause, AlpacaReconnectCause::LocalPublicationDeadline) {
+                // Admit this notification only under the current exact lease. If expiry raced
+                // selection, a later expired-doctor scan uses its existing renewal path.
+                let lease = current_lease.ok_or(ServiceError::Unavailable)?;
+                let current_request = account_group_request_from_binding(
+                    surface,
+                    Some(request.onboarding_session_id()),
+                    Some(request.expected_public_configuration_digest()),
+                    Some(&lease),
+                )
+                .map_err(reconnect_error)?;
+                if current_request != request {
+                    return Err(ServiceError::Unavailable);
+                }
+            }
             record
         };
         let command = saved_source_retry_command(
             SourceIdentifier::try_from(surface.surface_id()).map_err(|_| ServiceError::Internal)?,
             original.revision(),
-            "alpaca-doctor-proof-expired",
+            cause.reason(),
             deadline,
             cancellation,
         )
@@ -329,7 +388,7 @@ impl ProductionSourceLifecycleAuthority {
         let digest = command_digest(&command).map_err(reconnect_error)?;
         let operation = operation_id(digest).map_err(reconnect_error)?;
         // Keep the lifecycle gate through exact runtime comparison and durable intent. The
-        // ordinary transition then drains and acknowledges that predecessor before renewal.
+        // ordinary transition drains and acknowledges it before selecting successor authority.
         self.execute_account_transition(
             &command,
             surface,

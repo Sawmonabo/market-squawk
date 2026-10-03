@@ -810,6 +810,10 @@ fn require_digest(digest: EvidenceDigest) -> Result<(), AlpacaMarketPublicationE
 /// Closed Alpaca immutable-publication and restart failure.
 #[derive(Debug, Error)]
 pub(crate) enum AlpacaMarketPublicationError {
+    #[error("Alpaca publication operation exceeded its local deadline")]
+    LocalPublicationDeadline,
+    #[error("Alpaca publication operation was cancelled: {0:?}")]
+    PublicationCancelled(super::super::provider_runtime::ProviderPublicationCancellationCause),
     #[error("Alpaca original capture custody failed")]
     Custody(#[source] ResearchServiceError),
     #[error("Alpaca market publication authority is invalid or no longer current")]
@@ -981,6 +985,13 @@ impl super::super::ProductionResearchIngestCoordinator {
     }
 }
 impl AlpacaPublicationRuntimeInput {
+    /// A deadline is local only while the source and coordinator still admit publication.
+    pub(crate) fn admits_publication_deadline_recovery(&self) -> bool {
+        !self.registration.cancellation.is_cancelled()
+            && !self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            && self.registration.admission.ensure_live().is_ok()
+    }
+
     pub(crate) fn references(&self) -> Arc<[MarketDataReference]> {
         Arc::clone(&self.references)
     }
@@ -1102,7 +1113,23 @@ impl AlpacaPublicationRuntimeInput {
                 precommit,
                 operation.cancellation().clone(),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if matches!(
+                    &error,
+                    AlpacaMarketPublicationError::Ingest(
+                        IngestError::Cancelled | IngestError::DeadlineExceeded
+                    )
+                ) {
+                    if operation.has_local_deadline_failure() {
+                        return AlpacaMarketPublicationError::LocalPublicationDeadline;
+                    }
+                    if let Some(cause) = operation.cancellation_cause() {
+                        return AlpacaMarketPublicationError::PublicationCancelled(cause);
+                    }
+                }
+                error
+            })?;
         if !self.writer.retain(receipt).await? {
             return Err(AlpacaMarketPublicationError::RestartInvalid);
         }
@@ -1260,8 +1287,7 @@ impl AlpacaReferencePrecommit {
         if Instant::now() >= self.deadline {
             return Err(Self::rejected("deadline"));
         }
-        let now = super::super::system_timestamp()
-            .map_err(|_| Self::rejected("clock"))?;
+        let now = super::super::system_timestamp().map_err(|_| Self::rejected("clock"))?;
         if self.records.len() != self.references.len()
             || self.records.len() != self.identities.len()
         {
@@ -1290,7 +1316,10 @@ impl IngestPrecommitAuthority for AlpacaReferencePrecommit {
     fn validate_precommit(&self) -> Result<(), IngestError> {
         self.validate_time_and_references()?;
         self.publication.validate_precommit().inspect_err(|_| {
-            tracing::warn!(reason = "registration", "Alpaca publication precommit rejected");
+            tracing::warn!(
+                reason = "registration",
+                "Alpaca publication precommit rejected"
+            );
         })?;
         self.account
             .require_current()
@@ -1301,9 +1330,14 @@ impl IngestPrecommitAuthority for AlpacaReferencePrecommit {
         catalog: &market_squawk_data::CatalogAuthority,
     ) -> Result<(), IngestError> {
         self.validate_time_and_references()?;
-        self.publication.validate_catalog_precommit(catalog).inspect_err(|_| {
-            tracing::warn!(reason = "catalog_registration", "Alpaca publication precommit rejected");
-        })?;
+        self.publication
+            .validate_catalog_precommit(catalog)
+            .inspect_err(|_| {
+                tracing::warn!(
+                    reason = "catalog_registration",
+                    "Alpaca publication precommit rejected"
+                );
+            })?;
         self.account
             .require_catalog_current(catalog)
             .map_err(|_| Self::rejected("catalog_account"))?;

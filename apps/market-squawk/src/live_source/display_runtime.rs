@@ -1,8 +1,8 @@
 //! Display-only production source composition for authenticated U.S. market data.
 
+use super::super::sink::{AlpacaCapturedPublicationIngress, ProductionCapturedPublicationIngress};
+use crate::application::{AlpacaPublicationRuntime, AlpacaPublicationRuntimeInput};
 use std::sync::Arc;
-use crate::application::{AlpacaPublicationRuntime,AlpacaPublicationRuntimeInput};
-use super::super::sink::{AlpacaCapturedPublicationIngress,ProductionCapturedPublicationIngress};
 
 use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
@@ -82,8 +82,9 @@ impl ProductionDisplaySourceRuntime {
             DisplayTopology::PartialVenue,
         )
         .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
-        let profile = ProductionSourceProfile::alpaca_iex(source, credentials, publication.references())
-            .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
+        let profile =
+            ProductionSourceProfile::alpaca_iex(source, credentials, publication.references())
+                .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
         Self::start(
             app_config,
             directory,
@@ -126,8 +127,9 @@ impl ProductionDisplaySourceRuntime {
             DisplayTopology::SingleVenue,
         )
         .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
-        let profile = ProductionSourceProfile::alpaca_options(source, credentials, publication.references())
-            .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
+        let profile =
+            ProductionSourceProfile::alpaca_options(source, credentials, publication.references())
+                .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
         Self::start(
             app_config,
             directory,
@@ -166,9 +168,16 @@ impl ProductionDisplaySourceRuntime {
                 app_config.capture_destination_registry_memory_ceiling_bytes(),
             ))
             .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
-        let (publication_ingress, publication_receiver) = AlpacaCapturedPublicationIngress::try_channel(
-            app_config.capture_queue_capacity(), app_config.capture_memory_ceiling_bytes().get(),
-        ).map_err(|_| ProductionDisplaySourceStartFailure::before_owner(ProductionDisplaySourceRuntimeError::Allocation))?;
+        let (publication_ingress, publication_receiver) =
+            AlpacaCapturedPublicationIngress::try_channel(
+                app_config.capture_queue_capacity(),
+                app_config.capture_memory_ceiling_bytes().get(),
+            )
+            .map_err(|_| {
+                ProductionDisplaySourceStartFailure::before_owner(
+                    ProductionDisplaySourceRuntimeError::Allocation,
+                )
+            })?;
         let supervisor = ProductionSourceSupervisor::try_new_display_with_provider_rate(
             &app_config,
             profile,
@@ -187,9 +196,16 @@ impl ProductionDisplaySourceRuntime {
             cause: ProductionDisplaySourceRuntimeError::Supervisor(cause),
             cleanup: cleanup.map_err(ProductionDisplaySourceRuntimeError::Supervisor),
         })?;
-        let supervisor = supervisor.with_publication(ProductionCapturedPublicationIngress::Alpaca(publication_ingress));
+        let supervisor = supervisor.with_publication(ProductionCapturedPublicationIngress::Alpaca(
+            publication_ingress,
+        ));
         let mut publication = AlpacaPublicationRuntime::start(
-            publication, publication_receiver, app_config.source_shutdown().max(app_config.capture_shutdown()), cancellation.clone(),
+            publication,
+            publication_receiver,
+            app_config
+                .source_shutdown()
+                .max(app_config.capture_shutdown()),
+            cancellation.clone(),
         );
         let (startup_sender, startup_receiver) = oneshot::channel();
         let supervisor_cancellation = cancellation.clone();
@@ -213,7 +229,9 @@ impl ProductionDisplaySourceRuntime {
         let cleanup = publication.finish_retained_shutdown().await;
         Err(ProductionDisplaySourceStartFailure {
             cause: failure.cause,
-            cleanup: failure.cleanup.and(cleanup.map_err(|_| ProductionDisplaySourceRuntimeError::Publication)),
+            cleanup: failure
+                .cleanup
+                .and(cleanup.map_err(|_| ProductionDisplaySourceRuntimeError::Publication)),
         })
     }
 
@@ -224,7 +242,13 @@ impl ProductionDisplaySourceRuntime {
 
     /// Reports whether this child supervisor still owns a source generation.
     pub(crate) fn is_healthy(&self) -> bool {
-        !self.supervisor_cancellation.token.is_cancelled() && !self.supervisor.is_finished() && self.publication.is_healthy()
+        !self.supervisor_cancellation.token.is_cancelled()
+            && !self.supervisor.is_finished()
+            && self.publication.is_healthy()
+    }
+
+    pub(crate) fn has_local_publication_deadline_failure(&self) -> bool {
+        self.publication.has_local_deadline_failure()
     }
 
     /// Retains the exact child and joined outcome when a shutdown waiter is interrupted.
@@ -242,14 +266,23 @@ impl ProductionDisplaySourceRuntime {
                 .map(|()| ())
                 .map_err(|_| ServiceError::Unavailable);
         }
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(ServiceError::Cancelled),
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 Err(ServiceError::DeadlineExceeded)
             }
             result = self.finish_retained_shutdown() => result,
+        };
+        if let Err(error) = &result {
+            let stage = if self.supervisor_result.is_none() {
+                "display-supervisor"
+            } else {
+                "display-publication"
+            };
+            tracing::warn!(%error, stage, "retained account display cleanup remains incomplete");
         }
+        result
     }
 
     /// Joins under retained startup custody; ordinary waiters use the bounded finish method.
@@ -270,7 +303,10 @@ impl ProductionDisplaySourceRuntime {
             self.supervisor_result = Some(display_cleanup_outcome(outcome));
         }
         let publication_result = self.publication.finish_retained_shutdown().await;
-        let result = self.supervisor_result.take().ok_or(ProductionDisplaySourceRuntimeError::Publication)
+        let result = self
+            .supervisor_result
+            .take()
+            .ok_or(ProductionDisplaySourceRuntimeError::Publication)
             .and_then(|result| result)
             .and(publication_result.map_err(|_| ProductionDisplaySourceRuntimeError::Publication));
         let status = match &result {
@@ -284,8 +320,6 @@ impl ProductionDisplaySourceRuntime {
         self.shutdown_result = Some(result);
         status
     }
-
-
 }
 
 fn display_routes(

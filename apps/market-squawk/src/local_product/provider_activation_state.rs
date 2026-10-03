@@ -3099,10 +3099,21 @@ mod tests {
         // Cancellation persists its own operation before cleanup. Reopening must retain
         // Stop/Remove, never restart the superseded activation or lose its exact target.
         let account_surface = "alpaca.basic-market-data";
-        for action in [AccountLifecycleAction::Stop, AccountLifecycleAction::Remove] {
+        for (pending_action, action) in [
+            (AccountLifecycleAction::Start, AccountLifecycleAction::Stop),
+            (
+                AccountLifecycleAction::Start,
+                AccountLifecycleAction::Remove,
+            ),
+            (AccountLifecycleAction::Retry, AccountLifecycleAction::Stop),
+            (
+                AccountLifecycleAction::Retry,
+                AccountLifecycleAction::Remove,
+            ),
+        ] {
             let before = state.source_lifecycle_record(account_surface)?;
             let pending = PendingAccountLifecycle {
-                action: AccountLifecycleAction::Start,
+                action: pending_action,
                 predecessor: None,
                 disposition: AccountStopDisposition::NoPredecessor,
                 target_session_id: Some(Uuid::new_v4()),

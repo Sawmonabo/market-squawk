@@ -2,6 +2,24 @@
 
 ## Current execution — 2026-10-03
 
+### Verified publication-deadline recovery correction
+
+Financial correction committed as `9aa7fc83`. Both implementation owners have released their
+files. Classified local Alpaca publication deadlines now dispatch through the existing exact
+source lifecycle Retry, with a current matching lease and real retained stop acknowledgement.
+Explicit stop, revocation, unknown cancellation, custody/integrity failure and unhealthy sibling
+conditions do not receive that recovery authority. The existing cancellation watcher retains its
+first cause; direct typed deadlines are also recognized only while source/coordinator admission
+is live. Retained startup/stop cleanup receive separate budgets. Narrow stage diagnostics remain
+to identify the underlying live deadline bottleneck; automatic recovery is not proof it is gone.
+
+Critical checks passed: exact-generation revocation/publication drain; custody failure handling;
+health-drain successor rejection; cancelled currentness-monitor join; saved Retry command; and
+durable Stop/Remove superseding pending Retry. Together with the two financial checks this is
+eight existing critical cases from one compilation. No release approval or native successor/
+calendar recovery proof yet. Next barrier: one matched app build, actual ratio pages, then source
+recovery and affected history jobs. Watcher resumes only after this coherent commit/push.
+
 ### Verified financial applicability correction
 
 The shared ratio projector now attempts a calculation only when its exact complete reporting

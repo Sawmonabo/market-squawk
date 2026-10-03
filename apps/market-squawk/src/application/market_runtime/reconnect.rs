@@ -35,6 +35,14 @@ pub(crate) trait AccountMarketRuntimeReconnect: Send + Sync {
         generation: MarketRuntimeGroupGeneration,
         cancellation: CancellationToken,
     ) -> Result<(), ServiceError>;
+
+    /// Recover only a positively classified local publication deadline on this allocation.
+    async fn reconnect_alpaca_publication_deadline(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError>;
 }
 
 impl MarketRuntimeRegistry {
@@ -153,7 +161,7 @@ impl MarketRuntimeRegistry {
         let Some(owner) = self.account_reconnect.get().and_then(Weak::upgrade) else {
             return Ok(false);
         };
-        let request = {
+        let (request, publication_deadline) = {
             let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
             let Some(entry) = entries.iter().find(|entry| {
                 matches_unhealthy_account_generation(
@@ -174,6 +182,7 @@ impl MarketRuntimeRegistry {
             };
             let surface = AccountMarketSurface::parse(snapshot.surface_id.as_str())
                 .ok_or(ServiceError::InvalidResult)?;
+            let mut publication_deadline = false;
             match surface {
                 AccountMarketSurface::AlpacaBasic => {
                     let lease = group.activation_lease();
@@ -184,9 +193,13 @@ impl MarketRuntimeRegistry {
                         return Ok(false);
                     };
                     if doctor.exclusive_expires_at() > market_runtime_timestamp()? {
-                        // Other transport, authorization, or publication failures do not
-                        // authorize an automatic doctor retry.
-                        return Ok(false);
+                        publication_deadline =
+                            group.has_local_alpaca_publication_deadline_failure();
+                        if !publication_deadline {
+                            // An unknown cancellation, authorization or transport failure
+                            // does not authorize automatic recovery.
+                            return Ok(false);
+                        }
                     }
                 }
                 AccountMarketSurface::SchwabMarketData
@@ -196,24 +209,35 @@ impl MarketRuntimeRegistry {
                 }
             }
             let evidence = group.evidence();
-            PreparedMarketProviderConfigurationRequest::try_new(
+            let request = PreparedMarketProviderConfigurationRequest::try_new(
                 surface,
                 evidence.onboarding_session_id(),
                 evidence.public_configuration_digest(),
                 evidence.runtime_verification_receipt_digest(),
                 evidence.credential_generation(),
-            )?
+            )?;
+            (request, publication_deadline)
         };
         // The registry deadline bounds only selection. The lifecycle owner gives the complete
         // renewal/start/calendar operation its existing recovery budget, independently of drain.
         // No registry lock spans the lifecycle gate, OAuth continuation or physical drain.
-        owner
-            .reconnect(
-                request,
-                snapshot.group_generation,
-                cancellation.child_token(),
-            )
-            .await?;
+        if publication_deadline {
+            owner
+                .reconnect_alpaca_publication_deadline(
+                    request,
+                    snapshot.group_generation,
+                    cancellation.child_token(),
+                )
+                .await?;
+        } else {
+            owner
+                .reconnect(
+                    request,
+                    snapshot.group_generation,
+                    cancellation.child_token(),
+                )
+                .await?;
+        }
         Ok(true)
     }
 }

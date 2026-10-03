@@ -78,19 +78,32 @@ impl RetainedAccountStop {
         // A recovery operation also prepares its successor. Physical cleanup retains its
         // own shorter shutdown bound without consuming that operation's entire lifetime.
         let deadline = deadline.min(registry.cleanup_deadline()?);
-        let mut entry = bounded_lock(&self.owner, deadline, cancellation).await?;
+        let mut entry = bounded_lock(&self.owner, deadline, cancellation)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, stage = "retained-owner",
+                    generation = ?self.generation.digest(), "account stop remains incomplete");
+            })?;
         if self.complete.load(Ordering::Acquire) {
             return Ok(());
         }
         registry
             .clear_durable_market_routes(&entry.surface_id, deadline, cancellation)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, stage = "durable-routes",
+                    generation = ?self.generation.digest(), "account stop remains incomplete");
+            })?;
         let MarketRuntime::Account(group) = &mut entry.runtime else {
             return Err(ServiceError::InvalidResult);
         };
         group
             .finish_published_before(&registry.alpaca_historical_source, deadline, cancellation)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, stage = "published-group",
+                    generation = ?self.generation.digest(), "account stop remains incomplete");
+            })?;
         self.complete.store(true, Ordering::Release);
         Ok(())
     }
