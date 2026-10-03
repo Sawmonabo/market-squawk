@@ -257,7 +257,7 @@ impl InstrumentContextReadCapability {
         )
     }
 
-    /// Repeats the complete as-of join and rejects any product or private-evidence drift.
+    /// Reauthorizes the complete as-of join and rejects any selected-data drift.
     pub(crate) fn verify_restart(
         &self,
         expected: &InstrumentContextRead,
@@ -265,7 +265,7 @@ impl InstrumentContextReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<InstrumentContextRead, InstrumentContextReadError> {
         let replay = self.read(expected.request, deadline, cancellation)?;
-        if replay != *expected {
+        if !replay.same_selection(expected) {
             return Err(InstrumentContextReadError::RestartConflict);
         }
         Ok(replay)
@@ -640,6 +640,21 @@ impl InstrumentContextRead {
         }
     }
 
+    /// Compares the complete selection while allowing fresh authorization audit receipts.
+    fn same_selection(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.outcome == other.outcome
+            && self.evidence.definition == other.evidence.definition
+            && self.evidence.retained_matches == other.evidence.retained_matches
+            && self.evidence.directory_receipts.len() == other.evidence.directory_receipts.len()
+            && self
+                .evidence
+                .directory_receipts
+                .iter()
+                .zip(&other.evidence.directory_receipts)
+                .all(|(receipt, other)| receipt.same_selection(other))
+    }
+
     pub(crate) const fn request(&self) -> InstrumentContextRequest {
         self.request
     }
@@ -650,7 +665,9 @@ impl InstrumentContextRead {
 
     /// Borrows the original canonical source record from this exact completed identity read.
     /// Missing or ambiguous outcomes cannot supply a listing to source preparation.
-    pub(crate) fn canonical_record(&self) -> Option<&market_squawk_data::MarketDataInstrumentRecord> {
+    pub(crate) fn canonical_record(
+        &self,
+    ) -> Option<&market_squawk_data::MarketDataInstrumentRecord> {
         let InstrumentContextOutcome::Exact(context) = &self.outcome else {
             return None;
         };

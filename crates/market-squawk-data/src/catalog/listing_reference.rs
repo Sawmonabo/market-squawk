@@ -815,6 +815,27 @@ pub struct ListingReferenceMembershipSelectionReceipt {
 }
 
 impl ListingReferenceMembershipSelectionReceipt {
+    /// Compares the selected evidence across separately authorized reads.
+    ///
+    /// Each read retains its own authorization time and audit digest. Those identify the
+    /// permission check, not a change to the requested point-in-time membership selection.
+    /// Callers must obtain the other receipt through a fresh authorized read.
+    pub fn same_selection(&self, other: &Self) -> bool {
+        self.dataset == other.dataset
+            && self.source_id == other.source_id
+            && self.selection == other.selection
+            && self.requested_knowledge_at == other.requested_knowledge_at
+            && self.selected_generation_digest == other.selected_generation_digest
+            && self.selected_generation_published_at == other.selected_generation_published_at
+            && self.rights_id == other.rights_id
+            && self.source_revision_digest == other.source_revision_digest
+            && self.requested_cursor == other.requested_cursor
+            && self.maximum_rows == other.maximum_rows
+            && self.returned_rows == other.returned_rows
+            && self.state == other.state
+            && self.ordered_rows_digest == other.ordered_rows_digest
+    }
+
     pub const fn dataset(&self) -> &SourceIdentifier {
         &self.dataset
     }

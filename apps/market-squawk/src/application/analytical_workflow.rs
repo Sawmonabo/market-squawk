@@ -2057,6 +2057,9 @@ fn workflow_presentation(
         ),
         WorkflowRunState::Cancelled => Some("This analysis was cancelled before completion."),
         WorkflowRunState::Paused => Some(match run.last_error.as_deref() {
+            Some("analysis_preparation_required") => {
+                "Resume to refresh the information needed for this analysis."
+            }
             Some("analysis_setup_required") => {
                 "Choose a virtual portfolio and review your investment preferences in Settings, then resume this analysis."
             }

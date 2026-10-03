@@ -1120,6 +1120,37 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
         &cancellation,
     )?;
     assert_eq!(reopened_memberships.records(), exact_as_of.records());
+    // A new authorization check must not invalidate an unchanged point-in-time selection.
+    assert_ne!(
+        reopened_memberships.receipt().authorization_checked_at(),
+        exact_as_of.receipt().authorization_checked_at()
+    );
+    assert_ne!(
+        reopened_memberships.receipt().receipt_digest(),
+        exact_as_of.receipt().receipt_digest()
+    );
+    assert!(
+        reopened_memberships
+            .receipt()
+            .same_selection(exact_as_of.receipt())
+    );
+    assert!(
+        !reopened_memberships
+            .receipt()
+            .same_selection(empty_as_of.receipt())
+    );
+    let partial_replay = reader.memberships(
+        ListingReferenceGenerationSelection::AsOf(inserted.generation().published_at()),
+        None,
+        1,
+        deadline(),
+        &cancellation,
+    )?;
+    assert!(
+        !reopened_memberships
+            .receipt()
+            .same_selection(partial_replay.receipt())
+    );
     assert_eq!(
         reopened_memberships.receipt().ordered_rows_digest(),
         exact_as_of.receipt().ordered_rows_digest()

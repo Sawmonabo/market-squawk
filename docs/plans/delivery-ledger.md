@@ -2,6 +2,59 @@
 
 ## Current execution — 2026-10-03
 
+### Current native barrier — saved preparation job resume
+
+Source `abfaac1f` is pushed and its matched single-job build passed (6m13s), launching service
+11203 / Desktop 11246. Startup reports one restored connection; the persisted account advanced
+once to Active revision 33. Starter history checks complete. This does not prove the previously
+unfinished-transition branch or all startup behavior. The same saved stock workflow still pauses
+within approximately 93ms of Resume, at three steps. A verified read-only controller envelope shows
+`lastError=internal`, completed revalidation, no pending invocation, and retained preparation job
+`74a4332d-46bb-4e7a-b637-591e67588066` generation 1, observed sequence 3. No new workflow/reset.
+Evidence: `startup-single-restore-native-{status,resume,progress}.json`,
+`startup-single-restore-lifecycle-state.json`, `workflow-resume-retained-diagnostic.json` under
+`.agents/tmp/v1-first-stock/`.
+
+| Owner | Exact ownership | Required outcome |
+| --- | --- | --- |
+| Astra High `workflow_job_resume` | Read-only workflow job response/restart trace; report `.agents/tmp/v1-first-stock/workflow-job-resume.md` only | Identify exact internal rejection in retained preparation polling; smallest canonical correction and existing critical coverage |
+| Lead | Native read-only job inspection; all source/shared files, checks, runtime, Git and ledger | Correlate retained job with current service response; integrate only confirmed fix, preserve recovery evidence |
+
+Confirmed: Job.Get returns completed sequence 4. Its digest-verified artifact reports unavailable /
+`evidence_changed` with no preparation cutoff. `apply_receipt(PrepareSelection)` nevertheless
+requires a cutoff and rolls back the poll mutation, causing every Resume to reread the same result.
+Astra `workflow_job_resume` now owns `application/analytical_workflow/workflow_driver.rs` only
+(including its existing critical fixture): retain the exact terminal unavailable result, pause with
+`analysis_preparation_required`, and make explicit Resume preserve that evidence while reacquiring
+at the same step/selection/profile. Final preparation retains completed analyses; usable partial
+preparations still continue. Lead owns shared consumers/presentation and all checks. Watcher paused;
+existing service/Desktop stay running. A later native log again reports live publication deadline
+failure; that separate retained-frame retry defect remains open and is not the workflow parse cause.
+
+The producer-side cause is also concrete: `InstrumentContextReadCapability::verify_restart`
+compares the complete read, including directory receipt `authorization_checked_at`, sampled anew
+on every read and included in its audit digest. Unchanged PIT data is therefore rejected as changed.
+Lead owns `crates/market-squawk-data/src/catalog/listing_reference.rs` and its existing catalog
+fixture for a stable-selection comparison that retains all selected data/rights/revision/cursor
+checks and separate fresh authorization. Astra `identity_replay` owns only
+`apps/market-squawk/src/application/research/instrument_context.rs` and a bounded diagnostic report;
+use the shared comparison in context verification, preserving exact definition/outcome/matches.
+These producer and recovery changes integrate together before one serialized build.
+
+The six-file producer/consumer integration is frozen and inspected. Listing restart critical check
+passed 1/1 (0.60s; 47.39s compile); the existing workflow publication/persistence critical check
+passed 1/1 (0.89s; 6m23s compile). Both used locked/offline single-job nonincremental compilation.
+The latter now covers committed unavailable preparation, reopen, explicit single retry, usable
+partial continuation, final-preparation retry preserving prior calculations/cutoff, and mismatched
+binding/digest/instrument rejection. Logs: `identity-replay-critical.log` and
+`workflow-preparation-resume-critical.log`. Fresh listing authorization remains mandatory; complete
+audit receipt equality remains distinct from selected-data equality. Both agent source ownerships
+are released. Matching native deployment and the saved workflow continuation remain unverified.
+
+DAG: retained internal error → current job response and restart contract → scoped producer/consumer
+correction → critical check → matched native continuation. No new worktree, migration, timeout
+increase or manufactured successful result. Prior source-lifecycle lane ownership is released.
+
 ### Current native barrier — calendar work holds account activation open
 
 Source `bacd22b9` is pushed; the matching single-job build passed (7m39s), launching service
