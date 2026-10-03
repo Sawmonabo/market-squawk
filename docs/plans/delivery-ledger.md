@@ -3,7 +3,8 @@
 ## Current execution — 2026-10-03
 
 Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
-Pushed: pending setup/SEC content revisions `aeced650`, filing producer correction `ab0d54e0`.
+Pushed: SEC admission waiting `aedee7ee`, pending setup/content revisions `aeced650`,
+filing producer correction `ab0d54e0`.
 Earlier SEC stack `74eb6762`, SEC/schema `44b9f583`, calendar `dec65cdd` and financial autoload
 `3d078ba5` remain integrated. Origin retains the three intended branches plus active, unmerged
 Dependabot PR55. No new branch/worktree was created.
@@ -23,18 +24,29 @@ loss limit and 365-day horizon. Native status reports `ready`, setup revision 1;
 `corrected-v1-allocation-{status,preview,committed,configured}.json` in the same evidence directory.
 
 The matching build passed in 5m26s; the new launcher reused it in 1.35s. Fresh local-product startup
-reported 14,458ms. Desktop 50670/service 50614 are alive; native contexts are ready and connected
+reported 14,458ms. Its Desktop 50670/service 50614 reached ready/connected native contexts
 without an app-password prompt. Configured credentials imported privately; Alpaca verified and
 activated. All nine starter prices display. Same-root graceful restart passed: Desktop is ready,
 the identical Tiingo session/candidate generation remains stored and unverified, and no app password
-was requested. Supervisor 50095/watcher 50495 owns the single development instance. Daily changes remain unavailable; this is not
+was requested. Supervisor 50095/watcher 50495 owns the single development instance; its latest
+service/native replacement is recorded below. Daily changes remain unavailable; this is not
 instant-start or full financial-page acceptance. Captures/logs are `corrected-v1-*` under
 `.agents/tmp/v1-first-stock/`.
 
-**Live SEC remains blocked:** native Microsoft setup returns `connection_setup_rejected` with
-underlying `ExtractionSource(Authority(BudgetWaitUntil { deadline: MonotonicInstant(136613537500) }))`.
-There is no new stack overflow or immutable-revision conflict in this attempt. This rate-admission
-wait is not successful SEC setup. Logs also record Coinbase/Kraken public runtime shutdown-barrier
+**Live SEC advanced but remains incomplete:** after pushed `aedee7ee`, the matching build passed
+in 5m25s and the launcher replaced service/native with PIDs 60345/60383. Desktop reconnected and
+allocation preferences remained `ready`. Native Microsoft setup now publishes the complete
+`sec.submissions.cik.0000789019` dataset, then returns `Application(DeadlineExceeded)` after
+60.15s before Company Facts completes. The previous request-admission failure is passed; full SEC
+setup is not verified. Captures: `corrected-v1-sec-wait-{activation,publications,ready-native}.json`.
+Company Facts was downloaded (4,881,196 bytes); 98 revision batches/25,088 observations were
+staged before the first deadline, out of 32,671 native observations. No complete Microsoft facts
+manifest committed. A second native attempt failed at the same deadline after 60.06s; the short
+stack sample corroborates active revision processing but is insufficient to assign timing shares.
+Desktop stayed ready/connected with no failed Overview queries after the attempts. Evidence:
+`corrected-v1-sec-deadline-retry.json`, `sec-facts-deadline-sample.txt`,
+`corrected-v1-sec-wait-after-activation.json`. No timeout increase or partial-publication acceptance.
+Logs also record Coinbase/Kraken public runtime shutdown-barrier
 failures; the Desktop and stock prices remain available. These additional failures are unresolved.
 
 **Integrated SEC admission correction:** Astra `fresh_activation_stack` completed the SEC diagnosis:
@@ -47,8 +59,15 @@ Lead inspected the actual diff and caller deadlines. The existing mixed taxonomy
 regression passed 1/1 in 4.50s, including exhausted-budget waiting, cancellation and deadline
 expiry before subsequent successful admission. Log: `sec-admission-critical.log` in the same
 evidence directory. No rate limit, schema, redirect authority or external taxonomy behavior changed.
-Source ownership is released. Lead owns the next matched rebuild and native MSFT activation;
-the running instance remains on the preceding build until replacement succeeds.
+Source ownership is released. Astra's read-only follow-up in `sec-budget-wait.md` confirms that
+`publish_research_stream` was processing Company Facts when the foreground activation deadline
+expired. Connection readiness currently waits for all three financial families. The next coherent
+checkpoint should separate connection activation/restoration from the existing selected-investment
+financial-preparation job, keeping automatic loading on investment/tab opening. Its existing job
+authority owns cancellation, status and longer-running acquisition; setup CIK alone cannot mint an
+instrument/listing admission. Trace and update the selected-CIK setup contracts together so removing
+eager acquisition leaves no meaningless setting. No deadline increase, new job engine or source
+change for that next checkpoint has been made. Full filing preparation remains unverified.
 Runtime captures include
 `corrected-v1-restarted-native.json`, `corrected-v1-restarted-onboarding.json` and the
 `corrected-v1-paper-*` preparation/preview/creation receipts. The
