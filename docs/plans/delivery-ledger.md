@@ -2,6 +2,23 @@
 
 ## Current execution — 2026-10-02
 
+Automatic history loading/recovery is implemented and critically verified: one first-open 365-day
+request when no history/previous intent exists; missing and transiently failed reads observe later
+market publication, preserve the exact acquired generation and stop routine rereads after recovery.
+Terminal requests survive remounts; no failed/cancelled mutation is automatically repeated. The
+existing selected-investment/market cases PASS (2); Desktop typecheck PASS. Native QQQ confirms
+one initial job admission, but its old-backend job is still running: chart completion is not claimed.
+Watchlist/type/history changes are independent of the pending calendar backend check. No new
+suite, full CI, review ceremony, branch or worktree. PR43 comment5963673465 records pushed work.
+
+
+Live QQQ first-open now admits exactly one history job `04d960d8-c9f2-47c1-894d-b131cd5318f6`;
+it remains running in preparing-adjusted-history on the old backend. Sol stock_input_trace may
+read only that job runner / selected-history publisher and the existing local stack sample,
+updating its local report with the concrete next diagnostic. No product edits or runtime calls.
+Lead owns matched backend deployment and native verification; do not start duplicate jobs.
+
+
 Compact watchlist implemented and native HMR verified: ticker/currency price/change only,
 hover or keyboard-focus X, metadata in tooltip, no row description/timestamp/status paragraphs.
 Lead inspected native screenshot against TradingView's official watchlist screenshot; no overflow.

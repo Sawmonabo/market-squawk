@@ -1,9 +1,10 @@
 import { PreparationStatus, type PreparationController } from "./preparation-controls"
 
-export function HistoryPreparation({ controller, windowDays, onWindowChange }: {
+export function HistoryPreparation({ controller, windowDays, onWindowChange, showStatus = true }: {
   controller: PreparationController
   windowDays: string
   onWindowChange: (days: string) => void
+  showStatus?: boolean
 }) {
   return <div className="min-w-0 flex-1">
     <label className="flex items-center gap-2 text-xs">History window
@@ -15,6 +16,6 @@ export function HistoryPreparation({ controller, windowDays, onWindowChange }: {
         <option value="3650">10 years</option>
       </select>
     </label>
-    <PreparationStatus kind="history" controller={controller} />
+    <PreparationStatus kind="history" controller={controller} showMessage={showStatus} />
   </div>
 }

@@ -21,7 +21,9 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
 }) {
   const queryClient = useQueryClient()
   const generation = React.useRef<string | undefined>(undefined)
+  const awaitingReadRecovery = React.useRef(false)
   const lastChecked = React.useRef<MarketHistoryResult | undefined>(undefined)
+  const lastGood = React.useRef<MarketHistoryResult | undefined>(undefined)
   const epoch = React.useRef(0)
   const alive = React.useRef(true)
   const [revision, setRevision] = React.useState(0)
@@ -31,24 +33,33 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
   const [selectedBar, setSelectedBar] = React.useState<MarketHistoryBar | null>(null)
   React.useEffect(() => {
     alive.current = true
-    return () => { alive.current = false; epoch.current += 1; lastChecked.current = undefined }
+    return () => { alive.current = false; epoch.current += 1; lastChecked.current = undefined; lastGood.current = undefined }
   }, [])
   const queryKey = productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetHistory", { historyToken, ...viewport, revision })
   const history = useQuery({
     queryKey,
     gcTime: 0,
-    meta: snapshotQueryMeta,
+    meta: generation.current === undefined || awaitingReadRecovery.current ? { domainRefresh: "automatic" } : snapshotQueryMeta,
     placeholderData: keepPreviousData,
     enabled: !refreshing,
     queryFn: async ({ signal }) => {
       const requestEpoch = epoch.current
       const pinnedGeneration = generation.current
-      const result = parseMarketHistoryResult(await transport.query({ query: "marketHistory", historyToken, ...viewport,
-        ...(pinnedGeneration === undefined ? {} : { generationToken: pinnedGeneration }) }, { signal }), historyToken, viewport, pinnedGeneration)
-      if (signal.aborted || !alive.current || requestEpoch !== epoch.current) throw new DOMException("The view was closed.", "AbortError")
-      if (result.data !== null && generation.current === undefined) generation.current = result.data.generationToken
-      lastChecked.current = result
-      return result
+      try {
+        const result = parseMarketHistoryResult(await transport.query({ query: "marketHistory", historyToken, ...viewport,
+          ...(pinnedGeneration === undefined ? {} : { generationToken: pinnedGeneration }) }, { signal }), historyToken, viewport, pinnedGeneration)
+        if (signal.aborted || !alive.current || requestEpoch !== epoch.current) throw new DOMException("The view was closed.", "AbortError")
+        if (result.data !== null) {
+          if (generation.current === undefined) generation.current = result.data.generationToken
+          lastGood.current = result
+        }
+        awaitingReadRecovery.current = result.unavailableReason === "temporarily_unavailable"
+        lastChecked.current = result
+        return result
+      } catch (error) {
+        if (!signal.aborted && alive.current && requestEpoch === epoch.current) awaitingReadRecovery.current = true
+        throw error
+      }
     },
     ...queryPolicy,
   })
@@ -58,6 +69,7 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     await queryClient.cancelQueries({ queryKey, exact: true })
     if (!alive.current) return
     generation.current = undefined
+    awaitingReadRecovery.current = false
     setSelectedBar(null)
     setRevision((current) => current + 1)
     setRefreshing(false)
@@ -68,8 +80,20 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     seenRefresh.current = refreshRevision
     void reset()
   }, [refreshRevision, reset])
-  const result = history.data ?? lastChecked.current
+  const observed = history.data ?? lastChecked.current
+  const result = (history.isError || observed?.unavailableReason === "temporarily_unavailable") && lastGood.current
+    ? lastGood.current : observed
   const preparation = usePreparationController({ kind: "history", token: historyToken, bootstrap, transport, onPrepared: reset })
+  const initialLoadingAttempted = React.useRef(false)
+  React.useEffect(() => {
+    if (initialLoadingAttempted.current || !history.isSuccess || history.isPlaceholderData
+      || history.data?.unavailableReason !== "not_available" || generation.current !== undefined
+      || preparation.preparation || preparation.storageError || !preparation.canStart) return
+    initialLoadingAttempted.current = true
+    setWindowDays("365")
+    setViewport(recentHistoryWindow(365, history.data))
+    preparation.start(365)
+  }, [history.isSuccess, history.isPlaceholderData, history.data, preparation])
   const restoredWindow = React.useRef(false)
   React.useEffect(() => {
     if (restoredWindow.current) return
@@ -87,20 +111,25 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     if (days !== "all") preparation.start(Number(days))
   }
   const busy = history.isFetching || refreshing
+  const temporarilyUnavailable = observed?.unavailableReason === "temporarily_unavailable"
+  const showPreparationStatus = !history.isError && !temporarilyUnavailable && Boolean(preparation.active || preparation.unresolved || preparation.busy
+    || preparation.storageError || preparation.preparation?.error || preparation.status.isError
+    || preparation.job && preparation.job.state !== "completed")
+  const showReadStatus = !showPreparationStatus && (history.isError || temporarilyUnavailable || busy)
   return <div className="mt-3 min-h-[640px]">
-    <HistoryPreparation controller={preparation} windowDays={windowDays} onWindowChange={selectWindow} />
-    {result ? <div className={`[&>section]:mt-0 [&>section]:rounded-none [&>section]:border-0 [&>section]:bg-transparent [&>section]:p-0 ${result.data ? "[&>section>h3]:hidden" : ""}`}>
-      <MarketHistoryChart result={result}
+    <HistoryPreparation controller={preparation} windowDays={windowDays} onWindowChange={selectWindow} showStatus={showPreparationStatus} />
+    {result?.data || result && !showPreparationStatus && !showReadStatus ? <div className={`[&>section]:mt-0 [&>section]:rounded-none [&>section]:border-0 [&>section]:bg-transparent [&>section]:p-0 ${result?.data ? "[&>section>h3]:hidden" : ""}`}>
+      <MarketHistoryChart result={result ?? null}
         windowDays={windowDays}
         onViewportChange={(next) => { if (!refreshing) { setViewport(next); setSelectedBar(null) } }} onObservationSelect={setSelectedBar} />
-    </div> : <div className="flex h-[536px] items-center justify-center text-sm text-muted-foreground">{history.isError ? "No saved price history is available." : "Opening saved price history…"}</div>}
+    </div> : <div className="h-[536px]" aria-hidden="true" />}
     <div className="mt-2 min-h-10 text-xs leading-5">
-      {history.isError ? <div className="flex items-start justify-between gap-3">
+      {showReadStatus && (history.isError || temporarilyUnavailable) ? <div className="flex items-start justify-between gap-3">
         <p role="alert" className="text-destructive">{result?.data
           ? "Price history could not be updated. Showing saved prices, which may be out of date."
           : "Price history could not be loaded. Try again."}</p>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void history.refetch()}>Retry</Button>
-      </div> : busy ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating prices… Showing saved prices." : "Loading prices…"}</p> : null}
+      </div> : showReadStatus ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating prices… Showing saved prices." : "Loading prices…"}</p> : null}
     </div>
     {selectedBar !== null && result?.data ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${result.data.generationToken}`}
       bar={selectedBar} historyToken={historyToken} generationToken={result.data.generationToken} bootstrap={bootstrap} transport={transport} /> : null}

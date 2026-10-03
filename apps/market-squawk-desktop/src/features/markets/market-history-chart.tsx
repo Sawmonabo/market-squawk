@@ -15,7 +15,6 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
 }) {
   if (!result?.data) return <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
     <h3 className="text-sm font-semibold">Price history is unavailable</h3>
-    <p className="mt-2 text-xs leading-5 text-muted-foreground">Historical prices cannot be shown right now.</p>
   </section>
   const history = result.data
   return <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">

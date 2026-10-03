@@ -660,17 +660,20 @@ describe("Market Squawk desktop boundary", () => {
     const jobGeneration = "9007199254740993"
     const initialHistoryGeneration = "a".repeat(64)
     const publishedHistoryGeneration = "c".repeat(64)
-    let preparationState: "running" | "completed" = "running"
+    let preparationState: "running" | "completed" | "cancelled" = "running"
+    let historyAvailability: "available" | "missing" | "error" = "available"
+    let historyStarts = 0
     let reconciliations = 0
     const preparationRequests: { request: Parameters<ProductTransport["marketHistoryPreparation"]>[0]; confirmed: boolean | undefined }[] = []
     const subscriptions: Parameters<SystemTransport["subscribe"]>[1][] = []
     const recoveryKey = `market-squawk.history-preparation.v1:${blockedBootstrap.productSessionToken}:${historyToken}`
     sessionStorage.removeItem(recoveryKey)
     const historyJob = () => ({
-      jobId: historyJobId, generation: jobGeneration, sequence: preparationState === "completed" ? "11" : "10",
+      jobId: historyStarts > 1 ? "781276a0-33f1-4fb3-8cbb-bb2095acd0c8" : historyJobId,
+      generation: jobGeneration, sequence: preparationState === "completed" ? "11" : preparationState === "cancelled" ? "12" : "10",
       kind: "market.prepare-history.v1", state: preparationState, phase: null,
       completedUnits: preparationState === "completed" ? 1 : 0, totalUnits: 1,
-      cancellationRequested: false, failure: null, updatedAt: "1786363200000000000", recovery: null,
+      cancellationRequested: preparationState === "cancelled", failure: null, updatedAt: "1786363200000000000", recovery: null,
       result: preparationState === "completed" ? {
         authority: "market.adjusted-history-publication.v1", identity: "prepared-selected-history",
         evidenceDigest: { algorithm: "sha256", bytes: Array<number>(32).fill(1) }, artifacts: [],
@@ -678,16 +681,22 @@ describe("Market Squawk desktop boundary", () => {
     })
     const historyPreparation: ProductTransport["marketHistoryPreparation"] = async (request, confirmed) => {
       preparationRequests.push({ request, confirmed })
-      if (request.action === "start") throw new Error("The durable start acknowledgment was lost.")
+      if (request.action === "start") { historyStarts += 1; throw new Error("The durable start acknowledgment was lost.") }
+      if (request.action === "cancel") preparationState = "cancelled"
       const data = request.action === "get" ? historyJob()
         : request.action === "reconcileStart" ? ++reconciliations === 1
           ? { state: "unknown", job: null } : { state: "admitted", job: historyJob() }
-          : null
+          : request.action === "cancel" ? historyJob() : null
       if (data === null) throw new Error(`Unexpected history action: ${request.action}`)
       return { data, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } }
     }
     const savedHistory: ProductTransport["query"] = async (request) => {
       if (request.query !== "marketHistory") throw new Error("Expected a saved history read.")
+      if (historyAvailability === "error") throw new Error("The saved history read was temporarily unavailable.")
+      if (historyAvailability === "missing") return {
+        data: { data: null, unavailableReason: "not_available" },
+        metadata: { completeness: "complete", returnedItems: 0, availableItems: 0 },
+      }
       const generationToken = request.generationToken ?? (preparationState === "completed" ? publishedHistoryGeneration : initialHistoryGeneration)
       const bars = ["2026-06-01", "2026-08-08"].map((date, index) => ({
         originalOrdinal: String(index), breakBefore: [false, false, false],
@@ -1033,14 +1042,13 @@ describe("Market Squawk desktop boundary", () => {
       rangeClock.mockReturnValue(selectedAt + 86_400_000)
       preparationState = "completed"
       await act(async () => { publishJob() })
-      await screen.findByText("History is ready.")
       await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(historyReadsBeforeCompletion + 1))
       expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
         query: "marketHistory", historyToken, ...requestedWindow,
       })
       await waitFor(() => expect(screen.getAllByText("124.56789 USD").length).toBeGreaterThan(0))
       expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("90")
-      expect(sessionStorage.getItem(recoveryKey)).toBeNull()
+      expect(JSON.parse(sessionStorage.getItem(recoveryKey)!).receipt.sequence).toBe("11")
       const completedGets = preparationRequests.filter(({ request }) => request.action === "get").length
       await act(async () => { publishJob() })
       await waitFor(() => expect(preparationRequests.filter(({ request }) => request.action === "get")).toHaveLength(completedGets + 1))
@@ -1051,6 +1059,71 @@ describe("Market Squawk desktop boundary", () => {
       }))
       expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
       reloaded.unmount()
+
+      // A first open with no saved history automatically requests one year.
+      // Publications can fill the chart before the job settles; later price
+      // events must not reopen an acquired snapshot or retry the mutation.
+      sessionStorage.removeItem(recoveryKey)
+      historyAvailability = "missing"
+      preparationState = "running"
+      const firstMissing = openInvestment(lookupRoute(parsed.matches[0]!))
+      await screen.findByText("History loading could not be checked. Check the original request before trying again.")
+      expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+      expect(preparationRequests.filter(({ request }) => request.action === "start").at(-1)?.request).toMatchObject({
+        action: "start", historyToken, lookbackDays: 365,
+      })
+      expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("365")
+      expect(screen.queryByRole("heading", { name: "Price history is unavailable" })).toBeNull()
+      const initialRecovery = JSON.parse(sessionStorage.getItem(recoveryKey)!)
+      expect(initialRecovery.startRequestId).not.toBe(startRequestId)
+      let arrivalSequence = 0
+      const publishHistory = (domain: "market" | "source") => subscriptions.at(-1)!({
+        productSessionToken: blockedBootstrap.productSessionToken, sequence: String(++arrivalSequence),
+        body: { type: "invalidate", domains: [domain] },
+      })
+      const missingReads = issuedQueries.filter((request) => request.query === "marketHistory").length
+      await act(async () => { publishHistory("market") })
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(missingReads + 1))
+      expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+      historyAvailability = "available"
+      await act(async () => { publishHistory("market") })
+      const arrivedChart = await screen.findByRole("img", { name: /Daily investment prices in USD/ })
+      const pinnedReads = issuedQueries.filter((request) => request.query === "marketHistory").length
+      await act(async () => { publishHistory("market") })
+      expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(pinnedReads)
+      historyAvailability = "error"
+      await act(async () => { publishHistory("source") })
+      await screen.findByText("Price history could not be updated. Showing saved prices, which may be out of date.")
+      expect(screen.getByRole("img", { name: /Daily investment prices in USD/ })).toBe(arrivedChart)
+      expect(screen.queryByRole("heading", { name: "Price history is unavailable" })).toBeNull()
+      expect(screen.queryByText("History loading could not be checked. Check the original request before trying again.")).toBeNull()
+      historyAvailability = "available"
+      await act(async () => { publishHistory("market") })
+      await waitFor(() => expect(screen.queryByText("Price history could not be updated. Showing saved prices, which may be out of date.")).toBeNull())
+      expect(screen.getByRole("img", { name: /Daily investment prices in USD/ })).toBe(arrivedChart)
+      expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toMatchObject({
+        generationToken: initialHistoryGeneration,
+      })
+      const recoveredReads = issuedQueries.filter((request) => request.query === "marketHistory").length
+      await act(async () => { publishHistory("market") })
+      expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(recoveredReads)
+      await user.click(screen.getByRole("button", { name: "Check loading" }))
+      await screen.findByText("Loading history…")
+      await user.click(screen.getByRole("button", { name: "Cancel loading" }))
+      await screen.findByText("History loading was cancelled.")
+      expect(JSON.parse(sessionStorage.getItem(recoveryKey)!).receipt.sequence).toBe("12")
+      firstMissing.unmount()
+      historyAvailability = "missing"
+      const cancelledHistory = openInvestment(lookupRoute(parsed.matches[0]!))
+      await screen.findByText("History loading was cancelled.")
+      const cancelledReads = issuedQueries.filter((request) => request.query === "marketHistory").length
+      arrivalSequence = 0
+      await act(async () => { publishHistory("market") })
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(cancelledReads + 1))
+      expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+      expect(JSON.parse(sessionStorage.getItem(recoveryKey)!).startRequestId).toBe(initialRecovery.startRequestId)
+      cancelledHistory.unmount()
+      historyAvailability = "available"
     } finally {
       rangeClock.mockRestore()
     }
@@ -1201,7 +1274,7 @@ describe("Market Squawk desktop boundary", () => {
     for (const choice of collectionChoices) expect(collection.getByText(choice.symbol)).toBeTruthy()
     expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(false)
     expect((collection.getByRole("button", { name: "Follow QQQ in your watchlist" }) as HTMLButtonElement).disabled).toBe(false)
-    expect(collection.queryByText("USD 68,000.15")).toBeNull()
+    expect(collection.queryByText("$68,000.15")).toBeNull()
     expect(issuedQueries).toContainEqual({ query: "marketCollection", includeMarket: true })
     await user.click(collection.getByRole("button", { name: "Remove SPY from your watchlist" }))
     const restore = await collection.findByRole("button", { name: "Follow SPY in your watchlist" })
@@ -1218,18 +1291,15 @@ describe("Market Squawk desktop boundary", () => {
     // A failed background read must preserve the last matching price, without claiming it is live.
     marketRefreshFails = false
     await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))
-    expect(await collection.findByText("USD 68,000.15")).toBeTruthy()
-    const priceTime = screen.getByRole("region", { name: "Watchlist" }).querySelector("time")?.dateTime
-    expect(priceTime).toBe(marketObservedAt)
+    expect(await collection.findByText("$68,000.15")).toBeTruthy()
     marketRefreshFails = true
     collectionRefreshFails = true
     await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))
     await waitFor(() => expect((collection.getByRole("button", { name: "Remove SPY from your watchlist" }) as HTMLButtonElement).disabled).toBe(true))
     expect(await collection.findByText("Saved watchlist could not be refreshed")).toBeTruthy()
-    expect(collection.getByText(/Saved price/)).toBeTruthy()
-    expect(collection.getByText("USD 68,000.15")).toBeTruthy()
+    expect(collection.getByText("$68,000.15")).toBeTruthy()
+    expect(collection.getByText(/Showing saved prices and investment details/)).toBeTruthy()
     expect(collection.queryByText(/^Current/)).toBeNull()
-    expect(screen.getByRole("region", { name: "Watchlist" }).querySelector("time")?.dateTime).toBe(priceTime)
     collectionRefreshFails = false
     marketRefreshFails = false
     await user.click(collection.getByRole("button", { name: "Refresh watchlist" }))

@@ -216,16 +216,13 @@ export function usePreparationController(props: PreparationControllerProps) {
   React.useEffect(() => {
     if (!job || isActiveJob(job.state)) return
     try {
-      if (kind === "history") sessionStorage.removeItem(storageKey(kind, scope, token))
-      else {
-        // Keep the terminal request and sequence across remounts. Missing data
-        // must not silently retry a cancelled/failed request or accept older status.
-        const current = queryClient.getQueryData<Preparation | null>(receiptKey)
-        if (!current?.receipt || current.receipt.sequence === job.sequence) return
-        const next = { ...current, receipt: { ...current.receipt, sequence: job.sequence } }
-        persistPreparation(kind, scope, token, next)
-        queryClient.setQueryData(receiptKey, next)
-      }
+      // Keep the terminal request and sequence across remounts. Automatic loading
+      // must not repeat a cancelled/failed request or accept older status.
+      const current = queryClient.getQueryData<Preparation | null>(receiptKey)
+      if (!current?.receipt || current.receipt.sequence === job.sequence) return
+      const next = { ...current, receipt: { ...current.receipt, sequence: job.sequence } }
+      persistPreparation(kind, scope, token, next)
+      queryClient.setQueryData(receiptKey, next)
     } catch { setStorageError("The completed loading request could not be saved for recovery.") }
   }, [job, kind, scope, token, queryClient, receiptKey])
   React.useEffect(() => {
@@ -275,8 +272,8 @@ export function usePreparationController(props: PreparationControllerProps) {
 
 export type PreparationController = ReturnType<typeof usePreparationController>
 
-export function PreparationStatus({ kind, controller }: {
-  kind: PreparationKind; controller: PreparationController
+export function PreparationStatus({ kind, controller, showMessage = true }: {
+  kind: PreparationKind; controller: PreparationController; showMessage?: boolean
 }) {
   const { preparation, job, busy, unresolved, storageError, status } = controller
   const noun = kind === "history" ? "history" : "financial information"
@@ -295,7 +292,7 @@ export function PreparationStatus({ kind, controller }: {
       {status.isError || preparation?.error && preparation.receipt ? <Button variant="outline" size="sm" disabled={busy || status.isFetching}
         onClick={controller.checkStatus}>Check loading</Button> : null}
     </div>
-    <div className="mt-2 leading-5" aria-live="polite">
+    {showMessage ? <div className="mt-2 leading-5" aria-live="polite">
 
       {storageError ? <p role="alert" className="text-destructive">{storageError}</p> : null}
       {preparation?.error ? <p role="alert" className="text-destructive">{preparation.error}</p>
@@ -306,7 +303,7 @@ export function PreparationStatus({ kind, controller }: {
             : job ? <p role={job.state === "failed" || job.state === "interrupted" ? "alert" : "status"}
               className={job.state === "failed" || job.state === "interrupted" ? "text-destructive" : "text-muted-foreground"}>{jobMessage(job, kind)}</p>
               : preparation?.admission === "not_admitted" ? <p role="status" className="text-muted-foreground">{kind === "history" ? "The original request did not start. Select a history range to try again." : "The original request did not start. Information can be loaded again."}</p> : null}
-    </div>
+    </div> : null}
   </div>
 }
 
