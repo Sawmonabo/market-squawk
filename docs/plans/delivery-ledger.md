@@ -2,6 +2,44 @@
 
 ## Current execution — 2026-10-03
 
+### Source recovery and financial projection wave
+
+Previous goal turn was progress: completed the cross-source evidence trace. `e780b62a` is pushed;
+the nine-instrument native navigation pass has released its session on Home. The single
+supervisor build completed in5m41s; service1727/Desktop1777 run generation-v4mv15 from that
+source candidate. Watcher emission is paused while the two bounded source lanes edit. All256
+watchlist PNGs have been individually viewed; lead checked all256 hashes with zero mismatches. Current confirmed gaps: IEX is the sole captured equity
+quote route; SPY/QQQ have raw bars but adjusted acquisition loses runtime authority; AAPL ratios
+enumerate equity-only filing envelopes ahead of valid complete balance-sheet candidates.
+
+| Owner | Finishable outcome / exclusive files | Dependency and smallest critical evidence |
+| --- | --- | --- |
+| Astra High `native_price_authority` | Repair classified local publication-timeout recovery through the existing durable source lifecycle; `application/research/ingest/provider_runtime.rs`, `alpaca_historical/market.rs`, `application/market_runtime/{alpaca_publication,group,reconnect,account_stop}.rs`, `application/market_runtime.rs`, `local_product/source_lifecycle/reconnect.rs`, and only if necessary `live_source/display_runtime.rs` | Refresh completed `account-generation-drain.md`; retain exact generation/stop custody and explicit-stop semantics. No broad retry or timeout increase. Extend existing critical lifecycle/publication fixtures only for this uncovered failure. Lead owns shared composition/contracts and schedules all checks. |
+| Astra High `research_choice_streaming` | Correct misleading default ratio rows using whole reporting envelopes; `application/research/{company_product,company_research}.rs` and `application/research/investment_financials/{projection,snapshot,page}.rs` | Source-verified AAPL report; preserve PIT, conflicts, explicit nil operands, units, zero denominator and original evidence. Carry narrowly scoped verified operand-presence evidence where numeric-only projection currently loses nil relevance. No cross-filing operand mixing or frontend financial fallback. Coordinate any additional file before editing. Existing critical envelope fixture; no builds/runtime/Git. |
+| GPT-6.1 Sol High `console_qa` | Finish all-nine evidence matrix and actual image inspection in existing `watchlist-wide/` only | Native navigation released; no additional native interaction. Record failed harness attempts separately. Lead owns tracked audit report. |
+| Lead | Matched native verification, source activation/consumer tracing, tracked audit/ledger/PR and integration | Inspect handed-off diffs, serialize checks and commit/push each coherent outcome. Shared files remain lead-owned except the explicit authority-hotspot ownership above. |
+
+DAG: frozen `e780b62a` native build → affected source/research/cache reads; independent recovery
+and ratio implementation → lead critical checks → integrated native recovery and all-watchlist
+recheck. These close concrete acceptance1/2/5/6/7 failures; first-stock analysis remains required.
+
+Matched native evidence: `native-source-contract-e780b62a.json` parses25 profiles and the current
+Alpaca doctor (50 returned /37 valid two-sided quotes, admitted). Source imports parse to0 choices;
+actual UI settles to “No source is ready to import data” without the former parser error.
+`native-contract-check-e780b62a.json` returns0 Research choices in3143ms without decode failure;
+this does not prove usable positive preparation. The initial probe incorrectly used the product
+context for systemQuery; the separate corrected system-context probe is the accepted source proof.
+All nine native warm returns preserve their own display; three populated financial readers retain
+32 distinct Facts rows while revalidating. Durable restart display caching remains open.
+The running service again logs `analytical operation deadline exceeded` during Alpaca publication;
+classified recovery must cover the direct deadline as well as watcher-driven cancellation.
+Lead extended existing durable transition coverage for Stop/Remove superseding pending Retry and
+added the new retry reason to the existing command-contract fixture. Checks await frozen sources.
+
+Full all-nine findings are integrated in `docs/reports/2026-10-02-desktop-product-audit.md`; all36
+financial tabs and12 available Next/Previous paths were exercised. Six charts, five fund detail
+compositions, NVDA preparation, later-page ratios and remaining first-stock dependencies are open.
+
 ### QA remediation wave — reusable details and usable research/source reads
 
 Previous goal turn was progress: pushed audit checkpoint `4ea27456` and PR43 comment5973991415
@@ -47,7 +85,7 @@ Existing `app.test.tsx` was extended only for the uncovered warm-return/closed-l
 Pushed checkpoint `f7bfaa15`. All 11 existing cases pass with one Vitest worker; `tsc --build` and `git diff --check` pass.
 This establishes critical local behavior, not native all-watchlist or restart-cache completion.
 The dedicated auditor is checking all nine actual watchlist instruments on the running app.
-Source-contract and indexed Research work remain separate uncommitted integration lanes.
+Source-contract and indexed Research work subsequently landed together in pushed `e780b62a`.
 Lead shared changes align the doctor output and strict Desktop parser using the backend's
 `admits_source_start()` conclusion; source consumers no longer reconstruct stricter authority.
 Research options describe available source/recipe summaries; selected preview validates full
@@ -83,7 +121,9 @@ native build and restart; no agent may restart, build or alter runtime state. Th
 native navigation until the auditor is explicitly granted it; independent source/evidence mapping
 can proceed immediately. `detail_display_cache` additionally owns read-only visual inspection of the 27 captured
 `watchlist-wide/AAPL-statements-000..026.png` tiles, writing only
-`watchlist-wide/AAPL-statements-visual-review.md`; no navigation, implementation or builds.
+`watchlist-wide/AAPL-statements-visual-review.md`; this 27-tile pass is complete. The same
+agent next owns all `MSFT-statements-NNN.png` tiles and writes only
+`watchlist-wide/MSFT-statements-visual-review.md`; no navigation, implementation or builds.
 No product implementation or Git operations in this audit lane. Native background navigation is
 now assigned exclusively to `console_qa`; frontend cache candidate is explicitly identified as WIP
 over native `d9afd7cb`. `source_status_contract` separately owns read-only quote/reference origin

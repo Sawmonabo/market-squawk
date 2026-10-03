@@ -1,5 +1,79 @@
 # Desktop product audit — 2026-10-02 / current checkpoint 2026-10-03
 
+## Watchlist-wide extension — source tracing and remediation
+
+The subsequent native interaction pass covers all nine actual watchlist instruments: SPY, QQQ,
+DIA, IWM, VTI, AAPL, MSFT, NVDA and TSLA. Native navigation is complete and released on Home;
+all 256 new PNGs have been individually viewed (203 by the auditor, 53 by the delegated
+statement reviewer). This is not full product acceptance. Captures used the prior native generation with the warm-display renderer changes;
+some observation samples overlapped a single local compilation and cannot establish latency
+acceptance. The source findings below were independently inspected against retained evidence.
+
+| Finding | Evidence and implication | Correction / verification status |
+| --- | --- | --- |
+| DP-03 cache continuation | Warm display correction is pushed as `f7bfaa15`; existing 11-case renderer suite and typecheck passed, including closed-lease display reuse. Cached values contain no reusable cursor/authority. | All nine retain their own display on warm return; the three populated financial views retain their own 32 Facts rows before revalidation. Durable restart reuse remains unproven; this is not closure of the original finding. |
+| DP-08 preparation listing | `e780b62a` replaces whole-observation accumulation with streamed summaries and a temporary disk index; selected Preview retains full financial admission. A 9,000-point critical fixture checks complete-span sampling, annual purging and cancellation. | Matched native options read now completes in 3.143 seconds without the decoder error, but returns zero choices. Positive usable selection/Preview remains open. |
+| DP-14 / DP-17 source contracts | `e780b62a` aligns partial two-sided quote counts and backend `admitsSourceStart`, and makes imports reuse the canonical source parser. Producer and consumer changed together. | Matched native source response parses all 25 profiles, including the current admitted doctor with 50 returned / 37 two-sided-valid quotes. Imports parses the same response into zero choices; actual configured import coverage remains open. |
+| DP-18 Important — incomplete source alternatives | The quote index contains only Alpaca IEX equity quotes. DIA/NVDA/TSLA retained originals have zero ask price/size at the displayed times; Schwab/Tiingo are stored but unverified, Yahoo cancelled. Yahoo enrichment has a producer but no ordinary product caller. | Missing in one retained feed is not all-source absence. Complete applicable activation/acquisition/selection; do not combine unrelated quote sides or invent consolidated prices. |
+| DP-19 Important — retained history not displayed | SPY/QQQ each retain 21 raw daily bars. The chart selects only fully adjusted history; adjusted preparation fails with `operation-authority-unavailable` at the required runtime stage. The same all-nine pass reports six failed history preparations. | Repair acquisition/runtime recovery and the supported display policy. Do not relabel raw prices as adjusted or claim a provider returned no prices. |
+| DP-20 Important — misleading ratio enumeration | AAPL March/December periods have complete current ratios in earlier filing envelopes. Later equity-only contexts generate additional missing-input ratios and sort ahead of complete candidates. Exact original-source values and normalized operands agree. | Correct backend default selection over whole reporting envelopes; retain conflicts, actual filing/PIT dates and source evidence. Never borrow operands across filings to fill a ratio. |
+| DP-21 Important — indistinguishable statement rows | All 27 AAPL and 26 MSFT Statements tiles were individually viewed. Both show repeated indistinguishable filing rows; long first pages provide insufficient local orientation. Values stay contained and aligned at the captured width. | Improve ordinary statement presentation while retaining exact source context in evidence. Screenshot alignment does not prove arithmetic or interaction. |
+
+Detailed retained evidence lives in
+[cross-source selection](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/cross-source-selection.md),
+[AAPL ratio originals](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/AAPL-ratio-source-trace.md),
+[AAPL visual review](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/AAPL-statements-visual-review.md)
+and [MSFT visual review](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/MSFT-statements-visual-review.md).
+The VTI name concern is withdrawn: the captured name matches Vanguard's current official product
+page. Failed audit JavaScript selectors on initial SPY/QQQ/DIA warm attempts are harness failures,
+excluded from app-defect evidence; successful recaptures remain separate.
+
+### All-nine baseline and remaining red flags
+
+
+All prices below are USD. Positive changes appeared signed green and agree with `(selected price / Oct1 completed close − 1) × 100` at returned precision (Decimal difference at most rounding residue). This checks the returned arithmetic only; it does not independently validate all source prices. The price/trade/quote dates are Oct2; quote/trade freshness flags are false. Each profile is available, correctly classified stock/fund with currency and venue; successor/delisting lifecycle is explicitly not established.
+
+| Actual member / class | Selected price / basis / displayed change | Quote sides; profile | History / chart | Applicable information / next dependency |
+|---|---|---|---|---|
+| SPY / fund |769.72 last trade / +0.74% | Bid and ask present; ARCX | Adjusted read unavailable; automatic job failed. Raw21 bars retained. | Four corporate tabs empty `identity_missing`; fund NAV/holdings/docs not composed. Restore history acquisition authority and applicable fund consumer. |
+| QQQ / fund |749.2 last trade / +0.97% | Bid and ask present; XNAS | Same; raw21 retained. | Same four empty tabs and fund gap; history authority and fund consumer required. |
+| DIA / fund |510.92 previous close / +0.48% | Bid present; ask/size/mid absent in retained IEX original; ARCX | Adjusted read unavailable; automatic job failed; catalog has raw21. | Same corporate/fund gap; acquire/select eligible history and applicable fund data. A missing IEX ask is not universal source absence. |
+| IWM / fund |281.58 last trade / +0.91% | Bid and ask present; ARCX | Adjusted read unavailable; automatic job failed; raw21 catalog evidence. | Same corporate/fund gap; fund identity/consumer and history authority required. |
+| VTI / fund |378.62 midpoint / +0.92% | Bid367.12/ask390.12; ARCX. Displayed Morningstar name issuer-confirmed. | Adjusted read unavailable; automatic job failed; raw21 catalog evidence. | Same corporate/fund gap; required fund reads and adjusted acquisition remain incomplete. |
+| AAPL / stock |333.265 midpoint / +0.85% | Bid and ask present; XNAS |251 fully adjusted bars, line/candles exported and viewed; date selector exercised. | All4 tabs32+32; Next/Previous exact. Ratios3/32 missing on page1,7/32 on page2. Three page1 cases source-confirmed as envelope/default-selection defect; remaining source tracing and matched verification required. |
+| MSFT / stock |519.54 midpoint / +1.33% | Bid and ask present; XNAS |251 fully adjusted bars, line/candles exported and viewed; date selector exercised. | All4 tabs32+32; Next/Previous exact. First32 ratios reported; next page14/32 missing. Earlier independent32ratio/84input pass covers only that first page. Page2 source tracing required. |
+| NVDA / stock |234 previous close / +1.28% | Bid present; ask/size/mid absent in exact IEX original; XNAS | Adjusted read unavailable; automatic job failed; raw21 catalog evidence. | All4 tabs empty `identity_missing`; financial preparation still running, not proof no NVDA reports exist. Complete preparation, invalidate/reopen current reads and trace any residual identity gap. |
+| TSLA / stock |370.53 last trade / +4.61% | Bid present; ask/size/mid absent in exact IEX original; XNAS |251 fully adjusted bars, line/candles exported and viewed; date selector exercised. | All4 tabs32+32; Next/Previous exact. Ratios2/32 missing on page1,11/32 on page2; exact contexts/inputs retained. Trace upstream/envelope applicability before classifying absence. |
+
+**Units and sessions, every row:** price currency is explicitly USD. All9 quote results retain `quoteSizeBasis:source_units`; current UI displays bare size numbers. Economic shares/lots conversion remains unconfirmed. Full trading-calendar/session controls were not exercised for any member; only exact component times and Oct1 completed-close comparison were checked. Reference round-lot size is not proof of quote-size units. See [source quote/identity trace](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/source-quote-identity.md).
+
+
+All 36 financial tabs were selected. Across AAPL/MSFT/TSLA, all 12 available tab pagination
+paths returned 32 next-page items and Previous restored the exact first page. Line/candle
+rendering and date selection were exercised for those three stocks. Six other history charts
+remain blocked. All five funds incorrectly receive corporate financial sections. NVDA's
+financial preparation was still running while the page implied missing reports. These are
+required fixes, not source-absence findings.
+
+Ratios with `missing_input` on page1/page2: AAPL3/7, MSFT0/14, TSLA2/11. The earlier
+MSFT32-ratio source/arithmetic pass covers only page1. The three AAPL page1 cases are source
+traced; later/member cases require their own envelope checks. Bare quote sizes on all9 omit
+the unresolved economic-unit meaning; no shares/lots conversion is established. These extend
+DP-09/DP-20 and the quote presentation findings rather than asserting all missing data has one cause.
+
+Warm first samples retained AAPL/MSFT/TSLA's distinct 32 Facts rows at357/418/382ms respectively.
+These are observer samples, not latency acceptance. Full reads still took seconds. Restart cache,
+range-change loading, all per-row disclosures, pointer/keyboard chart inspection, narrower widths
+and the blocked analytical workflows remain unverified. Background WKWebView captures can miss
+canvas paint or retain outgoing tab styling; direct chart exports were inspected, and those
+capture limitations are not mislabeled application defects.
+
+The [full watchlist matrix](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/matrix.md)
+records each control, payload, limitation and source trace. The
+[256-image manifest](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/visual-review-manifest.json)
+records reviewer and hash for every captured image. Existing six actually inspected official
+competitor images remain the comparison baseline; no overall superiority claim is supported.
+
 ## Current checkpoint — 2026-10-03
 
 **This native investigative pass is complete; full workflow QA and product acceptance remain open.** All 17 sidebar routes, selected IWM/MSFT investment details and the three Onboarding tabs were inspected in the running Desktop. First-page Facts, Statements, Ratios and Filings were read; selected portfolio, research, profile and chart controls were exercised. Missing prerequisites prevented complete analysis/forecast/backtest/trading workflows. This does **not** establish that every button, financial field, responsive width or workflow works.
