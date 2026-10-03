@@ -3,6 +3,7 @@ import { z } from "zod"
 import { validateReturnedItems } from "@/features/research/research-contracts"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
 import type { ApplicationResult } from "@/lib/schemas"
+import { parseSourceStatusResult } from "./source-evidence"
 
 const researchSourceInputSchema = z.strictObject({
   provider: z.string().min(1),
@@ -84,54 +85,6 @@ const sourceObjectSchema = z
   })
   .strict()
 
-const providerProfileForResearchSchema = z
-  .object({
-    id: z.string().min(1),
-    display_name: z.string().min(1),
-    capability_revision: z.unknown(),
-    capability_digest: z.unknown(),
-    selected_setup_mode: z.unknown(),
-    setup_modes: z.unknown(),
-    human_boundary: z.unknown(),
-    credential_kind: z.unknown(),
-    minimum_authority: z.unknown(),
-    maximum_authority: z.unknown(),
-    verifier_revision: z.unknown(),
-    rate_policy: z.unknown(),
-    rights_state: z.unknown(),
-    lifecycle_support: z.unknown(),
-    capability_evidence: z.unknown(),
-    refresh_trigger: z.unknown(),
-    zero_fee: z.unknown(),
-    account_requirement: z.unknown(),
-    credential_requirement: z.unknown(),
-    administrative_contact_requirement: z.unknown(),
-    release_state: z.unknown(),
-    official_handoff_url: z.unknown(),
-    handoff_instruction: z.unknown(),
-    permissions: z.unknown(),
-    coverage: z.unknown(),
-    quality_ceiling: z.unknown(),
-    rights: z.unknown(),
-    rights_duties: z.unknown(),
-    rights_decision_digest: z.unknown(),
-    persistence_evidence: z.unknown(),
-    rotation: z.unknown(),
-    revocation: z.unknown(),
-    recovery: z.unknown(),
-    evidence: z.unknown(),
-  })
-  .strict()
-
-const researchSourceStatusSchema = z
-  .object({
-    profile: providerProfileForResearchSchema,
-    currentSession: z.record(z.string(), z.unknown()).nullable(),
-    providerDatasetIdentifier: z.string().min(1).nullable(),
-    runtime: z.record(z.string(), z.unknown()),
-  })
-  .strict()
-
 const sourceObjectListingSchema = z
   .object({
     profile: z.string().min(1),
@@ -163,18 +116,8 @@ export type ResearchSourceObject = z.infer<typeof sourceObjectSchema>
 export function parseResearchSourceInputs(
   result: ApplicationResult,
 ): ResearchSourceInput[] {
-  if (result.data === null) {
-    validateReturnedItems(result, 0, "research source")
-    return []
-  }
-  const statuses = z.array(researchSourceStatusSchema).safeParse(result.data)
-  if (!statuses.success) {
-    throw new Error(
-      "The installed service returned an unsupported research-source response.",
-    )
-  }
-  validateReturnedItems(result, statuses.data.length, "research source")
-  const inputs = statuses.data.flatMap((row) =>
+  const statuses = parseSourceStatusResult(result, [])
+  const inputs = statuses.flatMap((row) =>
     row.providerDatasetIdentifier === null
       ? []
       : [
@@ -188,11 +131,7 @@ export function parseResearchSourceInputs(
   const unique = new Map<string, ResearchSourceInput>()
   for (const input of inputs) {
     const key = `${input.provider}\u0000${input.dataset}`
-    if (unique.has(key)) {
-      throw new Error(
-        "The installed service returned a duplicate research-source identity.",
-      )
-    }
+    // The status parser binds repeated runtime rows to the same source dataset.
     unique.set(key, input)
   }
   return [...unique.values()].sort((left, right) =>

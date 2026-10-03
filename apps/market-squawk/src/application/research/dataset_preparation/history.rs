@@ -10,174 +10,7 @@ use market_squawk_backtesting::RECOMMENDATION_TARGET_HORIZON_NANOS_V1;
 use market_squawk_data::Sha256Digest;
 use sha2::{Digest as _, Sha256};
 
-use super::{DatasetPreparationError, MAXIMUM_EXAMPLES, MarketSeriesPoint};
-
-pub(super) struct DatasetRecipeCoordinates {
-    pub(super) identity: Sha256Digest,
-    pub(super) label: &'static str,
-    pub(super) coordinates: Vec<[usize; 3]>,
-    pub(super) split_counts: [usize; 3],
-    pub(super) observed_points: usize,
-}
-
-/// Both recipes select coordinates before inspecting return values. The annual recipe requires
-/// exact terminal timestamps and purges every label crossing the preselected time partitions.
-pub(super) fn recipes(
-    series: Sha256Digest,
-    points: &[MarketSeriesPoint],
-) -> Result<Vec<DatasetRecipeCoordinates>, DatasetPreparationError> {
-    let mut recipes = Vec::with_capacity(2);
-    if let Some(adjacent) = adjacent_recipe(series, points) {
-        recipes.push(adjacent);
-    }
-    if let Some(annual) = annual_recipe(series, points)? {
-        recipes.push(annual);
-    }
-    Ok(recipes)
-}
-
-fn adjacent_recipe(
-    identity: Sha256Digest,
-    points: &[MarketSeriesPoint],
-) -> Option<DatasetRecipeCoordinates> {
-    let mut horizons: BTreeMap<u64, Vec<[usize; 3]>> = BTreeMap::new();
-    for (chunk_index, triple) in points.chunks_exact(3).enumerate() {
-        let horizon = triple[2]
-            .effective
-            .unix_nanos()
-            .checked_sub(triple[1].effective.unix_nanos())
-            .and_then(|value| u64::try_from(value).ok());
-        let Some(horizon) = horizon.filter(|value| *value > 0) else {
-            continue;
-        };
-        let start = chunk_index * 3;
-        horizons
-            .entry(horizon)
-            .or_default()
-            .push([start, start + 1, start + 2]);
-    }
-    let (_, coordinates) =
-        horizons
-            .into_iter()
-            .fold(None, |selected, candidate| match selected {
-                None => Some(candidate),
-                Some(current) if candidate.1.len() > current.1.len() => Some(candidate),
-                Some(current)
-                    if candidate.1.len() == current.1.len() && candidate.0 < current.0 =>
-                {
-                    Some(candidate)
-                }
-                Some(current) => Some(current),
-            })?;
-    let count = coordinates.len();
-    if count < 3 {
-        return None;
-    }
-    Some(DatasetRecipeCoordinates {
-        identity,
-        label: "Price returns with economic context",
-        coordinates,
-        split_counts: [count / 3, count / 3, count - 2 * (count / 3)],
-        observed_points: count * 3,
-    })
-}
-
-fn annual_recipe(
-    series: Sha256Digest,
-    points: &[MarketSeriesPoint],
-) -> Result<Option<DatasetRecipeCoordinates>, DatasetPreparationError> {
-    let mut candidates = Vec::new();
-    for (current_index, current) in points.iter().enumerate().skip(1) {
-        let Ok(target_at) = current
-            .effective
-            .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
-        else {
-            continue;
-        };
-        let Ok(terminal_index) = points.binary_search_by_key(&target_at, |point| point.effective)
-        else {
-            continue;
-        };
-        let terminal = &points[terminal_index];
-        // Local acquisition after the historical target cannot manufacture a historical input.
-        // The unchanged dataset builder additionally reselects every source at these real clocks.
-        if terminal_index <= current_index
-            || current.available_at >= target_at
-            || current.available_at >= terminal.available_at
-        {
-            continue;
-        }
-        candidates.push([current_index - 1, current_index, terminal_index]);
-    }
-    let (Some(first), Some(last)) = (candidates.first(), candidates.last()) else {
-        return Ok(None);
-    };
-    let starts_at = i128::from(points[first[1]].available_at.unix_nanos());
-    let ends_at = i128::from(points[last[2]].available_at.unix_nanos());
-    let span = ends_at - starts_at;
-    if span <= 0 {
-        return Ok(None);
-    }
-    let train_boundary = starts_at + span / 3;
-    let validation_boundary = starts_at + 2 * span / 3;
-    let mut partitions: [Vec<[usize; 3]>; 3] = std::array::from_fn(|_| Vec::new());
-    for coordinate in candidates {
-        let origin = i128::from(points[coordinate[1]].available_at.unix_nanos());
-        let label_available = i128::from(points[coordinate[2]].available_at.unix_nanos());
-        let partition = if label_available <= train_boundary {
-            Some(0)
-        } else if origin > train_boundary && label_available <= validation_boundary {
-            Some(1)
-        } else if origin > validation_boundary && label_available <= ends_at {
-            Some(2)
-        } else {
-            None
-        };
-        if let Some(partition) = partition {
-            partitions[partition].push(coordinate);
-        }
-    }
-    if partitions.iter().any(Vec::is_empty) {
-        return Ok(None);
-    }
-    let mut coordinates = Vec::new();
-    coordinates
-        .try_reserve_exact(MAXIMUM_EXAMPLES)
-        .map_err(|_| DatasetPreparationError::Capacity)?;
-    let mut split_counts = [0; 3];
-    for (partition, candidates) in partitions.into_iter().enumerate() {
-        let maximum = MAXIMUM_EXAMPLES / 3 + usize::from(partition < MAXIMUM_EXAMPLES % 3);
-        let retained = candidates.len().min(maximum);
-        split_counts[partition] = retained;
-        // Even deterministic sampling retains the complete time extent, without choosing on
-        // labels, performance, or a later study result.
-        for index in 0..retained {
-            let selected = if retained == 1 {
-                0
-            } else {
-                index * (candidates.len() - 1) / (retained - 1)
-            };
-            coordinates.push(candidates[selected]);
-        }
-    }
-    let observed_points = coordinates
-        .iter()
-        .flatten()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .len();
-    let mut identity = Sha256::new();
-    identity.update(b"market-squawk/exact-365-day-purged-time-thirds-recipe/v1\0");
-    identity.update(series.bytes());
-    identity.update(RECOMMENDATION_TARGET_HORIZON_NANOS_V1.to_be_bytes());
-    Ok(Some(DatasetRecipeCoordinates {
-        identity: Sha256Digest::new(identity.finalize().into()),
-        label: "365-day price returns with economic context",
-        coordinates,
-        split_counts,
-        observed_points,
-    }))
-}
+use super::{DatasetPreparationError, MarketSeriesPoint};
 
 use super::{
     CanonicalSupport, DatasetPreparationAuthority, DatasetPreparationUse, EvidencePart,
@@ -787,8 +620,15 @@ async fn select_nominal_series(
     {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
-    nominal_series_from_history(authority, history, instrument, snapshot, deadline, cancellation)
-        .await
+    nominal_series_from_history(
+        authority,
+        history,
+        instrument,
+        snapshot,
+        deadline,
+        cancellation,
+    )
+    .await
 }
 
 async fn nominal_series_from_history(

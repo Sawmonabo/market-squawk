@@ -1,5 +1,6 @@
 //! Authority-derived dataset preparation and one-use build-admission receipts.
 
+mod catalog;
 mod current;
 mod fiscal;
 mod history;
@@ -78,13 +79,18 @@ use crate::{
     },
 };
 
-use history::DatasetRecipeCoordinates;
+struct DatasetRecipeCoordinates {
+    identity: Sha256Digest,
+    label: &'static str,
+    coordinates: Vec<[usize; 3]>,
+    split_counts: [usize; 3],
+    observed_points: usize,
+}
 pub(crate) use history::RecommendationCohortPreparationRequest;
 
 const MAXIMUM_GENERATIONS: usize = 64;
 pub(crate) const MAXIMUM_OBSERVATIONS_PER_GENERATION: usize = 4_096;
 const MAXIMUM_QUERY_BYTES: usize = 16 * 1024 * 1024;
-const MAXIMUM_OPTIONS: usize = 256;
 const MAXIMUM_EXAMPLES: usize = 2_048;
 const MAXIMUM_RECEIPTS: usize = 256;
 const MAXIMUM_RECEIPT_BYTES: usize = 256 * 1024 * 1024;
@@ -119,7 +125,7 @@ impl DatasetPreparationUse {
     }
 }
 
-/// One bounded data-owner-derived choice suitable for a point-in-time feature/label build.
+/// Source/recipe choice; preview separately validates complete macro and financial evidence.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DatasetPreparationOption {
@@ -135,7 +141,7 @@ pub(crate) struct DatasetPreparationOption {
     pub(crate) available_uses: Vec<DatasetPreparationUse>,
 }
 
-/// Exact bounded option snapshot projected from current immutable analytical authority.
+/// Exact source/recipe snapshot, not a promise of complete build-ready financial inputs.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DatasetPreparationOptions {
@@ -255,21 +261,6 @@ impl PreparedOption {
         self.variants
             .iter()
             .find(|variant| variant.use_case == use_case)
-    }
-}
-
-#[derive(Debug)]
-struct PreparedCatalog {
-    options: Box<[PreparedOption]>,
-    digest: Sha256Digest,
-}
-
-impl PreparedCatalog {
-    fn option(&self, id: &str) -> Option<&PreparedOption> {
-        self.options
-            .binary_search_by(|option| option.summary.id.as_str().cmp(id))
-            .ok()
-            .and_then(|index| self.options.get(index))
     }
 }
 
@@ -577,13 +568,14 @@ impl DatasetPreparationAuthority {
         check_control(deadline, cancellation)?;
         Ok((history, calendar))
     }
-    /// Lists only builds derivable from complete current source evidence and current rights.
+    /// Lists source/recipe choices with current source rights, without preparing every build.
+    /// Complete macro, point-in-time and financial evidence is checked by selected-only preview.
     pub(crate) async fn options(
         &self,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<DatasetPreparationOptions, DatasetPreparationError> {
-        let catalog = self.catalog(deadline, cancellation).await?;
+        let catalog = catalog::read(self, deadline, cancellation).await?;
         Ok(DatasetPreparationOptions {
             catalog_generation: encode_hex(catalog.digest.bytes()),
             datasets: catalog
@@ -609,13 +601,13 @@ impl DatasetPreparationAuthority {
             cancellation,
         } = request;
         ensure_origin(origin, workspace)?;
-        let catalog = self.catalog(deadline, cancellation.clone()).await?;
+        let catalog = catalog::read(self, deadline, cancellation.clone()).await?;
         if selection.catalog_generation != encode_hex(catalog.digest.bytes()) {
             return Err(DatasetPreparationError::StaleCatalog);
         }
         let option = catalog
-            .option(&selection.dataset)
-            .ok_or(DatasetPreparationError::InvalidSelection)?;
+            .prepare(self, &selection.dataset, deadline, &cancellation)
+            .await?;
         let variant = option
             .variant(selection.intended_use)
             .ok_or(DatasetPreparationError::InvalidSelection)?;
@@ -801,108 +793,6 @@ impl DatasetPreparationAuthority {
         .await
     }
 
-    async fn catalog(
-        &self,
-        deadline: Instant,
-        cancellation: CancellationToken,
-    ) -> Result<PreparedCatalog, DatasetPreparationError> {
-        check_control(deadline, &cancellation)?;
-        let limit = AnalyticalReadLimit::try_new(MAXIMUM_GENERATIONS)
-            .map_err(|_| DatasetPreparationError::Capacity)?;
-        let reader = self.reader.clone();
-        let page = self
-            .research
-            .run_owned_research_io(deadline, &cancellation, move |worker_cancellation| {
-                reader.datasets(None, limit, deadline, &worker_cancellation)
-            })
-            .await
-            .map_err(|error| preparation_worker_error("catalog_worker", error))?
-            .map_err(|error| preparation_read_error("catalog_read", error))?;
-        if page.has_more() {
-            return Err(DatasetPreparationError::Capacity);
-        }
-        let canonical = DatasetSchemaRegistry::local()
-            .canonical_research_observations()
-            .map_err(|_| DatasetPreparationError::Unavailable)?;
-        let mut generations = Vec::new();
-        for generation in page
-            .generations()
-            .iter()
-            .filter(|generation| generation.manifest().schema() == &canonical)
-        {
-            check_control(deadline, &cancellation)?;
-            let observations = self
-                .observations(generation, deadline, cancellation.child_token())
-                .await?;
-            generations.push((generation.clone(), observations));
-        }
-        let support = CanonicalSupport::from_generations(&generations)?;
-        let mut macro_cache = BTreeMap::new();
-        let mut options = Vec::new();
-        for (generation, observations) in &generations {
-            derive_generation_options(
-                self,
-                generation,
-                observations,
-                &support,
-                &mut macro_cache,
-                &mut options,
-                deadline,
-                &cancellation,
-            )
-            .await?;
-            if options.len() > MAXIMUM_OPTIONS {
-                return Err(DatasetPreparationError::Capacity);
-            }
-        }
-        options.sort_unstable_by(|left, right| left.summary.id.cmp(&right.summary.id));
-        if options
-            .windows(2)
-            .any(|pair| pair[0].summary.id == pair[1].summary.id)
-        {
-            return Err(DatasetPreparationError::InvalidEvidence);
-        }
-        let digest = catalog_digest(&options);
-        Ok(PreparedCatalog {
-            options: options.into_boxed_slice(),
-            digest,
-        })
-    }
-
-    async fn observations(
-        &self,
-        generation: &AnalyticalGeneration,
-        deadline: Instant,
-        cancellation: CancellationToken,
-    ) -> Result<Vec<ResearchObservation>, DatasetPreparationError> {
-        self.observations_with_retained_bytes(generation, deadline, cancellation)
-            .await
-            .map(|(values, _)| values)
-    }
-
-    async fn observations_with_retained_bytes(
-        &self,
-        generation: &AnalyticalGeneration,
-        deadline: Instant,
-        cancellation: CancellationToken,
-    ) -> Result<(Vec<ResearchObservation>, usize), DatasetPreparationError> {
-        let reader = self.reader.clone();
-        let manifest = generation.manifest().clone();
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| DatasetPreparationError::Unavailable)?;
-        self.research
-            .run_owned_research_io(deadline, &cancellation, move |worker_cancellation| {
-                runtime.block_on(read_preparation_observations(
-                    reader,
-                    manifest,
-                    deadline,
-                    worker_cancellation,
-                ))
-            })
-            .await
-            .map_err(|error| preparation_worker_error("observation_worker", error))?
-    }
-
     async fn observation_selection(
         &self,
         generation: &AnalyticalGeneration,
@@ -980,122 +870,6 @@ impl DatasetPreparationAuthority {
         }
         Ok((observations, retained_bytes))
     }
-}
-
-/// Exhausts an immutable cursor before deriving options. The guided catalog needs every row,
-/// but does not need a DataFusion plan, sort buffers or retained Arrow output for that scan.
-async fn read_preparation_observations(
-    reader: AnalyticalReadCapability,
-    manifest: DatasetManifestRef,
-    deadline: Instant,
-    cancellation: CancellationToken,
-) -> Result<(Vec<ResearchObservation>, usize), DatasetPreparationError> {
-    let deadline = deadline.min(
-        Instant::now()
-            .checked_add(QUERY_DURATION)
-            .ok_or(DatasetPreparationError::Capacity)?,
-    );
-    check_control(deadline, &cancellation)?;
-    let mut cursor = reader
-        .observation_batch_cursor(
-            &manifest,
-            0,
-            0,
-            None,
-            128,
-            MAXIMUM_QUERY_BYTES * 2,
-            deadline,
-            &cancellation,
-        )
-        .map_err(|error| preparation_read_error("observation_cursor", error))?;
-    let mut observations = Vec::new();
-    let mut retained_bytes = 0_usize;
-    loop {
-        check_control(deadline, &cancellation)?;
-        let batch = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            cursor.next_batch(),
-        )
-        .await
-        .map_err(|_| DatasetPreparationError::Cancelled)?
-        .map_err(|error| preparation_read_error("observation_batch", error.into()))?;
-        let Some(batch) = batch else {
-            break;
-        };
-        if observations.len().saturating_add(batch.num_rows()) > MAXIMUM_OBSERVATIONS_PER_GENERATION
-        {
-            return Err(DatasetPreparationError::Capacity);
-        }
-        let ordering_bytes = batch
-            .num_rows()
-            .checked_mul(std::mem::size_of::<[u8; 32]>())
-            .ok_or(DatasetPreparationError::Capacity)?;
-        let remaining = MAXIMUM_QUERY_BYTES
-            .checked_sub(retained_bytes)
-            .and_then(|bytes| bytes.checked_sub(ordering_bytes))
-            .ok_or(DatasetPreparationError::Capacity)?;
-        let (decoded, decoded_bytes) =
-            ResearchArrowBatch::decode_query_projection_bounded(batch.clone(), remaining).map_err(
-                |error| {
-                    let error_class = match error {
-                        market_squawk_data::ArrowConversionError::RetainedLimitExceeded {
-                            ..
-                        } => "decode_memory",
-                        _ => "decode_invalid",
-                    };
-                    tracing::warn!(
-                        stage = "observation_decode",
-                        error_class,
-                        "guided dataset preparation I/O failed"
-                    );
-                    DatasetPreparationError::InvalidEvidence
-                },
-            )?;
-        let digests = batch
-            .column_by_name("payload_sha256")
-            .and_then(|column| column.as_any().downcast_ref::<arrow::array::BinaryArray>())
-            .ok_or(DatasetPreparationError::InvalidEvidence)?;
-        observations
-            .try_reserve_exact(decoded.len())
-            .map_err(|_| DatasetPreparationError::Capacity)?;
-        for (index, observation) in decoded.into_iter().enumerate() {
-            let digest: [u8; 32] = digests
-                .value(index)
-                .try_into()
-                .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-            observations.push((observation, digest));
-        }
-        retained_bytes = retained_bytes
-            .checked_add(decoded_bytes)
-            .and_then(|bytes| bytes.checked_add(ordering_bytes))
-            .filter(|bytes| *bytes <= MAXIMUM_QUERY_BYTES)
-            .ok_or(DatasetPreparationError::Capacity)?;
-    }
-    check_control(deadline, &cancellation)?;
-    // Preserve the original closed query's ordering, including its revision tie-breaker.
-    observations.sort_unstable_by(|(left, left_digest), (right, right_digest)| {
-        let left = observation_context(left);
-        let right = observation_context(right);
-        left.provenance()
-            .source_id()
-            .cmp(right.provenance().source_id())
-            .then_with(|| {
-                left.provenance()
-                    .source_identifier()
-                    .cmp(right.provenance().source_identifier())
-            })
-            .then_with(|| {
-                left.time()
-                    .revision()
-                    .get()
-                    .cmp(&right.time().revision().get())
-            })
-            .then_with(|| left_digest.cmp(right_digest))
-    });
-    let ordering_bytes = observations.len() * std::mem::size_of::<[u8; 32]>();
-    let observations = observations.into_iter().map(|(value, _)| value).collect();
-    check_control(deadline, &cancellation)?;
-    Ok((observations, retained_bytes - ordering_bytes))
 }
 
 fn preparation_worker_error(
@@ -1310,146 +1084,6 @@ struct MarketSeriesPoint {
     /// Financial origin of the completed close; the provider timestamp stays in the observation.
     effective: Timestamp,
     available_at: Timestamp,
-}
-
-struct MarketSeries {
-    key: MarketSeriesKey,
-    identity: Sha256Digest,
-    points: Vec<MarketSeriesPoint>,
-}
-
-async fn derive_generation_options(
-    authority: &DatasetPreparationAuthority,
-    generation: &AnalyticalGeneration,
-    observations: &[ResearchObservation],
-    support: &CanonicalSupport,
-    macro_cache: &mut BTreeMap<(Timestamp, CalendarDate), MacroFeatureVector>,
-    output: &mut Vec<PreparedOption>,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<(), DatasetPreparationError> {
-    let mut series: BTreeMap<Sha256Digest, MarketSeries> = BTreeMap::new();
-    for observation in observations {
-        let ResearchObservation::MarketBar(value) = observation else {
-            continue;
-        };
-        if value.adjustment() != MarketBarAdjustment::Raw {
-            continue;
-        }
-        let context = value.context();
-        let Some(instrument_id) = context.provenance().instrument_id() else {
-            continue;
-        };
-        let Some(venue_id) = context.provenance().venue_id().cloned() else {
-            continue;
-        };
-        let Some(effective) = value.completed_at() else {
-            // Nominal histories require the separate genuine history/calendar source path.
-            continue;
-        };
-        let Some(available_at) = context
-            .provenance()
-            .availability()
-            .conservative_available_at()
-        else {
-            continue;
-        };
-        if available_at < effective {
-            return Err(DatasetPreparationError::InvalidEvidence);
-        }
-        let key = MarketSeriesKey {
-            instrument_id,
-            source_id: context.provenance().source_id().clone(),
-            venue_id,
-            provider_instrument_id: value.provider_instrument_id().clone(),
-            feed: value.feed().clone(),
-            interval: value.interval().clone(),
-            timestamp_basis: value
-                .time_semantics()
-                .timestamp_basis()
-                .ok_or(DatasetPreparationError::InvalidEvidence)?,
-            session: value
-                .time_semantics()
-                .session()
-                .cloned()
-                .ok_or(DatasetPreparationError::InvalidEvidence)?,
-            currency: value.currency(),
-        };
-        let identity = market_series_identity(generation.manifest(), &key);
-        let retained = series.entry(identity).or_insert_with(|| MarketSeries {
-            key: key.clone(),
-            identity,
-            points: Vec::new(),
-        });
-        if retained.key != key {
-            return Err(DatasetPreparationError::InvalidEvidence);
-        }
-        retained.points.push(MarketSeriesPoint {
-            effective,
-            available_at,
-            observation: value.clone(),
-            manifest: generation.manifest().clone(),
-            session_evidence: value
-                .time_semantics()
-                .session()
-                .ok_or(DatasetPreparationError::InvalidEvidence)?
-                .evidence(),
-        });
-    }
-    for (_, mut series) in series {
-        check_control(deadline, cancellation)?;
-        let points = &mut series.points;
-        points.sort_by(|left, right| {
-            left.effective
-                .cmp(&right.effective)
-                .then_with(|| left.available_at.cmp(&right.available_at))
-                .then_with(|| {
-                    left.observation
-                        .context()
-                        .time()
-                        .revision()
-                        .get()
-                        .cmp(&right.observation.context().time().revision().get())
-                })
-        });
-        let mut canonical = Vec::new();
-        for point in points.drain(..) {
-            if canonical
-                .last()
-                .is_some_and(|previous: &MarketSeriesPoint| previous.effective == point.effective)
-            {
-                let _ = canonical.pop();
-            }
-            canonical.push(point);
-        }
-        if canonical.len() < 9
-            || canonical.windows(2).any(|pair| {
-                pair[1].effective <= pair[0].effective
-                    || pair[1].available_at <= pair[0].available_at
-            })
-        {
-            continue;
-        }
-        canonical.truncate(MAXIMUM_EXAMPLES.saturating_mul(3));
-        for recipe in history::recipes(series.identity, &canonical)? {
-            if let Some(option) = build_option(
-                authority,
-                generation,
-                support,
-                macro_cache,
-                series.key.clone(),
-                recipe,
-                &canonical,
-                deadline,
-                cancellation,
-            )
-            .await?
-            {
-                output.push(option);
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn build_option(
@@ -1690,17 +1324,39 @@ async fn build_option(
             .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
         ),
     );
+    // The builder streams complete parents into its disk index. Admit their actual immutable
+    // row counts, not a per-generation history ceiling unrelated to the selected recipe.
+    let reader = authority.reader.clone();
+    let input_parents = all_parents.clone();
+    let max_input_rows = authority
+        .research
+        .run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
+            input_parents.iter().try_fold(0_usize, |total, parent| {
+                check_control(deadline, &worker_cancellation)?;
+                let generation = reader
+                    .exact(parent, deadline, &worker_cancellation)
+                    .map_err(|error| preparation_read_error("preview_parent", error))?;
+                let rows = usize::try_from(generation.row_count())
+                    .map_err(|_| DatasetPreparationError::Capacity)?;
+                total
+                    .checked_add(rows)
+                    .ok_or(DatasetPreparationError::Capacity)
+            })
+        })
+        .await
+        .map_err(|error| preparation_worker_error("preview_parent_worker", error))??;
     let mut variants = Vec::new();
     for use_case in [
         DatasetPreparationUse::LocalAnalysis,
         DatasetPreparationUse::Train,
     ] {
-        let request = dataset_request(
+        let request = dataset_request_with_input_rows(
             option_identity,
             use_case,
             inputs.clone(),
             policy.clone(),
             example_count,
+            Some(max_input_rows),
         )?;
         if authority
             .research
@@ -2173,6 +1829,17 @@ fn dataset_request(
     policy: DatasetBuildPolicy,
     examples: usize,
 ) -> Result<DatasetBuildRequest, DatasetPreparationError> {
+    dataset_request_with_input_rows(identity, use_case, inputs, policy, examples, None)
+}
+
+fn dataset_request_with_input_rows(
+    identity: Sha256Digest,
+    use_case: DatasetPreparationUse,
+    inputs: DatasetBuildInputs,
+    policy: DatasetBuildPolicy,
+    examples: usize,
+    actual_input_rows: Option<usize>,
+) -> Result<DatasetBuildRequest, DatasetPreparationError> {
     let output_id = format!(
         "prepared.{}.{}",
         short_hex(identity),
@@ -2194,10 +1861,13 @@ fn dataset_request(
     }
     let parent_count = inputs.parents().len();
     let component_count = inputs.component_specs().len();
-    let max_input_rows = parent_count
-        .checked_mul(MAXIMUM_OBSERVATIONS_PER_GENERATION)
-        .filter(|rows| *rows <= 1_000_000)
-        .ok_or(DatasetPreparationError::Capacity)?;
+    let max_input_rows = match actual_input_rows {
+        Some(rows) => rows,
+        None => parent_count
+            .checked_mul(MAXIMUM_OBSERVATIONS_PER_GENERATION)
+            .filter(|rows| *rows <= 1_000_000)
+            .ok_or(DatasetPreparationError::Capacity)?,
+    };
     let output_rows = examples
         .checked_mul(component_count)
         .ok_or(DatasetPreparationError::Capacity)?;
@@ -2431,20 +2101,6 @@ const fn digest_algorithm_tag(algorithm: DigestAlgorithm) -> u8 {
         DigestAlgorithm::Sha256 => 1,
         DigestAlgorithm::Blake3 => 2,
     }
-}
-
-fn catalog_digest(options: &[PreparedOption]) -> Sha256Digest {
-    let mut digest = Sha256::new();
-    digest.update(b"market-squawk/guided-dataset-catalog/v1");
-    digest.update((options.len() as u64).to_be_bytes());
-    for option in options {
-        update_text(&mut digest, &option.summary.id);
-        for variant in &option.variants {
-            digest.update([variant.use_case.tag()]);
-            digest.update(variant.request.build_spec_digest().digest().bytes());
-        }
-    }
-    Sha256Digest::new(digest.finalize().into())
 }
 
 #[allow(

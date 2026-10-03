@@ -153,16 +153,16 @@ export function DatasetBuilder({
           </AlertDescription>
         </Alert>
       ) : optionsQuery.isPending ? (
-        <Status text="Finding information that is ready to use…" />
+        <Status text="Finding available research history…" />
       ) : optionsQuery.isError ? (
         <Status text="Available research choices could not be loaded. Try again." tone="error" />
       ) : optionsQuery.data.choices.length === 0 ? (
         <Alert className="mt-4">
           <Database aria-hidden="true" />
-          <AlertTitle>No information is ready to prepare</AlertTitle>
+          <AlertTitle>No research history available</AlertTitle>
           <AlertDescription>
-            Add research history first. A choice appears here when Market Squawk has enough dated
-            information to prepare it safely.
+            Add research history to choose a collection. Its required inputs are checked when you
+            review preparation.
           </AlertDescription>
         </Alert>
       ) : selection && selectedDataset ? (

@@ -206,6 +206,22 @@ The output is a reproducible Parquet generation whose manifest, universe digest,
 build-spec digest, feature/label identity, and lineage can be revalidated before query, Python
 export, model admission, or backtesting.
 
+### Guided preparation choices
+
+The guided Research list reads compact canonical summary columns and indexes relevant history,
+membership and action rows in an operation-owned SQLite scratch database. It traverses dataset
+pages and the complete retained history; it does not decode unrelated financial payloads or build
+all possible financial datasets merely to populate a selector. The two guided recipes select up to
+2,048 value-independent examples across the complete eligible chronology. The annual recipe purges
+labels crossing its training, validation and test boundaries; source histories remain intact.
+
+A choice means that source history and its declared use are available. Selected Preview separately
+validates complete macro, point-in-time and financial inputs and retains the exact build request
+behind the existing one-use receipt. Choice identity binds immutable manifests, recipe coordinates,
+membership and stable rights-graph evidence. Expiring check timestamps do not change that identity.
+Scratch indexes are reclaimed with their owning operation; they are not another durable store.
+Implementation: [guided catalog](../../apps/market-squawk/src/application/research/dataset_preparation/catalog.rs).
+
 ## Query and Python boundaries
 
 ### DataFusion

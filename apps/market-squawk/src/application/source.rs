@@ -1283,6 +1283,7 @@ fn source_doctor_value(evidence: &SourceDoctorEvidence) -> Result<Value, Service
         "verifiedAt": timestamp_value(receipt.verified_at()),
         "exclusiveExpiresAt": timestamp_value(receipt.exclusive_expires_at()),
         "current": evidence.current(),
+        "admitsSourceStart": receipt.admits_source_start(),
         "capabilities": {
             "iexLatestQuote": doctor_quote_value(&input.quote)?,
             "iexSnapshotBatch": doctor_batch_value(&input.batch)?,

@@ -339,6 +339,7 @@ export interface SourceDoctorEvidence {
   verifiedAt: string
   exclusiveExpiresAt: string
   current: boolean
+  admitsSourceStart: boolean
   capabilities: SourceDoctorCapabilities
 }
 
@@ -461,7 +462,8 @@ export function parseSourceStatusResult(
   const profileRowCounts = new Map<string, number>()
   for (const [index, row] of rows.entries()) {
     const profileId = text(row.profile.id)
-    if (!profileId || !requestedSources.includes(profileId)) {
+    if (!profileId ||
+      (requestedSources.length !== 0 && !requestedSources.includes(profileId))) {
       return invalidSourceResult("Source.GetStatus profile identity")
     }
     const raw = record(rawRows[index])
@@ -1413,7 +1415,7 @@ function lifecycleEvidence(value: unknown): LifecycleEvidence | null {
     ? currentGenerationPresent !== runtimeGenerationPresent
     : !currentGenerationPresent && !runtimeGenerationPresent
   const doctorAdmitsStart = doctor !== null && doctor.current &&
-    doctorActivationReady(doctor)
+    doctor.admitsSourceStart
   const doctorCurrentnessIsExact = doctor === null || observedAt !== null &&
     doctor.current === (
       doctor.verifiedAt <= observedAt && observedAt < doctor.exclusiveExpiresAt
@@ -2077,7 +2079,7 @@ function receiptStartEligibilityBinding(
   const isAlpaca = provider === "alpaca.basic-market-data"
   const doctorAdmits = doctor !== null && doctor.current &&
     doctor.verifiedAt <= observedAt && observedAt < doctor.exclusiveExpiresAt &&
-    doctorActivationReady(doctor)
+    doctor.admitsSourceStart
   const eligibilityExact = eligibility === "eligible"
     ? isAlpaca && state === "stopped" && doctorAdmits
     : eligibility === "already_active"
@@ -2092,14 +2094,6 @@ function receiptStartEligibilityBinding(
       authorization === "admitted" && rights !== null && doctor !== null &&
       rights.sha256 === doctor.rightsDecisionSha256) &&
     (eligibility !== "already_active" || availability === "available")
-}
-
-function doctorActivationReady(doctor: SourceDoctorEvidence) {
-  return doctor.capabilities.iexLatestQuote.disposition === "available" &&
-    doctor.capabilities.iexSnapshotBatch.disposition === "available" &&
-    doctor.capabilities.iexWebSocket.disposition === "available" &&
-    doctor.capabilities.iexHistoricalBars.disposition === "available" &&
-    doctor.capabilities.iexUtcCalendar.disposition === "available"
 }
 
 function requestReceiptBinding(
@@ -2165,7 +2159,7 @@ function sourceDoctorEvidence(value: unknown): SourceDoctorEvidence | null {
     "principalSemantics", "capabilityRevision", "capabilitySha256",
     "publicConfigurationSha256", "rightsDecisionSha256", "ratePolicySha256",
     "doctorRevision", "doctorContractSha256", "dataQuality", "verifiedAt",
-    "exclusiveExpiresAt", "current", "capabilities",
+    "exclusiveExpiresAt", "current", "admitsSourceStart", "capabilities",
   ])
   if (!row) return null
   const capabilities = doctorCapabilities(row.capabilities)
@@ -2199,7 +2193,8 @@ function sourceDoctorEvidence(value: unknown): SourceDoctorEvidence | null {
     !doctorContractSha256 || !sha256(doctorContractSha256) ||
     !verifiedAt || !exclusiveExpiresAt ||
     verifiedAt >= exclusiveExpiresAt ||
-    typeof row.current !== "boolean" || !capabilities
+    typeof row.current !== "boolean" || typeof row.admitsSourceStart !== "boolean" ||
+    !capabilities
   ) return null
   return {
     schema: row.schema,
@@ -2221,6 +2216,7 @@ function sourceDoctorEvidence(value: unknown): SourceDoctorEvidence | null {
     verifiedAt,
     exclusiveExpiresAt,
     current: row.current,
+    admitsSourceStart: row.admitsSourceStart,
     capabilities,
   }
 }
@@ -2365,10 +2361,11 @@ function doctorBatchObservation(value: unknown): DoctorBatchObservation | null {
   const unexpected = boundedInteger(row?.unexpected, 101)
   const duplicate = boundedInteger(row?.duplicate, 101)
   const invalid = boundedInteger(row?.invalid, 101)
+  // Valid one-sided quotes are returned without increasing two-sided cardinality.
   if (!row || !http || !digest(row.semanticResultSha256) || requested !== 50 ||
     returned === null || valid === null || missing === null || unexpected === null ||
     duplicate === null || invalid === null || returned + missing !== requested ||
-    valid + invalid !== returned || !digest(row.requestedSetSha256) ||
+    valid + invalid > returned || !digest(row.requestedSetSha256) ||
     !digest(row.returnedSetSha256) || !digest(row.missingSetSha256) ||
     !digest(row.unexpectedSetSha256)) return null
   return { http, requested, returned, valid, missing }

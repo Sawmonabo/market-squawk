@@ -22,18 +22,52 @@ lead contract alignment/critical checks → coherent pushed checkpoints → one 
 and affected live workflow proof. These fixes close acceptance items1/2/5/6; the first stock's
 source-actions and current forecast handoff remain required next dependencies, not deferred scope.
 
+### Source contract and Research list integration
+
+The canonical source-status parser now accepts the backend's legitimate partial two-sided quote
+count, shares its schema with imports, and consumes backend `admitsSourceStart` rather than
+reconstructing stricter activation rules. Producer and closed output contract are updated together.
+Guided Research listing now uses compact column scans and a disk index over complete retained
+history, with full analytical build validation deferred to selected Preview. Old materialized
+catalog/recipe paths are removed. Native request/receipt consumers retain their exact bindings.
+
+Critical recipe check passed: 9,000 source points, samples spanning beyond the old 6,144-point
+truncation, annual partition purging and cancellation. Initial compile exposed SQLite integer type
+bindings, corrected by lead with checked shared conversions; the rerun passed. This check does
+not prove actual provider decoding, native timing, selected Preview, or the complete stock journey.
+Existing Desktop 11-case suite and final renderer typecheck passed after contract alignment.
+The coherent native replacement waits for the sole auditor to release navigation; no competing build.
+
 ### Integrated warm detail-display checkpoint
 
 The detail cache candidate retains rendering-only financial first pages and history viewports in
 existing scoped QueryClient storage, independently from closed cursors and history generations.
 Active reads still revalidate and own pagination, preparation and original-evidence selection.
 Existing `app.test.tsx` was extended only for the uncovered warm-return/closed-lease regression.
-All 11 existing cases pass with one Vitest worker; `tsc --build` and `git diff --check` pass.
+Pushed checkpoint `f7bfaa15`. All 11 existing cases pass with one Vitest worker; `tsc --build` and `git diff --check` pass.
 This establishes critical local behavior, not native all-watchlist or restart-cache completion.
 The dedicated auditor is checking all nine actual watchlist instruments on the running app.
 Source-contract and indexed Research work remain separate uncommitted integration lanes.
+Lead shared changes align the doctor output and strict Desktop parser using the backend's
+`admits_source_start()` conclusion; source consumers no longer reconstruct stricter authority.
+Research options describe available source/recipe summaries; selected preview validates full
+macro/PIT financial evidence. Catalog identity binds immutable manifests/recipes and rights graph,
+not expiring evaluation timestamps. Remove the superseded 256-choice array contract in producer
+and renderer together; per-request result bounds remain. The native choice registry and selected
+support working set still need their workflow-impact assessment before whole-V1 acceptance.
 
 ### Watchlist-wide QA extension — owner clarification
+
+`research_choice_streaming` now owns a read-only AAPL ratio-envelope trace after freezing
+implementation: `watchlist-wide/AAPL-ratio-source-trace.md` only. Determine whether missing
+ratios beside populated same-period results arise from source facts, normalization, context
+selection or presentation. No implementation/build/native interaction.
+
+Owner follow-up: a missing field in one IEX capture is not an all-source absence.
+`source_status_contract` owns read-only cross-source quote/history selection tracing for
+DIA/NVDA/TSLA and SPY/QQQ, writing only `watchlist-wide/cross-source-selection.md`.
+Establish current eligible alternatives and exact selector/acquisition gaps; no new activation,
+provider requests, native navigation, implementation or Git.
 
 The audit covers **every actual current watchlist instrument**, not MSFT as a proxy.
 `console_qa` owns only a new watchlist matrix and evidence under
@@ -47,7 +81,10 @@ source evidence. Fund/ETF data must not be judged by corporate-report assumption
 runtime/UI versions and blocked paths explicitly. Restart proof requires the lead's coordinated
 native build and restart; no agent may restart, build or alter runtime state. The lead retains
 native navigation until the auditor is explicitly granted it; independent source/evidence mapping
-can proceed immediately. No product implementation or Git operations in this audit lane. Native background navigation is
+can proceed immediately. `detail_display_cache` additionally owns read-only visual inspection of the 27 captured
+`watchlist-wide/AAPL-statements-000..026.png` tiles, writing only
+`watchlist-wide/AAPL-statements-visual-review.md`; no navigation, implementation or builds.
+No product implementation or Git operations in this audit lane. Native background navigation is
 now assigned exclusively to `console_qa`; frontend cache candidate is explicitly identified as WIP
 over native `d9afd7cb`. `source_status_contract` separately owns read-only quote/reference origin
 tracing for DIA/NVDA/TSLA and VTI, writing only `watchlist-wide/source-quote-identity.md`.

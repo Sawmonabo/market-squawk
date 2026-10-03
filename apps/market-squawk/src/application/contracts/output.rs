@@ -514,7 +514,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Analysis.GetFeatureDatasetPreparationOptions" => closed(
             vec![
                 ("catalogGeneration", text()),
-                ("datasets", bounded_array(record(), 256)),
+                ("datasets", array(record())),
             ],
             &["catalogGeneration", "datasets"],
         ),
@@ -5937,6 +5937,7 @@ fn source_doctor_evidence() -> Value {
             ("verifiedAt", timestamp()),
             ("exclusiveExpiresAt", timestamp()),
             ("current", boolean()),
+            ("admitsSourceStart", boolean()),
             ("capabilities", source_doctor_capabilities()),
         ],
         &[
@@ -5959,6 +5960,7 @@ fn source_doctor_evidence() -> Value {
             "verifiedAt",
             "exclusiveExpiresAt",
             "current",
+            "admitsSourceStart",
             "capabilities",
         ],
     )

@@ -19,7 +19,7 @@ const datasetPreparationOptionSchema = z
 
 const datasetPreparationOptionsSchema = z
   .object({
-    choices: z.array(datasetPreparationOptionSchema).max(256),
+    choices: z.array(datasetPreparationOptionSchema),
   })
   .strict()
 
