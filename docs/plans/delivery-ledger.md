@@ -2,7 +2,33 @@
 
 ## Current execution — 2026-10-03
 
-### Active wave — managed preparation for the retained stock analysis
+### Active wave — compose onboarding reads inside option publication
+
+Base `b69970a2`, clean primary feature worktree. Acceptance 1/2/6: native managed preparation
+reached option publication, whose final account check unconditionally starts a nested SQLite
+transaction. The renewed source registration is proved inside the failed job window; which final
+subguard rejected first remains unlogged. Bounded diagnosis is complete in
+`.agents/tmp/v1-first-stock/option-publication-authority.md`.
+
+| Owner | Exact disjoint ownership | Completion evidence |
+| --- | --- | --- |
+| Lead | `crates/market-squawk-data/src/catalog/onboarding.rs`, ledger/Git/build/runtime | Reuse caller transaction for read-only replay; preserve owned standalone snapshot, all validation, and outer commit/rollback ownership |
+| Astra High `options_original_recovery` | Existing option-publication fixture within `crates/market-squawk-data/tests/catalog.rs` only | Replay actual retained onboarding during publication and preserve final-rejection rollback; no new harness or builds |
+
+DAG: confirmed call chain → lead transaction fix + independent fixture extension → two existing
+critical catalog checks → commit/push → matching dev build → new recorded MSFT attempt. Retain the
+failed workflow and all original evidence; no database edits, migration, deadline or authority bypass.
+The watcher is paused during source edits, with the current visible app/service left running.
+
+Canonical replay now reuses an existing publication transaction and owns a snapshot only for
+standalone reads. All event/audit checks and publication guards remain. Agent changes inspected;
+fixture ownership released. Existing option publication/restart/rollback check passed (1/1, 1.66s,
+44.15s single-job compile), and standalone onboarding authority/restart/tamper check passed
+(1/1, 1.42s, cached compile). Logs: `.agents/tmp/v1-first-stock/option-transaction-critical.log`
+and `option-transaction-onboarding-critical.log`. Matching deployment and a new native MSFT
+attempt remain; these checks do not prove the complete stock journey.
+
+### Integrated wave — managed preparation for the retained stock analysis
 
 Base `ba77ce88`, clean primary feature worktree. Acceptance 2/6/7: the existing source pipeline
 exceeds the controller's 15-second request deadline. Keep canonical `Market.PrepareInvestmentEvidence`

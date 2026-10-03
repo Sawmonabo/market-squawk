@@ -2900,17 +2900,40 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         ALPACA_OPTION_CONTRACT_REFERENCE_ENDPOINT, AlpacaOptionContractReferenceRequest,
         AlpacaOptionContractReferenceSet, AlpacaPendingOptionContractReferencePage,
     };
-    use market_squawk_data::{AlpacaOptionReferenceAdmission, DatasetId};
+    use market_squawk_data::{
+        AlpacaOptionReferenceAdmission, DatasetId, OnboardingCatalogCapability,
+        ResumedProviderOnboarding,
+    };
     use market_squawk_domain::CalendarDate;
-    let reopen = || -> TestResult<AnalyticalDataService> {
-        Ok(AnalyticalDataService::open(
+    let reopen = || -> TestResult<(AnalyticalDataService, OnboardingCatalogCapability)> {
+        let (composition, onboarding) = AnalyticalDataService::open_with_provider_onboarding(
             CatalogAuthority::open(config.clone())?,
             AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
             paths.artifacts()?.clone(),
             ObjectStoreConfig::try_new(8 * 1024 * 1024, 32, Duration::from_secs(10))?,
-        )?)
+        )?;
+        let (service, _publisher) = composition.into_parts();
+        Ok((service, onboarding))
     };
-    let service = reopen()?;
+    let (service, onboarding) = reopen()?;
+    let capability = onboarding_capability()?;
+    onboarding.register_provider_capability(&capability)?;
+    let reservation =
+        onboarding.reserve_provider_onboarding(&OnboardingReservationRequest::try_new(
+            &capability,
+            ProviderPublicConfiguration::default(),
+            AuthoritySet::try_new(vec![SourceIdentifier::try_from("account.read")?])?,
+            SourceIdentifier::try_from("local-user")?,
+            SourceIdentifier::try_from("option-publication-replay")?,
+            Timestamp::from_unix_nanos(i64::MAX),
+            1,
+        )?)?;
+    let expected_session = onboarding.resume_provider_onboarding(reservation.session_id())?;
+    assert_eq!(
+        expected_session.lifecycle().state(),
+        OnboardingState::UserActionRequired
+    );
+    assert_eq!(expected_session.next_sequence(), 1);
     let option_source_for = |revision: &str, effective| -> TestResult<SourceMetadata> {
         Ok(SourceMetadata::try_new(SourceMetadataInput::new(
             SchemaVersion::CURRENT,
@@ -3116,9 +3139,11 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
     #[derive(Debug)]
     struct ReadOriginalDuringPublication<'a> {
         service: &'a AnalyticalDataService,
+        session: &'a ResumedProviderOnboarding,
         original: &'a market_squawk_data::ProviderCaptureOriginalReceipt,
         store: &'a market_squawk_platform::SealedResearchJournalStore,
         checks: AtomicUsize,
+        reject_on_check: usize,
     }
     impl IngestPrecommitAuthority for ReadOriginalDuringPublication<'_> {
         fn validate_precommit(&self) -> Result<(), IngestError> {
@@ -3127,8 +3152,20 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
 
         fn validate_catalog_precommit(
             &self,
-            _catalog: &CatalogAuthority,
+            catalog: &CatalogAuthority,
         ) -> Result<(), IngestError> {
+            // The same canonical replay must work before and inside the option transaction.
+            let resumed =
+                catalog.resume_provider_onboarding(self.session.reservation().session_id())?;
+            assert_eq!(
+                resumed.lifecycle().state(),
+                self.session.lifecycle().state()
+            );
+            assert_eq!(resumed.next_sequence(), self.session.next_sequence());
+            assert_eq!(
+                resumed.public_configuration(),
+                self.session.public_configuration()
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             let cancellation = CancellationToken::new();
             assert_eq!(
@@ -3205,19 +3242,29 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
                 ),
                 Err(IngestError::DeadlineExceeded),
             ));
-            self.checks.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.reject_on_check {
+                Err(IngestError::PublicationAuthorityRevoked)
+            } else {
+                Ok(())
+            }
         }
     }
     let read_during_publication = ReadOriginalDuringPublication {
         service: &service,
+        session: &expected_session,
         original: &originals[0],
         store: &raw_store,
         checks: AtomicUsize::new(0),
+        reject_on_check: usize::MAX,
     };
-    let revoked = Precommit {
+    let revoked = ReadOriginalDuringPublication {
+        service: &service,
+        session: &expected_session,
+        original: &originals[0],
+        store: &raw_store,
         checks: AtomicUsize::new(0),
-        revoke_on: 3,
+        // Reject only after replay succeeds with the newly inserted option still uncommitted.
+        reject_on_check: 2,
     };
     assert!(matches!(
         publisher.publish_alpaca_option_references(
@@ -3228,7 +3275,7 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         ),
         Err(MarketDataInstrumentCatalogError::PublicationAuthority(_))
     ));
-    assert_eq!(revoked.checks.load(Ordering::SeqCst), 3);
+    assert_eq!(revoked.checks.load(Ordering::SeqCst), 2);
     assert!(
         service
             .market_data_instruments()
@@ -3242,7 +3289,7 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         deadline(),
         &cancellation,
     )?;
-    assert!(read_during_publication.checks.load(Ordering::SeqCst) > 0);
+    assert_eq!(read_during_publication.checks.load(Ordering::SeqCst), 3);
     assert_eq!(published.inserted(), 1);
     let reader = service.market_data_instruments();
     let matched = reader.search("AAPL270115C00200000", 2, deadline(), &cancellation)?;
@@ -3251,8 +3298,15 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
     assert_eq!(option.definition().asset_class(), AssetClass::Option);
     drop(reader);
     drop(publisher);
+    drop(onboarding);
     drop(service);
-    let service = reopen()?;
+    let (service, onboarding) = reopen()?;
+    let resumed = onboarding.resume_provider_onboarding(reservation.session_id())?;
+    assert_eq!(
+        resumed.lifecycle().state(),
+        expected_session.lifecycle().state()
+    );
+    assert_eq!(resumed.next_sequence(), expected_session.next_sequence());
     assert_eq!(
         service.market_data_instruments().latest(
             option.definition().instrument_id(),
@@ -3261,16 +3315,25 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         )?,
         Some(option.clone())
     );
+    let read_after_restart = ReadOriginalDuringPublication {
+        service: &service,
+        session: &expected_session,
+        original: &originals[0],
+        store: &raw_store,
+        checks: AtomicUsize::new(0),
+        reject_on_check: usize::MAX,
+    };
     let replayed = service
         .market_data_instrument_synchronization()
         .publish_alpaca_option_references(
             option_admission(created.clone(), source.source_id().clone()),
-            &allowed,
+            &read_after_restart,
             deadline(),
             &cancellation,
         )?;
     assert_eq!(replayed.inserted(), 0);
     assert_eq!(replayed.replayed(), 1);
+    assert_eq!(read_after_restart.checks.load(Ordering::SeqCst), 3);
 
     // This synthetic source cannot manufacture a doctor-renewal origin. Current metadata is
     // admitted at current knowledge time, but unchanged originals still need that typed proof.

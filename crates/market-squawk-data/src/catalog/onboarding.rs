@@ -7,7 +7,7 @@ use market_squawk_sources::{
     OnboardingState, ProviderCapability, ProviderCapabilityRevision, ProviderPublicConfiguration,
     RuntimeVerificationContext,
 };
-use rusqlite::{OptionalExtension as _, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, params};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -525,10 +525,18 @@ impl CatalogAuthority {
         &self,
         session_id: Uuid,
     ) -> Result<ResumedProviderOnboarding, CatalogError> {
-        let transaction = self.catalog().connection.unchecked_transaction()?;
+        let connection = &self.catalog().connection;
+        // Publication already owns a snapshot; standalone reads create their own.
+        // Only the owner may commit or roll back that transaction.
+        let transaction = connection
+            .is_autocommit()
+            .then(|| connection.unchecked_transaction())
+            .transpose()?;
         let mut budget = ResultBudget::new(self.catalog().result_bytes);
-        let loaded = load_session(&transaction, self.session_id(), session_id, &mut budget)?;
-        transaction.commit()?;
+        let loaded = load_session(connection, self.session_id(), session_id, &mut budget)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(loaded.into_public())
     }
 
@@ -948,7 +956,7 @@ impl StoredSession {
 }
 
 fn load_session(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     catalog_id: Uuid,
     session_id: Uuid,
     budget: &mut ResultBudget,
@@ -984,7 +992,7 @@ fn load_session(
 }
 
 fn prepare_onboarding_replay(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     catalog_id: Uuid,
     session_id: Uuid,
     budget: &mut OnboardingValidationBudget<'_>,
@@ -1105,7 +1113,7 @@ fn prepare_onboarding_replay(
 }
 
 fn replay_events(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: Uuid,
     capability: &ProviderCapability,
     lifecycle: &mut OnboardingLifecycle,
@@ -1138,7 +1146,7 @@ fn replay_events(
     reason = "migration and runtime replay share every exact reservation and chronology binding"
 )]
 fn reconstruct_onboarding_stream(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: Uuid,
     capability: &ProviderCapability,
     lifecycle: &mut OnboardingLifecycle,
@@ -1271,7 +1279,7 @@ fn reconstruct_onboarding_stream(
 }
 
 fn load_onboarding_stream_head(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: Uuid,
     budget: &mut OnboardingValidationBudget<'_>,
 ) -> Result<OnboardingStreamHead, CatalogError> {
@@ -1480,7 +1488,7 @@ fn reservation_audit_digest(
 }
 
 fn verify_reservation_audit(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     stored: &StoredSession,
     session_id: Uuid,
     request: &OnboardingReservationRequest,
