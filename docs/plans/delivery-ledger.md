@@ -2,6 +2,24 @@
 
 ## Current execution — 2026-10-03
 
+### Current native barrier — calendar work holds account activation open
+
+Source `bacd22b9` is pushed; the matching single-job build passed (7m39s), launching service
+99971 and Desktop 162. The fresh active root and both preserved prior roots are present. The
+MSFT prefix-ambiguity boundary is passed: account startup now reaches calendar publication.
+It still does not complete restoration: `source_lifecycle.rs:1411` reports completed-session
+deadline expiry, and startup reports zero restored sources. The same saved analysis resume was
+accepted, then paused at three steps; no new workflow or workspace was created. Native receipts:
+`exact-stock-native-{status,resume,progress}.json` under `.agents/tmp/v1-first-stock/`.
+
+| Owner | Exact ownership | Completion evidence |
+| --- | --- | --- |
+| Astra High `stock_preparation_deadline` | Read-only trace; `.agents/tmp/v1-first-stock/calendar-startup-activation.md` only | Identify why existing calendar preflight blocks after account reads are admitted; trace lock ownership and separate actual failed guard from incidental timeout; smallest canonical fix and critical check |
+| Lead | All source/shared consumers, native runtime, Git/checks/ledger | Integrate only the confirmed correction; preserve pending successor and saved workflow, no deadline increase/reset |
+
+DAG: matched calendar failure → exact ownership/admission trace → scoped correction → critical
+check → matched native recovery. Existing unrelated crypto reference unavailability remains open.
+
 ### Active correction — exact stock identity survives option discovery
 
 Base `0816a979`, matching source `57ac6639`. Acceptance 1/2/7: startup renewed Alpaca's doctor,
