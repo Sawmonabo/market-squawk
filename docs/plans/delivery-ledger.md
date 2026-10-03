@@ -2,6 +2,72 @@
 
 ## Current execution — 2026-10-02
 
+Parallel provider diagnosis: Sol stock_input_trace reads only
+`application/market_calendar/read.rs` and its source origin producer/retained evidence for the
+observed `calendar-origin-row-decode` InvalidEvidence failure; writes only its existing local
+report. No runtime/provider calls, edits, builds or new test suite. It is independent of the
+options read-snapshot implementation and converges at lead-owned workflow preparation.
+
+
+Actual diagnostic established the live cause: `resume.pending.catalog` returns
+`analytical catalog authority is busy` during the retained-original read. No corrupt data is
+shown. After matched diagnostic build PASS (5m19s), original workflow remains paused at step5.
+The earlier post-rebuild attempt occurred before saved live restoration completed and was revoked;
+resuming after the observed restoration then exposed the writer-mutex contention above.
+Astra stock_workflow_trace now owns `crates/market-squawk-data/src/ingest/provider_capture_original.rs`,
+`src/catalog/{read_snapshot.rs,provider_capture/original.rs}` and the smallest extension to existing
+`tests/{catalog,publication_recovery}.rs` (choose one) to move pure original reads onto existing
+endpoint-bound WAL snapshots. Reuse canonical query/validation; publication stays writer-owned.
+Lead owns all other source, build/Git/native verification. No retry loop, unlocked writes,
+duplicate DB stack, migration or relaxed integrity. Native calendar-origin decode is a separate
+observed source failure requiring diagnosis; it is not closed by this options fix.
+
+
+Current owners: lead only; both bounded follow-ups finished and released ownership.
+Custody stage diagnostic is implemented/frozen; matched single-job build pending.
+A final diagnostic save arrived after compilation started; lead stopped that compiler group early
+and let the existing queue build the final source once. Existing app/service remained running.
+Native background chart probe: ResizeObserver delivered, requestAnimationFrame did not within
+1.5s while hidden. Blank screenshot cannot prove a chart defect; visible paint proof remains open.
+No production chart change, foreground automation, full CI or whole-app RAM measurement.
+
+
+Independent Desktop observation: native background snapshot shows correct concise Last trade and
+price/change but blank chart canvases (default300x150 backing size while document hidden).
+Sol stock_input_trace reads the chart/rendering path only and updates its existing local report to
+distinguish WKWebView background paint suspension from a product data/render defect. No UI edits,
+focus changes or new acceptance claim; lead preserves the screenshot and DOM evidence.
+
+
+Retained-options diagnosis verified all three original digests, catalog custody joins, file/body
+hashes and sizes, exact request identities and raw event envelopes. No data violation found.
+Astra now owns only `application/market_runtime/alpaca_option_chain.rs` to preserve the exact
+internal custody failure stage and safe typed error in diagnostics; no admission/retry changes.
+Lead owns the single build/native resume and will use that evidence before any further fix.
+Native Home and MSFT detail now both show Last trade without Last known (local DOM receipts).
+
+
+Live resume after `ffb969d6`: matched build PASS (6m23s), service97488/Desktop97541,
+generationPnBBIm. Same workflow resumed once, remains paused (completedSteps3, no result).
+The new exact diagnostic is `Custody`: original option evidence could not be retained or reopened.
+The catalog source correction is fixture-proven but has not yet established live option publication.
+Astra stock_workflow_trace now diagnoses this actual retained-original failure read-only, owning
+only its local report until the exact failed boundary and fix are established. Lead owns native
+receipts and runtime diagnostics. Preserve pending originals and do not blindly retry or reset.
+
+
+`ffb969d6` is pushed; PR43 comment5963231992 records the options fixture evidence.
+Watcher is resumed and one matched build is running. Current disjoint continuation:
+lead owns runtime replacement, same-workflow resume, ledger/Git and all builds;
+Astra stock_workflow_trace reads only the retained-options recovery path and writes only its
+existing local diagnosis report, identifying which checks remain after process restart;
+Sol stock_input_trace reads only current input readiness/selection consumers and updates only its
+existing local report with the precise next native read if options succeeds. No product edits,
+provider calls, builds, new branches/worktrees or replacement analysis from either agent.
+DAG: critical source fix → matched build → original workflow resume → actual next receipt;
+independent source traces converge with that receipt before another implementation assignment.
+
+
 Options source correction is critically verified. The existing authenticated asset-reference case
 now publishes an option from retained originals, rejects mismatched namespace/underlying, reopens
 the option after restart and replays idempotently: PASS (1 case, 0.86s; single Cargo job).

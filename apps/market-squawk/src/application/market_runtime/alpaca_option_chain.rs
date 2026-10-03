@@ -315,11 +315,11 @@ impl Worker {
                 data.pending_provider_capture_original(&source, deadline, &worker)
             })
             .await
-            .map_err(|_| OptionChainDemandError::Custody)?
-            .map_err(|_| OptionChainDemandError::Custody)?;
+            .map_err(|error| custody_error("resume.pending.worker", None, &error))?
+            .map_err(|error| custody_error("resume.pending.catalog", None, &error))?;
         if let Some(original) = pending {
             let saved: OriginalContext = serde_json::from_slice(original.context())
-                .map_err(|_| OptionChainDemandError::Custody)?;
+                .map_err(|error| custody_error("resume.context", Some(0), &error))?;
             if saved.version != 1
                 || saved.source != *self.authority.metadata().source_id()
                 || saved.generation
@@ -385,7 +385,7 @@ impl Worker {
                 .analytical()
                 .acquire_provider_capture_original_lease(deadline, caller)
                 .await
-                .map_err(|_| OptionChainDemandError::Custody)?,
+                .map_err(|error| custody_error("original.lease", None, &error))?,
         );
         let (originals, original_receipts) = self
             .originals(
@@ -425,7 +425,13 @@ impl Worker {
                 .capture()
                 .pages()
                 .first()
-                .ok_or(OptionChainDemandError::Custody)?
+                .ok_or_else(|| {
+                    custody_error(
+                        "original.rights.page",
+                        Some(original.ordinal()),
+                        &OptionChainDemandError::Custody,
+                    )
+                })?
                 .received_at();
             original_rights.push(
                 operation
@@ -456,9 +462,11 @@ impl Worker {
                     originals: original_receipts,
                     contracts: Arc::clone(&originals),
                     underlying: underlying_record.clone(),
-                    underlying_asset_namespace: binding.native_identity()
+                    underlying_asset_namespace: binding
+                        .native_identity()
                         .ok_or(OptionChainDemandError::Identity)?
-                        .namespace.clone(),
+                        .namespace
+                        .clone(),
                 },
                 reference_precommit,
                 deadline,
@@ -503,15 +511,27 @@ impl Worker {
         let research = Arc::clone(&self.research);
         let capture = self
             .authority
-            .acquire_complete_chain(&mapping, &reference_request, deadline, caller, move |request| {
-                let research = Arc::clone(&research);
-                async move {
-                    let finish = CancellationToken::new();
-                    research.seal_provider_capture(request, &finish, Instant::now() + CUSTODY_TIMEOUT)
-                        .await.map(|_| ())
-                        .map_err(|_| market_squawk_adapter_alpaca::AlpacaError::CaptureMaterial)
-                }
-            })
+            .acquire_complete_chain(
+                &mapping,
+                &reference_request,
+                deadline,
+                caller,
+                move |request| {
+                    let research = Arc::clone(&research);
+                    async move {
+                        let finish = CancellationToken::new();
+                        research
+                            .seal_provider_capture(
+                                request,
+                                &finish,
+                                Instant::now() + CUSTODY_TIMEOUT,
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|_| market_squawk_adapter_alpaca::AlpacaError::CaptureMaterial)
+                    }
+                },
+            )
             .await
             .map_err(map_acquisition)?;
         let (rejoin, seal_request) = capture.into_parts();
@@ -522,7 +542,7 @@ impl Worker {
             .research
             .seal_provider_capture(seal_request, &custody, custody_deadline)
             .await
-            .map_err(|_| OptionChainDemandError::Custody)?;
+            .map_err(|error| custody_error("chain.seal", None, &error))?;
         ensure_active(deadline, caller)?;
         let observed_at = timestamp()?;
         let request = AlpacaOptionChainPublicationRequest::try_new(
@@ -596,11 +616,11 @@ impl Worker {
                 data.pending_provider_capture_original(&source, deadline, &worker)
             })
             .await
-            .map_err(|_| OptionChainDemandError::Custody)?
-            .map_err(|_| OptionChainDemandError::Custody)?;
+            .map_err(|error| custody_error("original.pending.worker", None, &error))?
+            .map_err(|error| custody_error("original.pending.catalog", None, &error))?;
         let (context, originals) = if let Some(first) = pending {
             let context: OriginalContext = serde_json::from_slice(first.context())
-                .map_err(|_| OptionChainDemandError::Custody)?;
+                .map_err(|error| custody_error("original.context", Some(0), &error))?;
             if context.version != 1
                 || context.generation
                     != self
@@ -627,14 +647,22 @@ impl Worker {
                     for ordinal in 0..count {
                         values.push(
                             data.provider_capture_original(session, ordinal, deadline, &worker)
-                                .map_err(|_| OptionChainDemandError::Custody)?
-                                .ok_or(OptionChainDemandError::Custody)?,
+                                .map_err(|error| {
+                                    custody_error("original.load.catalog", Some(ordinal), &error)
+                                })?
+                                .ok_or_else(|| {
+                                    custody_error(
+                                        "original.load.missing",
+                                        Some(ordinal),
+                                        &OptionChainDemandError::Custody,
+                                    )
+                                })?,
                         );
                     }
                     Ok::<_, OptionChainDemandError>(values)
                 })
                 .await
-                .map_err(|_| OptionChainDemandError::Custody)??;
+                .map_err(|error| custody_error("original.load.worker", None, &error))??;
             (context, originals)
         } else {
             let research = Arc::clone(&self.research);
@@ -672,7 +700,10 @@ impl Worker {
                 )
                 .await
                 .map_err(map_acquisition)?;
-            let contexts = retained_pages.iter().map(|(context, _, _)| context.clone()).collect();
+            let contexts = retained_pages
+                .iter()
+                .map(|(context, _, _)| context.clone())
+                .collect();
             let context = OriginalContext {
                 version: 1,
                 demand: demand.clone(),
@@ -684,8 +715,8 @@ impl Worker {
                 request: request.clone(),
                 contexts,
             };
-            let encoded =
-                serde_json::to_vec(&context).map_err(|_| OptionChainDemandError::Custody)?;
+            let encoded = serde_json::to_vec(&context)
+                .map_err(|error| custody_error("original.encode", None, &error))?;
             let session =
                 EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&encoded).into());
             let data = self.research.analytical_service();
@@ -709,7 +740,13 @@ impl Worker {
                         let received_at = capture
                             .pages()
                             .last()
-                            .ok_or(OptionChainDemandError::Custody)?
+                            .ok_or_else(|| {
+                                custody_error(
+                                    "original.retain.page",
+                                    None,
+                                    &OptionChainDemandError::Custody,
+                                )
+                            })?
                             .received_at();
                         let decision = rights
                             .decision(capture.observation_digest(), received_at)
@@ -726,10 +763,10 @@ impl Worker {
                         custody_deadline,
                         &worker,
                     )
-                    .map_err(|_| OptionChainDemandError::Custody)
+                    .map_err(|error| custody_error("original.retain.catalog", None, &error))
                 })
                 .await
-                .map_err(|_| OptionChainDemandError::Custody)??;
+                .map_err(|error| custody_error("original.retain.worker", None, &error))??;
             (context, originals)
         };
         let proof = self
@@ -751,7 +788,11 @@ impl Worker {
             .run_owned_research_io(deadline, caller, move |worker| {
                 let _lease = lease;
                 if originals.len() != context.contexts.len() {
-                    return Err(OptionChainDemandError::Custody);
+                    return Err(custody_error(
+                        "replay.count",
+                        None,
+                        &OptionChainDemandError::Custody,
+                    ));
                 }
                 let mut pages = Vec::new();
                 pages
@@ -760,31 +801,79 @@ impl Worker {
                 for (original, bytes) in originals.iter().zip(context.contexts.iter()) {
                     let read = data
                         .reopen_provider_capture_original(original, &store, deadline, &worker)
-                        .map_err(|_| OptionChainDemandError::Custody)?;
+                        .map_err(|error| {
+                            custody_error("replay.raw_open", Some(original.ordinal()), &error)
+                        })?;
                     let page = AlpacaPendingOptionContractReferencePage::restore_original(
                         bytes.as_bytes(),
                         read.original().capture(),
                         read.records(),
                     )
-                    .map_err(|_| OptionChainDemandError::Custody)?;
-                    let (rejoin, seal) = page
-                        .into_seal_parts()
-                        .map_err(|_| OptionChainDemandError::Custody)?;
+                    .map_err(|error| {
+                        custody_error("replay.restore", Some(original.ordinal()), &error)
+                    })?;
+                    let (rejoin, seal) = page.into_seal_parts().map_err(|error| {
+                        custody_error("replay.seal_parts", Some(original.ordinal()), &error)
+                    })?;
                     pages.push(
                         rejoin
-                            .try_rejoin(
-                                seal.seal(&store)
-                                    .map_err(|_| OptionChainDemandError::Custody)?,
-                            )
-                            .map_err(|_| OptionChainDemandError::Custody)?,
+                            .try_rejoin(seal.seal(&store).map_err(|error| {
+                                custody_error("replay.seal", Some(original.ordinal()), &error)
+                            })?)
+                            .map_err(|error| {
+                                custody_error("replay.rejoin", Some(original.ordinal()), &error)
+                            })?,
                     );
                 }
                 AlpacaOptionContractReferenceSet::try_from_pages(pages)
-                    .map_err(|_| OptionChainDemandError::Custody)
+                    .map_err(|error| custody_error("replay.complete_set", None, &error))
             })
             .await
-            .map_err(|_| OptionChainDemandError::Custody)?
+            .map_err(|error| custody_error("replay.worker", None, &error))?
     }
+}
+
+// Only explicitly audited, fixed Display messages escape this diagnostic. Wrapped filesystem,
+// catalog and JSON errors can carry paths or input text and retain only their fixed stage label.
+fn custody_error<E: std::error::Error + 'static>(
+    stage: &'static str,
+    ordinal: Option<u16>,
+    error: &E,
+) -> OptionChainDemandError {
+    use crate::research_service::ResearchServiceError;
+    use market_squawk_adapter_alpaca::AlpacaError;
+
+    let error: &(dyn std::error::Error + 'static) = error;
+    let error: &(dyn std::error::Error + 'static) =
+        match error.downcast_ref::<ResearchServiceError>() {
+            Some(ResearchServiceError::Ingest(inner)) => inner,
+            _ => error,
+        };
+    let diagnostic: &dyn fmt::Display = if let Some(error) = error.downcast_ref::<IngestError>() {
+        // IngestError's Display messages are fixed and do not interpolate their wrapped sources.
+        error
+    } else if let Some(error) = error.downcast_ref::<AlpacaError>() {
+        match error {
+            AlpacaError::CaptureMaterial
+            | AlpacaError::Protocol
+            | AlpacaError::InvalidCoverage
+            | AlpacaError::Serialization
+            | AlpacaError::Allocation
+            | AlpacaError::BodyTooLarge
+            | AlpacaError::DeadlineExceeded
+            | AlpacaError::Cancelled => error,
+            _ => &"adapter custody operation failed",
+        }
+    } else if matches!(
+        error.downcast_ref::<ResearchServiceError>(),
+        Some(ResearchServiceError::ProviderCaptureSealWorkerUnavailable)
+    ) {
+        &"research I/O worker unavailable"
+    } else {
+        &"custody operation failed"
+    };
+    tracing::warn!(stage, ordinal, error = %diagnostic, "option custody stage failed");
+    OptionChainDemandError::Custody
 }
 
 #[derive(Serialize, Deserialize)]
@@ -977,7 +1066,9 @@ fn map_acquisition(
         R::Adapter(A::InvalidAuthorization) => OptionChainDemandError::Permission,
         R::SourceBinding | R::Adapter(A::InvalidCredentials) => OptionChainDemandError::Authority,
         R::Adapter(A::Network) => OptionChainDemandError::Acquisition,
-        R::Adapter(A::CaptureMaterial) => OptionChainDemandError::Custody,
+        R::Adapter(error @ A::CaptureMaterial) => {
+            custody_error("acquisition.capture", None, &error)
+        }
         R::Adapter(_) => OptionChainDemandError::Identity,
     }
 }
