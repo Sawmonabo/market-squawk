@@ -4,6 +4,20 @@
 
 ### Current native barrier — investment dataset cursor admission
 
+Owner follow-up on repeated build output: completed supported workspace-only Cargo cleanup
+(`cargo clean --workspace --profile dev`) after inspecting its dry-run paths, confirming the
+watcher paused and no compiler active, and checking that no removal intersected open files.
+Cargo removed 9,974 files / 45.1 GiB; measured target is now 11 GiB and free disk 136 GiB.
+Third-party dependencies (including editor-loaded procedural macros), the running staged Desktop,
+all source WIP and workspace/recovery data remain. Workspace artifacts will rebuild on the next
+necessary Rust compilation; no build was launched to refill the cache after cleanup.
+The existing launcher already removes unreferenced generations through `cleanStages`; the retained
+live stage is 1.1 GiB. UI edits remain Vite HMR without Cargo. Continue one serialized native build
+configuration, batch critical checks, and reconcile obsolete variants at integration boundaries.
+Do not add per-save `cargo clean`, extra target directories or routine binary recovery copies.
+Cargo's automatic global-cache cleanup does not prune target; automatic target pruning remains
+unconfigured. This cleanup does not resolve the source-check or backend-startup barriers below.
+
 Owner disk cleanup completed while Cargo and watcher were idle: removed 9,941 superseded
 `.rcgu.o` files older than 24 hours, keeping the latest object group per crate, current-day
 objects and every library. Exact path/stat/no-open-file checks preceded deletion. Reclaimed
