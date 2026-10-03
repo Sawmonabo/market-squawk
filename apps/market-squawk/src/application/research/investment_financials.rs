@@ -297,7 +297,7 @@ impl InvestmentFinancialReadCapability {
             let effective_on = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
             let snapshot = self
                 .research
-                .run_owned_research_generation_read(deadline, cancellation, move |control| {
+                .run_owned_financial_read(deadline, cancellation, move |control| {
                     build_snapshot(
                         request,
                         selection_token,
@@ -334,7 +334,7 @@ impl InvestmentFinancialReadCapability {
         let owned = Arc::clone(&snapshot);
         let result = self
             .research
-            .run_owned_research_generation_read(deadline, cancellation, move |control| {
+            .run_owned_financial_read(deadline, cancellation, move |control| {
                 page(
                     &owned,
                     &position,

@@ -2,6 +2,70 @@
 
 ## Current execution — 2026-10-03
 
+### Integration in progress — financial read isolation and Tiingo qualification
+
+The preceding owner-question turn restated known source coverage and made no implementation
+progress. This continuation revalidated the live supervisor/service/Desktop and starts the next
+safe action: one single-job, nonincremental application-library compilation for the two frozen
+patches. Watcher PID28250 remains intentionally suspended; existing native app stays running.
+No parallel compilation, new runtime workspace or worktree was created.
+
+Owner follow-up: GPT-6.1 Sol High `source_status_contract` performs a read-only trace of why the
+current Schwab workspace lacks completed OAuth, whether already retained authorization can be
+reused by the existing flow, and the exact Yahoo consumer omission. It may append only the existing
+cross-source report; no source edits, secret reads, external browser, native/provider requests,
+builds or Git. Lead continues frozen-patch checks independently.
+
+Both implementation owners have released their files. Financial reads now use a separate existing
+`ResearchIoWorker` instance from bulk original-generation work; all company selection/resolve,
+financial snapshot/page and shutdown consumers are updated. This addresses demonstrated queue
+contention, not cold source-verification cost. Tiingo now follows its declared local token-shape
+qualification, with remote access explicitly pending. Three existing critical fixtures pass:
+`startup_reconciles_every_page_of_recognized_historical_sessions`,
+`retained_read_progresses_during_capture_and_generation_and_all_workers_drain`, and
+`selected_page_binds_cursor_and_close_to_original_snapshot`. They cover saved-credential
+continuation, independent reads with cancelled-worker retention/shutdown, and actual
+company/financial cursor operations while the bulk owner is held. One library compilation took
+4m52s; all three ran from that binary. Scoped rustfmt and diff checks pass. Log:
+`.agents/tmp/v1-first-stock/source-financial-critical.log`. No broad gate or CI was run.
+
+Native `935b3b65` evidence: all nine histories return251 adjusted bars; AAPL/MSFT first two ratio
+pages each contain64 reported values; TSLA has one remaining missing ratio on page two, now traced
+to a cross-concept occurrence-grouping defect; NVDA read deadline remains open. Yahoo activation
+succeeded but its product caller remains missing. The tracked product audit records these updates.
+
+Branch inspection: three local branches and one primary worktree. Origin additionally has open
+Dependabot PR55 (`crc32fast`1.5.2), whose commit is not integrated and whose version differs from
+our lockfile1.5.0; it was preserved rather than deleted as supposedly completed work. Recovery
+bundle remote references are separate from origin branches and remain untouched.
+
+Next barrier: commit/push this critically verified checkpoint, then let the single supervisor
+rebuild for native activation/read/restart verification. Fix the confirmed TSLA
+grouping next without mixing that source change into an in-progress compilation.
+
+### Matched native verification and alternative-source activation
+
+Previous turn was evidence progress: current catalog confirms only IEX equity quotes, unverified
+Schwab/Tiingo and cancelled Yahoo; this changes the next action from parser investigation to
+activation/consumer closure. The supervisor completed the `935b3b65` build in5m38s and now owns
+service12773/Desktop12818, generation-iGhdrn. No additional build or workspace was created.
+Native source status is active at revision37; corrected ratio-display identity requires rebuilding
+the existing derived display indexes before native result comparison, not a database migration.
+
+| Owner | Exact ownership / outcome | Next evidence |
+| --- | --- | --- |
+| Astra High `native_price_authority` | Isolate company/financial reads from bulk history-original replay using existing `ResearchIoWorker`; only `research_service.rs`, `application/research/company_research.rs`, `application/research/investment_financials.rs`, and existing fixtures in `research_service/worker.rs` / `investment_financials/page.rs` | Shared generation gate caused financial deadline during five history jobs. Preserve ownership, cancellation/join and source/evidence checks; no extra runtime/threadpool or weakened verification. Lead schedules existing critical checks. |
+| Astra High `research_choice_streaming` | Read-only remaining TSLA second-page net-margin occurrence3 source trace; append existing AAPL ratio-source report | Match exact CompanyFacts filing/period original and selected revenue occurrences. Determine source absence vs incorrect cross-concept occurrence grouping; no implementation, native calls or builds. |
+| Lead | Native navigation, source/history/financial preparation, shared runtime/Git/docs | Rebuild selected financial display through ordinary preparation; compare actual ratio pages. Retry failed adjusted history with live calendar authority, retain exact job/result. |
+| GPT-6.1 Sol High `source_status_contract` | Repair missing Tiingo saved-credential qualification in `provider_onboarding/service.rs` only, existing inline fixture if necessary; maintain cross-source report | Native activation returns `Onboarding(InvalidProfile)` before provider call: probe and assurance matches omit Tiingo despite its declared Local verification. Preserve exact local-vs-remote assurance and existing secret lifecycle. No runtime/provider requests, builds or Git. |
+
+Native progress: all nine history reads now return251 adjusted bars; all six retried jobs completed.
+AAPL first/next ratio pages each return32 reported values with zero missing values after normal
+preparation. Read contention under concurrent history jobs remains a demonstrated defect.
+
+DAG: frozen native candidate → selected preparation → actual pages/history. Alternative-source
+continuation tracing is independent; lead alone performs any subsequent native activation.
+
 ### Verified publication-deadline recovery correction
 
 Financial correction committed as `9aa7fc83`. Both implementation owners have released their

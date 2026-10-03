@@ -1,5 +1,37 @@
 # Desktop product audit — 2026-10-02 / current checkpoint 2026-10-03
 
+## Matched native follow-up — `935b3b65`
+
+This follow-up supersedes the affected failures in the historical baseline below; it does not
+close the overall audit. Ordinary history preparation completed for the six previously failed
+members. Native history reads now return 251 fully adjusted daily bars for **all nine** watchlist
+members. Observed reads took 3.016–8.668 seconds: this is data-recovery evidence, not instant-loading
+or restart-cache acceptance. SPY's actual chart export contains the plotted history; hidden WKWebView
+page capture can omit canvas pixels and is not by itself evidence that a chart is empty.
+
+After normal preparation rebuilt the derived financial indexes, AAPL and MSFT each returned 32
+reported ratio values on both first and next pages. TSLA returned 32 values on its first page and
+one missing-input row on its next page. That row is a confirmed local grouping defect: the same
+original filing contains net income 2,173,000,000 and revenue 25,182,000,000, but their independent
+concept revision ordinals (3 and 2) incorrectly split the shared reporting envelope. Preserve the
+original ordinals and fix grouping; no source absence is established. NVDA preparation completed,
+but a subsequent financial read timed out. Financial reads also reproduced gate-admission timeout
+while history jobs ran. Read isolation now passes the existing worker-custody/shutdown and actual
+financial-cursor fixtures; matched native contention verification remains required.
+
+Yahoo's native activation succeeded, but its missing ordinary product consumer remains open.
+Tiingo's native activation failed locally with `InvalidProfile` before a provider request; its
+qualification dispatch omitted the configured profile. The correction now passes the existing
+saved-credential continuation fixture; a matched native retry remains required. Schwab still needs its official authorization,
+qualified runtime and captured quotes; no alternative ask coverage is claimed.
+
+Retained evidence: `native-all-nine-history-935b3b65.json`,
+`native-aapl-ratios-ready-935b3b65.json`, `native-stock-ratios-ready-935b3b65.json`,
+`native-yahoo-activation-935b3b65.json` and `native-tiingo-activation-935b3b65.json` under
+`.agents/tmp/v1-first-stock/`. The lead individually inspected seven AAPL ratio tiles, three SPY
+page tiles and the SPY chart export in `native-935b3b65/`. Fund-specific composition, statement
+presentation, remaining source coverage and cold/warm/restart responsiveness remain open.
+
 ## Watchlist-wide extension — source tracing and remediation
 
 The subsequent native interaction pass covers all nine actual watchlist instruments: SPY, QQQ,

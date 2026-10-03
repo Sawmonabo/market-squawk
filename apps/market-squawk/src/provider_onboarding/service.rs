@@ -1785,6 +1785,8 @@ impl ProviderOnboardingService {
                     }
                     let probe_evidence = if profile.id() == "alpaca.basic-market-data" {
                         alpaca_credential_shape_evidence(&resumed, profile, generation, &secret)?
+                    } else if profile.id() == "tiingo.starter-eod-nav" {
+                        tiingo_credential_shape_evidence(&resumed, profile, generation, &secret)?
                     } else {
                         self.run_credential_probe(profile, &secret, cancellation.clone())
                             .await?
@@ -4024,6 +4026,39 @@ fn schwab_application_shape_evidence(
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
+/// Qualifies Tiingo's declared local token/composition contract, not remote token access or coverage.
+fn tiingo_credential_shape_evidence(
+    resumed: &ResumedProviderOnboarding,
+    profile: &ProviderOnboardingProfile,
+    generation: SecretGeneration,
+    secret: &SecretValue,
+) -> Result<CredentialProbeEvidence, ProviderOnboardingError> {
+    if profile.id() != "tiingo.starter-eod-nav"
+        || profile.probe().transport() != ProbeTransport::Local
+    {
+        return Err(ProviderOnboardingError::InvalidProfile);
+    }
+    if resumed.lifecycle().candidate_generation() != Some(generation)
+        || resumed.lifecycle().generation_state(generation)
+            != Some(CredentialGenerationState::StoredUnverified)
+    {
+        return Err(ProviderOnboardingError::InvalidSessionState);
+    }
+    validate_secret_shape(profile, secret)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/tiingo-token-shape/v1\0");
+    hasher.update(resumed.reservation().session_id().as_bytes());
+    hasher.update(generation.get().to_be_bytes());
+    hasher.update(profile.capability().content_digest().bytes());
+    hasher.update(resumed.reservation().public_configuration_digest().bytes());
+    hasher.update(profile.rights_decision_digest().bytes());
+    hasher.update(secret.expose_secret().as_bytes());
+    Ok(CredentialProbeEvidence {
+        response_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into()),
+        account_digest: None,
+    })
+}
+
 fn coinbase_account_digest(body: &[u8]) -> Result<EvidenceDigest, ProviderOnboardingError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
@@ -4165,6 +4200,10 @@ fn credential_assurance(
             "schwab-application-credential-shape-verified-oauth-entitlement-pending",
         )
         .map_err(Into::into),
+        "tiingo.starter-eod-nav" => {
+            SourceIdentifier::try_from("tiingo-token-shape-verified-remote-access-pending")
+                .map_err(Into::into)
+        }
         "kraken.spot-authenticated-level3-market-data" => {
             SourceIdentifier::try_from("kraken-create-ws-token-only-key-permission-verified")
                 .map_err(Into::into)
@@ -4505,8 +4544,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn startup_reconciles_every_page_of_recognized_historical_sessions() -> TestResult {
+    #[tokio::test]
+    async fn startup_reconciles_every_page_of_recognized_historical_sessions() -> TestResult {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
         let (_research, catalog, _publisher) =
@@ -4629,7 +4668,7 @@ mod tests {
             .unix_nanos()
             .saturating_sub(system_timestamp()?.unix_nanos());
         if remaining >= 0 {
-            std::thread::sleep(Duration::from_nanos(u64::try_from(remaining)? + 1_000_000));
+            tokio::time::sleep(Duration::from_nanos(u64::try_from(remaining)? + 1_000_000)).await;
         }
         let recovered = ProviderOnboardingService::try_new_with_provider_rate(
             catalog,
@@ -4662,6 +4701,74 @@ mod tests {
             SecretInteractionPolicy::Forbid,
         )?;
         assert_eq!(retained.expose_secret(), "fixture-pending-tiingo-token");
+
+        let pending = recovered
+            .catalog
+            .resume_provider_onboarding(*pending_session)?;
+        assert!(matches!(
+            tiingo_credential_shape_evidence(
+                &pending,
+                tiingo,
+                pending_coordinate.0,
+                &SecretValue::new("invalid token".to_owned())?,
+            ),
+            Err(ProviderOnboardingError::InvalidSecretShape)
+        ));
+        assert!(matches!(
+            tiingo_credential_shape_evidence(
+                &pending,
+                tiingo,
+                SecretGeneration::new(pending_coordinate.0.get() + 1)?,
+                &retained,
+            ),
+            Err(ProviderOnboardingError::InvalidSessionState)
+        ));
+
+        let cancelled_preparation = CancellationToken::new();
+        cancelled_preparation.cancel();
+        assert!(matches!(
+            recovered
+                .prepare_runtime_activation_target(*pending_session, cancelled_preparation)
+                .await,
+            Err(ProviderOnboardingError::OperationCancelled)
+        ));
+        assert_eq!(
+            recovered.resume(*pending_session)?.state(),
+            OnboardingState::StoredUnverified
+        );
+        let prepared = recovered
+            .prepare_runtime_activation_target(*pending_session, CancellationToken::new())
+            .await?;
+        assert_eq!(prepared.session_id(), *pending_session);
+        assert_eq!(prepared.generation(), Some(pending_coordinate.0));
+        assert_eq!(prepared.secret_reference(), Some(&pending_coordinate.1));
+        let qualified = recovered
+            .catalog
+            .resume_provider_onboarding(*pending_session)?;
+        assert_eq!(
+            qualified.lifecycle().state(),
+            OnboardingState::RuntimeVerificationPending
+        );
+        assert!(qualified.lifecycle().active_generation().is_none());
+        let verification = qualified
+            .lifecycle()
+            .generation_verification(pending_coordinate.0)
+            .ok_or("Tiingo local qualification is missing")?;
+        assert_eq!(
+            verification.assurance_limitation().as_str(),
+            "tiingo-token-shape-verified-remote-access-pending"
+        );
+        let repeated = recovered
+            .prepare_runtime_activation_target(*pending_session, CancellationToken::new())
+            .await?;
+        require_same_active_lease(&prepared, &repeated)?;
+        assert_eq!(
+            recovered
+                .catalog
+                .resume_provider_onboarding(*pending_session)?
+                .next_sequence(),
+            qualified.next_sequence()
+        );
         let cancelled = recovered
             .catalog
             .resume_provider_onboarding(*cancelled_session)?;
@@ -4690,6 +4797,12 @@ mod tests {
                 LocalSecretStoreError::NotFound
             ))
         ));
+        assert!(
+            recovered
+                .prepare_runtime_activation_target(*cancelled_session, CancellationToken::new())
+                .await
+                .is_err()
+        );
         Ok(())
     }
 

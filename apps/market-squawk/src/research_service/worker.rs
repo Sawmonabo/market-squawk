@@ -364,6 +364,33 @@ mod tests {
             })
         };
         entered.await?;
+        let financial_read = service
+            .run_owned_financial_read(deadline, &CancellationToken::new(), |_| 126)
+            .await?;
+        assert_eq!(financial_read, 126);
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!generation_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
+        let financial_cancel = CancellationToken::new();
+        let (financial_entered, entered) = oneshot::channel();
+        let (release_financial, financial_release) = std::sync::mpsc::channel();
+        let financial_finished = Arc::new(AtomicBool::new(false));
+        let financial = {
+            let service = Arc::clone(&service);
+            let token = financial_cancel.clone();
+            let finished = Arc::clone(&financial_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_financial_read(deadline, &token, move |owned| {
+                        let _ = financial_entered.send(());
+                        let _ = financial_release.recv_timeout(Duration::from_secs(10));
+                        assert!(owned.is_cancelled());
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
         let read = service
             .run_owned_research_read(deadline, &CancellationToken::new(), |_| 42)
             .await?;
@@ -371,6 +398,7 @@ mod tests {
         assert!(!capture_finished.load(Ordering::Acquire));
         assert!(!generation_finished.load(Ordering::Acquire));
         assert!(!preparation_finished.load(Ordering::Acquire));
+        assert!(!financial_finished.load(Ordering::Acquire));
 
         let read_cancel = CancellationToken::new();
         let (read_entered, entered) = oneshot::channel();
@@ -394,6 +422,7 @@ mod tests {
         capture_cancel.cancel();
         generation_cancel.cancel();
         preparation_cancel.cancel();
+        financial_cancel.cancel();
         read_cancel.cancel();
         assert!(matches!(
             capture.await?,
@@ -411,19 +440,46 @@ mod tests {
             read.await?,
             Err(ResearchServiceError::Ingest(IngestError::Cancelled))
         ));
+        assert!(matches!(
+            financial.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
         assert!(!capture_finished.load(Ordering::Acquire));
         assert!(!generation_finished.load(Ordering::Acquire));
         assert!(!preparation_finished.load(Ordering::Acquire));
         assert!(!read_finished.load(Ordering::Acquire));
+        assert!(!financial_finished.load(Ordering::Acquire));
+        // Returning cancellation does not free admission or discard the original handle.
+        assert_eq!(service.financial_read_worker.gate.available_permits(), 0);
+        assert!(
+            service
+                .financial_read_worker
+                .state
+                .lock()
+                .await
+                .worker
+                .is_some()
+        );
         release_capture.send(())?;
         release_generation.send(())?;
         release_preparation.send(())?;
         release_read.send(())?;
+        release_financial.send(())?;
         service.finish_owned_io_shutdown(deadline).await?;
         assert!(capture_finished.load(Ordering::Acquire));
         assert!(generation_finished.load(Ordering::Acquire));
         assert!(preparation_finished.load(Ordering::Acquire));
         assert!(read_finished.load(Ordering::Acquire));
+        assert!(financial_finished.load(Ordering::Acquire));
+        assert!(
+            service
+                .financial_read_worker
+                .state
+                .lock()
+                .await
+                .worker
+                .is_none()
+        );
         Ok(())
     }
 }

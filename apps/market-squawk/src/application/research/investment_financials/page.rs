@@ -299,6 +299,7 @@ mod tests {
     use market_squawk_domain::{CalendarDate, InstrumentId};
     use market_squawk_platform::LocalPaths;
     use market_squawk_services::JsonStructureLimits;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The missing-evidence path is a real frozen snapshot too: changing section/selection must
     /// not reuse its handle, and closing it must not silently open a different current read.
@@ -330,23 +331,79 @@ mod tests {
             ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 10, 2)?),
             ResearchRevisionPolicy::LatestKnown,
         )?;
+        let (generation_entered, entered) = tokio::sync::oneshot::channel();
+        let (release_generation, generation_release) = std::sync::mpsc::channel();
+        let generation_finished = Arc::new(AtomicBool::new(false));
+        let generation = {
+            let research = Arc::clone(&research);
+            let finished = Arc::clone(&generation_finished);
+            tokio::spawn(async move {
+                research
+                    .run_owned_research_generation_read(
+                        deadline,
+                        &CancellationToken::new(),
+                        move |_| {
+                            let _ = generation_entered.send(());
+                            let _ = generation_release.recv_timeout(Duration::from_secs(30));
+                            finished.store(true, Ordering::Release);
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.await?;
+        // Real family resolution/selection and cursor reads must not queue behind the held
+        // bulk original-generation owner. No source identity is fabricated by this fixture.
+        let reader = CompanyResearchReadCapability::new(Arc::clone(&research));
+        let resolved = reader
+            .resolve_company_family(
+                &request,
+                SecResearchFamily::CompanyFacts,
+                deadline,
+                &cancellation,
+            )
+            .await?;
+        assert!(matches!(
+            resolved.outcome(),
+            market_squawk_data::SecResearchResolvedOutcome::Missing
+        ));
+        let selected = reader
+            .select_company_family(
+                &request,
+                SecResearchFamily::CompanyFacts,
+                deadline,
+                cancellation.child_token(),
+            )
+            .await?;
+        assert!(matches!(
+            selected.outcome(),
+            SecResearchIdentityOutcome::Missing
+        ));
+        assert!(!generation_finished.load(Ordering::Acquire));
         let id = Uuid::new_v4();
-        let snapshot = Arc::new(build_snapshot(
-            request,
-            "selected-security".into(),
-            InvestmentFinancialSection::Facts,
-            "2026-10-02".into(),
-            vec![FamilyAvailability {
-                family: "company_facts",
-                state: InvestmentFinancialState::Missing,
-                reason: Some("identity_missing"),
-            }],
-            Vec::new(),
-            Vec::new(),
-            research.analytical().operation_scratch()?,
-            deadline,
-            &cancellation,
-        )?);
+        let scratch = research.analytical().operation_scratch()?;
+        let snapshot = Arc::new(
+            research
+                .run_owned_financial_read(deadline, &cancellation, move |owned| {
+                    build_snapshot(
+                        request,
+                        "selected-security".into(),
+                        InvestmentFinancialSection::Facts,
+                        "2026-10-02".into(),
+                        vec![FamilyAvailability {
+                            family: "company_facts",
+                            state: InvestmentFinancialState::Missing,
+                            reason: Some("identity_missing"),
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        scratch,
+                        deadline,
+                        &owned,
+                    )
+                })
+                .await??,
+        );
         capability
             .cache
             .entries
@@ -427,6 +484,10 @@ mod tests {
             .await?;
         assert_eq!(expired.state, InvestmentFinancialState::Expired);
         assert!(expired.knowledge_at.is_none() && expired.read_token.is_none());
+        assert!(!generation_finished.load(Ordering::Acquire));
+        release_generation.send(())?;
+        generation.await??;
+        assert!(generation_finished.load(Ordering::Acquire));
         // The admitted page's original ownership remains usable after the cache closes it.
         let owned = super::page(
             &snapshot,
@@ -518,6 +579,7 @@ mod tests {
             ),
             Err(ServiceError::InvalidResult)
         ));
+        research.finish_owned_io_shutdown(deadline).await?;
         Ok(())
     }
 }

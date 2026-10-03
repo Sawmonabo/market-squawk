@@ -331,7 +331,7 @@ impl CompanyResearchReadCapability {
     ) -> Result<T, CanonicalResearchReadError> {
         check_operation(deadline, cancellation)?;
         self.research
-            .run_owned_research_generation_read(deadline, cancellation, operation)
+            .run_owned_financial_read(deadline, cancellation, operation)
             .await
             .map_err(map_company_worker_error)?
             .map_err(map_company_data_error)

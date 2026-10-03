@@ -400,6 +400,7 @@ pub struct ResearchService {
     provider_capture_worker: ResearchIoWorker,
     retained_read_worker: ResearchIoWorker,
     retained_generation_worker: ResearchIoWorker,
+    financial_read_worker: ResearchIoWorker,
     financial_preparation_worker: ResearchIoWorker,
     retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
     application_changes: market_squawk_runtime::ApplicationChanges,
@@ -646,6 +647,7 @@ impl ResearchService {
             provider_capture_worker: ResearchIoWorker::new(),
             retained_read_worker: ResearchIoWorker::new(),
             retained_generation_worker: ResearchIoWorker::new(),
+            financial_read_worker: ResearchIoWorker::new(),
             financial_preparation_worker: ResearchIoWorker::new(),
             retained_use_policies: retained_use::current_policies()?.into(),
             application_changes,
@@ -837,9 +839,8 @@ impl ResearchService {
             .await
     }
 
-    /// Runs complete retained-generation verification or indexing independently of compact
-    /// price and rights reads. Reuses the existing bulk owner and its interruption/shutdown
-    /// custody; the closure must not reacquire this lane or retain a ResearchService Arc.
+    /// Holds the actual bulk-generation owner in the existing scheduling fixtures.
+    #[cfg(test)]
     pub(crate) async fn run_owned_research_generation_read<T, F>(
         &self,
         deadline: Instant,
@@ -851,6 +852,25 @@ impl ResearchService {
         F: FnOnce(CancellationToken) -> T + Send + 'static,
     {
         self.retained_generation_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Runs company selection, financial snapshot construction and pages independently of
+    /// bulk original replay, capture and financial preparation. The original blocking handle
+    /// remains owned through interruption and shutdown. The closure must preserve evidence
+    /// checks and must not reacquire this lane or retain a ResearchService Arc.
+    pub(crate) async fn run_owned_financial_read<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.financial_read_worker
             .run(deadline, cancellation, operation)
             .await
     }
@@ -894,6 +914,7 @@ impl ResearchService {
         self.provider_capture_worker.begin_shutdown();
         self.retained_read_worker.begin_shutdown();
         self.retained_generation_worker.begin_shutdown();
+        self.financial_read_worker.begin_shutdown();
         self.financial_preparation_worker.begin_shutdown();
     }
 
@@ -903,13 +924,18 @@ impl ResearchService {
         deadline: Instant,
     ) -> Result<(), ResearchServiceError> {
         self.begin_owned_io_shutdown();
-        let (capture, reads, generations, preparation) = tokio::join!(
+        let (capture, reads, generations, financial_reads, preparation) = tokio::join!(
             self.provider_capture_worker.finish_shutdown(deadline),
             self.retained_read_worker.finish_shutdown(deadline),
             self.retained_generation_worker.finish_shutdown(deadline),
+            self.financial_read_worker.finish_shutdown(deadline),
             self.financial_preparation_worker.finish_shutdown(deadline),
         );
-        capture.and(reads).and(generations).and(preparation)
+        capture
+            .and(reads)
+            .and(generations)
+            .and(financial_reads)
+            .and(preparation)
     }
 
     /// Rejoins the fixed analytical selection to bounded original native/physical custody in the
