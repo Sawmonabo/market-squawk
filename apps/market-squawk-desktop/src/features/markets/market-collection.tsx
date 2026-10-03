@@ -1,7 +1,7 @@
 import { formatProductTimestamp } from "@/lib/time"
 import { RefreshButton } from "@/components/ui/refresh-button"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Activity, CircleAlert } from "lucide-react"
+import { CircleAlert, X } from "lucide-react"
 import { Link } from "react-router-dom"
 import { z } from "zod"
 
@@ -11,7 +11,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { PercentageChange } from "@/features/shared/percentage-change"
 import { Skeleton } from "@/components/ui/skeleton"
-import { formatMoney } from "@/lib/formatters"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { formatMoney, groupDecimal } from "@/lib/formatters"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -110,14 +111,17 @@ export function MarketCollection({
     || collection.isError || marketInformation.isError || disconnected
   const refreshing = collection.isFetching || marketInformation.isFetching
 
-  return <section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Watchlist">
-    <div className="flex items-start justify-between gap-3">
-      <div>
-        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Followed investments</p>
-        <h2 className="mt-1 text-base font-semibold">Watchlist</h2>
-        <p className="mt-2 text-xs leading-5 text-muted-foreground">Follow investments you want to check on Overview. This watchlist does not represent investments you own. You can restore removed investments below.</p>
+  return <TooltipProvider><section className="rounded-xl border border-border bg-card/45 p-5" aria-label="Watchlist" aria-busy={refreshing || choice.isPending}>
+    <div className="flex items-center justify-between gap-3">
+      <h2 className="text-base font-semibold">Watchlist</h2>
+      <div className="flex items-center gap-2">
+        <RefreshButton label="Refresh watchlist" refreshing={refreshing} disabled={collection.isFetching || choice.isPending}
+          onClick={() => {
+            void collection.refetch()
+            if (savedCollection !== undefined) void marketInformation.refetch()
+          }} />
+        <Button asChild size="xs" variant="ghost"><Link to="/markets">Explore markets</Link></Button>
       </div>
-      <Activity className="size-5 shrink-0 text-primary" aria-hidden="true" />
     </div>
     {collection.isPending ? <Skeleton className="mt-5 h-40 rounded-lg" />
       : collection.isError && savedCollection === undefined ? <Alert className="mt-5">
@@ -137,26 +141,34 @@ export function MarketCollection({
           </Alert> : marketCollection !== null && !marketInformationMatches ? <Alert className="mt-5">
             <CircleAlert aria-hidden="true" /><AlertTitle>Market information needs refreshing</AlertTitle>
             <AlertDescription>The market information does not match your latest saved watchlist. Refresh to check again.</AlertDescription>
-          </Alert> : collection.isFetching || marketInformation.isFetching
-            ? <p role="status" className="mt-4 text-xs text-muted-foreground">Checking your saved choices and market information…</p> : null}
-          {kept.length === 0 ? <p className="mt-5 rounded-lg border border-dashed border-border p-5 text-xs text-muted-foreground">Your watchlist is empty. Follow an investment below to show it here again.</p>
-            : <ul className={layout === "grid" ? "mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3" : "mt-5 divide-y divide-border"}>
-              {kept.map((entry) => <li key={entry.symbol} className={layout === "grid" ? "rounded-lg border border-border bg-background/35 p-3" : "py-3 first:pt-0 last:pb-0"}>
-                <div className="flex items-center gap-3">
+          </Alert> : refreshing ? <p role="status" className="sr-only">Updating watchlist…</p> : null}
+          {kept.length === 0 ? <p className="mt-5 rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">Your watchlist is empty.</p>
+            : <>
+              {layout === "list" ? <div aria-hidden="true" className="mt-4 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_5.5rem_2rem] gap-2 pb-2 text-[10px] text-muted-foreground">
+                <span>Symbol</span><span className="text-right">Price</span><span className="text-right">Change %</span><span />
+              </div> : null}
+              <ul className={layout === "grid" ? "mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3" : "divide-y divide-border"}>
+              {kept.map((entry) => <li key={entry.symbol} className={layout === "grid" ? "group rounded-lg border border-border bg-background/35 px-3 py-1" : "group py-1"}>
+                <div className="flex items-center gap-2">
                   <div className="min-w-0 flex-1">
                     <CollectionInvestment symbol={entry.symbol} market={entry.market} unverified={marketInformationUnverified} refreshing={refreshing} />
                   </div>
-                  <Button type="button" size="xs" variant="ghost" disabled={busy}
+                  <span className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100">
+                  <Button type="button" size="icon-sm" variant="ghost" disabled={busy}
+                    className="text-muted-foreground"
                     aria-label={`Remove ${entry.symbol} from your watchlist`}
-                    onClick={() => choice.mutate({ symbol: entry.symbol, kept: false })}>Remove</Button>
+                    title={`Remove ${entry.symbol} from your watchlist`}
+                    onClick={() => choice.mutate({ symbol: entry.symbol, kept: false })}><X className="size-3.5" aria-hidden="true" /></Button>
+                  </span>
                 </div>
               </li>)}
-            </ul>}
+              </ul>
+            </>}
           {removed.length > 0 ? <details className="mt-4 rounded-lg border border-border bg-background/35 p-3">
             <summary className="cursor-pointer text-xs font-medium">Removed investments ({removed.length})</summary>
             <ul className="mt-3 space-y-3">
               {removed.map((entry) => <li key={entry.symbol} className="flex items-center justify-between gap-3">
-                <span className="text-xs"><span className="font-medium">{entry.symbol}</span>{entry.market?.identity.name ? ` · ${entry.market.identity.name}` : ""}</span>
+                <span className="text-xs font-medium">{entry.symbol}</span>
                 <Button type="button" size="xs" variant="outline" disabled={busy}
                   aria-label={`Follow ${entry.symbol} in your watchlist`}
                   onClick={() => choice.mutate({ symbol: entry.symbol, kept: true })}>Follow</Button>
@@ -164,17 +176,9 @@ export function MarketCollection({
             </ul>
           </details> : null}
         </>}
-    {choice.isPending ? <p role="status" className="mt-3 text-xs text-muted-foreground">Saving your watchlist…</p> : null}
+    {choice.isPending ? <p role="status" className="sr-only">Saving your watchlist…</p> : null}
     {choice.isError ? <p role="alert" className="mt-3 text-xs text-destructive">Your choice could not be saved. Check the refreshed watchlist and try again.</p> : null}
-    <div className="mt-4 flex flex-wrap gap-2">
-      <RefreshButton label="Refresh watchlist" refreshing={refreshing} disabled={collection.isFetching || choice.isPending}
-        onClick={() => {
-          void collection.refetch()
-          if (savedCollection !== undefined) void marketInformation.refetch()
-        }} />
-      <Button asChild size="sm" variant="outline"><Link to="/markets">Explore markets</Link></Button>
-    </div>
-  </section>
+  </section></TooltipProvider>
 }
 
 function CollectionInvestment({ symbol, market, unverified, refreshing }: {
@@ -183,19 +187,31 @@ function CollectionInvestment({ symbol, market, unverified, refreshing }: {
   unverified: boolean
   refreshing: boolean
 }) {
-  const label = <><span className="block text-xs font-medium">{symbol}</span>
-    {market?.identity.name ? <span className="mt-0.5 block text-[10px] text-muted-foreground">{market.identity.name}</span> : null}</>
-  return <>
-    {market === null ? label
-      : <Link className="block underline-offset-4 hover:underline" to={`/investments/${encodeURIComponent(market.selectionToken)}`}>{label}</Link>}
-    {market === null ? <p className="mt-2 text-[10px] text-muted-foreground">Investment details are not available yet.</p>
-      : <div className="mt-2 text-[10px] text-muted-foreground">
-        <p>{marketPriceBasisLabel(market)}</p>
-        <p className="font-mono text-foreground">{market.price ? formatMoney({ amount: market.price.value, currency: market.price.currency }) : "Price unavailable"}</p>
-        <p>{unverified && market.price !== null ? <>Saved price · </> : refreshing ? <>Updating… · </>
-          : marketAvailabilityLabel(market) ? <>{marketAvailabilityLabel(market)} · </> : null}
-          <PercentageChange value={market.changePercent} description={marketChangeDescription(market)} /></p>
-        {market.asOf ? <time dateTime={market.asOf}>{formatProductTimestamp(market.asOf)}</time> : null}
-      </div>}
+  const values = <>
+    <span className="truncate font-medium">{symbol}</span>
+    <span className={`truncate text-right font-mono tabular-nums ${unverified || market?.availability !== "current" ? "text-muted-foreground" : "text-foreground"}`}>
+      {market?.price ? <>{market.price.currency === "USD" ? "$" : `${market.price.currency} `}{groupDecimal(market.price.value, { maximumFractionDigits: 2 })}</> : <><span className="sr-only">Price unavailable</span><span aria-hidden="true">—</span></>}
+    </span>
+    <span className="whitespace-nowrap text-right">
+      {market?.changePercent !== null && market?.changePercent !== undefined
+        ? <PercentageChange value={market.changePercent} description={marketChangeDescription(market)} />
+        : <><span className="sr-only">Change unavailable</span><span aria-hidden="true" className="text-muted-foreground">—</span></>}
+    </span>
   </>
+  const rowClassName = "grid min-h-8 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_5.5rem] items-center gap-2 rounded-sm text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+  return <Tooltip>
+    <TooltipTrigger asChild>
+      {market === null ? <span tabIndex={0} className={rowClassName}>{values}</span>
+        : <Link className={`${rowClassName} hover:bg-accent/40`} to={`/investments/${encodeURIComponent(market.selectionToken)}`}>{values}</Link>}
+    </TooltipTrigger>
+    <TooltipContent side="top" align="start" className="max-w-xs space-y-1">
+      <p className="font-medium">{market?.identity.name ?? symbol}</p>
+      {market === null ? <p>Investment details unavailable.</p> : <>
+        {market.price ? <p>{marketPriceBasisLabel(market)} · {formatMoney({ amount: market.price.value, currency: market.price.currency })}</p> : <p>Price unavailable.</p>}
+        {unverified && market.price !== null ? <p>Saved price</p> : marketAvailabilityLabel(market) ? <p>{marketAvailabilityLabel(market)}</p> : null}
+        {market.asOf ? <p><time dateTime={market.asOf}>{formatProductTimestamp(market.asOf)}</time></p> : null}
+      </>}
+      {refreshing ? <p>Updating…</p> : null}
+    </TooltipContent>
+  </Tooltip>
 }

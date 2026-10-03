@@ -2,6 +2,32 @@
 
 ## Current execution — 2026-10-02
 
+Compact watchlist implemented and native HMR verified: ticker/currency price/change only,
+hover or keyboard-focus X, metadata in tooltip, no row description/timestamp/status paragraphs.
+Lead inspected native screenshot against TradingView's official watchlist screenshot; no overflow.
+Desktop typecheck PASS. Native probe confirms controls stay hidden at rest and the row accepts keyboard focus;
+background WKWebView does not establish foreground focus-ring/hover paint.
+Original-read snapshot fix pushed `f5695ed4`; existing writer-held custody case PASS (1, 1.14s).
+Live nine-symbol history audit: MSFT251 and IWM21 rows; other seven not_available. This is an
+open history acquisition/observation issue, not a completed screen workflow. Current fixes remain
+in the documented history/calendar lanes; no claim that compact styling resolves data availability.
+
+
+History ownership extension: Sol may edit `history-preparation.tsx` to coordinate one loading
+state, and only the existing history fixture section in `src/test/app.test.tsx`. Lead owns the
+shared `preparation-controls.tsx` terminal-receipt persistence correction so automatic first-open
+acquisition never repeats an already failed/cancelled history request across observer remounts.
+
+
+Sol history_range_interaction owns only `features/markets/market-history-read.tsx`,
+`market-history-chart.tsx` and the existing selected-market critical history case in
+`src/test/app.test.tsx`. Correct unacquired history being treated as a frozen snapshot:
+missing/temporarily unavailable reads must observe new market publication; acquired generations
+remain pinned. Retain an existing good chart during transient refresh failures and show one
+coherent loading/error state. No automatic mutation retry, manufactured data or new harness.
+Lead owns source diagnosis, native verification and scheduling; independent of compact watchlist.
+
+
 Original-read snapshot critical case PASS (existing catalog fixture, 1 test). Files frozen.
 Next bounded Astra stock_workflow_trace ownership: `apps/market-squawk/src/application/market_calendar/read.rs`
 and one existing calendar critical fixture if necessary. Diagnose the decoder's transient/retained
