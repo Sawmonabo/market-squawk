@@ -1066,6 +1066,7 @@ describe("Market Squawk desktop boundary", () => {
       sessionStorage.removeItem(recoveryKey)
       historyAvailability = "missing"
       preparationState = "running"
+      const firstMissingReadOffset = issuedQueries.length
       const firstMissing = openInvestment(lookupRoute(parsed.matches[0]!))
       await screen.findByText("History loading could not be checked. Check the original request before trying again.")
       expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
@@ -1074,6 +1075,9 @@ describe("Market Squawk desktop boundary", () => {
       })
       expect((screen.getByLabelText("History window") as HTMLSelectElement).value).toBe("365")
       expect(screen.queryByRole("heading", { name: "Price history is unavailable" })).toBeNull()
+      expect(issuedQueries.slice(firstMissingReadOffset).filter((request) => request.query === "marketHistory")).toEqual([
+        { query: "marketHistory", historyToken, pointLimit: 512 },
+      ])
       const initialRecovery = JSON.parse(sessionStorage.getItem(recoveryKey)!)
       expect(initialRecovery.startRequestId).not.toBe(startRequestId)
       let arrivalSequence = 0

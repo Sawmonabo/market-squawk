@@ -137,6 +137,9 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
 }
 
 function recentHistoryWindow(days: number, result: MarketHistoryResult | undefined): MarketHistoryViewportInput {
+  // The first read establishes the source time precision; guessing dates rejects
+  // timestamped histories when their first publication arrives.
+  if (!result?.data) return { pointLimit: 512 }
   const end = Date.now()
   const start = end - days * 86_400_000
   const timestamped = result?.data?.bars[0]?.time.precision === "timestamped_period"

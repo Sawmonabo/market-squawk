@@ -2,6 +2,22 @@
 
 ## Current execution — 2026-10-02
 
+Additional history consumer defect corrected: initial missing history no longer guesses nominal
+calendar-date viewport bounds. Native timestamped projections reject those bounds after the first
+publication. Initial read now establishes time precision with the bounded point projection, while
+acquisition retains the chosen lookback. Existing first-open critical journey PASS (1); later
+known-precision range behavior remains covered. Matched Rust build running once; no competing
+compilers or runtime instances.
+
+
+Lead adds fixed safe stage breadcrumbs only in selected-history `preflight/{history,display_history}.rs`
+for the observed long-running QQQ job. Existing logs cover errors but not the pending await.
+Instrument UUID, static stage and elapsed time only; no credentials/payload logging, admission
+change or new orchestration. Included before the single matched build to avoid a diagnostic-only
+rebuild. Original job is reconciled before any replacement request; process-bound recovery is not
+claimed to resume transparently.
+
+
 Calendar bounded decoding critical fixture PASS (1, 8.72s): a 2,712-row physical query containing
 2,709 selected calendar rows fails whole-batch decoding under the same 64 MiB allowance but
 succeeds in bounded chunks with complete ordinal/provenance/native replay checks. Earlier fixture
