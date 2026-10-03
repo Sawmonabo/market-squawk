@@ -17,7 +17,6 @@ const CONTRACT_METADATA_KEY: &str = "org.market-squawk/tool-contract";
 const MAXIMUM_TOOL_NAME_BYTES: usize = 128;
 const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
 const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
-const MAXIMUM_TOOLS: usize = 256;
 // Closed production contracts are intentionally detailed; these bounds still cap every retained
 // descriptor independently while allowing the complete Source and Market schema graphs.
 const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 256 * 1024;
@@ -619,16 +618,11 @@ impl ServiceCapabilities {
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceCapabilityError`] for duplicate names or more than 256 operations.
+    /// Returns [`ServiceCapabilityError`] for duplicate names. Descriptors are constructed by
+    /// the application, not supplied by requests; each descriptor validates its own schema bounds.
     pub fn try_new(mut tools: Vec<ToolDescriptor>) -> Result<Self, ServiceCapabilityError> {
-        if tools.len() > MAXIMUM_TOOLS {
-            return Err(ServiceCapabilityError::TooManyTools {
-                maximum: MAXIMUM_TOOLS,
-            });
-        }
         tools.sort_unstable_by(|left, right| left.name().cmp(right.name()));
-        let mut names = HashSet::with_capacity(tools.len());
-        if tools.iter().any(|tool| !names.insert(tool.name())) {
+        if tools.windows(2).any(|pair| pair[0].name() == pair[1].name()) {
             return Err(ServiceCapabilityError::DuplicateName);
         }
         Ok(Self {

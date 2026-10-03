@@ -57,8 +57,8 @@ const MAXIMUM_QUEUED_JOBS: usize = 256;
 const MAXIMUM_RUNNING_JOBS: usize = 8;
 const MAXIMUM_QUEUED_PER_KIND: usize = 64;
 const MAXIMUM_RUNNING_PER_KIND: usize = 2;
-const RUNNER_PENDING_CAPACITY: usize = 256;
-const RUNNER_DEADLINE: Duration = Duration::from_secs(60 * 60);
+pub(crate) const RUNNER_PENDING_CAPACITY: usize = 256;
+pub(crate) const RUNNER_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 /// Code-owned installed runner set retained for both scheduling and typed admission.
 pub struct InstalledJobRunners {

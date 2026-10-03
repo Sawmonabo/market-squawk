@@ -61,6 +61,9 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Research.GetInvestmentFinancials"
             | "Research.CloseInvestmentFinancials"
             | "Market.PrepareInvestmentEvidence"
+            | "Market.GetInvestmentEvidencePreparation"
+            | "Market.CancelInvestmentEvidencePreparation"
+            | "Market.GetInvestmentEvidencePreparationResult"
             | "Market.SelectInvestmentEvidence"
             | "Market.ReadInvestmentEvidence"
             | "Market.GetHistory"
@@ -1636,6 +1639,7 @@ const JOB_START_RECONCILIATION_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required(
         "operation",
         ArgumentKind::Enumeration(&[
+            "Market.PrepareInvestmentEvidence",
             "Market.StartHistoryPreparation",
             "Research.StartInvestmentFinancialPreparation",
             "Research.StartIngestSource",
@@ -2108,7 +2112,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     OperationSpec {
         name: "Market.PrepareInvestmentEvidence",
-        description: "Prepare the latest trading-session information for this investment.",
+        description: "Prepare the inputs for an investment analysis as a durable job.",
         domain: ServiceDomain::Market,
         scope: LOCAL_SCOPE,
         arguments: MARKET_PREPARE_INVESTMENT_ARGUMENTS,
@@ -2119,6 +2123,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         idempotent: false,
         open_world: true,
     },
+    read(
+        "Market.GetInvestmentEvidencePreparation",
+        "Read the preparation job for this investment.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        FINANCIAL_PREPARATION_JOB_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Market.CancelInvestmentEvidencePreparation",
+        "Cancel the exact preparation job for this investment.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        FINANCIAL_PREPARATION_CANCEL_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Market.GetInvestmentEvidencePreparationResult",
+        "Reopen the exact completed investment preparation and its original inputs.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        JOB_GET_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
     read(
         "Market.SelectInvestmentEvidence",
         "Select the price and trading conditions used in an investment analysis.",
@@ -4151,6 +4179,28 @@ enum ArgumentKind {
     Enumeration(&'static [&'static str]),
     Signed { minimum: i64, maximum: i64 },
     Unsigned { minimum: u64, maximum: u64 },
+}
+
+fn investment_preparation_arguments_schema() -> Value {
+    let properties: Map<String, Value> = MARKET_PREPARE_INVESTMENT_ARGUMENTS
+        .iter()
+        .map(|argument| {
+            let schema = match argument.kind {
+                // Results use the existing product token representation. Admission and the
+                // retained request commitment still validate its exact selection identity.
+                ArgumentKind::MarketSelectionToken => output::market_token("market"),
+                kind => argument_schema(kind),
+            };
+            (argument.name.to_owned(), schema)
+        })
+        .collect();
+    let required: Vec<&str> = MARKET_PREPARE_INVESTMENT_ARGUMENTS
+        .iter()
+        .filter(|argument| argument.required)
+        .map(|argument| argument.name)
+        .collect();
+    json!({"type":"object", "properties": properties, "required":required,
+        "additionalProperties":false})
 }
 
 fn schema_for(spec: OperationSpec) -> Value {

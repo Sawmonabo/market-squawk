@@ -354,7 +354,6 @@ async fn cancel_pending_start(
         | "Portfolio.SelectAnalysisPrerequisites"
         | "Portfolio.ReadAnalysisPrerequisites"
         | "Model.PrepareInvestmentForecast"
-        | "Market.PrepareInvestmentEvidence"
         | "Analysis.GetFiscalPreparationPlan"
         | "Analysis.GetHistoricalStudyPlan"
         | "Decision.PrepareCurrentScreen"
@@ -362,7 +361,8 @@ async fn cancel_pending_start(
         | "Decision.ReadCurrentScreenPreparation"
         | "Decision.GetFindResults"
         | "Decision.GetInvestmentAnalysis" => return Ok(StartCancellation::Settled(None)),
-        "Model.StartPreparedForecast"
+        "Market.PrepareInvestmentEvidence"
+        | "Model.StartPreparedForecast"
         | "Analysis.StartPreparedBacktest"
         | "Analysis.StartInvestmentDataset"
         | "Analysis.StartFiscalDatasetBuild"

@@ -2,8 +2,55 @@
 
 ## Current execution — 2026-10-03
 
+### Active wave — managed preparation for the retained stock analysis
 
-### Active wave — renewed option-source admission for the retained stock workflow
+Base `ba77ce88`, clean primary feature worktree. Acceptance 2/6/7: the existing source pipeline
+exceeds the controller's 15-second request deadline. Keep canonical `Market.PrepareInvestmentEvidence`
+but return the existing admitted-job receipt. Reuse the installed scheduler and existing pipeline.
+
+| Owner | Disjoint files / dependency | Required evidence |
+| --- | --- | --- |
+| Sol High `financial_preparation_worker` | `service/market_evidence.rs` and new `service/market_evidence/job.rs`; existing preparation pipeline, local admission, owned execution and immutable result | Exact input/origin/result binding, request-independent lifetime, terminal publication and completed-result reopening |
+| Astra High `stock_preparation_deadline` | `application/analytical_workflow/workflow_driver.rs` and `workflow_control.rs`; consumes the frozen job contract below | Both preparation steps, lost acknowledgement, original Find-member arguments and exact result restart; extend the existing critical workflow fixture |
+| Sol High `financial_display_fixes` | `cli.rs` and `local_product/cli_transport.rs`; consumes the same frozen operations | Honest admitted-job CLI response and exact preparation status/result/cancel/reconciliation |
+| Lead | Shared contracts/schema, bootstrap/tool-services/job control, CLI, ledger/Git/build/runtime | Integrate all callers, serialized critical checks, commit/push, resume the same retained MSFT workflow |
+
+Frozen contract: preparation starts return the standard job receipt. Product operations
+`Market.GetInvestmentEvidencePreparation`, `Market.CancelInvestmentEvidencePreparation` accept
+`selectionToken`, `jobId`, `generation` (cancel also `expectedSequence`).
+`Market.GetInvestmentEvidencePreparationResult` accepts `jobId`, `generation` and returns
+`{job, preparation, arguments, requestSha256}`: exact original business arguments and their SHA-256,
+plus the existing preparation body. Completed results never reacquire sources or change cutoffs.
+The runner receives shared preparation/forecast capabilities, the existing artifact repository and
+the existing runner capacity/deadline policy; service bootstrap composes/registers it before transport.
+
+DAG: frozen interfaces → disjoint runner/controller work plus lead shared routing → integrated
+critical check → one matching development build → same-workflow native continuation. The single
+watcher is paused during edits; the current Desktop/service remain open. No new worktrees, branches,
+executor, migration, deadline increase, full CI or RAM measurement. Preserved workspaces remain intact.
+
+Integration found two concrete registration failures: the retained-arguments output reused an
+unsupported input token pattern, corrected with the existing product token output definition;
+then the complete code-owned registry exceeded a hardcoded 256-operation ceiling. Lead additionally
+owns `crates/market-squawk-services/src/traits.rs` to remove that application-feature ceiling,
+retaining descriptor/request/result bounds and duplicate-name rejection using adjacent sorted names.
+The existing full operation-contract check covers the actual expanded registry; no new test harness.
+
+Runner/controller/CLI changes are integrated and agent ownership released. Three focused library
+checks passed: complete operation contracts (1/1, 1.24s), existing workflow publication/receipt
+binding (1/1, 0.57s), and request-independent job lifetime with retained origin/generation
+(1/1, <0.01s). The first compile exposed a diagnostic formatting error, then integration exposed
+the two registration defects above; corrected compilation took 4m13s and the remaining checks
+reused that build. These fixtures do not establish real acquisition or completed-artifact restart.
+The existing installed shared-client/restart check passed (1/1, 49.10s after a 5m15s single-job
+compile), without the unrelated Board fixture feature. It verifies native/MCP registration and
+installed lifecycle; it does not execute live investment preparation.
+Logs: `.agents/tmp/v1-first-stock/managed-preparation-{contract-fixed,workflow-critical,
+lifetime-critical,installed-critical}.log`. Matching deployment and same-MSFT continuation remain
+the next barrier. No live-completion claim yet.
+
+
+### Integrated source correction — renewed option-source admission
 
 Base `a65f9394`, daily changes critically/live/restart verified below. The retained MSFT workflow
 again pauses at preparation. Matching runtime diagnostic now identifies `source-identity-conflict`

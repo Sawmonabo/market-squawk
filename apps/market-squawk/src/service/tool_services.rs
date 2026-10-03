@@ -63,7 +63,7 @@ use super::{
         START_RECOMMENDATION_BACKTEST,
     },
     jobs::{InstalledJobOperations, JobStartAdmission},
-    market_evidence::InstalledMarketEvidence,
+    market_evidence::{InstalledMarketEvidence, InvestmentEvidenceJobRunner, PREPARE},
     operations::InstalledOperations,
     portfolio_analysis::InstalledPortfolioAnalysis,
     portfolio_import::InstalledPortfolioImportOperations,
@@ -111,12 +111,13 @@ pub(super) struct InstalledToolServices {
         Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>,
     >,
     backtest_preparation: InstalledBacktestPreparation,
-    forecast_preparation: InstalledForecastPreparation,
+    forecast_preparation: Arc<InstalledForecastPreparation>,
     profile_benchmarks: crate::application::RecommendationBenchmarkSelectionReadCapability,
     profile_research: Arc<crate::ResearchService>,
     training_preparation: InstalledProductTraining,
     current_find: InstalledCurrentFind,
-    market_evidence: Option<InstalledMarketEvidence>,
+    market_evidence: Option<Arc<InstalledMarketEvidence>>,
+    investment_evidence: Option<Arc<InvestmentEvidenceJobRunner>>,
     market_session_runtime: Arc<MarketRuntimeRegistry>,
     market_session_reader: MarketSessionContextReadCapability,
     recommendation_backtest: InstalledRecommendationBacktestReadOperations,
@@ -162,6 +163,9 @@ impl<'a> InstalledToolServiceAuthorities<'a> {
 /// Runtime-owned resources required to compose the installed tool surface.
 pub(super) struct InstalledToolServiceRuntime {
     runners: Arc<InstalledJobRunners>,
+    forecast_preparation: Arc<InstalledForecastPreparation>,
+    market_evidence: Option<Arc<InstalledMarketEvidence>>,
+    investment_evidence: Option<Arc<InvestmentEvidenceJobRunner>>,
     inputs: Arc<InputStager>,
     runtime: RuntimeIdentity,
     portfolio_import: InstalledPortfolioImportOperations,
@@ -172,6 +176,9 @@ pub(super) struct InstalledToolServiceRuntime {
 impl InstalledToolServiceRuntime {
     pub(super) fn new(
         runners: Arc<InstalledJobRunners>,
+        forecast_preparation: Arc<InstalledForecastPreparation>,
+        market_evidence: Option<Arc<InstalledMarketEvidence>>,
+        investment_evidence: Option<Arc<InvestmentEvidenceJobRunner>>,
         inputs: Arc<InputStager>,
         runtime: RuntimeIdentity,
         portfolio_import: InstalledPortfolioImportOperations,
@@ -180,6 +187,9 @@ impl InstalledToolServiceRuntime {
     ) -> Self {
         Self {
             runners,
+            forecast_preparation,
+            market_evidence,
+            investment_evidence,
             inputs,
             runtime,
             portfolio_import,
@@ -207,17 +217,15 @@ impl InstalledToolServices {
         } = authorities;
         let InstalledToolServiceRuntime {
             runners,
+            forecast_preparation,
+            market_evidence,
+            investment_evidence,
             inputs,
             runtime,
             portfolio_import,
             provider_credential_import,
             research_file_import,
         } = runtime_resources;
-        let forecast_preparation = InstalledForecastPreparation::new(
-            product,
-            runtime,
-            runners.forecast().preparation_authority(),
-        );
         let policy = market_squawk_decisions::RecommendationPolicy::v1()
             .map_err(|_| ServiceError::Internal)?;
         let maximum_mark_age_nanos = u64::try_from(policy.parameters().market_max_age_nanos)
@@ -292,26 +300,6 @@ impl InstalledToolServices {
             )
             .with_artifact_repository(product.artifacts()),
         );
-        let market_evidence = product.instrument_context_read_capability().map(|identities| {
-            let selections = crate::application::market_selection::product::MarketProductSelectionReadCapability::new(
-                product.research(),
-                product.research().market_data_instruments(),
-            );
-            Ok::<_, ServiceError>(InstalledMarketEvidence::new(
-                selections,
-                markets,
-                Arc::new(identities),
-                CompletedMarketSessionReadCapability::new(product.research(), product.market_runtime()),
-                super::market_evidence::InstalledInvestmentSourcePreparation::new(
-                    product.research(), product.research_ingest(), product.provider_activation(),
-                    product.macro_context_read_capability(),
-                    product.source_action_preparation(),
-                    product.market_runtime(),
-                    product.options_context_read_capability(),
-                ),
-                product.decisions(),
-            ))
-        }).transpose()?;
         let installed_operations = InstalledOperations::new(
             operations,
             jobs,
@@ -332,7 +320,8 @@ impl InstalledToolServices {
             analytical_workflow,
             application: Arc::clone(&application),
             product_capabilities,
-            jobs: InstalledJobOperations::new(jobs),
+            jobs: InstalledJobOperations::new(jobs)
+                .with_investment_evidence(investment_evidence.clone()),
             runners,
             inputs: Arc::clone(&inputs),
             runtime,
@@ -354,6 +343,7 @@ impl InstalledToolServices {
             training_preparation: InstalledProductTraining::new(product, jobs),
             current_find: InstalledCurrentFind::new(product, runtime),
             market_evidence,
+            investment_evidence,
             market_session_runtime: product.market_runtime(),
             market_session_reader: MarketSessionContextReadCapability::new(
                 product.research(),
@@ -556,6 +546,15 @@ impl InstalledToolServices {
                 super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
             let limits = context.limits();
             let (admission, revoke) = match request.name() {
+                PREPARE => {
+                    let admission = self
+                        .investment_evidence
+                        .as_ref()
+                        .ok_or(ServiceError::Unavailable)?
+                        .admit(request, context)
+                        .await?;
+                    (admission, JobAdmissionOwner::InvestmentEvidence)
+                }
                 START_FINANCIALS => {
                     let input: FinancialPreparationStart = decode(request.arguments())?;
                     let runner = self
@@ -1110,6 +1109,11 @@ impl InstalledToolServices {
 
     fn revoke(&self, owner: JobAdmissionOwner, admission: &crate::application::job::JobAdmission) {
         match owner {
+            JobAdmissionOwner::InvestmentEvidence => {
+                if let Some(runner) = &self.investment_evidence {
+                    let _result = runner.revoke(admission);
+                }
+            }
             JobAdmissionOwner::InvestmentFinancials => {
                 if let Some(runner) = self.runners.investment_financials() {
                     let _result = runner.revoke(admission);
@@ -1247,6 +1251,7 @@ fn required_argument<'a>(
 
 #[derive(Clone, Copy)]
 enum JobAdmissionOwner {
+    InvestmentEvidence,
     MarketHistory,
     InvestmentFinancials,
     Ingest,
@@ -2110,7 +2115,8 @@ impl InstalledToolServices {
 fn owns_job_start(name: &str) -> bool {
     matches!(
         name,
-        START_HISTORY
+        PREPARE
+            | START_HISTORY
             | START_FINANCIALS
             | START_INGEST
             | START_EXPORT

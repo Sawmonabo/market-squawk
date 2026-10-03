@@ -3,6 +3,10 @@
 mod historical_study;
 pub(super) use historical_study::GET_RECOMMENDATION_BACKTEST_JOB_RESULT;
 
+use super::market_evidence::{
+    CANCEL_PREPARATION, GET_PREPARATION, GET_PREPARATION_RESULT, InvestmentEvidenceJobRunner,
+};
+
 use std::sync::Arc;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
@@ -27,6 +31,7 @@ use crate::{
 pub(super) struct InstalledJobOperations {
     application: JobApplication<SqliteJobRepository>,
     repository: Arc<SqliteJobRepository>,
+    investment_evidence: Option<Arc<InvestmentEvidenceJobRunner>>,
 }
 
 pub(super) enum JobStartAdmission {
@@ -39,7 +44,16 @@ impl InstalledJobOperations {
         Self {
             application: JobApplication::new(jobs.repository(), jobs.authority()),
             repository: jobs.repository(),
+            investment_evidence: None,
         }
+    }
+
+    pub(super) fn with_investment_evidence(
+        mut self,
+        runner: Option<Arc<InvestmentEvidenceJobRunner>>,
+    ) -> Self {
+        self.investment_evidence = runner;
+        self
     }
 
     /// Reopens the actual forecast published by an exact completed job generation.
@@ -121,7 +135,10 @@ impl InstalledJobOperations {
     pub(super) fn owns(operation: &str) -> bool {
         matches!(
             operation,
-            "Research.GetInvestmentFinancialPreparation"
+            GET_PREPARATION
+                | CANCEL_PREPARATION
+                | GET_PREPARATION_RESULT
+                | "Research.GetInvestmentFinancialPreparation"
                 | "Research.CancelInvestmentFinancialPreparation"
                 | "Market.GetHistoryPreparation"
                 | "Market.CancelHistoryPreparation"
@@ -145,12 +162,35 @@ impl InstalledJobOperations {
         ensure_live(context)?;
         let arguments = super::business_arguments(request.arguments());
         let content = match request.name() {
-            "Market.GetHistoryPreparation"
+            GET_PREPARATION_RESULT => {
+                let input: GetRequest = decode(&arguments)?;
+                let snapshot = self
+                    .owned_snapshot(&input.job_id, input.generation, context)
+                    .await?;
+                let mut result = self
+                    .investment_evidence
+                    .as_ref()
+                    .ok_or(ServiceError::Unavailable)?
+                    .read_result(&snapshot, context)
+                    .await?;
+                result
+                    .as_object_mut()
+                    .ok_or(ServiceError::InvalidResult)?
+                    .insert(
+                        "job".to_owned(),
+                        encode(JobReceipt::from_snapshot(&snapshot))?,
+                    );
+                result
+            }
+            GET_PREPARATION
+            | CANCEL_PREPARATION
+            | "Market.GetHistoryPreparation"
             | "Market.CancelHistoryPreparation"
             | "Research.GetInvestmentFinancialPreparation"
             | "Research.CancelInvestmentFinancialPreparation" => {
                 let financial = request.name().starts_with("Research.");
-                let (token, job_id, generation, expected_sequence) = if financial {
+                let investment = matches!(request.name(), GET_PREPARATION | CANCEL_PREPARATION);
+                let (token, job_id, generation, expected_sequence) = if financial || investment {
                     let input: FinancialPreparationRequest = decode(&arguments)?;
                     (
                         input.selection_token,
@@ -168,7 +208,11 @@ impl InstalledJobOperations {
                     )
                 };
                 let snapshot = self.owned_snapshot(&job_id, generation, context).await?;
-                let belongs = if financial {
+                let belongs = if investment {
+                    self.investment_evidence
+                        .as_ref()
+                        .is_some_and(|runner| runner.belongs_to(&snapshot, &token))
+                } else if financial {
                     runners
                         .investment_financials()
                         .is_some_and(|runner| runner.belongs_to(&snapshot, &token))
@@ -341,6 +385,11 @@ impl InstalledJobOperations {
                 .get(id, generation)
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
+            if let Some(runner) = &self.investment_evidence {
+                if snapshot.spec().kind() == market_squawk_jobs::JobRunner::kind(runner.as_ref()) {
+                    runner.release_terminal(&snapshot)?;
+                }
+            }
             if runners.market_history().input(&snapshot).is_some() {
                 runners
                     .market_history()

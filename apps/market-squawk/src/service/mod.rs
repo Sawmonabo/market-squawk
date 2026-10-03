@@ -710,9 +710,35 @@ impl InstalledService {
                     return Err(error.into());
                 }
             };
+            let forecast_preparation = Arc::new(forecast_preparation::InstalledForecastPreparation::new(
+                &product, runtime.runtime(), runners.forecast().preparation_authority(),
+            ));
+            let evidence = (|| {
+                let preparation = market_evidence::InstalledMarketEvidence::from_product(&product)?;
+                let runner = preparation.as_ref().map(|preparation| {
+                    market_evidence::InvestmentEvidenceJobRunner::try_new(
+                        Arc::clone(preparation), Arc::clone(&forecast_preparation), product.artifacts(),
+                        crate::jobs::RUNNER_PENDING_CAPACITY, crate::jobs::RUNNER_DEADLINE,
+                    ).map(Arc::new)
+                }).transpose()?;
+                Ok::<_, market_squawk_services::ServiceError>((preparation, runner))
+            })();
+            let (market_evidence, investment_evidence) = match evidence {
+                Ok(evidence) => evidence,
+                Err(_) => {
+                    shutdown_application(product.application()).await;
+                    return Err(InstalledServiceError::CompositionStage("investment preparation"));
+                }
+            };
+            let mut registered = runners.registered();
+            if let Some(runner) = &investment_evidence {
+                registered.push(market_squawk_jobs::JobRunnerRegistration::new(
+                    runner.clone(), market_squawk_jobs::JobActivityClass::Mutation,
+                ));
+            }
             let jobs = match InstalledJobAuthority::open(
                 &workspace_paths,
-                runners.registered(),
+                registered,
                 current_timestamp()?,
             )
             .await
@@ -747,6 +773,9 @@ impl InstalledService {
                 product: &product,
                 jobs: &jobs,
                 runners,
+                forecast_preparation,
+                market_evidence,
+                investment_evidence,
                 operations: &operations,
                 workspace_selector: Arc::clone(&workspace_selector),
                 workspace_placement: selection.placement(),
@@ -1056,6 +1085,9 @@ struct TransportComposition<'a> {
     product: &'a LocalProduct,
     jobs: &'a InstalledJobAuthority,
     runners: Arc<crate::jobs::InstalledJobRunners>,
+    forecast_preparation: Arc<forecast_preparation::InstalledForecastPreparation>,
+    market_evidence: Option<Arc<market_evidence::InstalledMarketEvidence>>,
+    investment_evidence: Option<Arc<market_evidence::InvestmentEvidenceJobRunner>>,
     operations: &'a ReadyInstalledOperations,
     workspace_selector: Arc<WorkspaceSelector>,
     workspace_placement: WorkspacePlacement,
@@ -1070,6 +1102,9 @@ async fn compose_transport(
         product,
         jobs,
         runners,
+        forecast_preparation,
+        market_evidence,
+        investment_evidence,
         operations,
         workspace_selector,
         workspace_placement,
@@ -1187,6 +1222,9 @@ async fn compose_transport(
             ),
             InstalledToolServiceRuntime::new(
                 runners,
+                forecast_preparation,
+                market_evidence,
+                investment_evidence,
                 Arc::clone(&inputs),
                 runtime.runtime(),
                 portfolio_import,

@@ -101,6 +101,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Job.Confirm"
         | "Research.GetInvestmentFinancialPreparation"
         | "Research.CancelInvestmentFinancialPreparation"
+        | "Market.GetInvestmentEvidencePreparation"
+        | "Market.CancelInvestmentEvidencePreparation"
         | "Market.GetHistoryPreparation"
         | "Market.CancelHistoryPreparation" => job_view(),
         "Job.ReconcileStart" | "Job.CancelStart" => one_of(vec![
@@ -230,7 +232,16 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Market.GetSessionContext" | "Market.ReadSessionContext" => {
             market_session_context::result()
         }
-        "Market.PrepareInvestmentEvidence" => market_evidence::preparation_result(),
+        "Market.PrepareInvestmentEvidence" => job_receipt(),
+        "Market.GetInvestmentEvidencePreparationResult" => closed_complete(vec![
+            ("job", job_receipt()),
+            ("preparation", market_evidence::preparation_result()),
+            (
+                "arguments",
+                super::investment_preparation_arguments_schema(),
+            ),
+            ("requestSha256", sha256()),
+        ]),
         "Market.SelectInvestmentEvidence" | "Market.ReadInvestmentEvidence" => {
             market_evidence::result()
         }
@@ -2295,7 +2306,7 @@ fn market_search_page() -> Value {
     ])
 }
 
-fn market_token(prefix: &str) -> Value {
+pub(super) fn market_token(prefix: &str) -> Value {
     json!({
         "type": "string",
         "minLength": prefix.len() + 33,

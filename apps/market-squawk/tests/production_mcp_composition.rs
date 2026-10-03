@@ -324,6 +324,18 @@ async fn run_installed_service_authority_scenario(
 
         // Selected preparation is shared across native and ordinary MCP clients before setup.
         for (operation, domain, read_only) in [
+            ("Market.PrepareInvestmentEvidence", "market", false),
+            ("Market.GetInvestmentEvidencePreparation", "market", true),
+            (
+                "Market.CancelInvestmentEvidencePreparation",
+                "market",
+                false,
+            ),
+            (
+                "Market.GetInvestmentEvidencePreparationResult",
+                "market",
+                true,
+            ),
             ("Market.StartHistoryPreparation", "market", false),
             ("Market.GetHistoryPreparation", "market", true),
             ("Market.CancelHistoryPreparation", "market", false),

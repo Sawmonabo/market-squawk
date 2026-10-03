@@ -532,13 +532,55 @@ pub enum MarketCommand {
         /// JSON file containing the original returned reference object.
         reference: PathBuf,
     },
-    /// Acquire the current-session calendar before freezing an investment analysis cutoff.
+    /// Admit a durable job to prepare the selected investment's analysis evidence.
     PrepareInvestmentEvidence {
         /// JSON request containing the selected investment and resolved financial profile.
         request: PathBuf,
         /// Authorize bounded source acquisition and local evidence publication.
         #[arg(long)]
         confirm: bool,
+    },
+    /// Read one exact investment evidence preparation job for the selected investment.
+    InvestmentEvidencePreparation {
+        #[arg(long)]
+        selection_token: String,
+        /// Durable job identity returned by preparation.
+        #[arg(long)]
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Reopen the completed preparation and its exact original arguments without reacquisition.
+    InvestmentEvidencePreparationResult {
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Cancel investment evidence preparation at the exact observed generation and sequence.
+    CancelInvestmentEvidencePreparation {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Check the original evidence preparation start after an uncertain acknowledgement.
+    ReconcileInvestmentEvidencePreparation {
+        /// Original request identity reported by the uncertain start.
+        #[arg(long)]
+        request_id: String,
+        /// Exact lowercase SHA-256 reported with that request identity.
+        #[arg(long)]
+        arguments_sha256: String,
     },
     /// Return provider-neutral current-market summaries selected by Market Squawk.
     Overview {

@@ -2,6 +2,7 @@ export function jobKindLabel(kind: string): string {
   const knownJobKinds: Record<string, string> = {
     "research.ingest-source.v1": "Import research data",
     "market.prepare-history.v1": "Load price history",
+    "market.prepare-investment-evidence.v1": "Prepare investment analysis",
     "research.prepare-investment-financials.v1": "Load financial information",
     "research.phase-one-derived-generation-job.v1": "Build research dataset",
     "analysis.phase-one-feature-derived-generation-job.v1": "Build analysis dataset",
@@ -33,6 +34,7 @@ export function jobPhaseLabel(phase: string): string {
     "validating-inputs": "Checking inputs",
     "resolving-inputs": "Preparing inputs",
     "preparing-adjusted-history": "Preparing price history",
+    "preparing-investment-evidence": "Preparing investment inputs",
     "preparing-investment-financials": "Preparing financial information",
     "building-phase-one-derived-generation": "Building dataset",
     "evaluating-screen": "Finding opportunities",

@@ -45,6 +45,8 @@ use historical::{
     retain_historical_page, retain_historical_target, revalidate_historical_frontier,
 };
 
+const PREPARATION_RESULT: &str = "Market.GetInvestmentEvidencePreparationResult";
+
 const MAXIMUM_RECEIPTS: usize = 64;
 const MAXIMUM_RECEIPT_BYTES: usize = 128 * 1024;
 const MAXIMUM_RETAINED_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
@@ -52,7 +54,10 @@ const MAXIMUM_FISCAL_TARGETS: usize = 9;
 const MAXIMUM_UNAVAILABLE_RECEIPTS: usize = 7 * 32;
 
 fn maximum_receipt_bytes(operation: &str) -> usize {
-    if operation == "Market.PrepareInvestmentEvidence" {
+    if matches!(
+        operation,
+        "Market.PrepareInvestmentEvidence" | PREPARATION_RESULT
+    ) {
         market_squawk_decisions::MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES
     } else {
         MAXIMUM_RECEIPT_BYTES
@@ -120,6 +125,24 @@ pub(super) struct Receipt {
 }
 
 impl Receipt {
+    fn preparation(&self) -> Result<&Value, WorkflowError> {
+        if self.operation != PREPARATION_RESULT {
+            return Err(WorkflowError::internal());
+        }
+        preparation_arguments(&self.body)?;
+        let job = self.body.get("job").ok_or_else(WorkflowError::internal)?;
+        let child = workflow_control::job_reference(job)?;
+        if job.get("state").and_then(Value::as_str) != Some("completed")
+            || self.arguments != job_arguments(&child)?
+        {
+            return Err(WorkflowError::internal());
+        }
+        self.body
+            .get("preparation")
+            .filter(|value| value.is_object())
+            .ok_or_else(WorkflowError::internal)
+    }
+
     fn valid(&self) -> bool {
         super::valid_identifier(&self.operation, 128)
             && valid_digest(&self.sha256)
@@ -135,6 +158,7 @@ impl Receipt {
                         64 * 1024
                     }
             })
+            && (self.operation != PREPARATION_RESULT || self.preparation().is_ok())
             && (self.operation != "Model.PrepareInvestmentForecast"
                 || price_preparation(self).is_ok())
             && (self.operation != "Analysis.GetHistoricalStudyPlan"
@@ -150,6 +174,8 @@ struct ActiveJob {
     reference: ServiceJobReference,
     observed_sequence: u64,
     result_arguments: Map<String, Value>,
+    /// Original business arguments must match the completed preparation, not just its own hash.
+    preparation_arguments: Option<Map<String, Value>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -348,10 +374,20 @@ impl DriverState {
                     && find.population_count <= find.canonical_population_count
                     && find.canonical_population_count <= 65_536
             })
-            && self
-                .active_job
-                .as_ref()
-                .is_none_or(|job| super::valid_service_job_reference(&job.reference))
+            && self.active_job.as_ref().is_none_or(|job| {
+                super::valid_service_job_reference(&job.reference)
+                    && match &job.preparation_arguments {
+                        Some(arguments) => {
+                            job.result_operation == PREPARATION_RESULT
+                                && matches!(job.step, Step::PrepareSelection | Step::FinalPrepare)
+                                && !arguments.contains_key("confirm")
+                                && !arguments.contains_key("resultLimits")
+                                && serde_json::to_vec(arguments)
+                                    .is_ok_and(|bytes| bytes.len() <= 64 * 1024)
+                        }
+                        None => job.result_operation != PREPARATION_RESULT,
+                    }
+            })
     }
 
     pub(super) fn result_ordering(&self) -> Option<&'static str> {
@@ -409,7 +445,7 @@ impl DriverState {
 
     fn initial_source_action_reference(&self) -> Result<&Value, WorkflowError> {
         self.receipt(Step::PrepareSelection)?
-            .body
+            .preparation()?
             .get("sourceActionReference")
             .filter(|value| value.is_object())
             .ok_or_else(|| {
@@ -544,17 +580,14 @@ impl AnalyticalWorkflowController {
                 ));
             }
             let driver = run.driver.as_mut().ok_or_else(WorkflowError::internal)?;
-            let refresh_current = matches!(
-                driver.step,
-                Step::FinalPrepare | Step::FinalEvidence | Step::FinalPortfolio
-            );
+            let refresh_current = matches!(driver.step, Step::FinalEvidence | Step::FinalPortfolio);
             if refresh_current {
-                // No publication was submitted at these stages. Refresh current price/portfolio
-                // evidence after setup or interruption, retaining the original analytical cutoff.
-                for key in ["FinalPrepare", "FinalEvidence", "FinalPortfolio"] {
+                // Refresh only the reads. Completed preparation and an uncertain job admission
+                // retain their original custody and cutoff across resumption.
+                for key in ["FinalEvidence", "FinalPortfolio"] {
                     driver.receipts.remove(key);
                 }
-                driver.step = Step::FinalPrepare;
+                driver.step = Step::FinalEvidence;
                 run.pending_invocation = None;
             }
             driver.revalidating = true;
@@ -675,6 +708,9 @@ impl AnalyticalWorkflowController {
                     reference: child.clone(),
                     observed_sequence: sequence,
                     result_arguments,
+                    preparation_arguments: (expected.operation
+                        == "Market.PrepareInvestmentEvidence")
+                        .then(|| preparation_business_arguments(&expected.arguments)),
                 });
                 append_checkpoint(
                     run,
@@ -750,6 +786,7 @@ pub(super) fn capabilities_available(generation: &WorkflowGeneration) -> bool {
         "AnalyticalProfile.Resolve",
         "Portfolio.GetRecommendationSetup",
         "Market.PrepareInvestmentEvidence",
+        PREPARATION_RESULT,
         "Market.SelectInvestmentEvidence",
         "Analysis.PrepareProbabilityEvent",
         "Analysis.StartProbabilityDataset",
@@ -1138,6 +1175,7 @@ async fn call(
 
 fn job_result_operation(operation: &str) -> Option<&'static str> {
     match operation {
+        "Market.PrepareInvestmentEvidence" => Some(PREPARATION_RESULT),
         "Analysis.StartProbabilityDataset"
         | "Analysis.StartInvestmentDataset"
         | "Analysis.StartFiscalDatasetBuild"
@@ -1435,7 +1473,7 @@ fn next_invocation(
         ),
         Step::FinalEvidence => (
             "Market.SelectInvestmentEvidence",
-            json!({"selectionToken": work.selection_token, "sourceCutoffUnixNanos": work.receipt(Step::FinalPrepare)?.body.get("preparedAtUnixNanos").ok_or_else(WorkflowError::internal)?, "financialProfile": DriverState::profile(run)?}),
+            json!({"selectionToken": work.selection_token, "sourceCutoffUnixNanos": work.receipt(Step::FinalPrepare)?.preparation()?.get("preparedAtUnixNanos").ok_or_else(WorkflowError::internal)?, "financialProfile": DriverState::profile(run)?}),
             false,
         ),
         Step::FinalPortfolio => (
@@ -1700,8 +1738,10 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
             };
         }
         Step::PrepareSelection => {
+            let preparation = receipt.preparation()?;
+            let original_arguments = preparation_arguments(&receipt.body)?;
             if !matches!(
-                receipt.body.get("status").and_then(Value::as_str),
+                preparation.get("status").and_then(Value::as_str),
                 Some("prepared" | "unavailable")
             ) {
                 return Err(WorkflowError::new(
@@ -1716,18 +1756,17 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
                     .ok_or_else(WorkflowError::internal)?,
             )
             .map_err(|_| WorkflowError::internal())?;
-            if receipt.body.get("financialConfigurationDigest")
+            if preparation.get("financialConfigurationDigest")
                 != resolution.get("configurationDigest")
             {
                 return Err(WorkflowError::internal());
             }
             if work.find.is_some()
-                && receipt.body.get("status").and_then(Value::as_str) == Some("unavailable")
-                && receipt.body.get("findMemberUnavailable").is_some()
+                && preparation.get("status").and_then(Value::as_str) == Some("unavailable")
+                && preparation.get("findMemberUnavailable").is_some()
             {
                 let unavailable: FindMemberUnavailable = serde_json::from_value(
-                    receipt
-                        .body
+                    preparation
                         .get("findMemberUnavailable")
                         .cloned()
                         .ok_or_else(WorkflowError::internal)?,
@@ -1735,12 +1774,12 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
                 .map_err(|_| WorkflowError::internal())?;
                 if !unavailable.valid()
                     || unavailable.member != current_find_member(work)?
-                    || receipt.arguments.get("findMember")
+                    || original_arguments.get("findMember")
                         != Some(
                             &serde_json::to_value(&unavailable.member)
                                 .map_err(|_| WorkflowError::internal())?,
                         )
-                    || receipt.body.get("reason")
+                    || preparation.get("reason")
                         != Some(
                             &serde_json::to_value(&unavailable.reason)
                                 .map_err(|_| WorkflowError::internal())?,
@@ -1760,9 +1799,8 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
                 }
                 return Ok(());
             }
-            work.instrument_id = Some(uuid_field(&receipt.body, "instrumentId")?);
-            let prepared_at = receipt
-                .body
+            work.instrument_id = Some(uuid_field(preparation, "instrumentId")?);
+            let prepared_at = preparation
                 .get("preparedAtUnixNanos")
                 .and_then(Value::as_str)
                 .filter(|value| super::valid_timestamp(value))
@@ -2012,10 +2050,10 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
             work.step = Step::FinalPrepare;
         }
         Step::FinalPrepare => {
-            if uuid_field(&receipt.body, "instrumentId")?
+            let preparation = receipt.preparation()?;
+            if uuid_field(preparation, "instrumentId")?
                 != work.instrument_id.ok_or_else(WorkflowError::internal)?
-                || !receipt
-                    .body
+                || !preparation
                     .get("preparedAtUnixNanos")
                     .and_then(Value::as_str)
                     .is_some_and(super::valid_timestamp)
@@ -2455,6 +2493,11 @@ fn compact_completed_run(run: &mut WorkflowRun) -> Result<(), WorkflowError> {
 
 fn archive_unavailable_receipts(work: &mut DriverState) -> Result<(), WorkflowError> {
     for receipt in work.receipts.values() {
+        let preparation = if receipt.operation == PREPARATION_RESULT {
+            receipt.preparation()?
+        } else {
+            &receipt.body
+        };
         let unavailable = matches!(
             receipt.operation.as_str(),
             "Model.PrepareInvestmentForecast" | "Analysis.PrepareProbabilityEvent"
@@ -2463,7 +2506,7 @@ fn archive_unavailable_receipts(work: &mut DriverState) -> Result<(), WorkflowEr
             .pointer("/availability/state")
             .and_then(Value::as_str)
             == Some("unavailable")
-            || receipt.body.get("status").and_then(Value::as_str) == Some("unavailable")
+            || preparation.get("status").and_then(Value::as_str) == Some("unavailable")
             || receipt.operation == "Analysis.GetFiscalPreparationPlan"
                 && receipt
                     .body
@@ -2480,7 +2523,7 @@ fn archive_unavailable_receipts(work: &mut DriverState) -> Result<(), WorkflowEr
         // A source-assessed Find member is already retained in the immutable parent journal;
         // its final aggregate retains the exact reference and visible reason after compaction.
         if unavailable
-            && receipt.body.get("findMemberUnavailable").is_none()
+            && preparation.get("findMemberUnavailable").is_none()
             && !work.completed_unavailable_receipts.contains(receipt)
         {
             if work.completed_unavailable_receipts.len() == MAXIMUM_UNAVAILABLE_RECEIPTS {
@@ -2502,6 +2545,41 @@ fn exact_forecast_reference(receipt: &Receipt) -> Result<Value, WorkflowError> {
         "forecastToken": uuid_field(receipt.body.get("forecast").ok_or_else(WorkflowError::internal)?, "forecastToken")?,
         "requestSha256": receipt.body.get("requestSha256").ok_or_else(WorkflowError::internal)?}),
     )
+}
+
+/// Mirrors the shared transport envelope; the start binding still hashes all sent arguments.
+fn preparation_business_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
+    let mut business = arguments.clone();
+    business.remove("confirm");
+    business.remove("resultLimits");
+    business
+}
+
+fn validate_preparation_binding(
+    body: &Value,
+    expected: &Map<String, Value>,
+) -> Result<(), WorkflowError> {
+    if preparation_arguments(body)? != expected {
+        return Err(WorkflowError::internal());
+    }
+    Ok(())
+}
+
+fn preparation_arguments(body: &Value) -> Result<&Map<String, Value>, WorkflowError> {
+    let arguments = body
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(WorkflowError::internal)?;
+    let digest = hex_digest(Sha256::digest(
+        serde_json::to_vec(arguments).map_err(|_| WorkflowError::internal())?,
+    ));
+    if arguments.contains_key("confirm")
+        || arguments.contains_key("resultLimits")
+        || body.get("requestSha256").and_then(Value::as_str) != Some(digest.as_str())
+    {
+        return Err(WorkflowError::internal());
+    }
+    Ok(arguments)
 }
 
 fn checkpoint_body(operation: &str, body: Value) -> Result<Value, WorkflowError> {
@@ -2598,14 +2676,14 @@ fn publication_arguments(run: &WorkflowRun) -> Result<Value, WorkflowError> {
             Value::Null
         } else {
             work.receipt(Step::FinalPrepare)?
-                .body
+                .preparation()?
                 .get("sourceActionReference")
                 .cloned()
                 .unwrap_or(Value::Null)
         };
     let fundamental_share_sources = work
         .receipt(Step::FinalPrepare)?
-        .body
+        .preparation()?
         .get("fundamentalShareSources")
         .cloned()
         .ok_or_else(WorkflowError::internal)?;
@@ -2886,6 +2964,7 @@ async fn poll_job(
         });
     }
     let operation = match active.result_operation.as_str() {
+        PREPARATION_RESULT => PREPARATION_RESULT,
         "Analysis.GetPreparedDatasetJobResult" => "Analysis.GetPreparedDatasetJobResult",
         "Model.GetTrainingJobResult" => "Model.GetTrainingJobResult",
         "Model.GetForecastJobResult" => "Model.GetForecastJobResult",
@@ -2978,9 +3057,18 @@ async fn poll_job(
     {
         return Err(WorkflowError::internal());
     }
+    if operation == PREPARATION_RESULT {
+        validate_preparation_binding(
+            &body,
+            active
+                .preparation_arguments
+                .as_ref()
+                .ok_or_else(WorkflowError::internal)?,
+        )?;
+    }
     let body = checkpoint_body(operation, body)?;
     let bytes = serde_json::to_vec(&body).map_err(|_| WorkflowError::internal())?;
-    if bytes.len() > MAXIMUM_RECEIPT_BYTES {
+    if bytes.len() > maximum_receipt_bytes(operation) {
         return Err(WorkflowError::internal());
     }
     let receipt = Receipt {
@@ -3140,7 +3228,8 @@ async fn revalidate(
         .find(|(_, receipt)| {
             matches!(
                 receipt.operation.as_str(),
-                "Analysis.PrepareProbabilityEvent"
+                PREPARATION_RESULT
+                    | "Analysis.PrepareProbabilityEvent"
                     | "Analysis.GetPreparedDatasetJobResult"
                     | "Model.GetTrainingJobResult"
                     | "Model.GetForecastJobResult"
@@ -3151,6 +3240,7 @@ async fn revalidate(
         });
     if let Some((key, receipt)) = next {
         let operation = match receipt.operation.as_str() {
+            PREPARATION_RESULT => PREPARATION_RESULT,
             "Analysis.PrepareProbabilityEvent" => "Analysis.PrepareProbabilityEvent",
             "Analysis.GetPreparedDatasetJobResult" => "Analysis.GetPreparedDatasetJobResult",
             "Model.GetTrainingJobResult" => "Model.GetTrainingJobResult",
@@ -3377,6 +3467,73 @@ mod tests {
         }
     }
 
+    fn preparation_receipt(
+        run: &WorkflowRun,
+        preparation: Value,
+    ) -> Result<Receipt, WorkflowError> {
+        let (operation, arguments, mutation) = next_invocation(run)?;
+        assert_eq!(operation, "Market.PrepareInvestmentEvidence");
+        assert!(mutation);
+        assert_eq!(job_result_operation(operation), Some(PREPARATION_RESULT));
+        let original = preparation_business_arguments(&arguments);
+        let job =
+            json!({"jobId": Uuid::new_v4(), "generation": 1, "sequence": 3, "state": "completed"});
+        let reference = workflow_control::job_reference(&job)?;
+        let active = ActiveJob {
+            step: run
+                .driver
+                .as_ref()
+                .ok_or_else(WorkflowError::internal)?
+                .step,
+            result_operation: PREPARATION_RESULT.to_owned(),
+            reference: reference.clone(),
+            observed_sequence: 1,
+            result_arguments: job_arguments(&reference)?,
+            preparation_arguments: Some(original.clone()),
+        };
+        // Retained active-job serialization keeps the original request binding.
+        let active: ActiveJob = serde_json::from_value(
+            serde_json::to_value(active).map_err(|_| WorkflowError::internal())?,
+        )
+        .map_err(|_| WorkflowError::internal())?;
+        let body = json!({
+            "job": job,
+            "preparation": preparation,
+            "arguments": original,
+            "requestSha256": hex_digest(Sha256::digest(
+                serde_json::to_vec(&original).map_err(|_| WorkflowError::internal())?
+            )),
+        });
+        let expected = active
+            .preparation_arguments
+            .as_ref()
+            .ok_or_else(WorkflowError::internal)?;
+        validate_preparation_binding(&body, expected)?;
+        let mut changed = body.clone();
+        changed["arguments"]["findMember"] = json!({"member": "another-retained-member"});
+        changed["requestSha256"] = json!(hex_digest(Sha256::digest(
+            serde_json::to_vec(&changed["arguments"]).map_err(|_| WorkflowError::internal())?
+        )));
+        // A self-consistent digest does not authorize substituting the original Find member.
+        assert!(validate_preparation_binding(&changed, expected).is_err());
+        changed = body.clone();
+        changed["requestSha256"] = json!("0".repeat(64));
+        assert!(validate_preparation_binding(&changed, expected).is_err());
+        let retained = receipt(
+            PREPARATION_RESULT,
+            Value::Object(active.result_arguments),
+            body,
+        );
+        assert!(retained.valid());
+        let reopened: Receipt = serde_json::from_value(
+            serde_json::to_value(&retained).map_err(|_| WorkflowError::internal())?,
+        )
+        .map_err(|_| WorkflowError::internal())?;
+        assert_eq!(reopened, retained);
+        assert_eq!(reopened.preparation()?, &preparation);
+        Ok(retained)
+    }
+
     #[test]
     fn publication_action_references_follow_forecast_and_market_admission()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3448,20 +3605,16 @@ mod tests {
             receipt("AnalyticalProfile.Resolve", json!({}), profile.clone()),
             &now,
         )?;
-        apply_receipt(
-            &mut run,
-            receipt(
-                "Market.PrepareInvestmentEvidence",
-                json!({}),
-                json!({
-                    "status": "prepared", "instrumentId": instrument,
-                    "preparedAtUnixNanos": cutoff.to_string(),
-                    "financialConfigurationDigest": profile["configurationDigest"],
-                    "sourceActionReference": original
-                }),
-            ),
-            &now,
+        let prepared = preparation_receipt(
+            &run,
+            json!({
+                "status": "prepared", "instrumentId": instrument,
+                "preparedAtUnixNanos": cutoff.to_string(),
+                "financialConfigurationDigest": profile["configurationDigest"],
+                "sourceActionReference": original
+            }),
         )?;
+        apply_receipt(&mut run, prepared, &now)?;
         run.driver.as_mut().ok_or("missing driver")?.step = Step::PreparePriceForecast;
         let (operation, arguments, _) = next_invocation(&run)?;
         let absence = receipt(
@@ -3511,18 +3664,14 @@ mod tests {
             ),
         );
         work.step = Step::FinalPrepare;
-        apply_receipt(
-            &mut run,
-            receipt(
-                "Market.PrepareInvestmentEvidence",
-                json!({}),
-                json!({
-                    "instrumentId": instrument, "preparedAtUnixNanos": now,
-                    "sourceActionReference": current_actions, "fundamentalShareSources": null
-                }),
-            ),
-            &now,
+        let prepared = preparation_receipt(
+            &run,
+            json!({
+                "instrumentId": instrument, "preparedAtUnixNanos": now,
+                "sourceActionReference": current_actions, "fundamentalShareSources": null
+            }),
         )?;
+        apply_receipt(&mut run, prepared, &now)?;
         apply_receipt(
             &mut run,
             receipt(

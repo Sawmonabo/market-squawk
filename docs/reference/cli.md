@@ -9,7 +9,7 @@ typed operation registry rather than this operator-oriented command projection.
 | --- | --- |
 | Document type | Reference |
 | Status | Current implementation contract |
-| Last substantive review | 2026-10-02 |
+| Last substantive review | 2026-10-03 |
 | Authority | `apps/market-squawk/src/cli.rs` and `src/main.rs` |
 
 ## Invocation and global options
@@ -128,6 +128,16 @@ as Desktop and MCP:
 | `market history-preparation --history-token <token> --job-id <UUID> --generation <positive>` | Read the selected job's exact generation, progress, outcome and publication result. |
 | `market cancel-history-preparation --history-token <token> --job-id <UUID> --generation <positive> --expected-sequence <n> --confirm` | Cancel against the exact observed sequence; already committed evidence remains retained. |
 | `market reconcile-history-preparation --request-id <original> --arguments-sha256 <digest>` | Resolve an uncertain start using its original request identity and digest; does not start another job. |
+| `market prepare-investment-evidence <request> --confirm` | Start investment analysis preparation from the selected investment and resolved financial profile; returns an admitted job, not completed evidence. |
+| `market investment-evidence-preparation --selection-token <token> --job-id <UUID> --generation <positive>` | Read the exact preparation job and progress. |
+| `market investment-evidence-preparation-result --job-id <UUID> --generation <positive>` | Reopen completed preparation, its original arguments and digest without acquiring new data. |
+| `market cancel-investment-evidence-preparation --selection-token <token> --job-id <UUID> --generation <positive> --expected-sequence <n> --confirm` | Cancel the exact preparation generation; genuine intermediate publications remain retained. |
+| `market reconcile-investment-evidence-preparation --request-id <original> --arguments-sha256 <digest>` | Resolve the original submission after an uncertain acknowledgement without starting duplicate work. |
+
+Investment preparation runs independently of the short client request. Both initial analytical
+inputs and final current-market preparation use the same job lifecycle. A completed result preserves
+its original cutoff and evidence; it does not establish current execution eligibility. After service
+restart, completed results reopen exactly and unfinished work is reported as interrupted.
 
 History preparation uses the returned `historyToken`, not the investment's `selectionToken`.
 `lookback-days` requests 30–3650 calendar days ending at admission; the result reports actual

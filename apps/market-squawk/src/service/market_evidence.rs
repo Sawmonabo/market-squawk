@@ -1,7 +1,9 @@
 //! Shared selected market evidence over the existing identity, policy and durable data owners.
 
+mod job;
 mod preparation;
-pub(super) use preparation::InstalledInvestmentSourcePreparation;
+pub(super) use job::InvestmentEvidenceJobRunner;
+use preparation::InstalledInvestmentSourcePreparation;
 use preparation::{SourcePreparationStep, clock, reference_digest};
 
 use std::sync::Arc;
@@ -30,6 +32,9 @@ use crate::application::{
 };
 
 pub(super) const PREPARE: &str = "Market.PrepareInvestmentEvidence";
+pub(super) const GET_PREPARATION: &str = "Market.GetInvestmentEvidencePreparation";
+pub(super) const CANCEL_PREPARATION: &str = "Market.CancelInvestmentEvidencePreparation";
+pub(super) const GET_PREPARATION_RESULT: &str = "Market.GetInvestmentEvidencePreparationResult";
 pub(super) const SELECT: &str = "Market.SelectInvestmentEvidence";
 pub(super) const READ: &str = "Market.ReadInvestmentEvidence";
 
@@ -43,7 +48,49 @@ pub(super) struct InstalledMarketEvidence {
     decisions: Arc<crate::application::decision::DecisionApplication>,
 }
 
+struct PreparationAdmission {
+    instrument_id: InstrumentId,
+    identity: Option<crate::application::InstrumentContextRead>,
+}
+
 impl InstalledMarketEvidence {
+    pub(super) fn from_product(
+        product: &crate::LocalProduct,
+    ) -> Result<Option<Arc<Self>>, ServiceError> {
+        let Some(identities) = product.instrument_context_read_capability() else {
+            return Ok(None);
+        };
+        let policy = market_squawk_decisions::RecommendationPolicy::v1()
+            .map_err(|_| ServiceError::Internal)?;
+        let maximum_mark_age_nanos = u64::try_from(policy.parameters().market_max_age_nanos)
+            .map_err(|_| ServiceError::Internal)?;
+        let markets = MarketInvestmentReadCapability::try_new(
+            product.research(),
+            product.research().instrument_definitions(),
+            product.research().market_data_instruments(),
+            maximum_mark_age_nanos,
+        )?;
+        Ok(Some(Arc::new(Self::new(
+            MarketProductSelectionReadCapability::new(
+                product.research(),
+                product.research().market_data_instruments(),
+            ),
+            markets,
+            Arc::new(identities),
+            CompletedMarketSessionReadCapability::new(product.research(), product.market_runtime()),
+            InstalledInvestmentSourcePreparation::new(
+                product.research(),
+                product.research_ingest(),
+                product.provider_activation(),
+                product.macro_context_read_capability(),
+                product.source_action_preparation(),
+                product.market_runtime(),
+                product.options_context_read_capability(),
+            ),
+            product.decisions(),
+        ))))
+    }
+
     pub(super) const fn new(
         selections: MarketProductSelectionReadCapability,
         markets: MarketInvestmentReadCapability,
@@ -63,7 +110,7 @@ impl InstalledMarketEvidence {
     }
 
     pub(super) fn owns(operation: &str) -> bool {
-        matches!(operation, PREPARE | SELECT | READ)
+        matches!(operation, SELECT | READ)
     }
 
     pub(super) async fn call(
@@ -74,11 +121,6 @@ impl InstalledMarketEvidence {
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
         let arguments = serde_json::Value::Object(super::business_arguments(request.arguments()));
-        if request.name() == PREPARE {
-            let input =
-                serde_json::from_value(arguments).map_err(|_| ServiceError::InvalidRequest)?;
-            return self.prepare(input, context, models).await;
-        }
         let (input, selection) = match request.name() {
             SELECT => {
                 let input: SelectRequest =
@@ -258,9 +300,99 @@ impl InstalledMarketEvidence {
         result(content, context)
     }
 
-    /// Complete source acquisition precedes the analysis cutoff. Final market refresh requests
-    /// current-market preparation without reacquiring historical investment sources.
-    async fn prepare(
+    /// Admission and final validation read only local exact profile, selection and identity.
+    /// Provider acquisition remains exclusively in the independently owned job execution.
+    async fn admit_preparation(
+        &self,
+        input: &PrepareRequest,
+        context: &RequestContext,
+        models: Option<&ForecastPreparationCatalog>,
+    ) -> Result<PreparationAdmission, ServiceError> {
+        ensure_live(context)?;
+        context.origin().ok_or(ServiceError::Unauthorized)?;
+        revalidate(&input.financial_profile, models)?;
+        if (input.share_origin_unix_nanos.is_some()
+            || input.original_knowledge_at_unix_nanos.is_some())
+            && input.purpose != PreparationPurpose::CurrentMarket
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let at = clock()?;
+        for value in [
+            input.share_origin_unix_nanos.as_deref(),
+            input.original_knowledge_at_unix_nanos.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if parse_cutoff(value)? > at {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        let instrument = self
+            .selections
+            .resolve(
+                &input.selection_token,
+                at,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?;
+        if let Some(member) = &input.find_member {
+            if input.purpose != PreparationPurpose::InvestmentAnalysis {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let admitted = self.decisions.admit_find_member(
+                member,
+                &input.financial_profile,
+                &input.selection_token,
+                context,
+            )?;
+            let original = self
+                .selections
+                .resolve(
+                    &input.selection_token,
+                    admitted.source_cutoff(),
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?;
+            if original != instrument || admitted.instrument_id() != instrument {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        let identity = match self.identities.read(
+            InstrumentContextRequest::try_new(instrument, at, at).map_err(map_identity_error)?,
+            context.deadline(),
+            context.cancellation(),
+        ) {
+            Ok(value) if matches!(value.outcome(), InstrumentContextOutcome::Exact(_)) => {
+                Some(value)
+            }
+            Ok(_) | Err(InstrumentContextReadError::AuthorityUnavailable) => None,
+            Err(error) => return Err(map_identity_error(error)),
+        };
+        // Missing identity and unsupported investments retain the pipeline's typed unavailable
+        // response, including its source-assessed Find-member outcome.
+        ensure_live(context)?;
+        Ok(PreparationAdmission {
+            instrument_id: instrument,
+            identity,
+        })
+    }
+
+    /// Complete source acquisition precedes the analysis cutoff. Keep the acquisition state
+    /// behind the existing boxed boundary when invoked from the installed job runner.
+    fn prepare<'a>(
+        &'a self,
+        input: PrepareRequest,
+        context: &'a RequestContext,
+        models: Option<&'a ForecastPreparationCatalog>,
+    ) -> BoxFuture<'a, Result<TypedToolResult, ServiceError>> {
+        Box::pin(self.prepare_impl(input, context, models))
+    }
+
+    async fn prepare_impl(
         &self,
         input: PrepareRequest,
         context: &RequestContext,
@@ -793,7 +925,7 @@ enum Selection {
     Reference(MarketInvestmentReadReference),
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InvestmentIdentity {
     instrument_id: InstrumentId,

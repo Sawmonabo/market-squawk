@@ -51,18 +51,21 @@ const CLI_HARD_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
 enum PreparationKind {
     History,
     Financials,
+    InvestmentEvidence,
 }
 impl PreparationKind {
     const fn operation(self) -> &'static str {
         match self {
             Self::History => "Market.StartHistoryPreparation",
             Self::Financials => "Research.StartInvestmentFinancialPreparation",
+            Self::InvestmentEvidence => "Market.PrepareInvestmentEvidence",
         }
     }
     const fn reconcile_command(self) -> &'static str {
         match self {
             Self::History => "reconcile-history-preparation",
             Self::Financials => "reconcile-financial-preparation",
+            Self::InvestmentEvidence => "reconcile-investment-evidence-preparation",
         }
     }
 }
@@ -588,11 +591,77 @@ async fn market(
             require_installed(authority, "Market.PrepareInvestmentEvidence")?;
             let mut arguments = read_json_object(&request)?;
             arguments.insert("confirm".to_owned(), Value::Bool(true));
+            arguments
+                .entry("resultLimits".to_owned())
+                .or_insert_with(|| {
+                    json!({
+                        "maximumItems": CLI_DEFAULT_MAXIMUM_ITEMS,
+                        "maximumBytes": CLI_DEFAULT_MAXIMUM_BYTES,
+                    })
+                });
+            start_preparation(
+                authority,
+                PreparationKind::InvestmentEvidence,
+                Value::Object(arguments),
+            )
+            .await
+        }
+        MarketCommand::InvestmentEvidencePreparation {
+            selection_token,
+            job_id,
+            generation,
+        } => {
+            require_installed(authority, "Market.GetInvestmentEvidencePreparation")?;
             invoke_without_result_limits(
                 authority,
-                "Market.PrepareInvestmentEvidence",
-                Value::Object(arguments),
-                "current-session evidence preparation completed",
+                "Market.GetInvestmentEvidencePreparation",
+                json!({"selectionToken": selection_token, "jobId": job_id, "generation": generation}),
+                "investment evidence preparation read",
+            )
+            .await
+        }
+        MarketCommand::InvestmentEvidencePreparationResult { job_id, generation } => {
+            require_installed(authority, "Market.GetInvestmentEvidencePreparationResult")?;
+            invoke_without_result_limits(
+                authority,
+                "Market.GetInvestmentEvidencePreparationResult",
+                json!({"jobId": job_id, "generation": generation}),
+                "saved investment evidence preparation read",
+            )
+            .await
+        }
+        MarketCommand::CancelInvestmentEvidencePreparation {
+            selection_token,
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            require_installed(authority, "Market.CancelInvestmentEvidencePreparation")?;
+            invoke_without_result_limits(
+                authority,
+                "Market.CancelInvestmentEvidencePreparation",
+                json!({
+                    "selectionToken": selection_token,
+                    "jobId": job_id,
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "confirm": true,
+                }),
+                "investment evidence preparation cancellation requested",
+            )
+            .await
+        }
+        MarketCommand::ReconcileInvestmentEvidencePreparation {
+            request_id,
+            arguments_sha256,
+        } => {
+            reconcile_preparation(
+                authority,
+                PreparationKind::InvestmentEvidence,
+                &request_id,
+                &arguments_sha256,
             )
             .await
         }
@@ -862,8 +931,8 @@ async fn start_preparation(
             operation: kind.operation(),
         });
     };
-    // Match InstalledJobOperations::begin_start: hash every admitted argument, including
-    // confirmation. This operation has no resultLimits, so no transport adds that field.
+    // Match InstalledJobOperations::begin_start: hash the complete arguments sent unchanged
+    // by invoke_operation, including confirmation and any fields from the request file.
     let encoded = serde_json::to_vec(&arguments).map_err(|_| CliProductError::RequestShape)?;
     let arguments_sha256 = hex(&Sha256::digest(encoded));
     let request_id = format!("cli-preparation-{}", uuid::Uuid::new_v4().simple());
