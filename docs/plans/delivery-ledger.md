@@ -1,42 +1,74 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-02
+## Current execution — 2026-10-03
 
-Latest pushed code: `3d078ba5` (automatic missing-company financial preparation),
-`ff81f644` (original option metadata knowledge clock), `ffb6faf5` (account recovery deadline
-ownership), following `e49cf71a` and `daa47b49`. One primary worktree; no new branch/worktree.
+Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
+Calendar correction pushed as `dec65cdd`, following `3d078ba5` financial autoload and `262a0274`
+saved-analysis research. Origin has those three intended branches plus active, unmerged Dependabot
+PR55. No branch or worktree was created; recovery refs and unique work are preserved.
 
-**Verified:** compact watchlist and all nine saved histories reopened in the prior matched native
-run; QQQ30-day selection automatically completed20bars. Financial autoload TypeScript and the
-existing exact lookup/financial/history journey PASS1/1. Native AAPL opening actually started a
-financial preparation job without a Load action; it subsequently failed SEC XBRL acquisition.
-A successful start is not populated financial information.
+**This checkpoint:** SEC standard LinkbaseRef roles corrected in place. The extended existing
+mixed-source graph/publication/restart check exposed SQL incorrectly discarding distinct logical
+documents with identical content-addressed bytes. The canonical V1 table now permits those
+occurrences while preserving ordinal uniqueness, sealed-object foreign keys, hashes and counts.
+Object-insert idempotency applies only to the ordinal primary key. The existing schema identity
+is synchronized; no migration version or compatibility path was added.
 
-**Calendar checkpoint:** existing accumulated-calendar regression PASS1/1 (19.22s):8,130
-inherited rows, only2,709 selected-original rows decoded through the existing bounded cursor.
-Matched Desktop/service build PASS (5m17s); service2667/Desktop2701 are running. The original
-MSFT workflow advanced from9 to10 completed preparation steps and now stops at exact option
-identity admission, with no calendar budget failure in this attempt. It still has zero saved results.
-Native evidence: `.agents/tmp/v1-first-stock/calendar-object-status.json`; log lines254932–254976
-in `prepared-financial-dev-after-restart.log`. This is partial workflow verification, not completion.
+**Critical evidence:** `captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation`
+PASS1/1,2.29s (compile1m01s), including all five standard roles, malformed role rejection,
+normalized publication and physical restart. Log: `.agents/tmp/v1-first-stock/sec-standard-linkbase-critical-verified.log`.
+Earlier failures are retained: generic publication rejection, duplicate physical-claim diagnosis,
+and an intermediate schema-registry mismatch corrected by updating its digest. Existing authorities
+were not weakened. Standard roles follow [XBRL2.1 §4.3.4 Table2](https://www.xbrl.org/Specification/XBRL-2.1/REC-2003-12-31/XBRL-2.1-REC-2003-12-31%2Bcorrected-errata-2013-02-20.html).
 
-**Current integration:** Astra `options_original_recovery` corrects standard SEC linkbase roles
-in the single assigned parser/test file; lead owns critical checks, runtime and Git. The watcher
-is temporarily stopped to serialize edits and verification; the current app remains available.
+**Live evidence:** calendar regression PASS1/1,19.22s (8,130 inherited rows; all2,709 selected
+original rows); matched calendar app build PASS5m17s. Running service2667/Desktop2701 retain
+that calendar build. Original MSFT workflow advanced9→10 preparation steps, then failed exact
+canonical option identity admission; zero saved results. Native AAPL previously autostarted
+financial preparation but failed taxonomy parsing. The new SEC/schema checkpoint is not live verified.
 
-**Concrete blockers:** original MSFT analysis now fails exact canonical option identity admission.
-AAPL financial acquisition rejects standard XBRL linkbase role names because the parser/fixture
-omit the `Ref` suffix. Workspace construction still takes about28seconds; full screen/data/loading
-completion remains open.
+**Deployment boundary:** current owner-test catalog pins the prior schema21 digest and retains
+41 logical object occurrences. Do not restart the current workspace with the changed schema until
+the owner chooses a fresh V1 workspace (preserving the entire old workspace) or explicitly permits
+a one-time backed-up development-database update. The question is pending because no-migrations
+and evidence-preservation instructions both apply. No existing data or schema was changed.
+Watcher99703 is temporarily stopped; current Desktop/service remain running. No second launcher.
 
-**Owner-requested architecture research:** [saved-analysis storage recommendation](../research/2026-10-02-saved-analysis-storage.md)
-compares current journal/replay with direct SQLite result reads, existing analytical artifacts,
-short transactions, indexed pagination and demand-loaded charts. Recommendation only; no saved-analysis
-storage implementation changed. Current journal lifetime ceilings and startup reconstruction are
-recorded gaps. Research is independently reviewable and does not imply final performance acceptance.
+**Active owner:** Astra `options_original_recovery` finishes read-only diagnosis of the next option
+identity barrier; lead owns integration/build/Git and runtime. SEC implementation/debugging ownership
+is released. Next: deployment choice, matched build and native AAPL retry; then original option
+recovery and the first complete saved analysis. Startup still about28seconds; remaining screens,
+providers, analytical workflows, installed lifecycle and full V1 acceptance remain incomplete.
 
-Full V1, installed lifecycle, remaining provider/analytical workflows and final resource acceptance
-remain incomplete. No full CI or RAM gate. Preserve the existing active unmerged DependabotPR55 branch.
+[Saved-analysis storage research](../research/2026-10-02-saved-analysis-storage.md) is a proposal;
+no direct-result storage replacement is implemented. No full CI or whole-app RAM gate was run.
+
+### Shared integration — identical captured document occurrences
+
+The SEC fixture exposed a real shared-catalog mismatch: ordered logical occurrences may share
+identical content-addressed bytes, but SQL uniqueness silently discarded duplicates during
+`INSERT OR IGNORE`. Lead owns the existing canonical SQL table definition and
+`catalog/provider_logical.rs`; remove physical-claim uniqueness while retaining ordinal PK and
+sealed-object foreign keys, and restrict idempotent conflict handling to that ordinal PK. Existing
+SEC publication/restart fixture supplies the critical regression. No new migration, compatibility
+path or mutation/deletion of existing owner evidence. Existing development catalogs retain their
+old schema; fresh-catalog verification is distinct from live deployment evidence.
+
+### SEC critical-check remediation
+
+The extended existing SEC check passed taxonomy closure but failed later normalized publication
+with `analytical catalog authority rejected the operation` (log `sec-standard-linkbase-critical.log`).
+Astra `sec_role_check` owns only `adapters/market-squawk-adapter-sec/src/xbrl/model.rs` to diagnose
+and correct an affected fixture, if demonstrated; shared catalog code remains lead-owned. No
+builds/tests/runtime/Git by the agent. Lead schedules the rerun after handoff. No acceptance claim.
+
+### Next verified dependency — retained option identity
+
+Calendar checkpoint is pushed as `dec65cdd`. SEC parser patch is frozen; lead runs its existing
+critical check. Astra `options_original_recovery` now owns read-only diagnosis of the live MSFT
+option-identity failure and `.agents/tmp/v1-first-stock/options-identity-after-calendar.md` only.
+Trace the exact rejection from current source and bounded read-only retained evidence; do not
+change source, data, runtime, tests or Git. Lead retains integration and all build ownership.
 
 ### Active wave — calendar integration and standard filing roles
 

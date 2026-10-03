@@ -1715,19 +1715,19 @@ fn resolve_taxonomy_reference(
 
 fn linkbase_reference_role(value: &str) -> Result<SecXbrlTaxonomyReferenceRole, SecXbrlError> {
     match value {
-        "http://www.xbrl.org/2003/role/calculationLinkbase" => {
+        "http://www.xbrl.org/2003/role/calculationLinkbaseRef" => {
             Ok(SecXbrlTaxonomyReferenceRole::CalculationLinkbase)
         }
-        "http://www.xbrl.org/2003/role/definitionLinkbase" => {
+        "http://www.xbrl.org/2003/role/definitionLinkbaseRef" => {
             Ok(SecXbrlTaxonomyReferenceRole::DefinitionLinkbase)
         }
-        "http://www.xbrl.org/2003/role/labelLinkbase" => {
+        "http://www.xbrl.org/2003/role/labelLinkbaseRef" => {
             Ok(SecXbrlTaxonomyReferenceRole::LabelLinkbase)
         }
-        "http://www.xbrl.org/2003/role/presentationLinkbase" => {
+        "http://www.xbrl.org/2003/role/presentationLinkbaseRef" => {
             Ok(SecXbrlTaxonomyReferenceRole::PresentationLinkbase)
         }
-        "http://www.xbrl.org/2003/role/referenceLinkbase" => {
+        "http://www.xbrl.org/2003/role/referenceLinkbaseRef" => {
             Ok(SecXbrlTaxonomyReferenceRole::ReferenceLinkbase)
         }
         _ => Err(SecXbrlError::InvalidTaxonomySet),
@@ -3082,7 +3082,7 @@ mod tests {
             )
             .await
             .map_err(|error| {
-                std::io::Error::other(format!("normalized SEC filing publication: {error}"))
+                std::io::Error::other(format!("normalized SEC filing publication: {error:?}"))
             })?;
         assert_eq!(binding_digest, payload_digest);
         drop(stream);
@@ -3664,8 +3664,25 @@ mod tests {
                     <xs:import namespace="http://xbrl.sec.gov/ecd-sub/2025"
                       schemaLocation="https://xbrl.sec.gov/ecd/2025/ecd-sub-2025.xsd"/>
                     <link:linkbaseRef xlink:type="simple"
-                      xlink:role="http://www.xbrl.org/2003/role/presentationLinkbase"
+                      xlink:role="http://www.xbrl.org/2003/role/presentationLinkbaseRef"
+                      xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase"
                       xlink:href="company-20251231_pre.xml"/>
+                    <link:linkbaseRef xlink:type="simple"
+                      xlink:role="http://www.xbrl.org/2003/role/definitionLinkbaseRef"
+                      xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase"
+                      xlink:href="company-20251231_def.xml"/>
+                    <link:linkbaseRef xlink:type="simple"
+                      xlink:role="http://www.xbrl.org/2003/role/labelLinkbaseRef"
+                      xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase"
+                      xlink:href="company-20251231_lab.xml"/>
+                    <link:linkbaseRef xlink:type="simple"
+                      xlink:role="http://www.xbrl.org/2003/role/calculationLinkbaseRef"
+                      xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase"
+                      xlink:href="company-20251231_cal.xml"/>
+                    <link:linkbaseRef xlink:type="simple"
+                      xlink:role="http://www.xbrl.org/2003/role/referenceLinkbaseRef"
+                      xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase"
+                      xlink:href="company-20251231_ref.xml"/>
                     <link:roleRef xlink:type="simple" roleURI="http://www.xbrl.org/2003/role/custom"
                       xlink:href="http://www.xbrl.org/2003/role/role-2003-12-31.xsd#custom"/>
                     <xs:annotation><xs:appinfo><link:linkbase>
@@ -3737,6 +3754,18 @@ mod tests {
                 observed_at,
             )?,
         ];
+        // The retained AAPL extension uses the standard presentation, definition, label and
+        // calculation LinkbaseRef roles. Keep all five standard roles in the captured graph.
+        for suffix in ["def", "lab", "cal", "ref"] {
+            artifacts.push(captured_artifact(
+                &store,
+                &format!("https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/company-20251231_{suffix}.xml"),
+                br#"<link:linkbase xmlns:link="http://www.xbrl.org/2003/linkbase"/>"#,
+                sec_source.clone(),
+                sec_revision.clone(),
+                observed_at,
+            )?);
+        }
         // Exact declarations reduced from retained MSFT 0001193125-26-323660. These
         // official components add graph evidence without adding financial facts or meanings.
         for (locator, namespace, publisher) in [
@@ -3886,6 +3915,17 @@ mod tests {
                 Ok(())
             };
         let extension = "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/company-20251231.xsd";
+        // The former no-Ref spelling and a misspelled standard role must not gain aliases.
+        for malformed in [
+            "http://www.xbrl.org/2003/role/presentationLinkbase",
+            "http://www.xbrl.org/2003/role/presentationLinkbaseREF",
+        ] {
+            reject_changed(
+                extension,
+                "http://www.xbrl.org/2003/role/presentationLinkbaseRef",
+                malformed,
+            )?;
+        }
         // Mismatched import, absent import namespace, include and redefine namespace mismatch.
         reject_changed(
             "https://www.xbrl.org/2003/xlink-2003-12-31.xsd",
@@ -3987,7 +4027,7 @@ mod tests {
             SecParserLimits::production_defaults(),
             &CancellationToken::new(),
         )?;
-        assert_eq!(admitted.validated().artifacts().len(), 13);
+        assert_eq!(admitted.validated().artifacts().len(), 17);
         let parser_context = || {
             XbrlDocumentContext::new(
                 SourceIdentifier::try_from("0001").expect("static accession"),
@@ -4042,6 +4082,10 @@ mod tests {
                 "schema_include",
                 "schema_redefine",
                 "presentation_linkbase",
+                "definition_linkbase",
+                "label_linkbase",
+                "calculation_linkbase",
+                "reference_linkbase",
                 "role_definition",
                 "arcrole_definition",
             ]

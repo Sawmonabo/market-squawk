@@ -527,10 +527,11 @@ fn insert_logical_binding(
             recorded_at,
         )?;
         connection.execute(
-            "INSERT OR IGNORE INTO provider_logical_publication_objects
+            "INSERT INTO provider_logical_publication_objects
              (binding_digest, object_ordinal, object_role, semantic_identity,
               raw_claim_digest, physical_receipt_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (binding_digest, object_ordinal) DO NOTHING",
             params![
                 digest_bytes(evidence.binding_digest),
                 i64::from(object.ordinal),

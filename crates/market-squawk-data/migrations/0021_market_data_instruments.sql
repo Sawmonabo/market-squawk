@@ -1435,8 +1435,8 @@ CREATE TABLE provider_logical_publication_objects (
         length(physical_receipt_digest) = 32
         AND physical_receipt_digest <> zeroblob(32)
     ),
+    -- Distinct captured occurrences may share content-addressed physical bytes.
     PRIMARY KEY (binding_digest, object_ordinal),
-    UNIQUE (binding_digest, raw_claim_digest, physical_receipt_digest),
     FOREIGN KEY (raw_claim_digest, physical_receipt_digest)
         REFERENCES sealed_raw_objects(raw_claim_digest, physical_receipt_digest)
 ) STRICT, WITHOUT ROWID;
