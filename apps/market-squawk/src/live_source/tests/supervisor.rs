@@ -30,14 +30,17 @@ use tokio_util::sync::CancellationToken;
 use super::super::{
     composition::{ProductionCoinbaseProfile, SupervisorDropCancellation, system_timestamp},
     provider::ProductionSourceProfile,
-    supervisor::{ProductionSupervisorError, activate_owned_capture, retry_catalog_selection},
+    supervisor::{
+        ProductionSupervisorError, activate_owned_capture, retry_catalog_selection,
+        select_catalog_routes,
+    },
 };
 use super::budget_free_metadata;
 use super::sink::app_config;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dropping_runtime_owner_cancels_and_reaps_a_blocked_provider_task() -> TestResult {
     let cancellation = CancellationToken::new();
     let provider_cancellation = cancellation.clone();
@@ -142,6 +145,70 @@ async fn dropping_runtime_owner_cancels_and_reaps_a_blocked_provider_task() -> T
             matches!(failure, Err(ProductionSupervisorError::Registry(error)) if error == terminal)
         );
     }
+
+    // Exercise the production blocking boundary on the sole async worker. The real catalog
+    // writer releases only after a peer task runs; an inline selector would consume its deadline.
+    let config = app_config()?;
+    let source = config
+        .coinbase()
+        .ok_or("Coinbase production configuration missing")?;
+    let profile = ProductionCoinbaseProfile::try_from(source)?;
+    let profile = ProductionSourceProfile::coinbase(profile, source, 64, 32 * 1024 * 1024)?;
+    let root = TempDir::new()?;
+    let (reader, request, authority) = identity_catalog(root.path(), source)?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
+        .with_provider_identity_authority(Arc::new(reader))?;
+    let registered = registry.register(
+        budget_free_metadata(profile.metadata())?,
+        system_timestamp()?,
+    )?;
+    let (held, writer_held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || -> Result<(), &'static str> {
+        let _guard = authority.lock().map_err(|_| "catalog lock poisoned")?;
+        held.send(())
+            .map_err(|_| "writer admission receiver closed")?;
+        released
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| "peer did not release catalog writer")?;
+        Ok(())
+    });
+    writer_held.await?;
+    let (entered, selection_entered) = tokio::sync::oneshot::channel();
+    let selection = tokio::spawn(async move {
+        let _sent = entered.send(());
+        let result = select_catalog_routes(
+            &mut registry,
+            &registered,
+            &mut [request],
+            Instant::now() + Duration::from_secs(2),
+            &CancellationToken::new(),
+        );
+        (registry, registered, result)
+    });
+    let peer = tokio::spawn(async move {
+        selection_entered
+            .await
+            .map_err(|_| "selector did not enter")?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.send(()).map_err(|_| "catalog writer exited")
+    });
+    let selected = selection.await;
+    let peer_result = peer.await;
+    let writer_result = writer.join();
+    peer_result??;
+    writer_result.map_err(|_| "catalog writer panicked")??;
+    let (mut registry, registered, selected) = selected?;
+    selected?;
+    let session = registry.begin_next_session(
+        &registered,
+        SessionId::new(SourceIdentifier::try_from("selection-after-peer-release")?),
+        system_timestamp()?,
+    )?;
+    registry.end_session(&session, system_timestamp()?)?;
+    drop(session);
+    drop(registered);
+    registry.shutdown()?;
     Ok(())
 }
 
@@ -166,7 +233,7 @@ async fn activation_failure_keeps_capture_control_and_writer_under_cleanup_owner
     let profile = ProductionCoinbaseProfile::try_from(source)?;
     let profile = ProductionSourceProfile::coinbase(profile, source, 64, 32 * 1024 * 1024)?;
     let root = TempDir::new()?;
-    let (reader, request) = identity_catalog(root.path(), source)?;
+    let (reader, request, _) = identity_catalog(root.path(), source)?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
         .with_provider_identity_authority(Arc::new(reader))?;
     let registered = registry.register(
@@ -237,7 +304,7 @@ fn run_registry_generation(root: &std::path::Path) -> TestResult<ConnectionGener
         .ok_or("Coinbase production configuration missing")?;
     let profile = ProductionCoinbaseProfile::try_from(source)?;
     let profile = ProductionSourceProfile::coinbase(profile, source, 64, 32 * 1024 * 1024)?;
-    let (reader, request) = identity_catalog(root, source)?;
+    let (reader, request, _) = identity_catalog(root, source)?;
     let paths = LocalPaths::prepare(root)?;
     let provider_rate =
         crate::provider_rate::open_provider_rate_authority(paths.control_root()?.root())?;
@@ -277,6 +344,7 @@ fn identity_catalog(
 ) -> TestResult<(
     MarketDataInstrumentReadCapability,
     ProviderNativeIdentityRequest,
+    Arc<Mutex<CatalogAuthority>>,
 )> {
     let [mapping] = source.instruments() else {
         return Err("fixture requires one Coinbase instrument".into());
@@ -332,7 +400,7 @@ fn identity_catalog(
     let at = system_timestamp()?;
     Ok((
         MarketDataInstrumentReadCapability::new(
-            authority,
+            Arc::clone(&authority),
             Instant::now() + Duration::from_secs(5),
             &CancellationToken::new(),
         )?,
@@ -345,5 +413,6 @@ fn identity_catalog(
             knowledge_at: at,
             effective_at: at,
         },
+        authority,
     ))
 }

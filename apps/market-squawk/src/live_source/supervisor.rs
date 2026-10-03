@@ -21,8 +21,8 @@ use market_squawk_platform::{
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, BudgetUnavailableReason,
     CaptureGenerationCapabilities, ProviderBackoffAuthority, ProviderBackoffDecision,
-    ProviderBackoffError, ProviderRateAuthority, RegisteredSource, RegistryError, SessionId,
-    SourceError,
+    ProviderBackoffError, ProviderNativeIdentityRequest, ProviderRateAuthority, RegisteredSource,
+    RegistryError, SessionId, SourceError,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -391,27 +391,35 @@ impl ProductionSourceSupervisor {
                 .as_ref()
                 .map(|(_, cancellation)| cancellation);
             let mut requests = selection.requests().to_vec();
-            retry_catalog_selection(
+            let selection_started = Instant::now();
+            let mut attempts = 0_usize;
+            let result = retry_catalog_selection(
                 selection_deadline,
                 &cancellation,
                 startup_cancellation,
                 || {
-                    let at = system_timestamp()?;
-                    for request in &mut requests {
-                        request.knowledge_at = at;
-                        request.effective_at = at;
-                    }
-                    registry
-                        .record_provider_identities(
-                            &self.registered,
-                            &requests,
-                            selection_deadline,
-                            &cancellation,
-                        )
-                        .map_err(ProductionSupervisorError::from_registry_selection)
+                    attempts += 1;
+                    select_catalog_routes(
+                        registry,
+                        &self.registered,
+                        &mut requests,
+                        selection_deadline,
+                        &cancellation,
+                    )
                 },
             )
-            .await?;
+            .await;
+            tracing::info!(
+                source = self.profile.source_key(),
+                routes = requests.len(),
+                startup = startup_admission.is_some(),
+                budget_ms = selection_deadline.saturating_duration_since(selection_started).as_millis(),
+                elapsed_ms = selection_started.elapsed().as_millis(),
+                attempts,
+                error = ?result.as_ref().err(),
+                "production catalog route selection completed"
+            );
+            result?;
         }
         let at = system_timestamp()?;
         let session = registry.begin_next_session(&self.registered, session_id, at)?;
@@ -875,6 +883,27 @@ impl ProductionSourceSupervisor {
         registry.shutdown()?;
         Ok(())
     }
+}
+
+/// The installed source supervisors run on Tokio's multi-thread runtime. Keep their non-cloneable
+/// registry custody borrowed in place while bounded catalog I/O yields the worker to peer tasks.
+pub(super) fn select_catalog_routes(
+    registry: &mut AuthoritativeSourceRegistry,
+    registered: &RegisteredSource,
+    requests: &mut [ProviderNativeIdentityRequest],
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), ProductionSupervisorError> {
+    tokio::task::block_in_place(|| {
+        let at = system_timestamp()?;
+        for request in requests.iter_mut() {
+            request.knowledge_at = at;
+            request.effective_at = at;
+        }
+        registry
+            .record_provider_identities(registered, requests, deadline, cancellation)
+            .map_err(ProductionSupervisorError::from_registry_selection)
+    })
 }
 
 /// Waits only for transient catalog contention; each attempt installs one complete route set.
