@@ -1,5 +1,6 @@
 import { QueryClientProvider } from "@tanstack/react-query"
 import * as React from "react"
+import { useLocation } from "react-router-dom"
 
 import { AppHeader } from "@/components/app-header"
 import { AppSidebar } from "@/components/app-sidebar"
@@ -16,6 +17,12 @@ import { AppRoutes } from "./routes"
 
 export function App({ transport }: { transport: DesktopTransport }) {
   const [queryClient] = React.useState(createProductQueryClient)
+  const { pathname } = useLocation()
+  const page = React.useRef<HTMLDivElement>(null)
+  React.useLayoutEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" })
+    page.current?.scrollTo({ top: 0, left: 0, behavior: "instant" })
+  }, [pathname])
   return (
     <QueryClientProvider client={queryClient}>
       <ProductProvider transport={transport}>
@@ -31,7 +38,7 @@ export function App({ transport }: { transport: DesktopTransport }) {
           <SidebarInset className="min-w-0">
             <AppHeader />
             <StatusRail />
-            <div className="min-h-0 flex-1 overflow-auto">
+            <div ref={page} className="min-h-0 flex-1 overflow-auto">
               <AppRoutes />
             </div>
           </SidebarInset>

@@ -2,6 +2,45 @@
 
 ## Current execution — 2026-10-02
 
+Continuation classification: prior turn made verified progress (history/UI code and evidence pushed
+through `d2ef1654`). Current branch clean at refresh; service 27815/Desktop 27852/watcher 99703 live.
+
+Current dependency wave (Quarter 4, existing contract): lead resumes only saved MSFT workflow
+`workflow_96bca8b553dd5278afa3e9a2a4040af5` after the original-custody/history fixes, captures its
+first actual failure or saved brief, and owns all runtime/Git/build/shared integration. In parallel,
+Astra `stock_workflow_trace` owns fixed safe phase/elapsed diagnostics only in
+`application/paper/market.rs::load_retained_display_evidence` and
+`application/research/ingest/crypto_market.rs::select_current_batch` for the observed collection
+14.9s failure. No SQL optimization or authority changes until measurements establish the wait;
+no new harness/tests for logging. It must read full relevant functions/callees, preserve control
+flow and avoid payload/credential logs. These disjoint lanes converge at one matched build after
+the lead's workflow observation; watcher paused during edits, existing app/service retained.
+
+The two-function collection diagnostic patch is frozen pending lead inspection and one matched
+build. The saved MSFT workflow now pauses at options acquisition with `PendingOriginalDemand`,
+not the prior catalog-lock failure. Astra `stock_workflow_trace` now owns read-only diagnosis of
+`market_runtime/alpaca_option_chain.rs` and `research/ingest/provider_runtime.rs` plus directly
+called original-custody/current-authority code. Identify which retained context comparison fails,
+and propose the smallest safe same-account restart/renewal recovery with existing critical check.
+No edits, builds, runtime mutations or Git in this assignment. Lead owns integration and live state.
+
+Lead additionally owns `apps/market-squawk-desktop/src/app/app.tsx` for the observed ticker
+navigation defect: clicking QQQ from a scrolled Home retained document.scrollTop=753 and placed
+its loaded chart above the viewport. Reset the actual page scroller on pathname changes only;
+keep refreshes on the same page stationary. Native click/scroll observation and TypeScript are
+sufficient for this presentation change; no new test harness. Existing Rust diagnostic build is
+running alone; frontend edits use HMR.
+
+Native navigation correction verified: Home scrollY753 → actual QQQ link click → investment
+heading at scrollY0; same-route price refetch preserved scrollY400. TypeScript PASS; no new tests.
+QQQ history read succeeds with no alert and mounted chart/date inspection. Artifacts:
+`native-navigation-scroll-check.json`, `qqq-current-history-view.json`,
+`watchlist-current-compact.png` under `.agents/tmp/v1-first-stock/`.
+Options recovery diagnosis is complete in `options-renewal-recovery.md`: same credential/session
+and rights, changed doctor validity window. Recovery must preserve original evidence and validate
+current permission separately across reference admission and fresh-chain dependency reopen;
+no bypass or source change applied. Collection diagnostics are in the one running matched build.
+
 Current code checkpoint: `caa08000`, pushed on the existing feature branch. The single matched
 build passed in 5m18s; service 27815 and Desktop 27852 run generation `tU6dcK`. Watcher is running,
 with no compiler active at this checkpoint.
