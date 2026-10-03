@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_data::{
-    MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MarketDataInstrumentCatalogError,
-    MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+    MarketDataInstrumentCatalogError, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentRecord,
 };
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, Currency, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
@@ -219,11 +219,15 @@ impl MarketReferenceIdentityAuthority {
             .pop()
             .ok_or(MarketReferenceIdentityError::InvalidEvidence)?;
 
+        // An official listing supplies an exact symbol. Unrelated prefixed option symbols
+        // must not consume candidate capacity or make its canonical stock identity ambiguous.
+        let selection_at = system_timestamp()?;
         let search = self
             .catalog
-            .search(
+            .resolve_exact_as_of(
                 request.provider_instrument_id().as_str(),
-                MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS,
+                selection_at,
+                selection_at,
                 deadline,
                 cancellation,
             )

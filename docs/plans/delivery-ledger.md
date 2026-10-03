@@ -2,6 +2,30 @@
 
 ## Current execution — 2026-10-03
 
+### Active correction — exact stock identity survives option discovery
+
+Base `0816a979`, matching source `57ac6639`. Acceptance 1/2/7: startup renewed Alpaca's doctor,
+then repeatedly published asset references but could not restore its group. Sanitized read-only
+evidence rules out lost predecessor state and missing verification. MSFT has **2,753 fuzzy
+matches but one exact match** (`alpaca-restart-msft-identity-counts.json`). The shared stock identity
+resolver uses fuzzy search capped at 256 and treats its `has_more` as exact stock ambiguity.
+Option reference publication therefore makes a previously resolvable stock fail after restart.
+
+| Owner | Exact file ownership | Required evidence |
+| --- | --- | --- |
+| Astra High `stock_preparation_deadline` | `apps/market-squawk/src/provider_activation/reference_identity.rs`; existing exact-identity fixture in `crates/market-squawk-data/tests/catalog.rs` only if critical coverage needs extension | Reuse existing exact current lookup; retain official listing/venue/asset, actual ambiguity, latest definition and freshness checks; smallest relevant regression for prefix pollution |
+| Lead | Shared callers, ledger/Git/checks/runtime | Inspect Alpaca/Schwab consumers, one serialized critical check/build, same saved lifecycle and workflow recovery |
+
+DAG: confirmed lookup overflow → exact lookup → critical catalog/app verification → matching
+deployment → automatic continuation of the preserved pending transition → same analysis. No
+limit increase, fuzzy first-match fallback, lifecycle reset, new worktree or source authority bypass.
+The extended existing catalog fixture passes (1/1, 1.78s; single-job compile 46.68s), including
+prefix saturation and genuine ambiguity. Lead inspected the shared Alpaca/Schwab consumers and
+accepted the frozen two-file change; agent ownership is released. Application compilation and
+normal native recovery remain unproven. The watcher was paused for editing; Desktop subsequently
+exited normally, while the service and development supervisor remain running. Diagnostic report:
+`.agents/tmp/v1-first-stock/alpaca-restart-lifecycle.md`.
+
 ### Integrated correction — return committed option identities to their consumer
 
 Source `57ac6639` is pushed. Matching development build passed in 6m06s; service/Desktop

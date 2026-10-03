@@ -1372,6 +1372,53 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         unique_before_competitor.effective_at(),
         Some(Timestamp::from_unix_nanos(10))
     );
+    // Unrelated prefix matches can fill discovery without making an exact stock symbol
+    // ambiguous. This is the boundary exercised after a full option chain enters the catalog.
+    let prefix_count = market_squawk_data::MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS;
+    let mut prefixed = Vec::new();
+    for index in 0..prefix_count {
+        let id = InstrumentId::try_from(uuid::Uuid::from_u128(4096 + u128::try_from(index)?))?;
+        let symbol = format!("AAPL-PREFIX-{index}");
+        let mut definition = serde_json::to_value(market_data_definition(
+            id,
+            10,
+            None,
+            "Unrelated prefix fixture",
+            &symbol,
+            91,
+        )?)?;
+        definition["venue_mappings"][0]["venue_symbol"] = serde_json::json!(symbol);
+        definition["identifiers"] = serde_json::json!([]);
+        prefixed.push(serde_json::from_value(definition)?);
+    }
+    publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(prefixed, prefix_count)?,
+        deadline(),
+        &cancellation,
+    )?;
+    let prefix_knowledge_at = reader
+        .latest(
+            InstrumentId::try_from(uuid::Uuid::from_u128(4096))?,
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or(CatalogError::InvalidRecord)?
+        .published_at();
+    assert!(
+        reader
+            .search("AAPL", prefix_count, deadline(), &cancellation)?
+            .has_more()
+    );
+    let unique_with_prefixes = reader.resolve_exact_as_of(
+        "AAPL",
+        prefix_knowledge_at,
+        Timestamp::from_unix_nanos(10),
+        deadline(),
+        &cancellation,
+    )?;
+    assert!(!unique_with_prefixes.has_more());
+    assert_eq!(unique_with_prefixes.matches().len(), 1);
+    assert_eq!(unique_with_prefixes.matches()[0].record(), &retained);
     let provider_identity_query = MarketDataProviderIdentityQuery::try_new(
         SourceId::try_from("nasdaq-symbol-directory")?,
         ProviderInstrumentId::try_from("AAPL.US")?,
