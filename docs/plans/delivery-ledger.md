@@ -33,7 +33,26 @@ Log: `.agents/tmp/v1-first-stock/option-source-renewal-critical.log`. No new har
 schema migration or general authority relaxation. MSFT detail also reopened its daily change,
 history and financial facts without query errors (`daily-comparison-msft-detail.json`).
 
-### Active wave — session-correct daily changes and first complete stock analysis
+Source `6eec8142` is pushed; matching development build passed in 6m18s, service 34566/Desktop
+34610. The first same-workflow retry on the fresh service paused after the unchanged 15-second
+`Market.PrepareInvestmentEvidence` deadline; option demand was cancelled before publication.
+No option-reference audit committed and no renewed catalog revision appeared in that run, so
+successful live renewal is **not yet proved**. All three original rows, decoded times and
+original/capture/raw-claim digests remain identical. The failed retry creates no approval of the
+full investment workflow. Artifacts: `option-renewal-{before-catalog,after-catalog,workflow-before,
+native-resume,workflow-after}.json` under `.agents/tmp/v1-first-stock/`.
+
+Next barrier: implement the already diagnosed managed preparation job, updating canonical start,
+result/status/cancel/reconciliation and both controller preparation steps together. Reuse the
+existing pipeline and installed job authority; keep the original workflow/profile/originals.
+A useful composition boundary is the existing installed service bootstrap: construct the shared
+preparation capability before job registration, register its runner with the existing registry,
+and pass the same capability to tool services. Avoid a jobs-to-service module cycle or duplicate
+provider pipeline. Freeze this interface before any new runner/controller writer assignment.
+The current app remains visible, with one active development supervisor and watcher; no builds
+or agents remain active at this checkpoint. Full analysis remains incomplete.
+
+### Integrated wave — session-correct daily changes and first stock diagnosis
 
 Refresh base `1dbb5f54`, clean single feature worktree; source checkpoint `4f92916c` runs as
 service 76207 with Desktop 5863. Previous goal turn made progress: pushed filing/ratio fixes,
