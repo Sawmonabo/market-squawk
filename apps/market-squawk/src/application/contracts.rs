@@ -1083,6 +1083,7 @@ const PROBABILITY_DATASET_ARGUMENTS: &[ArgumentSpec] = &[
 const INVESTMENT_DATASET_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("instrumentId", ArgumentKind::Uuid),
     ArgumentSpec::required("sourceCutoffUnixNanos", ArgumentKind::UnixNanosText),
+    ArgumentSpec::required("sourceActionReference", ArgumentKind::SourceActionReference),
     ArgumentSpec::required(
         "financialProfile",
         ArgumentKind::AnalyticalProfileResolution,

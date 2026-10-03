@@ -451,7 +451,7 @@ impl DriverState {
             .ok_or_else(|| {
                 WorkflowError::new(
                     "analysis_source_actions_unavailable",
-                    "The original source-action evidence is unavailable. Start a fresh analysis.",
+                    "Price history is not ready for analysis. Resume after the connection is available.",
                 )
             })
     }
@@ -579,12 +579,21 @@ impl AnalyticalWorkflowController {
                     "This analysis can no longer resume. Start a new analysis.",
                 ));
             }
-            if run.last_error.as_deref() == Some("analysis_preparation_required") {
+            let refresh_initial = run.last_error.as_deref()
+                == Some("analysis_source_actions_unavailable")
+                && initial_preparation_can_refresh(run)?;
+            if run.last_error.as_deref() == Some("analysis_preparation_required") || refresh_initial
+            {
                 let driver = run.driver.as_ref().ok_or_else(WorkflowError::internal)?;
-                let receipt = driver.receipt(driver.step)?.clone();
+                let preparation_step = if refresh_initial {
+                    Step::PrepareSelection
+                } else {
+                    driver.step
+                };
+                let receipt = driver.receipt(preparation_step)?.clone();
                 if run.pending_invocation.is_some()
                     || driver.active_job.is_some()
-                    || !preparation_requires_retry(run, &receipt)?
+                    || (!refresh_initial && !preparation_requires_retry(run, &receipt)?)
                 {
                     return Err(WorkflowError::internal());
                 }
@@ -607,7 +616,12 @@ impl AnalyticalWorkflowController {
                 // A confirmed resume admits a new attempt; the immutable failed preparation and
                 // its terminal child remain evidence. Earlier analytical cutoffs never change.
                 driver.completed_unavailable_receipts.push(receipt);
-                driver.receipts.remove(&driver.key(driver.step));
+                driver.receipts.remove(&driver.key(preparation_step));
+                if refresh_initial {
+                    driver.receipts.remove(&driver.key(Step::SelectMarket));
+                    driver.source_cutoff = None;
+                    driver.step = Step::PrepareSelection;
+                }
             }
             let driver = run.driver.as_mut().ok_or_else(WorkflowError::internal)?;
             let refresh_current = matches!(driver.step, Step::FinalEvidence | Step::FinalPortfolio);
@@ -1299,6 +1313,7 @@ fn next_invocation(
         ),
         Step::PriceDataset | Step::PriceInputs => {
             let mut input = work.input(run)?;
+            input["sourceActionReference"] = work.initial_source_action_reference()?.clone();
             input["intendedUse"] = json!(if work.step == Step::PriceDataset {
                 "train"
             } else {
@@ -2657,6 +2672,51 @@ fn preparation_requires_retry(run: &WorkflowRun, receipt: &Receipt) -> Result<bo
     Ok(true)
 }
 
+/// A partial initial acquisition can be retried before any analytical result is admitted.
+/// Unknown job delivery is reconciled first; completed calculations never acquire a new cutoff.
+fn initial_preparation_can_refresh(run: &WorkflowRun) -> Result<bool, WorkflowError> {
+    let work = run.driver.as_ref().ok_or_else(WorkflowError::internal)?;
+    if work.find.is_some()
+        || !matches!(work.step, Step::PriceDataset | Step::PriceInputs)
+        || run.pending_invocation.is_some()
+        || work.active_job.is_some()
+        || work.receipts.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "ResolveProfile" | "PrepareSelection" | "SelectMarket"
+            )
+        })
+    {
+        return Ok(false);
+    }
+    let receipt = work.receipt(Step::PrepareSelection)?;
+    let preparation = receipt.preparation()?;
+    if preparation.get("sourceActionReference") != Some(&Value::Null) {
+        return Ok(false);
+    }
+    let mut initial = run.clone();
+    initial
+        .driver
+        .as_mut()
+        .ok_or_else(WorkflowError::internal)?
+        .step = Step::PrepareSelection;
+    let (_, arguments, _) = next_invocation(&initial)?;
+    if !receipt.valid()
+        || preparation_arguments(&receipt.body)? != &preparation_business_arguments(&arguments)
+        || preparation.get("financialConfigurationDigest")
+            != DriverState::profile(run)?.get("configurationDigest")
+        || uuid_field(preparation, "instrumentId")?
+            != work.instrument_id.ok_or_else(WorkflowError::internal)?
+        || preparation
+            .get("preparedAtUnixNanos")
+            .and_then(Value::as_str)
+            != work.source_cutoff.as_deref()
+    {
+        return Err(WorkflowError::internal());
+    }
+    Ok(true)
+}
+
 fn validate_preparation_binding(
     body: &Value,
     expected: &Map<String, Value>,
@@ -3852,6 +3912,88 @@ mod tests {
                 .as_deref(),
             Some(cutoff.to_string().as_str())
         );
+        // A real cutoff does not imply that annual history/action authority was acquired.
+        // The first dependent dataset pauses without admission, and explicit Resume refreshes
+        // only that initial prefix while preserving the completed partial preparation receipt.
+        let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
+        controller.mutate(|document, _| {
+            document.workflow_runs[0] = run.clone();
+            Ok(())
+        })?;
+        let (operation, arguments, _) = next_invocation(&run)?;
+        let pending = controller.retain_pending(&token, operation, arguments)?;
+        controller.retain_response(
+            &token,
+            &pending,
+            json!({
+                "jobId": Uuid::new_v4(), "generation": 1, "sequence": 1, "state": "queued"
+            }),
+        )?;
+        let waiting = controller
+            .next_run()?
+            .ok_or("missing partial preparation")?;
+        // Durable controller transitions use its real clock, not the reference fixtures' clock.
+        let mut partial = unavailable.clone();
+        partial["reason"] = json!("source_evidence_unavailable");
+        partial["preparedAtUnixNanos"] = json!(waiting.updated_at);
+        let partial_receipt = preparation_receipt(&waiting, partial)?;
+        let active = waiting
+            .driver
+            .as_ref()
+            .and_then(|driver| driver.active_job.as_ref())
+            .ok_or("missing partial job")?
+            .clone();
+        controller.mutate(|document, recorded_at| {
+            let retained = workflow_control::find_workflow_mut(document, &token)?;
+            retain_completed_job(retained, &active, partial_receipt.clone(), 3, &recorded_at)?;
+            apply_receipt(
+                retained,
+                receipt(
+                    "Market.SelectInvestmentEvidence",
+                    json!({}),
+                    json!({"instrumentId": instrument}),
+                ),
+                &recorded_at,
+            )
+        })?;
+        let incomplete = controller
+            .next_run()?
+            .ok_or("missing partial dataset boundary")?;
+        assert!(initial_preparation_can_refresh(&incomplete)?);
+        let missing = next_invocation(&incomplete)
+            .expect_err("missing source authority must not admit a dataset");
+        let mut uncertain = incomplete.clone();
+        uncertain.pending_invocation = Some(pending.clone());
+        assert!(!initial_preparation_can_refresh(&uncertain)?);
+        let mut calculated = incomplete.clone();
+        calculated
+            .driver
+            .as_mut()
+            .ok_or("missing calculated driver")?
+            .receipts
+            .insert("PriceDataset".into(), partial_receipt.clone());
+        assert!(!initial_preparation_can_refresh(&calculated)?);
+        controller.pause_workflow(&token, &missing)?;
+        drop(controller);
+        let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
+        assert!(controller.next_run()?.is_none());
+        controller.resume_workflow(&token)?;
+        let refreshed = controller
+            .next_run()?
+            .ok_or("missing fresh source attempt")?;
+        let driver = refreshed
+            .driver
+            .as_ref()
+            .ok_or("missing refreshed driver")?;
+        assert_eq!(refreshed.run_id, run.run_id);
+        assert_eq!(driver.step, Step::PrepareSelection);
+        assert_eq!(driver.instrument_id, Some(instrument));
+        assert!(driver.source_cutoff.is_none());
+        assert_eq!(driver.completed_unavailable_receipts, vec![partial_receipt]);
+        assert!(driver.receipt(Step::SelectMarket).is_err());
+        assert_eq!(next_invocation(&refreshed)?.1, pending.arguments);
+        drop(controller);
+
         let prepared = preparation_receipt(
             &run,
             json!({
@@ -3862,6 +4004,12 @@ mod tests {
             }),
         )?;
         apply_receipt(&mut run, prepared, &now)?;
+        for step in [Step::PriceDataset, Step::PriceInputs] {
+            run.driver.as_mut().ok_or("missing driver")?.step = step;
+            let (operation, arguments, _) = next_invocation(&run)?;
+            assert_eq!(operation, "Analysis.StartInvestmentDataset");
+            assert_eq!(arguments["sourceActionReference"], original);
+        }
         run.driver.as_mut().ok_or("missing driver")?.step = Step::PreparePriceForecast;
         let (operation, arguments, _) = next_invocation(&run)?;
         let absence = receipt(

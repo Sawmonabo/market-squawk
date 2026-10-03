@@ -1,5 +1,8 @@
 //! Source-coordinate recipes shared by the existing composition-owned feature publisher.
 
+mod stock;
+pub(super) use stock::prepare_investment_dataset;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -536,6 +539,7 @@ impl DatasetPreparationAuthority {
             &request,
             &sources,
             &support,
+            None,
             source_plan.as_ref(),
             deadline,
             &cancellation,
@@ -783,6 +787,19 @@ async fn select_nominal_series(
     {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
+    nominal_series_from_history(authority, history, instrument, snapshot, deadline, cancellation)
+        .await
+}
+
+async fn nominal_series_from_history(
+    authority: &DatasetPreparationAuthority,
+    history: CompleteMarketBarHistoryCursor,
+    instrument: InstrumentId,
+    snapshot: Timestamp,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<CohortSeries, DatasetPreparationError> {
+    let manifest = history.selection().pinned().manifest().clone();
     let (history, calendar) = authority
         .rejoin_nominal_history(history, deadline, cancellation)
         .await?;
@@ -827,7 +844,7 @@ async fn select_nominal_series(
         let session_evidence = evidence_digest(
             b"market-squawk/cohort-original-nominal-session/v1",
             &[
-                EvidencePart::Manifest(manifest),
+                EvidencePart::Manifest(&manifest),
                 EvidencePart::Sha256(history.read_receipt().result_digest()),
                 EvidencePart::Sha256(history.read_receipt().history_content_digest()),
                 EvidencePart::Sha256(history.selection().receipt().receipt_digest()),
@@ -993,11 +1010,16 @@ async fn select_coordinate_sources(
     Ok(result)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "historical and fixed population authority share the existing source recipe"
+)]
 async fn build_cohort(
     authority: &DatasetPreparationAuthority,
     request: &CohortPreparationRequest,
     sources: &[CohortSeries],
     support: &CanonicalSupport,
+    population: Option<&market_squawk_data::CurrentListedPopulationPartition>,
     source_plan: Option<&Arc<market_squawk_data::CorporateActionPlan>>,
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -1208,23 +1230,32 @@ async fn build_cohort(
         HistoricalStudyBasis::RetrospectiveFrozenSnapshot => request.study.snapshot_as_of(),
     };
     let mut memberships = Vec::new();
-    for instrument in instruments.iter().copied() {
-        let membership = membership_evidence(
-            &support.memberships,
-            instrument,
-            first_source,
-            last_source,
-            cancellation,
-        )?
-        .ok_or(DatasetPreparationError::InvalidEvidence)?;
-        push_parent(&mut all_parents, &membership.manifest)?;
-        memberships.push(membership);
-    }
-    if memberships
-        .iter()
-        .any(|membership| membership.universe_id != memberships[0].universe_id)
-    {
-        return Err(DatasetPreparationError::InvalidEvidence);
+    if let Some(population) = population {
+        if population.instrument_ids() != instruments
+            || population.population().membership_as_of() != request.study.snapshot_as_of()
+            || request.study.basis() != HistoricalStudyBasis::RetrospectiveFrozenSnapshot
+        {
+            return Err(DatasetPreparationError::InvalidEvidence);
+        }
+    } else {
+        for instrument in instruments.iter().copied() {
+            let membership = membership_evidence(
+                &support.memberships,
+                instrument,
+                first_source,
+                last_source,
+                cancellation,
+            )?
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+            push_parent(&mut all_parents, &membership.manifest)?;
+            memberships.push(membership);
+        }
+        if memberships
+            .iter()
+            .any(|membership| membership.universe_id != memberships[0].universe_id)
+        {
+            return Err(DatasetPreparationError::InvalidEvidence);
+        }
     }
     let mut macro_parents = Vec::new();
     let mut macros = BTreeMap::new();
@@ -1311,6 +1342,13 @@ async fn build_cohort(
     if let Some(event) = request.probability_subject {
         identity.update(b"probability-subject/v1");
         identity.update(event.digest().bytes());
+    }
+    if let Some(partition) = population {
+        let population = partition.population();
+        identity.update(b"present-day-fixed-cohort/v1");
+        identity.update(population.content_digest().bytes());
+        identity.update(population.audit_digest().bytes());
+        identity.update(population.financial_profile_digest().bytes());
     }
     identity.update(request.population_starts_at.unix_nanos().to_be_bytes());
     identity.update(request.population_ends_at.unix_nanos().to_be_bytes());
@@ -1814,16 +1852,26 @@ async fn build_cohort(
         });
     }
     let example_count = examples.len();
-    let inputs = DatasetBuildInputs::try_new(
-        all_parents,
-        memberships[0].universe_id.clone(),
-        memberships
-            .iter()
-            .map(|membership| membership.value.clone())
-            .collect(),
-        specs,
-        examples,
-    )
+    let inputs = if let Some(population) = population {
+        DatasetBuildInputs::try_new_for_current_population(
+            all_parents,
+            population.clone(),
+            specs,
+            examples,
+            Vec::new(),
+        )
+    } else {
+        DatasetBuildInputs::try_new(
+            all_parents,
+            memberships[0].universe_id.clone(),
+            memberships
+                .iter()
+                .map(|membership| membership.value.clone())
+                .collect(),
+            specs,
+            examples,
+        )
+    }
     .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
     let inputs = match request.probability_subject {
         Some(event) => inputs
@@ -1852,7 +1900,7 @@ async fn build_cohort(
         Some(request.study),
     );
     let aggregate = |domain, values: &Vec<_>| aggregate_evidence(domain, values);
-    let evidence = PreparedProductionEvidence {
+    let mut evidence = PreparedProductionEvidence {
         universe_membership_content: aggregate_evidence(
             b"market-squawk/cohort-universe-content/v1",
             &memberships
@@ -1904,6 +1952,32 @@ async fn build_cohort(
             .then(|| aggregate(b"market-squawk/label-pit-audit-set/v1", &label_audit)),
         return_kernel_output: aggregate(b"market-squawk/return-kernel-output-set/v1", &returns),
     };
+    if let Some(partition) = population {
+        let population = partition.population();
+        evidence.universe_membership_content = super::EvidenceDigest::new(
+            super::DigestAlgorithm::Sha256,
+            population.content_digest().bytes(),
+        );
+        evidence.universe_membership_audit = super::EvidenceDigest::new(
+            super::DigestAlgorithm::Sha256,
+            population.audit_digest().bytes(),
+        );
+        evidence.instrument_population_query = super::EvidenceDigest::new(
+            super::DigestAlgorithm::Sha256,
+            population.source_population_digest().bytes(),
+        );
+        evidence.instrument_population_receipt = evidence_digest(
+            b"market-squawk/native-stock-fixed-population/v1",
+            &[
+                EvidencePart::Sha256(population.content_digest()),
+                EvidencePart::Sha256(population.audit_digest()),
+                EvidencePart::Sha256(population.financial_profile_digest()),
+                EvidencePart::Sha256(population.official_directory_digest()),
+                EvidencePart::Bytes(&partition.descriptor().partition_digest()),
+                EvidencePart::Timestamp(population.membership_as_of()),
+            ],
+        );
+    }
     Ok(PreparedSourceCohort {
         identity,
         inputs,

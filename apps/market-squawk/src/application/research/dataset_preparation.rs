@@ -762,12 +762,20 @@ impl DatasetPreparationAuthority {
         })
     }
 
-    /// Selects the existing annual recipe by source coordinates before inspecting labels.
-    /// The same preview/consume path retains current parent and rights fences.
+    /// Builds the selected stock's annual cohort from its retained native source authority.
+    /// LocalAnalysis retains the same labeled evaluation mirror required by forecast pairing;
+    /// those historical labels are never used as current serving features.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source, profile, population and request authority remain explicit"
+    )]
     pub(crate) async fn prepare_investment_dataset(
         &self,
         instrument: InstrumentId,
         source_cutoff: Timestamp,
+        source_action_reference: super::corporate_actions::SourceAppliedCorporateActionPlanReference,
+        profile: &crate::application::analytical_profile::ValidatedAnalyticalProfile,
+        population: market_squawk_data::CurrentListedPopulation,
         intended_use: DatasetPreparationUse,
         origin: RequestOrigin,
         workspace: WorkspaceRuntimeIdentity,
@@ -779,44 +787,18 @@ impl DatasetPreparationAuthority {
         if source_cutoff > observed_at {
             return Err(DatasetPreparationError::InvalidSelection);
         }
-        let catalog = self.catalog(deadline, cancellation.child_token()).await?;
-        let option = catalog.options.iter().filter(|option| {
-            option.summary.instrument_id == instrument
-                && option.summary.observed_through <= source_cutoff
-                && option.variant(intended_use).is_some_and(|variant| {
-                    variant.request.policy().study_policy().is_some_and(|study| {
-                        study.snapshot_as_of() <= source_cutoff
-                            && study.target_horizon().exact_elapsed().is_some_and(|horizon|
-                                horizon.as_nanos() == market_squawk_backtesting::RECOMMENDATION_TARGET_HORIZON_NANOS_V1 as u128)
-                    })
-                })
-        }).max_by(|left,right| left.summary.observed_through.cmp(&right.summary.observed_through)
-            .then(left.summary.immutable_generation.cmp(&right.summary.immutable_generation))
-            .then(left.summary.id.cmp(&right.summary.id)))
-            .ok_or(DatasetPreparationError::NotFound)?;
-        let preview = self
-            .preview(DatasetPreparationPreviewRequest {
-                selection: DatasetPreparationSelection {
-                    catalog_generation: encode_hex(catalog.digest.bytes()),
-                    dataset: option.summary.id.clone(),
-                    intended_use,
-                },
-                origin,
-                workspace,
-                now: Instant::now(),
-                observed_at,
-                deadline,
-                cancellation: cancellation.child_token(),
-            })
-            .await?;
-        self.consume(
-            preview.receipt,
-            origin,
-            workspace,
-            Instant::now(),
+        history::prepare_investment_dataset(
+            self,
+            instrument,
+            source_cutoff,
+            source_action_reference,
+            profile,
+            population,
+            intended_use,
             deadline,
             &cancellation,
         )
+        .await
     }
 
     async fn catalog(

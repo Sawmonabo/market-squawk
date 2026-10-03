@@ -4,6 +4,42 @@
 
 ### Current native barrier — investment dataset cursor admission
 
+The retained-preparation recovery check now passes: the fixture had mixed a simulated 2027
+financial-reference clock with real controller checkpoint time. Only its durable partial-result
+clock was corrected; production chronology/admission checks remain unchanged. Focused rerun:
+`publication_action_references_follow_forecast_and_market_admission`, 1/1 in 1.09s after 6m57s
+single-job compilation; log `native-stock-recovery-critical.log`. The unchanged provider
+scheduler check passed in `native-stock-handoff-critical.log`. Lead inspected actual producer,
+contract, service, workflow and scheduler changes; all writers are released. Source integration
+binds stock datasets to exact retained native history/actions and a selected fixed cohort,
+preserves labeled training/analysis pairing, and permits explicit recovery of an initial partial
+preparation before any calculation is admitted. This is critical workflow/scheduler verification,
+not positive native dataset or installed-stock acceptance. Target is 14 GiB after this necessary
+check, with one compiler configuration and no new runtime copy.
+
+Next concrete dependencies: restore one matched native service; add current StudyInputs handoff
+using the existing feature recipe; prove native preparation and forecasts. Provider tracing also
+confirmed that the apparent Alpaca fallback eventually requires Tiingo ordinary-action evidence
+inside `corporate_actions/preflight/history_plan.rs`. Its roughly nine-year acquisition span is
+adequate in principle for annual partitions, but no-Tiingo completion is not established. Do not
+describe raw Alpaca publication as a complete fallback or invent absent corporate-action evidence.
+Bounded source trace: `.agents/tmp/v1-first-stock/stock-history-route.md`.
+
+Current bounded continuation: Astra `stock_recovery_check` owns only the failing existing
+workflow recovery fixture in `application/analytical_workflow/workflow_driver.rs`; diagnose its
+retained-checkpoint failure and correct the fixture or report any production defect before
+expanding scope. Lead inspects the frozen native dataset producer and service consumers in parallel,
+owns all other source, Git and build scheduling. DAG: fixture correction + producer/consumer
+inspection → one focused serialized check → coherent integration → matched live recovery.
+No additional build, runtime copy, branch or worktree is delegated.
+
+While that frozen source check runs, GPT-6.1 Sol `stock_history_route` owns read-only tracing
+and `.agents/tmp/v1-first-stock/stock-history-route.md`: the stock preparation currently invokes
+Tiingo-specific benchmark acquisition before selected history. Establish whether an actual
+Alpaca alternative is reachable and identify the smallest existing-authority correction if not.
+No source writes/builds/runtime actions; lead retains integration ownership. This checks a concrete
+required core-provider dependency, not a new provider or permission review.
+
 Owner follow-up on repeated build output: completed supported workspace-only Cargo cleanup
 (`cargo clean --workspace --profile dev`) after inspecting its dry-run paths, confirming the
 watcher paused and no compiler active, and checking that no removal intersected open files.

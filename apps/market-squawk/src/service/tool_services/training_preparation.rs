@@ -130,29 +130,32 @@ impl InstalledProductTraining {
         let cutoff = Timestamp::from_unix_nanos(cutoff);
         let profile = revalidate(&input.financial_profile, None).map_err(ServiceError::from)?;
         let identities = self.instruments.as_ref().ok_or(ServiceError::Unavailable)?;
-        let identity = identities
-            .read(
-                crate::application::InstrumentContextRequest::try_new(
-                    input.instrument_id,
-                    cutoff,
-                    cutoff,
-                )
-                .map_err(|_| ServiceError::InvalidRequest)?,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .map_err(super::super::market_evidence::map_identity_error)?;
-        let crate::application::InstrumentContextOutcome::Exact(identity) = identity.outcome()
-        else {
-            return Err(ServiceError::Unavailable);
+        let population = crate::application::prepare_fixed_current_population(
+            &self.research,
+            Arc::clone(identities),
+            vec![input.instrument_id],
+            digest(&profile.resolution().configuration_digest)?,
+            cutoff,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await?;
+        let [member] = population.members() else {
+            return Err(ServiceError::InvalidResult);
         };
-        if !profile.admits_investment(identity.asset_class(), identity.exchange_traded_fund()) {
+        if !profile.admits_investment(
+            member.canonical_record().definition().asset_class(),
+            member.listing_record().is_etf(),
+        ) {
             return Err(ServiceError::InvalidRequest);
         }
         authority
             .prepare_investment_dataset(
                 input.instrument_id,
                 cutoff,
+                input.source_action_reference,
+                &profile,
+                population,
                 input.intended_use,
                 context.origin().ok_or(ServiceError::Unauthorized)?,
                 crate::application::lifecycle::WorkspaceRuntimeIdentity::try_from_runtime(runtime)
@@ -467,6 +470,7 @@ struct SplitWire {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DatasetStartInput {
+    source_action_reference: crate::application::SourceAppliedCorporateActionPlanReference,
     instrument_id: market_squawk_domain::InstrumentId,
     source_cutoff_unix_nanos: String,
     financial_profile: AnalyticalProfileResolution,
