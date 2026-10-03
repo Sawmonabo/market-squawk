@@ -3,6 +3,23 @@
 ## Current execution — 2026-10-03
 
 
+### Active wave — renewed option-source admission for the retained stock workflow
+
+Base `a65f9394`, daily changes critically/live/restart verified below. The retained MSFT workflow
+again pauses at preparation. Matching runtime diagnostic now identifies `source-identity-conflict`
+at `option-reference-publication` (restart log lines 15789–15797); the exact sub-guard remains to
+be checked. Originals stay pending and unchanged. Acceptance 1/2/6; no failed admission is waived.
+
+| Owner | Exact ownership / dependencies | Completion evidence |
+| --- | --- | --- |
+| Astra High `options_original_recovery` | `crates/market-squawk-data/src/catalog/market_data_instruments/option_reference.rs` and the option-reference tail of the existing `crates/market-squawk-data/tests/catalog.rs` fixture; no other source files | Recheck current authenticated source renewal versus original capture binding, implement narrow trusted-clock source registration if warranted, extend the existing actual-reference fixture for renewed admission and preserved rejection |
+| Lead | Shared authority/contracts/composition, ledger/Git/build/runtime; preparation-job integration remains next dependent checkpoint | Inspect every guard and caller, run the existing focused catalog check, commit/push and resume the same native MSFT workflow; publish runner interface before any additional writer dispatch |
+
+DAG: exact failed admission → current source registration with retained original provenance →
+focused source-identity check → matched native retry → preparation-job integration. Watcher paused;
+current Desktop stays open. No raw-original mutation, expired permission bypass, migration,
+new worktree/branch, concurrent builds or full gate.
+
 ### Active wave — session-correct daily changes and first complete stock analysis
 
 Refresh base `1dbb5f54`, clean single feature worktree; source checkpoint `4f92916c` runs as
@@ -53,6 +70,28 @@ compile took 4m23s; subsequent checks reused it. Frontend TypeScript build passe
 `.agents/tmp/v1-first-stock/`. The restart fixture checks the persisted comparison shape and calculation;
 it does not alone prove original-source admission. Matched native nine-card/restart evidence remains
 the next barrier. No CI, new review round, schema migration or RAM measurement ran.
+
+Source checkpoint `a65f9394` is pushed. Matching coordinated build passed in 5m24s;
+service 26545/Desktop 26585 reopened without an application password. Actual native Home shows
+all nine starter price changes instead of unavailable: SPY +0.74%, QQQ +0.97%, DIA +0.48%,
+IWM +0.91%, VTI +0.92%, AAPL +0.85%, MSFT +1.33%, NVDA +1.28%, TSLA +4.61%, each against
+its exact October 1 close for the displayed October 2 observation. These are retained
+closed-market observations, not evidence of live streaming. The native watchlist screenshot was
+captured and inspected. No query errors remained in the completed read. An early startup retained
+read warning recovered; instant startup/complete visual acceptance is not claimed.
+
+A clean development shutdown exited 0. Relaunch with the required Node 24.18.0 reused the build
+in 1.36s; service 28366/Desktop 28403 reopened the same corrected workspace and all nine exact
+prices/baselines/change values matched the pre-restart capture under a new service scope.
+The first relaunch attempt used the shell's Node 26 and was rejected by the existing engine check
+before app launch; selecting the repository-pinned Node resolved it without a code change.
+The original paused MSFT workflow/profile remains intact. Both preserved workspace directories
+are still present. Evidence under `.agents/tmp/v1-first-stock/`:
+`daily-comparison-{before-live,live,live-screen,after-restart,restart-result,workflow-retained}.json`,
+`daily-comparison-watchlist.png`, and `daily-comparison-restart-dev.log`.
+PR #43 evidence: comment `5967145208`; source/fixture acceptance remains distinct from the full
+analysis, remaining screens/providers and installed package acceptance. Next dependency is the
+retained MSFT preparation's managed-job integration and exact option-source admission fix.
 
 ### Integrated wave — selected filing transform completion
 
