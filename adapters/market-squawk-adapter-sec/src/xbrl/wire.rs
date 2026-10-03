@@ -502,6 +502,17 @@ pub(super) fn transform_numeric(
 ) -> Result<String, SecXbrlError> {
     match format {
         None => Ok(value.trim().to_owned()),
+        Some(format)
+            if is_element(
+                format,
+                "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12",
+                "fixed-zero",
+            ) =>
+        {
+            // Transformation Registry 4 section 4.93 accepts any xs:string as zero.
+            // The normalizer separately retains the source text, scale and sign.
+            Ok("0".to_owned())
+        }
         Some(format) if is_supported_dot_decimal_transform(format) => {
             let transformed: String = value
                 .chars()

@@ -1977,6 +1977,21 @@ fn exercise_nested_continuations(document: XbrlDocumentContext) -> Result<(), Se
 /// The existing captured-taxonomy fixture owns this grammar and numeric-evidence regression.
 #[cfg(test)]
 fn exercise_number_word_transforms(document: XbrlDocumentContext) -> Result<(), SecXbrlError> {
+    let fixed_zero_namespace = "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12";
+    let fixed_zero = XbrlQualifiedName::try_new("ixt:fixed-zero", fixed_zero_namespace)?;
+    // TSLA 2026-06-30 uses all four nonempty spellings; the registry admits any string.
+    for lexical in ["no", "No", "immaterial", "—", "", " \t123\n"] {
+        assert_eq!(transform_numeric(lexical, Some(&fixed_zero))?, "0");
+    }
+    for unsupported in [
+        XbrlQualifiedName::try_new("ixt:fixed-zero", "https://unrelated.test")?,
+        XbrlQualifiedName::try_new("ixt:unknown", fixed_zero_namespace)?,
+    ] {
+        assert!(matches!(
+            transform_numeric("no", Some(&unsupported)),
+            Err(SecXbrlError::UnsupportedTransform)
+        ));
+    }
     let format = XbrlQualifiedName::try_new(
         "sec:numwordsen",
         "http://www.sec.gov/inlineXBRL/transformation/2015-08-31",
@@ -2066,12 +2081,14 @@ fn exercise_number_word_transforms(document: XbrlDocumentContext) -> Result<(), 
         xmlns:us-gaap="http://fasb.org/us-gaap/2026"
         xmlns:msft="http://www.microsoft.com/20260630"
         xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+        xmlns:ixt="http://www.xbrl.org/inlineXBRL/transformation/2020-02-12"
         xmlns:sec="http://www.sec.gov/inlineXBRL/transformation/2015-08-31"><body>
         <xbrli:context id="annual"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000789019</xbrli:identifier></xbrli:entity><xbrli:period><xbrli:startDate>2025-07-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period></xbrli:context>
         <xbrli:unit id="segments"><xbrli:measure>msft:Segment</xbrli:measure></xbrli:unit>
         <xbrli:unit id="dollars"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>
         <ix:nonFraction id="segments-fact" name="us-gaap:NumberOfReportableSegments" contextRef="annual" unitRef="segments" decimals="0" format="sec:numwordsen">three</ix:nonFraction>
         <ix:nonFraction id="scaled-fact" name="us-gaap:NetIncomeLoss" contextRef="annual" unitRef="dollars" decimals="2" format="sec:numwordsen" scale="-2" sign="-"> nineteen hundred forty-four </ix:nonFraction>
+        <ix:nonFraction id="zero-fact" name="us-gaap:PreferredStockValue" contextRef="annual" unitRef="dollars" decimals="INF" format="ixt:fixed-zero" scale="6" sign="-"> no </ix:nonFraction>
         </body></html>"#;
     let parsed = XbrlDocumentParser::parse_with_cancellation(
         xml.as_bytes(),
@@ -2085,8 +2102,8 @@ fn exercise_number_word_transforms(document: XbrlDocumentContext) -> Result<(), 
         document.clone(),
         &CancellationToken::new(),
     )?;
-    assert_eq!(parsed.numeric_facts().len(), 2);
-    assert_eq!(indexed.numeric_count, 2);
+    assert_eq!(parsed.numeric_facts().len(), 3);
+    assert_eq!(indexed.numeric_count, 3);
     for (ordinal, expected) in parsed.numeric_facts().iter().enumerate() {
         assert_eq!(indexed.numeric_at(ordinal)?.as_ref(), Some(expected));
     }
@@ -2120,10 +2137,22 @@ fn exercise_number_word_transforms(document: XbrlDocumentContext) -> Result<(), 
         "1944"
     );
     assert_eq!(scaled.evidence().normalized_value()?, scaled.value());
+    let zero = &parsed.numeric_facts()[2];
+    assert_eq!(zero.value(), Decimal::ZERO);
+    assert_eq!(zero.evidence().lexical_value().as_str(), " no ");
+    assert_eq!(zero.evidence().inline_scale(), Some(6));
+    assert_eq!(zero.evidence().inline_sign(), Some(XbrlSign::Negative));
+    assert_eq!(
+        serde_json::to_value(zero.evidence())?["transformed_lexeme"],
+        "0"
+    );
+    assert_eq!(zero.evidence().normalized_value()?, zero.value());
     // The caller must not trim away invalid boundary NBSP before validating the transform.
     for invalid in [
         xml.replace(">three<", ">\u{a0}three<"),
         xml.replace("scale=\"-2\"", "scale=\"28\""),
+        xml.replace("scale=\"6\"", "scale=\"29\""),
+        xml.replace("scale=\"6\" sign=\"-\"", "scale=\"6\" sign=\"invalid\""),
     ] {
         assert!(matches!(
             XbrlDocumentParser::parse_with_cancellation(

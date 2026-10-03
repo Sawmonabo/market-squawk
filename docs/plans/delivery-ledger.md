@@ -11,12 +11,23 @@ available. This is a concrete selected-provider acquisition gap, not completion 
 
 | Owner | Disjoint files / dependency | Critical evidence |
 | --- | --- | --- |
-| Astra High `sec_numeric_transform` | SEC `src/xbrl/wire.rs` and existing XBRL fixture/test; report exact additional path before editing | Identify actual retained TSLA numeric transform, verify primary specification, implement its exact semantics using existing parser, extend smallest critical fixture; no builds/Git/runtime |
+| Astra High `sec_numeric_transform` | SEC `src/xbrl/wire.rs` and existing parser regression helper in `src/xbrl.rs` | Identify actual retained TSLA numeric transform, verify primary specification, implement its exact semantics using existing parser, extend smallest critical fixture; no builds/Git/runtime |
 | Lead | Application integration, all manifests/ledger/Git/build/native runtime | Inspect actual parser change and source sample, schedule one relevant critical check, commit/push, matched live preparation completion with concurrent reads |
 
 DAG: retained failing filing → primary transform contract → focused parser fix/fixture → lead
 check → matching build → selected-company completion. No unknown-transform passthrough,
 zero substitution, schema migration, new branch/worktree or speculative parser rewrite.
+
+Astra implementation is integrated and ownership released. The exact captured Tesla filing
+contains 84 TRR4 `fixed-zero` facts (first `f-84`, preferred shares, text `no`, scale 6).
+Lead independently verified retained body SHA-256
+`55d7e9deef9a524e920c43310689b5cf770614b6cd35b4e95401e7aafb4cf49b`
+and official registry section 4.93. The parser admits only that exact namespace/name, preserving
+original text and numeric attributes; unknown formats remain rejected. The existing captured-taxonomy
+critical fixture passed 1/1 in 4.41s (compile 1m03s), including original/indexed evidence parity,
+unknown transform rejection and sign/scale validation. Log: `tsla-transform-critical.log`;
+diagnosis: `tsla-numeric-transform.md`, both under `.agents/tmp/v1-first-stock/`.
+Matched native retry/completion is the next barrier. No schema/data reset or migration.
 
 ### Integrated wave — keep reads available during financial preparation
 

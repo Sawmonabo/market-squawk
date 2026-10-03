@@ -107,6 +107,12 @@ normalization and retained reads. Meaningful spaces such as `SCHEDULE 13G` and `
 preserved; empty/control-bearing labels remain invalid. Accession and other identifier contracts
 are unchanged.
 
+Inline numeric transforms, reviewed 2026-10-03: the parser supports the exact TRR4
+`fixed-zero` QName in `http://www.xbrl.org/inlineXBRL/transformation/2020-02-12`.
+The [official registry, section 4.93](https://www.xbrl.org/Specification/inlineXBRL-transformationRegistry/REC-2020-02-12/inlineXBRL-transformationRegistry-REC-2020-02-12.html)
+defines any input string as zero for this format. Original filing text, sign and scale remain
+retained and validated; unknown transform names/namespaces remain unsupported.
+
 ## Official limits, application budgets, and scheduling
 
 **VERIFIED PROVIDER FACT:** SEC states a maximum of `10 requests/second` for automated access.
