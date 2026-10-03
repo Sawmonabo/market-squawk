@@ -28,9 +28,10 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     AuthorizationMode, ExtractionAuthority, ExtractionAuthorityError, ExtractionRedirectPermit,
-    HttpRequestBounds, MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy,
-    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SourceMetadata, SourceMetadataProvider, TlsProviderCapability,
+    HttpRequestBounds, InFlightExtractionRequest, MAX_PROVIDER_CAPTURE_PAGE_BYTES,
+    NetworkAccessPolicy, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, SourceMetadata, SourceMetadataProvider,
+    TlsProviderCapability,
 };
 use reqwest::header::{
     ACCEPT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
@@ -713,9 +714,8 @@ impl SecEdgarSource {
         } else {
             return Err(SecClientError::InvalidLocator);
         };
-        let in_flight = authority
-            .try_network_request(&current)?
-            .authorize_send(&current)?;
+        let in_flight =
+            acquire_sec_request(authority, &current, Some(deadline), cancellation).await?;
         let response = tokio::select! {
             response = self.client.get(&current).header(ACCEPT_ENCODING, "identity").send() => {
                 match response {
@@ -1001,9 +1001,9 @@ impl SecEdgarSource {
             }
             let in_flight = match redirect_permit.take() {
                 Some(permit) => permit.authorize_send(&current)?,
-                None => authority
-                    .try_network_request(&current)?
-                    .authorize_send(&current)?,
+                // Discovery/composite and live operations retain their original deadline in
+                // this cancellation token; waiting must not restart that operation clock.
+                None => acquire_sec_request(authority, &current, None, cancellation).await?,
             };
             let response = tokio::select! {
                 response = request.send() => match response {
@@ -1358,6 +1358,51 @@ impl SecEdgarSource {
 
     pub(crate) const fn parser_limits(&self) -> SecParserLimits {
         self.parser_limits
+    }
+}
+
+/// Waits for the same SEC authority to admit one exact request, without retaining a permit
+/// across backpressure. An absent wall deadline uses the caller's operation cancellation.
+pub(crate) async fn acquire_sec_request(
+    authority: &ExtractionAuthority,
+    target: &str,
+    deadline: Option<Timestamp>,
+    cancellation: &CancellationToken,
+) -> Result<InFlightExtractionRequest, SecClientError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(SecClientError::Cancelled);
+        }
+        if let Some(deadline) = deadline {
+            ensure_before_deadline(deadline)?;
+        }
+        let admission = (|| {
+            let permit = authority.try_network_request(target)?;
+            if cancellation.is_cancelled() {
+                return Err(SecClientError::Cancelled);
+            }
+            if let Some(deadline) = deadline {
+                ensure_before_deadline(deadline)?;
+            }
+            permit.authorize_send(target).map_err(SecClientError::from)
+        })();
+        let wait_until = match admission {
+            Ok(in_flight) => return Ok(in_flight),
+            Err(SecClientError::Authority(ExtractionAuthorityError::BudgetWaitUntil {
+                deadline,
+            })) => deadline,
+            Err(error) => return Err(error),
+        };
+        let wait = authority.remaining_budget_wait(wait_until)?;
+        let wait = match deadline {
+            Some(deadline) => wait.min(remaining_until(deadline)?),
+            None => wait,
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
+            () = tokio::time::sleep(wait) => {}
+        }
     }
 }
 

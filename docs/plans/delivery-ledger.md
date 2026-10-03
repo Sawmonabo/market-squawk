@@ -17,7 +17,10 @@ no database migration, deletion or retained-evidence rewrite occurred. Receipt:
 Original MSFT workflow `workflow_96bca8b553dd5278afa3e9a2a4040af5`, its pending captures and
 prior saved evidence remain in the first root. The second root retains the previously created
 $100,000/0.25% virtual account. Those authorized settings were also recreated in the new root;
-no paper session or order started. Allocation settings remain to be applied.
+no paper session or order started. The approved allocation settings are now committed through
+the native preview/confirmation flow: 2–5% position weights, $10,000 cash reserve, 1% downside
+loss limit and 365-day horizon. Native status reports `ready`, setup revision 1; receipts are
+`corrected-v1-allocation-{status,preview,committed,configured}.json` in the same evidence directory.
 
 The matching build passed in 5m26s; the new launcher reused it in 1.35s. Fresh local-product startup
 reported 14,458ms. Desktop 50670/service 50614 are alive; native contexts are ready and connected
@@ -34,10 +37,19 @@ There is no new stack overflow or immutable-revision conflict in this attempt. T
 wait is not successful SEC setup. Logs also record Coinbase/Kraken public runtime shutdown-barrier
 failures; the Desktop and stock prices remain available. These additional failures are unresolved.
 
-**Next bounded ownership:** Astra `fresh_activation_stack` owns read-only diagnosis of the SEC
-rate-admission failure and `.agents/tmp/v1-first-stock/sec-budget-wait.md` only. Trace the precise
-wait/propagation and retained publication stage; no provider calls, source/data/runtime changes,
-builds or Git. Lead owns runtime/restart evidence, integration and any shared contracts. Runtime captures include
+**Integrated SEC admission correction:** Astra `fresh_activation_stack` completed the SEC diagnosis:
+the third Submissions request encounters normal admission backpressure before any publication.
+It handed off `adapters/market-squawk-adapter-sec/src/client.rs`, `client/taxonomy.rs` and the
+existing `xbrl/model.rs` critical fixture: shared cooperative admission waiting across ordinary,
+bulk and SEC-owned taxonomy requests, retaining cancellation, absolute deadlines and rate authority.
+Dependency: `.agents/tmp/v1-first-stock/sec-budget-wait.md`; no schema or rate-policy change.
+Lead inspected the actual diff and caller deadlines. The existing mixed taxonomy/cancellation
+regression passed 1/1 in 4.50s, including exhausted-budget waiting, cancellation and deadline
+expiry before subsequent successful admission. Log: `sec-admission-critical.log` in the same
+evidence directory. No rate limit, schema, redirect authority or external taxonomy behavior changed.
+Source ownership is released. Lead owns the next matched rebuild and native MSFT activation;
+the running instance remains on the preceding build until replacement succeeds.
+Runtime captures include
 `corrected-v1-restarted-native.json`, `corrected-v1-restarted-onboarding.json` and the
 `corrected-v1-paper-*` preparation/preview/creation receipts. The
 closed-session comparison design is complete but unimplemented. Option renewal and the first

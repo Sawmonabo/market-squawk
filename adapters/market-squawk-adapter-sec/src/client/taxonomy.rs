@@ -302,9 +302,13 @@ impl TaxonomyClientSet {
             .header(ACCEPT_ENCODING, "identity");
         let mut in_flight = Some(if authority == SEC_EDGAR_AUTHORITY {
             TaxonomyInFlightRequest::Sec(
-                sec_authority
-                    .try_network_request(request.physical_locator())?
-                    .authorize_send(request.physical_locator())?,
+                super::acquire_sec_request(
+                    sec_authority,
+                    request.physical_locator(),
+                    Some(deadline),
+                    cancellation,
+                )
+                .await?,
             )
         } else {
             let budget = client
