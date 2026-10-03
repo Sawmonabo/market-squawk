@@ -1197,6 +1197,7 @@ impl SecFundamentalsApplicationBridge {
             || !revisions.native_lineage_required()
             || row_capture_page_ordinals.len() != batch.records().len()
             || revisions.is_locally_observed()
+                != (coordinates.family == SecFundamentalsFamily::Submissions)
         {
             return Err(SecFundamentalsApplicationError::InvalidAuthority);
         }

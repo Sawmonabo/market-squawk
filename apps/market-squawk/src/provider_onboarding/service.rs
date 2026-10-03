@@ -4557,8 +4557,11 @@ mod tests {
             directory.path().join("startup-secrets"),
             SecretValue::new("startup reconciliation unlock".to_owned())?,
         )?);
-        let service =
-            ProviderOnboardingService::try_new_with_provider_rate(catalog, secrets, provider_rate)?;
+        let service = ProviderOnboardingService::try_new_with_provider_rate(
+            catalog,
+            Arc::clone(&secrets),
+            provider_rate.clone(),
+        )?;
         let session_ids = service
             .catalog
             .provider_onboarding_session_ids_after(None, CatalogLimit::new(64)?)?;
@@ -4573,6 +4576,120 @@ mod tests {
                 OnboardingState::RefreshRequired
             );
         }
+
+        // A stored initial setup has durable intent even after its operation reservation ends.
+        // It has no saved runtime recipe, and restart must preserve the exact protected value.
+        let tiingo = profiles
+            .get("tiingo.starter-eod-nav")
+            .ok_or("Tiingo onboarding profile is missing")?;
+        let setup_deadline = wall_deadline(Duration::from_secs(3))?;
+        let mut stored_sessions = Vec::new();
+        for owner in ["pending-stored-setup", "cancelled-stored-setup"] {
+            let request = OnboardingReservationRequest::try_new(
+                tiingo.capability(),
+                ProviderPublicConfiguration::default(),
+                tiingo.capability().maximum_authority().clone(),
+                SourceIdentifier::try_from("startup-recovery-test")?,
+                SourceIdentifier::try_from(owner)?,
+                setup_deadline,
+                0,
+            )?;
+            let reservation = service.catalog.reserve_provider_onboarding(&request)?;
+            let session_id = reservation.session_id();
+            let stored = service.submit_secret_blocking(
+                session_id,
+                SecretValue::new("fixture-pending-tiingo-token".to_owned())?,
+                SecretCancellation::new(),
+            )?;
+            assert_eq!(stored.state(), OnboardingState::StoredUnverified);
+            stored_sessions.push((
+                session_id,
+                service.retained_credential_coordinate(session_id)?,
+            ));
+        }
+        let [
+            (pending_session, pending_coordinate),
+            (cancelled_session, cancelled_coordinate),
+        ] = stored_sessions.as_slice()
+        else {
+            return Err("expected pending and cancelled setup fixtures".into());
+        };
+        let cancelled = service
+            .catalog
+            .resume_provider_onboarding(*cancelled_session)?;
+        service.append(
+            cancelled.reservation(),
+            cancelled.next_sequence(),
+            OnboardingEvent::Cancelled {
+                evidence_digest: event_digest(b"user-cancelled", *cancelled_session, None),
+            },
+        )?;
+        let ProviderOnboardingService { catalog, .. } = service;
+        let remaining = setup_deadline
+            .unix_nanos()
+            .saturating_sub(system_timestamp()?.unix_nanos());
+        if remaining >= 0 {
+            std::thread::sleep(Duration::from_nanos(u64::try_from(remaining)? + 1_000_000));
+        }
+        let recovered = ProviderOnboardingService::try_new_with_provider_rate(
+            catalog,
+            Arc::clone(&secrets),
+            provider_rate,
+        )?;
+        let resumed = recovered.resume(*pending_session)?;
+        assert_eq!(resumed.state(), OnboardingState::StoredUnverified);
+        assert_eq!(
+            resumed.next_action(),
+            crate::provider_onboarding::OnboardingNextAction::VerifyAndActivate
+        );
+        assert_eq!(
+            recovered.retained_credential_coordinate(*pending_session)?,
+            *pending_coordinate
+        );
+        assert!(
+            recovered
+                .catalog
+                .resume_provider_onboarding(*pending_session)?
+                .lifecycle()
+                .active_generation()
+                .is_none()
+        );
+        let retained = read_secret_reference(
+            secrets.as_ref(),
+            *pending_session,
+            &pending_coordinate.1,
+            SecretCancellation::new(),
+            SecretInteractionPolicy::Forbid,
+        )?;
+        assert_eq!(retained.expose_secret(), "fixture-pending-tiingo-token");
+        let cancelled = recovered
+            .catalog
+            .resume_provider_onboarding(*cancelled_session)?;
+        assert_eq!(cancelled.lifecycle().state(), OnboardingState::Blocked);
+        assert_eq!(
+            cancelled
+                .lifecycle()
+                .generation_state(cancelled_coordinate.0),
+            Some(CredentialGenerationState::Tombstoned)
+        );
+        assert_eq!(
+            cancelled
+                .lifecycle()
+                .generation_local_deletion(cancelled_coordinate.0),
+            Some(market_squawk_sources::LocalDeletionOutcome::Deleted)
+        );
+        assert!(matches!(
+            read_secret_reference(
+                secrets.as_ref(),
+                *cancelled_session,
+                &cancelled_coordinate.1,
+                SecretCancellation::new(),
+                SecretInteractionPolicy::Forbid,
+            ),
+            Err(ProviderOnboardingError::SecretStore(
+                LocalSecretStoreError::NotFound
+            ))
+        ));
         Ok(())
     }
 

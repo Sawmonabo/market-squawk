@@ -2,65 +2,63 @@
 
 ## Current execution — 2026-10-03
 
-Branch `feature/v1-installed-product-experience`; one primary worktree, three local branches.
-Pushed: SEC/schema `44b9f583`, calendar `dec65cdd`, financial autoload `3d078ba5`,
-saved-analysis research `262a0274`. Origin retains the three intended branches plus the active,
-unmerged Dependabot PR55. No branches/worktrees were created; recovery refs remain preserved.
+Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
+Pushed baseline: SEC stack `74eb6762`, SEC/schema `44b9f583`, calendar `dec65cdd`,
+financial autoload `3d078ba5`, saved-analysis research `262a0274`. Origin retains the three
+intended branches plus active, unmerged Dependabot PR55. No new branch/worktree was created.
 
-**Owner-approved deployment:** the complete former workspace
-`.market-squawk/v1-owner-test-financial-detail-2026-10-02` remains untouched recovery evidence
-following graceful shutdown. No database migration, deletion or old-row alteration occurred.
-The active fresh V1 root is `.market-squawk/v1-owner-test-fresh-2026-10-03`.
-Receipt: `.agents/tmp/v1-first-stock/fresh-workspace-preservation.json`.
-Original MSFT workflow `workflow_96bca8b553dd5278afa3e9a2a4040af5`, its three pending captures,
-and all prior saved evidence remain in the old root. Its calendar step advanced9→10; exact option
-identity admission remained blocked, with zero saved analysis results.
+**Owner-approved deployment:** preserve the complete prior workspace
+`.market-squawk/v1-owner-test-financial-detail-2026-10-02` and the attempted fresh root
+`.market-squawk/v1-owner-test-fresh-2026-10-03` as recovery evidence. Initialize corrected V1
+storage after this checkpoint; do not migrate, delete or alter retained revision evidence.
+The second root already contains provider-version Submissions records that cannot be reclassified
+without rewriting history. The owner explicitly chose a fresh workspace. Original MSFT workflow
+`workflow_96bca8b553dd5278afa3e9a2a4040af5`, its three pending captures and all saved evidence
+remain in the first root. Preservation receipt: `.agents/tmp/v1-first-stock/fresh-workspace-preservation.json`.
 
-**Current checkpoint:** three large SEC child futures are heap-pinned in the existing coordinator
-and live-source modules. Same-task cancellation, leases, deadlines and terminal results are
-unchanged; no stack limit, data limit, schema or shared dispatch change was introduced.
-This follows Rust Clippy's [documented large-future correction](https://rust-lang.github.io/rust-clippy/master/index.html#large_futures).
-The exact original macOS crash traced SEC activation rather than Tiingo or recursive provenance
-JSON. Twelve measured caller frames consumed1,983,712bytes before remaining serde/runtime frames.
-The rebuilt same frames consume1,558,736bytes, a424,976byte reduction (21.4%). Binary UUID:
-`1BD4EAD4-301C-3A80-8954-20AB3CD46945`. Diagnostic report:
-`.agents/tmp/v1-first-stock/fresh-activation-stack.md`.
+### Integrated checkpoint — SEC corrected metadata and pending credential recovery
 
-**Verification:** scoped rustfmt and `git diff --check` pass. One coordinated single-job build
-passed in5m32s. Native SEC activation passed the previous decoding crash point and returned a
-structured setup error in2.7s; service26924 remained alive and Desktop22413 stayed connected/ready.
-It now fails later with `Application(Fundamentals(Research(Ingest(RevisionAuthority(Conflict)))))`.
-This is crash-fix evidence, **not successful SEC setup or complete financial data**. Captures:
-`fresh-v1-sec-stack-fixed-activation.json`, `fresh-v1-after-sec-stack-fixed.json`, and
-`fresh-v1-dev.log` under `.agents/tmp/v1-first-stock/`.
+Acceptance 1/2/7: SEC changes acceptance timestamps while retaining filing accessions. Three of
+2,260 live rows changed; the catalog correctly rejected changed data represented as the same
+immutable provider version. Submissions now uses the existing locally observed native-content
+revision mechanism. Company Facts keeps its provider-version contract. Adapter, application
+publication and shared reobservation gates change together; generic immutable replay checks remain.
 
-**Fresh workspace evidence:** configured credentials imported privately, Alpaca verified and
-activated, and nine starter prices appeared. The workspace reopened without an application
-password; both native contexts were ready and events connected. After the latest service-only
-replacement, nine prices remain visible but the captured watchlist changes show unavailable;
-full market-display acceptance is not established. Tiingo's restored onboarding session is blocked
-and its imported credential generation tombstoned; this is separate from the SEC crash.
-The initial fresh full service startup took about15seconds; no instant-start claim is made.
-One coordinated supervisor21852/watcher22254 remains running; source changes replace the service
-while retaining the Desktop window. No full CI or whole-app RAM gate ran.
+Startup also quarantined and deleted Tiingo's stored pending credential before its setup timeout.
+One shared lifecycle predicate now recognizes stored, noncancelled initial setup. Service resume,
+startup reconciliation and catalog deadline admission preserve it through restart and elapsed setup
+time. This grants no runtime access: provider verification, rights, rate admission and activation
+are still required. Expired never-stored operations, explicit cancellation, revocation and cleanup
+retain their existing checks. No default password, compatibility path or migration was added.
 
-**Previously verified schema checkpoint:** the existing
-`captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation` passed1/1 in2.29s,
-covering all five standard LinkbaseRef roles, malformed-role rejection, duplicate-byte logical
-document occurrences, normalized publication and restart. Log:
-`.agents/tmp/v1-first-stock/sec-standard-linkbase-critical-verified.log`.
-It does not cover the additional live application activation stack. The calendar regression
-passed1/1 in19.22s with8,130 inherited rows and all2,709 selected original rows retained.
+| Ownership / dependency | Files and status | Critical evidence |
+| --- | --- | --- |
+| Astra `fresh_activation_stack` — SEC producer and fixture | Handed off `adapter-sec/src/extraction.rs`, `research/ingest/sec_fundamentals.rs`, existing `data/tests/publication_recovery.rs` fixture | Existing rights-bound ingest check passed 1/1 in 146.08s: original/corrected revision clocks, exact replay, earlier cutoff, raw evidence and restart; existing 4,525-row case retained |
+| Sol `tiingo_setup_recovery` — service recovery | Handed off `provider_onboarding/service/lifecycle_runtime.rs` and existing test in `service.rs` | Existing service restart check passed 1/1 in 4.14s: pending actual secret retained beyond deadline, cancelled secret deleted |
+| Lead — shared authority/integration | `sources/src/onboarding/lifecycle.rs`, `data/src/catalog/onboarding.rs`, `data/src/ingest.rs`, existing `data/tests/catalog.rs`, ledger; all Git/build/runtime ownership | Catalog check passed 1/1 in 1.47s: stored setup completes after deadline and reopens; expired never-stored setup rejected |
+| Astra `closed_session_change` — financial read design | Read-only report complete; no source ownership or implementation | Seven watchlist cards reject same-session baseline; DIA/NVDA separately reject completed-close changes. Required native-session pair/calendar rollover design remains unimplemented |
 
-**Ownership and next dependency:** lead owns integration/Git/build/runtime; Astra
-`fresh_activation_stack` has handed off the two SEC source files and measured diagnosis.
-No other active implementation ownership. Next: diagnose exact SEC revision conflict without
-weakening immutable evidence, reconcile Tiingo recovery, complete financial-page verification,
-then option renewal and the first saved analysis. Option diagnosis remains at
-`.agents/tmp/v1-first-stock/options-identity-after-calendar.md`.
-[Saved-analysis storage research](../research/2026-10-02-saved-analysis-storage.md) remains a proposal.
-No direct-result storage replacement is implemented. Remaining screens/providers/analytical and
-installed workflows, final measurements and complete V1 acceptance are still incomplete.
+Focused logs: `.agents/tmp/v1-first-stock/{pending-setup-catalog-critical,sec-corrected-metadata-critical,pending-setup-service-critical}.log`.
+Reports: `sec-revision-conflict.md`, `tiingo-setup-recovery.md`, `closed-session-change.md` in that directory.
+No full CI or whole-app RAM gate ran. These are critical fixture results, not live SEC completion.
+
+**Runtime:** current attempted-fresh Desktop 22413/service 26924 remain alive under supervisor 21852;
+watcher 22254 is paused while the lead serializes checks. All three focused checks pass. The next barrier is coherent commit/push and corrected-fresh native deployment. Then prove real SEC publication,
+financial-tab reads and restart, finish daily comparison, option renewal and the first saved analysis.
+The approved $100,000/0.25% virtual account was created in the attempted-fresh root; no paper session
+or order started. Recreate these authorized test settings in the new root, preserving this attempt.
+
+**Preserved live evidence:** `74eb6762` reduced the twelve SEC caller frames by 424,976 bytes without
+raising stack/data limits. Native retry passed the crash point and returned the revision conflict
+while service/Desktop remained alive. The fresh root displayed nine prices and reopened without
+an application password, but daily changes remain unavailable. No instant-start or complete
+financial-page claim is made. Selected-calendar regression retained all 2,709 original rows among
+8,130 inherited rows. Logs and captures remain under `.agents/tmp/v1-first-stock/`.
+
+[Saved-analysis storage research](../research/2026-10-02-saved-analysis-storage.md) remains a proposal;
+no direct-result storage replacement is implemented. Option renewal diagnosis remains in
+`.agents/tmp/v1-first-stock/options-identity-after-calendar.md`. All remaining provider, analytical,
+screen, shared-client, installed and final resource obligations remain in the owner-test goal.
 
 ### Shared integration — identical captured document occurrences
 

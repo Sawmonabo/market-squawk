@@ -428,7 +428,7 @@ impl CatalogAuthority {
             )?;
             let checked_at = trusted_catalog_now(&transaction)?;
             let deadline_exceeded = checked_at >= reservation.deadline_at()
-                && !event_allowed_after_deadline(&resumed.lifecycle, &event);
+                && !event_allowed_after_deadline(&resumed.lifecycle, &event, true);
             transaction.commit()?;
             if deadline_exceeded {
                 return Err(CatalogError::OnboardingDeadlineExceeded);
@@ -440,7 +440,7 @@ impl CatalogAuthority {
         }
         let occurred_at = trusted_catalog_now(&transaction)?;
         if occurred_at >= reservation.deadline_at()
-            && !event_allowed_after_deadline(&resumed.lifecycle, &event)
+            && !event_allowed_after_deadline(&resumed.lifecycle, &event, false)
         {
             return Err(CatalogError::OnboardingDeadlineExceeded);
         }
@@ -1230,7 +1230,7 @@ fn reconstruct_onboarding_stream(
         {
             return Err(CatalogError::CorruptCatalog);
         }
-        if occurred_at >= deadline_at && !event_allowed_after_deadline(lifecycle, &event) {
+        if occurred_at >= deadline_at && !event_allowed_after_deadline(lifecycle, &event, false) {
             return Err(CatalogError::CorruptCatalog);
         }
         let state = lifecycle
@@ -1515,7 +1515,40 @@ fn verify_reservation_audit(
     Ok(expected_digest)
 }
 
-fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &OnboardingEvent) -> bool {
+fn event_allowed_after_deadline(
+    lifecycle: &OnboardingLifecycle,
+    event: &OnboardingEvent,
+    exact_replay: bool,
+) -> bool {
+    // A completed secret store establishes durable setup intent, not runtime authority.
+    // Later admission still passes the lifecycle's provider/currentness checks. An exact
+    // committed replay may see the resulting active state; it cannot append a new event.
+    let retained = lifecycle
+        .retained_setup_credential_generation()
+        .or_else(|| {
+            (exact_replay && lifecycle.state() == OnboardingState::ActiveScoped)
+                .then(|| lifecycle.active_generation())
+                .flatten()
+        });
+    if let Some(retained) = retained {
+        match event {
+            OnboardingEvent::AuthorityVerified { .. } => return true,
+            OnboardingEvent::CredentialStored { reference }
+                if exact_replay && reference.generation() == retained =>
+            {
+                return true;
+            }
+            OnboardingEvent::RightsAdmitted { generation, .. }
+            | OnboardingEvent::RatePolicyAdmitted { generation, .. }
+            | OnboardingEvent::RuntimeVerified { generation, .. }
+            | OnboardingEvent::Activate { generation }
+                if *generation == Some(retained) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
     // The setup reservation does not retire an already verified Alpaca credential. Renew only
     // its retained doctor chain, then let ordinary lifecycle validation enforce currentness,
     // exact authority and activation. Include the post-state for exact event replays.

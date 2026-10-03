@@ -36,7 +36,7 @@ use crate::normalize::{
     normalize_company_fact_occurrence, normalize_filing_xbrl_with_cancellation,
     same_company_fact_family,
 };
-use crate::product::{SEC_FILING_XBRL_DATASET_PREFIX, SecFilingXbrlCoordinates};
+use crate::product::SecFilingXbrlCoordinates;
 use crate::xbrl::{
     SecPendingValidatedXbrlTaxonomySet, SecXbrlTaxonomyRegistry, XbrlDocumentContext,
     XbrlDocumentParser,
@@ -480,10 +480,11 @@ impl SecEdgarSource {
         })
     }
 
-    /// Builds provider-owned revision evidence aligned to one extracted SEC batch.
+    /// Builds revision evidence aligned to one extracted SEC batch.
     ///
-    /// Exact canonical source-record identity is the version token. Conservative availability is
-    /// the ordering coordinate; filing civil dates never become knowledge time. Final immutable
+    /// Submissions and Filing XBRL retain locally observed native content revisions: a filing
+    /// accession identifies the filing, but its published metadata can change. Company Facts
+    /// retains exact source-record version and publication ordering evidence. Final immutable
     /// revision numbers remain owned by the shared publication plan.
     ///
     /// # Errors
@@ -501,13 +502,12 @@ impl SecEdgarSource {
         {
             return Err(SecClientError::RegistrationMismatch);
         }
-        if batch
-            .request()
-            .object()
-            .dataset()
-            .as_str()
-            .starts_with(SEC_FILING_XBRL_DATASET_PREFIX)
-        {
+        let dataset = SecResearchDataset::try_from_identifier(batch.request().object().dataset())
+            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+        if matches!(
+            dataset.kind(),
+            SecResearchDatasetKind::Submissions | SecResearchDatasetKind::FilingXbrl
+        ) {
             return ExtractionRevisionPlan::locally_observed_with_native_lineage(
                 batch.records().len(),
             )

@@ -1688,6 +1688,36 @@ impl OnboardingLifecycle {
         self.candidate_generation
     }
 
+    /// Returns a stored initial credential whose setup can resume after restart.
+    ///
+    /// The initial operation deadline does not revoke this durable setup intent. This
+    /// grants no provider or runtime authority; verification and admission remain required.
+    pub fn retained_setup_credential_generation(&self) -> Option<SecretGeneration> {
+        if self.cancellation_recorded()
+            || self.active_generation.is_some()
+            || !matches!(
+                self.state,
+                OnboardingState::StoredUnverified
+                    | OnboardingState::VerifiedLeastPrivilege
+                    | OnboardingState::RightsAdmissionPending
+                    | OnboardingState::RuntimeVerificationPending
+            )
+        {
+            return None;
+        }
+        let generation = self.candidate_generation?;
+        (matches!(
+            self.generation_state(generation),
+            Some(
+                CredentialGenerationState::StoredUnverified
+                    | CredentialGenerationState::VerifiedLeastPrivilege
+            )
+        ) && self.generation_reference(generation).is_some()
+            && self.generation_remote_revocation(generation).is_none()
+            && self.generation_local_deletion(generation).is_none())
+        .then_some(generation)
+    }
+
     /// Returns the next contiguous credential generation without reserving it.
     pub fn next_generation(&self) -> Result<SecretGeneration, OnboardingStateError> {
         let next = match self.generations.last() {

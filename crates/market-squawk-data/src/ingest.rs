@@ -4955,18 +4955,22 @@ impl AnalyticalDataService {
                 }
             };
             if let Some((retained, committed)) = reobserved {
-                let sec_company = prepared.evidence.native_lineage().implementation()
-                    == "sec_edgar_v1"
-                    && company_identity.as_ref().is_some_and(|company| {
-                        matches!(
-                            company.surface(),
-                            market_squawk_domain::CompanyIdentitySurface::SecSubmissions
-                                | market_squawk_domain::CompanyIdentitySurface::SecCompanyFacts
-                        )
-                    });
-                if (!sec_company
-                    && (company_identity.is_some() || !revisions.is_locally_observed()))
-                    || (sec_company && revisions.is_locally_observed())
+                let local_revisions_expected = match (
+                    prepared.evidence.native_lineage().implementation(),
+                    company_identity.as_ref().map(|company| company.surface()),
+                ) {
+                    (
+                        "sec_edgar_v1",
+                        Some(market_squawk_domain::CompanyIdentitySurface::SecSubmissions),
+                    )
+                    | (_, None) => true,
+                    (
+                        "sec_edgar_v1",
+                        Some(market_squawk_domain::CompanyIdentitySurface::SecCompanyFacts),
+                    ) => false,
+                    _ => return Err(IngestError::ReplayConflict),
+                };
+                if revisions.is_locally_observed() != local_revisions_expected
                     || !revisions.native_lineage_required()
                     || revisions.len() != sealed_capture.batch().records().len()
                 {

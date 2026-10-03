@@ -144,12 +144,17 @@ impl ProviderOnboardingService {
             resumed = self.catalog.resume_provider_onboarding(session_id)?;
             profile = self.profile_for(&resumed)?;
         }
-        // The reservation deadline bounds initial setup, not an already activated runtime.
+        // The reservation bounds the initial operation, not a stored credential's lifetime.
+        // Pending stored setup retains its exact generation until activation or explicit cleanup.
         // Anonymous ActiveScoped sessions intentionally have no credential generation; their
         // current capability, rights and runtime-evidence expiry remain checked by the lease.
         if capability_is_current
             && resumed.lifecycle().state() != OnboardingState::ActiveScoped
             && resumed.lifecycle().active_generation().is_none()
+            && resumed
+                .lifecycle()
+                .retained_setup_credential_generation()
+                .is_none()
             && !schwab_oauth_bootstrap_retained(resumed.lifecycle())
             && !alpaca_verified_candidate_retained(resumed.lifecycle())
             && !matches!(
@@ -395,9 +400,22 @@ impl ProviderOnboardingService {
                 let schwab_bootstrap_recognized = authority_recognized
                     && exact_capability == profile.map(|profile| profile.capability())
                     && schwab_oauth_bootstrap_retained(lifecycle);
+                let pending_setup_recognized = authority_recognized
+                    && profile
+                        .zip(exact_capability)
+                        .is_some_and(|(profile, capability)| {
+                            capability == profile.capability()
+                                && matches!(
+                                    profile.release_state(),
+                                    ProfileReleaseState::Available
+                                        | ProfileReleaseState::RightsLimited
+                                )
+                        })
+                    && lifecycle.retained_setup_credential_generation().is_some();
                 if (!current_runtime_admitted
                     && secret_authority_retained
-                    && !schwab_bootstrap_recognized)
+                    && !schwab_bootstrap_recognized
+                    && !pending_setup_recognized)
                     || !authority_recognized
                 {
                     self.quarantine_startup_authority(&resumed)?;
