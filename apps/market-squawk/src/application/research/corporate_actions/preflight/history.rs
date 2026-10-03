@@ -83,6 +83,11 @@ impl SourceActionPreparationCapability {
         context: &RequestContext,
     ) -> Result<PublishedAnchorHistory, ServiceError> {
         check(context)?;
+        let started = Instant::now();
+        let progress = |stage: &'static str| {
+            tracing::info!(stage, instrument_id = %instrument.definition().instrument_id(), elapsed_ms = started.elapsed().as_millis(), "preparing canonical price history");
+        };
+        progress("history-native-identity");
         let selected_at = now()?;
         let namespace = SourceId::try_from("alpaca-basic-asset-reference-v1")
             .map_err(|_| ServiceError::Internal)?;
@@ -175,6 +180,7 @@ impl SourceActionPreparationCapability {
             runtime.runtime_evidence_digest(),
             runtime.credential_generation(),
         )?;
+        progress("history-plan-admission");
         let receipt = self
             .runtime
             .admit_alpaca_historical_plan(
@@ -190,6 +196,7 @@ impl SourceActionPreparationCapability {
                 tracing::warn!(?error, "historical plan admission failed");
                 controlled(context, ServiceError::Unavailable)
             })?;
+        progress("history-plan-authorization");
         let authorized = self
             .runtime
             .authorize_alpaca_historical_plan_receipt(
@@ -217,6 +224,7 @@ impl SourceActionPreparationCapability {
         drop(authorized);
         let profile = SourceIdentifier::try_from("alpaca.basic-market-data.historical-v1")
             .map_err(|_| ServiceError::Internal)?;
+        progress("history-discovery");
         let discovery = self
             .ingest
             .discover_registered_objects(
@@ -266,6 +274,7 @@ impl SourceActionPreparationCapability {
         )?;
         // Calls the sole coordinator directly under this operation's existing context. No child
         // job, second runtime, callback publisher, or native-authored capture is introduced.
+        progress("history-ingest");
         let publication = match commit {
             Some(commit) => {
                 self.ingest
@@ -285,6 +294,7 @@ impl SourceActionPreparationCapability {
                 "historical publication unavailable"
             );
         })?;
+        progress("history-published");
         drop(rollback); // Receipt revocation is idempotent after the one-use ingest consumes it.
         let manifest: ManifestWire = serde_json::from_value(
             publication

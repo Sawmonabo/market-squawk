@@ -24,6 +24,7 @@ impl SourceActionPreparationCapability {
         if captured_at > now()? || instrument.published_at() > captured_at {
             return Err(ServiceError::InvalidRequest);
         }
+        tracing::info!(stage = "selected-history-runtime", instrument_id = %instrument.definition().instrument_id(), "preparing selected price history");
         let runtime = self
             .runtime
             .current_alpaca_calendar_runtime(context.deadline(), context.cancellation())
@@ -45,6 +46,7 @@ impl SourceActionPreparationCapability {
             .await?;
         // This read is pinned to the actual committed manifest; it never selects another latest
         // window or substitutes raw prices. Projection is independently derived by Market.GetHistory.
+        tracing::info!(stage = "selected-history-reopen", instrument_id = %instrument.definition().instrument_id(), "preparing selected price history");
         let history = self
             .reopen_published_history(published, now()?, context)
             .await?;

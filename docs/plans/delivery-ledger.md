@@ -2,6 +2,12 @@
 
 ## Current execution — 2026-10-02
 
+Matched single-job development build PASS (6m25s), including calendar batching, original-read
+separation and selected-history stage diagnostics. Supervisor started replacement service20932
+from generationEEd0Pu; existing Desktop remains visible while reconnecting. Await startup/source
+restoration before live retry. Backend diagnostics checkpoint is build-verified, not chart completion.
+
+
 Additional history consumer defect corrected: initial missing history no longer guesses nominal
 calendar-date viewport bounds. Native timestamped projections reject those bounds after the first
 publication. Initial read now establishes time precision with the bounded point projection, while
