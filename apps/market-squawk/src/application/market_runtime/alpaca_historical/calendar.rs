@@ -476,7 +476,7 @@ impl AlpacaHistoricalRuntimeCapability {
 
         for (row_index, row) in range_rows.into_iter().enumerate() {
             ensure_before(deadline, cancellation)?;
-            self.validate_current(cancellation).await?;
+            self.validate_normalization_at(clock.now()?)?;
             let producer_request =
                 AlpacaIexUtcCalendarFetchRequest::try_new(producer_environment, row.date)?;
             if producer_request.method() != transport_request.method()

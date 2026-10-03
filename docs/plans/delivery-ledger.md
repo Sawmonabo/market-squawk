@@ -2,6 +2,35 @@
 
 ## Current execution — 2026-10-02
 
+Current outcome: compact watchlist and automatic first-open history are live. Matched build PASS
+(5m18s), service27815/native27852 generationtU6dcK. Fresh SPY job
+`b63933de-17ed-435a-bb6a-b05968721b0e` completed: admission7.7s, published20.5s;
+native saved-history read251 bars in152ms. QQQ251/145ms, MSFT251/135ms. These are query timings,
+not whole-screen paint or all-symbol completion. Calendar pure normalization now avoids a full
+onboarding replay per row, preserving entry/exit/revocation/expiry checks. Remaining five
+unopened starter histories are not yet acquired. Watcher remains running; duplicate queued build
+was terminated after deployed binary confirmed final stage diagnostics. Frontend retry icon
+checkpoint `1b90f167` pushed/typecheck PASS. No new worktree, CI, memory measurement or quarter review.
+
+Lead owns the two remaining history error-retry controls in `market-history-read.tsx`, reusing the
+shared faint refresh icon instead of text buttons. Backend three-file correction is frozen and
+compiling once under the existing supervisor. No new test suite or competing build.
+
+SPY admission ended RuntimeUnavailable with an activation-expired diagnostic; no self-deadlock
+has been established. Astra owns only `application/market_runtime/alpaca_historical/calendar.rs`
+to reuse existing in-memory revocation/expiry validation during pure row normalization, retaining
+full durable entry/exit validation. It also traces lease expiry/currentness read-only. Lead owns
+all other source and critical checks. Watcher paused to batch this correction; app remains running.
+
+QQQ original job is confirmed completed and its251 history rows reopen after matched restart.
+Fresh SPY first-open admits one request but currently stops at `history-plan-admission` after
+native identity selection (21ms), before plan authorization. Astra stock_workflow_trace reads
+only `application/market_runtime.rs::admit_alpaca_historical_plan` and its source-directory lease/
+authorization dependencies to identify an actual lock-order/self-contention defect. Local report
+only until exact fix ownership is approved by lead. No new job or speculative retry. Lead retains
+native verification, source mutations and build/Git scheduling.
+
+
 Matched single-job development build PASS (6m25s), including calendar batching, original-read
 separation and selected-history stage diagnostics. Supervisor started replacement service20932
 from generationEEd0Pu; existing Desktop remains visible while reconnecting. Await startup/source

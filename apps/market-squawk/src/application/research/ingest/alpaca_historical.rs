@@ -1554,9 +1554,18 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
         cancellation: &CancellationToken,
         identity: Arc<dyn CurrentCatalogProviderIdentity>,
     ) -> Result<AlpacaHistoricalAdmittedPlan, AlpacaHistoricalPlanAdmissionError> {
+        let started = Instant::now();
+        let progress = |stage: &'static str| {
+            tracing::info!(
+                stage,
+                elapsed_ms = started.elapsed().as_millis(),
+                "admitting historical directory plan"
+            );
+        };
         // A single generation owns this directory's mutation authority. Serializing the bounded
         // network preflight with publication prevents concurrent identical clicks from minting
         // different observation-time receipts before either immutable record becomes visible.
+        progress("history-directory-admission-lock");
         let _admission = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
@@ -1567,6 +1576,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             }
             admission = self.inner.admission.lock() => admission,
         };
+        progress("history-directory-runtime-currentness");
         self.inner
             .runtime
             .require_current(deadline, cancellation)
@@ -1579,6 +1589,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
         if timeframe.as_str() != "1Day" {
             return Err(AlpacaHistoricalPlanAdmissionError::CalendarUnavailable);
         }
+        progress("history-directory-instrument-validation");
         AlpacaHistoricalEquitySource::validate_one_preflight_instrument(
             &self.inner.metadata,
             &preflight_plan,
@@ -1587,6 +1598,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
         )
         .map_err(|_error| AlpacaHistoricalPlanAdmissionError::InvalidInstrumentAuthority)?;
         {
+            progress("history-directory-existing-plan");
             let plans = self
                 .inner
                 .plans
@@ -1599,6 +1611,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
                 if existing.canonical_instrument == canonical_instrument
                     && existing.identity.evidence() == identity.evidence()
                 {
+                    progress("history-directory-existing-complete");
                     return Ok(admitted_plan(existing));
                 }
                 return Err(AlpacaHistoricalPlanAdmissionError::IdentityCollision);
@@ -1610,6 +1623,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
         let provider_instrument_id =
             ProviderInstrumentId::try_from(preflight_plan.mapping().symbol().to_owned())
                 .map_err(|_error| AlpacaHistoricalPlanAdmissionError::InvalidInstrumentAuthority)?;
+        progress("history-directory-provider-preflight");
         let preflight = self
             .inner
             .runtime
@@ -1621,6 +1635,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             )
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::PreflightUnavailable)?;
+        progress("history-directory-calendar-composition");
         let bar_time_authority = self
             .inner
             .runtime
@@ -1634,6 +1649,7 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             )
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::CalendarUnavailable)?;
+        progress("history-directory-plan-binding");
         let plan = AlpacaHistoricalEquityDatasetPlan::bind_preflight(
             preflight.plan().clone(),
             bar_time_authority.series_semantics().clone(),
@@ -1682,11 +1698,13 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
             retained_response_bytes,
         });
 
+        progress("history-directory-final-currentness");
         self.inner
             .runtime
             .require_current(deadline, cancellation)
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        progress("history-directory-plan-insertion");
         let record = {
             let mut plans = self
                 .inner
@@ -1732,11 +1750,13 @@ impl AlpacaHistoricalPlanDirectoryAuthority {
                 }
             }
         };
+        progress("history-directory-inserted-currentness");
         self.inner
             .runtime
             .require_current(deadline, cancellation)
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        progress("history-directory-complete");
         Ok(admitted_plan(record.as_ref()))
     }
 }

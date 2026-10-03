@@ -1693,11 +1693,20 @@ impl MarketRuntimeRegistry {
         cancellation: &CancellationToken,
         identity: Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
     ) -> Result<AlpacaHistoricalPlanReceipt, AlpacaHistoricalPlanAdmissionError> {
+        let started = Instant::now();
+        let progress = |stage: &'static str| {
+            tracing::info!(
+                stage,
+                elapsed_ms = started.elapsed().as_millis(),
+                "admitting historical plan"
+            );
+        };
         if request.surface() != AccountMarketSurface::AlpacaBasic {
             return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
         }
         ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        progress("history-admission-initial-mutation");
         let (surface_id, capability) = {
             let _mutation = bounded_lock(&self.mutation, deadline, cancellation)
                 .await
@@ -1706,6 +1715,7 @@ impl MarketRuntimeRegistry {
                 .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
             let surface_id = try_surface_identifier(AccountMarketSurface::AlpacaBasic)
                 .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+            progress("history-admission-initial-entries");
             let entries = bounded_lock(&self.entries, deadline, cancellation)
                 .await
                 .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
@@ -1724,15 +1734,18 @@ impl MarketRuntimeRegistry {
                 .ok_or(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
             (surface_id, capability)
         };
+        progress("history-admission-runtime-currentness");
         capability
             .require_current(deadline, cancellation)
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        progress("history-admission-source-install");
         let lease = self
             .alpaca_historical_source
             .install_or_join_runtime(capability.clone(), deadline, cancellation)
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        progress("history-admission-directory-plan");
         let receipt = lease
             .admit_plan(
                 preflight_plan,
@@ -1743,12 +1756,14 @@ impl MarketRuntimeRegistry {
             )
             .await?;
         drop(lease);
+        progress("history-admission-final-mutation");
         let mutation = bounded_lock(&self.mutation, deadline, cancellation)
             .await
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
         ensure_alpaca_historical_lookup(&self.accepting, deadline, cancellation)
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
         {
+            progress("history-admission-final-entries");
             let entries = bounded_lock(&self.entries, deadline, cancellation)
                 .await
                 .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
@@ -1761,6 +1776,7 @@ impl MarketRuntimeRegistry {
             let MarketRuntime::Account(group) = &entry.runtime else {
                 return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
             };
+            progress("history-admission-final-currentness");
             if !group.owns_alpaca_historical_capability(&capability)
                 || !receipt.matches_group_generation(group.evidence().group_generation())
                 || capability.is_revoked()
@@ -1769,10 +1785,12 @@ impl MarketRuntimeRegistry {
                 return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
             }
         }
+        progress("history-admission-receipt-validation");
         let validated = self
             .alpaca_historical_source
             .validate_plan_receipt(&receipt, deadline, cancellation)
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
+        progress("history-admission-publication-authority");
         let authorized = validated
             .authorize(deadline, cancellation)
             .await
@@ -1782,6 +1800,7 @@ impl MarketRuntimeRegistry {
         if !receipt.matches_group_generation(capability.group_generation()) {
             return Err(AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable);
         }
+        progress("history-admission-authorized-currentness");
         capability
             .validate_current_now()
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
@@ -1790,6 +1809,7 @@ impl MarketRuntimeRegistry {
             .map_err(|_error| AlpacaHistoricalPlanAdmissionError::RuntimeUnavailable)?;
         drop(mutation);
         drop(authorized);
+        progress("history-admission-complete");
         Ok(receipt)
     }
 
