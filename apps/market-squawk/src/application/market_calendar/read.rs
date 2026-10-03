@@ -42,6 +42,8 @@ use tokio_util::sync::CancellationToken;
 const MAXIMUM_ORIGIN_CANDIDATES: usize = 64;
 const MAXIMUM_CALENDAR_QUERY_ROWS: u64 = 100_000;
 const MAXIMUM_CALENDAR_QUERY_BYTES: u64 = 64 * 1024 * 1024;
+// Bound transient projection reconstruction independently of the query engine's batch size.
+const CALENDAR_DECODE_CHUNK_ROWS: usize = 256;
 
 /// Public references retain only immutable content commitments. They contain no provider choice,
 /// request builder, source ID, or physical path and are not publication or account authority.
@@ -829,37 +831,70 @@ async fn read_calendar_origin(
         cancellation,
     };
     for batch in batches {
-        check(deadline, cancellation)?;
-        let (records, retained_bytes) =
-            ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
-                batch.clone(),
-                &binding,
-                remaining_read_bytes,
-                &control,
-            )
-            .map_err(|_| calendar_invalid("calendar-origin-row-decode"))?;
-        remaining_read_bytes = remaining_read_bytes
-            .checked_sub(retained_bytes)
-            .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?;
-        for (ordinal, record) in records {
+        // Slices share the query's buffers. The decoder still charges those backing arrays;
+        // only per-row decoding/reconstruction becomes bounded by this smaller work unit.
+        for offset in (0..batch.num_rows()).step_by(CALENDAR_DECODE_CHUNK_ROWS) {
             check(deadline, cancellation)?;
-            let ResearchObservation::MarketCalendar(calendar) = record else {
-                return Err(calendar_invalid("calendar-origin-row-type"));
-            };
-            let provenance = calendar.context().provenance();
-            if provenance.received_at() > as_of
-                || provenance.ingested_at() > as_of
-                || provenance.ingested_at() > published_at
-                || calendar.observed_at() > as_of
-                || provenance
-                    .availability()
-                    .conservative_available_at()
-                    .is_none_or(|available| available > as_of)
-                || rows.len() >= binding.record_count()
-            {
-                return Err(calendar_invalid("calendar-origin-row-clock-or-count"));
+            let chunk_rows = CALENDAR_DECODE_CHUNK_ROWS.min(batch.num_rows() - offset);
+            let (records, retained_bytes) =
+                ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
+                    batch.slice(offset, chunk_rows),
+                    &binding,
+                    remaining_read_bytes,
+                    &control,
+                )
+                .map_err(|error| {
+                    // ArrowConversionError Display exposes fixed variants and numeric bounds only.
+                    tracing::warn!(
+                        stage = "calendar-origin-row-decode",
+                        error = %error,
+                        batch_rows = batch.num_rows(),
+                        chunk_offset = offset,
+                        chunk_rows,
+                        remaining_bytes = remaining_read_bytes,
+                        binding = %encode_digest(binding.binding_digest()),
+                        "completed market calendar row decoding failed"
+                    );
+                    use market_squawk_data::ArrowConversionError;
+                    use market_squawk_platform::ResearchObjectControlError;
+                    match error {
+                        ArrowConversionError::RetainedLimitExceeded { .. }
+                        | ArrowConversionError::RetainedSizeOverflow
+                        | ArrowConversionError::AllocationFailure => {
+                            CompletedMarketSessionError::ResourceBoundExceeded
+                        }
+                        ArrowConversionError::ObjectControl(
+                            ResearchObjectControlError::Cancelled,
+                        ) => CompletedMarketSessionError::Cancelled,
+                        ArrowConversionError::ObjectControl(
+                            ResearchObjectControlError::DeadlineExceeded,
+                        ) => CompletedMarketSessionError::DeadlineExceeded,
+                        _ => CompletedMarketSessionError::InvalidEvidence,
+                    }
+                })?;
+            remaining_read_bytes = remaining_read_bytes
+                .checked_sub(retained_bytes)
+                .ok_or(CompletedMarketSessionError::ResourceBoundExceeded)?;
+            for (ordinal, record) in records {
+                check(deadline, cancellation)?;
+                let ResearchObservation::MarketCalendar(calendar) = record else {
+                    return Err(calendar_invalid("calendar-origin-row-type"));
+                };
+                let provenance = calendar.context().provenance();
+                if provenance.received_at() > as_of
+                    || provenance.ingested_at() > as_of
+                    || provenance.ingested_at() > published_at
+                    || calendar.observed_at() > as_of
+                    || provenance
+                        .availability()
+                        .conservative_available_at()
+                        .is_none_or(|available| available > as_of)
+                    || rows.len() >= binding.record_count()
+                {
+                    return Err(calendar_invalid("calendar-origin-row-clock-or-count"));
+                }
+                rows.push((ordinal, calendar));
             }
-            rows.push((ordinal, calendar));
         }
     }
     rows.sort_unstable_by_key(|(ordinal, _)| *ordinal);
@@ -937,9 +972,7 @@ pub(super) fn calendar_worker_failure(stage: &'static str, error: &ResearchServi
         ResearchServiceError::Ingest(IngestError::AuthorityBusy)
         | ResearchServiceError::Ingest(IngestError::Catalog(CatalogError::AuthorityBusy))
         | ResearchServiceError::Catalog(CatalogError::AuthorityBusy) => "catalog-busy",
-        ResearchServiceError::Ingest(IngestError::AuthorityLockPoisoned) => {
-            "catalog-lock-poisoned"
-        }
+        ResearchServiceError::Ingest(IngestError::AuthorityLockPoisoned) => "catalog-lock-poisoned",
         ResearchServiceError::Ingest(IngestError::Cancelled) => "cancelled",
         ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => "deadline-exceeded",
         ResearchServiceError::Ingest(IngestError::ProviderCaptureRequired) => {
@@ -949,12 +982,10 @@ pub(super) fn calendar_worker_failure(stage: &'static str, error: &ResearchServi
         | ResearchServiceError::Manifest(_) => "manifest-error",
         ResearchServiceError::Ingest(IngestError::Catalog(_))
         | ResearchServiceError::Catalog(_) => "catalog-error",
-        ResearchServiceError::Ingest(IngestError::SealedProviderCapture(
-            StoreError::Io { .. },
-        ))
-        | ResearchServiceError::ProviderCaptureStore(StoreError::Io { .. }) => {
-            "capture-store-io"
-        }
+        ResearchServiceError::Ingest(IngestError::SealedProviderCapture(StoreError::Io {
+            ..
+        }))
+        | ResearchServiceError::ProviderCaptureStore(StoreError::Io { .. }) => "capture-store-io",
         ResearchServiceError::Ingest(IngestError::SealedProviderCapture(_))
         | ResearchServiceError::ProviderCaptureStore(_) => "capture-store-error",
         ResearchServiceError::Ingest(_) => "ingest-error",

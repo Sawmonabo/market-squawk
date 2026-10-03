@@ -2,6 +2,16 @@
 
 ## Current execution — 2026-10-02
 
+Calendar bounded decoding critical fixture PASS (1, 8.72s): a 2,712-row physical query containing
+2,709 selected calendar rows fails whole-batch decoding under the same 64 MiB allowance but
+succeeds in bounded chunks with complete ordinal/provenance/native replay checks. Earlier fixture
+failures exposed reused ingestion identity, tiny test staging and retained prior rows; producer
+fixture configuration now matches installed settings and preserves exact selected-row assertions.
+No product budget was increased. Calendar implementation and test frozen; next is one matched
+single-job build, then exact native history/workflow verification. `f5e99622` pushed the independent
+Desktop automatic history correction. No live chart-completion claim yet.
+
+
 Automatic history loading/recovery is implemented and critically verified: one first-open 365-day
 request when no history/previous intent exists; missing and transiently failed reads observe later
 market publication, preserve the exact acquired generation and stop routine rereads after recovery.
