@@ -146,7 +146,7 @@ export function usePreparationController(props: PreparationControllerProps) {
         if (queryClient.getQueryData<Preparation | null>(receiptKey)?.startRequestId !== original.startRequestId) return
         queryClient.setQueryData(receiptKey, next)
         try {
-          if (next.admission === "not_admitted") sessionStorage.removeItem(storageKey(kind, scope, token))
+          if (kind === "history" && next.admission === "not_admitted") sessionStorage.removeItem(storageKey(kind, scope, token))
           else persistPreparation(kind, scope, token, next)
           setStorageError(null)
         } catch { setStorageError(kind === "history" ? "Loading recovery could not be saved. Keep this page open until loading is checked."

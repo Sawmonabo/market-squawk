@@ -43,6 +43,12 @@ vi.mock("lightweight-charts", () => ({
   }),
 }))
 
+// jsdom does not implement element scrolling used by route navigation.
+Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+  configurable: true,
+  value: () => undefined,
+})
+
 const TEST_WORKSPACE_ID = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
 const TEST_SERVICE_GENERATION = 1
 
@@ -723,6 +729,7 @@ describe("Market Squawk desktop boundary", () => {
     let finishFinancial: ((value: ApplicationResult) => void) | undefined
     const financialRead = "781276a0-33f1-4fb3-8cbb-bb2095acd0ce"
     let financialVersion = 0
+    let financialMissingReason: "identity_missing" | "no_records" = "identity_missing"
     let financialPreparationState: "running" | "cancelled" | "completed" = "running"
     let financialStarts = 0
     let wrongFinancialJob = true
@@ -732,8 +739,8 @@ describe("Market Squawk desktop boundary", () => {
     sessionStorage.removeItem(financialRecoveryKey)
     const financialPreparationRequests: { request: Parameters<ProductTransport["investmentFinancialPreparation"]>[0]; confirmed: boolean | undefined }[] = []
     const financialJob = () => ({
-      ...historyJob(), jobId: financialStarts <= 1 ? financialJobId
-        : financialStarts === 2 ? "781276a0-33f1-4fb3-8cbb-bb2095acd0cb" : "781276a0-33f1-4fb3-8cbb-bb2095acd0ca",
+      ...historyJob(), jobId: financialStarts <= 2 ? financialJobId
+        : financialStarts === 3 ? "781276a0-33f1-4fb3-8cbb-bb2095acd0cb" : "781276a0-33f1-4fb3-8cbb-bb2095acd0ca",
       kind: "research.prepare-investment-financials.v1", state: financialPreparationState,
       sequence: financialPreparationState === "running" ? financialSequence : "9007199254740995",
       cancellationRequested: financialPreparationState === "cancelled",
@@ -746,11 +753,11 @@ describe("Market Squawk desktop boundary", () => {
       financialPreparationRequests.push({ request, confirmed })
       if (request.action === "start") {
         financialPreparationState = "running"
-        if (++financialStarts === 1) throw new Error("The financial start acknowledgment was lost.")
+        if (++financialStarts <= 2) throw new Error("The financial start acknowledgment was lost.")
       }
       if (request.action === "cancel") financialPreparationState = "cancelled"
       const data = request.action === "cancelStart" || request.action === "reconcileStart"
-        ? { state: "admitted", job: financialJob() }
+        ? financialStarts === 1 ? { state: "not_admitted", job: null } : { state: "admitted", job: financialJob() }
         : request.action === "get" && wrongFinancialJob ? { ...financialJob(), jobId: historyJobId } : financialJob()
       return { data, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } }
     }
@@ -809,7 +816,7 @@ describe("Market Squawk desktop boundary", () => {
                   ...financialResult().data as object, section: request.section, items: [],
                   state: financialVersion === 0 ? "missing" : "reported",
                   families: [{ family: "filings", state: financialVersion === 0 ? "missing" : "reported",
-                    reason: financialVersion === 0 ? "no_records" : null }],
+                    reason: financialVersion === 0 ? financialMissingReason : null }],
                   nextCursor: null,
                 },
                 metadata: { completeness: "complete", returnedItems: 0, availableItems: 0 },
@@ -858,6 +865,11 @@ describe("Market Squawk desktop boundary", () => {
     expect((await facts.findByRole("alert")).textContent).toContain("Could not update financial information")
     expect(facts.getByText("USD 123,456.78")).toBeTruthy()
     expect(screen.getByRole("heading", { name: "MSQ · Requested investment" })).toBeTruthy()
+    requestedRow.identity.assetClass = "fund"
+    const instrumentReadsBeforeFund = issuedQueries.filter((request) => request.query === "marketInstrument").length
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketInstrument")).toHaveLength(instrumentReadsBeforeFund + 1))
+    await waitFor(() => expect((facts.getByRole("button", { name: "Retry" }) as HTMLButtonElement).disabled).toBe(false))
     financialMode = "pending"
     await userEvent.setup().click(facts.getByRole("button", { name: "Retry" }))
     await waitFor(() => expect(financialSignal).toBeDefined())
@@ -868,6 +880,12 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(issuedQueries).toContainEqual({ query: "closeInvestmentFinancials", selectionToken: marketSelectionToken, readToken: financialRead }))
     expect(screen.queryByRole("region", { name: "Reported financial facts" })).toBeNull()
 
+    // Fund identities do not enter the company-filing acquisition path.
+    await within(screen.getByRole("region", { name: "Filings" })).findByText("No reported information is available for this section at the information date.")
+    expect(financialPreparationRequests).toHaveLength(0)
+    requestedRow.identity.assetClass = "equity"
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh investment" }))
+
     // A successful missing-family read loads financial information automatically.
     // Recover its lost acknowledgment, reject another job, and cancel using
     // the original lossless generation and the last checked sequence.
@@ -876,9 +894,33 @@ describe("Market Squawk desktop boundary", () => {
     await financialControls.findByText("Loading could not be checked. Check the original request before trying again.")
     expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
     expect(financialControls.queryByRole("button", { name: /^(Load|Update) financial information$/ })).toBeNull()
-    const financialStart = financialPreparationRequests[0]!.request
+
+    const notAdmittedStart = financialPreparationRequests[0]!.request
+    if (notAdmittedStart.action !== "start") throw new Error("Expected the original financial Start.")
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Check loading" }))
+    await financialControls.findByText("The original request did not start. Information can be loaded again.")
+    expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!)).toMatchObject({ startRequestId: notAdmittedStart.startRequestId, receipt: null })
+    investment.unmount()
+    investment = openInvestment(lookupRoute(parsed.matches[0]!))
+    await screen.findByRole("heading", { name: "MSQ · Requested investment" })
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Filings" }))
+    financialControlNode = screen.getByRole("group", { name: "Financial information loading" })
+    financialControls = within(financialControlNode)
+    await financialControls.findByText("The original request did not start. Information can be loaded again.")
+    await within(screen.getByRole("region", { name: "Filings" })).findByText("No reported information is available for this section at the information date.")
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "reconcileStart")).toEqual([
+      { request: { action: "reconcileStart", selectionToken: marketSelectionToken, startRequestId: notAdmittedStart.startRequestId }, confirmed: false },
+      { request: { action: "reconcileStart", selectionToken: marketSelectionToken, startRequestId: notAdmittedStart.startRequestId }, confirmed: false },
+    ])
+    await userEvent.setup().click(financialControls.getByRole("button", { name: "Retry" }))
+    await financialControls.findByText("Loading could not be checked. Check the original request before trying again.")
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+    const retriedStart = financialPreparationRequests.filter(({ request }) => request.action === "start").at(-1)!
+    const financialStart = retriedStart.request
     if (financialStart.action !== "start") throw new Error("Expected financial Start.")
-    expect(financialPreparationRequests[0]!.confirmed).toBe(true)
+    expect(retriedStart.confirmed).toBe(true)
+    expect(financialStart.startRequestId).not.toBe(notAdmittedStart.startRequestId)
     expect(financialStart).toEqual({ action: "start", selectionToken: marketSelectionToken, startRequestId: financialStart.startRequestId })
     expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).startRequestId).toBe(financialStart.startRequestId)
     await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel loading" }))
@@ -888,7 +930,7 @@ describe("Market Squawk desktop boundary", () => {
     })
     expect(financialControls.queryByRole("button", { name: "Cancel loading" })).toBeNull()
     expect(financialControls.queryByRole("button", { name: "Retry" })).toBeNull()
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
     wrongFinancialJob = false
     await userEvent.setup().click(financialControls.getByRole("button", { name: "Check loading" }))
     await financialControls.findByText(/^Loading financial information…/)
@@ -896,6 +938,7 @@ describe("Market Squawk desktop boundary", () => {
       jobId: financialJobId, generation: jobGeneration, sequence: financialSequence,
     })
     const financialReadsBeforeCancel = issuedQueries.filter((request) => request.query === "investmentFinancials").length
+    financialMissingReason = "no_records"
     await userEvent.setup().click(financialControls.getByRole("button", { name: "Cancel loading" }))
     await financialControls.findByText("Financial information loading was cancelled.")
     expect(financialPreparationRequests.at(-1)).toEqual({ request: {
@@ -908,7 +951,7 @@ describe("Market Squawk desktop boundary", () => {
     })
     expect(financialControls.getByText("Financial information loading was cancelled.")).toBeTruthy()
     expect(financialControls.queryByText("Financial information is ready.")).toBeNull()
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
     expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!)).toMatchObject({
       startRequestId: financialStart.startRequestId,
       receipt: { jobId: financialJobId, generation: jobGeneration, sequence: "9007199254740995" },
@@ -922,12 +965,12 @@ describe("Market Squawk desktop boundary", () => {
     financialControls = within(financialControlNode)
     await financialControls.findByText("Financial information loading was cancelled.")
     await within(screen.getByRole("region", { name: "Filings" })).findByText("No reported information is available for this section at the information date.")
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(1)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
     expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).startRequestId).toBe(financialStart.startRequestId)
 
     await userEvent.setup().click(financialControls.getByRole("button", { name: "Retry" }))
     await financialControls.findByText(/^Loading financial information…/)
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(3)
     await userEvent.setup().click(screen.getByRole("tab", { name: "Facts" }))
     expect(screen.getByRole("group", { name: "Financial information loading" })).toBe(financialControlNode)
     const preparedFacts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
@@ -974,7 +1017,7 @@ describe("Market Squawk desktop boundary", () => {
     await act(async () => { publishFinancialJob() })
     await financialControls.findByText("Financial information is ready.")
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(freshReads)
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(3)
     expect(JSON.parse(sessionStorage.getItem(financialRecoveryKey)!).receipt).toMatchObject({
       jobId: "781276a0-33f1-4fb3-8cbb-bb2095acd0cb", generation: jobGeneration, sequence: "9007199254740995",
     })
@@ -982,7 +1025,7 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(issuedQueries.filter((request) => request.query === "investmentFinancials").at(-1)).toEqual({
       query: "investmentFinancials", selectionToken: marketSelectionToken, section: "filings", limit: 32,
     }))
-    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
+    expect(financialPreparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(3)
 
     // Selecting a recent range loads it immediately; a lost acknowledgment
     // survives a fresh App/QueryClient without replaying the durable start.

@@ -88,6 +88,54 @@ explicitly covers metadata missing before registration and present at registrati
 is `market-squawk-data --test publication_recovery`. No new test harness/case. Next barrier:
 matched rebuild and resume of the same original workflow, keeping current app available.
 
+Independent provider-to-screen lane during the one matched build: native owner navigation
+currently shows AAPL Statements with successful transport but `identity_missing` for company_facts
+and filing_details. GPT-6.1 Sol High `financial_display_fixes` owns read-only trace of current
+financial projection/preparation/SEC identity consumers, writing only
+`.agents/tmp/v1-first-stock/aapl-financial-identity-diagnosis.md`. Determine exact missing wiring
+or valid acquisition state and smallest correction; no source/build/Git/runtime mutations,
+no invented values. Lead retains integration and original MSFT live recovery checks.
+
+AAPL trace confirms missing automatic trigger while native preparation already resolves eligible
+SEC identities. Backend admission remains exact equity/non-ETF/listing authority; current AAPL
+qualifies and QQQ is Fund. GPT-6.1 Sol High `financial_display_fixes` now owns only Desktop
+`features/markets/investment-page.tsx`, `investment-financials.tsx`, `preparation-controls.tsx`
+and the existing relevant financial journey in `src/test/app.test.tsx`: pass canonical instrument
+eligibility for rendering, include missing/identity_missing in automatic preparation, and retain
+not_admitted terminal recovery instead of automatic reattempt on remount. No new transport/domain
+logic, provider fetcher or testsuite. Lead runs TypeScript and that existing critical journey after
+freeze; Rust compilation remains singular and existing native account validation stays decisive.
+
+Matched clock-fix build PASS5m17s, service86277/Desktop86311. Resume now records9steps but no
+saved result; this count is not proof of completed analytical stages. Read-only catalog confirms
+all3original captures still pending, none published. Latest failing read is calendar evidence:
+8,127-row Arrow batch requires90,283,916 retained bytes against64,854,976 remaining. A sliced
+256-row chunk still shares/charges the full backing batch. No limit increase authorized/needed
+as a substitute for bounded processing. Astra `options_original_recovery` owns read-only diagnosis
+of `application/market_calendar/read.rs` plus directly called Arrow/read query implementation,
+append existing options recovery report only; identify smallest bounded selective/streamed fix
+preserving exact evidence. No edits/build/Git/runtime. Lead retains all source integration.
+
+Calendar diagnosis confirms unfiltered SELECT*+ORDER BY materializes8,127rows before slicing;
+Arrow slices retain full buffers and decoder admission correctly charges them. Existing
+AnalyticalReadCapability observation/pinned-object batch cursors already provide bounded reads.
+Astra `options_original_recovery` now owns only `application/market_calendar/read.rs` to replace
+this eager read with the existing exact-manifest cursor, preserving source/binding/PIT clocks,
+original row identity and bounded decoded accumulation. Lead reserves tests/integration/runtime.
+No cap increase or new cursor infrastructure. Existing calendar/reobservation/restart check is
+selected after agent freeze; no competing build.
+
+Financial autoload integration: TypeScript PASS; existing `keeps lookup output closed and bound
+to exact product destinations` critical journey PASS1/1 (2.53s). Initial run exposed missing
+jsdom HTMLElement.scrollTo, corrected only in its existing test setup; no production workaround.
+Covers missing-identity acquisition, fund exclusion, exact lost-ack recovery, not-admitted remount
+without duplicate Start, explicit retry/cancellation and retained pagination. Native AAPL read is
+next; no live financial completion claim yet. Calendar lane additionally owns only the existing
+large-calendar tail in `data/tests/publication_recovery.rs` to cover multiple 2,709-row originals
+through the exact-object cursor; lead schedules tests/build/Git. Previous status-only turn made
+no implementation progress; execution resumed against confirmed live service86277/Desktop86311,
+with watcher99703 paused during the bounded edit/check wave.
+
 ### Current continuation wave — 2026-10-02 late session
 
 Prior turn: progress, pushed `3ee4d7a9` with native history evidence. Fresh branch clean; service53066,

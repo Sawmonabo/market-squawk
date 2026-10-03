@@ -129,7 +129,8 @@ function SelectedInvestment({ selectionToken, bootstrap, transport }: {
         </section>
       </aside>
     </div>
-    <InvestmentFinancials selectionToken={selectionToken} bootstrap={bootstrap} transport={transport} refreshRevision={refreshRevision} />
+    <InvestmentFinancials selectionToken={selectionToken} bootstrap={bootstrap} transport={transport}
+      preparationEligible={row?.identity.assetClass === "equity"} refreshRevision={refreshRevision} />
   </main>
 }
 

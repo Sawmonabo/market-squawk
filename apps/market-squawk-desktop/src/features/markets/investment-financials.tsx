@@ -29,6 +29,7 @@ import {
 
 type FinancialProps = {
   refreshRevision?: number
+  preparationEligible: boolean
   selectionToken: string
   bootstrap: DesktopBootstrap
   transport: ProductTransport
@@ -57,7 +58,8 @@ function SelectedFinancials(props: FinancialProps) {
   const [needsData, setNeedsData] = React.useState(false)
   const onRead = React.useCallback((result: InvestmentFinancialsResult) => {
     setNeedsData(result.state === "preparation_required" || result.families.some((family) =>
-      family.reason === "preparation_required" || family.state === "missing" && family.reason === "no_records"))
+      family.reason === "preparation_required" || family.state === "missing"
+        && (family.reason === "no_records" || family.reason === "identity_missing")))
   }, [])
   const [preparationCompleted, setPreparationCompleted] = React.useState(false)
   const onPrepared = React.useCallback(async () => {
@@ -71,7 +73,7 @@ function SelectedFinancials(props: FinancialProps) {
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment financial information">
     <h2 className="text-base font-semibold">Financial information</h2>
     <p className="mt-1 text-xs text-muted-foreground">Company reports, financial statements and ratios.</p>
-    <div className="mt-4"><FinancialPreparation {...props} needsData={needsData} onPrepared={onPrepared} onSettled={onSettled} /></div>
+    <div className="mt-4"><FinancialPreparation {...props} needsData={props.preparationEligible && needsData} onPrepared={onPrepared} onSettled={onSettled} /></div>
     <Tabs.Root defaultValue="facts" activationMode="manual" className="mt-4">
       <Tabs.List aria-label="Financial sections" className="flex flex-wrap gap-1 border-b border-border pb-2">
         {(["facts", "statements", "ratios", "filings"] as const).map((section) => <Tabs.Trigger key={section} value={section}
