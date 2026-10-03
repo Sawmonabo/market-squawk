@@ -342,7 +342,7 @@ impl CompanyFinancialMetric {
             Self::GrossProfit => "Gross profit",
             Self::OperatingExpenses => "Operating expenses",
             Self::OperatingIncome => "Operating income or loss",
-            Self::NetIncome => "Net income or loss",
+            Self::NetIncome => "Net income or loss attributable to parent",
             Self::CommonNetIncome => "Net income or loss available to common stockholders",
             Self::PreferredDividendsAndAdjustments => {
                 "Preferred dividends and other income adjustments"
@@ -1367,12 +1367,23 @@ fn project_ratios(
                 budget,
             )?,
             FundamentalPeriod::Duration { .. } => {
+                let revenue = revenue_metrics(group);
+                // Parent-attributable and consolidated income are different bases, not
+                // conflicting observations. Presence selects the basis before validation.
+                let net_income = if group
+                    .iter()
+                    .any(|candidate| candidate.fact.metric == CompanyFinancialMetric::NetIncome)
+                {
+                    CompanyFinancialMetric::NetIncome
+                } else {
+                    CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests
+                };
                 append_ratio(
                     &mut ratios,
                     group,
                     CompanyRatioMetric::GrossMargin,
                     &[CompanyFinancialMetric::GrossProfit],
-                    revenue_metrics(),
+                    revenue,
                     budget,
                 )?;
                 append_ratio(
@@ -1380,18 +1391,15 @@ fn project_ratios(
                     group,
                     CompanyRatioMetric::OperatingMargin,
                     &[CompanyFinancialMetric::OperatingIncome],
-                    revenue_metrics(),
+                    revenue,
                     budget,
                 )?;
                 append_ratio(
                     &mut ratios,
                     group,
                     CompanyRatioMetric::NetMargin,
-                    &[
-                        CompanyFinancialMetric::NetIncome,
-                        CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests,
-                    ],
-                    revenue_metrics(),
+                    &[net_income],
+                    revenue,
                     budget,
                 )?;
             }
@@ -1444,12 +1452,21 @@ fn unavailable_ratio_set(
     })
 }
 
-const fn revenue_metrics() -> &'static [CompanyFinancialMetric] {
-    &[
-        CompanyFinancialMetric::CustomerRevenueExcludingAssessedTax,
-        CompanyFinancialMetric::Revenue,
-        CompanyFinancialMetric::NetSales,
-    ]
+fn revenue_metrics(group: &[EnvelopeFactRef<'_>]) -> &'static [CompanyFinancialMetric] {
+    // Total revenue takes precedence over narrower revenue concepts, regardless of their
+    // values. An invalid selected total must not fall back to a different financial basis.
+    if group
+        .iter()
+        .any(|candidate| candidate.fact.metric == CompanyFinancialMetric::Revenue)
+    {
+        &[CompanyFinancialMetric::Revenue]
+    } else {
+        // Either concept alone can supply the fallback; both together remain ambiguous.
+        &[
+            CompanyFinancialMetric::CustomerRevenueExcludingAssessedTax,
+            CompanyFinancialMetric::NetSales,
+        ]
+    }
 }
 
 fn append_ratio(
@@ -1494,9 +1511,20 @@ fn append_ratio(
             (CompanyRatioState::Unavailable, None)
         }
     };
+    let display_name = match (metric, numerator_metrics, numerator_count) {
+        (CompanyRatioMetric::NetMargin, [CompanyFinancialMetric::NetIncome], 1..) => {
+            "Net margin attributable to parent"
+        }
+        (
+            CompanyRatioMetric::NetMargin,
+            [CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests],
+            1..,
+        ) => "Consolidated net margin",
+        _ => metric.display_name(),
+    };
     let product = CompanyRatioProduct {
         metric,
-        display_name: metric.display_name(),
+        display_name,
         state,
         value,
         unit: CompanyRatioUnit::Ratio,
@@ -2246,6 +2274,159 @@ mod tests {
             .iter()
             .all(|ratio| ratio.state() == CompanyRatioState::ConflictingInput)
         );
+
+        // TSLA's H1 filing reports both total/customer revenue and parent/consolidated
+        // income. Choose a defined basis, preserving source alternatives in statements.
+        let tsla_end = CalendarDate::new(2026, 6, 30)?;
+        let tsla_period = FundamentalPeriod::duration(CalendarDate::new(2026, 1, 1)?, tsla_end)?;
+        let project_basis = |items: &[CompanyFactProduct]| {
+            project_ratios(
+                items,
+                CompanyProductSectionState::Reported,
+                &mut CompanySerializedBudget::new(),
+            )
+        };
+        for scope in [
+            CompanyFactProductScope::CompanyWide,
+            CompanyFactProductScope::FilingDetail,
+        ] {
+            let mut tsla = Vec::new();
+            for (index, (metric, value)) in [
+                (CompanyFinancialMetric::Revenue, 50_623_000_000),
+                (
+                    CompanyFinancialMetric::CustomerRevenueExcludingAssessedTax,
+                    50_623_000_000,
+                ),
+                (CompanyFinancialMetric::GrossProfit, 9_471_000_000),
+                (CompanyFinancialMetric::OperatingIncome, 1_339_000_000),
+                (CompanyFinancialMetric::NetIncome, 1_591_000_000),
+                (
+                    CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests,
+                    1_619_000_000,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut item = fact(
+                    metric,
+                    value,
+                    usd,
+                    tsla_period,
+                    CalendarDate::new(2026, 7, 23)?,
+                    known_at,
+                    "0001628280-26-049270",
+                    3,
+                )?;
+                item.scope = scope;
+                item.effective = CompanyProductTime::CalendarDate(tsla_end);
+                item.fiscal_context = CompanyFactFiscalContext {
+                    fiscal_year: Some(2026),
+                    fiscal_period: CompanyFactFiscalPeriod::SecondQuarter,
+                    cadence: CompanyFactCadence::Quarterly,
+                };
+                if scope == CompanyFactProductScope::FilingDetail {
+                    item.lineage.xbrl_identity = Some((
+                        SourceIdentifier::try_from("c-1")?,
+                        SourceIdentifier::try_from(format!("tsla-{index}"))?,
+                    ));
+                }
+                tsla.push(item);
+            }
+            if scope == CompanyFactProductScope::FilingDetail {
+                for index in [0, 4] {
+                    let mut repeated = tsla[index].clone();
+                    repeated.reporting_context.occurrence = RevisionNumber::new(2)?;
+                    repeated.lineage.xbrl_identity = Some((
+                        SourceIdentifier::try_from("c-1")?,
+                        SourceIdentifier::try_from(format!("tsla-repeat-{index}"))?,
+                    ));
+                    tsla.push(repeated);
+                }
+            }
+            let selected = project_basis(&tsla)?;
+            assert_eq!(selected.items().len(), 3);
+            for (ratio, numerator) in selected.items().iter().zip([
+                CompanyFinancialMetric::GrossProfit,
+                CompanyFinancialMetric::OperatingIncome,
+                CompanyFinancialMetric::NetIncome,
+            ]) {
+                assert_eq!(ratio.state(), CompanyRatioState::Reported);
+                let mut expected_inputs: Vec<_> = tsla
+                    .iter()
+                    .filter(|fact| {
+                        fact.metric == numerator || fact.metric == CompanyFinancialMetric::Revenue
+                    })
+                    .map(|fact| (fact.metric == CompanyFinancialMetric::Revenue, fact))
+                    .collect();
+                let mut actual_inputs: Vec<_> = ratio
+                    .inputs()
+                    .iter()
+                    .map(|input| {
+                        (
+                            input.role() == CompanyRatioInputRole::Denominator,
+                            input.fact(),
+                        )
+                    })
+                    .collect();
+                expected_inputs.sort_unstable_by_key(|(denominator, fact)| {
+                    (*denominator, fact.reporting_context.occurrence.get())
+                });
+                actual_inputs.sort_unstable_by_key(|(denominator, fact)| {
+                    (*denominator, fact.reporting_context.occurrence.get())
+                });
+                assert_eq!(actual_inputs, expected_inputs);
+            }
+            assert_eq!(
+                selected.items()[2].value(),
+                Some(Decimal::from(1591) / Decimal::from(50623))
+            );
+            assert_eq!(
+                selected.items()[2].display_name,
+                "Net margin attributable to parent"
+            );
+            // Total-revenue selection depends on financial meaning, not equal values.
+            tsla[1].value = Decimal::ONE;
+            assert_eq!(project_basis(&tsla)?, selected);
+            for selected_index in [0, 4] {
+                let mut conflicted = tsla.clone();
+                let mut disagreeing = conflicted[selected_index].clone();
+                disagreeing.value += Decimal::ONE;
+                if scope == CompanyFactProductScope::FilingDetail {
+                    disagreeing.lineage.xbrl_identity = Some((
+                        SourceIdentifier::try_from("c-1")?,
+                        SourceIdentifier::try_from("tsla-conflicting-occurrence")?,
+                    ));
+                }
+                conflicted.push(disagreeing);
+                let rejected = project_basis(&conflicted)?;
+                for ratio in rejected.items() {
+                    if selected_index == 0 || ratio.metric() == CompanyRatioMetric::NetMargin {
+                        assert_eq!(ratio.state(), CompanyRatioState::ConflictingInput);
+                        assert!(ratio.value().is_none());
+                    } else {
+                        assert_eq!(ratio.state(), CompanyRatioState::Reported);
+                    }
+                }
+            }
+            // Consolidated income is admitted only when no parent-attributable fact exists.
+            tsla.retain(|fact| fact.metric != CompanyFinancialMetric::NetIncome);
+            let consolidated = project_basis(&tsla)?;
+            let net = &consolidated.items()[2];
+            assert_eq!(net.state(), CompanyRatioState::Reported);
+            assert_eq!(
+                net.value(),
+                Some(Decimal::from(1619) / Decimal::from(50623))
+            );
+            assert_eq!(net.display_name, "Consolidated net margin");
+            assert!(
+                net.inputs()
+                    .iter()
+                    .filter(|input| input.role() == CompanyRatioInputRole::Numerator)
+                    .all(|input| input.fact().metric()
+                        == CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests)
+            );
+        }
 
         let distinct_filings = vec![
             fact(

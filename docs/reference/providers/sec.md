@@ -197,6 +197,17 @@ index for cursor pages and complete reporting contexts for derived ratios. Quote
 remain independent. Current critical and live verification are recorded in the delivery ledger;
 this implementation description does not establish live or installed acceptance.
 
+Financial ratio basis, reviewed 2026-10-03: margins select total `Revenues` when present.
+Otherwise a sole net-sales or customer-contract-revenue concept may supply the denominator;
+multiple narrower concepts remain ambiguous. Net margin uses parent-attributable `NetIncomeLoss`
+when present, with explicitly named consolidated `ProfitLoss` only when parent income is absent.
+These are application calculation definitions, not interchangeable taxonomy aliases. The
+[FASB taxonomy guide](https://xbrl.fasb.org/impdocs/OCI_TIG/othercompincome.htm) distinguishes
+consolidated income, and [Tesla's June 2026 filing](https://www.sec.gov/Archives/edgar/data/1318605/000162828026049270/tsla-20260630.htm)
+reports both income bases separately. Conflicting occurrences of the selected concept block the
+ratio; they never trigger fallback. Original facts remain available, and each ratio retains only
+its actual selected operands within the same filing, period and reporting context.
+
 Company submissions, Company Facts and filing XBRL retain an explicit issuer subject with the
 validated CIK and `instrument_id: None` in their original observations. The source-qualified subject
 participates in revision and point-in-time family identity, keeping different issuers' facts distinct.

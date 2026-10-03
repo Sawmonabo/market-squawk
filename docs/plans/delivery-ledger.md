@@ -44,19 +44,32 @@ Artifacts under `.agents/tmp/v1-first-stock/`: `fixed-zero-tsla-{job-start,durin
 `fixed-zero-msft-concurrent-tabs.json`. No schema/data reset, migration, full gate or RAM measurement.
 Daily-change, complete financial coverage and full product/installed acceptance remain open.
 
-### Next diagnosis — remaining reported ratio conflicts
+### Active correction — explicit financial ratio bases
 
 Acceptance 1/2/5; base `bf616223`. Completed TSLA acquisition now exposes real ratio rows,
-including 24 first-page conflicts. Determine whether these are genuine source differences or an
-incorrect CompanyFacts consumer grouping before changing financial semantics.
+including 24 first-page conflicts. Diagnosis is complete: all 24 conflicts combine different revenue/income concepts; no same-concept
+value disagreement was found. Lead independently inspected native operands and consumer code.
+Select the broad revenue concept when present, retain ambiguity between multiple narrower fallbacks,
+and distinguish parent-attributable from consolidated net margin. Never fall back past a conflict
+within a selected concept. Original facts and exact filing/context boundaries remain intact.
 
 | Owner | Exclusive scope | Completion evidence |
 | --- | --- | --- |
-| Astra High `ratio_context_diagnosis` | Read-only source and retained evidence; append only `.agents/tmp/v1-first-stock/ratio-context-diagnosis.md` | Trace concrete TSLA conflict inputs and exact source contexts; explain valid versus invalid conflicts and smallest critical producer-to-consumer correction if needed |
-| Lead | All source/runtime/Git/build ownership; current evidence and ledger | Independently inspect findings before assigning implementation; no parallel build or workspace reset |
+| Astra High `ratio_context_diagnosis` | Only `apps/market-squawk/src/application/research/company_product.rs`, including its existing critical fixture | Explicit operand basis selection, truthful parent/consolidated names, retained selected input evidence and unchanged same-concept conflict validation |
+| Lead | Shared contracts/runtime/Git/build ownership; current evidence and ledger | Inspect producer/consumer impact, run existing focused fixture, commit/push and matched native financial reads |
 
-DAG: completed selected-company data → actual conflict operands → verified grouping semantics →
-bounded implementation decision. No speculative ratio fallback, hidden unavailable rows or scope expansion.
+DAG: retained concept definitions and exact operands → explicit basis selection → existing critical
+fixture → lead integration → matched native read. Watcher paused during source edits; current
+app stays running. No schema migration, coordinate regrouping, hidden unavailable rows or new test target.
+
+Implementation is integrated and agent ownership released. Lead inspected actual ratio selection,
+unchanged exact-envelope pagination and shared Desktop/CLI/MCP rendering contracts. The existing
+`statement_and_ratio_projection_requires_one_exact_filing_envelope` fixture passed 1/1 in 0.01s
+(single-job compile 5m16s; `.agents/tmp/v1-first-stock/ratio-basis-critical.log`). The uncovered
+failure was legitimate alternative revenue/income concepts being treated as conflicting observations. Selected-concept conflicts still block output. The
+reference contract records the explicit financial basis and primary FASB/filing sources.
+Matched native ratio verification remains pending; no complete-coverage claim.
+
 
 ### Integrated wave — keep reads available during financial preparation
 
