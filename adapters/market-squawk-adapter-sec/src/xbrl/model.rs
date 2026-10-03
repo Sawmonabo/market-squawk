@@ -2375,9 +2375,9 @@ mod tests {
         };
         use market_squawk_sources::{
             AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
-            EndpointPolicy, FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
+            FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
             SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-            SourceMetadataProvider, SourceProtocolProfile,
+            SourceProtocolProfile,
         };
         use std::num::{NonZeroU32, NonZeroU64};
         use std::time::Instant;
@@ -2446,10 +2446,7 @@ mod tests {
                 DeliveryEvidence::Unknown,
             )?,
             DataQuality::OfficialDelayed,
-            NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
-                "https://data.sec.gov/submissions",
-                "https://www.sec.gov/Archives/edgar/data",
-            ])?),
+            NetworkAccessPolicy::Allowlisted(SEC_EDGAR_AUTHORITY.endpoint_policy()?),
             FreshnessPolicy::try_new(1, 1, 1, 1, 0)?,
             Some(crate::sec_application_budget_policy()?),
             SourceCapabilities::new(
@@ -2462,16 +2459,27 @@ mod tests {
             ),
             SourceProtocolProfile::NotLive,
         ))?;
-        struct MetadataOwner(SourceMetadata);
-        impl SourceMetadataProvider for MetadataOwner {
-            fn metadata(&self) -> &SourceMetadata {
-                &self.0
-            }
-        }
+        let provider_rate = market_squawk_sources::ProviderRateAuthority::try_new(Arc::new(
+            market_squawk_data::SqliteProviderRateStore::try_open(
+                root.join("normalized-filing-provider-rate.sqlite3"),
+            )?,
+        ))?;
+        let source = crate::SecEdgarSource::try_new(
+            metadata.clone(),
+            crate::SecContact::try_new("SEC fixture", "fixture@example.test")?,
+            crate::FilingTaxonomySharedRateBudgets::try_new(&provider_rate)?,
+            market_squawk_sources::install_ring_tls_provider()?,
+            RawEvidenceStore::new(Dir::open_ambient_dir(root, ambient_authority())?),
+            crate::SecRepresentationRegistry::open(
+                Dir::open_ambient_dir(&registry_path, ambient_authority())?,
+                crate::SecRepresentationLimits::production_defaults(),
+            )?,
+            market_squawk_domain::ProviderIdentityRegistry::new(),
+            SecParserLimits::production_defaults(),
+        )?;
         let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let registered = registry.register(metadata.clone(), at)?;
-        let extraction_authority =
-            registry.extraction_authority(&registered, &MetadataOwner(metadata.clone()))?;
+        let extraction_authority = registry.extraction_authority(&registered, &source)?;
         // CompanyFacts uses the same complete logical stream, preserving revisions and native
         // source ordinals across the existing 256-row work window. Repeat one official fixture
         // occurrence as distinct source-array occurrences; no rows are deduplicated or capped.
@@ -2963,7 +2971,11 @@ mod tests {
             }
             native_set.seal_current_partition(&raw_store, &control)?;
             row_partitions.seal_current_partition(&raw_store, &control)?;
-            let revisions = market_squawk_sources::ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())?;
+            // Exercise the production planner: this opaque filing dataset cannot be rebuilt
+            // through the identifier-only Submissions/CompanyFacts parser.
+            let revisions = source.revision_plan(&batch)?;
+            assert!(revisions.is_locally_observed());
+            assert!(revisions.native_lineage_required());
             let observations = batch
                 .records()
                 .iter()

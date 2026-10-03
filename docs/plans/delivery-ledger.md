@@ -16,6 +16,18 @@ without rewriting history. The owner explicitly chose a fresh workspace. Origina
 `workflow_96bca8b553dd5278afa3e9a2a4040af5`, its three pending captures and all saved evidence
 remain in the first root. Preservation receipt: `.agents/tmp/v1-first-stock/fresh-workspace-preservation.json`.
 
+### SEC caller correction — verified integration
+
+`aeced650` is pushed and its three focused checks pass. Final caller inspection found that the
+typed company-dataset parser does not accept Filing XBRL identifiers. The existing filing branch
+now runs before that parser. The existing mixed-taxonomy fixture replaces its synthetic metadata
+owner/manual revision plan with the real SEC source and `source.revision_plan(&batch)`.
+It passed 1/1 in 2.26s through publication/restart. Log:
+`.agents/tmp/v1-first-stock/sec-filing-revision-critical.log`. No new harness or parser was added.
+Lead inspected both changes; Astra's fixture ownership is released. The previous matching build
+passed in 7m34s; deployment waits for the corrected build. Watcher 22254 remains paused until the
+lead resumes its single build queue. No live SEC success is claimed.
+
 ### Integrated checkpoint — SEC corrected metadata and pending credential recovery
 
 Acceptance 1/2/7: SEC changes acceptance timestamps while retaining filing accessions. Three of
@@ -42,7 +54,7 @@ Focused logs: `.agents/tmp/v1-first-stock/{pending-setup-catalog-critical,sec-co
 Reports: `sec-revision-conflict.md`, `tiingo-setup-recovery.md`, `closed-session-change.md` in that directory.
 No full CI or whole-app RAM gate ran. These are critical fixture results, not live SEC completion.
 
-**Runtime:** current attempted-fresh Desktop 22413/service 26924 remain alive under supervisor 21852;
+**Runtime:** current attempted-fresh Desktop 42895/service 42851 remain alive under supervisor 21852;
 watcher 22254 is paused while the lead serializes checks. All three focused checks pass. The next barrier is coherent commit/push and corrected-fresh native deployment. Then prove real SEC publication,
 financial-tab reads and restart, finish daily comparison, option renewal and the first saved analysis.
 The approved $100,000/0.25% virtual account was created in the attempted-fresh root; no paper session

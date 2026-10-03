@@ -36,7 +36,7 @@ use crate::normalize::{
     normalize_company_fact_occurrence, normalize_filing_xbrl_with_cancellation,
     same_company_fact_family,
 };
-use crate::product::SecFilingXbrlCoordinates;
+use crate::product::{SEC_FILING_XBRL_DATASET_PREFIX, SecFilingXbrlCoordinates};
 use crate::xbrl::{
     SecPendingValidatedXbrlTaxonomySet, SecXbrlTaxonomyRegistry, XbrlDocumentContext,
     XbrlDocumentParser,
@@ -502,12 +502,15 @@ impl SecEdgarSource {
         {
             return Err(SecClientError::RegistrationMismatch);
         }
-        let dataset = SecResearchDataset::try_from_identifier(batch.request().object().dataset())
-            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
-        if matches!(
-            dataset.kind(),
-            SecResearchDatasetKind::Submissions | SecResearchDatasetKind::FilingXbrl
-        ) {
+        let dataset = batch.request().object().dataset();
+        // Filing identifiers commit their retained coordinates rather than encoding a CIK,
+        // so they do not use the company-dataset parser.
+        if dataset.as_str().starts_with(SEC_FILING_XBRL_DATASET_PREFIX)
+            || SecResearchDataset::try_from_identifier(dataset)
+                .map_err(|_| SecClientError::InvalidCompositeRepresentation)?
+                .kind()
+                == SecResearchDatasetKind::Submissions
+        {
             return ExtractionRevisionPlan::locally_observed_with_native_lineage(
                 batch.records().len(),
             )
