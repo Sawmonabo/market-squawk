@@ -43,6 +43,13 @@ SEC_USER_AGENT_EMAIL="<MONITORED_CONTACT_EMAIL>"
 **APPLICATION POLICY:** the Rust provider service constructs the header, rejects malformed or
 placeholder identity, and owns every SEC request. Frontend code never calls SEC directly.
 
+Connection setup update, 2026-10-03: the native activation request is `{ "kind": "sec" }`.
+Setup verifies the declared contact and retains source authority; it requires no company CIK.
+Activation and saved-connection restoration do not wait for company submissions, facts or filings
+to publish. Opening a financial section automatically uses the existing selected-investment
+preparation job to acquire missing company evidence, as described below. A connected status alone
+does not establish financial-data availability.
+
 ## Exact surfaces and data families
 
 | Surface | Exact locator/family |
@@ -166,12 +173,15 @@ generation; it cannot rewrite an earlier model, backtest, valuation, or recommen
 
 ## Issuer ownership and selected-security use
 
-Selected-detail implementation update, 2026-10-02: opening a financial section with missing issuer
-identity can discover the exact symbol/exchange candidate from SEC's company directory through the
-configured server-side source operation. Conflicting CIK candidates remain ambiguous. The operation
-then acquires that one company's submissions and facts through the existing publication path;
-actual submissions and an admitted official listing must corroborate security attribution. It does
-not loop over every configured company or infer identity from company-name similarity. The
+Selected-detail implementation update, 2026-10-03: opening a financial section automatically starts
+the existing preparation job when required evidence is missing. The job admits the exact selected
+investment and official listing, then discovers the matching symbol/exchange CIK candidate from
+SEC's company directory through the configured server-side source operation. Conflicting CIK
+candidates remain ambiguous. It acquires missing submissions, Company Facts and filing XBRL for
+that one company through the existing publication path; actual submissions and the admitted
+official listing must corroborate security attribution. The job retains its own status,
+cancellation and recovery independently of connection setup. It does not loop over every company
+or infer identity from company-name similarity. The
 [SEC access guide](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data)
 documents the directory and its accuracy/completeness caveat.
 

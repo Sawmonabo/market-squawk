@@ -443,9 +443,13 @@ that explicit resume. Invalid evidence, authority, or adapter state quarantines 
 At the reviewed commit, release and rights gates have concrete consequences:
 
 - SEC EDGAR and unregistered BLS v1 are available under their exact no-key public-profile
-  constraints and digest-bound authority decisions. SEC activation still requires a truthful
-  declared contact and selected ten-digit issuer CIKs. Company facts and filings retain issuer
-  ownership; selected-security use requires a separately verified company/security relationship.
+  constraints and digest-bound authority decisions. SEC connection activation requires a truthful
+  declared contact and the request `{ "kind": "sec" }`, with no company selection. Activation and
+  restoration retain source authority without waiting for full company acquisition. Opening a
+  financial section uses the existing automatic selected-investment preparation job to resolve
+  the exact listing to a CIK and acquire missing submissions, facts and filing XBRL. Company facts
+  and filings retain issuer ownership; selected-security use requires a separately verified
+  company/security relationship. A connected status does not establish financial-data availability.
 - Registered BLS v2 remains a distinct `refresh_required`, provider-keyed surface; BLS v1
   availability does not authorize or activate v2.
 - FRED revision 5 is rights-limited. The shipping `Source.Inspect` boundary performs bounded

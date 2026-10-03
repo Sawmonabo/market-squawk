@@ -346,7 +346,9 @@ function SelectedConnection({
       </div> : null}
       {session && savedConfigurationSessionId ? <div className="mt-5 space-y-3">
         <p className="text-sm text-muted-foreground">
-          This connection has a saved data selection. Verification and resume keep that exact selection and its retained evidence.
+          {activationKind === "sec"
+            ? "This connection has saved setup. Verification and resume reuse its contact details."
+            : "This connection has a saved data selection. Verification and resume keep that exact selection and its retained evidence."}
         </p>
         <div className="flex flex-wrap gap-2">
           <Button
@@ -590,7 +592,6 @@ function ActivationForm({ kind, pending, saved, onSubmit }: {
         const request: Record<string, unknown> = { kind }
         if (kind === "bea") request.selection = beaSelection(data)
         if (kind === "census") request.configuration = censusConfiguration(data)
-        if (kind === "sec") request.cik = field(data, "cik")
         if (kind === "treasury_fiscal") request.page_size = Number(field(data, "pageSize"))
         if (kind === "eia_electricity_price") {
           request.start_period = field(data, "startPeriod")
@@ -628,12 +629,6 @@ function ActivationForm({ kind, pending, saved, onSubmit }: {
     </p> : null}
     {kind === "bea" ? <BeaSelectionFields /> : null}
     {kind === "census" ? <CensusSelectionFields /> : null}
-    {kind === "sec" ? <Field
-      name="cik"
-      label="Company CIK (10 digits)"
-      pattern="[0-9]{10}"
-      maxLength={10}
-    /> : null}
     {kind === "treasury_fiscal" || kind === "treasury_daily_rates" ? <p className="text-sm text-muted-foreground">
       Import the complete published Treasury rate history. Accepted progress is retained for restart and resume.
     </p> : null}

@@ -296,7 +296,6 @@ struct SecFundProductActivation {
     source: Arc<SecEdgarSource>,
     generation: ResearchProviderRuntimeGeneration,
     operation: Arc<SecLiveFundSource>,
-    selected_companies: Vec<SourceIdentifier>,
 }
 
 impl SecFundProductActivation {
@@ -1231,41 +1230,6 @@ impl ProviderAdapterActivation {
             return Err(SecFundProductError::Unavailable);
         }
         Ok(activation)
-    }
-
-    /// Closes the selected companies through the existing Settings SEC generation and catalog.
-    pub(crate) async fn publish_sec_fundamentals(
-        &self,
-        deadline: Instant,
-        cancellation: CancellationToken,
-    ) -> Result<(), SecFundProductError> {
-        let activation = self.active_sec_company_operation()?;
-        for cik in &activation.selected_companies {
-            activation
-                .operation
-                .publish_company_research(
-                    cik.as_str(),
-                    &[
-                        market_squawk_data::SecResearchFamily::Submissions,
-                        market_squawk_data::SecResearchFamily::CompanyFacts,
-                        market_squawk_data::SecResearchFamily::FilingXbrl,
-                    ],
-                    deadline,
-                    cancellation.child_token(),
-                    |precommit, family_cancellation| {
-                        Box::pin(self.associate_sec_company_families(
-                            &activation,
-                            cik,
-                            None,
-                            precommit,
-                            deadline,
-                            family_cancellation,
-                        ))
-                    },
-                )
-                .await?;
-        }
-        Ok(())
     }
 
     /// Executes one bounded SEC N-PORT or N-CEN publication through the retained exact source.
@@ -2375,9 +2339,6 @@ impl ProviderAdapterActivation {
         spec: SecAdapterActivation,
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
         require_surface(&lease, SEC_EDGAR_PROFILE_ID)?;
-        if spec.selected_companies.is_empty() || spec.selected_companies.len() > 16 {
-            return Err(ProviderAdapterActivationError::SourceBinding);
-        }
         let organization = lease
             .public_configuration()
             .get("organization")
@@ -2394,7 +2355,6 @@ impl ProviderAdapterActivation {
             .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
         if let Some(current) = retained.as_ref() {
             if current.matches(&lease, &spec.metadata)
-                && current.selected_companies == spec.selected_companies
                 && self
                     .research
                     .provider_runtime_generation(current.generation.profile())?
@@ -2445,7 +2405,6 @@ impl ProviderAdapterActivation {
             source,
             generation: generation.clone(),
             operation,
-            selected_companies: spec.selected_companies,
         }));
         Ok(ActivatedResearchProvider {
             lease,

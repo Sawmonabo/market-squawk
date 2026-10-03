@@ -81,7 +81,6 @@ use crate::provider_activation::{
     ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
     TiingoAdapterActivation, YahooAdapterActivation, selected_regional_source_config,
 };
-use crate::provider_onboarding::SecCikInput;
 use crate::provider_onboarding::{
     SchwabMarketDoctorRunPreparation, SchwabMarketDoctorRuntimeCoordinator,
     SchwabMarketDoctorRuntimeTerminal, SchwabOAuthBrowserError, SchwabOAuthLifecycleAction,
@@ -107,7 +106,6 @@ const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
 const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
-const MAXIMUM_SEC_COMPANIES: usize = 16;
 const MAXIMUM_BLS_SERIES: usize = 1_000;
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
@@ -1789,14 +1787,6 @@ pub(super) async fn publish_activated_macro_data(
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<(), CliProviderActivationError> {
-    if lease.surface_id().as_str() == SEC_EDGAR_PROFILE_ID {
-        return Box::pin(activation.publish_sec_fundamentals(deadline, cancellation))
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(error = ?error, "SEC company publication failed");
-            })
-            .map_err(|_| CliProviderActivationError::ProviderConfiguration);
-    }
     let operation = match lease.surface_id().as_str() {
         "eia.api-v2" => "source.energy-data.publication",
         BLS_PUBLIC_SURFACE | BLS_REGISTERED_SURFACE => "source.labor-data.publication",
@@ -3411,7 +3401,7 @@ fn build_research_activation(
                 provider_dataset,
             ))
         }
-        ProviderRequest::Sec { companies } => {
+        ProviderRequest::Sec {} => {
             let metadata = metadata_with_source_id(
                 lease,
                 activation_evidence,
@@ -3434,18 +3424,6 @@ fn build_research_activation(
                     .budget_policy()
                     .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
-            if companies.is_empty() || companies.len() > MAXIMUM_SEC_COMPANIES {
-                return Err(CliProviderActivationError::ProviderConfiguration);
-            }
-            let mut selected_companies = companies
-                .iter()
-                .map(|cik| {
-                    SourceIdentifier::try_from(cik.as_str())
-                        .map_err(|_| CliProviderActivationError::ProviderConfiguration)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            selected_companies.sort_unstable();
-            selected_companies.dedup();
             let (raw_store, representations) = sec_state(paths, activation_evidence)?;
             ProviderAdapterActivationRequest::Sec(SecAdapterActivation::new(
                 metadata,
@@ -3453,7 +3431,6 @@ fn build_research_activation(
                 representations,
                 ProviderIdentityRegistry::new(),
                 SecParserLimits::production_defaults(),
-                selected_companies,
             ))
         }
         ProviderRequest::Bls {
@@ -3747,9 +3724,7 @@ enum ProviderRequest {
     BeaRegional {
         provider_dataset: SourceIdentifier,
     },
-    Sec {
-        companies: Vec<SecCikInput>,
-    },
+    Sec {},
     Bls {
         series_metadata: Vec<ExactInputReference>,
         start_year: u16,
@@ -3871,12 +3846,10 @@ fn portal_provider_request(
                 },
             ))
         }
-        ProviderPortalActivationRequest::Sec { cik } => {
+        ProviderPortalActivationRequest::Sec {} => {
             require_surface(lease, ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID))?;
             Ok((
-                ProviderRequest::Sec {
-                    companies: vec![cik],
-                },
+                ProviderRequest::Sec {},
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
@@ -4221,12 +4194,8 @@ fn evidence_references(
 ) -> Result<Vec<BoundedExactReference<'_>>, CliProviderActivationError> {
     let mut references = Vec::new();
     match &request.provider {
-        ProviderRequest::Sec { companies } => {
-            if companies.is_empty() || companies.len() > MAXIMUM_SEC_COMPANIES {
-                return Err(CliProviderActivationError::ProviderConfiguration);
-            }
-        }
-        ProviderRequest::BeaRegional { .. }
+        ProviderRequest::Sec {}
+        | ProviderRequest::BeaRegional { .. }
         | ProviderRequest::TreasuryFiscal { .. }
         | ProviderRequest::TreasuryDailyRates
         | ProviderRequest::FederalReserveBoardH15
@@ -6014,8 +5983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sec_company_recipe_retains_issuer_selection_and_rejects_invalid_requests() -> TestResult
-    {
+    async fn sec_connection_activates_and_restores_without_company_acquisition() -> TestResult {
         let temporary = tempfile::tempdir()?;
         let config = AppConfig::load(ConfigSources::new(
             None,
@@ -6025,55 +5993,85 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config).await?;
-        let lease = prepared_sec_lease(&product, "sec-identity-recipe").await?;
-        let cik = SecCikInput::try_new("0000320193".to_owned())?;
-        let (provider, evidence) =
-            portal_provider_request(&lease, ProviderPortalActivationRequest::Sec { cik })?;
-        let request = ActivationRequest {
-            schema_version: REQUEST_SCHEMA_VERSION,
-            session_id: lease.session_id(),
-            provider,
+        let product = crate::LocalProduct::try_new(config.clone()).await?;
+        let lease = prepared_sec_lease(&product, "sec-connection-recipe").await?;
+        let activation = ProviderResearchActivationService::new(
+            product.paths().clone(),
+            product.provider_onboarding(),
+            product.provider_activation(),
+            product.provider_activation_state().clone(),
+            None,
+            None,
+        );
+        // No issuer is selected. Connecting must retain the callable source without fetching
+        // company history; that work belongs to the selected-investment preparation job.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            activation.activate_from_portal(
+                lease.session_id(),
+                ProviderPortalActivationRequest::Sec {},
+                CancellationToken::new(),
+            ),
+        )
+        .await??;
+        let DurableActivationRecipeState::Desired(recipe) = product
+            .provider_activation_state()
+            .load_recipe(SEC_EDGAR_PROFILE_ID)?
+        else {
+            return Err("SEC connection recipe was not committed".into());
         };
-        let request_bytes = serde_json::to_vec(&request)?;
-        let recovered = decode_request(&request_bytes)?;
-        assert!(matches!(
-            &recovered.provider,
-            ProviderRequest::Sec { companies }
-                if companies.len() == 1
-                    && companies[0].as_str() == "0000320193"
-        ));
-        let activation = build_research_activation(
-            product.paths(),
-            &lease,
-            &request_bytes,
-            recovered,
-            &evidence,
-        )?;
-        assert!(matches!(
-            activation,
-            ProviderAdapterActivationRequest::Sec(_)
-        ));
-
-        let legacy = serde_json::to_vec(&json!({
-            "schema_version": 2,
-            "session_id": lease.session_id(),
-            "provider": {"kind": "sec"}
-        }))?;
-        assert!(matches!(
-            decode_request(&legacy),
-            Err(CliProviderActivationError::InvalidRequest)
-        ));
+        let request = decode_request(&recipe.request_bytes)?;
+        assert!(matches!(request.provider, ProviderRequest::Sec {}));
+        let generation = product
+            .provider_activation()
+            .research_runtime_generation(lease.surface_id())?
+            .ok_or("SEC connection did not register a runtime")?;
+        let invalid_selection = json!({"kind": "sec", "cik": "0000320193"});
+        assert!(
+            serde_json::from_value::<ProviderPortalActivationRequest>(invalid_selection).is_err()
+        );
+        let mut invalid_recipe: Value = serde_json::from_slice(&recipe.request_bytes)?;
+        invalid_recipe["provider"]["companies"] = json!(["0000320193"]);
+        assert!(decode_request(&serde_json::to_vec(&invalid_recipe)?).is_err());
         for schema_version in [2, 3, 5] {
-            let mut unsupported: Value = serde_json::from_slice(&request_bytes)?;
+            let mut unsupported: Value = serde_json::from_slice(&recipe.request_bytes)?;
             unsupported["schema_version"] = json!(schema_version);
             assert!(matches!(
                 decode_request(&serde_json::to_vec(&unsupported)?),
                 Err(CliProviderActivationError::InvalidRequest)
             ));
         }
+        drop(activation);
         assert!(
             product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        drop(product);
+
+        let recovered = crate::LocalProduct::try_new(config).await?;
+        assert_eq!(
+            recovered
+                .provider_activation()
+                .research_runtime_generation(lease.surface_id())?,
+            Some(generation.clone())
+        );
+        let resumed = resume_exact_research_provider(
+            recovered.paths(),
+            &recovered.provider_onboarding(),
+            &recovered.provider_activation(),
+            recovered.provider_activation_state(),
+            SEC_EDGAR_PROFILE_ID,
+            lease.session_id(),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(resumed, generation);
+        assert!(
+            recovered
                 .application()
                 .shutdown(Instant::now() + Duration::from_secs(5))
                 .await

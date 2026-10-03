@@ -192,7 +192,6 @@ pub struct SecAdapterActivation {
     pub(super) representations: SecRepresentationRegistry,
     pub(super) identities: ProviderIdentityRegistry,
     pub(super) parser_limits: SecParserLimits,
-    pub(super) selected_companies: Vec<SourceIdentifier>,
 }
 
 impl SecAdapterActivation {
@@ -204,7 +203,6 @@ impl SecAdapterActivation {
         representations: SecRepresentationRegistry,
         identities: ProviderIdentityRegistry,
         parser_limits: SecParserLimits,
-        selected_companies: Vec<SourceIdentifier>,
     ) -> Self {
         Self {
             metadata,
@@ -212,7 +210,6 @@ impl SecAdapterActivation {
             representations,
             identities,
             parser_limits,
-            selected_companies,
         }
     }
 }

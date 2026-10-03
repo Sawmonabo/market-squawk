@@ -2,6 +2,30 @@
 
 ## Current execution — 2026-10-03
 
+### Active wave — connection readiness independent of financial acquisition
+
+Audit base `d492a0ce`; acceptance 1/2/5/7. SEC connection setup currently times out while
+processing valid Company Facts. Reuse the existing automatic selected-investment preparation
+job for acquisition; connection activation and restoration retain source authority without
+waiting for full company history. Remove the obsolete setup-only CIK selection in place.
+
+| Owner | Exclusive files / dependency | Completion evidence |
+| --- | --- | --- |
+| Lead | `provider_onboarding/{contracts,mod}.rs`, `provider_activation/{mod,specs}.rs`, `local_product/cli_provider.rs`, ledger; all Git/build/runtime | Existing SEC activation fixture proves durable activation/restoration without foreground financial requests; one matched build and native connection/automatic preparation check |
+| GPT-6.1 Sol High `sec_connection_ui` | `apps/market-squawk-desktop/src/features/sources/connection-setup.tsx`, `docs/reference/providers/sec.md`, SEC paragraph in `docs/reference/source-coverage.md`; lead corrects the affected `source-operations.md` recovery row | Consume `{kind: "sec"}` with no company setup field; document existing automatic investment acquisition, preserve other providers and all financial identities |
+
+Dependency order: shared request change → matched Desktop consumer → focused critical check →
+single integration commit/push → coordinated native replacement. Watcher paused during edits;
+no competing builds, new worktrees, migration or deadline increase. Both prior workspace roots
+remain intact. This checkpoint does not establish complete live financial preparation.
+
+Implementation is integrated; Sol UI/docs ownership is released. The extended existing SEC
+activation check passed 1/1 in 12.36s after a single-job compile (6m18s), proving committed
+connection state, same-generation restart and explicit resume without company acquisition, plus
+strict rejection of obsolete setup fields. Log: `.agents/tmp/v1-first-stock/sec-connection-critical.log`.
+Lead inspected affected callers and automatic financial loading. Matching build/native verification
+remains the next barrier; no full CI or whole-app RAM measurement ran.
+
 Branch `feature/v1-installed-product-experience`; one primary worktree and three local branches.
 Pushed: SEC admission waiting `aedee7ee`, pending setup/content revisions `aeced650`,
 filing producer correction `ab0d54e0`.

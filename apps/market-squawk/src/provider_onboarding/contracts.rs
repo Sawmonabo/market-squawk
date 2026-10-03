@@ -271,74 +271,14 @@ impl SchwabOAuthLifecycleView {
     }
 }
 
-/// Exact zero-padded SEC Central Index Key supplied through local onboarding.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SecCikInput(String);
-
-impl SecCikInput {
-    /// Constructs one nonzero ten-digit SEC CIK.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SecCikInputError::InvalidFormat`] unless `value` is exactly ten ASCII digits,
-    /// or [`SecCikInputError::Zero`] for the reserved all-zero value.
-    pub fn try_new(value: String) -> Result<Self, SecCikInputError> {
-        if value.len() != 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(SecCikInputError::InvalidFormat);
-        }
-        if value.bytes().all(|byte| byte == b'0') {
-            return Err(SecCikInputError::Zero);
-        }
-        Ok(Self(value))
-    }
-
-    /// Returns the exact zero-padded ten-digit CIK.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Serialize for SecCikInput {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for SecCikInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::try_new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Invalid SEC CIK accepted at the local onboarding boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum SecCikInputError {
-    /// The value was not exactly ten ASCII digits.
-    #[error("SEC CIK must contain exactly ten ASCII digits")]
-    InvalidFormat,
-    /// The all-zero value does not identify an SEC registrant.
-    #[error("SEC CIK must not be all zeros")]
-    Zero,
-}
-
 /// Closed provider-specific configuration accepted by the installed onboarding authority.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ProviderPortalActivationRequest {
     /// Commit one verified live source session without a research adapter.
     Source,
-    /// SEC EDGAR uses one exact registrant identity plus the declared onboarding contact.
-    Sec {
-        /// Exact zero-padded CIK used for both submissions and Company Facts.
-        cik: SecCikInput,
-    },
+    /// SEC EDGAR uses the declared contact; investment preparation selects each issuer.
+    Sec {},
     /// BLS needs explicit user-verified series semantics and a bounded year range.
     Bls {
         /// Exact series semantics; units and frequency are never inferred.
