@@ -13,6 +13,7 @@ import { formatCalendarDate, formatProductTimestamp, formatTimestamp } from "@/l
 import type { ProductTransport } from "@/lib/transport"
 
 import { FinancialPreparation } from "./financial-preparation"
+import { detailDisplayOperation, useDetailDisplayCache } from "./detail-display-cache"
 import {
   parseInvestmentFinancialsResult,
   type InvestmentFinancialDate,
@@ -33,6 +34,16 @@ type FinancialProps = {
   selectionToken: string
   bootstrap: DesktopBootstrap
   transport: ProductTransport
+}
+
+type FinancialDisplay = {
+  [Section in InvestmentFinancialSection]: Omit<Extract<InvestmentFinancialsResult, { section: Section }>,
+    "selectionToken" | "readToken" | "currentCursor" | "nextCursor">
+}[InvestmentFinancialSection]
+
+function financialDisplay(result: InvestmentFinancialsResult): FinancialDisplay {
+  const { selectionToken: _selection, readToken: _read, currentCursor: _current, nextCursor: _next, ...display } = result
+  return display
 }
 
 const sectionLabels = {
@@ -95,6 +106,9 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
   onRead: (result: InvestmentFinancialsResult) => void
 }) {
   const queryClient = useQueryClient()
+  const display = useDetailDisplayCache<FinancialDisplay>(productKeys.operation(
+    bootstrap.productSessionToken, "research", detailDisplayOperation, { selectionToken, section },
+  ))
   const navigation = useCursorNavigation()
   const snapshot = React.useRef<InvestmentFinancialSnapshot | undefined>(undefined)
   const lastChecked = React.useRef<InvestmentFinancialsResult | undefined>(undefined)
@@ -134,6 +148,8 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
   const page = useQuery({
     queryKey,
     gcTime: 0,
+    staleTime: 0,
+    refetchOnMount: "always",
     meta: snapshotQueryMeta,
     retry: false,
     refetchOnWindowFocus: false,
@@ -141,6 +157,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     enabled: !releasing,
     queryFn: async ({ signal }) => {
       const requestEpoch = epoch.current
+      const displayState = display.capture()
       const expectedSnapshot = cursor === undefined ? undefined : snapshot.current
       const result = parseInvestmentFinancialsResult(await transport.query({
         query: "investmentFinancials", selectionToken, section, limit: 32,
@@ -159,13 +176,18 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
         if (oldToken && oldToken !== result.readToken) void closeRead(oldToken)
       }
       lastChecked.current = result
+      if (cursor === undefined) {
+        if (result.state === "expired") display.clear()
+        else if (result.state !== "preparation_required") display.save(financialDisplay(result), displayState)
+      }
       return result
     },
   })
 
   React.useEffect(() => {
-    if (page.isSuccess && !page.isPlaceholderData) onRead(page.data)
-  }, [page.isSuccess, page.isPlaceholderData, page.data, onRead])
+    if (page.isSuccess && page.isFetchedAfterMount && !page.isPlaceholderData
+      && lastChecked.current !== undefined && page.data.readToken === lastChecked.current.readToken) onRead(page.data)
+  }, [page.isSuccess, page.isFetchedAfterMount, page.isPlaceholderData, page.data, onRead])
 
   const refresh = React.useCallback(async () => {
     setReleasing(true)
@@ -198,10 +220,12 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     seenRefresh.current = refreshRevision
     void refresh()
   }, [refreshRevision, refresh])
-  const result = page.data ?? lastChecked.current
+  const checkedPage = page.data ?? lastChecked.current
+  const result = checkedPage ?? (cursor === undefined ? display.data : undefined)
   const busy = page.isFetching || releasing
-  const showingPrior = page.isPlaceholderData || page.isError || releasing
-  const retainedPage = result && !page.isPlaceholderData && result.readToken === snapshot.current?.readToken
+  const retainedPage = checkedPage && !page.isPlaceholderData && checkedPage.readToken !== null
+    && checkedPage.readToken === snapshot.current?.readToken
+  const showingPrior = !retainedPage || page.isError || releasing
 
   return <section aria-label={sectionLabels[section]}>
     <div className="flex items-start justify-between gap-4">
@@ -227,8 +251,8 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
       <FinancialFamilies families={result.families} />
       <FinancialLimitations result={result} />
       <FinancialItems result={result} />
-      {result.currentCursor !== null ? <CursorNavigation navigation={navigation} current={result.currentCursor}
-        next={retainedPage && !page.isError ? result.nextCursor : null} busy={busy}
+      {checkedPage?.currentCursor ? <CursorNavigation navigation={navigation} current={checkedPage.currentCursor}
+        next={retainedPage && !page.isError ? checkedPage.nextCursor : null} busy={busy}
         onRestart={() => void refresh()} /> : null}
       {result.state === "expired" ? <Button variant="outline" size="sm" className="mt-3" disabled={busy} onClick={() => void refresh()}>Open fresh information</Button> : null}
     </> : null}
@@ -236,7 +260,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
   </section>
 }
 
-function FinancialItems({ result }: { result: InvestmentFinancialsResult }) {
+function FinancialItems({ result }: { result: FinancialDisplay }) {
   if (result.items.length === 0) return null
   switch (result.section) {
     case "facts": return <div className="mt-4"><FinancialFactsTable facts={result.items} caption="Reported financial facts on this page" /></div>
@@ -451,7 +475,7 @@ function FinancialFamilies({ families }: { families: InvestmentFinancialsResult[
   </details>
 }
 
-function FinancialLimitations({ result }: { result: InvestmentFinancialsResult }) {
+function FinancialLimitations({ result }: { result: FinancialDisplay }) {
   const labels = {
     some_reported_facts_not_supported: "Some reported facts cannot be shown with their available context.",
     item_exceeds_response_limit: "Some information is too large for this page and has not been shown.",

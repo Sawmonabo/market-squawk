@@ -7,11 +7,13 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { HistoryPreparation } from "./history-preparation"
-import { MarketHistoryChart } from "./market-history-chart"
+import { detailDisplayOperation, useDetailDisplayCache } from "./detail-display-cache"
+import { MarketHistoryChart, type MarketHistoryDisplayResult } from "./market-history-chart"
 import { parseMarketHistoryResult, sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryResult, type MarketHistoryViewportInput } from "./market-history"
 import { usePreparationController } from "./preparation-controls"
 
 const queryPolicy = { retry: false, refetchOnWindowFocus: false } as const
+type HistoryDisplayCache = { result: MarketHistoryDisplayResult; windowDays: string }
 
 export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshRevision = 0 }: {
   refreshRevision?: number
@@ -20,6 +22,10 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
   transport: ProductTransport
 }) {
   const queryClient = useQueryClient()
+  const display = useDetailDisplayCache<HistoryDisplayCache>(productKeys.operation(
+    bootstrap.productSessionToken, "market", detailDisplayOperation, { historyToken },
+  ))
+  const initialDisplay = React.useRef(display.data)
   const generation = React.useRef<string | undefined>(undefined)
   const awaitingReadRecovery = React.useRef(false)
   const lastChecked = React.useRef<MarketHistoryResult | undefined>(undefined)
@@ -28,8 +34,8 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
   const alive = React.useRef(true)
   const [revision, setRevision] = React.useState(0)
   const [refreshing, setRefreshing] = React.useState(false)
-  const [viewport, setViewport] = React.useState<MarketHistoryViewportInput>({ pointLimit: 512 })
-  const [windowDays, setWindowDays] = React.useState("all")
+  const [viewport, setViewport] = React.useState<MarketHistoryViewportInput>(() => displayViewport(initialDisplay.current?.result))
+  const [windowDays, setWindowDays] = React.useState(initialDisplay.current?.windowDays ?? "all")
   const [selectedBar, setSelectedBar] = React.useState<MarketHistoryBar | null>(null)
   React.useEffect(() => {
     alive.current = true
@@ -39,11 +45,14 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
   const history = useQuery({
     queryKey,
     gcTime: 0,
+    staleTime: 0,
+    refetchOnMount: "always",
     meta: generation.current === undefined || awaitingReadRecovery.current ? { domainRefresh: "automatic" } : snapshotQueryMeta,
     placeholderData: keepPreviousData,
     enabled: !refreshing,
     queryFn: async ({ signal }) => {
       const requestEpoch = epoch.current
+      const displayState = display.capture()
       const pinnedGeneration = generation.current
       try {
         const result = parseMarketHistoryResult(await transport.query({ query: "marketHistory", historyToken, ...viewport,
@@ -52,6 +61,10 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
         if (result.data !== null) {
           if (generation.current === undefined) generation.current = result.data.generationToken
           lastGood.current = result
+          const { historyToken: _history, generationToken: _generation, ...data } = result.data
+          display.save({ result: { data, unavailableReason: null }, windowDays }, displayState)
+        } else if (result.unavailableReason !== "temporarily_unavailable") {
+          display.clear()
         }
         awaitingReadRecovery.current = result.unavailableReason === "temporarily_unavailable"
         lastChecked.current = result
@@ -81,20 +94,29 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     void reset()
   }, [refreshRevision, reset])
   const observed = history.data ?? lastChecked.current
-  const result = (history.isError || observed?.unavailableReason === "temporarily_unavailable") && lastGood.current
-    ? lastGood.current : observed
+  const cachedViewport = display.data?.result.data?.viewport
+  const matchingDisplay = cachedViewport && cachedViewport.pointLimit === viewport.pointLimit
+    && cachedViewport.startDate === (viewport.startDate ?? null) && cachedViewport.endDate === (viewport.endDate ?? null)
+    && cachedViewport.startUnixNanos === (viewport.startUnixNanos ?? null) && cachedViewport.endUnixNanos === (viewport.endUnixNanos ?? null)
+    ? display.data?.result : undefined
+  const result = history.isError || observed?.unavailableReason === "temporarily_unavailable"
+    ? lastGood.current ?? matchingDisplay ?? observed : observed ?? matchingDisplay
+  const currentGeneration = history.isSuccess && !history.isPlaceholderData && !history.isFetching && !refreshing
+    && history.isFetchedAfterMount
+    && history.data.data !== null && history.data.data.generationToken === generation.current
+    ? history.data.data.generationToken : undefined
   const preparation = usePreparationController({ kind: "history", token: historyToken, bootstrap, transport, onPrepared: reset })
   const initialLoadingAttempted = React.useRef(false)
   React.useEffect(() => {
-    if (initialLoadingAttempted.current || !history.isSuccess || history.isPlaceholderData
+    if (initialLoadingAttempted.current || !history.isSuccess || !history.isFetchedAfterMount || history.isPlaceholderData
       || history.data?.unavailableReason !== "not_available" || generation.current !== undefined
       || preparation.preparation || preparation.storageError || !preparation.canStart) return
     initialLoadingAttempted.current = true
     setWindowDays("365")
     setViewport(recentHistoryWindow(365, history.data))
     preparation.start(365)
-  }, [history.isSuccess, history.isPlaceholderData, history.data, preparation])
-  const restoredWindow = React.useRef(false)
+  }, [history.isSuccess, history.isFetchedAfterMount, history.isPlaceholderData, history.data, preparation])
+  const restoredWindow = React.useRef(initialDisplay.current !== undefined)
   React.useEffect(() => {
     if (restoredWindow.current) return
     const days = preparation.preparation?.lookbackDays
@@ -121,7 +143,8 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     {result?.data || result && !showPreparationStatus && !showReadStatus ? <div className={`[&>section]:mt-0 [&>section]:rounded-none [&>section]:border-0 [&>section]:bg-transparent [&>section]:p-0 ${result?.data ? "[&>section>h3]:hidden" : ""}`}>
       <MarketHistoryChart result={result ?? null}
         windowDays={windowDays}
-        onViewportChange={(next) => { if (!refreshing) { setViewport(next); setSelectedBar(null) } }} onObservationSelect={setSelectedBar} />
+        onViewportChange={(next) => { if (!refreshing) { setViewport(next); setSelectedBar(null) } }}
+        onObservationSelect={currentGeneration === undefined ? undefined : setSelectedBar} />
     </div> : <div className="h-[536px]" aria-hidden="true" />}
     <div className="mt-2 min-h-10 text-xs leading-5">
       {showReadStatus && (history.isError || temporarilyUnavailable) ? <div className="flex items-start justify-between gap-3">
@@ -131,12 +154,23 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
         <RefreshButton label="Retry price history" refreshing={busy} onClick={() => void history.refetch()} />
       </div> : showReadStatus ? <p role="status" className="text-muted-foreground">{result?.data ? "Updating prices… Showing saved prices." : "Loading prices…"}</p> : null}
     </div>
-    {selectedBar !== null && result?.data ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${result.data.generationToken}`}
-      bar={selectedBar} historyToken={historyToken} generationToken={result.data.generationToken} bootstrap={bootstrap} transport={transport} /> : null}
+    {selectedBar !== null && currentGeneration !== undefined ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${currentGeneration}`}
+      bar={selectedBar} historyToken={historyToken} generationToken={currentGeneration} bootstrap={bootstrap} transport={transport} /> : null}
   </div>
 }
 
-function recentHistoryWindow(days: number, result: MarketHistoryResult | undefined): MarketHistoryViewportInput {
+function displayViewport(result: MarketHistoryDisplayResult | undefined): MarketHistoryViewportInput {
+  const viewport = result?.data?.viewport
+  return viewport ? {
+    pointLimit: viewport.pointLimit,
+    ...(viewport.startDate === null ? {} : { startDate: viewport.startDate }),
+    ...(viewport.endDate === null ? {} : { endDate: viewport.endDate }),
+    ...(viewport.startUnixNanos === null ? {} : { startUnixNanos: viewport.startUnixNanos }),
+    ...(viewport.endUnixNanos === null ? {} : { endUnixNanos: viewport.endUnixNanos }),
+  } : { pointLimit: 512 }
+}
+
+function recentHistoryWindow(days: number, result: MarketHistoryDisplayResult | undefined): MarketHistoryViewportInput {
   // The first read establishes the source time precision; guessing dates rejects
   // timestamped histories when their first publication arrives.
   if (!result?.data) return { pointLimit: 512 }

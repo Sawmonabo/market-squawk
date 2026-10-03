@@ -2,6 +2,56 @@
 
 ## Current execution — 2026-10-03
 
+### QA remediation wave — reusable details and usable research/source reads
+
+Previous goal turn was progress: pushed audit checkpoint `4ea27456` and PR43 comment5973991415
+establish concrete current failures and narrow passes. Scope remains the complete owner-test goal.
+The existing native generation stays open; lead paused only its Watchexec emitter (PID28250),
+verified no Cargo process, and will schedule one coherent build after native source integration.
+Frontend-only changes still use existing Vite HMR.
+
+| Owner | Finishable outcome / exact files | Dependencies and critical evidence |
+| --- | --- | --- |
+| GPT-6.1 Sol High `detail_display_cache` | Retain already-read financial/history display on warm tab/route return; only `features/markets/investment-financials.tsx`, `market-history-read.tsx`, `market-history-chart.tsx`, and a cohesive markets-owned display-cache helper if needed | Reuse QueryClient; separate display values from closed read/cursor/generation authority. No global persistence/framework. Existing detail fixture extension only for cache/authority regression; lead owns tests/build and shared app files. Restart persistence remains a required separate native/durable consumer boundary, not declared solved by session caching. |
+| GPT-6 Astra High `research_choice_streaming` | Make existing Research preparation options usable from retained data without accumulating all decoded observations; only `application/research/dataset_preparation.rs`, its new `catalog.rs`, and obsolete guided recipe helpers in `history.rs` | Trace consumers and exact recipe/evidence selection. Stream/index summaries using existing data APIs, preserve complete eligible choices and admission integrity; do not raise caps or silently drop required data. Existing critical fixture proposal and actual changes to lead; no build/runtime/Git. |
+| GPT-6.1 Sol High `source_status_contract` | Diagnose/fix current Alpaca status and research-import parser failures; only `features/sources/source-evidence.ts`, `features/sources/research-ingestion.tsx`, and `features/sources/research-ingestion-contracts.ts` | First trace exact normalized response. No relaxed unknown-field acceptance or changed authority rules. Report required backend/shared-contract change to lead before editing it; source absence is not inferred. No UI navigation/runtime/Git/build. |
+| Lead | Durable detail-read/index boundary, provider recovery and stock-pipeline integration; shared authority, contracts, schemas, manifests, tests, runtime and Git | Inspect all actual changes/callers; serialize critical checks and accept coherent checkpoints. No competing native navigation or builds. |
+
+DAG: independent frontend display reuse + retained-data options + source parser diagnosis →
+lead contract alignment/critical checks → coherent pushed checkpoints → one matched native build
+and affected live workflow proof. These fixes close acceptance items1/2/5/6; the first stock's
+source-actions and current forecast handoff remain required next dependencies, not deferred scope.
+
+### Integrated warm detail-display checkpoint
+
+The detail cache candidate retains rendering-only financial first pages and history viewports in
+existing scoped QueryClient storage, independently from closed cursors and history generations.
+Active reads still revalidate and own pagination, preparation and original-evidence selection.
+Existing `app.test.tsx` was extended only for the uncovered warm-return/closed-lease regression.
+All 11 existing cases pass with one Vitest worker; `tsc --build` and `git diff --check` pass.
+This establishes critical local behavior, not native all-watchlist or restart-cache completion.
+The dedicated auditor is checking all nine actual watchlist instruments on the running app.
+Source-contract and indexed Research work remain separate uncommitted integration lanes.
+
+### Watchlist-wide QA extension — owner clarification
+
+The audit covers **every actual current watchlist instrument**, not MSFT as a proxy.
+`console_qa` owns only a new watchlist matrix and evidence under
+`.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/`; lead integrates findings into
+`docs/reports/2026-10-02-desktop-product-audit.md`. First enumerate the live watchlist and asset
+class. Record each instrument's quote/change/units/session, history/chart, profile, applicable
+financial or fund information, pagination, first load and warm return. Reuse prior captures where
+valid; capture and inspect newly exercised full pages. Trace every unexpected missing value to
+identity, acquisition, normalization, storage, selection or presentation; upstream absence needs
+source evidence. Fund/ETF data must not be judged by corporate-report assumptions. Mark unmatched
+runtime/UI versions and blocked paths explicitly. Restart proof requires the lead's coordinated
+native build and restart; no agent may restart, build or alter runtime state. The lead retains
+native navigation until the auditor is explicitly granted it; independent source/evidence mapping
+can proceed immediately. No product implementation or Git operations in this audit lane. Native background navigation is
+now assigned exclusively to `console_qa`; frontend cache candidate is explicitly identified as WIP
+over native `d9afd7cb`. `source_status_contract` separately owns read-only quote/reference origin
+tracing for DIA/NVDA/TSLA and VTI, writing only `watchlist-wide/source-quote-identity.md`.
+
 ### Owner-directed complete console QA and persistent detail reads
 
 Treat unexpected unavailable/missing data as a defect requiring exact service/source tracing;

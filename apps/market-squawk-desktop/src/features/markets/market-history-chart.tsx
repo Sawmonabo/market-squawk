@@ -7,11 +7,17 @@ import { useDebouncedChartCallback } from "@/components/charts/market-price-char
 
 import { sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryResult, type MarketHistoryViewportInput } from "./market-history"
 
+export type MarketHistoryDisplay = Omit<NonNullable<MarketHistoryResult["data"]>, "historyToken" | "generationToken">
+export type MarketHistoryDisplayResult = {
+  data: MarketHistoryDisplay | null
+  unavailableReason: MarketHistoryResult["unavailableReason"]
+}
+
 export function MarketHistoryChart({ result, onViewportChange, onObservationSelect, windowDays }: {
-  result: MarketHistoryResult | null
+  result: MarketHistoryDisplayResult | null
   windowDays?: string
   onViewportChange: (viewport: MarketHistoryViewportInput) => void
-  onObservationSelect: (bar: MarketHistoryBar) => void
+  onObservationSelect?: (bar: MarketHistoryBar) => void
 }) {
   if (!result?.data) return <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
     <h3 className="text-sm font-semibold">Price history is unavailable</h3>
@@ -46,10 +52,10 @@ export function MarketHistoryChart({ result, onViewportChange, onObservationSele
 }
 
 function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, windowDays }: {
-  history: NonNullable<MarketHistoryResult["data"]>; nominal: boolean
+  history: MarketHistoryDisplay; nominal: boolean
   windowDays?: string
   onViewportChange: (viewport: MarketHistoryViewportInput) => void
-  onObservationSelect: (bar: MarketHistoryBar) => void
+  onObservationSelect?: (bar: MarketHistoryBar) => void
 }) {
   const bars = history.bars
   const currency = history.currency
@@ -76,7 +82,7 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
     interacting.current = false
   }, [windowDays])
   const selectedOriginal = selectedCoordinate === null ? null : visibleBars.find((bar) => coordinate(bar) === selectedCoordinate) ?? null
-  useDebouncedChartCallback(selectedOriginal === null ? null : `${history.generationToken}:${coordinate(selectedOriginal)}:${selectedOriginal.originalOrdinal}`, selectedOriginal, onObservationSelect)
+  useDebouncedChartCallback(selectedOriginal === null ? null : `${history.display.projectionDigest}:${coordinate(selectedOriginal)}:${selectedOriginal.originalOrdinal}`, selectedOriginal, onObservationSelect)
   const selectedIndex = visibleBars.findIndex((bar) => coordinate(bar) === selectedCoordinate)
   const index = selectedIndex >= 0 ? selectedIndex : visibleBars.length - 1
   const selected = visibleBars[index]

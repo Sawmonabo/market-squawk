@@ -880,6 +880,20 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(issuedQueries).toContainEqual({ query: "closeInvestmentFinancials", selectionToken: marketSelectionToken, readToken: financialRead }))
     expect(screen.queryByRole("region", { name: "Reported financial facts" })).toBeNull()
 
+    // A warm first-page display survives the tab's closed lease. It must not
+    // reuse that lease for pagination while its replacement read is pending.
+    financialMode = "pending"
+    finishFinancial = undefined
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Facts" }))
+    const warmFacts = within(await screen.findByRole("region", { name: "Reported financial facts" }))
+    expect(warmFacts.getByText("USD 123,456.78")).toBeTruthy()
+    expect(warmFacts.queryByRole("button", { name: "Next" })).toBeNull()
+    await waitFor(() => expect(finishFinancial).toBeTypeOf("function"))
+    financialMode = "available"
+    await act(async () => { finishFinancial?.(financialResult()) })
+    await waitFor(() => expect((warmFacts.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false))
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Filings" }))
+
     // Fund identities do not enter the company-filing acquisition path.
     await within(screen.getByRole("region", { name: "Filings" })).findByText("No reported information is available for this section at the information date.")
     expect(financialPreparationRequests).toHaveLength(0)
@@ -1224,6 +1238,8 @@ describe("Market Squawk desktop boundary", () => {
     let viewportSignal: AbortSignal | undefined
     let resolveViewport: ((result: ApplicationResult) => void) | undefined
     let holdInstrumentRead = false
+    let holdHistoryRead = false
+    let resolveHistory: (() => void) | undefined
     let resolveInstrument: (() => void) | undefined
     const readyBootstrap: DesktopSystemBootstrap = {
       ...blockedBootstrap,
@@ -1277,6 +1293,7 @@ describe("Market Squawk desktop boundary", () => {
         })
       }
       if (request.query === "marketHistory") {
+        if (holdHistoryRead) await new Promise<void>((resolve) => { resolveHistory = resolve })
         if (request.startDate !== undefined) {
           viewportSignal = options?.signal
           return new Promise<ApplicationResult>((resolve) => { resolveViewport = resolve })
@@ -1439,6 +1456,7 @@ describe("Market Squawk desktop boundary", () => {
     // Warm navigation must retain the selected price without claiming that the
     // returning screen has checked its freshness before revalidation completes.
     holdInstrumentRead = true
+    holdHistoryRead = true
     await user.click(screen.getByRole("link", { name: "Back to Markets" }))
     const returningCard = (await screen.findByRole("heading", { name: "Bitcoin" })).closest("button")
     if (!returningCard) throw new Error("The returning market card is absent")
@@ -1447,6 +1465,12 @@ describe("Market Squawk desktop boundary", () => {
     expect(returningPrice.getByText("USD 68,000.15")).toBeTruthy()
     expect(returningPrice.getByText(/Saved price/)).toBeTruthy()
     expect(returningPrice.queryByText(/^Bid\/ask midpoint · Current/)).toBeNull()
+    await waitFor(() => expect(resolveHistory).toBeTypeOf("function"))
+    expect(screen.getByRole("img", { name: /Daily investment prices in USD/ })).toBeTruthy()
+    expect(screen.getAllByText("68001.123456789 USD").length).toBeGreaterThan(0)
+    expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
+    holdHistoryRead = false
+    await act(async () => { resolveHistory?.() })
     await waitFor(() => expect(resolveInstrument).toBeTypeOf("function"))
     resolveInstrument?.()
     expect(await returningPrice.findByText(/^Bid\/ask midpoint · Current/)).toBeTruthy()
