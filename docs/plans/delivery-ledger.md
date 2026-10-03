@@ -59,6 +59,35 @@ exact-generation health drain and saved retry/control checks each PASS1/1 (singl
 3m56s; no new tests or CI). Next barrier is one matched development rebuild, then original saved
 MSFT resume and actual phase timings. Both agent lanes are complete; lead owns verification.
 
+Matched recovery build PASS5m11s, code `ffb6faf5`, service82027/Desktop82061. Original MSFT
+resume advances from7to8steps, then pauses at `Market.PrepareInvestmentEvidence` with
+`source_evidence_invalid` / `option_context`: "original option evidence could not be retained
+or reopened". This is a different first failure from revoked demand; no saved result yet.
+Astra `options_original_recovery` owns read-only exact original-reopen diagnosis, app
+`application/market_runtime/alpaca_option_chain.rs` and its custody/option-reference callees;
+write only the existing `.agents/tmp/v1-first-stock/options-renewal-recovery.md`. No source edits,
+builds, Git, runtime mutation or secret output. Lead owns integration and native evidence.
+Startup timings: research_open10216ms; before_reconnect13897ms; reconnect_bound13898ms;
+executable_identity5466ms (cumulative19367ms); complete27070ms; installed_operations56ms.
+No startup fix claimed; the timings isolate subsequent work without dropping integrity checks.
+
+Exact original-option read failure is now established read-only: first capture receipt precedes
+its source-revision registration by492,986,000ns. The recovery metadata query incorrectly uses
+provider receipt time as catalog knowledge cutoff, excluding the later registered revision.
+Original revision/digest and all3pending captures remain intact. Astra `options_original_recovery`
+now owns ONLY `application/market_runtime/alpaca_option_chain.rs` to correct the knowledge clock
+using the verified original custody registration contract, retaining original received-time
+validity and doctor proof; no timestamp rewrite. Lead owns closest existing data custody regression
+and shared integration/build. No reset/replacement originals or broader source-policy change.
+
+Original metadata cutoff fix frozen: only app option-chain recovery now selects its exact
+retained metadata revision at original.decoded_at(), matching canonical custody registration;
+original received/source/authorization clocks are unchanged. Existing publication/restart test
+explicitly covers metadata missing before registration and present at registration, PASS1/1
+(11.12s). Initial wrong-target exact filter selected0tests and is not evidence; corrected target
+is `market-squawk-data --test publication_recovery`. No new test harness/case. Next barrier:
+matched rebuild and resume of the same original workflow, keeping current app available.
+
 ### Current continuation wave — 2026-10-02 late session
 
 Prior turn: progress, pushed `3ee4d7a9` with native history evidence. Fresh branch clean; service53066,

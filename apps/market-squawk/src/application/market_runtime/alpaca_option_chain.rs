@@ -787,18 +787,17 @@ impl Worker {
         }
         let data = self.research.analytical_service();
         let capture = original.capture().clone();
+        // Original custody registers previously unseen metadata at the first page's decoded_at,
+        // after receipt. Use that sealed knowledge cutoff to find the exact retained revision;
+        // origin validation still checks its effectiveness at the unchanged acquisition clocks.
+        let knowledge_cutoff = original.decoded_at();
         let original_metadata = self
             .research
             .run_owned_research_io(deadline, caller, move |worker| {
-                let at = capture
-                    .pages()
-                    .first()
-                    .ok_or(OptionChainDemandError::Custody)?
-                    .received_at();
                 data.retained_source_metadata(
                     capture.source_id(),
                     capture.metadata_revision(),
-                    at,
+                    knowledge_cutoff,
                     deadline,
                     &worker,
                 )
