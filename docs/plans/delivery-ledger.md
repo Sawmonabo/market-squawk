@@ -2,7 +2,25 @@
 
 ## Current execution — 2026-10-03
 
-### Active wave — compose onboarding reads inside option publication
+### Active wave — wait for option writer admission instead of failing busy
+
+Base `38ce7afb`. Acceptance 1/2/6: matching native preparation now reports
+`option-reference-publication / catalog-unavailable`, before publication. The error maps exactly
+to the synchronization capability's `authority.try_lock()` failure; it must not be conflated with
+invalid option identity. Prior nested-transaction correction passed its critical checks, but this
+live attempt does not establish that it reached the corrected inner replay.
+
+| Owner | Exact disjoint ownership | Completion evidence |
+| --- | --- | --- |
+| Astra High `options_original_recovery` | `catalog/market_data_instruments/option_reference.rs` and existing option fixture in `crates/market-squawk-data/tests/catalog.rs`; read adjacent ownership paths | Correct temporary writer admission using existing scheduling/coordination where available, preserving cancellation/deadline and final authority; prove contention recovery and revocation with smallest existing fixture extension |
+| Lead | Shared authority changes if needed, ledger/Git/build/runtime | Inspect lock ordering and callers; serialize critical checks, integration and new native attempt |
+
+DAG: exact busy error → ownership/lock-order trace and bounded correction → critical contention and
+publication check → coherent commit/push → matching native analysis. Agent must stop for shared-file
+ownership transfer if necessary, without adding a new generic scheduler or increasing deadlines.
+No branch, worktree, migration, failed-job reset or background build. Current visible app stays open.
+
+### Integrated wave — compose onboarding reads inside option publication
 
 Base `b69970a2`, clean primary feature worktree. Acceptance 1/2/6: native managed preparation
 reached option publication, whose final account check unconditionally starts a nested SQLite
@@ -27,6 +45,16 @@ fixture ownership released. Existing option publication/restart/rollback check p
 (1/1, 1.42s, cached compile). Logs: `.agents/tmp/v1-first-stock/option-transaction-critical.log`
 and `option-transaction-onboarding-critical.log`. Matching deployment and a new native MSFT
 attempt remain; these checks do not prove the complete stock journey.
+
+Checkpoint `38ce7afb` pushed. Matching build passed in 6m28s; service/Desktop PIDs 65052/65090.
+Workspace startup took ~26s; readiness remains a separate unfinished product concern. A too-early
+native probe before state registration failed without admitting a workflow; readiness was verified
+before the real attempt. New MSFT workflow `workflow_e8c9687b9bbb55008c27bdb4feaafb74` admitted
+job `02c89149-5b6a-4379-a2c6-d4a58dc2109a`, then failed after ~10s with `catalog-unavailable` /
+`InvalidResult`, four retained steps and zero results. Original failed workflow remains unchanged.
+Artifacts: `.agents/tmp/v1-first-stock/option-transaction-{ready-status,native-start-ready,
+native-progress,startup}.json`; same runtime log. Both preserved roots and fresh active root were
+verified present. No claim of live option publication or saved analysis completion.
 
 ### Integrated wave — managed preparation for the retained stock analysis
 
