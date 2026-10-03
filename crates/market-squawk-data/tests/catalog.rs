@@ -2911,51 +2911,57 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         )?)
     };
     let service = reopen()?;
-    let option_source = SourceMetadata::try_new(SourceMetadataInput::new(
-        SchemaVersion::CURRENT,
-        SourceId::try_from("alpaca-basic-indicative-option-chain-v1")?,
-        RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(SourceIdentifier::try_from(
-                "alpaca-option-reference-test-v1",
+    let option_source_for = |revision: &str, effective| -> TestResult<SourceMetadata> {
+        Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            SourceId::try_from("alpaca-basic-indicative-option-chain-v1")?,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from(revision)?),
+                ExactPayloadEvidence::from_content_digest(digest(153)),
+            ),
+            SourceClass::Broker,
+            source.provider().clone(),
+            AuthorizationGrant::new(
+                source.authorization().mode(),
+                source.authorization().basis().clone(),
+                source.authorization().evidence().clone(),
+                effective,
+            ),
+            SourceCoverage::try_instrument(
+                ExactPayloadEvidence::from_content_digest(digest(154)),
+                effective,
+                vec![AssetClass::Option],
+                CoverageTopology::single_venue(VenueId::try_from("alpaca-indicative-options")?),
+                InstrumentCoverage::partial(),
+                None,
+                CoverageDelay::Delayed(900_000_000_000),
+                DeliveryEvidence::Indirect,
+            )?,
+            DataQuality::DirectUnverified,
+            NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_from_api_rules(
+                vec![ApiEndpointRule::try_new(
+                    ALPACA_OPTION_CONTRACT_REFERENCE_ENDPOINT,
+                    PathScope::Exact,
+                    vec![],
+                    1,
+                    128,
+                )?],
+                bounds,
             )?),
-            ExactPayloadEvidence::from_content_digest(digest(153)),
-        ),
-        SourceClass::Broker,
-        source.provider().clone(),
-        source.authorization().clone(),
-        SourceCoverage::try_instrument(
-            ExactPayloadEvidence::from_content_digest(digest(154)),
-            effective,
-            vec![AssetClass::Option],
-            CoverageTopology::single_venue(VenueId::try_from("alpaca-indicative-options")?),
-            InstrumentCoverage::partial(),
-            None,
-            CoverageDelay::Delayed(900_000_000_000),
-            DeliveryEvidence::Indirect,
-        )?,
-        DataQuality::DirectUnverified,
-        NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_from_api_rules(
-            vec![ApiEndpointRule::try_new(
-                ALPACA_OPTION_CONTRACT_REFERENCE_ENDPOINT,
-                PathScope::Exact,
-                vec![],
-                1,
-                128,
-            )?],
-            bounds,
-        )?),
-        source.freshness_policy(),
-        source.budget_policy().cloned(),
-        SourceCapabilities::new(
-            false,
-            true,
-            SequenceCapability::Unsupported,
-            ChecksumCapability::Unsupported,
-            HistoricalCapability::None,
-            false,
-        ),
-        SourceProtocolProfile::NotLive,
-    ))?;
+            source.freshness_policy(),
+            source.budget_policy().cloned(),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::None,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))?)
+    };
+    let option_source = option_source_for("alpaca-option-reference-test-v1", effective)?;
     let option_at = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?);
@@ -3066,6 +3072,27 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         underlying_asset_namespace: namespace,
     };
     let publisher = service.market_data_instrument_synchronization();
+    // Expired current permission must fail before it can replace the retained source.
+    let expired_source = option_source_for(
+        "alpaca-option-reference-expired-v1",
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), Some(option_at))?,
+    )?;
+    let mut expired = option_admission(created.clone(), source.source_id().clone());
+    expired.source = expired_source.clone();
+    assert!(matches!(
+        publisher.publish_alpaca_option_references(expired, &allowed, deadline(), &cancellation,),
+        Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
+    ));
+    assert_eq!(
+        service.retained_source_metadata(
+            expired_source.source_id(),
+            expired_source.revision(),
+            Timestamp::from_unix_nanos(i64::MAX),
+            deadline(),
+            &cancellation,
+        )?,
+        None,
+    );
     assert!(matches!(
         publisher.publish_alpaca_option_references(
             option_admission(created.clone(), listing_source.source_id().clone()),
@@ -3188,6 +3215,27 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         store: &raw_store,
         checks: AtomicUsize::new(0),
     };
+    let revoked = Precommit {
+        checks: AtomicUsize::new(0),
+        revoke_on: 3,
+    };
+    assert!(matches!(
+        publisher.publish_alpaca_option_references(
+            option_admission(created.clone(), source.source_id().clone()),
+            &revoked,
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::PublicationAuthority(_))
+    ));
+    assert_eq!(revoked.checks.load(Ordering::SeqCst), 3);
+    assert!(
+        service
+            .market_data_instruments()
+            .search("AAPL270115C00200000", 2, deadline(), &cancellation)?
+            .matches()
+            .is_empty()
+    );
     let published = publisher.publish_alpaca_option_references(
         option_admission(created.clone(), source.source_id().clone()),
         &read_during_publication,
@@ -3211,18 +3259,116 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
             deadline(),
             &cancellation,
         )?,
-        Some(option)
+        Some(option.clone())
     );
     let replayed = service
         .market_data_instrument_synchronization()
         .publish_alpaca_option_references(
-            option_admission(created, source.source_id().clone()),
+            option_admission(created.clone(), source.source_id().clone()),
             &allowed,
             deadline(),
             &cancellation,
         )?;
     assert_eq!(replayed.inserted(), 0);
     assert_eq!(replayed.replayed(), 1);
+
+    // This synthetic source cannot manufacture a doctor-renewal origin. Current metadata is
+    // admitted at current knowledge time, but unchanged originals still need that typed proof.
+    let current_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let current_source = option_source_for(
+        "alpaca-option-reference-current-v1",
+        EffectiveInterval::new(current_at, None)?,
+    )?;
+    let current_admission = || {
+        let mut input = option_admission(created.clone(), source.source_id().clone());
+        input.source = current_source.clone();
+        input
+    };
+    let revoked = Precommit {
+        checks: AtomicUsize::new(0),
+        revoke_on: 2,
+    };
+    let publisher = service.market_data_instrument_synchronization();
+    assert!(matches!(
+        publisher.publish_alpaca_option_references(
+            current_admission(),
+            &revoked,
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::PublicationAuthority(_))
+    ));
+    assert_eq!(
+        service.retained_source_metadata(
+            current_source.source_id(),
+            current_source.revision(),
+            Timestamp::from_unix_nanos(i64::MAX),
+            deadline(),
+            &cancellation,
+        )?,
+        None,
+    );
+    assert!(matches!(
+        publisher.publish_alpaca_option_references(
+            current_admission(),
+            &allowed,
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
+    ));
+    assert_eq!(
+        service.retained_source_metadata(
+            current_source.source_id(),
+            current_source.revision(),
+            option_at,
+            deadline(),
+            &cancellation,
+        )?,
+        None,
+    );
+    let checked_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    assert_eq!(
+        service.retained_source_metadata(
+            current_source.source_id(),
+            current_source.revision(),
+            checked_at,
+            deadline(),
+            &cancellation,
+        )?,
+        Some(current_source.clone()),
+    );
+    assert_eq!(
+        service.retained_source_metadata(
+            option_source.source_id(),
+            option_source.revision(),
+            option_at,
+            deadline(),
+            &cancellation,
+        )?,
+        Some(option_source.clone()),
+    );
+    assert_eq!(
+        service.reopen_provider_capture_original(
+            &originals[0],
+            &raw_store,
+            deadline(),
+            &cancellation,
+        )?.original(),
+        &originals[0],
+    );
+    assert_eq!(
+        service.market_data_instruments().latest(
+            option.definition().instrument_id(),
+            deadline(),
+            &cancellation,
+        )?,
+        Some(option),
+    );
     Ok(())
 }
 

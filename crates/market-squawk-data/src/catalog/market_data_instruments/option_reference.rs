@@ -23,7 +23,7 @@ type Error = MarketDataInstrumentCatalogError;
 /// Complete source-owned reference graph and the existing authority that permits its admission.
 /// No caller-provided canonical option ID, currency, external identifier, or economics is accepted.
 pub struct AlpacaOptionReferenceAdmission {
-    /// Exact registered Alpaca source generation.
+    /// Exact currently authorized Alpaca source generation, admitted here if newly renewed.
     pub source: SourceMetadata,
     /// Historical same-credential relationship, while `source` remains current permission.
     pub origin: Option<market_squawk_sources::OptionReferenceOrigin>,
@@ -130,6 +130,20 @@ impl CatalogAuthority {
                     .contains(&input.underlying.definition().asset_class())
             {
                 return Err(Error::SourceIdentityConflict);
+            }
+            if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
+                // Restored originals retain their acquisition metadata. A separately authorized
+                // renewal must enter this catalog at current knowledge time, not an old page clock.
+                let registered_at = {
+                    let transaction = connection.unchecked_transaction()?;
+                    let now = trusted_catalog_now(&transaction)?;
+                    if !input.source.is_effective_at(now) {
+                        return Err(Error::SourceIdentityConflict);
+                    }
+                    transaction.commit()?;
+                    now
+                };
+                self.catalog().register_source(&input.source, registered_at)?;
             }
             if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
                 return Err(Error::SourceIdentityConflict);

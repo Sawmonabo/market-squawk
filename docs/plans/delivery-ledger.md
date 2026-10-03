@@ -20,6 +20,19 @@ focused source-identity check → matched native retry → preparation-job integ
 current Desktop stays open. No raw-original mutation, expired permission bypass, migration,
 new worktree/branch, concurrent builds or full gate.
 
+The option correction is integrated and agent ownership released. The catalog admits renewed,
+currently effective metadata at a trusted current clock before its existing exact comparison;
+original page clocks/metadata, typed historical-origin relation, underlying identity, rights and
+final precommit validation remain unchanged. The existing
+`alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity` fixture passed 1/1 in
+1.20s after a 43.39s single-job compile. It covers expired/revoked registration rejection, final
+revocation rollback, current-time registration, missing renewal-proof rejection and unchanged
+original custody/identity. A genuine typed renewed-origin fixture is not present; this check does
+not establish successful real renewal. The retained live originals/native retry are the next proof.
+Log: `.agents/tmp/v1-first-stock/option-source-renewal-critical.log`. No new harness/API, CI,
+schema migration or general authority relaxation. MSFT detail also reopened its daily change,
+history and financial facts without query errors (`daily-comparison-msft-detail.json`).
+
 ### Active wave — session-correct daily changes and first complete stock analysis
 
 Refresh base `1dbb5f54`, clean single feature worktree; source checkpoint `4f92916c` runs as
