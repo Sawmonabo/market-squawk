@@ -20,6 +20,35 @@ accepted, then paused at three steps; no new workflow or workspace was created. 
 DAG: matched calendar failure → exact ownership/admission trace → scoped correction → critical
 check → matched native recovery. Existing unrelated crypto reference unavailability remains open.
 
+Confirmed startup defect: `restore_live_sources` completes an unfinished account transition,
+then enqueues that same newly active record for automatic Alpaca Retry, replacing the runtime it
+just restored. It also selects the pending record before taking the lifecycle gate. The native
+audit shows a successful calendar commit followed by another set of nine asset publications,
+consistent with repeated restoration; exact timeout causality is not inferred from that sequence.
+Bounded source ownership now transfers to Astra `stock_preparation_deadline` for
+`apps/market-squawk/src/local_product/source_lifecycle.rs` only: refresh under the gate, retain a
+verified already-restored successor, and avoid a second startup retry after successful completion.
+Lead owns existing integration fixtures, shared interfaces, checks and deployment. No calendar
+validation/deadline change is authorized by this diagnosis. Watcher paused; current app stays open.
+
+The source correction is frozen and inspected: one account record read under the lifecycle gate;
+recovery completed by either startup or the health worker is reused only when its exact persisted
+successor still verifies. Terminal stop/remove remains excluded, and absent/unhealthy groups or
+expired proof retain the existing startup path. Agent ownership is released. The existing Retry
+command/cancellation critical fixture passed (1/1, 0.15s; single-job compile 5m46s), including
+pending recognition and explicit stop/remove semantics. It does not directly prove duplicate-start
+avoidance, which still requires the matching native consumer. Log: `startup-single-restore-critical.log`.
+
+A later read-only envelope audit verifies Active revision 32 / finished successor in both slots:
+background recovery did complete despite the startup report. The live publication worker later
+failed its operation deadline; a resume against that Active state again paused at three steps.
+Do not equate durable Active with a healthy live group. Evidence: `calendar-startup-lifecycle-state.json`,
+`calendar-startup-ingest.json`, `exact-stock-native-{resume,progress}-active.json`. Source identity
+checkpoint is reflected in PR #43 comment 5972514655. Current branches verified: three local, one
+worktree, four remote heads including the still-open unique Dependabot PR #55; no branches created.
+
+
+
 ### Active correction — exact stock identity survives option discovery
 
 Base `0816a979`, matching source `57ac6639`. Acceptance 1/2/7: startup renewed Alpaca's doctor,

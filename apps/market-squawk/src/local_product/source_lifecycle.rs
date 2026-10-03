@@ -198,6 +198,29 @@ impl ProductionSourceLifecycleAuthority {
             let deadline = operation_deadline(deadline, operation_timeout)?;
             let provider = SourceIdentifier::try_from(surface)
                 .map_err(|_error| SourceLifecycleError::InvalidResult)?;
+            let account_surface = AccountMarketSurface::parse(surface);
+            // The health owner can finish or replace the saved transition while startup
+            // waits for this gate. Only the record read under ownership may be resumed.
+            let _gate = if account_surface.is_some() {
+                Some(
+                    match self
+                        .lifecycle_gate_before(surface, deadline, cancellation)
+                        .await
+                    {
+                        Ok(gate) => gate,
+                        Err(error)
+                            if operation_timeout.is_some()
+                                && error != SourceLifecycleError::Cancelled =>
+                        {
+                            failures.push(LiveSourceRestoreFailure { provider, error });
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    },
+                )
+            } else {
+                None
+            };
             let mut record = match self.durable.source_lifecycle_record(surface) {
                 Ok(record) => record,
                 Err(error) => {
@@ -208,38 +231,59 @@ impl ProductionSourceLifecycleAuthority {
                     continue;
                 }
             };
-            if let Some(account_surface) = AccountMarketSurface::parse(surface)
-                && record.account().is_some_and(|pending| !pending.finished)
-            {
-                let _gate = match self
-                    .lifecycle_gate_before(surface, deadline, cancellation)
-                    .await
-                {
-                    Ok(gate) => gate,
-                    Err(error)
-                        if operation_timeout.is_some()
-                            && error != SourceLifecycleError::Cancelled =>
+            if let Some(account_surface) = account_surface {
+                if record.account().is_some_and(|pending| !pending.finished) {
+                    match self
+                        .continue_account_transition(
+                            record,
+                            account_surface,
+                            deadline,
+                            cancellation,
+                            true,
+                            account_surface == AccountMarketSurface::AlpacaBasic,
+                        )
+                        .await
                     {
-                        failures.push(LiveSourceRestoreFailure { provider, error });
-                        continue;
+                        Ok(completed) => record = completed,
+                        Err(error) => {
+                            failures.push(LiveSourceRestoreFailure { provider, error });
+                            continue;
+                        }
                     }
-                    Err(error) => return Err(error),
-                };
-                match self
-                    .continue_account_transition(
-                        record,
-                        account_surface,
-                        deadline,
-                        cancellation,
-                        true,
-                        account_surface == AccountMarketSurface::AlpacaBasic,
-                    )
-                    .await
+                }
+                // A completed continuation already owns its successor, including calendar
+                // publication. Reuse that exact healthy allocation instead of issuing another
+                // Retry that would retire it. This also covers recovery winning the gate first.
+                if record.phase() == DurableSourceLifecyclePhase::Active
+                    && let Some(successor) = record
+                        .account()
+                        .and_then(|pending| pending.successor.as_ref())
+                    && let Ok(request) =
+                        self.restored_account_group_request(account_surface, &provider, &record)
                 {
-                    Ok(completed) => record = completed,
-                    Err(error) => {
-                        failures.push(LiveSourceRestoreFailure { provider, error });
-                        continue;
+                    match self
+                        .live
+                        .verify_account_group(request, deadline, cancellation)
+                        .await
+                    {
+                        Ok(Some(evidence))
+                            if validate_account_group_evidence(request, &evidence)
+                                .is_ok_and(|generation| successor.matches(request, generation)) =>
+                        {
+                            restored.push(provider);
+                            continue;
+                        }
+                        Err(
+                            error @ (market_squawk_services::ServiceError::Cancelled
+                            | market_squawk_services::ServiceError::DeadlineExceeded),
+                        ) => {
+                            failures.push(LiveSourceRestoreFailure {
+                                provider,
+                                error: map_live_error(error),
+                            });
+                            continue;
+                        }
+                        Ok(_) | Err(_) => {}
                     }
                 }
             }
@@ -316,7 +360,12 @@ impl ProductionSourceLifecycleAuthority {
                     }
                 };
                 match self
-                    .start_restored_scalar_live_source(&provider, session_id, deadline, cancellation)
+                    .start_restored_scalar_live_source(
+                        &provider,
+                        session_id,
+                        deadline,
+                        cancellation,
+                    )
                     .await
                 {
                     Ok(()) => restored.push(provider),
