@@ -6674,7 +6674,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     let paths = LocalPaths::prepare(directory.path().join("complete-alpaca-history"))?;
     let location = paths.catalog()?.clone();
     // Match the installed producer's catalog and staging policy (local_product/mod.rs).
-    // Decoder/query comparison below deliberately retains its separate 64 MiB ceiling.
+    // Retained decoding/query comparison keeps 64 MiB; the investment cursor uses 32 MiB.
     let catalog_config = CatalogConfig::try_new(
         location.clone(),
         Duration::from_millis(750),
@@ -8157,18 +8157,33 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(creating_object.inputs()[0].binding(), &long_binding);
     assert_eq!(creating_object.object().object().row_count(), 2_709);
     assert!(creating_object.generation_object_ordinal() > 0);
+    // The investment workflow reads the same complete calendar with 128-row/32 MiB
+    // cursor admission. Its prior whole-row-group output estimate rejected this data.
+    let mut too_small = restarted.object_store().pinned_object_batch_cursor(
+        long_origin.pinned(),
+        creating_object.object().artifact_id(),
+        creating_object.generation_object_ordinal(),
+        128,
+        1024 * 1024,
+        &CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        too_small.next_batch().await,
+        Err(market_squawk_data::ParquetStoreError::ReadLimitExceeded)
+    ));
+    drop(too_small);
     let mut cursor = restarted.object_store().pinned_object_batch_cursor(
         long_origin.pinned(),
         creating_object.object().artifact_id(),
         creating_object.generation_object_ordinal(),
-        256,
-        64 * 1024 * 1024,
+        128,
+        32 * 1024 * 1024,
         &CancellationToken::new(),
     )?;
     let read_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut decoded = Vec::with_capacity(long_binding.record_count());
     while let Some(batch) = tokio::time::timeout_at(read_deadline, cursor.next_batch()).await?? {
-        assert!(batch.num_rows() <= 256);
+        assert!(batch.num_rows() <= 128);
         let (rows, retained) = ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
             batch,
             &long_binding,

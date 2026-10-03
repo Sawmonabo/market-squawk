@@ -1,10 +1,16 @@
 //! Sequential verified reads retaining one decoder and one caller-owned batch.
 
-use arrow::datatypes::DataType;
-use parquet::basic::Encoding;
 use std::{fmt, time::Instant};
 
-use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReader};
+use parquet::arrow::{
+    ProjectionMask,
+    arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader},
+};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+
+#[path = "cursor/admission.rs"]
+mod admission;
+use admission::{admit_cursor_working_set, admit_offset_index};
 
 use super::*;
 
@@ -574,7 +580,22 @@ impl CursorState {
                 return Err(ParquetStoreError::ReadLimitExceeded);
             }
             file.seek(SeekFrom::Start(0))?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let metadata = ParquetMetaDataReader::new().parse_and_finish(&file)?;
+            // Indexes live outside the footer. The library fetches their entire enclosing
+            // byte range, so admit that range and its decoded metadata before loading it.
+            admit_offset_index(
+                &metadata,
+                pinned.bytes - 8 - u64::from(footer_bytes),
+                self.max_batch_bytes,
+            )?;
+            let mut metadata_reader = ParquetMetaDataReader::new_with_metadata(metadata)
+                .with_offset_index_policy(PageIndexPolicy::Optional);
+            metadata_reader.read_page_indexes(&file)?;
+            let metadata = ArrowReaderMetadata::try_new(
+                Arc::new(metadata_reader.finish()?),
+                ArrowReaderOptions::new(),
+            )?;
+            let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata);
             if u64::try_from(builder.metadata().file_metadata().num_rows()).ok()
                 != Some(pinned.rows)
                 || self
@@ -584,87 +605,15 @@ impl CursorState {
             {
                 return Err(ParquetStoreError::ObjectMetadataMismatch);
             }
-            // Parquet retains compressed column chunks and page/decoder scratch for one row
-            // group. Admit that working set, not the total size of the immutable object.
-            let metadata_bytes = builder.metadata().memory_size();
-            for group in builder.metadata().row_groups() {
-                let rows = usize::try_from(group.num_rows())
-                    .map_err(|_| ParquetStoreError::SizeOverflow)?;
-                let fields = builder.schema().fields();
-                if group.num_columns() != fields.len() {
-                    return Err(ParquetStoreError::ObjectMetadataMismatch);
-                }
-                let mut working = metadata_bytes
-                    .checked_add(64 * 1024)
-                    .ok_or(ParquetStoreError::SizeOverflow)?;
-                for (index, (field, column)) in fields.iter().zip(group.columns()).enumerate() {
-                    if self
-                        .projection
-                        .as_ref()
-                        .is_some_and(|columns| columns.binary_search(&index).is_err())
-                    {
-                        continue;
-                    }
-                    let uncompressed = usize::try_from(column.uncompressed_size())
-                        .map_err(|_| ParquetStoreError::SizeOverflow)?;
-                    let compressed = usize::try_from(column.compressed_size())
-                        .map_err(|_| ParquetStoreError::SizeOverflow)?;
-                    let values = match field.data_type() {
-                        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(rows),
-                        DataType::Int16 | DataType::UInt16 => rows.checked_mul(2),
-                        DataType::Int32
-                        | DataType::UInt32
-                        | DataType::Date32
-                        | DataType::Float32 => rows.checked_mul(4),
-                        DataType::Int64
-                        | DataType::UInt64
-                        | DataType::Float64
-                        | DataType::Date64
-                        | DataType::Timestamp(_, _) => rows.checked_mul(8),
-                        DataType::Decimal128(_, _) => rows.checked_mul(16),
-                        DataType::FixedSizeBinary(width) => usize::try_from(*width)
-                            .ok()
-                            .and_then(|width| rows.checked_mul(width)),
-                        DataType::Utf8
-                        | DataType::Binary
-                        | DataType::LargeUtf8
-                        | DataType::LargeBinary => {
-                            let values = if column
-                                .encodings()
-                                .all(|encoding| matches!(encoding, Encoding::PLAIN | Encoding::RLE))
-                            {
-                                Some(uncompressed)
-                            } else {
-                                rows.checked_mul(uncompressed)
-                            };
-                            rows.checked_add(1)
-                                .and_then(|rows| rows.checked_mul(8))
-                                .and_then(|offsets| {
-                                    values.and_then(|values| offsets.checked_add(values))
-                                })
-                        }
-                        _ => return Err(ParquetStoreError::ReadLimitExceeded),
-                    }
-                    .ok_or(ParquetStoreError::SizeOverflow)?;
-                    working = working
-                        .checked_add(compressed)
-                        .and_then(|bytes| bytes.checked_add(uncompressed))
-                        .and_then(|bytes| {
-                            values
-                                .checked_mul(2)
-                                .and_then(|values| bytes.checked_add(values))
-                        })
-                        .and_then(|bytes| {
-                            rows.checked_add(7)
-                                .map(|validity| validity / 8)
-                                .and_then(|validity| bytes.checked_add(validity))
-                        })
-                        .ok_or(ParquetStoreError::SizeOverflow)?;
-                }
-                if working > self.max_batch_bytes {
-                    return Err(ParquetStoreError::ReadLimitExceeded);
-                }
-            }
+            admit_cursor_working_set(
+                builder.metadata(),
+                builder.schema(),
+                self.projection.as_deref(),
+                self.batch_rows,
+                self.start_row,
+                self.max_batch_bytes,
+                cancellation,
+            )?;
             self.reader_schema = Some(if let Some(columns) = &self.projection {
                 Arc::new(builder.schema().project(columns)?)
             } else {

@@ -4,6 +4,51 @@
 
 ### Current native barrier — investment dataset cursor admission
 
+Cursor correction is implemented with the existing Parquet offset index: output admission uses
+pages intersecting requested batches, while decoder/dictionary scratch remains conservative.
+Exact schema, hashes, complete rows, cancellation and insufficient-budget rejection remain.
+This does not remove all large-column limits or correct selected-stock dataset wiring. The
+existing 2,709-row calendar fixture passes at 128 rows / 32 MiB, including the lead's numeric
+dictionary scratch correction: final check 1/1 in 27.01s after 50.31s single-job compilation.
+Insufficient 1 MiB admission still rejects. Both agents released source ownership.
+
+The completed stock-consumer diagnosis (`investment-dataset-cursor.md`) identifies required
+in-place integration: retained sourceActionReference → canonical dataset operation input →
+exact native history and current fixed-cohort authority → existing retrospective annual builder.
+It must replace the all-dataset scan for this selected-stock operation. The current preparation
+has no required annual history/action plan: every acquisition reports unavailable after the
+account identity deadline failure (`investment-dataset-preparation-coverage.json`). Do not
+substitute overview bars, invent historical knowledge, or call a cursor fixture a completed
+analysis. Lead owns shared handoff and same-request reconciliation; no migration/reset.
+
+
+Owner-requested disk cleanup (2026-10-03): removed 29 superseded executable variants under
+`target/debug/deps` after checking no process held them open, retaining the latest executable of
+each name and every library cache. Reclaimed 7.77 GiB; free space increased from 46 to 54 GiB.
+Receipt: `stale-build-cleanup-20261003.json`. Preserved original sessions, prior workspace roots,
+pre-schema recovery executables, active reports and both live runtime generations. No source,
+Git state, database or unrelated session was removed.
+
+
+Confirmed read evidence: the first failing ordered canonical object is the 2,709-row market
+calendar (817,766 compressed bytes, 11,323-byte footer). Its current row-group estimate is
+43,737,009 bytes before metadata, exceeding the 32 MiB batch budget; the installed Parquet 58.3
+sync reader consumes pages, so that estimate charges work the requested 128-row batch does not
+retain. Metadata evidence: `investment-dataset-parquet-metadata.json`. Separately, guided stock
+preparation scans unrelated canonical datasets (including large SEC facts) before selecting the
+instrument. Fixing only calendar admission would leave that dependency defect.
+
+Current disjoint wave: Astra `cursor_page_admission` owns only
+`crates/market-squawk-data/src/parquet_store/cursor.rs` and a cohesive sibling helper if needed,
+plus the existing calendar cursor regression in `tests/publication_recovery.rs`; correct actual
+page/batch accounting with existing Parquet APIs, preserving exact full-input evidence and real
+resource safeguards. Astra `workflow_job_resume` remains read-only for stock history selection
+and writes its existing diagnosis report only. Lead reserves dataset preparation source, shared
+contracts/manifests, integration and all checks. Watcher paused; visible app stays running.
+DAG: concrete page admission evidence → cursor correction and independent exact-history design
+→ focused critical verification → integrate required stock consumer before live retry.
+
+
 Source **`fbcce915`** is pushed and critically verified. The matched development build passed in
 7m06s; supervisor replaced the service with PID 89615 while the existing native window (11246)
 stayed open and reconnected. Workflow logic and its presentation are service-owned; no transport
