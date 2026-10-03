@@ -3147,6 +3147,54 @@ impl AnalyticalDataService {
             .authorize_research_use(request, cancellation)
     }
 
+    /// Authorizes display of exact retained manifests without taking the publication gate.
+    /// Missing or expired grants require policy renewal; other failures remain errors.
+    pub fn authorize_current_research_use(
+        &self,
+        request: crate::ResearchUseRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::AuthorizedResearchRead>, crate::ResearchUseCatalogError> {
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(request.limits().traversal_deadline())
+                .ok_or(crate::ResearchUseCatalogError::DeadlineExceeded)?,
+        );
+        let snapshot =
+            self.manifests
+                .read_snapshot(self.catalog_read_limits, deadline, cancellation)?;
+        snapshot.read(|snapshot| {
+            crate::research_use::authorize_current_research_use_in_snapshot(
+                snapshot,
+                self.catalog_id,
+                request,
+                deadline,
+                cancellation,
+            )
+        })
+    }
+
+    /// Revalidates display authority after reading without granting derived publication rights.
+    pub fn recheck_research_use(
+        &self,
+        authorization: &crate::AuthorizedResearchRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), crate::ResearchUseCatalogError> {
+        let snapshot =
+            self.manifests
+                .read_snapshot(self.catalog_read_limits, deadline, cancellation)?;
+        snapshot.read(|snapshot| {
+            crate::research_use::recheck_research_use_in_snapshot(
+                snapshot,
+                self.catalog_id,
+                authorization,
+                deadline,
+                cancellation,
+            )
+        })
+    }
+
     /// Authorizes only the selected event coordinates through an independent catalog snapshot.
     pub fn authorize_market_event_use(
         &self,

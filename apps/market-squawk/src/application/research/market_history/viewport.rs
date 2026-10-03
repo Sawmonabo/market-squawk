@@ -4,6 +4,7 @@ use crate::{
     ResearchService,
     application::model::forecast::{
         authorize_projection_parents, chart_storage_error, read_chart_display,
+        recheck_projection_parents,
     },
 };
 use market_squawk_data::{ChartProjectionError, ChartProjectionRow};
@@ -174,9 +175,7 @@ impl MarketHistoryReadCapability {
                         context.cancellation(),
                     )
                     .map_err(chart_storage_error)?;
-                if current_time()? >= permit.expires_at() {
-                    return Err(ServiceError::Unauthorized);
-                };
+                recheck_projection_parents(research, permit, context).await?;
                 reference
             }
         };
@@ -222,9 +221,7 @@ impl MarketHistoryReadCapability {
             display["firstTimeUnixNanos"] = Value::Null;
             display["lastTimeUnixNanos"] = Value::Null;
         }
-        if current_time()? >= permit.expires_at() {
-            return Err(ServiceError::Unauthorized);
-        };
+        recheck_projection_parents(research, permit, context).await?;
         Ok(Some(
             json!({"currency":metadata.currency.as_str(),"bars":bars,"partial":display["reduced"],"display":display,
             "generationToken":hex(reference.source_sha256),
@@ -251,14 +248,6 @@ fn date_text(key: i64) -> String {
 fn timestamp(value: Timestamp) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(value.unix_nanos())
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-}
-fn current_time() -> Result<Timestamp, ServiceError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|v| i64::try_from(v.as_nanos()).ok())
-        .map(Timestamp::from_unix_nanos)
-        .ok_or(ServiceError::Internal)
 }
 fn hex(bytes: [u8; 32]) -> String {
     use std::fmt::Write as _;

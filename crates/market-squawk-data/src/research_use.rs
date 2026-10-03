@@ -19,6 +19,11 @@ pub(crate) use persistence::{
     RetainedSourceUseGrant, SourceGrantSelection, select_source_use_grant, source_use_frontier,
 };
 mod publication;
+mod read;
+pub use read::AuthorizedResearchRead;
+pub(crate) use read::{
+    authorize_current_research_use_in_snapshot, recheck_research_use_in_snapshot,
+};
 mod traversal;
 
 pub use self::catalog::{

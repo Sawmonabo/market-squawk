@@ -72,6 +72,86 @@ pub(crate) fn research_source_operations(
 }
 
 impl ResearchService {
+    /// Displays retained manifests through current catalog snapshots. Only missing or expired
+    /// grants use existing policy renewal; display receipts carry no publication authority.
+    pub(crate) async fn authorize_research_display(
+        &self,
+        request: market_squawk_data::ResearchUseRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Result<
+            Arc<market_squawk_data::AuthorizedResearchRead>,
+            market_squawk_data::ResearchUseCatalogError,
+        >,
+        ResearchServiceError,
+    > {
+        let Some(traversal_deadline) =
+            Instant::now().checked_add(request.limits().traversal_deadline())
+        else {
+            return Ok(Err(
+                market_squawk_data::ResearchUseCatalogError::DeadlineExceeded,
+            ));
+        };
+        let deadline = deadline.min(traversal_deadline);
+        let analytical = Arc::clone(&self.analytical);
+        let current_request = request.clone();
+        let current = self
+            .run_owned_research_read(deadline, cancellation, move |owned| {
+                analytical.authorize_current_research_use(current_request, deadline, &owned)
+            })
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(market_squawk_data::IngestError::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(market_squawk_data::IngestError::DeadlineExceeded.into());
+        }
+        match current {
+            Ok(Some(receipt)) => return Ok(Ok(Arc::new(receipt))),
+            Err(error) => return Ok(Err(error)),
+            Ok(None) => {}
+        }
+        // Leave the read worker before waiting for renewal. Preserve the durable authorization
+        // path used by calculations and publications, then read its newly admitted grants.
+        if let Err(error) = self
+            .authorize_research_use(request.clone(), deadline, cancellation)
+            .await?
+        {
+            return Ok(Err(error));
+        }
+        let analytical = Arc::clone(&self.analytical);
+        let renewed = self
+            .run_owned_research_read(deadline, cancellation, move |owned| {
+                analytical.authorize_current_research_use(request, deadline, &owned)
+            })
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(market_squawk_data::IngestError::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(market_squawk_data::IngestError::DeadlineExceeded.into());
+        }
+        Ok(renewed.and_then(|receipt| {
+            receipt
+                .map(Arc::new)
+                .ok_or(market_squawk_data::ResearchUseCatalogError::Expired)
+        }))
+    }
+
+    pub(crate) async fn recheck_research_display(
+        &self,
+        receipt: Arc<market_squawk_data::AuthorizedResearchRead>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Result<(), market_squawk_data::ResearchUseCatalogError>, ResearchServiceError> {
+        let analytical = Arc::clone(&self.analytical);
+        self.run_owned_research_read(deadline, cancellation, move |owned| {
+            analytical.recheck_research_use(&receipt, deadline, &owned)
+        })
+        .await
+    }
+
     /// Admits exact lineage on the retained-read worker with the existing writer lease.
     /// The worker owns only the existing analytical service, never this worker's owner.
     pub(crate) async fn authorize_research_use(

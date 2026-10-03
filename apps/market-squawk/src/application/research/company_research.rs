@@ -306,16 +306,20 @@ impl CompanyResearchReadCapability {
         let raw_store = self.research.provider_capture_store();
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CanonicalResearchReadError::AuthorityUnavailable)?;
-        self.run_company_read(deadline, cancellation, move |owned| {
-            runtime.block_on(reader.prepare_display_by_identity(
-                request,
-                raw_store.as_ref(),
-                &super::investment_financials::FinancialDisplayProjection,
-                deadline,
-                owned,
-            ))
-        })
-        .await
+        check_operation(deadline, cancellation)?;
+        self.research
+            .run_owned_research_preparation(deadline, cancellation, move |owned| {
+                runtime.block_on(reader.prepare_display_by_identity(
+                    request,
+                    raw_store.as_ref(),
+                    &super::investment_financials::FinancialDisplayProjection,
+                    deadline,
+                    owned,
+                ))
+            })
+            .await
+            .map_err(map_company_worker_error)?
+            .map_err(map_company_data_error)
     }
 
     async fn run_company_read<T: Send + 'static>(
@@ -328,15 +332,7 @@ impl CompanyResearchReadCapability {
         self.research
             .run_owned_research_generation_read(deadline, cancellation, operation)
             .await
-            .map_err(|error| match error {
-                crate::ResearchServiceError::Ingest(IngestError::Cancelled) => {
-                    CanonicalResearchReadError::Cancelled
-                }
-                crate::ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => {
-                    CanonicalResearchReadError::DeadlineExceeded
-                }
-                _ => CanonicalResearchReadError::AuthorityUnavailable,
-            })?
+            .map_err(map_company_worker_error)?
             .map_err(map_company_data_error)
     }
 
@@ -2010,6 +2006,18 @@ fn check_operation(
         Err(CanonicalResearchReadError::DeadlineExceeded)
     } else {
         Ok(())
+    }
+}
+
+fn map_company_worker_error(error: crate::ResearchServiceError) -> CanonicalResearchReadError {
+    match error {
+        crate::ResearchServiceError::Ingest(IngestError::Cancelled) => {
+            CanonicalResearchReadError::Cancelled
+        }
+        crate::ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => {
+            CanonicalResearchReadError::DeadlineExceeded
+        }
+        _ => CanonicalResearchReadError::AuthorityUnavailable,
     }
 }
 

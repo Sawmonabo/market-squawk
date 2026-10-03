@@ -2,6 +2,40 @@
 
 ## Current execution — 2026-10-03
 
+### Active wave — keep reads available during financial preparation
+
+Refresh base `450f4909`, clean primary branch; service 75379/Desktop 75415 confirmed live.
+Acceptance 2/5/7: concurrent market and financial reads timed out during the completed MSFT
+acquisition. Reuse existing authorization and I/O ownership mechanisms; preserve integrity,
+policy mutation ordering and shutdown custody. No deadline increase or new scheduling framework.
+
+| Owner | Disjoint files / dependency | Critical evidence |
+| --- | --- | --- |
+| Astra High `manifest_read_authority` | `crates/market-squawk-data/src/research_use.rs`, `src/research_use/` and `tests/publication_recovery.rs`; separate display receipt preserves durable calculation/publication permits | Existing manifest traversal/grant evaluator reused for snapshot-only current authorization; current reads succeed during unrelated writer admission, revocation/expiry still enforced |
+| GPT-6.1 Sol High `financial_preparation_worker` | `apps/market-squawk/src/application/research/company_research.rs`, `src/research_service/worker.rs` | Full preparation uses lead-provided `run_owned_research_preparation`; reads retain existing generation worker; extend existing worker progress/drain fixture |
+| Lead | `data/src/ingest.rs`, app `research_service.rs`, `research_service/retained_use.rs`, chart projection/viewport/previous-close callers and exports, shared interfaces, ledger, all Git/build/runtime | Integrate snapshot facade and fourth existing-type worker lifecycle, inspect callers, serialize focused tests, commit/push and matched native read-during-preparation verification |
+
+DAG: publish common method signatures → parallel evaluator/financial caller changes → lead
+integration → focused authority/worker checks → one matching build → actual simultaneous native
+preparation and reads. Watcher paused while edits are in flight; current app remains available.
+No new branches/worktrees. Prior source and UI lanes are complete and ownership released.
+
+Both implementation lanes are integrated and frozen. Display authorization uses a separate
+process-local `AuthorizedResearchRead`, reusing the manifest graph/grant evaluator; durable
+calculation/publication permits remain unchanged. Saved charts and viewports recheck original
+grants after reading. Only missing/expired display grants enter existing policy renewal.
+Financial preparation has its own existing-type I/O worker, included in cancellation/shutdown.
+The extended existing manifest/restart fixture passed 1/1 (1.86s), including held-writer reads,
+expiry/renewal, revocation, unchanged durable decision count and old-session rejection. Log:
+`.agents/tmp/v1-first-stock/concurrent-read-authority-critical.log`. Same-session revocation
+between read and recheck is not separately fixture-proven; no new mutation test API was added.
+The existing worker progress/drain check passed 1/1 (0.47s), and retained authorization
+waiting outside capture I/O passed 1/1 (0.42s). Logs:
+`.agents/tmp/v1-first-stock/concurrent-read-worker-critical.log` and
+`concurrent-read-renewal-critical.log`. Lead inspected producer/consumer and shutdown changes;
+no CI, extra review round or whole-app RAM measurement. Matched native verification remains
+pending; the two preserved workspace roots have not been reset or migrated.
+
 ### Active wave — connection readiness independent of financial acquisition
 
 Audit base `d492a0ce`; acceptance 1/2/5/7. SEC connection setup currently times out while

@@ -4,7 +4,9 @@ use super::{MarketHistoryReadCapability, MarketHistoryUnavailableReason, unavail
 use crate::{
     ResearchService,
     application::{
-        model::forecast::{authorize_projection_parents, chart_storage_error},
+        model::forecast::{
+            authorize_projection_parents, chart_storage_error, recheck_projection_parents,
+        },
         research::corporate_actions::map_research_error,
     },
 };
@@ -425,9 +427,7 @@ impl MarketHistoryReadCapability {
             return Err(invalid_close_read(instrument_id, "terminal-bar-count"));
         }
         check(context)?;
-        if wall_now()? >= permit.expires_at() {
-            return Err(ServiceError::Unauthorized);
-        }
+        recheck_projection_parents(research, std::sync::Arc::clone(&permit), context).await?;
         let Some(latest) = latest else {
             return Ok(None);
         };
@@ -473,9 +473,7 @@ impl MarketHistoryReadCapability {
             .map_err(map_research_error)?
             .map_err(chart_storage_error)?;
         check(context)?;
-        if wall_now()? >= permit.expires_at() {
-            return Err(ServiceError::Unauthorized);
-        }
+        recheck_projection_parents(research, std::sync::Arc::clone(&permit), context).await?;
         read_projection(research, &selected, knowledge_cutoff, context).await
     }
 }

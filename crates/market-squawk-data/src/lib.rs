@@ -338,10 +338,10 @@ pub use query::{
     QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,
 };
 pub use research_use::{
-    AuthorizedMarketEventUse, AuthorizedResearchUse, DerivedOutputObjectInput,
-    DerivedPublicationDigest, DerivedPublicationInput, DerivedPublicationObject,
-    DerivedRetentionOperation, MAX_DERIVED_PUBLICATION_OBJECTS, MAX_RESEARCH_USE_EDGES,
-    MAX_RESEARCH_USE_GRAPH_NODES, MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
+    AuthorizedMarketEventUse, AuthorizedResearchRead, AuthorizedResearchUse,
+    DerivedOutputObjectInput, DerivedPublicationDigest, DerivedPublicationInput,
+    DerivedPublicationObject, DerivedRetentionOperation, MAX_DERIVED_PUBLICATION_OBJECTS,
+    MAX_RESEARCH_USE_EDGES, MAX_RESEARCH_USE_GRAPH_NODES, MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
     MAX_RESEARCH_USE_RETAINED_BYTES, MAX_RESEARCH_USE_ROOTS, MAX_RESEARCH_USE_SOURCES,
     MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS, MarketEventUseInput, MarketEventUseRequest,
     PublishedDerivedGeneration, RegisteredResearchUseGrant, ResearchUse,

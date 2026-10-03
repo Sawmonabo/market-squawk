@@ -42,7 +42,8 @@ use super::{
 mod chart_history;
 pub(crate) use chart_history::{
     SavedForecastChart, authorize_projection_parents, chart_quality, chart_storage_error,
-    read_chart_display, read_chart_display_from_catalog, replay_price_history_inputs,
+    read_chart_display, read_chart_display_from_catalog, recheck_projection_parents,
+    replay_price_history_inputs,
 };
 mod current_input;
 mod distribution;

@@ -400,6 +400,7 @@ pub struct ResearchService {
     provider_capture_worker: ResearchIoWorker,
     retained_read_worker: ResearchIoWorker,
     retained_generation_worker: ResearchIoWorker,
+    financial_preparation_worker: ResearchIoWorker,
     retained_use_policies: Arc<[market_squawk_data::RetainedResearchUsePolicy]>,
     application_changes: market_squawk_runtime::ApplicationChanges,
     history_publications: Arc<tokio::sync::Notify>,
@@ -643,6 +644,7 @@ impl ResearchService {
             provider_capture_worker: ResearchIoWorker::new(),
             retained_read_worker: ResearchIoWorker::new(),
             retained_generation_worker: ResearchIoWorker::new(),
+            financial_preparation_worker: ResearchIoWorker::new(),
             retained_use_policies: retained_use::current_policies()?.into(),
             application_changes,
             history_publications,
@@ -825,6 +827,23 @@ impl ResearchService {
             .await
     }
 
+    /// Prepares financial indexes without occupying workers used by visible retained reads.
+    /// The existing worker retains cancellation and shutdown custody of the original handle.
+    pub(crate) async fn run_owned_research_preparation<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.financial_preparation_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
     /// Runs one synchronous operation and drains its admitted handle before returning on
     /// cancellation or deadline, keeping the caller's authority lease alive through completion.
     pub(crate) async fn run_owned_research_io_joined<T, F>(
@@ -847,6 +866,7 @@ impl ResearchService {
         self.provider_capture_worker.begin_shutdown();
         self.retained_read_worker.begin_shutdown();
         self.retained_generation_worker.begin_shutdown();
+        self.financial_preparation_worker.begin_shutdown();
     }
 
     /// Joins every original worker even if one fails; interrupted joins retain their owners.
@@ -855,12 +875,13 @@ impl ResearchService {
         deadline: Instant,
     ) -> Result<(), ResearchServiceError> {
         self.begin_owned_io_shutdown();
-        let (capture, reads, generations) = tokio::join!(
+        let (capture, reads, generations, preparation) = tokio::join!(
             self.provider_capture_worker.finish_shutdown(deadline),
             self.retained_read_worker.finish_shutdown(deadline),
             self.retained_generation_worker.finish_shutdown(deadline),
+            self.financial_preparation_worker.finish_shutdown(deadline),
         );
-        capture.and(reads).and(generations)
+        capture.and(reads).and(generations).and(preparation)
     }
 
     /// Rejoins the fixed analytical selection to bounded original native/physical custody in the

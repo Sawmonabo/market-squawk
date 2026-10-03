@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use market_squawk_domain::{SchemaVersion, SourceId};
-use rusqlite::{OptionalExtension as _, Transaction, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use crate::{
 const GRAPH_FIXED_RETAINED_BYTES: usize = 12 * 8;
 
 pub(super) fn load_graph(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     request: &ResearchUseRequest,
     cancellation: &CancellationToken,
     deadline: Instant,
@@ -182,7 +182,7 @@ impl StoredGeneration {
 }
 
 fn load_generation_by_coordinate(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     manifest: &DatasetManifestRef,
 ) -> Result<Option<StoredGeneration>, ResearchUseCatalogError> {
     transaction
@@ -203,7 +203,7 @@ fn load_generation_by_coordinate(
 }
 
 fn load_generation_by_sequence(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     sequence: u64,
 ) -> Result<Option<StoredGeneration>, ResearchUseCatalogError> {
     transaction
@@ -235,7 +235,7 @@ fn stored_generation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGenerati
 }
 
 fn load_parents(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     generation: &ResearchUseGeneration,
     cancellation: &CancellationToken,
     deadline: Instant,
@@ -281,7 +281,7 @@ fn load_parents(
 }
 
 fn load_source_input(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     sequence: u64,
 ) -> Result<ResearchUseSourceInput, ResearchUseCatalogError> {
     let row = transaction
@@ -309,7 +309,7 @@ fn load_source_input(
 }
 
 fn source_input_exists(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     sequence: u64,
 ) -> Result<bool, ResearchUseCatalogError> {
     transaction

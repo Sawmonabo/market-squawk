@@ -614,7 +614,7 @@ fn selected_grant(
 
 // Immutable reads do not advance the durable clock. A detected rollback fails closed; recovering
 // requires the wall clock to reach the retained floor, not resetting it or reviving this handle.
-fn checked_read_clock(
+pub(super) fn checked_read_clock(
     connection: &Connection,
     evaluated_at: Option<Timestamp>,
 ) -> Result<Timestamp, ResearchUseCatalogError> {

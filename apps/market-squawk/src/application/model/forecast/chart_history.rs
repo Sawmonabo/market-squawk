@@ -19,7 +19,8 @@ use std::num::NonZeroU32;
 mod projection;
 pub(crate) use projection::{
     authorize_projection_parents, quality as chart_quality, read_chart_display,
-    read_chart_display_from_catalog, storage_error as chart_storage_error,
+    read_chart_display_from_catalog, recheck_projection_parents,
+    storage_error as chart_storage_error,
 };
 
 /// Original financial authority and immutable display projection retained with the decision.

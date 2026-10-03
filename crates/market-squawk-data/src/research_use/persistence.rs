@@ -390,20 +390,20 @@ pub(super) fn publish_derived(
 }
 
 #[derive(Clone)]
-enum SourceSelection {
+pub(super) enum SourceSelection {
     Selected(Box<ResearchUseAuthorityEvidence>),
     Missing,
 }
 
-type AuthoritySelections = (
+pub(super) type AuthoritySelections = (
     Vec<ResearchUseAuthorityEvidence>,
     BTreeMap<u64, SourceSelection>,
     u64,
     Option<ResearchUseDenialReason>,
 );
 
-fn select_authorities(
-    transaction: &Transaction<'_>,
+pub(super) fn select_authorities(
+    transaction: &rusqlite::Connection,
     graph: &ResearchUseGraph,
     requested_use: super::ResearchUse,
     now: Timestamp,
@@ -425,6 +425,7 @@ fn select_authorities(
             requested_use,
             now,
             frontier,
+            None,
             cancellation,
             deadline,
         )? {
@@ -444,7 +445,7 @@ fn select_authorities(
     Ok((authorities, selections, frontier, denial))
 }
 
-enum SourceAuthority {
+pub(super) enum SourceAuthority {
     Selected(Box<ResearchUseAuthorityEvidence>),
     Denied(ResearchUseDenialReason),
 }
@@ -465,12 +466,17 @@ pub(crate) enum SourceGrantSelection {
     Denied(ResearchUseDenialReason),
 }
 
-fn select_source_authority(
-    transaction: &Transaction<'_>,
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact source and optional selected grant share one authority evaluator"
+)]
+pub(super) fn select_source_authority(
+    transaction: &rusqlite::Connection,
     source: &ResearchUseSourceInput,
     requested_use: super::ResearchUse,
     now: Timestamp,
     frontier: u64,
+    expected_grant: Option<[u8; 32]>,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<SourceAuthority, ResearchUseCatalogError> {
@@ -481,7 +487,7 @@ fn select_source_authority(
         requested_use,
         now,
         frontier,
-        None,
+        expected_grant,
         cancellation,
         deadline,
     )? {
@@ -626,7 +632,7 @@ pub(crate) fn select_source_use_grant(
     }))
 }
 
-fn decision_expiry(
+pub(super) fn decision_expiry(
     now: Timestamp,
     limits: super::ResearchUseLimits,
     authorities: &[ResearchUseAuthorityEvidence],

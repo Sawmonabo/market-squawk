@@ -2932,8 +2932,13 @@ fn exercise_sec_fiscal_epoch_restart_with_rows(
             )?))
         };
         let base = now()?;
-        let fixture =
-            sec_research_capture_fixture_with_row_counts(base.unix_nanos(), true, 5, fact_rows, None)?;
+        let fixture = sec_research_capture_fixture_with_row_counts(
+            base.unix_nanos(),
+            true,
+            5,
+            fact_rows,
+            None,
+        )?;
         let raw_digest = fixture.capture_material.receipt().pages()[0].body_digest();
         let payload_digest = extraction_provider_payload_digest(&fixture.batch);
         let company = sec_research_company_identity(
@@ -4886,13 +4891,22 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
         basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-        permitted_operations: vec![SourceOperation::Persist],
+        permitted_operations: vec![SourceOperation::Persist, SourceOperation::Display],
     })?;
     authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
         rights.rights_id(),
         ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
         digest(33),
         Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    let display_expiry = SystemTime::now() + Duration::from_secs(1);
+    authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::Display])?,
+        digest(33),
+        Some(Timestamp::from_unix_nanos(i64::try_from(
+            display_expiry.duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?)),
     )?)?;
     let reservation = authority.reserve_ingest(
         &IngestIdentity::try_new(
@@ -4918,6 +4932,135 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
             CancellationToken::new(),
         )
         .await?;
+    let service = Arc::new(service);
+    let cancellation = CancellationToken::new();
+    let display_request = ResearchUseRequest::try_new(
+        vec![committed.manifest().clone()],
+        ResearchUse::Display,
+        ResearchUseLimits::try_new(
+            8,
+            32,
+            32,
+            8,
+            1024 * 1024,
+            Duration::from_secs(2),
+            Duration::from_secs(300),
+        )?,
+    )?;
+    // Wait for the explicit source-grant expiry, not an inferred operation-duration bound.
+    tokio::time::sleep(
+        display_expiry
+            .duration_since(SystemTime::now())
+            .unwrap_or_default(),
+    )
+    .await;
+    let writer = service.acquire_research_operation(&cancellation).await?;
+    assert!(
+        service
+            .authorize_current_research_use(
+                display_request.clone(),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )?
+            .is_none(),
+        "an expired grant requires controlled renewal even while an unrelated writer is held"
+    );
+    drop(writer);
+    let display_policy = market_squawk_data::RetainedResearchUsePolicy::try_new(
+        RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+        digest(32),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+        vec![SourceOperation::Persist, SourceOperation::Display],
+    )?;
+    service
+        .authorize_research_use_with_retained_policy(
+            display_request.clone(),
+            std::slice::from_ref(&display_policy),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )
+        .await?;
+    let proof = rusqlite::Connection::open(location.path())?;
+    let durable_decisions: i64 =
+        proof.query_row("SELECT COUNT(*) FROM research_use_decisions", [], |row| {
+            row.get(0)
+        })?;
+    let writer = service.acquire_research_operation(&cancellation).await?;
+    let display = service
+        .authorize_current_research_use(
+            display_request.clone(),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )?
+        .ok_or("admitted manifest display waited for unrelated writer renewal")?;
+    assert_eq!(display.graph().roots(), &[committed.manifest().clone()]);
+    assert_eq!(display.research_use(), ResearchUse::Display);
+    service.recheck_research_use(
+        &display,
+        Instant::now() + Duration::from_secs(5),
+        &cancellation,
+    )?;
+    let after_read: i64 =
+        proof.query_row("SELECT COUNT(*) FROM research_use_decisions", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(durable_decisions, after_read);
+    let changed_manifest = DatasetManifestRef::try_new_with_schema(
+        committed.manifest().dataset_id().clone(),
+        committed.manifest().manifest_version(),
+        committed.manifest().schema().clone(),
+        Sha256Digest::new([98; 32]),
+    )?;
+    assert!(matches!(
+        service.authorize_current_research_use(
+            ResearchUseRequest::try_new(
+                vec![changed_manifest],
+                ResearchUse::Display,
+                display_request.limits(),
+            )?,
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::UnknownGeneration)
+    ));
+    assert!(matches!(
+        service.authorize_current_research_use(
+            ResearchUseRequest::try_new(
+                display_request.roots().to_vec(),
+                ResearchUse::LocalAnalysis,
+                display_request.limits(),
+            )?,
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidGrant)
+    ));
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        service.authorize_current_research_use(
+            display_request.clone(),
+            Instant::now() + Duration::from_secs(5),
+            &cancelled,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::Cancelled)
+            | Err(market_squawk_data::ResearchUseCatalogError::Catalog(
+                CatalogError::MarketRecoveryReadCancelled,
+            ))
+    ));
+    assert!(matches!(
+        service.authorize_current_research_use(
+            display_request.clone(),
+            Instant::now(),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::DeadlineExceeded)
+            | Err(market_squawk_data::ResearchUseCatalogError::Catalog(
+                CatalogError::MarketRecoveryReadDeadlineExceeded,
+            ))
+    ));
+    drop(writer);
+    drop(proof);
     for persisted in service
         .object_store()
         .read_pinned(committed.pinned(), &CancellationToken::new())?
@@ -5060,7 +5203,7 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
     drop(service);
 
     let restarted = AnalyticalDataService::open(
-        CatalogAuthority::open(catalog_config)?,
+        CatalogAuthority::open(catalog_config.clone())?,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         store_config,
@@ -5086,6 +5229,59 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
     assert_eq!(replayed.output().result_digest(), candidate_result_digest);
     assert_eq!(replayed.selection_digest(), selection_digest);
     assert_eq!(replayed.observations(), expected_observations);
+    let cancellation = CancellationToken::new();
+    assert!(matches!(
+        restarted.recheck_research_use(
+            &display,
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidPermitSession)
+    ));
+    assert!(
+        restarted
+            .authorize_current_research_use(
+                display_request.clone(),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )?
+            .is_some()
+    );
+    drop(replayed);
+    drop(restarted);
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    let display_grant = authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::Display])?,
+        digest(32),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    authority.revoke_research_use(market_squawk_data::ResearchUseRevocationInput::try_new(
+        &display_grant,
+        ResearchUseSet::try_new(vec![ResearchUse::Display])?,
+        market_squawk_data::ResearchUseRevocationReason::AuthorizationWithdrawn,
+        digest(97),
+        Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?),
+    )?)?;
+    drop(authority);
+    let revoked = Arc::new(AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?);
+    let writer = revoked.acquire_research_operation(&cancellation).await?;
+    assert!(matches!(
+        revoked.authorize_current_research_use(
+            display_request,
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::Revoked)
+    ));
+    drop(writer);
     Ok(())
 }
 

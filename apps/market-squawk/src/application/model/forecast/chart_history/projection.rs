@@ -113,9 +113,7 @@ impl SavedForecastChart {
             )
         };
         check(context)?;
-        if wall_now()? >= permit.expires_at() {
-            return Err(ServiceError::Unauthorized);
-        }
+        recheck_projection_parents(research, permit, context).await?;
         Ok(SavedChartProjection {
             frame: self.clone(),
             history: json!({"state":"available", "basis":"split_adjusted_price", "points":points,
@@ -234,7 +232,7 @@ pub(crate) async fn authorize_projection_parents(
     parents: &[market_squawk_data::DatasetManifestRef],
     source_cutoff: Timestamp,
     context: &RequestContext,
-) -> Result<market_squawk_data::ResearchUsePermit, ServiceError> {
+) -> Result<std::sync::Arc<market_squawk_data::AuthorizedResearchRead>, ServiceError> {
     use market_squawk_data::{ResearchUse, ResearchUseLimits, ResearchUseRequest};
     check(context)?;
     let duration = context
@@ -259,7 +257,7 @@ pub(crate) async fn authorize_projection_parents(
     let request = ResearchUseRequest::try_new(parents.to_vec(), ResearchUse::Display, limits)
         .map_err(|_| ServiceError::InvalidResult)?;
     let authorized = research
-        .authorize_research_use(request, context.deadline(), context.cancellation())
+        .authorize_research_display(request, context.deadline(), context.cancellation())
         .await
         .map_err(crate::application::research::corporate_actions::map_research_error)?
         .map_err(crate::application::research::map_research_use_error)?;
@@ -280,7 +278,21 @@ pub(crate) async fn authorize_projection_parents(
     {
         return Err(ServiceError::InvalidResult);
     }
-    Ok(authorized.into_permit())
+    Ok(authorized)
+}
+
+pub(crate) async fn recheck_projection_parents(
+    research: &crate::ResearchService,
+    receipt: std::sync::Arc<market_squawk_data::AuthorizedResearchRead>,
+    context: &RequestContext,
+) -> Result<(), ServiceError> {
+    check(context)?;
+    research
+        .recheck_research_display(receipt, context.deadline(), context.cancellation())
+        .await
+        .map_err(crate::application::research::corporate_actions::map_research_error)?
+        .map_err(crate::application::research::map_research_use_error)?;
+    check(context)
 }
 
 #[derive(Clone)]

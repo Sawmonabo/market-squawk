@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::ResearchServiceError;
 
-/// Each lane owns one blocking operation; capture, compact reads and bulk reopens have separate owners.
+/// Each lane owns one blocking operation; capture, compact reads, bulk reopens and preparation
+/// have separate owners.
 #[derive(Debug)]
 pub(super) struct ResearchIoWorker {
     gate: Arc<Semaphore>,
@@ -319,6 +320,31 @@ mod tests {
             })
         };
         entered.await?;
+        let preparation_cancel = CancellationToken::new();
+        let (preparation_entered, entered) = oneshot::channel();
+        let (release_preparation, preparation_release) = std::sync::mpsc::channel();
+        let preparation_finished = Arc::new(AtomicBool::new(false));
+        let preparation = {
+            let service = Arc::clone(&service);
+            let token = preparation_cancel.clone();
+            let finished = Arc::clone(&preparation_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_preparation(deadline, &token, move |_| {
+                        let _ = preparation_entered.send(());
+                        let _ = preparation_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        let generation_read = service
+            .run_owned_research_generation_read(deadline, &CancellationToken::new(), |_| 84)
+            .await?;
+        assert_eq!(generation_read, 84);
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
         let generation_cancel = CancellationToken::new();
         let (generation_entered, entered) = oneshot::channel();
         let (release_generation, generation_release) = std::sync::mpsc::channel();
@@ -329,8 +355,7 @@ mod tests {
             let finished = Arc::clone(&generation_finished);
             tokio::spawn(async move {
                 service
-                    .retained_generation_worker
-                    .run(deadline, &token, move |_| {
+                    .run_owned_research_generation_read(deadline, &token, move |_| {
                         let _ = generation_entered.send(());
                         let _ = generation_release.recv_timeout(Duration::from_secs(10));
                         finished.store(true, Ordering::Release);
@@ -345,6 +370,7 @@ mod tests {
         assert_eq!(read, 42);
         assert!(!capture_finished.load(Ordering::Acquire));
         assert!(!generation_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
 
         let read_cancel = CancellationToken::new();
         let (read_entered, entered) = oneshot::channel();
@@ -367,6 +393,7 @@ mod tests {
         entered.await?;
         capture_cancel.cancel();
         generation_cancel.cancel();
+        preparation_cancel.cancel();
         read_cancel.cancel();
         assert!(matches!(
             capture.await?,
@@ -377,18 +404,25 @@ mod tests {
             Err(ResearchServiceError::Ingest(IngestError::Cancelled))
         ));
         assert!(matches!(
+            preparation.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
             read.await?,
             Err(ResearchServiceError::Ingest(IngestError::Cancelled))
         ));
         assert!(!capture_finished.load(Ordering::Acquire));
         assert!(!generation_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
         assert!(!read_finished.load(Ordering::Acquire));
         release_capture.send(())?;
         release_generation.send(())?;
+        release_preparation.send(())?;
         release_read.send(())?;
         service.finish_owned_io_shutdown(deadline).await?;
         assert!(capture_finished.load(Ordering::Acquire));
         assert!(generation_finished.load(Ordering::Acquire));
+        assert!(preparation_finished.load(Ordering::Acquire));
         assert!(read_finished.load(Ordering::Acquire));
         Ok(())
     }
