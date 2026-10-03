@@ -2,41 +2,36 @@
 
 ## Current execution — 2026-10-02
 
-Latest pushed code: `e49cf71a` (expired listing refresh) and `daa47b49` (retained
-option-reference recovery), following `3ee4d7a9`. Primary worktree only; implementation and
-read-only diagnosis lanes are finished. Lead owns the next recovery integration and verification.
+Latest pushed code: `3d078ba5` (automatic missing-company financial preparation),
+`ff81f644` (original option metadata knowledge clock), `ffb6faf5` (account recovery deadline
+ownership), following `e49cf71a` and `daa47b49`. One primary worktree; no new branch/worktree.
 
-**Implemented and critically verified:** compact ticker/price/change rows with hover/focus removal;
-automatic history and navigation scroll correction; indexed exact-key selection before publication
-joins; expired directory refresh through the existing publication owner; typed retained-option
-original recovery across a validated same-credential doctor-renewal chain. Source renewal,
-reference/custody reopen and directory freshness checks each PASS1/1. These are focused checks,
-not final release approval.
+**Verified:** compact watchlist and all nine saved histories reopened in the prior matched native
+run; QQQ30-day selection automatically completed20bars. Financial autoload TypeScript and the
+existing exact lookup/financial/history journey PASS1/1. Native AAPL opening actually started a
+financial preparation job without a Load action; it subsequently failed SEC XBRL acquisition.
+A successful start is not populated financial information.
 
-**Current native verification:** matched build PASS7m52s; service72588/Desktop72627 run the pushed
-source. Home returns all nine prices and changes without an error alert or layout overflow.
-All nine saved history reads succeed after restart: eight have251 bars, IWM21. First SPY read2220ms;
-remaining reads225–500ms. Artifacts under `.agents/tmp/v1-first-stock/`:
-`watchlist-after-directory-refresh.png`/JSON and `native-watchlist-history-final-results.json`.
-Actual QQQ link click reaches successful history in2682ms observation time with no alerts/overflow
-(`qqq-after-directory-refresh.json`/PNG). Selecting30days automatically starts preparation and
-completes with20trading-day bars, no failure and no extra Load action
-(`qqq-30day-automatic-start.json`, `qqq-30day-automatic-finish.json`,
-`qqq-30day-preparation-result.json`). Saved history remains visible during preparation.
-Directory generation2 actually published13,295 records after generation1 expired. Background
-chart capture proves drawable data but does not establish normal foreground first paint.
+**Current integration:** exact-object calendar reader and existing accumulated-calendar regression
+are uncommitted pending the matched app build. Data regression PASS1/1,19.22s:8,130 inherited rows,
+only2,709 selected-original rows decoded via the existing bounded cursor. The old running
+service86277/Desktop86311 remain available during the single scheduled build. Lead owns source
+integration/build/Git; all implementation-agent ownership is released.
 
-**Not complete:** workspace construction measures27502ms, installed-operation binding48ms.
-A joined Home collection request takes7217ms remaining; this is not its total duration or an
-instant-loading pass. Startup and concurrent read latency remain open. The original saved MSFT
-workflow advances to7steps but still has no saved result: current account publication/recovery
-can cancel option acquisition. Freshness-only quote health does not itself revoke the REST lane.
-The confirmed recovery ownership defect passes a shutdown deadline through full doctor renewal,
-reference preparation, startup and calendar publication. Next dependency: use the existing lifecycle
-recovery owner, then distinguish the first publication revocation before altering failure policy.
-Original option recovery is critically verified but not yet a completed live stock workflow.
-Whole V1, installed lifecycle and final resource acceptance remain open. No CI or RAM gate run.
-No new branch/worktree; the existing unmerged Dependabot PR55 branch is preserved.
+**Concrete blockers:** original MSFT workflow remains without a saved result; calendar read exceeded
+its budget because it materialized inherited objects. Calendar correction needs actual saved-workflow
+verification. AAPL acquisition fails `InvalidTaxonomySet`; read-only diagnosis located standard
+XBRL linkbase role names incorrectly missing the `Ref` suffix in the parser/fixture. Workspace
+construction still measures about28seconds; full screen/data/loading completion remains open.
+
+**Owner-requested architecture research:** [saved-analysis storage recommendation](../research/2026-10-02-saved-analysis-storage.md)
+compares current journal/replay with direct SQLite result reads, existing analytical artifacts,
+short transactions, indexed pagination and demand-loaded charts. Recommendation only; no saved-analysis
+storage implementation changed. Current journal lifetime ceilings and startup reconstruction are
+recorded gaps. Research is independently reviewable and does not imply final performance acceptance.
+
+Full V1, installed lifecycle, remaining provider/analytical workflows and final resource acceptance
+remain incomplete. No full CI or RAM gate. Preserve the existing active unmerged DependabotPR55 branch.
 
 ### Active wave — lifecycle recovery and measured startup
 
@@ -135,6 +130,22 @@ large-calendar tail in `data/tests/publication_recovery.rs` to cover multiple 2,
 through the exact-object cursor; lead schedules tests/build/Git. Previous status-only turn made
 no implementation progress; execution resumed against confirmed live service86277/Desktop86311,
 with watcher99703 paused during the bounded edit/check wave.
+
+Automatic financial loading pushed as `3d078ba5`; opening native AAPL starts real preparation job
+`615c4e3d-5061-4180-87e4-9ac7c300eec7` without a Load action. Status directly rechecked as running;
+no populated-financial completion claim. Calendar exact-object patch frozen and inspected, with
+existing history/calendar/restart regression PASS1/1 (19.22s; compile12.34s). It reproduces8,130
+inherited rows, confirms old256-row slice exceeds the unchanged budget, then reopens only the
+creating2,709-row object through the existing bounded cursor and checks every ordinal/clock/coverage.
+Lead starts one matched development build; current runtime retained while it compiles.
+
+Native AAPL acquisition reached real SEC data but now reports `Xbrl(InvalidTaxonomySet)`;
+this is a backend acquisition failure, not a missing automatic trigger. Calendar implementation
+ownership is released to lead for matched build/live verification. Astra `options_original_recovery`
+owns read-only diagnosis of the AAPL SEC XBRL taxonomy failure and directly referenced parser /
+provider-publication contracts, writing only `.agents/tmp/v1-first-stock/aapl-taxonomy-failure.md`.
+No source/build/Git/runtime changes; determine real invalid response versus parser/config mismatch
+and smallest exact repair without weakening evidence. Lead retains current job and build scheduling.
 
 ### Current continuation wave — 2026-10-02 late session
 
