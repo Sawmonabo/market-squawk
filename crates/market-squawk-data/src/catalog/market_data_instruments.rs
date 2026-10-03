@@ -20,7 +20,7 @@ pub(super) use live_generation::LiveProviderIdentityGenerations;
 pub use native_reference::{
     AcceptedNativeReferenceCapture, NativeReferenceSourceCoordinate, RetainedNativeReferenceCapture,
 };
-pub use option_reference::AlpacaOptionReferenceAdmission;
+pub use option_reference::{AlpacaOptionReferenceAdmission, AlpacaOptionReferencePublication};
 
 use std::collections::BTreeSet;
 use std::fmt;

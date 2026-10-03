@@ -26,8 +26,8 @@ use market_squawk_data::{
     MarketDataInstrumentRecord, ProviderCaptureOriginalLease, ProviderCaptureOriginalReceipt,
 };
 use market_squawk_domain::{
-    AssetClass, CalendarDate, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketDataReference,
-    ProviderInstrumentId, Timestamp,
+    AssetClass, CalendarDate, DigestAlgorithm, EvidenceDigest, ExternalIdentifier, InstrumentId,
+    MarketDataReference, OccOptionIdentity, ProviderInstrumentId, Timestamp,
 };
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{HttpRequestBounds, OptionReferenceOrigin};
@@ -246,7 +246,7 @@ impl AlpacaOptionChainRuntime {
         if let Some(worker) = self.worker.as_mut() {
             tokio::time::timeout_at(deadline.into(), worker)
                 .await
-                .map_err(|_| ServiceError::Unavailable)?
+                .map_err(|_| ServiceError::DeadlineExceeded)?
                 .map_err(|_| ServiceError::Unavailable)?;
             self.worker = None;
         }
@@ -309,14 +309,15 @@ impl Worker {
         ensure_active(deadline, caller)?;
         let data = self.research.analytical_service();
         let source = self.authority.metadata().source_id().clone();
-        let pending = self
-            .research
-            .run_owned_research_io(deadline, caller, move |worker| {
+        // Looking up retained custody is a pure read. Revoking this group stops its waiter,
+        // while the research owner keeps and cooperatively cancels the blocking read itself.
+        let pending = tokio::select! { biased;
+            () = self.cancellation.cancelled() => return Err(OptionChainDemandError::Revoked),
+            result = self.research.run_owned_research_read(deadline, caller, move |worker| {
                 data.pending_provider_capture_original(&source, deadline, &worker)
-            })
-            .await
-            .map_err(|error| custody_error("resume.pending.worker", None, &error))?
-            .map_err(|error| custody_error("resume.pending.catalog", None, &error))?;
+            }) => result.map_err(|error| custody_error("resume.pending.worker", None, &error))?,
+        }
+        .map_err(|error| custody_error("resume.pending.catalog", None, &error))?;
         if let Some(original) = pending {
             let saved: OriginalContext = serde_json::from_slice(original.context())
                 .map_err(|error| custody_error("resume.context", Some(0), &error))?;
@@ -390,12 +391,28 @@ impl Worker {
                 caller,
             )
             .await?;
-        ensure_active(deadline, caller)?;
+        ensure_owned_active(
+            deadline,
+            caller,
+            &self.cancellation,
+            operation.cancellation(),
+        )?;
         let now = timestamp()?;
         let catalog = self.research.market_data_instruments();
-        let underlying_record = catalog
-            .latest(demand.underlying, deadline, caller)
-            .map_err(|_| OptionChainDemandError::Identity)?
+        let read_catalog = catalog.clone();
+        let underlying_id = demand.underlying;
+        // This pure read may stop on revocation. The existing read owner keeps its exact
+        // blocking handle and cancels SQL if this waiter disappears; raw custody stays above.
+        let underlying_record = tokio::select! { biased;
+            () = self.cancellation.cancelled() => return Err(OptionChainDemandError::Revoked),
+            () = operation.cancellation().cancelled() => return Err(OptionChainDemandError::Revoked),
+            () = caller.cancelled() => return Err(OptionChainDemandError::Cancelled),
+            () = tokio::time::sleep_until(deadline.into()) => return Err(OptionChainDemandError::Deadline),
+            result = self.research.run_owned_research_read(deadline, caller, move |worker| {
+                read_catalog.latest(underlying_id, deadline, &worker)
+            }) => result.map_err(|_| OptionChainDemandError::Identity)?
+                .map_err(|_| OptionChainDemandError::Identity)?,
+        }
             .ok_or(OptionChainDemandError::Identity)?;
         let underlying = binding
             .publication_reference(&underlying_record, now)
@@ -414,6 +431,12 @@ impl Worker {
             .try_reserve_exact(original_receipts.len())
             .map_err(|_| OptionChainDemandError::Capacity)?;
         for original in &original_receipts {
+            ensure_owned_active(
+                deadline,
+                caller,
+                &self.cancellation,
+                operation.cancellation(),
+            )?;
             let received_at = original
                 .capture()
                 .pages()
@@ -447,8 +470,12 @@ impl Worker {
             cancellation: caller.clone(),
             lifecycle: self.cancellation.clone(),
         });
-        self.research
-            .publish_alpaca_option_references(
+        // Originals are already retained. Cancelling this canonical write leaves any admitted
+        // blocking work with its existing supervisor and cancels its SQL/precommit authority.
+        let published = tokio::select! { biased;
+            () = self.cancellation.cancelled() => return Err(OptionChainDemandError::Revoked),
+            () = operation.cancellation().cancelled() => return Err(OptionChainDemandError::Revoked),
+            result = self.research.publish_alpaca_option_references(
                 market_squawk_data::AlpacaOptionReferenceAdmission {
                     source: operation.source().clone(),
                     origin: reference_origin.clone(),
@@ -465,8 +492,8 @@ impl Worker {
                 reference_precommit,
                 deadline,
                 caller.clone(),
-            )
-            .await
+            ) => result,
+        }
             .map_err(|error| {
                 use market_squawk_data::MarketDataInstrumentCatalogError as E;
                 let failure = match error {
@@ -485,21 +512,28 @@ impl Worker {
                 );
                 OptionChainDemandError::Identity
             })?;
+        let published_records = published.into_records();
+        if published_records.len() != originals.contracts().count() {
+            return Err(OptionChainDemandError::Identity);
+        }
+        if published_records.len() > MAX_CONTRACTS {
+            return Err(OptionChainDemandError::Capacity);
+        }
         let mut records = vec![underlying_record];
         let mut references = vec![underlying.clone()];
         let mut contracts = Vec::new();
-        for original in originals.contracts() {
-            if contracts.len() == MAX_CONTRACTS {
-                return Err(OptionChainDemandError::Capacity);
-            }
-            let (record, reference) = resolve_contract(
-                &catalog,
-                original.symbol(),
-                original.occ_identity().as_str(),
-                now,
+        // The writer returns exactly the committed original order, including replays.
+        // Bind each original explicitly; final publication still checks current revisions.
+        for (original, record) in originals.contracts().zip(published_records) {
+            tokio::task::yield_now().await;
+            ensure_owned_active(
                 deadline,
                 caller,
+                &self.cancellation,
+                operation.cancellation(),
             )?;
+            let reference =
+                contract_reference(&record, original.symbol(), original.occ_identity(), now)?;
             contracts
                 .try_reserve(1)
                 .map_err(|_| OptionChainDemandError::Capacity)?;
@@ -518,7 +552,12 @@ impl Worker {
         }
         let originals =
             Arc::try_unwrap(originals).map_err(|_| OptionChainDemandError::Authority)?;
-        ensure_active(deadline, caller)?;
+        ensure_owned_active(
+            deadline,
+            caller,
+            &self.cancellation,
+            operation.cancellation(),
+        )?;
         let research = Arc::clone(&self.research);
         let capture = self
             .authority
@@ -959,50 +998,33 @@ struct OriginalContext {
     contexts: Vec<String>,
 }
 
-fn resolve_contract(
-    catalog: &MarketDataInstrumentReadCapability,
+fn contract_reference(
+    record: &MarketDataInstrumentRecord,
     symbol: &str,
-    occ_identity: &str,
+    occ_identity: &OccOptionIdentity,
     at: Timestamp,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<(MarketDataInstrumentRecord, MarketDataReference), OptionChainDemandError> {
-    let search = catalog
-        .search(occ_identity, 64, deadline, cancellation)
-        .map_err(|_| OptionChainDemandError::Identity)?;
-    if search.has_more() {
+) -> Result<MarketDataReference, OptionChainDemandError> {
+    if record.definition().asset_class() != AssetClass::Option {
         return Err(OptionChainDemandError::Identity);
     }
-    let mut accepted = None;
-    for candidate in search.matches() {
-        let record = candidate.record();
-        if record.definition().asset_class() != AssetClass::Option {
+    for identifier in record.definition().identifiers() {
+        if !matches!(identifier.identifier(), ExternalIdentifier::OccOption(occ) if occ == occ_identity)
+        {
             continue;
         }
-        for identifier in record.definition().identifiers() {
-            let Ok(binding) = MarketDataInstrumentBinding::try_from_assigned_identifier(
-                MarketSubscriptionPriority::CurrentlyViewed,
-                record.clone(),
-                ProviderInstrumentId::try_from(symbol)
-                    .map_err(|_| OptionChainDemandError::Identity)?,
-                identifier.clone(),
-            ) else {
-                continue;
-            };
-            let reference = binding
-                .publication_reference(record, at)
-                .map_err(|_| OptionChainDemandError::Identity)?;
-            if accepted.as_ref().is_some_and(
-                |(previous, _): &(MarketDataInstrumentRecord, MarketDataReference)| {
-                    previous != record
-                },
-            ) {
-                return Err(OptionChainDemandError::Identity);
-            }
-            accepted = Some((record.clone(), reference));
-        }
+        let Ok(binding) = MarketDataInstrumentBinding::try_from_assigned_identifier(
+            MarketSubscriptionPriority::CurrentlyViewed,
+            record.clone(),
+            ProviderInstrumentId::try_from(symbol).map_err(|_| OptionChainDemandError::Identity)?,
+            identifier.clone(),
+        ) else {
+            continue;
+        };
+        return binding
+            .publication_reference(record, at)
+            .map_err(|_| OptionChainDemandError::Identity);
     }
-    accepted.ok_or(OptionChainDemandError::Identity)
+    Err(OptionChainDemandError::Identity)
 }
 
 #[derive(Debug)]
@@ -1092,6 +1114,19 @@ fn ensure_active(
     } else {
         Ok(())
     }
+}
+
+fn ensure_owned_active(
+    deadline: Instant,
+    caller: &CancellationToken,
+    lifecycle: &CancellationToken,
+    operation: &CancellationToken,
+) -> Result<(), OptionChainDemandError> {
+    ensure_active(deadline, caller)?;
+    if lifecycle.is_cancelled() || operation.is_cancelled() {
+        return Err(OptionChainDemandError::Revoked);
+    }
+    Ok(())
 }
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub(crate) enum OptionChainDemandError {

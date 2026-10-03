@@ -142,7 +142,9 @@ pub use catalog::{
     SecFundamentalIdentitySelection, SourceCursor, StoredObservedRevision,
     sec_listing_exchange_matches_venue,
 };
-pub use catalog::{AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission};
+pub use catalog::{
+    AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission, AlpacaOptionReferencePublication,
+};
 pub use catalog::{
     ChartProjectionCatalogCapability, ChartProjectionError, ChartProjectionReference,
     ChartProjectionRow, ChartProjectionValue,

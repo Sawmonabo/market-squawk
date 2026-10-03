@@ -3434,7 +3434,7 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<
-        crate::MarketDataInstrumentSynchronizationReceipt,
+        crate::AlpacaOptionReferencePublication,
         crate::MarketDataInstrumentCatalogError,
     > {
         self.publish_market_data_reference(

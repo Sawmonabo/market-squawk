@@ -1262,7 +1262,7 @@ impl ResearchService {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<
-        market_squawk_data::MarketDataInstrumentSynchronizationReceipt,
+        market_squawk_data::AlpacaOptionReferencePublication,
         market_squawk_data::MarketDataInstrumentCatalogError,
     > {
         self.analytical

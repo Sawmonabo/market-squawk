@@ -3290,11 +3290,12 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         &cancellation,
     )?;
     assert_eq!(read_during_publication.checks.load(Ordering::SeqCst), 3);
-    assert_eq!(published.inserted(), 1);
+    assert_eq!(published.receipt().inserted(), 1);
     let reader = service.market_data_instruments();
     let matched = reader.search("AAPL270115C00200000", 2, deadline(), &cancellation)?;
     assert_eq!(matched.matches().len(), 1);
     let option = matched.matches()[0].record().clone();
+    assert_eq!(published.records(), std::slice::from_ref(&option));
     assert_eq!(option.definition().asset_class(), AssetClass::Option);
     drop(reader);
     drop(publisher);
@@ -3347,8 +3348,8 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
                 assert_eq!(precommit.checks.load(Ordering::SeqCst), 2);
             } else {
                 let replayed = result?;
-                assert_eq!(replayed.inserted(), 0);
-                assert_eq!(replayed.replayed(), 1);
+                assert_eq!(replayed.receipt().inserted(), 0);
+                assert_eq!(replayed.receipt().replayed(), 1);
             }
             Ok(())
         })?;
@@ -3387,9 +3388,10 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
             deadline(),
             &cancellation,
         )?;
-    assert_eq!(replayed.inserted(), 0);
-    assert_eq!(replayed.replayed(), 1);
+    assert_eq!(replayed.receipt().inserted(), 0);
+    assert_eq!(replayed.receipt().replayed(), 1);
     assert_eq!(read_after_restart.checks.load(Ordering::SeqCst), 3);
+    assert_eq!(replayed.into_records(), vec![option.clone()]);
 
     // This synthetic source cannot manufacture a doctor-renewal origin. Current metadata is
     // admitted at current knowledge time, but unchanged originals still need that typed proof.

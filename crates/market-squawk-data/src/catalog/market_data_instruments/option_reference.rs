@@ -54,6 +54,31 @@ impl fmt::Debug for AlpacaOptionReferenceAdmission {
     }
 }
 
+/// Committed option definitions in the exact original contract order.
+/// Returned only after the complete reference transaction commits.
+#[derive(Debug)]
+pub struct AlpacaOptionReferencePublication {
+    receipt: MarketDataInstrumentSynchronizationReceipt,
+    records: Vec<MarketDataInstrumentRecord>,
+}
+
+impl AlpacaOptionReferencePublication {
+    /// Returns the atomic publication's counts and ordered digest.
+    pub const fn receipt(&self) -> &MarketDataInstrumentSynchronizationReceipt {
+        &self.receipt
+    }
+
+    /// Returns inserted and replayed definitions in original contract order.
+    pub fn records(&self) -> &[MarketDataInstrumentRecord] {
+        &self.records
+    }
+
+    /// Transfers the committed definitions to the option acquisition owner.
+    pub fn into_records(self) -> Vec<MarketDataInstrumentRecord> {
+        self.records
+    }
+}
+
 impl MarketDataInstrumentSynchronizationCapability {
     /// Atomically creates or corroborates the complete original contract set in this catalog.
     /// Source facts and original custody remain separate from live publication authorization.
@@ -63,7 +88,7 @@ impl MarketDataInstrumentSynchronizationCapability {
         precommit: &dyn IngestPrecommitAuthority,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<MarketDataInstrumentSynchronizationReceipt, Error> {
+    ) -> Result<AlpacaOptionReferencePublication, Error> {
         check_operation(deadline, cancellation)?;
         precommit
             .validate_precommit()
@@ -85,7 +110,7 @@ impl CatalogAuthority {
         precommit: &dyn IngestPrecommitAuthority,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<MarketDataInstrumentSynchronizationReceipt, Error> {
+    ) -> Result<AlpacaOptionReferencePublication, Error> {
         let count = input.contracts.contracts().count();
         if count > MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS
             || input.originals.is_empty()
@@ -146,7 +171,8 @@ impl CatalogAuthority {
                     transaction.commit()?;
                     now
                 };
-                self.catalog().register_source(&input.source, registered_at)?;
+                self.catalog()
+                    .register_source(&input.source, registered_at)?;
             }
             if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
                 return Err(Error::SourceIdentityConflict);
@@ -228,6 +254,10 @@ impl CatalogAuthority {
             let mut inserted = 0usize;
             let mut replayed = 0usize;
             let mut underlying_asset_id = None;
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(count)
+                .map_err(|_| Error::ResultByteLimitExceeded)?;
             // Decode/prepare/insert one bounded definition at a time. All rows commit together;
             // any failed identity/rights/currentness check rolls back the entire reference batch.
             for original in input.contracts.contracts() {
@@ -321,6 +351,7 @@ impl CatalogAuthority {
                 };
                 batch_digest.update(record.definition().instrument_id().as_uuid().as_bytes());
                 batch_digest.update(record.revision_digest().bytes());
+                records.push(record);
             }
             check_operation(deadline, cancellation)?;
             precommit
@@ -361,11 +392,14 @@ impl CatalogAuthority {
                     .publication_observer
                     .record(crate::DataPublication::Reference);
             }
-            Ok(MarketDataInstrumentSynchronizationReceipt {
-                batch_digest,
-                submitted: count,
-                inserted,
-                replayed,
+            Ok(AlpacaOptionReferencePublication {
+                receipt: MarketDataInstrumentSynchronizationReceipt {
+                    batch_digest,
+                    submitted: count,
+                    inserted,
+                    replayed,
+                },
+                records,
             })
         })();
         let progress_cleanup = clear_progress_handler(connection);

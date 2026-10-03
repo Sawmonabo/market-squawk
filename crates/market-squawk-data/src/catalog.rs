@@ -105,8 +105,8 @@ pub use self::listing_reference::{
 pub(crate) use self::market_data_instruments::verify_provider_identity_evidence;
 pub use self::market_data_instruments::{
     AcceptedNativeReferenceCapture, AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission,
-    CurrentListedPopulation, CurrentListedPopulationAdmission, CurrentListedPopulationMember,
-    CurrentListedPopulationPartition, CurrentListedPopulationScope,
+    AlpacaOptionReferencePublication, CurrentListedPopulation, CurrentListedPopulationAdmission,
+    CurrentListedPopulationMember, CurrentListedPopulationPartition, CurrentListedPopulationScope,
     CurrentListedPopulationSourceScope, CurrentPopulationError, CurrentPopulationExclusion,
     CurrentPopulationExclusionReason, DatasetPopulationPartition, DatasetPopulationSourceUse,
     MAX_CURRENT_LISTED_POPULATION_MEMBERS, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,

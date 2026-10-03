@@ -2,6 +2,51 @@
 
 ## Current execution — 2026-10-03
 
+### Integrated correction — return committed option identities to their consumer
+
+Base `b26736d2`. Acceptance 1/2/6/7: the sampled option worker performs synchronous catalog
+searches for every just-published contract and ignores group cancellation inside that loop,
+preventing retained shutdown from joining. Reuse the committed records the writer already creates.
+
+| Owner | Exact file ownership | Completion evidence |
+| --- | --- | --- |
+| Lead | Data `catalog/market_data_instruments/option_reference.rs`, its existing catalog fixture, shared data exports, data `ingest.rs`, app `research_service.rs`, ledger/Git/build/runtime | Return exact committed records in original contract order only after commit; preserve rejection rollback, counts, restart and authority |
+| Astra High `stock_preparation_deadline` | `apps/market-squawk/src/application/market_runtime/alpaca_option_chain.rs` only | Consume committed records without requerying, validate exact original OCC/symbol/order, keep final currentness, honor group/request cancellation and supervised underlying read; distinguish join timeout |
+| Astra High `options_original_recovery` | Read-only live frame retry/cancellation report addendum only | Identify actual replay owner before any proposed local-deadline RawRetained outcome; do not lose normalized data |
+
+Frozen internal return: `AlpacaOptionReferencePublication` with `receipt()` and `records()` borrowed
+accessors, `into_records()` consuming exact ordered `Vec<MarketDataInstrumentRecord>`. No compatibility
+wrapper or alternate path. Shared wrappers return this canonical type. Consumer checks exact length
+and binding against each original; writer returns it only after successful transaction commit.
+DAG: frozen return → producer/shared lead + disjoint consumer → existing critical catalog check and
+app check → one matched deployment and same paused-workflow recovery. Watcher paused during edits;
+service/Desktop remain open. Live frame cancellation/retry correction is a separate required edge;
+no silent drop/defer without an actual durable processing owner.
+
+Producer/shared return changes are implemented. Existing option publication critical check passed
+(1/1, 1.74s; 42.36s single-job compile), including returned-record equality before/after restart,
+rollback and held-writer admission. Log: `.agents/tmp/v1-first-stock/option-committed-records-critical.log`.
+Consumer integration compiled and the existing retained-read/drain critical test passed
+(1/1, 0.43s; 4m48s single-job compile). Existing publication-failure/custody cleanup check also
+passed (1/1, <0.01s; reused build). Logs: `option-committed-consumer-critical.log` and
+`option-committed-custody-critical.log` under the same artifact directory. Source formatting
+followed these checks without behavior changes. The consumer uses ordered committed records,
+checks exact OCC/symbol binding, yields/checks group/request/operation cancellation, supervises
+underlying and pending-original reads, and preserves final currentness and independent raw custody.
+Agent ownership is released. These checks prove reusable worker/custody mechanics; direct option
+group cancellation and matched native recovery remain unverified. The prior Desktop remains open;
+`option-committed-before-deploy.json` confirms the same three-step workflow remains resumable.
+
+The separate live-frame retry diagnosis is complete in `option-after-reference.md`: no automatic
+normalization retry owner consumes `RawRetained`. Returning it for a local timeout would retain
+bytes but lose required normalized coverage. Next dependency is a scoped retained-frame attempt
+in the existing worker, preserving the same binding, queue permits and idempotency while rechecking
+current authority. Do not reset the workflow or return synthetic canonical success. Durable replay
+after process/session termination remains a distinct unverified gap. Existing supervised worker ownership follows Tokio's
+[blocking-work guidance](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html): a started
+blocking task cannot be aborted by dropping/aborting its handle, so retain its owner and signal
+cooperative SQL cancellation. No new executor/dependency is introduced.
+
 ### Active wave — complete option snapshots after real reference publication
 
 Base `e6949fca`, clean source. Acceptance 1/2/6: matching build passed in 6m33s, service/Desktop
@@ -21,6 +66,7 @@ restart/cancellation was initiated by the lead. Later status artifact:
 | Owner | Exact disjoint ownership | Required evidence |
 | --- | --- | --- |
 | Astra High `options_original_recovery` | Read-only current option snapshot/runtime authority chain; report `.agents/tmp/v1-first-stock/option-after-reference.md` only | Exact rejecting guard and cause after committed references; distinguish timeout, cancellation, generation replacement, and stale identity; smallest concrete correction and affected consumers |
+| Astra High `stock_preparation_deadline` | Read-only account group shutdown/retained cleanup; report `.agents/tmp/v1-first-stock/alpaca-retained-cleanup.md` only | Exact permanent cleanup rejection versus still-pending work; recovery correction preserving sealed captures and stopped authority |
 | Lead | All source/shared files, native status, ledger/Git/build/runtime | Preserve pending job and originals, verify its authoritative outcome, schedule scoped correction after diagnosis |
 
 DAG: actual committed reference event → owned snapshot acquisition failure trace → scoped correction
