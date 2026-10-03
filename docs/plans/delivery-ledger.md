@@ -2,7 +2,34 @@
 
 ## Current execution — 2026-10-03
 
-### Active wave — wait for option writer admission instead of failing busy
+### Active wave — complete option snapshots after real reference publication
+
+Base `e6949fca`, clean source. Acceptance 1/2/6: matching build passed in 6m33s, service/Desktop
+70295/70337. Native workflow `workflow_f6e2523cc5435da4a0b972d604946e42` initially waited at three
+steps. **Real option reference publication committed** at `1791023188876853000`, retaining original
+session `6c4403d2da42b940324d535ecd3b135ae8fcfd37c0506e6ec8e2910f652f324c`. Query-only audit
+artifact `option-writer-publication-audit.json` proves the prior nested transaction and writer
+admission boundaries passed together. Subsequent log reports option demand authority revoked and
+an Alpaca publication worker cancelled; their causal order remains to be traced. No terminal or
+whole-analysis success inferred from reference publication. The latest authoritative native status
+is paused, `canResume=true`, at `1791023235499166000`; the same workflow remains recoverable.
+The log subsequently reports stale Alpaca generation drain and retained cleanup failures. No
+restart/cancellation was initiated by the lead. Later status artifact:
+`option-writer-native-status-later.json`. A read-only one-second process sample is retained as
+`option-after-reference-service.sample.txt`; it does not by itself identify job ownership.
+
+| Owner | Exact disjoint ownership | Required evidence |
+| --- | --- | --- |
+| Astra High `options_original_recovery` | Read-only current option snapshot/runtime authority chain; report `.agents/tmp/v1-first-stock/option-after-reference.md` only | Exact rejecting guard and cause after committed references; distinguish timeout, cancellation, generation replacement, and stale identity; smallest concrete correction and affected consumers |
+| Lead | All source/shared files, native status, ledger/Git/build/runtime | Preserve pending job and originals, verify its authoritative outcome, schedule scoped correction after diagnosis |
+
+DAG: actual committed reference event → owned snapshot acquisition failure trace → scoped correction
+and critical check → same-job recovery if supported, otherwise a new explicitly recorded attempt.
+No automatic restart/reset, database edits, new branch/worktree or competing build. Native artifacts
+`option-writer-{ready-status,native-start,native-progress,native-outcome}.json` are under
+`.agents/tmp/v1-first-stock/`; runtime log remains `daily-comparison-restart-dev.log`.
+
+### Integrated wave — wait for option writer admission instead of failing busy
 
 Base `38ce7afb`. Acceptance 1/2/6: matching native preparation now reports
 `option-reference-publication / catalog-unavailable`, before publication. The error maps exactly
