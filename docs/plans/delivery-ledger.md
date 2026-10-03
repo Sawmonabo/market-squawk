@@ -2,31 +2,79 @@
 
 ## Current execution — 2026-10-02
 
-Latest pushed code: `a463ab39` (market selector) and `68221dde` (navigation). Primary worktree
-only; lead owns continuation, all agent edits are integrated and ownership released.
+Latest pushed code: `e49cf71a` (expired listing refresh) and `daa47b49` (retained
+option-reference recovery), following `3ee4d7a9`. Primary worktree only; implementation and
+read-only diagnosis lanes are finished. Lead owns the next recovery integration and verification.
 
 **Implemented and critically verified:** compact ticker/price/change rows with hover/focus removal;
 automatic history and navigation scroll correction; indexed exact-key selection before publication
-joins plus SQLite planner maintenance. Existing publication/recovery test PASS1/1 (11.20s,
-compile51.07s), preserving clocks, exclusions, source separation and restart evidence.
+joins; expired directory refresh through the existing publication owner; typed retained-option
+original recovery across a validated same-credential doctor-renewal chain. Source renewal,
+reference/custody reopen and directory freshness checks each PASS1/1. These are focused checks,
+not final release approval.
 
-**Native verification:** final matched build PASS6m34s; service53066/Desktop53116 run the new
-source. Home returns all nine prices and changes without a read-error alert or layout overflow.
-All nine saved history reads succeed after restart: eight have251 bars, IWM21. QQQ/DIA/IWM/VTI/
-AAPL/MSFT/NVDA/TSLA reads308–644ms; first SPY read2411ms. Screenshot and query evidence:
-`watchlist-final-native.png`, `watchlist-final-native-state.json`,
-`native-watchlist-history-final-results.json` in `.agents/tmp/v1-first-stock/`.
-An actual QQQ link click reached successful history with the chart mounted in4074ms observation
-time, no alerts or overflow (`qqq-final-native-state.json`/PNG). Background canvas painting does
-not establish foreground visual quality.
+**Current native verification:** matched build PASS7m52s; service72588/Desktop72627 run the pushed
+source. Home returns all nine prices and changes without an error alert or layout overflow.
+All nine saved history reads succeed after restart: eight have251 bars, IWM21. First SPY read2220ms;
+remaining reads225–500ms. Artifacts under `.agents/tmp/v1-first-stock/`:
+`watchlist-after-directory-refresh.png`/JSON and `native-watchlist-history-final-results.json`.
+Actual QQQ link click reaches successful history in2682ms observation time with no alerts/overflow
+(`qqq-after-directory-refresh.json`/PNG). Selecting30days automatically starts preparation and
+completes with20trading-day bars, no failure and no extra Load action
+(`qqq-30day-automatic-start.json`, `qqq-30day-automatic-finish.json`,
+`qqq-30day-preparation-result.json`). Saved history remains visible during preparation.
+Directory generation2 actually published13,295 records after generation1 expired. Background
+chart capture proves drawable data but does not establish normal foreground first paint.
 
-**Not complete:** a deliberately overlapping collection read now succeeds but takes14640ms;
-normal Home succeeds, yet slow cold startup and concurrent read latency remain open. Earlier
-direct diagnostic probes added a second request alongside Home; they were not proof of duplicate
-frontend ownership. No instant-loading or complete startup-performance claim. Further correction
-must measure actual remaining work without dropping evidence or raising deadlines.
-The saved-MSFT workflow still needs the diagnosed option doctor-renewal recovery. Whole V1,
-installed lifecycle and final resource acceptance remain open. No CI, new worktree or RAM gate.
+**Not complete:** workspace construction measures27502ms, installed-operation binding48ms.
+A joined Home collection request takes7217ms remaining; this is not its total duration or an
+instant-loading pass. Startup and concurrent read latency remain open. The original saved MSFT
+workflow advances to7steps but still has no saved result: current account publication/recovery
+can cancel option acquisition. Freshness-only quote health does not itself revoke the REST lane.
+The confirmed recovery ownership defect passes a shutdown deadline through full doctor renewal,
+reference preparation, startup and calendar publication. Next dependency: use the existing lifecycle
+recovery owner, then distinguish the first publication revocation before altering failure policy.
+Original option recovery is critically verified but not yet a completed live stock workflow.
+Whole V1, installed lifecycle and final resource acceptance remain open. No CI or RAM gate run.
+No new branch/worktree; the existing unmerged Dependabot PR55 branch is preserved.
+
+### Current continuation wave — 2026-10-02 late session
+
+Prior turn: progress, pushed `3ee4d7a9` with native history evidence. Fresh branch clean; service53066,
+Desktop53116 and watcher99703 live. Goal acceptance5/6/7 still fails on cold startup/concurrent latency;
+acceptance2 first saved stock workflow is blocked by original options across doctor renewal.
+
+| Owner | Outcome / exact ownership | Dependency / critical evidence |
+| --- | --- | --- |
+| Lead | Measure current service CPU/read latency and repair demonstrated bottleneck; shared contracts, runtime, build/Git/ledger | No speculative cache or timeout increase; preserve all original evidence and current permission. Serialize edits with provider lane after interface agreement. |
+| Astra High options_original_recovery | Recover exact saved option originals after same-credential doctor renewal. Own `application/market_runtime/alpaca_option_chain.rs`, `application/research/ingest/provider_runtime.rs`, data `catalog/market_data_instruments/option_reference.rs`, data `catalog/provider_option.rs`, sources `extraction/option_market.rs`; coordinate any exported/shared interface with lead before edits | Refresh existing diagnosis; publish smallest typed boundary first, then implement finite recovery. No replacement workflow/erased originals. Lead runs existing focused recovery tests and actual saved MSFT resume. |
+| GPT-6.1 Sol High desktop_startup_trace | Read-only native bootstrap/startup call-chain diagnosis, write `.agents/tmp/v1-first-stock/desktop-startup-current.md` only | Find exact synchronous dependency still holding bootstrap; no code/runtime/build/Git changes or new framework. Lead schedules any native timing. |
+
+Ownership refinement: option lane additionally owns adapter Alpaca `src/option_chain.rs` only
+for the exact original-dependency relation. Lead reserves onboarding historical-authority access
+and exports. Astra `stock_workflow_trace` owns read-only interpretation of current8second CPU
+sample `current-idle-read-sample.txt` and related hot callees, writing only
+`collection-deadline-diagnosis.md`. No builds/DB/runtime mutations. This traces existing CPU work,
+not whole-app RAM acceptance. Lead coordinates the shared proof boundary before option edits.
+
+Measured reconnect defect:8second service CPU sample shows repeated account startup/onboarding
+replay on the existing250ms health tick. The exact failure is expired Nasdaq listing evidence:
+`snapshot` returns cached data unconditionally and `load_snapshot` reloads retained generation1
+without freshness admission, preventing the existing directory refresh path. Astra
+`stock_workflow_trace` now owns ONLY `provider_activation/nasdaq_reference.rs` to use existing
+refresh ownership/acquisition for stale cached/retained data and validate its replacement. Preserve
+source timestamps, original evidence, existing rights/CAS and normal failures. No24h extension or
+new cache/framework. Add only existing local critical freshness case if feasible. Lead owns builds.
+Warm read-only startup integrity SQL measured1544ms+827ms, insufficient to attribute40–60sstartup;
+no integrity safeguard removed. Desktopstartup lane remains read-only.
+
+Lead rechecked the native owner screen: compact watchlist renders ticker/price/colored change and hover/focus removal (`owner-compact-watchlist-visible.png`); QQQ saved history query succeeds, but background snapshot has an empty canvas. GPT-6.1 Sol High `desktop_startup_trace` now owns read-only investigation of this canvas discrepancy in the existing report only. It may use background WebDriver reads and screenshots without changing routes or focus; no code, runtime, builds or Git. Distinguish suppressed background painting from missing chart data before any change.
+
+Integration freeze: source renewal critical test PASS1/1; existing Alpaca reference/custody reopen test PASS1/1. Lead reused the existing retained-source revision validator for the new option path instead of adding duplicate SQL, and updated the service error consumer for incompatible original authority. The app freshness test initially found that missing exhaustive arm; corrected and rerunning before the single matched build. Watcher99703 remains deliberately paused while checks run; original app/service stay available. Both Astra implementation lanes are frozen, lead owns all remaining edits/build/runtime/Git. No CI or additional branch/worktree.
+
+Current critical checks: doctor-chain source test PASS1/1; final shared-metadata custody/reference reopen PASS1/1 (1.09s); app freshness boundary PASS1/1 (compile5m26s). Code pushed as `daa47b49` and `e49cf71a`. Watcher99703 resumed and is building one matched Desktop/service generation; old runtime retained until successful handoff. Native compact watchlist screenshot verified; QQQ chart diagnostic flush proves251 rendered observations, not normal foreground first paint (`qqq-background-chart-flush.png`/JSON). Existing saved MSFT resume and post-handoff refresh/restart observations remain the next barrier.
+
+Matched build PASS7m52s: service72588/Desktop72627. Directory generation2 is actually published (13,295 rows); all9 saved histories reopen successfully (firstSPY2220ms; others225–500ms; eight251bars,IWM21). Home returns9prices/changes, joined in-flight read7217ms remaining (not total latency). Startup local-product construction27502ms; installed-operations48ms. Not an instant-startup pass. Original saved MSFT resume advances to7steps but reports revoked option authority amid repeated `freshness_only=true` sink health failures and account recovery deadlines. No replacement workflow or original deletion. Astra `options_original_recovery` now owns read-only diagnosis of that exact account-health→revocation coupling, append `.agents/tmp/v1-first-stock/options-renewal-recovery.md` only, no edits/builds/Git/runtime. Lead owns current native screen checks and integration.
 
 ### Execution evidence and ownership history
 
@@ -7380,3 +7428,9 @@ paper/equity.rs and paper_bot/virtual_routes.rs caller alignment. Reuse one sele
 path, no compatibility wrappers. Freeze all callers before the one scheduled service build.
 
 Financial UI ownership transferred to GPT-6.1 Sol High financial_preparation_ui_resume after two provider capacity errors; preserve and finish the existing candidate, not a replacement design.
+
+Native follow-up closes the current QQQ range-load check: choosing30days without a second action
+completed preparation, persisted its result artifact and returned20bars, with no visible error.
+Astra recovery diagnosis finished read-only. It rules out direct freshness-only cancellation and
+identifies the shutdown-versus-lifecycle deadline ownership mismatch; the initial generic
+publication revocation still requires a fixed-stage discriminator. All agent ownership released.
