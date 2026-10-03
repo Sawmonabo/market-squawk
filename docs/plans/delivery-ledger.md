@@ -4,6 +4,71 @@
 
 ### Current native barrier — investment dataset cursor admission
 
+Owner disk cleanup completed while Cargo and watcher were idle: removed 9,941 superseded
+`.rcgu.o` files older than 24 hours, keeping the latest object group per crate, current-day
+objects and every library. Exact path/stat/no-open-file checks preceded deletion. Reclaimed
+27.63 GiB; target fell from 84 GiB to 56 GiB, observed free space 87 GiB. Also removed eight
+unused Chrome/diagnostic cache directories (51.9 MiB) after no-open-file checks. Receipts:
+`stale-object-cleanup-receipt.json`, `tmp-cleanup-receipt.json`, and exact candidate inventories
+under `.agents/tmp/v1-first-stock/`. Remaining `.agents/tmp` is chiefly retained recovery
+programs and old workspace/catalog evidence, not disposable text scratch. No auto-pruner installed.
+Current Cargo automatic cleanup excludes target; upstream cargo-sweep is unmaintained. Supported
+cleanup and build reuse are documented in operations/troubleshooting.md. No additional build is
+scheduled during this cleanup; ordinary critical verification remains separate from full CI.
+
+The startup failure was diagnostic contamination: 90 RECORD-unowned NumPy/PyArrow bytecode files.
+Removed only verified unchanged unrecorded files (2,224,624 bytes) and empty cache directories;
+exact NumPy/PyArrow RECORD inventories now match again. Production already uses `-I -B`; no
+runtime dependency refresh or source-guard weakening was needed. Runtime recovery remains
+unverified until the next coherent service launch. Diagnosis and cleanup receipts are
+`training-distribution-startup.md` and `training-distribution-bytecode-cleanup.json`.
+
+The combined source batch compiled in 5m21s. Provider scheduler critical fixture passed; workflow
+publication/recovery fixture failed retained-checkpoint validation. Do not accept/push these source
+changes until that failure is corrected and the relevant check passes. New native annual producer
+also lacks direct composition/live proof. Its next consumer requirement is current StudyInputs
+through the existing current feature recipe; historical Training/Analysis mirrors must remain.
+Read-only handoffs: `stock-native-dataset.md`, `native-current-forecast-handoff.md`.
+
+Owner resource correction: lead inventories/removes verified stale Cargo object output while
+compilation is stopped; GPT-6.1 Sol `training_distribution` owns read-only `.agents/tmp` cleanup
+inventory/report only. No source or deletion authority delegated. Current workspace recovery
+roots remain conditional; existing source checks found provider scheduling regression passing,
+workflow recovery fixture failing retained-checkpoint validation, so this batch is not accepted.
+Lead repairs that failure after cleanup; watcher remains stopped and no native build is running.
+
+Active integration refresh: provider scheduler source is frozen for lead inspection. Astra
+`workflow_job_resume` now owns read-only `native-current-forecast-handoff.md` only: determine the
+existing native current-feature path needed after the annual labeled dataset pair. Astra
+`stock_native_dataset` finishes its assigned producer files; lead owns contracts, workflow,
+service handoff, verification and Git. No builds run while these files change.
+The matched cursor service exited at startup: `installed training distribution is invalid`.
+Desktop remains running but no healthy backend is inferred. GPT-6.1 Sol `training_distribution`
+will trace that concrete startup failure read-only (source/runtime identity, no provider secrets,
+no edits/builds/process control); lead owns any repair. DAG: coherent dataset handoff + scheduler
+critical check; distribution diagnosis concurrently; only then matched live recovery.
+
+Owner explicitly directed deletion of the three remaining `~/dev` historical folders:
+`market-squawk-handoff-backups`, `market-squawk-owner-verification`, and
+`market-squawk-preservation`. They were removed after exact-path/no-open-file checks, reclaiming
+212 MiB. This supersedes the earlier conditional retention note for these three folders only.
+The active repository, original Codex session and workspace roots remain intact.
+
+Matched cursor build completed (6m59s): service 13587 and Desktop 13656 share generation IYzRGa.
+Watcher is paused again before the next coordinated source edits; no compiler is active.
+Astra `stock_native_dataset` is released for its stated dataset/history ownership. Lead wires the
+required source-action reference and validated current-listed population through the operation.
+
+Provider diagnosis confirms a scheduler defect: synchronous catalog writer admission (including
+its blocking sleep) executes on the async source supervisor. Production runs a multithread Tokio
+runtime; keep registry/registration ownership in place and use Tokio's existing blocking boundary
+for that bounded synchronous selection. Astra `workflow_job_resume` now owns only
+`live_source/supervisor.rs` and its existing `live_source/tests/supervisor.rs` critical fixture;
+no new scheduler/timeout/capability cloning. Lead reserves data-catalog diagnostics if needed.
+Actual 30-second failing phase remains unmeasured; the correction must not claim all provider
+acquisition fixed without matched evidence. This lane is disjoint from stock dataset integration.
+
+
 Additional owner-requested `~/dev` cleanup: removed unused July 29 fixtures
 `.market-squawk-dmg-home-a0e4f01`, `.market-squawk-installer-home-a0e4f01`,
 `.market-squawk-installer-smoke-a0e4f01`, and the empty `market-squawk-worktrees` parent.

@@ -388,6 +388,33 @@ this repository in `rust-analyzer.linkedProjects`, its workspace settings contro
 the nested repository's `.vscode/settings.json` does not. Apply the same on-demand settings to
 that parent workspace and confirm the effective values in the rust-analyzer extension log.
 
+Routine development uses the existing coordinated watcher: React/CSS changes use Vite refresh,
+while Rust edits share one serialized compilation and replace the running staged programs only
+on success. Do not run a second manual build merely to display the console. Batch the relevant
+critical checks before the next native generation; avoid new target directories, one-off profile
+variants and executable copies for ordinary verification.
+
+Cargo's [automatic cache cleaning](https://doc.rust-lang.org/cargo/reference/config.html#cache)
+currently covers downloaded global caches, not this workspace's build output (checked 2026-10-03).
+On macOS, unpacked debug information also retains object files beside the executable. An old
+file's age alone does not prove it is unused. At each accepted integration checkpoint, inspect
+obsolete build variants and remove verified superseded output while the watcher is held and no
+compiler is active. Retain the current build/test artifacts and the running staged generation.
+For a deliberate reset of workspace-package output, use supported Cargo cleanup, previewing first:
+
+```bash
+cargo clean --workspace --profile dev --dry-run --verbose
+cargo clean --workspace --profile dev
+```
+
+This preserves third-party dependency output but forces workspace packages to rebuild; it is not
+a hook to run after every save. There is no automatic target-pruning hook configured.
+Do not install `cargo-sweep` as an assumed maintained solution: its upstream README currently
+marks it unmaintained. Do not accumulate new recovery executable copies for routine builds.
+Current recovery data must have a concrete restoration dependency; remove it when that dependency
+is closed or the owner explicitly authorizes its deletion. Managed Python diagnostics must use
+`-I -B`; isolated mode ignores the environment variable that ordinarily disables bytecode writes.
+
 Monitor generated storage at meaningful integration boundaries:
 
 ```bash
