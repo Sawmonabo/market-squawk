@@ -27,7 +27,36 @@ original text and numeric attributes; unknown formats remain rejected. The exist
 critical fixture passed 1/1 in 4.41s (compile 1m03s), including original/indexed evidence parity,
 unknown transform rejection and sign/scale validation. Log: `tsla-transform-critical.log`;
 diagnosis: `tsla-numeric-transform.md`, both under `.agents/tmp/v1-first-stock/`.
-Matched native retry/completion is the next barrier. No schema/data reset or migration.
+Source fix `bf616223` is pushed. The matching development build completed in 6m18s;
+service 5814/Desktop 5863 reopened the corrected workspace without an application password.
+Opening TSLA started job `ac495f0e-e4ae-4c7a-8b25-195f58292e37`, which completed with artifact
+`mcp-cfcea09779aaf51f877739631085d7adc561c99db460bbd809a65e7525ce8122`.
+The formerly rejected filing published successfully. Native TSLA Facts, Statements, Ratios and
+Filings each returned 32 first-page items and a continuation cursor without query errors.
+This does not mean every ratio is available: the first ratio page contains six reported,
+24 conflicting-input and two missing-input rows, requiring source-backed follow-up.
+MSFT quote/history/facts loaded while the TSLA job was confirmed running; its four tabs also
+returned without errors (Statements 3968ms, Filings 1067ms, Ratios 3731ms, Facts 3422ms).
+The tab captures occurred after filing publication; they do not prove overlap with the actual
+writer-held interval. Critical held-writer fixture evidence remains separate.
+Artifacts under `.agents/tmp/v1-first-stock/`: `fixed-zero-tsla-{job-start,during-msft,completion}.json`,
+`fixed-zero-tsla-completed-tabs.json`, `fixed-zero-msft-concurrent.json` and
+`fixed-zero-msft-concurrent-tabs.json`. No schema/data reset, migration, full gate or RAM measurement.
+Daily-change, complete financial coverage and full product/installed acceptance remain open.
+
+### Next diagnosis — remaining reported ratio conflicts
+
+Acceptance 1/2/5; base `bf616223`. Completed TSLA acquisition now exposes real ratio rows,
+including 24 first-page conflicts. Determine whether these are genuine source differences or an
+incorrect CompanyFacts consumer grouping before changing financial semantics.
+
+| Owner | Exclusive scope | Completion evidence |
+| --- | --- | --- |
+| Astra High `ratio_context_diagnosis` | Read-only source and retained evidence; append only `.agents/tmp/v1-first-stock/ratio-context-diagnosis.md` | Trace concrete TSLA conflict inputs and exact source contexts; explain valid versus invalid conflicts and smallest critical producer-to-consumer correction if needed |
+| Lead | All source/runtime/Git/build ownership; current evidence and ledger | Independently inspect findings before assigning implementation; no parallel build or workspace reset |
+
+DAG: completed selected-company data → actual conflict operands → verified grouping semantics →
+bounded implementation decision. No speculative ratio fallback, hidden unavailable rows or scope expansion.
 
 ### Integrated wave — keep reads available during financial preparation
 
