@@ -2,6 +2,130 @@
 
 ## Current execution — 2026-10-03
 
+### Owner-directed complete console QA and persistent detail reads
+
+Treat unexpected unavailable/missing data as a defect requiring exact service/source tracing;
+only a verified upstream absence/entitlement/market-session limitation can close it as expected.
+Owner requires all screens, tabs, menus, buttons, table/section data, charts/candles/colors, automatic
+loading, stable cached reads after restart, concise product copy and removal of redundant load/
+refresh controls or needless collapsed content. This supplements the existing product audit;
+missing financial workflows remain required fixes, not acceptable placeholders.
+
+| Current owner | Exclusive scope | Dependency / evidence |
+| --- | --- | --- |
+| GPT-6.1 Sol `console_qa` — released | Completed current native investigative pass; `.agents/tmp/desktop-product-audit/2026-10-03/`; updated `docs/reports/2026-10-02-desktop-product-audit.md` | 19 route surfaces, selected controls and full-page screenshots; actual passes, defects and blocked/unexecuted paths explicitly recorded. WebDriver session released; normal app stays running. Full workflow QA is still open. |
+| Astra `native_price_authority` — released | Completed read-only generation-drain investigation; `.agents/tmp/v1-first-stock/account-generation-drain.md` | Trace actual deadline/cancellation loss of Alpaca calendar during current native preparation; no source/runtime mutations. |
+| Lead | Detail cache/source call tracing; all shared source, runtime scheduling, ledger/Git/PR | Inspected report, relevant source and evidence manifest; source fixes remain pending. Native control ownership returned to lead. |
+
+DAG: one stable running native generation → exhaustive QA evidence; source/cache/lifecycle traces
+run concurrently without competing UI control. Findings are resolved as bounded coherent changes.
+No agent may label all screens complete from route presence or one successful request. Screens
+without real prerequisite data stay explicitly unverified. Financial correctness and source absence
+must not be fabricated to eliminate an unavailable label.
+
+Current QA evidence (same `d9afd7cb` native generation; no source changes during capture):
+- MSFT Facts tab return removes the table and takes 4.778s; route return takes 10.219s
+  until all observed reads are idle. These are observer upper bounds, not a new performance target.
+  Financial/history `gcTime: 0` discards inactive display results; financial tab unmount also closes
+  its cursor lease. The backend reopens durable prepared data but creates a fresh operation-owned
+  SQLite coordinate/sort index for each first-page read. No cross-restart display cache is proven.
+  Fix must retain display projections independently of released read authority, and reuse indexed
+  durable data; persisting opaque session/cursor tokens is not acceptable cache recovery.
+- Current MSFT Ratios first page has 32 reported values. Independent source QA recomputed all 32
+  at their returned decimal precision and matched all 84 input occurrences to retained original
+  SEC CompanyFacts or unsegmented filing facts. Both original SHA-256 names match recomputed hashes.
+  Evidence: `.agents/tmp/v1-first-stock/console-msft-source-check.json`. This closes neither later
+  pages nor other issuers, and does not replace production original-evidence authorization.
+- IWM financial response is `identity_missing`, not confirmed absent upstream; its saved history
+  preparation is failed. The official iShares fund page contains NAV, fund facts, holdings and
+  reports. Corporate statement applicability and required fund-specific presentation need separate
+  handling; generic missing-information text is not a complete fund workflow.
+- Markets now returns 100 MSFT option contracts in its default catalog overview. It is not the
+  required tracked-market discovery/movers view. Auditor retains actual response/screenshots.
+- Research preparation choices fail in the current native pass. The corresponding service log
+  records `Analysis.GetFeatureDatasetPreparationOptions` → `observation_decode/decode_memory`.
+  `dataset_preparation.rs::read_preparation_observations` reads batches but accumulates all decoded
+  rows plus ordering digests in one vector under 16 MiB/4,096-row generation admission, then sorts.
+  This is a confirmed local read/design failure, not proof missing upstream data. Correct the
+  choices enumeration to consume indexed/streamed summaries; raising the cap is not the fix.
+- The generation-drain investigation is finished, source ownership released. It identifies a
+  missing durable recovery/stop acknowledgement path after generic removal of an unhealthy account
+  runtime; the precise first cancellation signal/timed-out await is still unproven. Report:
+  `.agents/tmp/v1-first-stock/account-generation-drain.md`. No fix or successful recovery claimed.
+- Lead independently viewed all current Logs 000–016, Operations 000–009 and Markets 000–010
+  screenshots (38 tiles). Logs/Operations text remains contained at the captured 1376px width;
+  this does not prove narrow-window behavior or button actions. Markets shows 100 option identifiers
+  with repeated unavailable price/change labels, followed by the buried trading-session selector
+  and explicit load button. This is a confirmed discovery/read-flow failure, not verified upstream
+  absence. Generic job titles also omit the investment they concern.
+- Current screenshot manifest contains 224 unique files: 210 individually viewed, 205 accepted
+  as visual evidence, five viewed but excluded and 14 superseded without a viewing claim. Lead
+  verified every recorded file/hash and that no accepted entry lacks confirmed viewing. This
+  proves capture integrity, not control correctness or complete financial workflows. Native
+  interaction finished on Home; the normal Desktop/service remain running.
+
+Next correction order follows dependencies already exposed by this audit: preserve selected
+display data while reopening valid reads; reuse durable financial indexes; repair Research choice
+enumeration and the classified account-runtime recovery path; then finish the financial/source
+consumer and discovery workflows. Each unavailable field needs a source/identity/coverage cause,
+not a cosmetic replacement value. Full saved-result, restart-cache and mutation-dependent checks
+remain required where the audit lacks the necessary working prerequisite.
+
+### Integrated stock handoff and matched runtime recovery
+
+Latest live preparation finished partial and the same run paused again at PriceDataset with
+`analysis_source_actions_unavailable`; no retry loop is running. Runtime logs establish a separate
+remaining Alpaca lifecycle failure: stale-generation drain exceeded its service deadline, identity
+selection was cancelled, and the active calendar runtime later became NotConfigured. Successful
+route selection and populated retained prices do not prove continuous source health.
+
+The bounded generation-drain investigation below has completed; current ownership is in the
+console-QA table above. Astra wrote only `.agents/tmp/v1-first-stock/account-generation-drain.md`
+and released ownership. No source edits, process control, provider requests or builds were
+delegated. Its completed native-price report remains preserved. Native compilation is complete;
+source fixes remain pending integration and their critical checks.
+
+Matched native build passed in 8m02s. Service PID 59088 and Desktop PID 59131 start from the
+same staged generation; the startup receipt reports `ready`, and background native inspection
+shows Home/WORKSPACE READY. All nine starter watchlist prices and daily changes subsequently
+populated, including MSFT. This verifies real native display/recovery, not current-session live
+trades or the whole app. Provider route selection admitted all nine Alpaca routes (startup
+2.646s; subsequent 6.020s/3.531s); separate retained-account deadline and public crypto reference
+errors remain visible and are not claimed fixed.
+
+The saved MSFT workflow reopened, reconciled its pending work and advanced from seven to eight
+steps. It paused with `analysis_source_actions_unavailable`, with no pending invocation. Explicit
+Resume then preserved the partial receipt and admitted fresh preparation job
+`65079dcf-b9cd-4e71-89ed-7861431c0321` in the same saved run; the original profile remains and two
+partial receipts are archived. Preparation later completed partial, as recorded above. Evidence:
+`native-stock-runtime-recovery.json`, `native-stock-runtime-progress.json`,
+`native-stock-source-refresh.json` under the existing ignored first-stock evidence directory.
+
+Astra completed `.agents/tmp/v1-first-stock/native-price-authority.md` and released ownership.
+It identifies a native provider-Split evidence case through existing dataset/epoch and price
+readers, preserving Raw/calendar/lifecycle originals and separate cash/accounting guards. The
+current StudyInputs proposal must use this same price-basis boundary; its prior ordinary-only
+source seam would retain the Tiingo dependency. No implementation of that correction is claimed.
+Target is now approximately 20 GiB after the matched build; the launcher automatically reclaimed
+the old stage and retains one 1.2 GiB running generation. No second target, backup copy or compiler.
+
+Pushed source checkpoints: `39784d8d` (provider selection yields the async executor) and
+`d9afd7cb` (retained native stock dataset/source handoff and initial preparation recovery).
+Critical scheduler and persisted workflow checks passed as recorded below; live workflow acceptance
+remains open. The coordinated watcher completed the matched native Desktop/service generation. No parallel Cargo
+command ran; the next source correction remains lead-owned.
+
+| Owner | Outcome / ownership | Dependency and evidence |
+| --- | --- | --- |
+| Lead | Runtime recovery, Git/PR, all source and shared contracts | One existing build queue; verify actual service startup and native reconnect before claiming recovery. |
+| Astra `native_price_authority` | Read-only whole-history split-price design; sole write `.agents/tmp/v1-first-stock/native-price-authority.md` | Inspect actual Alpaca original-history/action capabilities and current guards; propose smallest producer-to-consumer no-Tiingo correction with authoritative source references. No source edits, builds, process control or provider requests. |
+
+DAG: frozen integrated build → native startup/reconnect evidence; independent price-authority
+source/research trace → lead-scoped implementation after compilation. Current StudyInputs remains
+a separate required handoff identified in the existing report; no historical dataset relabeling.
+Branch refresh: three local branches, one worktree, four origin branches. The extra origin branch
+belongs to open dependency PR #55 and retains unintegrated work; it is not an abandoned agent branch.
+
 ### Current native barrier — investment dataset cursor admission
 
 The retained-preparation recovery check now passes: the fixture had mixed a simulated 2027
