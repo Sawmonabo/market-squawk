@@ -5043,6 +5043,55 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     assert_eq!(selected.sources().len(), 1);
     assert_eq!(selected.commit(), &first_commit);
     assert_eq!(selected.commit_available_at(), first_commit.available_at());
+    // Query specialization must preserve unrestricted-source selection and keep
+    // native instruments out of the distinct source-cohort namespace.
+    let unrestricted_request =
+        market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
+            first_commit.dataset_id().clone(),
+            instrument,
+            retained_routes[0].venue_id().clone(),
+            LiveEventClass::Trade,
+            selection_request.as_of_cutoff(),
+            selection_request.knowledge_cutoff(),
+            selection_request.effective_time_basis(),
+            1,
+            first_commit.clone(),
+            None,
+        )?;
+    let cohort_request =
+        market_squawk_data::ProviderMarketEventPointInTimeRequest::try_cohort_exact(
+            first_commit.dataset_id().clone(),
+            SourceIdentifier::try_from("fixture-cohort")?,
+            retained_routes[0].venue_id().clone(),
+            source.source_id().clone(),
+            ProviderProduct::new(SourceIdentifier::try_from("fixture-product")?),
+            ProviderChannel::new(SourceIdentifier::try_from("fixture-channel")?),
+            selection_request.as_of_cutoff(),
+            selection_request.knowledge_cutoff(),
+            selection_request.effective_time_basis(),
+            1,
+            first_commit.clone(),
+        )?;
+    let mut scopes = restarted
+        .read_provider_market_event_point_in_time_batch(
+            &[unrestricted_request, cohort_request],
+            Arc::clone(&capture_store),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?
+        .into_iter();
+    let unrestricted = scopes
+        .next()
+        .ok_or("missing unrestricted result")??
+        .ok_or("missing unrestricted selection")?;
+    assert_eq!(unrestricted.sources(), selected.sources());
+    assert_eq!(unrestricted.exclusions(), selected.exclusions());
+    let cohort = scopes
+        .next()
+        .ok_or("missing cohort result")??
+        .ok_or("missing cohort selection")?;
+    assert!(cohort.sources().is_empty());
     // Selected-page reads share one snapshot/publication while keeping each exact
     // cutoff and source. Repeated requests must reproduce the original full receipt.
     let empty_request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(

@@ -337,7 +337,7 @@ impl Catalog {
             verify_migration_identities(&connection)?;
         }
         verify_integrity(&connection)?;
-        Ok(Self {
+        let catalog = Self {
             connection,
             publication_observer: crate::ingest::DataPublicationObserverSlot::default(),
             location: config.location.clone(),
@@ -349,7 +349,36 @@ impl Catalog {
             result_bytes: config.result_bytes,
             catalog_id: uuid::Uuid::new_v4(),
             artifact_root_binding,
-        })
+            planner_maintenance_at: std::cell::Cell::new(None),
+        };
+        // A restored catalog remains untouched until its first new publication.
+        if initialize {
+            catalog.refresh_query_planner_if_due();
+        }
+        Ok(catalog)
+    }
+
+    fn refresh_query_planner_if_due(&self) {
+        // SQLite bounds this statistics work itself. Revisit it on active publication,
+        // at most daily, without adding a timer or work to ordinary screen reads.
+        if self
+            .planner_maintenance_at
+            .get()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(24 * 60 * 60))
+        {
+            return;
+        }
+        self.planner_maintenance_at
+            .set(Some(std::time::Instant::now()));
+        if self
+            .connection
+            .execute_batch("PRAGMA optimize=0x10002")
+            .is_err()
+        {
+            // Statistics are optional: a maintenance failure must not turn a durable
+            // publication into a reported failure or prevent the workspace opening.
+            tracing::warn!("catalog query planner statistics could not be refreshed");
+        }
     }
 
     /// Returns defensive connection state and migration count.

@@ -116,6 +116,7 @@ impl Catalog {
             }
             check_cancelled(cancellation)?;
             transaction.commit()?;
+            self.refresh_query_planner_if_due();
             return Ok(commit);
         }
         require_reserved_run(&transaction, reservation.run_id())?;
@@ -238,6 +239,10 @@ impl Catalog {
         transaction.commit()?;
         self.publication_observer
             .record(crate::DataPublication::MarketEvents);
+        if previous_sequence == 0 {
+            self.planner_maintenance_at.set(None);
+        }
+        self.refresh_query_planner_if_due();
         Ok(commit)
     }
 }

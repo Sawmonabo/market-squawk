@@ -760,6 +760,7 @@ pub struct Catalog {
     pub(super) result_bytes: CatalogResultLimits,
     pub(super) catalog_id: Uuid,
     pub(super) artifact_root_binding: [u8; 32],
+    pub(super) planner_maintenance_at: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl fmt::Debug for Catalog {

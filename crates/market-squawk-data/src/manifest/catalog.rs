@@ -416,15 +416,19 @@ impl AnalyticalManifestCatalog {
             .maximum_candidates()
             .checked_add(1)
             .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
-        let mut statement = connection.prepare(
-            "WITH keyed_rows AS (
+        let exact_key_rows = provider_market_event_selection_rows_sql(
+            request,
+            ProviderMarketEventSelectionQuery::Candidates,
+        );
+        let sql = format!(
+            "{exact_key_rows}, keyed_rows AS (
              SELECT indexed.publication_digest, indexed.publication_kind,
                     indexed.publication_row_ordinal, indexed.coordinate_digest,
                     indexed.source_id, indexed.received_at_ns,
                     CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
                          ELSE indexed.received_at_ns END AS effective_at_ns,
                     committed.available_at_ns AS origin_committed_at_ns
-             FROM provider_market_event_selection_index AS indexed
+             FROM exact_key_rows AS indexed
              JOIN market_event_complete_commits AS committed
                ON committed.dataset_id=indexed.dataset_id
               AND committed.commit_sequence=indexed.commit_sequence
@@ -433,14 +437,7 @@ impl AnalyticalManifestCatalog {
              JOIN ingest_runs AS run ON run.run_id=committed.run_id
               AND run.source_id=indexed.source_id AND run.state='succeeded'
               AND run.completed_at_ns=committed.available_at_ns
-             WHERE indexed.dataset_id=?1 AND indexed.commit_sequence<=?2
-               AND ((?3 IS NOT NULL AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL)
-                    OR (?3 IS NULL AND indexed.instrument_id IS NULL AND indexed.cohort_key=?11
-                        AND indexed.provider_product=?12 AND indexed.provider_channel=?13))
-               AND indexed.venue_id=?4
-               AND indexed.event_kind=?5
-               AND (?9 IS NULL OR indexed.source_id=?9)
-               AND ((?6=0 AND indexed.source_timestamp_ns IS NOT NULL
+             WHERE ((?6=0 AND indexed.source_timestamp_ns IS NOT NULL
                                AND indexed.source_timestamp_ns<=?7)
                     OR (?6=1 AND indexed.received_at_ns<=?7))
                AND indexed.available_at_ns<=?8
@@ -462,7 +459,8 @@ impl AnalyticalManifestCatalog {
            AND (?14=0 OR received_at_ns=newest_received_at_ns)
          ORDER BY source_id, publication_digest, publication_row_ordinal
          LIMIT ?10",
-        )?;
+        );
+        let mut statement = connection.prepare(&sql)?;
         let instrument = request.instrument_id().map(|id| id.as_uuid());
         let mut rows = statement.query(params![
             request.dataset().as_str(),
@@ -3339,6 +3337,55 @@ fn selected_provider_market_event_commit(
         .transpose()
 }
 
+enum ProviderMarketEventSelectionQuery {
+    Candidates,
+    Exclusions,
+}
+
+fn provider_market_event_selection_rows_sql(
+    request: &ProviderMarketEventPointInTimeRequest,
+    query: ProviderMarketEventSelectionQuery,
+) -> String {
+    // Keep the admitted request shape visible to SQLite's index planner. All values
+    // remain bound parameters; only these closed SQL fragments vary between shapes.
+    let identity = if request.instrument_id().is_some() {
+        "indexed.instrument_id=?3 AND indexed.cohort_key IS NULL"
+    } else {
+        match query {
+            ProviderMarketEventSelectionQuery::Candidates => {
+                "indexed.instrument_id IS NULL AND indexed.cohort_key=?11 \
+                 AND indexed.provider_product=?12 AND indexed.provider_channel=?13"
+            }
+            ProviderMarketEventSelectionQuery::Exclusions => {
+                "indexed.instrument_id IS NULL AND indexed.cohort_key=?10 \
+                 AND indexed.provider_product=?11 AND indexed.provider_channel=?12"
+            }
+        }
+    };
+    let source = if request.exact_source_surface().is_some() {
+        "indexed.source_id=?9"
+    } else {
+        "?9 IS NULL"
+    };
+    // Select the exact key before the completeness joins can choose a source-wide
+    // run scan. Keep all row clocks here so exclusion accounting remains complete.
+    format!(
+        "WITH exact_key_rows AS MATERIALIZED (
+             SELECT indexed.dataset_id, indexed.commit_sequence,
+                    indexed.publication_digest, indexed.publication_kind,
+                    indexed.publication_row_ordinal, indexed.coordinate_digest,
+                    indexed.source_id, indexed.source_timestamp_ns, indexed.received_at_ns,
+                    indexed.available_at_ns, indexed.ingested_at_ns
+             FROM provider_market_event_selection_index AS indexed
+             WHERE indexed.dataset_id=?1 AND indexed.commit_sequence<=?2
+               AND {identity}
+               AND indexed.venue_id=?4
+               AND indexed.event_kind=?5
+               AND {source}
+         )"
+    )
+}
+
 fn provider_market_event_exclusion_counts(
     connection: &Connection,
     request: &ProviderMarketEventPointInTimeRequest,
@@ -3346,14 +3393,18 @@ fn provider_market_event_exclusion_counts(
     clock: i64,
 ) -> Result<ProviderMarketEventExclusionCounts, ManifestCatalogError> {
     let instrument = request.instrument_id().map(|id| id.as_uuid());
-    let mut statement = connection.prepare(
-        "WITH keyed_rows AS MATERIALIZED (
+    let exact_key_rows = provider_market_event_selection_rows_sql(
+        request,
+        ProviderMarketEventSelectionQuery::Exclusions,
+    );
+    let sql = format!(
+        "{exact_key_rows}, keyed_rows AS MATERIALIZED (
              SELECT indexed.source_id, indexed.source_timestamp_ns, indexed.received_at_ns,
                     indexed.available_at_ns, indexed.ingested_at_ns,
                     CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
                          ELSE indexed.received_at_ns END AS effective_at_ns,
                     committed.available_at_ns AS origin_committed_at_ns
-             FROM provider_market_event_selection_index AS indexed
+             FROM exact_key_rows AS indexed
              JOIN market_event_complete_commits AS committed
                ON committed.dataset_id=indexed.dataset_id
               AND committed.commit_sequence=indexed.commit_sequence
@@ -3362,13 +3413,6 @@ fn provider_market_event_exclusion_counts(
              JOIN ingest_runs AS run ON run.run_id=committed.run_id
               AND run.source_id=indexed.source_id AND run.state='succeeded'
               AND run.completed_at_ns=committed.available_at_ns
-             WHERE indexed.dataset_id=?1 AND indexed.commit_sequence<=?2
-               AND ((?3 IS NOT NULL AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL)
-                    OR (?3 IS NULL AND indexed.instrument_id IS NULL AND indexed.cohort_key=?10
-                        AND indexed.provider_product=?11 AND indexed.provider_channel=?12))
-               AND indexed.venue_id=?4
-               AND indexed.event_kind=?5
-               AND (?9 IS NULL OR indexed.source_id=?9)
          ), eligible AS (
              SELECT *, MAX(effective_at_ns) OVER (
                  PARTITION BY source_id
@@ -3412,7 +3456,8 @@ fn provider_market_event_exclusion_counts(
            COALESCE((SELECT COUNT(*) FROM eligible
                      WHERE ?13=1 AND effective_at_ns=newest_effective_at_ns
                        AND received_at_ns<newest_received_at_ns), 0)",
-    )?;
+    );
+    let mut statement = connection.prepare(&sql)?;
     let counts: (i64, i64, i64, i64, i64, i64, i64) = statement.query_row(
         params![
             request.dataset().as_str(),

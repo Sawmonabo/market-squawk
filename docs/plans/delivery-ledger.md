@@ -2,6 +2,17 @@
 
 ## Current execution — 2026-10-02
 
+Latest integration: `68221dde` pushed the native-verified navigation correction. Watchlist is
+compact and all nine saved histories were verified in the preceding pushed batch. Lead owns the
+current measured market-selection correction; Astra's manifest query handoff is inspected/frozen.
+The final existing publication/recovery test PASS1/1 (11.20s, compile51.07s), including unrestricted
+source and native/cohort separation. No extra harness, CI or review round. The single matched
+service/Desktop rebuild is running; final native concurrency evidence remains pending. Source
+changes retain every completeness, authority, time and exclusion check and add no workload cap.
+Options doctor-renewal recovery remains the next saved-MSFT workflow dependency, not completed.
+
+### Execution evidence and ownership history
+
 Continuation classification: prior turn made verified progress (history/UI code and evidence pushed
 through `d2ef1654`). Current branch clean at refresh; service 27815/Desktop 27852/watcher 99703 live.
 
@@ -40,6 +51,41 @@ Options recovery diagnosis is complete in `options-renewal-recovery.md`: same cr
 and rights, changed doctor validity window. Recovery must preserve original evidence and validate
 current permission separately across reference admission and fresh-chain dependency reopen;
 no bypass or source change applied. Collection diagnostics are in the one running matched build.
+
+Diagnostic matched build PASS5m57s, service40954/Desktop40997. Native collection returned nine
+prices/changes in14036ms. Timed retained event batch consumed7.6–11.1s across observed startup
+reads; route discovery1.6–2.3s, metadata/authorization roughly0.4–0.5s. Lead records a5second
+correlated CPU sample in `collection-event-batch-sample.txt`; Astra `stock_workflow_trace` owns
+read-only interpretation of that sample and exact data batch selector/publication callees, writing
+only the existing collection diagnosis. Identify measured dominant work and smallest existing-check
+correction; no further source edits/build/Git/runtime calls. Temporary timing source remains local.
+
+Measured correction wave: native/source predicate specialization alone did not improve the query;
+statistics alone worsened it. On a pinned temporary catalog copy (deleted), exact native+source
+predicates with planner statistics preserved all36 result sets and reduced combined SQL3550→2170ms,
+using the existing five-key index without a forced index. Astra `stock_workflow_trace` owns ONLY
+`crates/market-squawk-data/src/manifest/catalog.rs` candidate/exclusion predicates for this measured
+closed request-shape specialization. Lead owns catalog lifecycle statistics maintenance, existing
+publication-recovery integrity fixture, build/Git/native validation. Preserve cohort and unrestricted
+source semantics, all clocks/exclusion counts/completeness joins. No migration/index/hint/timeout
+increase. Temporary instrumentation removed from source and saved as an ignored diagnostic patch.
+
+Live follow-up: matched build PASS6m35s, service48461/Desktop48513. App-created planner
+statistics are present, but two native collection reads still time out at15006/15007ms;
+latest failure reaches previous-close selection after retained prices. This is not accepted as
+closing the loading defect. Astra `stock_workflow_trace` owns read-only interpretation of
+`collection-after-planner-sample.txt` and current exact query plans/results in the live read-only
+catalog; identify concurrent duplication and remaining dominant SQL, write only the existing
+collection diagnosis. No source/runtime/Git/build mutations. Lead traces Desktop request ownership
+and verifies individual saved history reads independently. Existing query changes remain frozen.
+
+Normal Home query is successful with all nine prices/changes; joining its existing in-flight
+read completes1905ms later (not a full-duration measurement). Direct diagnostic transport probes
+created a second batch alongside Home. The current full-statistics planner chooses source runs
+before instrument keys; Astra's readonly native-key MATERIALIZED scan removes that broad join:
+36outputs identical,3659.51→2302.56ms;48 additional clock/source/tie/cutoff comparisons identical.
+Astra owns only the same manifest/catalog.rs to apply this measured exact-key-before-completeness
+shape to candidate/exclusion reads without index hints. Lead retains all other files/builds.
 
 Current code checkpoint: `caa08000`, pushed on the existing feature branch. The single matched
 build passed in 5m18s; service 27815 and Desktop 27852 run generation `tU6dcK`. Watcher is running,
