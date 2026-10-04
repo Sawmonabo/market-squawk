@@ -2,28 +2,34 @@
 
 ## Current execution — 2026-10-04
 
-### Latest verified checkpoint — `a362a263`
+### Latest deployed checkpoint — `71ec9b6b`
 
-Single supervisor build passed6m41s and replaced service/Desktop with77827/77885 in
-`generation-BZYyS9`; the prior generation was automatically removed. No Cargo process remains.
-Native background read confirms `Market Squawk`, Workspace Ready, Home and retained watchlist
-prices without invoking Try again. Research open fell from58.255s to0.581s in this observed restart;
-its measured phases are catalog59ms, manifests19ms, analytical bound4ms and raw store0ms.
-Total local composition fell from69.407s to10.850s. This is one source-development restart,
-not a hardware-independent performance guarantee or complete installed-workflow acceptance.
+The single supervisor build passed in 7m48s and replaced service/Desktop with 5159/5495 in
+`generation-okyT25`; the prior generation was automatically removed. Watcher 26857 is running and
+no Cargo process remains. Native background read confirms Workspace Ready, Home and all nine
+retained watchlist prices without Try again. Research open took 576ms; the removed executable scan
+is now build metadata at 0ms (integer millisecond log resolution). Total local composition was 5.673s,
+versus 10.850s at `a362a263`, whose executable scan alone took 5.587s. This is one development restart,
+not instant-start or complete installed-workflow acceptance.
 
-The remaining executable identity scan took5.587s and pre-reconnect composition4.666s after research
-open; those are still pending correction under the owner-approved trusted-source runtime scope.
-All selected catalog/recovery checks passed7/7. The current native workflow remains paused on
-`analysis_source_actions_unavailable`; no completed forecast or saved brief is claimed. Evidence:
-`source-runtime-dev.log` from79877, `catalog-startup-native-{status,window}.json`, and the three
-`catalog-*-critical.log` files. Root inspected native output without taking desktop focus.
+Both build-provenance critical checks passed. Indexed identity lookup `0014e5fa` is deployed:
+startup native route selection returned nine Alpaca routes in 591ms and individual crypto routes
+in 52–410ms. This does not prove every authority or runtime lifetime issue is resolved.
 
-Startup implementation ownership is released. The ownership table below names the current slice;
-the Schwab unknown-quota/one-connection design remains a separate pending dependency. One primary worktree and three local
-branches remain; origin's additional dependency PR55 is confirmed open/unmerged and preserved.
+Live failures remain: an actual native `marketCollection` request with `includeMarket:true` timed
+out after 15011ms with `request_interrupted`; logs place the deadline in retained display authorization
+while the analysis preparation was active. The resumed stock workflow still encounters expired
+Alpaca activation/calendar authority and revoked option demand. Coinbase/Kraken also report sink
+health/publication rollback startup failures. Saved prices on screen are not live acceptance.
+Evidence: `source-runtime-dev.log` from line 95956, `build-metadata-native-{window,status,collection}.json`,
+and `build-metadata-workflow-{resume,progress}.json` under the existing first-stock evidence directory.
+The resumed workflow advanced from 17 to 20 completed checkpoints, then paused, with no saved analysis result.
 
-### Selected live identity lookup — critically verified; deployment pending
+One primary worktree and three local branches remain. Origin has the three corresponding branches
+plus dependency PR #55, confirmed open/unmerged and preserved. No branch/worktree or runtime clone
+was created for this correction. Main/release are unchanged.
+
+### Selected live identity lookup — deployed; critical and native route checks passed
 
 First-stock preparation loses live source authority after a nine-route selection exceeds its30s
 budget. The provider identity SQL ranks all as-of instrument revisions before filtering the requested
@@ -33,23 +39,22 @@ provider-symbol index, ranks all as-of revisions only for those IDs, then valida
 revision's matching term and effective interval. Never prefilter revisions in a way that revives a
 retired alias. No schema, migration, quota or deadline change is needed.
 
-Lead inspected the SQL and test changes. The existing point-in-time identity case passed1/1 in1.67s,
+Lead inspected the SQL and test changes. The existing point-in-time identity case passed 1/1 in1.67s,
 including prior alias validity, rejection after replacement and exact successor selection. The first
 attempt rejected invalid fixture clocks; correcting only those clocks preserved the production
-`effective_at <= knowledge_at` rule. Existing native custody recovery passed1/1 in0.94s, retaining
+`effective_at <= knowledge_at` rule. Existing native custody recovery passed 1/1 in0.94s, retaining
 successor invalidation, writer wait/cancellation and exact authority. Logs:
 `provider-identity-{index,custody}-critical.log`. A separate read-only SQLite3.50.4 probe used the
 existing symbol and instrument-revision indexes and returned one retained identity in0.397ms;
 `provider-identity-query-plan.json` is diagnostic, not native service performance proof.
 
-Implementation is frozen/released. Watcher26857 remains paused for integration; lead owns the next
-single supervised replacement. No claim that the full30s failure or optional-child/account teardown
+Implementation is frozen/released and deployed with 71ec9b6b; watcher 26857 is running. No claim that the full30s failure or optional-child/account teardown
 coupling is resolved. No schema, migration, query limit or deadline change was introduced.
 
-### Build provenance correction — critically verified; deployment pending
+### Build provenance correction — deployed and critically verified
 
-Indexed identity correction is pushed as `0014e5fa`. Lead keeps the watcher paused while integrating
-the separately approved remaining startup scan correction into the next supervised build.
+Indexed identity correction is pushed as `0014e5fa`; provenance correction is pushed as `71ec9b6b`.
+Both are deployed in one supervised replacement.
 The current executable will contribute bounded metadata (package/version, recorded optional native
 build revision, platform, file size and modification time), not a repeated two-pass file hash.
 This is explicitly provenance, not byte attestation; recorded revision may be absent or inherited
@@ -65,19 +70,23 @@ records already retain generic code bindings. Other installed helper scans remai
 work. No other writer/build/runtime owner is introduced.
 
 Lead inspected producer, receipt and saved-trial consumers. The extended governed-service test
-passed1/1 in0.17s after a3m46s single-job build: metadata changes only code provenance, produces a
+passed 1/1 in 0.17s after a 3m46s single-job build: metadata changes only code provenance, produces a
 distinct trial identity, and the original completed record reopens exactly. The existing immutable
-request identity test also passed1/1. Logs: `build-metadata-{restart,identity}-critical.log`.
+request identity test also passed 1/1. Logs: `build-metadata-{restart,identity}-critical.log`.
 No schema, migration, compatibility branch or alternative backtest engine was added. Application
-compilation and live startup timing remain pending the single supervised replacement.
+compilation and native startup passed as recorded above; other source/read failures remain.
 
 ### Current ownership — 2026-10-04
 
 | Owner | Required outcome and dependency | Exclusive scope | Next evidence |
 | --- | --- | --- | --- |
-| Lead | Integrate selected identity reads and verify native source/workflow behavior | Git, builds/runtime, shared contracts, ledger/PR | One supervised replacement and actual source/preparation result |
-| Astra High — schwab_doctor_diagnosis | Indexed exact symbol selection | Two data files above; frozen/released | Two existing critical checks passed; native timing remains unproven |
-| Astra High — account_start_coordination | Backtest build-metadata receipt and saved-result identity | Backtesting strategy.rs, experiments/model.rs and tests.rs; frozen/released | Lead inspected; two existing critical checks passed |
+| Lead | Close deployed checkpoint; integrate next concrete source/read fix | Git, builds/runtime, shared contracts, ledger/PR | Saved workflow result and exact failed admission |
+| Astra High — account_start_coordination | Diagnose the 15s fresh-watchlist timeout during preparation | Read-only retained market display authorization, research worker and direct owners | Exact lock/read lifetime, smallest correction and existing critical check |
+| Astra High — schwab_doctor_diagnosis | Diagnose premature Alpaca activation expiry and dependent cancellation | Read-only account lease, runtime group/health and current preparation failure | First causal transition, distinguish normal expiry from erroneous teardown |
+
+These are bounded read-only follow-ups to observed failures on 71ec9b6b. No edits, builds, provider
+requests or process control are delegated. The separately documented Schwab rate/connection fix and
+remaining installed-helper scan correction remain required pending dependencies.
 
 ## Earlier checkpoint evidence
 
