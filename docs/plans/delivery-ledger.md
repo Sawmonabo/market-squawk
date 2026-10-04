@@ -4,36 +4,69 @@
 
 ### Current ownership — 2026-10-04
 
-Audit base: `823a2b0f`. One primary worktree and three local branches; origin additionally retains
-open, unmerged dependency PR #55. No stale agent branch or linked worktree was found.
+Audit base: `e43ebd80` (safe Schwab diagnostics pushed). One primary worktree and three intended
+local branches. Origin also retains open, unmerged dependency PR #55; no stale agent branch or
+linked worktree was found. No branch, workspace or target directory was created in this checkpoint.
 
 | Owner | Required outcome and dependency | Exclusive scope | Critical completion evidence |
 | --- | --- | --- | --- |
-| Lead | Deploy the already verified source runtime, then resume the retained stock workflow | Runtime, Git, build scheduling, delivery ledger; source remains frozen during the existing supervised build | Successful replacement, actual workflow/model result and saved restart; fixture success alone is insufficient |
-| Astra High — Schwab failure diagnostics | Preserve the actual failing doctor stage after successful OAuth; diagnosis proved current error mapping loses it | Only `provider_onboarding/schwab_market_doctor_probe.rs` and `schwab_market_doctor.rs`; no builds, provider calls or runtime actions | Failure-only closed stage/family/error diagnostics without payloads or secrets; lead compile and one existing native retry |
+| Lead | Deploy the source-admission corrections, retry existing source authorization and resume the retained stock workflow | Git, build/test scheduling, native runtime, ledger/PR; implementation frozen | Single supervised replacement, actual source result and saved workflow result |
+| Astra High — account_start_coordination | Keep unrelated registry operations responsive during source startup | `application/market_runtime.rs` and `application/market_runtime/account_stop.rs`; frozen/released | Four focused registry checks passed, including the suspended-resolver concurrency and original custody cases |
+| Astra High — schwab_doctor_diagnosis | Admit the actual successful option-chain shape | Adapter `rest/response.rs`, `option_publication.rs`, `tests.rs`; frozen/released | Existing native parsing regression passed with all128 contracts under unchanged production bounds |
 
-The diagnostic build passed in 8m03s and the existing supervisor replaced service/Desktop with
-PIDs 26676/26780. No parallel build or extra runtime was created. A native lifecycle Resume was
-rejected as unauthorized; continuing the existing saved OAuth session refreshed access generation 3
-without new consent and invoked the actual doctor. It now identifies `LevelOneOptions` as the failing
-family (`InvalidProbeEvidence`); no transport/capture diagnostic fired. This narrows the investigation
-but does not establish the failed predicate or working Schwab data. Evidence:
-`schwab-diagnostic-native-{retry,continue}.json` and `source-runtime-dev.log`.
+### Source admission correction — implemented and critically verified; deployment pending
 
-Astra's Alpaca diagnosis is complete: account startup holds global `registry.mutation` across
-configuration resolution, network readiness, publication and cancellation drain. Retry reached route
-selection with 2,769ms remaining and expired there; initial restoration instead expired in subsequent
-calendar preflight. Existing logs cannot attribute earlier time to lock wait versus configuration or
-research storage work. Preserve per-surface start reservation and cleanup ownership, moving slow
-preparation outside global mutation and rechecking registry/authority at publication. This correction
-is pending; no timeout increase or claim of resolved live startup is justified.
+Account startup now retains its per-surface reservation while resolving configuration, waiting for
+network readiness and draining cancellation outside global registry mutation. Publication reacquires
+mutation and checks the original reservation, predecessor absence, accepting state, exact request and
+current authority. Generic stop joins the original startup owner and checks replacement races. Failed
+publication drains outside mutation. No deadline or admission budget was increased.
 
-Astra now has read-only ownership of the narrowed Schwab options prerequisite: trace all
-`InvalidProbeEvidence` paths before the newly instrumented capture/transport boundary, REST option
-outcome retention and sealed evidence selection. Return the smallest supported correction and
-critical test seam. No edits, builds, provider calls, Git or runtime operations. Lead retains all files.
-Installed-runtime scan removal remains a separate pending implementation checkpoint.
+The retained Schwab chain received 2026-10-04T04:31:27.391Z reports body status SUCCESS and128
+contracts in154,880 bytes. Its `daysToExpiration: 1.0` failed our integer-only parser; ten ordinary
+scalar fields per contract also exhausted unknown-field accounting. The adapter now preserves that
+numeric lexeme and recognizes those scalar fields, including sidecar encoding. Nested deliverables
+remain unknown evidence. Requests and resource bounds are unchanged; no chain was narrowed or
+failed family skipped to make verification pass. The capture filename is
+`9e173f3a13130f67cac598ebae902efaaf9d19a63be0573dc6c7689fa693d692.msj` under the current
+workspace's research-segment object store. HTTP status was not persisted after the failed doctor;
+body SUCCESS is not claimed as proof of HTTP200.
 
+Lead inspected actual changes and affected consumers. Critical evidence:
+- `schwab-chain-parser-critical.log`: existing native parsing check1/1 passed in0.02s, final compile7.16s.
+  It retains all128 contracts, native decimal/text/boolean metadata and nested unknown evidence.
+- `account-start-coordination-critical.log`: registry module4/4 passed in7.35s, compile7m13s.
+  The new uncovered concurrency case proves unrelated admission during suspended resolution and
+  cleanup, conflicting/exact duplicate handling, and shutdown joining the original worker. Existing
+  custody, receipt/credential mismatch and health-drain generation checks also pass.
+
+Before replacement, the visible runtime remains service26676/Desktop26780 in
+`generation-vvyv0h`. Watcher26857 was paused for integration; lead resumes it after committing for
+one supervised replacement. The supervisor already removed the prior runtime generation. No CI,
+release gate or whole-app RAM acceptance ran. The remaining large scratch binary copies are recorded
+recovery evidence; the current failing live workflow is not sufficient reason to delete that evidence.
+
+### Live acceptance state and next barrier
+
+The earlier native Resume request was rejected as unauthorized; continuing the existing saved OAuth
+session refreshed access generation3 without new consent and invoked the actual doctor. Diagnostic
+build8m03s identified `LevelOneOptions`/`InvalidProbeEvidence`, leading to the retained-chain parser
+correction above. Evidence: `schwab-diagnostic-native-{retry,continue}.json`, `source-runtime-dev.log`.
+
+The stock workflow remains paused before training with `analysis_source_actions_unavailable`.
+Alpaca Retry reached route selection with2,769ms remaining and expired there; initial restoration
+instead expired in later calendar preflight. The broad account-start lock is corrected and critically
+verified, but actual elapsed time before that failed selection was not attributed to a single cause.
+Shared research-worker contention and remaining source/calendar failures require live verification;
+this checkpoint does not claim all source activation or Desktop data coverage is fixed.
+
+Next: supervised replacement, saved Schwab authorization/doctor retry, source restoration and retained
+stock workflow resume. Prove actual model admission/inference and saved restart. The independent
+Schwab prerequisite bug (unavailable OptionChains followed by unconditional dependent stream probes)
+is still a substantiated open finding; no synthetic receipt or skipped capability was introduced here.
+Installed-runtime and residual own-executable scan removal remain pending under the existing
+`development-model-runtime-correction.md` design. All V1 provider/UI and installed acceptance scope
+remains active.
 
 ### Editable source runtime — critically verified integration
 

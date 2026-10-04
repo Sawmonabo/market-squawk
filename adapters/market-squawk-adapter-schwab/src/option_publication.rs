@@ -1311,7 +1311,7 @@ fn encode_sidecar(
                 underlying_price: native_number_field(parsed.value().underlying_price()),
                 volatility: native_number_field(parsed.value().volatility()),
                 interest_rate: native_number_field(parsed.value().interest_rate()),
-                days_to_expiration: native_u64_field(parsed.value().days_to_expiration()),
+                days_to_expiration: native_number_field(parsed.value().days_to_expiration()),
                 number_of_contracts: native_u64_field(parsed.value().number_of_contracts()),
             }),
         ),
@@ -1472,6 +1472,16 @@ const fn option_field_name(field: OptionContractField) -> &'static str {
         OptionContractField::InTheMoney => "inTheMoney",
         OptionContractField::Mini => "mini",
         OptionContractField::NonStandard => "nonStandard",
+        OptionContractField::BidAskSize => "bidAskSize",
+        OptionContractField::IntrinsicValue => "intrinsicValue",
+        OptionContractField::ExtrinsicValue => "extrinsicValue",
+        OptionContractField::OptionRoot => "optionRoot",
+        OptionContractField::ExerciseType => "exerciseType",
+        OptionContractField::High52Week => "high52Week",
+        OptionContractField::Low52Week => "low52Week",
+        OptionContractField::BreakEven => "breakEven",
+        OptionContractField::Ssid => "ssid",
+        OptionContractField::PennyPilot => "pennyPilot",
     }
 }
 

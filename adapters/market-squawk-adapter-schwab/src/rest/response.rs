@@ -395,6 +395,16 @@ pub enum OptionContractField {
     InTheMoney,
     Mini,
     NonStandard,
+    BidAskSize,
+    IntrinsicValue,
+    ExtrinsicValue,
+    OptionRoot,
+    ExerciseType,
+    High52Week,
+    Low52Week,
+    BreakEven,
+    Ssid,
+    PennyPilot,
 }
 
 impl OptionContractField {
@@ -444,6 +454,16 @@ impl OptionContractField {
             "inTheMoney" => Self::InTheMoney,
             "mini" => Self::Mini,
             "nonStandard" => Self::NonStandard,
+            "bidAskSize" => Self::BidAskSize,
+            "intrinsicValue" => Self::IntrinsicValue,
+            "extrinsicValue" => Self::ExtrinsicValue,
+            "optionRoot" => Self::OptionRoot,
+            "exerciseType" => Self::ExerciseType,
+            "high52Week" => Self::High52Week,
+            "low52Week" => Self::Low52Week,
+            "breakEven" => Self::BreakEven,
+            "ssid" => Self::Ssid,
+            "pennyPilot" => Self::PennyPilot,
             _ => return None,
         })
     }
@@ -481,7 +501,7 @@ pub struct OptionChain {
     underlying_price: NativeField<NativeNumber>,
     volatility: NativeField<NativeNumber>,
     interest_rate: NativeField<NativeNumber>,
-    days_to_expiration: NativeField<u64>,
+    days_to_expiration: NativeField<NativeNumber>,
     number_of_contracts: NativeField<u64>,
     underlying: Box<[NativeFieldEntry<QuoteComponentField>]>,
     contracts: Box<[OptionContract]>,
@@ -505,7 +525,7 @@ impl OptionChain {
     pub const fn interest_rate(&self) -> &NativeField<NativeNumber> {
         &self.interest_rate
     }
-    pub const fn days_to_expiration(&self) -> &NativeField<u64> {
+    pub const fn days_to_expiration(&self) -> &NativeField<NativeNumber> {
         &self.days_to_expiration
     }
     pub const fn number_of_contracts(&self) -> &NativeField<u64> {
@@ -606,7 +626,7 @@ pub fn parse_option_chain_response(
     let underlying_price = remove_native_number(&mut object, "underlyingPrice")?;
     let volatility = remove_native_number(&mut object, "volatility")?;
     let interest_rate = remove_native_number(&mut object, "interestRate")?;
-    let days_to_expiration = remove_native_u64(&mut object, "daysToExpiration")?;
+    let days_to_expiration = remove_native_number(&mut object, "daysToExpiration")?;
     let number_of_contracts = remove_native_u64(&mut object, "numberOfContracts")?;
     let underlying = parse_typed_block(
         &mut object,

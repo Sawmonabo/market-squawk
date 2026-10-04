@@ -922,7 +922,7 @@ impl MarketRuntimeRegistry {
             .await
     }
 
-    async fn start_account_group_owned(
+    async fn start_account_group_reserved(
         &self,
         request: PreparedMarketProviderConfigurationRequest,
         deadline: Instant,
@@ -992,7 +992,10 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<AccountGroupStartPreparation, ServiceError> {
+        let mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
         ensure_active(&self.accepting, deadline, cancellation)?;
+        self.require_account_start_reserved(request, deadline, cancellation)
+            .await?;
         self.ensure_account_stop_acknowledged(request.surface(), deadline, cancellation)
             .await?;
         let surface_id = try_surface_identifier(request.surface())?;
@@ -1008,9 +1011,19 @@ impl MarketRuntimeRegistry {
             Ok(None) | Err(ServiceError::Unavailable) => {}
             Err(error) => return Err(error),
         }
-        self.remove_unhealthy_account_group_owned(&surface_id, request, deadline, cancellation)
+        let predecessor = self
+            .retain_unhealthy_account_group_owned(&surface_id, request, deadline, cancellation)
             .await?;
+        drop(mutation);
+        if let Some(retained) = predecessor {
+            self.finish_account_stop_owned(&retained, deadline, cancellation)
+                .await?;
+            // Lifecycle must acknowledge the exact completed predecessor before a successor.
+            return Err(ServiceError::Unavailable);
+        }
 
+        // The retained surface reservation excludes successors while the original worker owns
+        // configuration, network readiness and cancellation draining outside global mutation.
         let mut resolution_guard = StartupCancellation::new(self.lifecycle.child_token());
         let prepared = match request.surface() {
             AccountMarketSurface::SchwabMarketData => PreparedAccountMarketRuntimeStart::Schwab(
@@ -1131,7 +1144,21 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> AccountGroupPublicationAttempt {
+        let _mutation = match bounded_lock(&self.mutation, deadline, cancellation).await {
+            Ok(mutation) => mutation,
+            Err(error) => return AccountGroupPublicationAttempt::Rejected { entry, error },
+        };
         if let Err(error) = ensure_active(&self.accepting, deadline, cancellation) {
+            return AccountGroupPublicationAttempt::Rejected { entry, error };
+        }
+        let admission = async {
+            self.require_account_start_reserved(request, deadline, cancellation)
+                .await?;
+            self.ensure_account_stop_acknowledged(request.surface(), deadline, cancellation)
+                .await
+        }
+        .await;
+        if let Err(error) = admission {
             return AccountGroupPublicationAttempt::Rejected { entry, error };
         }
         let publication_authority = match self
@@ -1910,6 +1937,10 @@ impl MarketRuntimeRegistry {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<MarketSourceRuntimeGeneration>, ServiceError> {
+        if let Some(surface) = AccountMarketSurface::parse(provider.as_str()) {
+            self.finish_account_start_before(surface, deadline, cancellation)
+                .await?;
+        }
         let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
         self.stop_owned(provider, expected_generation, deadline, cancellation)
             .await
@@ -1923,6 +1954,9 @@ impl MarketRuntimeRegistry {
         cancellation: &CancellationToken,
     ) -> Result<Option<MarketSourceRuntimeGeneration>, ServiceError> {
         if let Some(surface) = AccountMarketSurface::parse(provider.as_str()) {
+            // A new constructor can reserve this surface after the caller's join barrier.
+            self.prepare_account_stop_owned(surface, deadline, cancellation)
+                .await?;
             let expected = match expected_generation {
                 Some(MarketSourceRuntimeGeneration::Group(generation)) => Some(generation),
                 Some(MarketSourceRuntimeGeneration::Scalar(_)) => {
@@ -2741,7 +2775,7 @@ impl MarketRuntimeRegistry {
         if let Some(result) = *shutdown {
             return result;
         }
-        // Startup owns mutation until its original children and any failed publication finish.
+        // Join original startup/cleanup owners before closing the shared runtime authorities.
         self.finish_retained_account_starts(deadline, &cleanup)
             .await?;
         let _mutation = match bounded_lock(&self.mutation, deadline, &cleanup).await {
@@ -2930,13 +2964,13 @@ impl MarketRuntimeRegistry {
         Ok(())
     }
 
-    async fn remove_unhealthy_account_group_owned(
+    async fn retain_unhealthy_account_group_owned(
         &self,
         surface_id: &SourceIdentifier,
         request: PreparedMarketProviderConfigurationRequest,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<Arc<RetainedAccountStop>>, ServiceError> {
         {
             let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
             if let Some(entry) = entries.iter().find(|entry| &entry.surface_id == surface_id)
@@ -2945,22 +2979,14 @@ impl MarketRuntimeRegistry {
                 return Err(ServiceError::Unavailable);
             }
         }
-        if let Some(retained) = self
-            .retain_account_stop_owned(
-                request.surface(),
-                Some(request),
-                None,
-                deadline,
-                cancellation,
-            )
-            .await?
-        {
-            self.finish_account_stop_owned(&retained, deadline, cancellation)
-                .await?;
-            // Lifecycle must acknowledge the exact completed predecessor before a successor.
-            return Err(ServiceError::Unavailable);
-        }
-        Ok(())
+        self.retain_account_stop_owned(
+            request.surface(),
+            Some(request),
+            None,
+            deadline,
+            cancellation,
+        )
+        .await
     }
 
     async fn require_existing_session(
@@ -4393,6 +4419,179 @@ impl Drop for StartupCancellation {
 mod tests {
     use super::*;
     use market_squawk_domain::DigestAlgorithm;
+
+    #[derive(Default)]
+    struct SuspendedConfigurationResolver {
+        started: tokio::sync::Notify,
+        cancelling: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl PreparedMarketProviderConfigurationResolver for SuspendedConfigurationResolver {
+        async fn resolve(
+            &self,
+            _request: PreparedMarketProviderConfigurationRequest,
+            _deadline: Instant,
+            cancellation: CancellationToken,
+        ) -> Result<PreparedMarketProviderConfiguration, ServiceError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.started.notify_one();
+            cancellation.cancelled().await;
+            self.cancelling.notify_one();
+            self.release.notified().await;
+            self.finished
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(ServiceError::Cancelled)
+        }
+
+        fn begin_shutdown(&self) {}
+
+        async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+            if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(ServiceError::InvalidResult)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_account_start_preserves_independent_admission_and_original_cleanup() {
+        use market_squawk_platform::{ConfigOverrides, ConfigSources};
+        use std::{collections::BTreeMap, ffi::OsString, sync::atomic::Ordering};
+
+        let temporary = tempfile::tempdir().expect("isolated product root");
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("data")),
+                ..ConfigOverrides::default()
+            },
+        ))
+        .expect("isolated configuration");
+        let product = crate::LocalProduct::try_new(config.clone())
+            .await
+            .expect("local authorities");
+        let original = product.market_runtime();
+        let resolver = Arc::new(SuspendedConfigurationResolver::default());
+        let (_, _, historical_source) =
+            crate::application::ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
+                market_squawk_sources::AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()
+                    .expect("isolated source registry"),
+                product.research(),
+                crate::application::ResearchExtractionLimits::standard(),
+                std::iter::empty::<crate::application::PrepublishedResearchSourceRegistration>(),
+            )
+            .expect("independent historical source authority");
+        let registry = MarketRuntimeRegistry::try_new(
+            config,
+            original.provider_rate.clone(),
+            Arc::clone(&original.provider_activation),
+            historical_source,
+            resolver.clone(),
+            Arc::clone(&original.prepared_schwab),
+            Arc::clone(&original.live_fair_value),
+            product.research().application_changes(),
+        )
+        .expect("registry with suspended resolver");
+        let request = PreparedMarketProviderConfigurationRequest::try_new(
+            AccountMarketSurface::AlpacaBasic,
+            uuid::Uuid::new_v4(),
+            digest(1),
+            digest(2),
+            SecretGeneration::new(1).expect("generation"),
+        )
+        .expect("exact request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let caller = CancellationToken::new();
+        let owner = Arc::clone(&registry);
+        let cancelled = caller.clone();
+        let first = tokio::spawn(async move {
+            owner
+                .start_account_group(request, deadline, &cancelled)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), resolver.started.notified())
+            .await
+            .expect("original constructor enters resolution");
+
+        let independent = CancellationToken::new();
+        let unrelated = registry
+            .prepare_account_stop(
+                AccountMarketSurface::KrakenLevel3,
+                Instant::now() + Duration::from_secs(1),
+                &independent,
+            )
+            .await
+            .expect("unrelated registry admission proceeds during resolution");
+        assert!(unrelated.predecessor().is_none());
+        let conflict = PreparedMarketProviderConfigurationRequest::try_new(
+            request.surface(),
+            request.onboarding_session_id(),
+            digest(3),
+            request.expected_runtime_verification_receipt_digest(),
+            request.expected_credential_generation(),
+        )
+        .expect("conflicting request");
+        assert_eq!(
+            registry
+                .start_account_group(conflict, deadline, &independent)
+                .await,
+            Err(ServiceError::InvalidRequest),
+        );
+        let owner = Arc::clone(&registry);
+        let mut duplicate = Box::pin(async move {
+            owner
+                .start_account_group(request, deadline, &CancellationToken::new())
+                .await
+        });
+        assert!(futures_util::poll!(duplicate.as_mut()).is_pending());
+        let duplicate = tokio::spawn(duplicate);
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
+
+        caller.cancel();
+        assert_eq!(
+            first.await.expect("caller joins"),
+            Err(ServiceError::Cancelled)
+        );
+        tokio::time::timeout(Duration::from_secs(1), resolver.cancelling.notified())
+            .await
+            .expect("original resolver receives cancellation");
+        assert!(!resolver.finished.load(Ordering::Acquire));
+        // Cancellation draining must not monopolize mutation either.
+        assert!(
+            registry
+                .consume_account_stop(unrelated, deadline, &independent)
+                .await
+                .expect("unrelated admission remains usable during cleanup")
+                .is_none()
+        );
+        let mut shutdown = Box::pin(registry.finish_shutdown(deadline));
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        assert!(!resolver.finished.load(Ordering::Acquire));
+        assert!(!registry.account_starts.lock().await.is_empty());
+        resolver.release.notify_one();
+        shutdown.await.expect("shutdown joins original constructor");
+        assert_eq!(
+            duplicate.await.expect("duplicate joins"),
+            Err(ServiceError::Cancelled)
+        );
+        assert!(resolver.finished.load(Ordering::Acquire));
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
+        assert!(registry.account_starts.lock().await.is_empty());
+        assert!(registry.entries.lock().await.is_empty());
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_configuration_resolution_finishes_original_custody() {

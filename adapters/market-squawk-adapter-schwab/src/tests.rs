@@ -482,6 +482,8 @@ async fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
 
 #[test]
 fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semantics() {
+    use crate::{NativeField, NativeScalar, OptionContractField};
+
     let quote = br#"{
       "AAPL": {
         "assetMainType":"EQUITY", "assetSubType":"COE", "realtime":true,
@@ -501,13 +503,17 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
 
     let chain = br#"{
       "symbol":"SPY","status":"SUCCESS","strategy":"SINGLE","numberOfContracts":2,
-      "underlyingPrice":500.1,
+      "underlyingPrice":500.1,"daysToExpiration":1.0,
       "callExpDateMap":{"2026-08-21:10":{"500.0":[{"putCall":"CALL","symbol":"SPY C","bid":1.2,"ask":1.3,"volatility":0.2,"delta":0.51,"gamma":0.03,"theta":-0.02,"vega":0.08,"rho":0.04,"openInterest":10}]}},
       "putExpDateMap":{"2026-08-21:10":{"500.0":[{"putCall":"PUT","symbol":"SPY P","bid":1.1,"ask":1.4,"volatility":0.21,"delta":-0.49,"gamma":0.03,"theta":-0.02,"vega":0.08,"rho":-0.04,"openInterest":11}]}}
     }"#;
     let parsed_chain = parse_option_chain_response(chain, bounds())
         .unwrap_or_else(|error| panic!("chain payload: {error}"));
     assert_eq!(parsed_chain.value().contracts().len(), 2);
+    assert!(matches!(
+        parsed_chain.value().days_to_expiration(),
+        NativeField::Value(value) if value.as_str() == "1.0"
+    ));
     let option_candidates = canonicalize_option_chain(
         &parsed_chain,
         Timestamp::from_unix_nanos(1_710_000_000_000_000_000),
@@ -519,6 +525,105 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
             .iter()
             .all(|value| matches!(value, SchwabOptionCandidateOutcome::Mapped(_)))
     );
+
+    // The production response has 32 expirations, two strikes and both sides. Ordinary
+    // scalar fields must not exhaust unknown-field admission; nested deliverables stay raw.
+    let mut full_chain: serde_json::Value =
+        serde_json::from_slice(chain).unwrap_or_else(|error| panic!("chain fixture: {error}"));
+    let extra_fields = serde_json::json!({
+        "bidAskSize":"2X3", "intrinsicValue":1.25, "extrinsicValue":0.5,
+        "optionRoot":"SPY", "exerciseType":"A", "high52Week":5.25,
+        "low52Week":0.25, "breakEven":501.25, "ssid":123456, "pennyPilot":true,
+        "optionDeliverablesList":[{"symbol":"SPY","deliverableUnits":100.0}]
+    });
+    for (map_name, side) in [("callExpDateMap", "C"), ("putExpDateMap", "P")] {
+        let template = full_chain[map_name]["2026-08-21:10"]["500.0"][0].clone();
+        let mut expirations = serde_json::Map::new();
+        for day in 0_u64..32 {
+            let expiration = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .and_then(|date| date.checked_add_days(chrono::Days::new(day)))
+                .expect("bounded fixture expiration");
+            let mut strikes = serde_json::Map::new();
+            for strike in [500, 501] {
+                let mut contract = template.clone();
+                contract.as_object_mut().expect("contract object").extend(
+                    extra_fields
+                        .as_object()
+                        .expect("scalar fixture fields")
+                        .clone(),
+                );
+                contract["symbol"] = serde_json::json!(format!("SPY {expiration}{side}{strike}"));
+                strikes.insert(format!("{strike}.0"), serde_json::json!([contract]));
+            }
+            expirations.insert(format!("{expiration}:{}", day + 1), strikes.into());
+        }
+        full_chain[map_name] = expirations.into();
+    }
+    full_chain["numberOfContracts"] = serde_json::json!(128);
+    let full_chain = serde_json::to_vec(&full_chain)
+        .unwrap_or_else(|error| panic!("full chain fixture: {error}"));
+    let production_bounds = ParseBounds::new(
+        nonzero(4 * 1024 * 1024),
+        nonzero(8 * 1024),
+        nonzero(256 * 1024),
+        nonzero(64),
+        512,
+        512 * 1024,
+    );
+    let full_chain = parse_option_chain_response(&full_chain, production_bounds)
+        .unwrap_or_else(|error| panic!("production-shaped chain: {error}"));
+    assert_eq!(full_chain.value().contracts().len(), 128);
+    assert_eq!(
+        full_chain.value().number_of_contracts(),
+        &NativeField::Value(128)
+    );
+    assert!(matches!(
+        full_chain.value().days_to_expiration(),
+        NativeField::Value(value) if value.as_str() == "1.0"
+    ));
+    assert_eq!(full_chain.unknown_fields().field_count(), 128);
+    assert!(full_chain.unknown_fields().encoded_bytes() > 0);
+    assert!(
+        full_chain
+            .unknown_fields()
+            .paths()
+            .iter()
+            .all(|path| { path.ends_with(".optionDeliverablesList") })
+    );
+    for contract in full_chain.value().contracts() {
+        let field = |name| {
+            contract
+                .fields()
+                .iter()
+                .find(|entry| *entry.name() == name)
+                .unwrap_or_else(|| panic!("missing observed scalar {name:?}"))
+                .value()
+        };
+        for (name, expected) in [
+            (OptionContractField::IntrinsicValue, "1.25"),
+            (OptionContractField::ExtrinsicValue, "0.5"),
+            (OptionContractField::High52Week, "5.25"),
+            (OptionContractField::Low52Week, "0.25"),
+            (OptionContractField::BreakEven, "501.25"),
+            (OptionContractField::Ssid, "123456"),
+        ] {
+            assert_eq!(
+                field(name).number().map(|value| value.as_str()),
+                Some(expected)
+            );
+        }
+        for (name, expected) in [
+            (OptionContractField::BidAskSize, "2X3"),
+            (OptionContractField::OptionRoot, "SPY"),
+            (OptionContractField::ExerciseType, "A"),
+        ] {
+            assert_eq!(field(name).text(), Some(expected));
+        }
+        assert_eq!(
+            field(OptionContractField::PennyPilot),
+            &NativeScalar::Bool(true)
+        );
+    }
 
     let preference = br#"{
       "accounts":[{"accountNumber":"must-not-escape"}],

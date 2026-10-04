@@ -124,7 +124,7 @@ impl MarketRuntimeRegistry {
             .await
     }
 
-    async fn prepare_account_stop_owned(
+    pub(super) async fn prepare_account_stop_owned(
         &self,
         surface: AccountMarketSurface,
         deadline: Instant,
@@ -509,12 +509,10 @@ impl MarketRuntimeRegistry {
             let lifecycle = self.account_start_cancellation.child_token();
             let task_cancellation = lifecycle.clone();
             let task = tokio::spawn(async move {
-                // The installing caller still owns mutation until the actual handle is retained.
-                let _mutation = bounded_lock(&owned.mutation, deadline, &task_cancellation)
-                    .await
-                    .map_err(AccountRuntimeStartFailure::before_owner)?;
+                // Preparation acquires mutation after this caller retains the actual handle.
+                // The surface reservation, not the global lock, owns slow startup and cleanup.
                 owned
-                    .start_account_group_owned(request, deadline, &task_cancellation)
+                    .start_account_group_reserved(request, deadline, &task_cancellation)
                     .await
             });
             let retained = Arc::new(RetainedAccountStart {
@@ -543,6 +541,22 @@ impl MarketRuntimeRegistry {
                 }
                 Err(failure.cause)
             }
+        }
+    }
+
+    /// Caller holds mutation. A slot cannot be released until its original task has joined,
+    /// so this exact request cannot be replaced while its constructor prepares or publishes.
+    pub(super) async fn require_account_start_reserved(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let starts = bounded_lock(&self.account_starts, deadline, cancellation).await?;
+        if starts.iter().any(|start| start.request == request) {
+            Ok(())
+        } else {
+            Err(ServiceError::InvalidRequest)
         }
     }
 
