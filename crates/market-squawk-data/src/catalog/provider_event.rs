@@ -1659,6 +1659,89 @@ fn load_provider_market_event_selection_coordinate(
         .map_err(CatalogError::from)
 }
 
+/// Rechecks one admitted coordinate and its native component without reopening unrelated rows.
+/// Aggregate publication integrity is established by publication admission and explicit replay.
+pub(crate) fn provider_market_event_selection_for_coordinate(
+    connection: &Connection,
+    publication_digest: EvidenceDigest,
+    publication_row_ordinal: u32,
+) -> Result<Option<ProviderMarketEventSelectionCandidate>, CatalogError> {
+    let Some(candidate) = load_provider_market_event_selection_coordinate(
+        connection,
+        publication_digest,
+        publication_row_ordinal,
+    )? else {
+        return Ok(None);
+    };
+    let native: Option<(Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT CASE ?5 WHEN 'response' THEN response_row.native_semantic_payload
+                           ELSE event_row.native_semantic_payload END,
+                    CASE ?5 WHEN 'response' THEN response_row.native_semantic_digest
+                           ELSE event_row.native_semantic_digest END
+             FROM ingest_run_provider_publication_bindings AS publication
+             LEFT JOIN provider_composite_response_event_bindings AS composite
+               ON composite.composite_binding_digest=publication.composite_binding_digest
+             LEFT JOIN provider_response_market_event_bindings AS response
+               ON response.response_event_binding_digest=publication.response_binding_digest
+             LEFT JOIN provider_event_bindings AS event
+               ON event.event_binding_digest=publication.event_binding_digest
+             LEFT JOIN provider_response_market_event_binding_rows AS response_row
+               ON response_row.response_event_binding_digest=response.response_event_binding_digest
+              AND response_row.canonical_row_ordinal=?4
+              AND response_row.capture_observation_digest=response.capture_observation_digest
+             LEFT JOIN provider_event_binding_rows AS event_row
+               ON event_row.event_binding_digest=event.event_binding_digest
+              AND event_row.canonical_row_ordinal=?4
+              AND event_row.event_observation_digest=event.event_observation_digest
+             WHERE publication.publication_digest=?1 AND publication.publication_kind=?2
+               AND publication.source_id=?3
+               AND (
+                 (publication.publication_kind='response_market_event'
+                  AND publication.publication_digest=response.response_event_binding_digest
+                  AND publication.event_binding_digest IS NULL
+                  AND publication.composite_binding_digest IS NULL)
+                 OR (publication.publication_kind='event_microbatch'
+                  AND publication.publication_digest=event.event_binding_digest
+                  AND publication.response_binding_digest IS NULL
+                  AND publication.composite_binding_digest IS NULL)
+                 OR (publication.publication_kind='composite_response_event'
+                  AND publication.publication_digest=composite.composite_binding_digest
+                  AND composite.response_binding_digest=response.response_event_binding_digest
+                  AND composite.event_binding_digest=event.event_binding_digest
+                  AND composite.response_row_count=response.canonical_event_count
+                  AND composite.event_row_count=event.canonical_event_count)
+               )
+               AND (
+                 (?5='response' AND response.response_event_binding_digest=?6
+                  AND response_row.canonical_event_digest=?7
+                  AND ?4<response.canonical_event_count AND ?8=?4)
+                 OR (?5='stream' AND event.event_binding_digest=?6
+                  AND event_row.canonical_event_digest=?7
+                  AND ?4<event.canonical_event_count
+                  AND ?8=?4+CASE publication.publication_kind
+                    WHEN 'composite_response_event' THEN composite.response_row_count ELSE 0 END)
+               )",
+            params![
+                digest_bytes(publication_digest),
+                candidate.publication_kind.as_ref(),
+                candidate.source_id.as_ref(),
+                i64::from(candidate.component_row_ordinal),
+                candidate.component_kind.as_ref(),
+                digest_bytes(candidate.component_binding_digest),
+                digest_bytes(candidate.canonical_event_digest),
+                i64::from(publication_row_ordinal),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (payload, digest) = native.ok_or(CatalogError::ProviderEventMismatch)?;
+    if payload.is_empty() || sha256_evidence(&payload) != parse_digest(1, &digest)? {
+        return Err(CatalogError::ProviderEventMismatch);
+    }
+    Ok(Some(candidate))
+}
+
 fn load_provider_market_event_selection_candidate(
     row: &Row<'_>,
 ) -> Result<ProviderMarketEventSelectionCandidate, rusqlite::Error> {

@@ -5,8 +5,8 @@
 ### Latest deployed checkpoint — `71ec9b6b`
 
 The single supervisor build passed in 7m48s and replaced service/Desktop with 5159/5495 in
-`generation-okyT25`; the prior generation was automatically removed. Watcher 26857 is running and
-no Cargo process remains. Native background read confirms Workspace Ready, Home and all nine
+`generation-okyT25`; the prior generation was automatically removed. That deployment completed with watcher 26857 running and no Cargo process remaining;
+the watcher is currently paused for the integration below. Native background read confirms Workspace Ready, Home and all nine
 retained watchlist prices without Try again. Research open took 576ms; the removed executable scan
 is now build metadata at 0ms (integer millisecond log resolution). Total local composition was 5.673s,
 versus 10.850s at `a362a263`, whose executable scan alone took 5.587s. This is one development restart,
@@ -48,7 +48,7 @@ successor invalidation, writer wait/cancellation and exact authority. Logs:
 existing symbol and instrument-revision indexes and returned one retained identity in0.397ms;
 `provider-identity-query-plan.json` is diagnostic, not native service performance proof.
 
-Implementation is frozen/released and deployed with 71ec9b6b; watcher 26857 is running. No claim that the full30s failure or optional-child/account teardown
+Implementation is frozen/released and deployed with 71ec9b6b. No claim that the full30s failure or optional-child/account teardown
 coupling is resolved. No schema, migration, query limit or deadline change was introduced.
 
 ### Build provenance correction — deployed and critically verified
@@ -78,15 +78,64 @@ compilation and native startup passed as recorded above; other source/read failu
 
 ### Current ownership — 2026-10-04
 
-| Owner | Required outcome and dependency | Exclusive scope | Next evidence |
-| --- | --- | --- | --- |
-| Lead | Close deployed checkpoint; integrate next concrete source/read fix | Git, builds/runtime, shared contracts, ledger/PR | Saved workflow result and exact failed admission |
-| Astra High — account_start_coordination | Diagnose the 15s fresh-watchlist timeout during preparation | Read-only retained market display authorization, research worker and direct owners | Exact lock/read lifetime, smallest correction and existing critical check |
-| Astra High — schwab_doctor_diagnosis | Diagnose premature Alpaca activation expiry and dependent cancellation | Read-only account lease, runtime group/health and current preparation failure | First causal transition, distinguish normal expiry from erroneous teardown |
+Additional continuity defect found during this exact call-chain trace: onboarding.rs caps lifetime
+event sequence at1,024 in append, replay and stream-head validation. Periodic doctor renewal consumes
+that history (current Alpaca session155 events). The active-owner snapshot optimization does not
+remove this eventual stop condition. It remains required follow-through under the owner's continuous
+operation/no arbitrary lifetime-cap instruction; do not merely raise the constant or discard history.
 
-These are bounded read-only follow-ups to observed failures on 71ec9b6b. No edits, builds, provider
-requests or process control are delegated. The separately documented Schwab rate/connection fix and
-remaining installed-helper scan correction remain required pending dependencies.
+Post-renewal retry also failed independently of expiry: preparation retained a calendar reference,
+then options waited33.2s before revocation. The native nine-route identity lookup hit30s after many
+successful218–824ms reads. Current evidence still permits catalog authority contention; no query-only
+or expiry-only completion claim is justified. See `post-renewal-preparation.json` and current log tail.
+
+Confirmed after the deployed checkpoint: the repeated fresh collection request still timed out in
+15.111s after analysis had paused. A five-second service stack sample shows the account monitor
+replaying the full onboarding history under the shared catalog lock. Alpaca's session has155 events
+and1.09MB of JSON, including75 doctor receipts. The sample also includes history selection; it does
+not attribute the entire request duration to a single function. Separately, selected-row retained
+use validation reloads a complete verified publication for every requested row, despite prior PIT
+validation and immutable indexed row/component membership already committed at admission.
+
+The analysis expiry is now precisely identified: its initial calendar fetch started06:01:26.658313Z,
+proof expired06:01:27.468622Z, fetch failed06:01:27.881534Z, and automatic renewed proof persisted
+06:01:32.340674Z. This is normal timed proof expiry during the request, not evidence of optional-child
+failure. Lead resumed the saved workflow after renewal; evidence is `post-renewal-workflow-*.json`.
+Automatic recovery across renewal remains a distinct functional gap.
+
+| Owner | Required outcome and dependency | Exclusive scope | Critical evidence |
+| --- | --- | --- | --- |
+| Lead | Integrate exact currentness and retained-row reads; prove native behavior | Git, build/runtime, ledger/PR and shared integration | One supervised replacement, actual collection and workflow result |
+| Astra High — schwab_doctor_diagnosis (frozen; lead verifying) | Avoid full onboarding replay on every currentness check | data catalog/onboarding.rs, catalog_capabilities.rs; app provider_onboarding/service.rs, provider_activation/account.rs; existing data onboarding fixture | Snapshot reuse only for matching committed head; changed head, wrong owner and rollback rejected; expiry/profile/lease checked each time |
+| Astra High — account_start_coordination (frozen; lead verifying) | Indexed selected-row retained-use authorization | data catalog/provider_event.rs, research_use/market_event.rs and existing publication_recovery.rs fixture | Exact publication/component/ordinal/digest/run/horizon plus current grants; retain renewal, revocation and restart checks |
+
+Dependencies and decisions: currentness owns one verified snapshot per active account owner, not a
+historical-session map or TTL boolean. Read the entire committed stream head each time, replay on
+change, and never retain uncommitted transaction state. The selected-row path consumes previously
+admitted immutable publication and row/component bindings; keep full aggregate validation at
+publication admission and explicit replay. The preceding PIT full-publication reader is a documented
+remaining cost and is not claimed fixed by narrower authorization. No schema/migration, timeout
+increase, quota change or new worker is authorized in this slice. Lead pauses the existing watcher
+for integration; agents run no builds, Git, provider requests or runtime actions. The pending Schwab
+rate/connection correction and installed helper-scan correction remain separate required dependencies.
+
+Lead inspected both implementations and formatted the owned Rust files. Focused checks so far:
+- `onboarding-snapshot-critical.log`: existing catalog lifecycle case passed 1/1 in 1.39s;
+  unchanged snapshot reuse, committed append invalidation, wrong session and reopened owner rejection.
+- `selected-row-authorization-critical.log`: existing publication/restart case passed 1/1 in 11.14s;
+  selected ordinal/component rejection with existing rights, renewal and recovery checks retained.
+- `onboarding-rollback-critical.log`: private transaction-local snapshot case passed 1/1 in 0.30s.
+  It proves an unstamped replay cannot be reused after rollback; it does not append an event inside
+  the transaction because the public append API owns its transaction.
+- `account-snapshot-revocation-critical.log`: existing application shared-read/revocation case
+  passed 1/1 in 0.44s (5m18s compilation), including snapshot reuse behind a queued writer and
+  rejection after durable recipe invalidation.
+- `currentness-expiry-critical.log`: existing source doctor/renewal contract case passed 1/1 in
+  0.08s, retaining expiry and same-generation renewal checks.
+All five focused checks passed. No full gate, CI or whole-app RAM measurement ran. The current
+code is ready for one supervised deployment; no native acceptance is claimed yet.
+Fresh origin inspection still shows the three delivery branches plus open, unmerged dependency
+PR #55. One worktree and three local branches remain; the pending dependency branch is preserved.
 
 ## Earlier checkpoint evidence
 

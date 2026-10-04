@@ -420,6 +420,40 @@ impl ProviderOnboardingService {
         require_same_active_lease(&current, expected)
     }
 
+    fn require_active_snapshot(
+        &self,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, ProviderOnboardingError> {
+        let resumed = self
+            .catalog
+            .resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
+        self.require_active_from_resumed(&resumed, expected)?;
+        Ok(resumed)
+    }
+
+    fn require_active_from_resumed(
+        &self,
+        resumed: &ResumedProviderOnboarding,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let profile = self.current_profile_for(resumed)?;
+        let current = self.lease_from_resumed(resumed, profile)?;
+        require_same_active_lease(&current, expected)
+    }
+
+    fn require_active_snapshot_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<(), ProviderOnboardingError> {
+        let resumed =
+            catalog.resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
+        // The enclosing publication may roll back; never return this snapshot for caching.
+        self.require_active_from_resumed(&resumed, expected)
+    }
+
     fn require_prepared_or_active_lease(
         &self,
         expected: &ProviderActivationLease,
@@ -427,13 +461,21 @@ impl ProviderOnboardingService {
         let resumed = self
             .catalog
             .resume_provider_onboarding(expected.session_id())?;
-        let profile = self.current_profile_for(&resumed)?;
-        match self.lease_from_resumed(&resumed, profile) {
+        self.require_prepared_or_active_from_resumed(&resumed, expected)
+    }
+
+    fn require_prepared_or_active_from_resumed(
+        &self,
+        resumed: &ResumedProviderOnboarding,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let profile = self.current_profile_for(resumed)?;
+        match self.lease_from_resumed(resumed, profile) {
             Ok(current) if require_same_active_lease(&current, expected).is_ok() => return Ok(()),
             Ok(_) | Err(ProviderOnboardingError::ActivationUnavailable) => {}
             Err(error) => return Err(error),
         }
-        let prepared = self.prepared_lease_from_resumed(&resumed, profile)?;
+        let prepared = self.prepared_lease_from_resumed(resumed, profile)?;
         require_same_active_lease(&prepared, expected)
     }
 
@@ -3292,22 +3334,55 @@ impl ProviderOnboardingService {
 }
 
 impl ProviderOnboardingReadAuthority<'_> {
+    pub(crate) fn require_active_with_snapshot(
+        &self,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, ProviderOnboardingError> {
+        self.service.require_active_snapshot(expected, previous)
+    }
+
+    pub(crate) fn require_prepared_or_active_with_snapshot(
+        &self,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, ProviderOnboardingError> {
+        let resumed = self
+            .service
+            .catalog
+            .resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
+        self.service
+            .require_prepared_or_active_from_resumed(&resumed, expected)?;
+        Ok(resumed)
+    }
+
     pub(crate) fn require_active(
         &self,
         expected: &ProviderActivationLease,
     ) -> Result<(), ProviderOnboardingError> {
         self.service.require_active_lease(expected)
     }
-
-    pub(crate) fn require_prepared_or_active(
-        &self,
-        expected: &ProviderActivationLease,
-    ) -> Result<(), ProviderOnboardingError> {
-        self.service.require_prepared_or_active_lease(expected)
-    }
 }
 
 impl ProviderOnboardingOwnedReadAuthority {
+    pub(crate) fn require_active_with_snapshot(
+        &self,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, ProviderOnboardingError> {
+        self.service.require_active_snapshot(expected, previous)
+    }
+
+    pub(crate) fn require_active_in_catalog_with_snapshot(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<(), ProviderOnboardingError> {
+        self.service
+            .require_active_snapshot_in_catalog(catalog, expected, previous)
+    }
+
     /// Validates the exact active lease before acquiring the publication catalog lock.
     pub(crate) fn require_active(
         &self,
@@ -4846,7 +4921,9 @@ mod tests {
 
         let reader = service.acquire_runtime_read_authority().await;
         reader.require_active(&lease)?;
-        reader.require_prepared_or_active(&lease)?;
+        let snapshot = reader.require_active_with_snapshot(&lease, None)?;
+        let repeated = reader.require_prepared_or_active_with_snapshot(&lease, Some(&snapshot))?;
+        assert!(Arc::ptr_eq(&snapshot, &repeated));
         let publication = service.try_acquire_owned_runtime_read_authority()?;
         publication.require_active(&lease)?;
         service
@@ -4862,8 +4939,12 @@ mod tests {
             Err(ProviderOnboardingError::ActivationUnavailable)
         ));
         reader.require_active(&lease)?;
-        reader.require_prepared_or_active(&lease)?;
+        let repeated = reader.require_active_with_snapshot(&lease, Some(&snapshot))?;
+        assert!(Arc::ptr_eq(&snapshot, &repeated));
+        reader.require_prepared_or_active_with_snapshot(&lease, Some(&snapshot))?;
         publication.require_active(&lease)?;
+        let repeated = publication.require_active_with_snapshot(&lease, Some(&snapshot))?;
+        assert!(Arc::ptr_eq(&snapshot, &repeated));
         drop(reader);
         assert!(futures_util::poll!(pending_writer.as_mut()).is_pending());
         drop(publication);
@@ -4883,9 +4964,23 @@ mod tests {
 
         let reader = service.acquire_runtime_read_authority().await;
         assert!(reader.require_active(&lease).is_err());
-        assert!(reader.require_prepared_or_active(&lease).is_err());
+        assert!(
+            reader
+                .require_active_with_snapshot(&lease, Some(&snapshot))
+                .is_err()
+        );
+        assert!(
+            reader
+                .require_prepared_or_active_with_snapshot(&lease, Some(&snapshot))
+                .is_err()
+        );
         let publication = service.try_acquire_owned_runtime_read_authority()?;
         assert!(publication.require_active(&lease).is_err());
+        assert!(
+            publication
+                .require_active_with_snapshot(&lease, Some(&snapshot))
+                .is_err()
+        );
         assert!(service.activation_recipe_is_invalidated(lease.session_id())?);
         Ok(())
     }

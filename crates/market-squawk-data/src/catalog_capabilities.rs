@@ -719,6 +719,16 @@ impl OnboardingCatalogCapability {
         self.lock()?.resume_provider_onboarding(session_id)
     }
 
+    /// Revalidates an owner-retained snapshot against the current committed session head.
+    pub fn resume_provider_onboarding_with_snapshot(
+        &self,
+        session_id: Uuid,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, CatalogError> {
+        self.lock()?
+            .resume_provider_onboarding_with_snapshot(session_id, previous)
+    }
+
     /// Reads a validated historical doctor chain without issuing runtime authority.
     pub fn retained_alpaca_doctor_renewal_chain(
         &self,

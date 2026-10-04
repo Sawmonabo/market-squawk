@@ -190,6 +190,26 @@ Reviewed 2026-10-04 against SQLite's
 Implementation: [catalog lifecycle](../../crates/market-squawk-data/src/catalog.rs) and
 [research composition](../../apps/market-squawk/src/research_service.rs).
 
+### Repeated connection and selected-row reads
+
+Each active provider account retains one verified onboarding snapshot. A short database read
+compares its complete committed stream head before reuse; a changed head requires replay. Every
+use still checks the current profile, exact lease and wall-clock expiry. The snapshot mutex is
+released before acquiring catalog authority. A snapshot reconstructed inside a caller's transaction
+is never marked committed or installed in the account cache, because that transaction can roll back.
+
+Retained market-event authorization reads the selected coordinate and native component through
+their existing indexes, checking publication kind, source, component, ordinal and digests. Run,
+dataset, temporal horizon and current use grants remain checked. Full aggregate verification stays
+at publication admission and explicit replay. This narrows authorization work; the preceding
+point-in-time publication reader still reconstructs the publication and is a separate cost.
+
+Reviewed 2026-10-04 against SQLite's [transaction isolation](https://www.sqlite.org/isolation.html),
+including visibility of uncommitted changes on the same connection. Implementation:
+[onboarding reads](../../crates/market-squawk-data/src/catalog/onboarding.rs),
+[account ownership](../../apps/market-squawk/src/provider_activation/account.rs) and
+[retained-use authorization](../../crates/market-squawk-data/src/research_use/market_event.rs).
+
 ## Point-in-time construction
 
 The dataset builder consumes exact parent manifest pins and a digest-bound build specification. It

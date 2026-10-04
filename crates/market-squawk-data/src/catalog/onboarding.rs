@@ -1,5 +1,7 @@
 //! Append-only non-secret provider onboarding state.
 
+use std::sync::Arc;
+
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::SecretGeneration;
 use market_squawk_sources::{
@@ -199,6 +201,7 @@ pub struct ResumedProviderOnboarding {
     public_configuration: ProviderPublicConfiguration,
     lifecycle: OnboardingLifecycle,
     next_sequence: u64,
+    committed_head: Option<OnboardingStreamHead>,
 }
 
 impl ResumedProviderOnboarding {
@@ -538,6 +541,50 @@ impl CatalogAuthority {
             transaction.commit()?;
         }
         Ok(loaded.into_public())
+    }
+
+    /// Reuses one owner-retained, verified snapshot only at its exact committed stream head.
+    /// A changed stream is fully replayed. Transaction-local replay is never stamped for reuse.
+    pub fn resume_provider_onboarding_with_snapshot(
+        &self,
+        session_id: Uuid,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, CatalogError> {
+        if previous.is_some_and(|snapshot| {
+            snapshot.reservation.catalog_id != self.session_id()
+                || snapshot.reservation.session_id != session_id
+        }) {
+            return Err(CatalogError::InvalidOnboardingReservationCapability);
+        }
+        let connection = &self.catalog().connection;
+        let transaction = connection
+            .is_autocommit()
+            .then(|| connection.unchecked_transaction())
+            .transpose()?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
+        if let Some(previous) = previous
+            && let Some(expected) = previous.committed_head
+        {
+            let current = load_onboarding_stream_head(
+                connection,
+                session_id,
+                &mut OnboardingValidationBudget::Query(&mut budget),
+            )?;
+            if current == expected {
+                if let Some(transaction) = transaction {
+                    transaction.commit()?;
+                }
+                return Ok(Arc::clone(previous));
+            }
+        }
+        let loaded = load_session(connection, self.session_id(), session_id, &mut budget)?;
+        let head = loaded.stream_head;
+        let mut snapshot = loaded.into_public();
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+            snapshot.committed_head = Some(head);
+        }
+        Ok(Arc::new(snapshot))
     }
 
     /// Reopens an original Alpaca doctor and its validated renewal successors.
@@ -885,6 +932,7 @@ impl LoadedOnboarding {
             public_configuration: self.public_configuration,
             lifecycle: self.lifecycle,
             next_sequence: self.next_sequence,
+            committed_head: None,
         }
     }
 }
@@ -1761,4 +1809,58 @@ fn sha256_digest(bytes: &[u8]) -> Result<EvidenceDigest, CatalogError> {
         DigestAlgorithm::Sha256,
         exact_sha256(bytes)?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CatalogConfig, CatalogLimit, CatalogResultLimits};
+    use market_squawk_platform::LocalPaths;
+    use std::time::Duration;
+
+    #[test]
+    fn transaction_local_onboarding_snapshot_is_not_reused_after_rollback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(root.path().join("onboarding-snapshot"))?;
+        let catalog = CatalogAuthority::open(CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(250),
+            CatalogLimit::new(16)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)?;
+        let profiles = market_squawk_sources::built_in_provider_profiles()?;
+        let profile = profiles
+            .get("alpaca.basic-market-data")
+            .ok_or("missing Alpaca profile")?;
+        for capability in profile.capability_history() {
+            catalog.register_provider_capability(capability)?;
+        }
+        let capability = profile.capability();
+        let reservation =
+            catalog.reserve_provider_onboarding(&OnboardingReservationRequest::try_new(
+                capability,
+                ProviderPublicConfiguration::default(),
+                capability.minimum_authority().clone(),
+                SourceIdentifier::try_from("local-user")?,
+                SourceIdentifier::try_from("snapshot-rollback")?,
+                Timestamp::from_unix_nanos(i64::MAX),
+                1,
+            )?)?;
+        let transaction = catalog.catalog().connection.unchecked_transaction()?;
+        let uncommitted =
+            catalog.resume_provider_onboarding_with_snapshot(reservation.session_id(), None)?;
+        assert!(uncommitted.committed_head.is_none());
+        transaction.rollback()?;
+        let committed = catalog.resume_provider_onboarding_with_snapshot(
+            reservation.session_id(),
+            Some(&uncommitted),
+        )?;
+        assert!(!Arc::ptr_eq(&uncommitted, &committed));
+        assert!(committed.committed_head.is_some());
+        let unchanged = catalog
+            .resume_provider_onboarding_with_snapshot(reservation.session_id(), Some(&committed))?;
+        assert!(Arc::ptr_eq(&committed, &unchanged));
+        Ok(())
+    }
 }

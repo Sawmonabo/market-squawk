@@ -5866,6 +5866,81 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         ),
         Err(market_squawk_data::ResearchUseCatalogError::InvalidPublication)
     ));
+    let absent_ordinal = market_squawk_data::MarketEventUseInput::try_new(
+        retained.publication_digest(),
+        retained.publication_kind(),
+        retained.row_ordinal() + 1,
+        retained.coordinate_digest(),
+        retained.canonical_event_digest(),
+        retained.source_id().clone(),
+        retained.origin_committed_at(),
+    )?;
+    assert!(matches!(
+        restarted.authorize_current_market_event_use(
+            market_squawk_data::MarketEventUseRequest::try_from_retained(
+                authorized.commit().clone(),
+                vec![absent_ordinal],
+                authorized.research_use(),
+                research_limits,
+            )?,
+            deadline,
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidPublication)
+    ));
+    // An intact selection coordinate must not hide a damaged native component row. Bypass
+    // and restore the fixture's immutable-row guard only to exercise on-read validation.
+    let inspect = rusqlite::Connection::open(location.path())?;
+    let trigger: String = inspect.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='provider_event_binding_rows_immutable_update'",
+        [],
+        |row| row.get(0),
+    )?;
+    inspect.execute_batch("DROP TRIGGER provider_event_binding_rows_immutable_update")?;
+    let changed = inspect.execute(
+        "UPDATE provider_event_binding_rows SET canonical_event_digest=?1
+         WHERE (event_binding_digest,canonical_row_ordinal)=(
+           SELECT component_binding_digest,component_row_ordinal
+           FROM provider_market_event_selection_index
+           WHERE publication_digest=?2 AND publication_row_ordinal=?3)",
+        params![
+            altered_digest,
+            retained.publication_digest().bytes(),
+            i64::from(retained.row_ordinal()),
+        ],
+    )?;
+    assert_eq!(changed, 1);
+    let component_check = restarted.authorize_current_market_event_use(
+        market_squawk_data::MarketEventUseRequest::try_from_retained(
+            authorized.commit().clone(),
+            authorized.inputs().to_vec(),
+            authorized.research_use(),
+            research_limits,
+        )?,
+        deadline,
+        &cancellation,
+    );
+    inspect.execute(
+        "UPDATE provider_event_binding_rows SET canonical_event_digest=?1
+         WHERE (event_binding_digest,canonical_row_ordinal)=(
+           SELECT component_binding_digest,component_row_ordinal
+           FROM provider_market_event_selection_index
+           WHERE publication_digest=?2 AND publication_row_ordinal=?3)",
+        params![
+            retained.canonical_event_digest().bytes(),
+            retained.publication_digest().bytes(),
+            i64::from(retained.row_ordinal()),
+        ],
+    )?;
+    inspect.execute_batch(&trigger)?;
+    drop(inspect);
+    assert!(matches!(
+        component_check,
+        Err(market_squawk_data::ResearchUseCatalogError::Catalog(
+            CatalogError::ProviderEventMismatch
+        ))
+    ));
     assert!(matches!(
         restarted.authorize_current_market_event_use(
             market_squawk_data::MarketEventUseRequest::try_new(

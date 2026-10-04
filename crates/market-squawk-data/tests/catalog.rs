@@ -539,6 +539,7 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
         object_config,
     )?;
     let (analytical, _publisher) = composition.into_parts();
+    let catalog = Arc::new(catalog);
     assert_eq!(
         catalog.register_provider_capability(&capability)?,
         CapabilityRegistrationOutcome::Inserted
@@ -634,10 +635,29 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     let activate = OnboardingEvent::Activate {
         generation: Some(generation),
     };
+    let before_activation =
+        catalog.resume_provider_onboarding_with_snapshot(reservation.session_id(), None)?;
+    let unchanged = catalog.resume_provider_onboarding_with_snapshot(
+        reservation.session_id(),
+        Some(&before_activation),
+    )?;
+    assert!(Arc::ptr_eq(&before_activation, &unchanged));
+    let other_handle = Arc::clone(&catalog);
     assert_eq!(
-        catalog.append_provider_onboarding_event(&reservation, 6, activate.clone())?,
+        other_handle.append_provider_onboarding_event(&reservation, 6, activate.clone())?,
         OnboardingAppendOutcome::Inserted
     );
+    drop(other_handle);
+    let active_snapshot = catalog.resume_provider_onboarding_with_snapshot(
+        reservation.session_id(),
+        Some(&before_activation),
+    )?;
+    assert!(!Arc::ptr_eq(&before_activation, &active_snapshot));
+    assert_eq!(
+        active_snapshot.lifecycle().state(),
+        OnboardingState::ActiveScoped
+    );
+    assert_eq!(active_snapshot.next_sequence(), 7);
     assert_eq!(
         catalog.append_provider_onboarding_event(&reservation, 6, activate)?,
         OnboardingAppendOutcome::Replay
@@ -659,6 +679,13 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     )?;
     let zero_event_reservation = catalog.reserve_provider_onboarding(&zero_event_request)?;
     let zero_event_session_id = zero_event_reservation.session_id();
+    assert!(matches!(
+        catalog.resume_provider_onboarding_with_snapshot(
+            zero_event_session_id,
+            Some(&active_snapshot),
+        ),
+        Err(CatalogError::InvalidOnboardingReservationCapability)
+    ));
     assert_eq!(
         zero_event_reservation.initial_state(),
         OnboardingState::UserActionRequired
@@ -690,6 +717,13 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
         object_config,
     )?;
     let (firstreopened_analytical, _publisher) = composition.into_parts();
+    assert!(matches!(
+        first_reopened.resume_provider_onboarding_with_snapshot(
+            reservation.session_id(),
+            Some(&active_snapshot),
+        ),
+        Err(CatalogError::InvalidOnboardingReservationCapability)
+    ));
     assert_eq!(first_reopened.health()?.applied_migrations(), 22);
     let resumed = first_reopened.resume_provider_onboarding(reservation.session_id())?;
     assert_eq!(resumed.lifecycle().state(), OnboardingState::ActiveScoped);

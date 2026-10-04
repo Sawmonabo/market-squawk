@@ -20,7 +20,7 @@ use super::{
 use crate::catalog::market_event_store::{
     load_market_event_commit, load_market_event_commit_for_publication,
 };
-use crate::catalog::provider_event::provider_market_event_selection_for_publication;
+use crate::catalog::provider_event::provider_market_event_selection_for_coordinate;
 use crate::catalog::{CatalogReadSnapshot, now_timestamp};
 use crate::provider_event_selection::publication_kind_name;
 use crate::{
@@ -549,14 +549,16 @@ fn validate_input(
     {
         return Err(ResearchUseCatalogError::InvalidPublication);
     }
-    // Shared loader verifies capture bindings and canonical coordinate digests. No hot-row or
-    // archive placement enters the identity, and no unselected ancestor is traversed.
-    let rows =
-        provider_market_event_selection_for_publication(connection, input.publication.digest())?;
-    let row = rows
-        .get(input.row as usize)
-        .ok_or(ResearchUseCatalogError::InvalidPublication)?;
-    if row.canonical_event_digest() != input.canonical_event_digest
+    // Recheck the selected immutable component, not the publication's unrelated native rows.
+    // Full aggregate verification remains at publication admission and explicit replay.
+    let row = provider_market_event_selection_for_coordinate(
+        connection,
+        input.publication.digest(),
+        input.row,
+    )?
+    .ok_or(ResearchUseCatalogError::InvalidPublication)?;
+    if row.publication_kind() != publication_kind_name(input.publication.kind())
+        || row.canonical_event_digest() != input.canonical_event_digest
         || row.coordinate_digest() != input.coordinate_digest
         || row.source_id() != input.source.as_str()
     {
