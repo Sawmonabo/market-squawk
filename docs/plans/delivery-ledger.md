@@ -2,17 +2,70 @@
 
 ## Current execution — 2026-10-04
 
+### Latest verified checkpoint — `a362a263`
+
+Single supervisor build passed6m41s and replaced service/Desktop with77827/77885 in
+`generation-BZYyS9`; the prior generation was automatically removed. No Cargo process remains.
+Native background read confirms `Market Squawk`, Workspace Ready, Home and retained watchlist
+prices without invoking Try again. Research open fell from58.255s to0.581s in this observed restart;
+its measured phases are catalog59ms, manifests19ms, analytical bound4ms and raw store0ms.
+Total local composition fell from69.407s to10.850s. This is one source-development restart,
+not a hardware-independent performance guarantee or complete installed-workflow acceptance.
+
+The remaining executable identity scan took5.587s and pre-reconnect composition4.666s after research
+open; those are still pending correction under the owner-approved trusted-source runtime scope.
+All selected catalog/recovery checks passed7/7. The current native workflow remains paused on
+`analysis_source_actions_unavailable`; no completed forecast or saved brief is claimed. Evidence:
+`source-runtime-dev.log` from79877, `catalog-startup-native-{status,window}.json`, and the three
+`catalog-*-critical.log` files. Root inspected native output without taking desktop focus.
+
+Startup implementation ownership is released. The ownership table below names the current slice;
+the Schwab unknown-quota/one-connection design remains a separate pending dependency. One primary worktree and three local
+branches remain; origin's additional dependency PR55 is confirmed open/unmerged and preserved.
+
+### Selected live identity lookup — critically verified; deployment pending
+
+First-stock preparation loses live source authority after a nine-route selection exceeds its30s
+budget. The provider identity SQL ranks all as-of instrument revisions before filtering the requested
+symbol. Writer admission can also consume this deadline; current timing cannot attribute the entire
+failure to SQL. The finite correction selects candidate canonical IDs through the existing exact
+provider-symbol index, ranks all as-of revisions only for those IDs, then validates the latest
+revision's matching term and effective interval. Never prefilter revisions in a way that revives a
+retired alias. No schema, migration, quota or deadline change is needed.
+
+Lead inspected the SQL and test changes. The existing point-in-time identity case passed1/1 in1.67s,
+including prior alias validity, rejection after replacement and exact successor selection. The first
+attempt rejected invalid fixture clocks; correcting only those clocks preserved the production
+`effective_at <= knowledge_at` rule. Existing native custody recovery passed1/1 in0.94s, retaining
+successor invalidation, writer wait/cancellation and exact authority. Logs:
+`provider-identity-{index,custody}-critical.log`. A separate read-only SQLite3.50.4 probe used the
+existing symbol and instrument-revision indexes and returned one retained identity in0.539ms;
+`provider-identity-query-plan.json` is diagnostic, not native service performance proof.
+
+Implementation is frozen/released. Watcher26857 remains paused for integration; lead owns the next
+single supervised replacement. No claim that the full30s failure or optional-child/account teardown
+coupling is resolved. No schema, migration, query limit or deadline change was introduced.
+
+Astra `account_start_coordination` has independent read-only ownership of the remaining5.587s
+own-executable identity scan: `local_product/executable.rs`, `local_product/mod.rs`,
+`backtest_strategy.rs`, the existing backtest build receipt and source/installed runtime provenance
+contracts. Return the smallest honest metadata-based replacement and affected critical checks.
+Do not label a Git revision as executable bytes, introduce a dual backtest implementation, or drop
+financial input/model integrity. No edits/build/runtime actions; shared contract decisions remain
+with lead. Existing installed runtime correction design is the starting point, not a new audit.
+
 ### Current ownership — 2026-10-04
 
-Audit base: `8bd05b7a` (option parser and account-start corrections pushed). One primary worktree and three intended
-local branches. Origin also retains open, unmerged dependency PR #55; no stale agent branch or
-linked worktree was found. No branch, workspace or target directory was created in this checkpoint.
-
-| Owner | Required outcome and dependency | Exclusive scope | Critical completion evidence |
+| Owner | Required outcome and dependency | Exclusive scope | Next evidence |
 | --- | --- | --- | --- |
-| Lead | Deploy the source-admission corrections, retry existing source authorization and resume the retained stock workflow | Git, build/test scheduling, native runtime, ledger/PR; implementation frozen | Single supervised replacement, actual source result and saved workflow result |
-| Astra High — account_start_coordination | Keep unrelated registry operations responsive during source startup | `application/market_runtime.rs` and `application/market_runtime/account_stop.rs`; frozen/released | Four focused registry checks passed, including the suspended-resolver concurrency and original custody cases |
-| Astra High — schwab_doctor_diagnosis | Admit the actual successful option-chain shape | Adapter `rest/response.rs`, `option_publication.rs`, `tests.rs`; frozen/released | Existing native parsing regression passed with all128 contracts under unchanged production bounds |
+| Lead | Integrate selected identity reads and verify native source/workflow behavior | Git, builds/runtime, shared contracts, ledger/PR | One supervised replacement and actual source/preparation result |
+| Astra High — schwab_doctor_diagnosis | Indexed exact symbol selection | Two data files above; frozen/released | Two existing critical checks passed; native timing remains unproven |
+| Astra High — account_start_coordination | Remove remaining own-executable scan honestly | Read-only provenance call chain above | Exact metadata producer/consumer change and critical checks |
+
+## Earlier checkpoint evidence
+
+The following entries preserve their original checkpoint state. They are not active ownership or
+competing task queues; current execution and assignments are above.
 
 ### Source admission correction — implemented and critically verified; deployment pending
 
@@ -140,6 +193,44 @@ The existing native stock workflow was resumed and reached17checkpoints, then pa
 `analysis_source_actions_unavailable`. The original background preparation job completed, but the
 required source-action inputs remain unavailable; forecasting and saved-result acceptance are unfinished. Evidence:
 `source-8bd-workflow-{status,resume,progress}.json`. Main/release and the current workspace remain unchanged.
+
+### Deployment and next source edge — active
+
+Catalog startup correction pushed as `a362a263`; existing supervisor is compiling it with one
+Cargo process74993, watcher resumed, current service67737/Desktop67887 retained until success.
+Astra `schwab_doctor_diagnosis` now owns read-only tracing of the completed preparation receipt
+for job049b89b0-8546-4f02-b84b-6825dbaa72ab: current_session/benchmark_history/selected_history remain
+unavailable, so source_actions cannot qualify. Scope is `service/market_evidence/preparation.rs`,
+its corporate-action/history preflight consumers and exact selected source receipt evidence. Identify
+the first failed admission with current logs/retained evidence; no edits/builds/runtime/provider
+requests or broad audits. The independent rate-policy investigation remains with
+`account_start_coordination`. Lead owns startup deployment and live native checks.
+
+### Schwab rate/connection correction — next dependency design
+
+Read-only tracing found no separate production quota owner to switch on: REST and Streamer already
+register the activation policy under the same trusted account subject in `ProviderRateAuthority`.
+The current20/900s value is a logical-doctor-count application ceiling incorrectly charged per wire
+operation. A new arbitrary number, independent scope, counter reset or longer doctor timeout does
+not correct that mismatch. The next coherent change represents explicitly unknown numeric quota
+without numeric request windows, preserving the shared single-flight admission, exact dispatch and
+response custody, durable refusal/Retry-After/disabled state, cancellation and existing adaptive REST
+cadence. Only the current Schwab policy selects this mode; known provider quotas remain enforced.
+
+Dependencies: lead owns source budget policy/runtime/checkpoint contracts, onboarding capability and
+built-in profile, application rate adapter and explicit predecessor-checked policy transition through
+the existing provider-rate store. Registration must still reject conflicting policies. Transition
+requires drained attempts, invalidates old handles and retains refusal/cooldown state; it is an
+ordinary policy transition, not a schema migration or silent database reset. The doctor then reuses
+one native Streamer executor/login across selected families, retaining exact per-service evidence
+and continuing independent services after non-disconnecting refusals. Native desired-state replay
+and ACK serialization already exist. Do not forge a production activation before the doctor qualifies it.
+
+Required checks: >20 sequential unknown-quota admissions with single-flight exclusion; refusal and
+Retry-After retained across restart/policy transition; stale policy handles rejected; existing
+multi-service capture case proves one login and isolated service refusal. Numeric provider capacity
+remains unknown. No implementation ownership for this dependent slice is dispatched during the
+current startup build. The completed Astra diagnosis is design evidence, not a passing API test.
 
 ### Editable source runtime — critically verified integration
 

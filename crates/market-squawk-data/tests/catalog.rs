@@ -1789,6 +1789,56 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         .ok_or(CatalogError::InvalidRecord)?;
     assert!(future_parent.published_at() > retained.published_at());
     assert!(future_parent.published_at() < successor_effective_start);
+    // Candidate aliases identify instruments, not the revision to select. Rank every
+    // known revision for that instrument so a replaced alias cannot revive its old row.
+    let prior_alias = reader
+        .select_provider_identity_as_of(
+            MarketDataProviderIdentityQuery::try_new(
+                SourceId::try_from("nasdaq-symbol-directory")?,
+                ProviderInstrumentId::try_from("AAPL.US")?,
+                retained.published_at(),
+                retained.published_at(),
+            )?,
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or("missing prior provider alias before successor publication")?;
+    assert_eq!(
+        prior_alias.exact_receipt()?.definition_revision_digest(),
+        retained.revision_digest()
+    );
+    assert!(
+        reader
+            .select_provider_identity_as_of(
+                MarketDataProviderIdentityQuery::try_new(
+                    SourceId::try_from("nasdaq-symbol-directory")?,
+                    ProviderInstrumentId::try_from("AAPL.US")?,
+                    successor_effective_start,
+                    successor_effective_start,
+                )?,
+                deadline(),
+                &cancellation,
+            )?
+            .is_none()
+    );
+    let successor_alias = reader
+        .select_provider_identity_as_of(
+            MarketDataProviderIdentityQuery::try_new(
+                SourceId::try_from("nasdaq-symbol-directory")?,
+                ProviderInstrumentId::try_from("AAPL.NEW")?,
+                successor_effective_start,
+                successor_effective_start,
+            )?,
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or("missing exact successor provider alias")?;
+    assert_eq!(
+        successor_alias
+            .exact_receipt()?
+            .definition_revision_digest(),
+        future_parent.revision_digest()
+    );
     let valid_lower_rank_at = shift_timestamp(expired_alias_end, 1)?;
     assert!(!future_parent.matches_search_query_at("AAPL.AAA", valid_lower_rank_at)?);
     assert!(future_parent.matches_search_query_at("aapl.new", valid_lower_rank_at)?);

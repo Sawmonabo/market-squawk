@@ -1266,6 +1266,7 @@ fn resolve_provider_identity_in_connection(
             query.knowledge_at().unix_nanos(),
             query.effective_at().unix_nanos(),
             retrieval_limit,
+            normalize(query.provider_instrument_id().as_str()),
         ],
         |row| {
             Ok((
@@ -3933,8 +3934,19 @@ SELECT EXISTS(
     WHERE revisions.instrument_id=?1 AND revisions.published_at_ns<=?2
 )";
 
+// Find candidate instruments through the symbol index, then rank all their as-of
+// revisions before matching terms so a successor cannot revive a retired alias.
 const PROVIDER_IDENTITY_AS_OF_SQL: &str = "
-WITH selectable_revisions AS (
+WITH candidate_instruments AS (
+    SELECT DISTINCT revisions.instrument_id
+    FROM market_data_instrument_search_terms AS terms
+    JOIN market_data_instrument_revisions AS revisions
+      ON revisions.revision_digest=terms.revision_digest
+    WHERE terms.normalized_term=?6
+      AND terms.term_kind='provider_symbol'
+      AND terms.source_id=?1
+      AND terms.display_term=?2
+), selectable_revisions AS (
     SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
            revisions.effective_start_ns, revisions.effective_end_ns,
            revisions.reference_revision, revisions.reference_algorithm,
@@ -3947,7 +3959,8 @@ WITH selectable_revisions AS (
                         revisions.revision_digest
            ) AS revision_position
     FROM market_data_instrument_revisions AS revisions
-    WHERE revisions.published_at_ns<=?3
+    WHERE revisions.instrument_id IN (SELECT instrument_id FROM candidate_instruments)
+      AND revisions.published_at_ns<=?3
       AND revisions.effective_start_ns<=?4
 )
 SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
