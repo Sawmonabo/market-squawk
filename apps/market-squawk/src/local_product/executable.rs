@@ -16,11 +16,44 @@ const SERVICE_APPLICATION_BASENAME: &str = "market-squawk-service";
 const MCP_RELAY_APPLICATION_BASENAME: &str = "market-squawk-mcp-relay";
 const ONNX_WORKER_BASENAME: &str = "market-squawk-onnx-worker";
 
-/// Returns the two-pass SHA-256 identity of the exact executable opened at startup.
-pub(super) fn current_executable_sha256() -> Result<[u8; 32], ExecutableIdentityError> {
+/// Records build provenance without scanning or attesting the executable's contents.
+pub(super) fn current_program_build_metadata() -> Result<Vec<u8>, ExecutableIdentityError> {
+    #[derive(serde::Serialize)]
+    struct BuildMetadata {
+        schema_version: u32,
+        package_version: &'static str,
+        recorded_native_build_revision: Option<&'static str>,
+        target_os: &'static str,
+        target_arch: &'static str,
+        executable_size: u64,
+        executable_modified_unix_nanos: Option<String>,
+    }
+
     let executable = std::env::current_exe()
         .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
-    hash_stable_regular_file(&executable)
+    let metadata =
+        fs::metadata(executable).map_err(|source| ExecutableIdentityError::Metadata { source })?;
+    if !metadata.is_file() {
+        return Err(ExecutableIdentityError::UnsafeFileType);
+    }
+    if metadata.len() == 0 {
+        return Err(ExecutableIdentityError::InvalidSize);
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().to_string());
+    serde_json::to_vec(&BuildMetadata {
+        schema_version: 1,
+        package_version: env!("CARGO_PKG_VERSION"),
+        recorded_native_build_revision: option_env!("MARKET_SQUAWK_NATIVE_BUILD_REVISION"),
+        target_os: std::env::consts::OS,
+        target_arch: std::env::consts::ARCH,
+        executable_size: metadata.len(),
+        executable_modified_unix_nanos: modified,
+    })
+    .map_err(ExecutableIdentityError::BuildMetadata)
 }
 
 /// Returns the signed application identity and its fixed sibling ONNX worker path.
@@ -211,6 +244,9 @@ struct HashPass {
 /// Startup executable or helper identity could not be established exactly.
 #[derive(Debug, Error)]
 pub enum ExecutableIdentityError {
+    /// Observed build metadata could not be encoded.
+    #[error("program build metadata could not be encoded")]
+    BuildMetadata(#[source] serde_json::Error),
     /// The operating system did not report the running executable.
     #[error("current executable identity is unavailable")]
     CurrentExecutable {

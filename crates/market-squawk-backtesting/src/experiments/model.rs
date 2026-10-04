@@ -14,7 +14,7 @@ const HARD_MAX_PARAMETERS: usize = 1_024;
 const HARD_MAX_SEARCH_DIMENSIONS: usize = 1_024;
 const HARD_MAX_CANDIDATES_PER_DIMENSION: usize = 16_384;
 
-/// Stable identity and content hash for one model, strategy, or code artifact.
+/// Stable name and evidence digest for a model, strategy, or code provenance binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrialComponentBinding {
     pub(super) name: SourceIdentifier,
@@ -34,7 +34,7 @@ impl TrialComponentBinding {
         &self.name
     }
 
-    /// Returns the exact component bytes identity.
+    /// Returns the evidence digest, which may identify build metadata rather than program bytes.
     #[must_use]
     pub const fn digest(&self) -> Sha256Digest {
         self.digest
@@ -79,7 +79,7 @@ impl BacktestExecutableIdentity {
         &self.strategy
     }
 
-    /// Returns the compiled code revision identity.
+    /// Returns the code provenance binding; build metadata does not attest executable contents.
     #[must_use]
     pub const fn code(&self) -> &TrialComponentBinding {
         &self.code

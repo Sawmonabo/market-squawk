@@ -39,20 +39,37 @@ attempt rejected invalid fixture clocks; correcting only those clocks preserved 
 `effective_at <= knowledge_at` rule. Existing native custody recovery passed1/1 in0.94s, retaining
 successor invalidation, writer wait/cancellation and exact authority. Logs:
 `provider-identity-{index,custody}-critical.log`. A separate read-only SQLite3.50.4 probe used the
-existing symbol and instrument-revision indexes and returned one retained identity in0.539ms;
+existing symbol and instrument-revision indexes and returned one retained identity in0.397ms;
 `provider-identity-query-plan.json` is diagnostic, not native service performance proof.
 
 Implementation is frozen/released. Watcher26857 remains paused for integration; lead owns the next
 single supervised replacement. No claim that the full30s failure or optional-child/account teardown
 coupling is resolved. No schema, migration, query limit or deadline change was introduced.
 
-Astra `account_start_coordination` has independent read-only ownership of the remaining5.587s
-own-executable identity scan: `local_product/executable.rs`, `local_product/mod.rs`,
-`backtest_strategy.rs`, the existing backtest build receipt and source/installed runtime provenance
-contracts. Return the smallest honest metadata-based replacement and affected critical checks.
-Do not label a Git revision as executable bytes, introduce a dual backtest implementation, or drop
-financial input/model integrity. No edits/build/runtime actions; shared contract decisions remain
-with lead. Existing installed runtime correction design is the starting point, not a new audit.
+### Build provenance correction — critically verified; deployment pending
+
+Indexed identity correction is pushed as `0014e5fa`. Lead keeps the watcher paused while integrating
+the separately approved remaining startup scan correction into the next supervised build.
+The current executable will contribute bounded metadata (package/version, recorded optional native
+build revision, platform, file size and modification time), not a repeated two-pass file hash.
+This is explicitly provenance, not byte attestation; recorded revision may be absent or inherited
+from the supervisor launch. Existing small strategy/configuration bindings remain.
+
+Lead owns `local_product/{mod,executable}.rs` and `backtest_strategy.rs`. Astra
+`account_start_coordination` owns backtesting `strategy.rs`, `experiments/model.rs` documentation and
+existing `tests.rs`: rename the receipt argument/domain/binding to build metadata, preserve the
+common registry/engine and stored trial identity decoder. Extend the existing governed-service
+case to prove changed metadata changes new trial identity while the original completed trial reopens.
+Run it and the existing immutable-input identity check. No schema or migration is needed; historical
+records already retain generic code bindings. Other installed helper scans remain separate pending
+work. No other writer/build/runtime owner is introduced.
+
+Lead inspected producer, receipt and saved-trial consumers. The extended governed-service test
+passed1/1 in0.17s after a3m46s single-job build: metadata changes only code provenance, produces a
+distinct trial identity, and the original completed record reopens exactly. The existing immutable
+request identity test also passed1/1. Logs: `build-metadata-{restart,identity}-critical.log`.
+No schema, migration, compatibility branch or alternative backtest engine was added. Application
+compilation and live startup timing remain pending the single supervised replacement.
 
 ### Current ownership — 2026-10-04
 
@@ -60,7 +77,7 @@ with lead. Existing installed runtime correction design is the starting point, n
 | --- | --- | --- | --- |
 | Lead | Integrate selected identity reads and verify native source/workflow behavior | Git, builds/runtime, shared contracts, ledger/PR | One supervised replacement and actual source/preparation result |
 | Astra High — schwab_doctor_diagnosis | Indexed exact symbol selection | Two data files above; frozen/released | Two existing critical checks passed; native timing remains unproven |
-| Astra High — account_start_coordination | Remove remaining own-executable scan honestly | Read-only provenance call chain above | Exact metadata producer/consumer change and critical checks |
+| Astra High — account_start_coordination | Backtest build-metadata receipt and saved-result identity | Backtesting strategy.rs, experiments/model.rs and tests.rs; frozen/released | Lead inspected; two existing critical checks passed |
 
 ## Earlier checkpoint evidence
 

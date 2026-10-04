@@ -70,7 +70,7 @@ pub use self::cli_transport::{
 };
 use self::executable::installed_release_programs;
 use self::executable::{
-    ExecutableIdentityError, current_executable_sha256, installed_application_program,
+    ExecutableIdentityError, current_program_build_metadata, installed_application_program,
     installed_service_program,
 };
 #[cfg(debug_assertions)]
@@ -1115,9 +1115,9 @@ impl LocalProduct {
             portal_activation.bind_treasury_publication(treasury_closure, &research_domains)?;
 
             let identity_started = Instant::now();
-            let executable_sha256 = current_executable_sha256()?;
-            tracing::info!(phase = "executable_identity", elapsed_ms = %identity_started.elapsed().as_millis(), composition_elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
-            let strategies = production_backtest_strategy_registry(executable_sha256)?;
+            let build_metadata = current_program_build_metadata()?;
+            tracing::info!(phase = "build_metadata", elapsed_ms = %identity_started.elapsed().as_millis(), composition_elapsed_ms = %composition_started.elapsed().as_millis(), "workspace composition milestone");
+            let strategies = production_backtest_strategy_registry(&build_metadata)?;
             let backtest_service = Arc::new(ProductionBacktestService::initialize(
                 &paths,
                 experiment_limits()?,

@@ -341,28 +341,31 @@ fn run_with_time_in_force(
 fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
-    let inventory = ExperimentInventory::try_new(
-        root,
-        ExperimentLimits::try_new(ExperimentLimitsInput {
-            max_trials: 8,
-            max_record_bytes: 64 * 1024,
-            max_artifact_bytes: 64 * 1024,
-            max_metrics: 8,
-        })?,
-    )?;
+    let limits = ExperimentLimits::try_new(ExperimentLimitsInput {
+        max_trials: 8,
+        max_record_bytes: 64 * 1024,
+        max_artifact_bytes: 64 * 1024,
+        max_metrics: 8,
+    })?;
+    let inventory = ExperimentInventory::try_new(root, limits)?;
     let service = BacktestService::new(inventory);
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let request = request(account_id, dataset(execution_terms()?)?, None)?;
-    let (registry, build_id) = strategy_registry(account_id)?;
+    let (registry, build_id) = strategy_registry(account_id, b"buy-once-build-metadata-v1")?;
     let mut strategy = registry.admit(&build_id)?;
+    assert_eq!(
+        strategy.identity().code().name().as_str(),
+        "buy-once-v1-build-metadata"
+    );
+    let plan = BacktestTrialPlan::new(
+        Vec::new(),
+        Vec::new(),
+        SourceIdentifier::try_from("cost-adjusted-total-return")?,
+    );
     let outcome = service.run(
-        request,
+        request.clone(),
         &mut strategy,
-        BacktestTrialPlan::new(
-            Vec::new(),
-            Vec::new(),
-            SourceIdentifier::try_from("cost-adjusted-total-return")?,
-        ),
+        plan.clone(),
         &CancellationToken::new(),
     )?;
     let BacktestOutcome::Completed(result) = outcome else {
@@ -418,6 +421,34 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
             .len(),
         result.run().fill_count()
     );
+    let (changed_registry, changed_build_id) =
+        strategy_registry(account_id, b"buy-once-build-metadata-v2")?;
+    assert_eq!(changed_build_id, build_id);
+    let mut changed_strategy = changed_registry.admit(&changed_build_id)?;
+    assert_eq!(
+        strategy.identity().strategy(),
+        changed_strategy.identity().strategy()
+    );
+    assert_eq!(
+        strategy.identity().configuration_digest(),
+        changed_strategy.identity().configuration_digest()
+    );
+    assert_ne!(strategy.identity().code(), changed_strategy.identity().code());
+    let changed_outcome = service.run(
+        request,
+        &mut changed_strategy,
+        plan,
+        &CancellationToken::new(),
+    )?;
+    let BacktestOutcome::Completed(changed_result) = changed_outcome else {
+        return Err("expected completed trial with changed build metadata".into());
+    };
+    assert_ne!(result.trial().spec().id(), changed_result.trial().spec().id());
+
+    drop(service);
+    let reopened_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let reopened = ExperimentInventory::try_new(reopened_root, limits)?;
+    assert_eq!(reopened.trial(result.trial().spec().id())?, *result.trial());
     Ok(())
 }
 
@@ -1431,7 +1462,7 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
         })?,
     )?;
     let service = BacktestService::new(inventory);
-    let (registry, build_id) = strategy_registry(account_id)?;
+    let (registry, build_id) = strategy_registry(account_id, b"buy-once-build-metadata-v1")?;
     let mut strategy = registry.admit(&build_id)?;
     assert!(matches!(
         service.run(
@@ -1506,7 +1537,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
     let inventory = ExperimentInventory::try_new(root, limits)?;
     let service = BacktestService::new(inventory);
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
-    let (registry, build_id) = strategy_registry(account_id)?;
+    let (registry, build_id) = strategy_registry(account_id, b"buy-once-build-metadata-v1")?;
     let parameters = &["fast", "medium", "slow"];
     let universe = cohort_universe(&[(10, 40), (70, 100)], 40)?;
     let differently_bounded_universe = BacktestCohortUniverse::try_new(
@@ -1987,6 +2018,7 @@ fn typed_model_failure_is_audited_no_action() -> TestResult {
 
 fn strategy_registry(
     account_id: AccountId,
+    build_metadata: &[u8],
 ) -> Result<(BacktestStrategyRegistry, SourceIdentifier), Box<dyn Error>> {
     let build_id = SourceIdentifier::try_from("buy-once-v1")?;
     let receipt = BacktestBuildReceipt::try_from_evidence(
@@ -1994,7 +2026,7 @@ fn strategy_registry(
         BacktestStrategyClass::RuleBased,
         SourceIdentifier::try_from("buy-once")?,
         b"buy-once-source-closure-v1",
-        b"buy-once-executable-v1",
+        build_metadata,
         b"{\"quantity_lots\":4}",
     )?;
     let registry = BacktestStrategyRegistry::try_new(vec![BacktestBuildRegistration::new(

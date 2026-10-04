@@ -27,17 +27,15 @@ pub fn baseline_backtest_build_id() -> Result<SourceIdentifier, BacktestStrategy
         .map_err(|_| BacktestStrategyCompositionError::InvalidCodeOwnedIdentity)
 }
 
-/// Registers the caller-free baseline strategy against the exact running executable identity.
+/// Registers the baseline strategy against recorded program build metadata.
 ///
-/// `executable_sha256` must be derived from the executable file opened by the application
-/// composition before this function is called. The registry then binds the code-owned strategy
-/// implementation, that executable identity, and the canonical fixed configuration into one
-/// immutable build receipt.
+/// The metadata records the observed build; it is not an executable-content attestation.
+/// The registry binds it with the code-owned strategy and canonical configuration.
 pub fn production_backtest_strategy_registry(
-    executable_sha256: [u8; 32],
+    build_metadata: &[u8],
 ) -> Result<BacktestStrategyRegistry, BacktestStrategyCompositionError> {
-    if executable_sha256 == [0; 32] {
-        return Err(BacktestStrategyCompositionError::InvalidExecutableIdentity);
+    if build_metadata.is_empty() {
+        return Err(BacktestStrategyCompositionError::InvalidBuildMetadata);
     }
     let build_id = baseline_backtest_build_id()?;
     let strategy_name = SourceIdentifier::try_from(BASELINE_STRATEGY_NAME)
@@ -47,7 +45,7 @@ pub fn production_backtest_strategy_registry(
         BacktestStrategyClass::RuleBased,
         strategy_name,
         BASELINE_SOURCE,
-        &executable_sha256,
+        build_metadata,
         BASELINE_CONFIGURATION,
     )?;
     BacktestStrategyRegistry::try_new(vec![BacktestBuildRegistration::new(
@@ -63,9 +61,9 @@ pub enum BacktestStrategyCompositionError {
     /// A source-controlled identity is invalid.
     #[error("baseline backtest strategy identity is invalid")]
     InvalidCodeOwnedIdentity,
-    /// The exact executable digest was absent.
-    #[error("baseline backtest executable identity is invalid")]
-    InvalidExecutableIdentity,
+    /// Recorded program build metadata was absent.
+    #[error("baseline backtest build metadata is invalid")]
+    InvalidBuildMetadata,
     /// The backtest registry rejected code-owned build evidence.
     #[error("baseline backtest strategy registration failed: {0}")]
     Admission(#[from] market_squawk_backtesting::BacktestAdmissionError),
