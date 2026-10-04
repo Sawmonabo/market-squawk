@@ -383,56 +383,101 @@ async fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
     .unwrap_or_else(|error| panic!("chain request: {error}"));
     assert_eq!(chain.route(), ReadOnlyRoute::Chains);
 
-    let tls = Arc::new(BrowserProbeTlsAcceptor {
-        attempts: AtomicUsize::new(0),
-    });
-    let receiver = OAuthLoopbackReceiver::bind(
-        tls.clone(),
-        OAuthLoopbackBounds::try_new(
-            Duration::from_secs(2),
-            Duration::from_millis(250),
-            Duration::from_millis(250),
-            nonzero(2),
-            nonzero(4 * 1024),
-            nonzero(16),
+    for (request, authorized) in [
+        (
+            "GET /?code=one-time-browser&session=private-session&state=correlation HTTP/1.1\r\nHost: 127.0.0.1:8182\r\n\r\n",
+            true,
+        ),
+        (
+            "GET /?error=private-denial&error_description=private-description&state=correlation HTTP/1.1\r\nHost: 127.0.0.1:8182\r\n\r\n",
+            false,
+        ),
+    ] {
+        let tls = Arc::new(BrowserProbeTlsAcceptor {
+            attempts: AtomicUsize::new(0),
+        });
+        let receiver = OAuthLoopbackReceiver::bind(
+            tls.clone(),
+            OAuthLoopbackBounds::try_new(
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+                Duration::from_millis(250),
+                nonzero(2),
+                nonzero(4 * 1024),
+                nonzero(16),
+            )
+            .unwrap_or_else(|error| panic!("callback bounds: {error}")),
         )
-        .unwrap_or_else(|error| panic!("callback bounds: {error}")),
-    )
-    .await
-    .unwrap_or_else(|error| panic!("callback listener: {error}"));
-    let receive = tokio::spawn(async move {
-        receiver
-            .receive("correlation", CancellationToken::new())
+        .await
+        .unwrap_or_else(|error| panic!("callback listener: {error}"));
+        let receive = tokio::spawn(async move {
+            receiver
+                .receive("correlation", CancellationToken::new())
+                .await
+        });
+        let browser_probe = TcpStream::connect("127.0.0.1:8182")
             .await
-    });
-    let browser_probe = TcpStream::connect("127.0.0.1:8182")
-        .await
-        .unwrap_or_else(|error| panic!("browser TLS probe: {error}"));
-    drop(browser_probe);
-    let mut callback = TcpStream::connect("127.0.0.1:8182")
-        .await
-        .unwrap_or_else(|error| panic!("browser callback: {error}"));
-    callback
-        .write_all(
-            b"GET /?code=one-time-browser&state=correlation HTTP/1.1\r\nHost: 127.0.0.1:8182\r\n\r\n",
-        )
-        .await
-        .unwrap_or_else(|error| panic!("write browser callback: {error}"));
-    let mut acknowledgement = Vec::new();
-    callback
-        .read_to_end(&mut acknowledgement)
-        .await
-        .unwrap_or_else(|error| panic!("read browser acknowledgement: {error}"));
-    assert!(acknowledgement.starts_with(b"HTTP/1.1 200 OK\r\n"));
-    let outcome = receive
-        .await
-        .unwrap_or_else(|error| panic!("callback task: {error}"))
-        .unwrap_or_else(|error| panic!("callback receive: {error}"));
-    let CallbackOutcome::Authorized(callback) = outcome else {
-        panic!("browser callback was not authorized")
-    };
-    assert_eq!(callback.expose_code(), "one-time-browser");
-    assert_eq!(tls.attempts.load(Ordering::SeqCst), 2);
+            .unwrap_or_else(|error| panic!("browser TLS probe: {error}"));
+        drop(browser_probe);
+        let mut callback = TcpStream::connect("127.0.0.1:8182")
+            .await
+            .unwrap_or_else(|error| panic!("browser callback: {error}"));
+        callback
+            .write_all(request.as_bytes())
+            .await
+            .unwrap_or_else(|error| panic!("write browser callback: {error}"));
+        let mut acknowledgement = Vec::new();
+        callback
+            .read_to_end(&mut acknowledgement)
+            .await
+            .unwrap_or_else(|error| panic!("read browser acknowledgement: {error}"));
+        assert!(acknowledgement.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let acknowledgement = std::str::from_utf8(&acknowledgement)
+            .unwrap_or_else(|error| panic!("acknowledgement UTF-8: {error}"));
+        let (headers, body) = acknowledgement
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("missing acknowledgement header boundary"));
+        assert!(headers.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(headers.contains("Cache-Control: no-store\r\n"));
+        assert!(headers.contains(
+            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'"
+        ));
+        assert!(headers.contains("Referrer-Policy: no-referrer\r\n"));
+        let content_length = headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap_or_else(|| panic!("missing acknowledgement length"))
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("acknowledgement length: {error}"));
+        assert_eq!(content_length, body.len());
+        assert!(body.starts_with("<!doctype html>"));
+        for private_value in [
+            "one-time-browser",
+            "private-session",
+            "correlation",
+            "private-denial",
+            "private-description",
+            "127.0.0.1:8182",
+        ] {
+            assert!(!acknowledgement.contains(private_value));
+        }
+        let outcome = receive
+            .await
+            .unwrap_or_else(|error| panic!("callback task: {error}"))
+            .unwrap_or_else(|error| panic!("callback receive: {error}"));
+        match (authorized, outcome) {
+            (true, CallbackOutcome::Authorized(callback)) => {
+                assert_eq!(callback.expose_code(), "one-time-browser");
+                assert_eq!(callback.expose_session(), Some("private-session"));
+            }
+            (false, CallbackOutcome::Denied { error, description }) => {
+                assert_eq!(error.as_ref(), "private-denial");
+                assert_eq!(description.as_deref(), Some("private-description"));
+            }
+            _ => panic!("unexpected browser callback outcome"),
+        }
+        assert_eq!(tls.attempts.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[test]

@@ -2,6 +2,87 @@
 
 ## Current execution — 2026-10-03
 
+### Callback presentation verified; Schwab coverage gaps remain open
+
+Lead inspected the received page at 1200×800 and the denied page at an explicitly emulated
+360×800 Chrome viewport; the narrow document is 360px wide with no horizontal overflow.
+Screenshots are `callback-preview/{received,denied}.png` under the existing first-stock scratch.
+The existing OAuth lifecycle/route fixture passes (one test, 10.46s compilation), including both
+callback outcomes, HTTP body length and non-reflection of private callback values. No new test
+target or dependency. Callback source is ready for its independent commit; deployment uses the
+next normal coordinated native build. This does not establish completed provider connection.
+
+The running native Source.GetStatus read at 2026-10-04T01:22:40Z confirms Schwab `not_active`,
+Stopped, no current generation or doctor. Source inspection also confirms incomplete consumer
+coverage: installed binding bootstrap uses only SPY/VTI; the streaming quote dictionary requests
+bid/ask/sizes/time but not last trade or daily change; history and REST option publication functions
+have no production callers. Book/chart/screener subscription code alone does not prove screen
+consumption. These are open acceptance 1/5 gaps, not upstream data absences. After the current
+connection fix, expand the existing neutral acquisition/selector/display paths in coherent slices;
+do not substitute more refresh controls or a second provider-specific frontend.
+
+### Owner-requested callback presentation — independent bounded lane
+
+GPT-6.1 Sol High `detail_display_cache` owns only Schwab adapter `src/callback.rs`, a colocated
+static callback HTML asset if useful, and the existing callback fixture in `src/tests.rs`.
+Outcome: the validated received/denied response matches the existing dark/blue/white brand with
+logo, centered responsive card and concise close-tab/return instruction. Use fixed trusted content;
+no reflected codes/state/provider errors, external network dependencies, invented deep link, or
+false final connection-success claim. Keep callback/cancellation/acknowledgement semantics intact.
+Lead schedules existing callback critical check and actual rendered preview; no extra UI test suite.
+This lane is disjoint from Schwab rate diagnosis and Tiingo activation remediation.
+
+### Schwab OAuth active; authenticated doctor blocked locally
+
+Diagnosis update: the error label is misleading, not proof of a digest mismatch. The User Preference
+request permit remains in scope while the doctor tries the next REST request against a one-request
+concurrency budget. Lead owns `provider_onboarding/schwab_market_doctor.rs` only to release that
+settled permit before the REST loop; Sol remains read-only and checks adjacent Streamer ownership.
+The same digest checks/rate limits stay intact. Native sequential doctor completion is the required
+critical proof; no broad fixture scaffold is justified for the one-line lifetime correction.
+
+Native bfb26a27 on the restored supervisor accepted the real browser callback without a pinned-client
+workaround. Continue returned access generation1 and `active`; protected expiry metadata retained in
+`native-schwab-detached-continue.json`. Automatic keychain setup and token exchange are live verified.
+The following read-only doctor failed locally with `InvalidRateAuthority` before completing API
+verification. Source bootstrap correctly remains runtime_verification_pending; no quote claim yet.
+
+GPT-6.1 Sol High `source_status_contract` owns read-only diagnosis of the mismatch and writes only
+`.agents/tmp/v1-first-stock/source-status-contract.md`; inspect actual policy digest producers and
+consumer, report minimal correction, no builds/runtime/provider calls/Git. Astra Tiingo implementation
+continues in its two disjoint files; lead owns Schwab live verification and shared integration.
+
+### Pushed Schwab checkpoint and independent Tiingo correction
+
+Follow-up live enrollment proof: native Begin installed the exact missing leaf, macOS approval
+completed, and both exact-host and policy-string-free SSL checks pass. Evidence:
+`schwab-auto-enrollment-{precondition,verified}.json`. No private identity was changed.
+The original tool-owned supervisor subsequently disappeared; its service state is explicitly
+Stopped and its exec handle is absent, while Desktop/Vite/watcher were orphaned. No crash cause is
+established. Lead retired only those owned orphan processes normally and restarted the same normal
+development command detached from the transient tool handle: supervisor65099, service65240,
+Desktop65279, watcher65111 paused during OAuth/agent edits. Cached build1.55s; no new workspace.
+The interrupted consent cannot prove API access and must use a fresh authorized browser flow.
+
+`bfb26a27` is pushed. The normal native build passed in 6m50s; two existing critical adapter checks
+pass. The rebuilt Desktop reached Ready without a manual retry (composition59.090s, still too slow).
+For native fresh-enrollment verification, lead removed only the exact public certificate from the
+user keychain, preserving the installation identity/private key. Ordinary Begin installed that same
+leaf automatically; Desktop56038 owns security56795 and macOS requested its own approval. Owner
+input is pending. No Chrome callback or authenticated API success yet. A20s WebDriver observation
+timeout did not stop the native approval flow. Watcher43081 is paused to protect pending consent.
+
+| Owner | Outcome and dependency | Exclusive files | Smallest check / next barrier |
+| --- | --- | --- | --- |
+| Lead | Complete automatic trust, browser consent and read-only Schwab API on bfb26a27 | Native runtime, OS prompt observations, docs, Git/build scheduling | Exact enrollment, callback, OAuth and authenticated doctor result |
+| Astra High `native_price_authority` | Fix confirmed Tiingo busy-lock rejection after successful activation | `provider_activation/mod.rs`, `local_product/cli_provider.rs` and existing inline fixture only | Await existing mutation authority, preserve revalidation/cancellation/deadline; existing focused fixture then lead integration |
+
+Tiingo diagnosis from Sol is complete/read-only. Catalog proves qualification/ActiveScoped followed
+244ms later by AdapterRejected quarantine. Its try-write treats ordinary shared contention as
+ActivationUnavailable; the audited caller holds no nested onboarding guard. Specific competing
+owner is not observed. No provider failure is inferred. Freeze Tiingo handoff before lead checks;
+no source watcher/build may interrupt Schwab consent.
+
 ### Automatic Schwab setup and token decoding — integration verification
 
 | Active owner | Finishable outcome / dependency | Exclusive files | Check / release |

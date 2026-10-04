@@ -23,8 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{CallbackOutcome, OAuthCallback, RequestAdmission, SchwabAdapterError};
 
 const CALLBACK_ADDRESS: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8182));
-const AUTHORIZED_BODY: &[u8] = b"Authorization received. Return to Market Squawk.";
-const DENIED_BODY: &[u8] = b"Authorization was not completed. Return to Market Squawk.";
+const CALLBACK_PAGE: &str = include_str!("callback.html");
 const MAX_CONNECTION_ATTEMPTS: usize = 16;
 
 /// Finite local listener and request bounds. None is a provider capacity claim.
@@ -194,18 +193,39 @@ impl OAuthLoopbackReceiver {
                 Ok(outcome) => outcome,
                 Err(_error) => continue,
             };
-            let body = match &outcome {
-                CallbackOutcome::Authorized(_) => AUTHORIZED_BODY,
-                CallbackOutcome::Denied { .. } => DENIED_BODY,
-            };
+            let body = callback_page(&outcome);
             // Browser acknowledgement is best effort after the complete callback has been
             // validated. A browser closing the connection must not discard a valid one-time code.
-            let _acknowledgement =
-                write_response(&mut *stream, body, self.bounds, deadline, &cancellation).await;
+            let _acknowledgement = write_response(
+                &mut *stream,
+                body.as_bytes(),
+                self.bounds,
+                deadline,
+                &cancellation,
+            )
+            .await;
             return Ok(outcome);
         }
         Err(OAuthLoopbackError::ConnectionAttemptsExhausted)
     }
+}
+
+fn callback_page(outcome: &CallbackOutcome) -> String {
+    // Only code-owned text enters the page. Callback codes, correlation state, provider errors
+    // and request URLs must never be reflected into the browser acknowledgement.
+    let (heading, detail) = match outcome {
+        CallbackOutcome::Authorized(_) => (
+            "Authorization received",
+            "Return to Market Squawk to finish connecting Schwab.",
+        ),
+        CallbackOutcome::Denied { .. } => (
+            "Authorization not completed",
+            "Return to Market Squawk to try again.",
+        ),
+    };
+    CALLBACK_PAGE
+        .replace("{{heading}}", heading)
+        .replace("{{detail}}", detail)
 }
 
 async fn read_request(
@@ -316,7 +336,7 @@ async fn write_response(
     cancellation: &CancellationToken,
 ) -> Result<(), OAuthLoopbackError> {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
         body.len()
     );
     cancellable_deadline(
