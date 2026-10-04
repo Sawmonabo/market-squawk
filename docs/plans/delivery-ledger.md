@@ -1,6 +1,39 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-03
+## Current execution — 2026-10-04
+
+### Current ownership — 2026-10-04
+
+Audit base: `823a2b0f`. One primary worktree and three local branches; origin additionally retains
+open, unmerged dependency PR #55. No stale agent branch or linked worktree was found.
+
+| Owner | Required outcome and dependency | Exclusive scope | Critical completion evidence |
+| --- | --- | --- | --- |
+| Lead | Deploy the already verified source runtime, then resume the retained stock workflow | Runtime, Git, build scheduling, delivery ledger; source remains frozen during the existing supervised build | Successful replacement, actual workflow/model result and saved restart; fixture success alone is insufficient |
+| Astra High — Schwab failure diagnostics | Preserve the actual failing doctor stage after successful OAuth; diagnosis proved current error mapping loses it | Only `provider_onboarding/schwab_market_doctor_probe.rs` and `schwab_market_doctor.rs`; no builds, provider calls or runtime actions | Failure-only closed stage/family/error diagnostics without payloads or secrets; lead compile and one existing native retry |
+
+The diagnostic build passed in 8m03s and the existing supervisor replaced service/Desktop with
+PIDs 26676/26780. No parallel build or extra runtime was created. A native lifecycle Resume was
+rejected as unauthorized; continuing the existing saved OAuth session refreshed access generation 3
+without new consent and invoked the actual doctor. It now identifies `LevelOneOptions` as the failing
+family (`InvalidProbeEvidence`); no transport/capture diagnostic fired. This narrows the investigation
+but does not establish the failed predicate or working Schwab data. Evidence:
+`schwab-diagnostic-native-{retry,continue}.json` and `source-runtime-dev.log`.
+
+Astra's Alpaca diagnosis is complete: account startup holds global `registry.mutation` across
+configuration resolution, network readiness, publication and cancellation drain. Retry reached route
+selection with 2,769ms remaining and expired there; initial restoration instead expired in subsequent
+calendar preflight. Existing logs cannot attribute earlier time to lock wait versus configuration or
+research storage work. Preserve per-surface start reservation and cleanup ownership, moving slow
+preparation outside global mutation and rechecking registry/authority at publication. This correction
+is pending; no timeout increase or claim of resolved live startup is justified.
+
+Astra now has read-only ownership of the narrowed Schwab options prerequisite: trace all
+`InvalidProbeEvidence` paths before the newly instrumented capture/transport boundary, REST option
+outcome retention and sealed evidence selection. Return the smallest supported correction and
+critical test seam. No edits, builds, provider calls, Git or runtime operations. Lead retains all files.
+Installed-runtime scan removal remains a separate pending implementation checkpoint.
+
 
 ### Editable source runtime — critically verified integration
 
@@ -15,11 +48,24 @@ After correcting the genuine dataset fixture to match the thirteen-feature produ
 all six selected Python checks passed in 23.962s: deterministic native bundle export, deterministic
 ONNX candidate/finalization, partial-input/altered-authority rejection, and all three existing dataset
 PIT/integrity checks. Evidence: `source-runtime-python-export-critical.log`; fixture build 14.05s.
-No production model-validation rule was relaxed. Source/model writers are frozen and lead owns
-integration. The active supervised app remains visible; its watcher is paused during manual checks.
+No production model-validation rule was relaxed. Implementation is pushed as `823a2b0f` and all
+implementation ownership is released. The single supervisor build passed in 7m08s and replaced
+service/Desktop with PIDs 56681/57006 in `generation-8pyQP1`; the prior generation was removed.
+No additional Cargo process remains. Evidence: `source-runtime-dev.log`.
 
-Next: deploy the writer correction through the same supervisor and prove the live stock workflow,
-model admission/inference and saved restart. Remove remaining recurring installed-software scans
+The retained stock workflow resumed through the actual native transport and progressed from eleven
+to twelve completed steps, then paused with `analysis_source_actions_unavailable`. Its actual
+preparation receipt reports unavailable current session, benchmark/selected history and action
+evidence; this attempt did not reach model training. Startup logged failed Alpaca calendar/restoration
+and public crypto startup/shutdown. A normal Alpaca Retry also reached its service deadline, with
+route selection subsequently cancelled. The retained doctor reports quote/history/calendar/WebSocket
+probes available, so invalid credentials or an exhausted provider quota are not established causes.
+Evidence: `source-runtime-live-{resume,progress,preparation}.json`, `source-runtime-alpaca-controls.json` and
+`source-runtime-dev.log`. Desktop remains running; this is a failed live acceptance attempt, not a
+successful analysis/restart claim.
+
+Next: trace source restoration/Retry deadline ownership and repair the first proven failure, then
+prove live model admission/inference and saved restart. Remove remaining recurring installed-software scans
 using the existing installation metadata contract documented in the source-runtime correction report.
 That installed correction, residual own-executable provenance reads, Schwab API/stream qualification
 and remaining provider/UI coverage are unfinished. Schwab saved OAuth refresh succeeded at access

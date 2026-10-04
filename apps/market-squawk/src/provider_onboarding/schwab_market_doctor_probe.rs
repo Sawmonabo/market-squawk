@@ -1435,34 +1435,73 @@ fn observe_streamer_capture(
         .filter(|response| response.service() == service)
         .cloned()
         .collect::<Vec<_>>();
+    let frame_count = capture.streamer_receipt().frame_count();
+    let accumulator_present = accumulator.is_some();
+    let failed = |reason: &'static str, error: SchwabMarketDataDoctorError| {
+        tracing::warn!(
+            stage = "streamer-capture",
+            reason,
+            ?family,
+            ?service,
+            response_count = responses.len(),
+            status_code = ?responses.first().map(|response| response.status_code()),
+            frame_count,
+            accumulator_present,
+            ?error,
+            "Schwab doctor capture validation failed"
+        );
+        error
+    };
     match responses.as_slice() {
         [] => {
-            let mut retained = accumulator
-                .take()
-                .ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
+            let mut retained = accumulator.take().ok_or_else(|| {
+                failed(
+                    "missing-prior-ack",
+                    SchwabMarketDataDoctorError::InvalidProbeEvidence,
+                )
+            })?;
             retained
                 .try_push_data_capture(capture)
-                .map_err(|rejection| map_vertical_error(rejection.error()))?;
-            let handoff = retained.try_finish().map_err(map_vertical_error)?;
-            successful_streamer_handoff_evidence(family, service, &handoff).map(Some)
+                .map_err(|rejection| {
+                    failed("data-capture", map_vertical_error(rejection.error()))
+                })?;
+            let handoff = retained
+                .try_finish()
+                .map_err(|error| failed("data-handoff", map_vertical_error(error)))?;
+            successful_streamer_handoff_evidence(family, service, &handoff)
+                .map_err(|error| failed("handoff-evidence", error))
+                .map(Some)
         }
         [response] if response.status_code() == 0 => {
             if accumulator.is_some() {
-                return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence);
+                return Err(failed(
+                    "duplicate-ack",
+                    SchwabMarketDataDoctorError::InvalidProbeEvidence,
+                ));
             }
             let retained =
                 SchwabStreamerFamilyDoctorAccumulator::try_from_ack_capture(service, capture)
-                    .map_err(|rejection| map_vertical_error(rejection.error()))?;
+                    .map_err(|rejection| {
+                        failed("ack-capture", map_vertical_error(rejection.error()))
+                    })?;
             *accumulator = Some(retained);
             Ok(None)
         }
         [_response] => {
             if accumulator.is_some() {
-                return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence);
+                return Err(failed(
+                    "rejection-after-ack",
+                    SchwabMarketDataDoctorError::InvalidProbeEvidence,
+                ));
             }
-            rejected_streamer_capture_evidence(family, service, &capture).map(Some)
+            rejected_streamer_capture_evidence(family, service, &capture)
+                .map_err(|error| failed("rejection-evidence", error))
+                .map(Some)
         }
-        _ => Err(SchwabMarketDataDoctorError::InvalidProbeEvidence),
+        _ => Err(failed(
+            "multiple-service-responses",
+            SchwabMarketDataDoctorError::InvalidProbeEvidence,
+        )),
     }
 }
 
@@ -1827,6 +1866,11 @@ fn map_token_error(error: TokenAuthorityError) -> SchwabMarketDataDoctorError {
 }
 
 fn map_transport_error(error: SchwabTransportError) -> SchwabMarketDataDoctorError {
+    tracing::warn!(
+        stage = "transport",
+        ?error,
+        "Schwab doctor transport failed"
+    );
     match error {
         SchwabTransportError::Cancelled => SchwabMarketDataDoctorError::Cancelled,
         SchwabTransportError::Deadline => SchwabMarketDataDoctorError::Deadline,

@@ -449,7 +449,11 @@ impl SchwabMarketDoctorFamilyProbeEvidence {
             || input.service.as_deref() != expected_service
             || matches!(
                 input.quote_delay,
-                Some(CoverageDelay::Delayed(0) | CoverageDelay::NotApplicable | CoverageDelay::Unknown)
+                Some(
+                    CoverageDelay::Delayed(0)
+                        | CoverageDelay::NotApplicable
+                        | CoverageDelay::Unknown
+                )
             )
             || input.quote_delay.is_some()
                 && (input.family != SchwabMarketDataFamily::Quotes
@@ -666,7 +670,14 @@ impl SchwabMarketDataDoctorExecutor {
         let preference = self
             .probes
             .user_preference(&authority, cancellation.child_token(), deadline)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    stage = "user-preference",
+                    ?error,
+                    "Schwab doctor probe failed"
+                );
+            })?;
         let (user_preference, user_preference_rate_observation) = match preference {
             SchwabMarketDoctorUserPreferenceOutcome::Available(available) => {
                 if available.token_generation != oauth.generation().get() {
@@ -800,7 +811,14 @@ impl SchwabMarketDataDoctorExecutor {
                 exclusive_expires_at: Timestamp::from_unix_nanos(maximum_expiry),
                 predecessor_digest: binding.predecessor_digest,
             })
-            .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    stage = "final-receipt",
+                    ?error,
+                    "Schwab doctor receipt validation failed"
+                );
+                SchwabMarketDataDoctorError::InvalidProbeEvidence
+            })?;
         Ok(SchwabMarketDataDoctorOutcome::Observed(
             SchwabMarketDataDoctorRun {
                 receipt,
@@ -849,7 +867,15 @@ impl SchwabMarketDataDoctorExecutor {
                     cancellation.child_token(),
                     deadline,
                 )
-                .await?
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        stage = "streamer-family",
+                        ?family,
+                        ?error,
+                        "Schwab doctor probe failed"
+                    );
+                })?
         } else {
             let mut permit = self
                 .acquire_rate(scope, binding, cancellation, deadline)
@@ -870,7 +896,15 @@ impl SchwabMarketDataDoctorExecutor {
                     cancellation.child_token(),
                     deadline,
                 )
-                .await?;
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        stage = "rest-family",
+                        ?family,
+                        ?error,
+                        "Schwab doctor probe failed"
+                    );
+                })?;
             ensure_active(cancellation, deadline)?;
             await_bounded(
                 permit.observe(&evidence.rate_observation, cancellation, deadline),
@@ -1161,7 +1195,12 @@ impl SchwabStreamerRequestPermit for SchwabDoctorStreamerRequestPermit {
     }
 }
 
-const fn map_streamer_rate_error(error: SchwabMarketDataDoctorError) -> SchwabTransportError {
+fn map_streamer_rate_error(error: SchwabMarketDataDoctorError) -> SchwabTransportError {
+    tracing::warn!(
+        stage = "streamer-rate",
+        ?error,
+        "Schwab doctor Streamer rate operation failed"
+    );
     match error {
         SchwabMarketDataDoctorError::Cancelled => SchwabTransportError::Cancelled,
         SchwabMarketDataDoctorError::Deadline => SchwabTransportError::Deadline,
@@ -1387,6 +1426,29 @@ fn require_digest(digest: EvidenceDigest) -> Result<(), SchwabMarketDataDoctorEr
 }
 
 fn map_research_seal_error(error: ResearchServiceError) -> SchwabMarketDataDoctorError {
+    // Research errors can carry paths or nested provider data; retain only fixed variant labels.
+    let cause = match &error {
+        ResearchServiceError::Path(_) => "Path",
+        ResearchServiceError::Catalog(_) => "Catalog",
+        ResearchServiceError::Manifest(_) => "Manifest",
+        ResearchServiceError::ProviderCaptureStore(_) => "ProviderCaptureStore",
+        ResearchServiceError::ProviderCaptureSealWorkerUnavailable => {
+            "ProviderCaptureSealWorkerUnavailable"
+        }
+        ResearchServiceError::Ingest(IngestError::Cancelled) => "IngestCancelled",
+        ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => "IngestDeadlineExceeded",
+        ResearchServiceError::Ingest(_) => "Ingest",
+        ResearchServiceError::ProviderOnboarding(_) => "ProviderOnboarding",
+        ResearchServiceError::Dataset(_) => "Dataset",
+        ResearchServiceError::IngestAuthorityMismatch => "IngestAuthorityMismatch",
+        ResearchServiceError::Rights(_) => "Rights",
+        ResearchServiceError::IdentityOverflow => "IdentityOverflow",
+    };
+    tracing::warn!(
+        stage = "physical-seal",
+        cause,
+        "Schwab doctor capture sealing failed"
+    );
     match error {
         ResearchServiceError::Ingest(IngestError::Cancelled) => {
             SchwabMarketDataDoctorError::Cancelled
