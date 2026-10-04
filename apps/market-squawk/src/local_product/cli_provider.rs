@@ -1663,7 +1663,12 @@ async fn publish_research_activation(
         return Err(error);
     }
     let outcome = match activation_authority
-        .activate_exact_research_profile(&candidate, request, cancellation.clone())
+        .activate_exact_research_profile(
+            &candidate,
+            request,
+            cancellation.clone(),
+            publication_deadline,
+        )
         .await
     {
         Ok(outcome) => outcome,
@@ -2815,7 +2820,12 @@ pub(super) async fn resume_exact_research_provider(
     }
     let expected = prepared.generation.clone();
     let outcome = activation_authority
-        .activate_exact_research_profile(&expected, prepared.request, cancellation.clone())
+        .activate_exact_research_profile(
+            &expected,
+            prepared.request,
+            cancellation.clone(),
+            deadline,
+        )
         .await
         .map_err(CliProviderActivationError::Activation)?;
     let Some(activated_generation) = provider_activation_generation(&outcome) else {

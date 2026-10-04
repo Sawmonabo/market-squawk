@@ -850,6 +850,7 @@ impl ProviderAdapterActivation {
         expected: &ResearchProviderRuntimeGeneration,
         request: ProviderAdapterActivationRequest,
         cancellation: CancellationToken,
+        deadline: Instant,
     ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
         if cancellation.is_cancelled() {
             return Err(ProviderAdapterActivationError::Cancelled);
@@ -859,7 +860,20 @@ impl ProviderAdapterActivation {
         if &candidate != expected {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
-        self.activate_with_lease(lease, request, cancellation).await
+        if matches!(&request, ProviderAdapterActivationRequest::Tiingo(_)) {
+            // Tiingo's local construction may wait for an existing onboarding reader.
+            // Use the publication/resume caller's budget, never a new activation timeout.
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(ProviderAdapterActivationError::Cancelled),
+                () = tokio::time::sleep_until(deadline.into()) => {
+                    Err(tiingo::TiingoProductError::Unavailable.into())
+                }
+                result = self.activate_with_lease(lease, request, cancellation.clone()) => result,
+            }
+        } else {
+            self.activate_with_lease(lease, request, cancellation).await
+        }
     }
 
     /// Reconstructs an adapter only from an already-active durable onboarding lease.
@@ -2672,15 +2686,20 @@ impl ProviderAdapterActivation {
         }
         let secret = self
             .onboarding
-            .read_secret_for_activation_request(&lease, cancellation)
+            .read_secret_for_activation_request(&lease, cancellation.clone())
             .await?;
         let token = market_squawk_adapter_tiingo::TiingoApiToken::try_new(
             secret.expose_secret().to_owned(),
         )
         .map_err(tiingo::TiingoProductError::from)?;
-        self.onboarding
-            .try_acquire_runtime_mutation_authority()?
-            .require_active(&lease)?;
+        let onboarding_authority = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ProviderAdapterActivationError::Cancelled),
+            authority = self.onboarding.acquire_runtime_mutation_authority() => authority,
+        };
+        // Revalidate after waiting, and retain exclusive ownership through registration and
+        // slot publication so a concurrent revoke cannot invalidate the checked generation.
+        onboarding_authority.require_active(&lease)?;
         let authority = tiingo::TiingoProductActivation::try_new(
             lease.clone(),
             spec.metadata,

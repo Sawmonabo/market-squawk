@@ -2,7 +2,87 @@
 
 ## Current execution — 2026-10-03
 
+### Tiingo contention correction — native activation verified
+
+The normal native build contains the two-file Tiingo correction: wait for the existing onboarding
+mutation owner within the caller's cancellation/deadline, then revalidate and retain authority
+through synchronous registration/publication. Native activation now succeeds instead of immediately
+quarantining the valid credential as AdapterRejected. Protected CLI import reused existing saved
+connections and restored only the missing Tiingo credential; no secrets entered React or logs.
+
+Evidence: `credential-reimport-after-tiingo-fix.json`, `tiingo-after-contention-fix.json`, and
+`tiingo-status-after-contention-fix.json` under the current first-stock scratch. At
+2026-10-04T01:58:09Z the new session90aff7d8-7808-44e0-ad7e-b492b655723e is ActiveScoped generation1,
+with saved lifecycle Active and no blocker. This proves installed activation/recovery, not complete
+NAV/history consumption or the full provider product vertical. Lead inspected both affected callers;
+normal native build and the serialized CLI build passed. No CI or new test harness was run.
+
+### Expired Schwab access token blocks its own refresh — confirmed
+
+Read-only protected-state metadata confirms active token generation1: access expired at
+2026-10-04T01:37:42Z, refresh authorization remains valid until 2026-10-11T01:07:42Z.
+At 01:54:57Z the current_receipt validation rejects access expiry before acquisition can refresh it.
+Astra High `native_price_authority` owns the bounded correction in
+`provider_onboarding/schwab_oauth_runtime.rs` and the existing
+`application/research/ingest/provider_runtime.rs` fixture for the uncovered expired-token recovery
+regression. Lead alone owns the affected `local_product/cli_provider.rs` caller/lifecycle response. Preserve the sole protected
+token writer and publication barrier; pure receipt reads remain read-only. No new sign-in is justified.
+Watcher65111 is paused during this source batch; existing native pair stays running.
+
+The full native-set-plus-CLI build finished in7m07s, exit0. Protected CLI bundle import is running
+through the current installed service (handle87870), not React or a second credential store.
+
+### Current connection recovery ownership
+
+Previous goal turn made progress: refreshed native failure/session evidence and corrected the
+ledger's overwritten-evidence/build claims. Current native build handle87418 remains live.
+Lead owns protected CLI import, native checks, source integration and all build/Git actions.
+GPT-6.1 Sol High `source_status_contract` owns a read-only trace of the current Schwab Continue
+rejection, extending only `.agents/tmp/v1-first-stock/source-status-contract.md`. It may inspect
+source and secret-free durable metadata; no credential/token bytes, provider calls, runtime
+mutations or builds. Outcome: identify the first failing gate or exact missing diagnostic.
+The existing startup and last-trade reports are frozen inputs, not completed implementation.
+
+### Matched connection candidate built; startup failure reproduced
+
+The normal single native build passed in 10m08s. Supervisor65099 replaced the prior pair with
+service81133/Desktop81205 under `generation-CyRHEA`; watcher65111 is running. Source candidate is
+`d097b539` plus the frozen Tiingo two-file correction and Schwab doctor permit release. No live
+connection acceptance yet: Desktop's initial attach timed out and shows Workspace unavailable.
+An early native onboarding probe reported unmanaged state while startup continued, not OAuth rejection.
+The one-second process sample `service-startup-candidate.sample.txt` captures
+LocalProduct → open_model_domain → verify_application_training_environment → verify_distributions
+reading/hashing training-runtime files before service readiness. Lead retains the existing runtime;
+no timeout-triggered restart. The initial CLI-only build selected a different dependency feature
+graph and was stopped (exit143). The replacement serialized build selects the normal native binary
+set plus CLI in the same target directory; it is not yet verified. This supports protected credential
+file import without a foreground file picker. No concurrent compiler is scheduled.
+
+GPT-6.1 Sol High `source_status_contract` completed read-only startup dependency tracing in
+`.agents/tmp/v1-first-stock/startup-training-dependency.md`; ownership is released. Both
+open_model_domain and TrainingJobRunner eagerly consume training-environment verification.
+The proposed boundary preserves the real catalog/read image and defers verification to existing
+execution/training admission. No startup implementation change has been made.
+
+After service readiness, native Continue returned connection_setup_rejected; the refreshed
+Schwab session still has a stored candidate credential and runtime_verification_pending.
+This does not prove access-token expiry or an upstream rejection. The previously named
+native-schwab-detached-continue.json was overwritten by a later probe; the original Active
+observation remains in the session tool transcript, not that scratch file. Probe helper outputs
+now require an explicit destination. Current failure: schwab-post-fix-continue.json.
+
 ### Callback presentation verified; Schwab coverage gaps remain open
+
+`d097b539` is pushed; PR #43's existing checkpoint comment is updated. Callback ownership is
+released. Lead now integrates the two connection corrections before the normal single native build.
+In parallel, GPT-6.1 Sol High `source_status_contract` owns read-only tracing of the exact minimal
+Schwab last-trade and watchlist-selection producer/consumer changes; its only writable file is the
+existing `.agents/tmp/v1-first-stock/source-status-contract.md`. No build/runtime/provider calls.
+This supplies the next bounded implementation brief, not a replacement audit or completed feature.
+Tiingo's source handoff is frozen. During the single native rebuild, Astra High
+`native_price_authority` owns a read-only decision on representing provider last-trade snapshots
+without inventing transaction IDs or treating conflated quotes as a full trade tape. It writes only
+`.agents/tmp/v1-first-stock/schwab-last-trade-contract.md`; shared domain/schema edits remain lead-owned.
 
 Lead inspected the received page at 1200×800 and the denied page at an explicitly emulated
 360×800 Chrome viewport; the narrow document is 360px wide with no horizontal overflow.
@@ -42,8 +122,8 @@ The same digest checks/rate limits stay intact. Native sequential doctor complet
 critical proof; no broad fixture scaffold is justified for the one-line lifetime correction.
 
 Native bfb26a27 on the restored supervisor accepted the real browser callback without a pinned-client
-workaround. Continue returned access generation1 and `active`; protected expiry metadata retained in
-`native-schwab-detached-continue.json`. Automatic keychain setup and token exchange are live verified.
+workaround. Continue returned access generation1 and `active` in the recorded native tool response; the
+original scratch observation was subsequently overwritten as disclosed above. Automatic keychain setup and token exchange are live verified.
 The following read-only doctor failed locally with `InvalidRateAuthority` before completing API
 verification. Source bootstrap correctly remains runtime_verification_pending; no quote claim yet.
 
