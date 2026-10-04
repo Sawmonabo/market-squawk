@@ -1301,7 +1301,7 @@ struct CompanyFactEnvelopeKey<'fact> {
     consolidation: u8,
     amendment: u8,
     restatement: u8,
-    occurrence: Option<u32>,
+    // Per-concept revision ordinals belong to facts, not the shared reporting context.
     xbrl_context_identity: Option<&'fact str>,
     filed_on_present: bool,
     filed_on: i32,
@@ -1695,8 +1695,6 @@ fn fact_envelope_key(fact: &CompanyFactProduct) -> CompanyFactEnvelopeKey<'_> {
             CompanyFactRestatement::ReportedNotRestated => 1,
             CompanyFactRestatement::Unavailable => 2,
         },
-        occurrence: (fact.scope == CompanyFactProductScope::CompanyWide)
-            .then_some(fact.reporting_context.occurrence.get()),
         xbrl_context_identity: fact
             .lineage
             .xbrl_identity
@@ -2475,6 +2473,134 @@ mod tests {
                     .filter(|input| input.role() == CompanyRatioInputRole::Numerator)
                     .all(|input| input.fact().metric()
                         == CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests)
+            );
+        }
+
+        // TSLA's comparative quarter has three net-income occurrences but only two
+        // revenue occurrences. Those concept-local revisions do not split one filing.
+        let comparative_end = CalendarDate::new(2024, 9, 30)?;
+        let comparative_period =
+            FundamentalPeriod::duration(CalendarDate::new(2024, 7, 1)?, comparative_end)?;
+        let mut comparative = Vec::new();
+        for (metric, value, ordinal) in [
+            (CompanyFinancialMetric::Revenue, 25_182_000_000, 2),
+            (CompanyFinancialMetric::NetIncome, 2_173_000_000, 3),
+            (
+                CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests,
+                2_189_000_000,
+                2,
+            ),
+        ] {
+            let mut item = fact(
+                metric,
+                value,
+                usd,
+                comparative_period,
+                CalendarDate::new(2025, 10, 23)?,
+                known_at,
+                "0001628280-25-045968",
+                7,
+            )?;
+            item.effective = CompanyProductTime::CalendarDate(comparative_end);
+            item.fiscal_context = CompanyFactFiscalContext {
+                fiscal_year: Some(2025),
+                fiscal_period: CompanyFactFiscalPeriod::ThirdQuarter,
+                cadence: CompanyFactCadence::Quarterly,
+            };
+            item.reporting_context.occurrence = RevisionNumber::new(ordinal)?;
+            comparative.push(item);
+        }
+        let original_comparative = comparative.clone();
+        assert_eq!(
+            fact_envelope_bytes(&comparative[0])?,
+            fact_envelope_bytes(&comparative[1])?
+        );
+        let comparative_ratios = project_basis(&comparative)?;
+        let parent_margin = &comparative_ratios.items()[2];
+        assert_eq!(parent_margin.metric(), CompanyRatioMetric::NetMargin);
+        assert_eq!(parent_margin.state(), CompanyRatioState::Reported);
+        assert_eq!(
+            parent_margin.display_name,
+            "Net margin attributable to parent"
+        );
+        assert_eq!(
+            parent_margin.value(),
+            Some(Decimal::from(2173) / Decimal::from(25182))
+        );
+        assert_eq!(parent_margin.inputs().len(), 2);
+        assert_eq!(parent_margin.inputs()[0].fact(), &comparative[1]);
+        assert_eq!(parent_margin.inputs()[1].fact(), &comparative[0]);
+        assert_eq!(
+            project_financial_envelope(&comparative, true)?[2],
+            serde_json::to_value(parent_margin)?
+        );
+        let comparative_statements = project_statements(
+            &comparative,
+            CompanyProductSectionState::Reported,
+            &mut CompanySerializedBudget::new(),
+        )?;
+        assert_eq!(comparative_statements.groups().len(), 1);
+        assert_eq!(
+            comparative_statements.groups()[0].items().len(),
+            comparative.len()
+        );
+        for original in &original_comparative {
+            assert!(
+                comparative_statements.groups()[0]
+                    .items()
+                    .contains(original)
+            );
+        }
+        assert_eq!(comparative, original_comparative);
+
+        // Removing the unrelated ordinal must not hide conflicting values of one concept,
+        // select a later ordinal itself, or fall back to consolidated income.
+        let mut disagreeing = comparative[1].clone();
+        disagreeing.reporting_context.occurrence = RevisionNumber::new(4)?;
+        disagreeing.value += Decimal::ONE;
+        let mut conflict = comparative.clone();
+        conflict.push(disagreeing);
+        assert_eq!(
+            ratio_states(&project_basis(&conflict)?, CompanyRatioMetric::NetMargin),
+            vec![CompanyRatioState::ConflictingInput]
+        );
+        assert_eq!(
+            project_financial_envelope(&conflict, true)?[2]["state"],
+            "conflicting_input"
+        );
+
+        // The selected revision state, publication, precise period and knowledge clock
+        // still prevent cross-envelope joins even when the source ordinal happens to match.
+        let mut other_revision = comparative[1].clone();
+        other_revision.revision = CompanyProductRevisionState::Superseded;
+        let mut other_publication = comparative[1].clone();
+        other_publication.lineage.publication_identity = [8; 32];
+        let mut other_period = comparative[1].clone();
+        other_period.period =
+            FundamentalPeriod::duration(CalendarDate::new(2024, 1, 1)?, comparative_end)?;
+        let mut other_knowledge = comparative[1].clone();
+        other_knowledge.known_at = Timestamp::from_unix_nanos(known_at.unix_nanos() + 1);
+        for mut other in [
+            other_revision,
+            other_publication,
+            other_period,
+            other_knowledge,
+        ] {
+            other.reporting_context.occurrence = comparative[0].reporting_context.occurrence;
+            assert_ne!(
+                fact_envelope_bytes(&comparative[0])?,
+                fact_envelope_bytes(&other)?
+            );
+            let separate = [comparative[0].clone(), other];
+            assert_eq!(
+                project_financial_envelope(&separate, true),
+                Err(CompanyProductProjectionError::InvalidEvidence)
+            );
+            assert!(
+                project_basis(&separate)?
+                    .items()
+                    .iter()
+                    .all(|ratio| ratio.state() == CompanyRatioState::MissingInput)
             );
         }
 

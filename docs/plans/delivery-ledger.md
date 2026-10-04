@@ -2,6 +2,77 @@
 
 ## Current execution — 2026-10-03
 
+### OAuth/financial correction — critically verified, native pending
+
+TSLA grouping and both Schwab fixes are frozen. One nonincremental, single-job application-library
+compilation completed in4m16s. All three focused checks pass: failed exchange/retry/interrupted
+drain custody; exact filing-envelope financial projection with TSLA unequal concept ordinals;
+and real financial cursor/close binding. The fixture deliberately panics one worker to verify
+its failed join stays retained; the test itself passes. Logs are `schwab-retry-critical.log`,
+`tsla-envelope-critical.log`, and `tsla-cursor-critical.log` under `.agents/tmp/v1-first-stock/`.
+Source formatting and diff checks pass. API readiness
+recheck still returns `connection_setup_rejected`; inspected session has no active generation.
+
+The old runtime has no safe OAuth action that releases its completed failed exchange. After fixed
+binaries are ready, use normal supervised shutdown and retain its expected nonzero failure as
+failure evidence. Verify the actual service/children and rendezvous retire before starting a new
+normal supervisor on the same workspace; do not force termination, delete state or change lock
+policy. No clean-shutdown claim applies to the old defective binary. Native retry requires new
+consent; actual authenticated doctor/quote responses are the next acceptance barrier.
+
+### Schwab failed-exchange recovery — active
+
+The exact local callback was accepted under verified installation-leaf TLS, but the token
+exchange failed; no authenticated API success is established. Lead repaired the existing user
+trust entry by removing its unsupported hostname-policy restriction. Native Begin now remains
+stuck in `exchanging_authorization`: a completed provider error is incorrectly treated as an
+unjoined worker, so Continue never releases the exchange owner. No expired-code cause is proven.
+
+Astra High `native_price_authority` owns `provider_onboarding/schwab_oauth_runtime.rs` and its
+existing inline critical fixture only, to separate worker join from provider outcome, permit safe
+retry, and preserve shutdown/credential lifecycle custody. Its installation trust patch is frozen.
+No builds, Git or runtime operations. Lead owns live OAuth/API validation and serialized integration;
+TSLA's independent frozen patch remains queued for focused verification. No new workspace.
+
+### Schwab callback trust defect — active source continuation
+
+Owner completed browser interaction and requested an API check. Native Continue still returns
+`awaiting_authorization`; Chrome's active tab is `Privacy error` at the exact HTTPS127.0.0.1:8182
+callback, whose listener is service12773. OS `security verify-cert` accepts the installation leaf
+for127.0.0.1, but Chrome does not. No completed OAuth grant/API success is claimed. Keep the callback
+and existing service alive; do not restart or repeat authorization while this is investigated.
+
+Astra High `native_price_authority` owns bounded diagnosis/research of this trust discrepancy and,
+after reporting concrete cause, a minimal correction in `provider_onboarding/schwab_oauth_installation.rs`
+only (lead reserves Desktop bridge/runtime). No builds, runtime/trust mutation, secret/browser URL
+reads or Git. Root alone may complete the already-authorized exact local callback under verified
+installation-certificate trust; that diagnostic recovery does not establish Chrome workflow acceptance.
+TSLA's two-file grouping patch is now frozen; lead inspects and schedules its existing checks while
+OAuth work continues. No other task is paused by the browser issue.
+
+### OAuth authorization and next financial correction
+
+`402209be` is pushed; all three focused checks passed. The single matched native build completed
+in5m46s. The owner explicitly requested Schwab sign-in now: ordinary native OAuth Begin returned
+`awaiting_authorization`. Lead temporarily suspended supervisor27848 before beginning, so compiled
+app replacement cannot interrupt the callback; service12773/Desktop12818 remain running. Watcher
+28250 is also suspended while the next source patch is prepared. No application or OAuth worker
+was stopped. Resume supervisor after authorization settles, then verify the built402209be app.
+
+Parallel ownership: Astra High `research_choice_streaming` corrects the confirmed TSLA same-filing
+ratio grouping, limited to `application/research/company_product.rs`,
+`application/research/investment_financials/{projection,snapshot,page}.rs` only as necessary.
+Preserve original fact occurrence/revision evidence, filing/period/context/unit/PIT boundaries and
+conflicts; shared financial context must not compare independent concept revision ordinals. Reuse
+the existing exact-envelope fixture for genuine cross-concept occurrences plus nonmerge boundaries;
+lead alone schedules checks/builds/Git. No source scope expansion or unrelated ratio redesign.
+The read-isolation page fixture is now committed and released before this assignment.
+
+Lead owns native OAuth continuation, frozen binary replacement, Tiingo retry, shared integration
+and tracked evidence. This current patch does not modify the already built402209be executable.
+Yahoo source-to-screen composition remains required; its precise missing response mapper and
+whole-source selection seams are recorded in the cross-source report.
+
 ### Integration in progress — financial read isolation and Tiingo qualification
 
 The preceding owner-question turn restated known source coverage and made no implementation

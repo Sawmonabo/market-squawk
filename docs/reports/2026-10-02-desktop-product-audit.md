@@ -1,5 +1,24 @@
 # Desktop product audit — 2026-10-02 / current checkpoint 2026-10-03
 
+## Schwab authorization follow-up — 2026-10-03
+
+Owner browser sign-in has not yet established API access. The exact localhost callback was
+blocked by Chrome's certificate interstitial despite macOS hostname verification succeeding.
+Enrollment used a hostname-policy restriction that Chromium ignores; the correction keeps the
+same non-CA, server-auth leaf with sole SAN127.0.0.1 and omits that unsupported trust restriction.
+See [Chromium trust evaluation](https://chromium.googlesource.com/chromium/src/+/main/net/cert/internal/trust_store_mac.cc).
+The exact callback was recovered under verified installation-leaf TLS, but its token exchange
+failed. Expired authorization is not established as the cause. No token/code was retained in
+reports. Native session remains `runtime_verification_pending`, with no active generation.
+
+A separate confirmed local defect retained completed provider failures as unfinished exchanges,
+preventing retry and falsely failing shutdown custody. The pending correction separates joined
+worker completion from the protected authority result across lifecycle consumers. It preserves
+unfinished/failed worker ownership and durable reconciliation; a fresh Begin uses fresh consent.
+Source inspection, formatting and the focused failed-exchange/custody regression pass. The
+TSLA exact-envelope and financial cursor checks also pass in the same compiled candidate.
+Native/API verification remains pending; source coverage and browser authorization are not closed.
+
 ## Matched native follow-up — `935b3b65`
 
 This follow-up supersedes the affected failures in the historical baseline below; it does not

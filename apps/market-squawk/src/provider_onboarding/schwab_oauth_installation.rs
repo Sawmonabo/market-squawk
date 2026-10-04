@@ -211,7 +211,7 @@ impl InstallationSchwabOAuthIdentity {
             .join(CERTIFICATE_FILE)
     }
 
-    /// Checks the actual user-domain SSL trust for the exact certificate and hostname.
+    /// Checks exact-host SSL trust and excludes hostname-scoped trust unsupported by Chromium.
     pub(crate) async fn trust_state(
         &self,
         cancellation: CancellationToken,
@@ -219,20 +219,34 @@ impl InstallationSchwabOAuthIdentity {
         verify_security_tool_path()?;
         #[cfg(target_os = "macos")]
         {
-            let mut command = Command::new(SECURITY_TOOL);
-            command
-                .args(["verify-cert", "-c"])
-                .arg(self.certificate_path())
-                .args(["-p", "ssl", "-n", CALLBACK_HOST, "-L", "-q"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            let status = run_security_tool(command, TRUST_STATUS_TIMEOUT, cancellation).await?;
-            return Ok(if status.success() {
-                SchwabOAuthInstallationTrustState::Trusted
-            } else {
-                SchwabOAuthInstallationTrustState::SetupRequired
-            });
+            let deadline = tokio::time::Instant::now() + TRUST_STATUS_TIMEOUT;
+            // Chromium ignores kSecTrustSettingsPolicyString even when macOS accepts the
+            // requested hostname. macOS's SSL evaluation without a name cannot match that
+            // restricted trust record. Require both evaluations; the second does not replace
+            // the first's hostname check. Both are local and share the original status budget.
+            for hostname in [Some(CALLBACK_HOST), None] {
+                let mut command = Command::new(SECURITY_TOOL);
+                command
+                    .args(["verify-cert", "-c"])
+                    .arg(self.certificate_path())
+                    .args(["-p", "ssl", "-L", "-q"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if let Some(hostname) = hostname {
+                    command.args(["-n", hostname]);
+                }
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(SchwabOAuthInstallationCapabilityError::TrustTimeout)?;
+                let status =
+                    run_security_tool(command, remaining, cancellation.child_token()).await?;
+                if !status.success() {
+                    return Ok(SchwabOAuthInstallationTrustState::SetupRequired);
+                }
+            }
+            return Ok(SchwabOAuthInstallationTrustState::Trusted);
         }
         #[cfg(not(target_os = "macos"))]
         Err(SchwabOAuthInstallationCapabilityError::UnsupportedPlatform)
@@ -251,16 +265,11 @@ impl InstallationSchwabOAuthIdentity {
         #[cfg(target_os = "macos")]
         {
             let mut command = Command::new(SECURITY_TOOL);
+            // Trust only this non-CA, server-auth leaf whose sole SAN is 127.0.0.1. Do not
+            // add a hostname policy string: Chromium ignores that entire trust record.
+            // The issuer is never installed and this transition preserves the server identity.
             command
-                .args([
-                    "add-trusted-cert",
-                    "-r",
-                    "trustAsRoot",
-                    "-p",
-                    "ssl",
-                    "-s",
-                    CALLBACK_HOST,
-                ])
+                .args(["add-trusted-cert", "-r", "trustAsRoot", "-p", "ssl"])
                 .arg(self.certificate_path())
                 .stdin(Stdio::null());
             let status = match run_security_tool(

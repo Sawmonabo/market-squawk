@@ -14,11 +14,12 @@ use super::super::{
     company_research::{CanonicalResearchReadError, company_source_row},
 };
 
-/// Advance this domain version whenever display omission, grouping or time semantics change.
+/// Change this domain whenever display omission, grouping or time semantics change.
 pub(crate) fn financial_display_identity() -> EvidenceDigest {
     EvidenceDigest::new(
         DigestAlgorithm::Sha256,
-        Sha256::digest(b"market-squawk/investment-financial-display/operand-relevance/v1\0").into(),
+        Sha256::digest(b"market-squawk/investment-financial-display/filing-reporting-context/v1\0")
+            .into(),
     )
 }
 
