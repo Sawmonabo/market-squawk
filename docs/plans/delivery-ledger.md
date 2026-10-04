@@ -2,6 +2,68 @@
 
 ## Current execution — 2026-10-03
 
+### Source training export — dataset repaired, validator diagnosis
+
+The corrected empty-writer admission now lets the genuine dataset fixture complete (1/1 passed
+in `source-runtime-dataset-critical.log`, 1.11s). Production memory limits are unchanged; the
+fixture's workspace matches its existing 21-column dataset. Of the three
+existing Python training/export checks, partial-input/altered-authority rejection passes; deterministic
+bundle export and ONNX driver finalization reach the Rust validator and are rejected. Log:
+`source-runtime-python-export-critical.log`. These are unresolved failures, not training acceptance.
+Astra `deferred_model_startup` has read-only ownership of the validator/admission call graph to
+identify the next failed boundary; lead alone runs the focused diagnostic, builds and runtime.
+No additional implementation lane starts before this checkpoint is integrated.
+
+The validator trace identified stale test producers: they request only the price-return feature,
+but the production recipe requires price return plus all 12 macro features. Their two training
+examples also cannot fit that recipe. Correct the existing fixture and its consumers together;
+do not relax production feature admission or replace the real training/export checks.
+
+One worktree and the three intended local branches are present. Origin's extra branch is the active
+unmerged Dependabot PR #55 (`crc32fast` 1.5.2); its unique change is preserved, not treated as stale
+agent work. The local bundle-backup remote remains recovery evidence. No branch was created.
+
+### Source runtime verification — editable environment refreshed
+
+The managed editable Python/native refresh completed successfully in7m41s using the existing dev
+target. A fresh isolated Python import resolves the checkout and reports native build revision
+`development-v0.1.0-1539-g4c53d8cf-dirty`, with `development-unsealed-v1` provenance. This proves
+editable import, not training or installed completion. The previous explanation-only turn made no
+implementation progress; this continuation resumed the concrete build/verification dependency.
+
+Lead is compiling the current service, Desktop, relay, capture and model helpers through the same
+supervisor build method, single-job, while the prior visible app remains running. Evidence log:
+`source-runtime-native-build.log`. All source writers remain frozen. The managed descriptor and
+training/export checks follow successful helper compilation; native deployment follows those checks.
+The installed-runtime dependency trace is complete; implementation remains pending until this
+coherent source checkpoint is integrated. No extra worktree, runtime or target directory was created.
+
+The native build passed in8m56s. Configuration isolation and editable provenance checks passed.
+The three training/export checks require the existing `publication_recovery` dataset fixture,
+currently rebuilding serially after cleanup; their first invocation stopped at missing fixture setup.
+Astra `deferred_model_startup` has one read-only integration question while that compiles: trace
+whether the new source ONNX generation identity is compatible with saved-model restart/candidate
+admission, and return the concrete consumer evidence or defect. No source edits, report expansion,
+builds, runtime actions or Git. Lead retains all files and resumes the actual export/driver checks.
+
+The ONNX generation trace found no persisted cross-generation comparison; lead inspected its
+runtime-evidence and stored-policy consumers. The export checks now reach the real dataset producer
+but fail there with `WriterMemoryLimitExceeded { limit: 1025404 }`. Astra's next bounded diagnosis
+owns only `crates/market-squawk-data/tests/publication_recovery/python_training_fixture.rs` and
+the existing `closed_price_return_request_for_fixture` helper in `tests/publication_recovery.rs`
+if a stale verification budget is proved. Trace the encoder's minimum working memory first; do not
+raise production limits or bypass admission. A product defect requires an evidence handoff before
+any broader edit. No build/test/Git/runtime actions. Lead retains the source runtime and all builds.
+
+The single fixture diagnosis recorded an empty encoder (`buffered_rows=0`, `writer_bytes=0`),
+388,532 input bytes, 1,819,184 active bytes and 2,684,912 footer/metadata bytes: a false extra
+byte-split footer reservation makes 4,892,628 required exceed4,171,132. The exact Parquet58.3 writer
+does not byte-split an empty row group; the existing row-count allowance already covers these slices.
+Astra now owns only `src/parquet_store/streaming.rs` to correct that empty-writer calculation,
+retaining nonempty-group bounds and actual memory checks. The existing genuine dataset fixture
+and training/export checks cover this reproduced integrity/workflow failure; no new test suite.
+Lead owns removal of the temporary test-only tracing observer and all rebuilds/runtime integration.
+
 ### Listing revalidation — critically verified checkpoint
 
 The two-file Nasdaq correction uses one shared successful-receipt expiry calculation in current

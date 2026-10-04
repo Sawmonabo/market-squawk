@@ -401,14 +401,20 @@ impl WriterState {
         // bounds those extra groups by ceil(2 * encoded_bytes / target). A nonempty group
         // also consumes a row, so incoming row count is an independent upper bound. Existing
         // row-count/partial-group accounting below covers groups below the half-target.
-        let byte_groups = self
-            .writer
-            .in_progress_size()
-            .checked_add(admission.active_writer_bytes)
-            .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_add(self.row_group_bytes - 1))
-            .map(|bytes| (bytes / self.row_group_bytes).min(batch.num_rows()))
-            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let byte_groups = if self.writer.in_progress_rows() == 0 {
+            // Parquet 58.3 only splits by estimated bytes when rows are already buffered.
+            // Our write slices at the row-count limit, so an empty writer produces at most
+            // the row-count groups already included in admission.metadata_bytes.
+            0
+        } else {
+            self.writer
+                .in_progress_size()
+                .checked_add(admission.active_writer_bytes)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_add(self.row_group_bytes - 1))
+                .map(|bytes| (bytes / self.row_group_bytes).min(batch.num_rows()))
+                .ok_or(ParquetStoreError::SizeOverflow)?
+        };
         let metadata_bytes = retained_groups
             .checked_add(byte_groups)
             .and_then(|groups| groups.checked_mul(per_group))

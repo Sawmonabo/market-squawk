@@ -11715,7 +11715,14 @@ fn closed_price_return_request_for_fixture(
         8,
         feature_dataset_macro_components_v1().len() + 2,
         if training { 128 } else { 64 },
-        4 * 1024 * 1024,
+        // The six-example export repeats its PIT epoch in the 21-column production schema.
+        // After candidate-store reservation, 4 MiB total leaves about 1 MiB for Parquet,
+        // below this fixture's input/encoding workspace. Reserve about 4 MiB for the writer.
+        if training {
+            16 * 1024 * 1024
+        } else {
+            4 * 1024 * 1024
+        },
         Duration::from_secs(5),
         PointInTimeLimits::try_new(128, 128, 8, 128, 1024 * 1024)?,
         UniverseLimits::try_new(16, 1024 * 1024)?,
