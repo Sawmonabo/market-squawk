@@ -2961,7 +2961,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let session = Uuid::new_v4();
         let (oauth, _, reference) =
-            scripted_market_authority(directory.path().join("renewal"), session, 1_800, 60).await?;
+            scripted_market_authority(directory.path().join("renewal"), session, 1_800, 60, 0)
+                .await?;
         let (_, epoch) =
             SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
         let prior_doctor = doctor_receipt(session, digest(31), digest(32), epoch.receipt())?;
@@ -3133,9 +3134,14 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let session_id = Uuid::new_v4();
-        let (oauth, wire, secret_reference) =
-            scripted_market_authority(directory.path().join("stable-oauth"), session_id, 1_800, 60)
-                .await?;
+        let (oauth, wire, secret_reference) = scripted_market_authority(
+            directory.path().join("stable-oauth"),
+            session_id,
+            1_800,
+            60,
+            0,
+        )
+        .await?;
         let (token, epoch) =
             SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
         let oauth_receipt = epoch.receipt();
@@ -3178,9 +3184,14 @@ mod tests {
             })
         ));
 
-        let (rotating, rotating_wire, _secret_reference) =
-            scripted_market_authority(directory.path().join("rotating-oauth"), session_id, 30, 300)
-                .await?;
+        let (rotating, rotating_wire, _secret_reference) = scripted_market_authority(
+            directory.path().join("rotating-oauth"),
+            session_id,
+            30,
+            300,
+            0,
+        )
+        .await?;
         let mut quote_dispatches = 0_u8;
         let attempt =
             SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&rotating, 1).await;
@@ -3193,6 +3204,63 @@ mod tests {
         ));
         assert_eq!(rotating_wire.exchange_count(), 2);
         assert_eq!(quote_dispatches, 0);
+
+        // Restored access expiry must reach the sole writer's refresh path before doctor
+        // admission. Pure receipt inspection remains read-only and rejects the expired epoch.
+        let (expired, expired_wire, _) = scripted_market_authority(
+            directory.path().join("expired-bootstrap"),
+            session_id,
+            30,
+            60,
+            60,
+        )
+        .await?;
+        let prior = expired.issued_receipt();
+        assert!(expired.current_receipt().await.is_err());
+        assert_eq!(expired_wire.exchange_count(), 1);
+        expired_wire.refresh_release.try_acquire()?.forget();
+        let mut bootstrap = Box::pin(expired.prepare_test_bootstrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = expired_wire.refresh_started.notified() => Ok(()),
+                _result = &mut bootstrap => Err("bootstrap completed before held refresh"),
+            }
+        })
+        .await??;
+        // The response waiter may time out while the retained operation still owns rotation.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut bootstrap)
+                .await
+                .is_err()
+        );
+        assert_eq!(expired_wire.exchange_count(), 2);
+        assert!(
+            expired
+                .receipt_currentness()
+                .validate_current_receipt(prior)
+                .is_err()
+        );
+        expired_wire.refresh_release.add_permits(1);
+        let refreshed = tokio::time::timeout(Duration::from_secs(5), bootstrap).await??;
+        assert_eq!(refreshed.generation().get(), 2);
+        assert_eq!(expired.current_receipt().await?, refreshed);
+        assert_eq!(expired.prepare_test_bootstrap().await?, refreshed);
+        assert_eq!(
+            expired_wire.exchange_count(),
+            2,
+            "current bootstrap exchanged again"
+        );
+        assert!(
+            expired
+                .receipt_currentness()
+                .validate_current_receipt(prior)
+                .is_err()
+        );
+        assert!(matches!(
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&expired, 1).await,
+            Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
+        ));
+        assert_eq!(expired_wire.exchange_count(), 2);
         Ok(())
     }
 
@@ -3224,6 +3292,8 @@ mod tests {
     struct ScriptedSchwabOAuthWire {
         initial_lifetime_seconds: u64,
         exchanges: AtomicUsize,
+        refresh_started: tokio::sync::Notify,
+        refresh_release: tokio::sync::Semaphore,
     }
 
     impl ScriptedSchwabOAuthWire {
@@ -3245,6 +3315,14 @@ mod tests {
         > {
             Box::pin(async move {
                 let attempt = self.exchanges.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    self.refresh_started.notify_one();
+                    self.refresh_release
+                        .acquire()
+                        .await
+                        .map_err(|_| SchwabOAuthWireError::Protocol)?
+                        .forget();
+                }
                 let body = match attempt {
                     0 => format!(
                         r#"{{"access_token":"initial-access","refresh_token":"initial-refresh","token_type":"Bearer","expires_in":{},"scope":"market-data"}}"#,
@@ -3265,6 +3343,7 @@ mod tests {
         session_id: Uuid,
         initial_lifetime_seconds: u64,
         refresh_early_seconds: u64,
+        issued_seconds_ago: u64,
     ) -> Result<
         (
             SchwabOAuthMarketAuthority,
@@ -3297,12 +3376,14 @@ mod tests {
         let wire = Arc::new(ScriptedSchwabOAuthWire {
             initial_lifetime_seconds,
             exchanges: AtomicUsize::new(0),
+            refresh_started: tokio::sync::Notify::new(),
+            refresh_release: tokio::sync::Semaphore::new(1),
         });
         let authority = Arc::new(
             ProtectedSchwabOAuthAuthority::try_open(
                 root.join("authority"),
                 SchwabOAuthAuthorityConfiguration::try_new(
-                    secrets,
+                    secrets.clone(),
                     wire.clone(),
                     application_credential.clone(),
                     SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)?,
@@ -3321,10 +3402,34 @@ mod tests {
             CallbackOutcome::Authorized(callback) => callback,
             CallbackOutcome::Denied { .. } => return Err("test callback was denied".into()),
         };
-        let issued_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .checked_sub(issued_seconds_ago)
+            .ok_or("fixture issuance underflow")?;
         let receipt = authority
             .complete_authorization(&callback, issued_at, SchwabOAuthInteraction::Background)
             .await?;
+        let authority = if issued_seconds_ago > 0 {
+            drop(authority);
+            Arc::new(
+                ProtectedSchwabOAuthAuthority::try_open(
+                    root.join("authority"),
+                    SchwabOAuthAuthorityConfiguration::try_new(
+                        secrets,
+                        wire.clone(),
+                        application_credential.clone(),
+                        SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)?,
+                        parse_bounds(),
+                        AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1)),
+                        refresh_early_seconds,
+                    )?,
+                )
+                .await?,
+            )
+        } else {
+            authority
+        };
         Ok((
             SchwabOAuthMarketAuthority::from_test_authority(
                 session_id,

@@ -269,7 +269,7 @@ impl SchwabOAuthRuntime {
         }
     }
 
-    /// Issues a bounded market-data token authority only from an active exact OAuth session.
+    /// Prepares a current market-data token authority, supervising any required token refresh.
     pub(crate) async fn market_authority(
         &self,
         session_id: Uuid,
@@ -278,7 +278,7 @@ impl SchwabOAuthRuntime {
         let _operation = self.admit_operation()?;
         let mut sessions = self.lock_sessions(&cancellation).await?;
         let session = self
-            .ensure_session(&mut sessions, session_id, cancellation)
+            .ensure_session(&mut sessions, session_id, cancellation.clone())
             .await?;
         if session
             .exchange
@@ -288,19 +288,33 @@ impl SchwabOAuthRuntime {
             return Err(SchwabOAuthRuntimeError::AuthorizationExchangeInFlight);
         }
         if session.exchange.is_some() {
-            let _outcome = PendingTokenExchange::finish(&mut session.exchange).await?;
+            PendingTokenExchange::finish(&mut session.exchange).await??;
         }
-        let authority = &session.authority;
         let status = session.status().await?;
         let SchwabOAuthAuthorityStatus::Active(receipt) = status else {
             return Err(SchwabOAuthRuntimeError::ReauthorizationRequired);
         };
-        Ok(SchwabOAuthMarketAuthority {
+        let mut authority = SchwabOAuthMarketAuthority {
             session_id,
             issued_receipt: receipt,
-            authority: Arc::clone(authority),
+            authority: Arc::clone(&session.authority),
             currentness: Arc::clone(&session.market_epoch),
-        })
+        };
+        if cancellation.is_cancelled() || self.shutdown.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::Cancelled);
+        }
+        // Access expiry is not refresh expiry. Acquire before requiring a current receipt,
+        // through the same sole writer/publication barrier used by market requests. Retain
+        // the actual task before awaiting: a timed-out portal must not drop a remote rotation.
+        session.exchange = Some(PendingTokenExchange::market_bootstrap(authority.clone()));
+        let receipt = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(SchwabOAuthRuntimeError::Cancelled),
+            () = self.shutdown.cancelled() => return Err(SchwabOAuthRuntimeError::ShuttingDown),
+            outcome = PendingTokenExchange::finish(&mut session.exchange) => outcome??,
+        };
+        authority.issued_receipt = receipt;
+        Ok(authority)
     }
 
     /// Stops new lifecycle admission and cancels every pending callback receiver.
@@ -497,7 +511,11 @@ impl SchwabOAuthRuntime {
         }
         let status = session.status().await?;
         if let SchwabOAuthAuthorityStatus::Active(receipt) = status {
-            return active_view(session_id, SchwabOAuthLifecycleAction::Begin, receipt);
+            return SchwabOAuthLifecycleView::active(
+                session_id,
+                SchwabOAuthLifecycleAction::Begin,
+                receipt,
+            );
         }
 
         let state = oauth_state()?;
@@ -581,7 +599,11 @@ impl SchwabOAuthRuntime {
             session
                 .market_epoch
                 .observe_status(SchwabOAuthAuthorityStatus::Active(receipt))?;
-            return active_view(session_id, SchwabOAuthLifecycleAction::Continue, receipt);
+            return SchwabOAuthLifecycleView::active(
+                session_id,
+                SchwabOAuthLifecycleAction::Continue,
+                receipt,
+            );
         }
         let Some(pending) = session.pending.as_ref() else {
             let status = session.status().await?;
@@ -633,6 +655,7 @@ impl SchwabOAuthRuntime {
                                 SchwabOAuthInteraction::Foreground,
                             )
                             .await
+                            .map_err(Into::into)
                     }),
                 });
                 Ok(exchanging_view(
@@ -688,7 +711,11 @@ impl SchwabOAuthRuntime {
         }
         let status = session.status().await?;
         if let SchwabOAuthAuthorityStatus::Active(receipt) = status {
-            return active_view(session_id, SchwabOAuthLifecycleAction::Cancel, receipt);
+            return SchwabOAuthLifecycleView::active(
+                session_id,
+                SchwabOAuthLifecycleAction::Cancel,
+                receipt,
+            );
         }
         Ok(SchwabOAuthLifecycleView::new(
             session_id,
@@ -1299,10 +1326,10 @@ struct PendingAuthorization {
 }
 
 struct PendingTokenExchange {
-    task: JoinHandle<Result<SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityError>>,
+    task: JoinHandle<Result<SchwabOAuthAuthorityReceipt, SchwabOAuthRuntimeError>>,
     joined: Option<
         Result<
-            Result<SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityError>,
+            Result<SchwabOAuthAuthorityReceipt, SchwabOAuthRuntimeError>,
             tokio::task::JoinError,
         >,
     >,
@@ -1322,14 +1349,22 @@ impl PendingAuthorization {
 }
 
 impl PendingTokenExchange {
+    fn market_bootstrap(authority: SchwabOAuthMarketAuthority) -> Self {
+        Self {
+            joined: None,
+            task: tokio::spawn(async move {
+                let (_token, epoch) = authority.acquire_publication_attempt().await?;
+                Ok(epoch.receipt())
+            }),
+        }
+    }
+
     /// Removes only an actually joined operation. Its domain outcome remains separate so
     /// Continue can report failure while retry, unlink and shutdown retain correct custody.
     async fn finish(
         retained: &mut Option<Self>,
-    ) -> Result<
-        Result<SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityError>,
-        SchwabOAuthRuntimeError,
-    > {
+    ) -> Result<Result<SchwabOAuthAuthorityReceipt, SchwabOAuthRuntimeError>, SchwabOAuthRuntimeError>
+    {
         retained
             .as_mut()
             .ok_or(SchwabOAuthRuntimeError::InvalidState)?
@@ -1345,7 +1380,7 @@ impl PendingTokenExchange {
             .take()
             .ok_or(SchwabOAuthRuntimeError::InvalidState)?
             .map_err(|_| SchwabOAuthRuntimeError::ExchangeTask)?;
-        if let Err(error) = &outcome {
+        if let Err(SchwabOAuthRuntimeError::Authority(error)) = &outcome {
             // Fixed labels only: nested provider/transport/store errors are never formatted.
             let category = match error {
                 SchwabOAuthAuthorityError::InvalidConfiguration => "invalid_configuration",
@@ -1370,7 +1405,12 @@ impl PendingTokenExchange {
                 SchwabOAuthAuthorityError::Secret(_) => "protected_store",
                 SchwabOAuthAuthorityError::State(_) => "durable_state",
             };
-            tracing::warn!(category, "Schwab OAuth authorization exchange failed");
+            tracing::warn!(category, "Schwab OAuth token operation failed");
+        } else if outcome.is_err() {
+            tracing::warn!(
+                category = "market_authority",
+                "Schwab OAuth token operation failed"
+            );
         }
         Ok(outcome)
     }
@@ -1419,6 +1459,14 @@ pub(crate) struct SchwabOAuthMarketAuthority {
 }
 
 impl SchwabOAuthMarketAuthority {
+    #[cfg(test)]
+    pub(crate) async fn prepare_test_bootstrap(
+        &self,
+    ) -> Result<SchwabOAuthAuthorityReceipt, SchwabOAuthRuntimeError> {
+        let mut retained = Some(PendingTokenExchange::market_bootstrap(self.clone()));
+        PendingTokenExchange::finish(&mut retained).await?
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_authority(
         session_id: Uuid,
@@ -1698,7 +1746,9 @@ fn lifecycle_view(
             None,
             None,
         )),
-        SchwabOAuthAuthorityStatus::Active(receipt) => active_view(session_id, action, receipt),
+        SchwabOAuthAuthorityStatus::Active(receipt) => {
+            SchwabOAuthLifecycleView::active(session_id, action, receipt)
+        }
         SchwabOAuthAuthorityStatus::ReauthorizationRequired => Ok(SchwabOAuthLifecycleView::new(
             session_id,
             action,
@@ -1724,23 +1774,25 @@ fn exchanging_view(
     )
 }
 
-fn active_view(
-    session_id: Uuid,
-    action: SchwabOAuthLifecycleAction,
-    receipt: SchwabOAuthAuthorityReceipt,
-) -> Result<SchwabOAuthLifecycleView, SchwabOAuthRuntimeError> {
-    Ok(SchwabOAuthLifecycleView::new(
-        session_id,
-        action,
-        SchwabOAuthLifecycleState::Active,
-        Some(receipt.generation().get()),
-        Some(timestamp_from_unix_seconds(
-            receipt.access_expires_at_unix_seconds(),
-        )?),
-        Some(timestamp_from_unix_seconds(
-            receipt.refresh_expires_at_unix_seconds(),
-        )?),
-    ))
+impl SchwabOAuthLifecycleView {
+    pub(crate) fn active(
+        session_id: Uuid,
+        action: SchwabOAuthLifecycleAction,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<SchwabOAuthLifecycleView, SchwabOAuthRuntimeError> {
+        Ok(SchwabOAuthLifecycleView::new(
+            session_id,
+            action,
+            SchwabOAuthLifecycleState::Active,
+            Some(receipt.generation().get()),
+            Some(timestamp_from_unix_seconds(
+                receipt.access_expires_at_unix_seconds(),
+            )?),
+            Some(timestamp_from_unix_seconds(
+                receipt.refresh_expires_at_unix_seconds(),
+            )?),
+        ))
+    }
 }
 
 fn oauth_state() -> Result<Zeroizing<String>, SchwabOAuthRuntimeError> {
@@ -1875,7 +1927,7 @@ mod tests {
             task: tokio::spawn(async move {
                 let _ = entered.send(());
                 let _ = completion.await;
-                Err(SchwabOAuthAuthorityError::ProviderRejected)
+                Err(SchwabOAuthAuthorityError::ProviderRejected.into())
             }),
             joined: None,
         });
@@ -1893,20 +1945,26 @@ mod tests {
         let outcome = PendingTokenExchange::finish(&mut retained).await?;
         assert!(matches!(
             outcome,
-            Err(SchwabOAuthAuthorityError::ProviderRejected)
+            Err(SchwabOAuthRuntimeError::Authority(
+                SchwabOAuthAuthorityError::ProviderRejected
+            ))
         ));
         assert!(retained.is_none());
 
         // The same session slot now admits a fresh explicit attempt; the prior outcome is not
         // mistaken for running work or reused as a callback. A completed rejection drains too.
         retained = Some(PendingTokenExchange {
-            task: tokio::spawn(async { Err(SchwabOAuthAuthorityError::ReauthorizationRequired) }),
+            task: tokio::spawn(async {
+                Err(SchwabOAuthAuthorityError::ReauthorizationRequired.into())
+            }),
             joined: None,
         });
         let drained = PendingTokenExchange::finish(&mut retained).await?;
         assert!(matches!(
             drained,
-            Err(SchwabOAuthAuthorityError::ReauthorizationRequired)
+            Err(SchwabOAuthRuntimeError::Authority(
+                SchwabOAuthAuthorityError::ReauthorizationRequired
+            ))
         ));
         assert!(retained.is_none());
 

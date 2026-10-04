@@ -2506,6 +2506,8 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .current_receipt()
             .await
             .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
+        let view = SchwabOAuthLifecycleView::active(session_id, action, current)
+            .map_err(map_schwab_oauth_error)?;
         let preparation = self
             .onboarding
             .prepare_schwab_market_doctor_run(

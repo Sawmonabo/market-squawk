@@ -2,6 +2,75 @@
 
 ## Current execution — 2026-10-03
 
+### Schwab refresh correction — critically verified checkpoint
+
+The focused app-library command completed in11m37s; all four selected checks passed in10.62s.
+Evidence: `.agents/tmp/v1-first-stock/deferred-startup-oauth-critical.log`. Expired-access bootstrap
+reaches the existing protected refresh writer, preserves interrupted exchange custody, reports the
+new receipt generation, and refuses old doctor authority. The sequential API doctor now releases
+its settled preference-request permit before acquiring the next request permit. Existing native
+consent remains reusable; no new browser sign-in is requested by this correction.
+
+Lead inspected the four source files and their affected lifecycle/doctor callers; this checkpoint
+includes only the independent Schwab correction plus this ledger. Live refreshed OAuth, sequential
+API success and full live-feed coverage remain unverified on the rebuilt native app. The passing
+model-catalog/failed-training cases cover the current pending startup candidate only; they do not
+accept the newly requested source-development environment correction. All startup WIP is retained.
+
+### Development runtime correction — owner direction, 2026-10-03
+
+The owner challenged recurring signed-release/file scans for trusted local development. The prior
+turn made progress through source integration, callsite inspection and a live focused compilation;
+it did not establish startup or training success. Moving the scan to first training use is not the
+complete development correction. Preserve the current source candidate until it is reconciled.
+
+Astra High `deferred_model_startup` owns a read-only follow-up tracing existing source-development
+Python setup, runner/native extension and candidate validation. Return the smallest canonical
+source-mode contract using tracked code/locked dependencies/version provenance without requiring
+our signed shipping environment; retain real model/data integrity and installed-release provenance.
+Writable report only: `.agents/tmp/v1-first-stock/development-model-runtime-correction.md`.
+No edits/builds/runtime/Git; lead retains all source, docs, Git and compilation until exact ownership
+is reassigned. Schwab token/doctor fixes are independent and proceed through the existing focused
+check. Do not silently present a development run as signed installed-release evidence.
+
+### Parallel integration wave — live connections and responsive startup
+
+| Owner | Outcome / dependency | Exclusive files | Critical evidence / integration order |
+| --- | --- | --- | --- |
+| Lead | Native Tiingo activation accepted; integrate Schwab supervised refresh and sequential API proof | CLI provider caller, provider doctor, all composition/contracts/docs/Git/build/runtime | Tiingo pushed2f659a46; then one frozen Schwab source batch and native proof |
+| Astra High `native_price_authority` | Expired access recovers from valid refresh without losing token custody on client timeout | `provider_onboarding/schwab_oauth_runtime.rs`, existing `application/research/ingest/provider_runtime.rs` fixture | Existing token/epoch and drain coverage plus one expired-token case; handoff before lead compilation |
+| Astra High `deferred_model_startup` | Open real saved model catalog without eagerly scanning optional training environment; verify before model execution/training | `application/model/runtime.rs`, `application/model/runtime/inventory.rs`, `application/model/backup.rs`, `jobs/training.rs`, `jobs/training/prepared.rs`, `crates/market-squawk-modeling/src/training_environment.rs`, `service/tool_services/training_preparation.rs`, `service/forecast_preparation/fiscal.rs`, `service/historical_study.rs` | Depends on frozen startup report; propose composition signature first; lead owns `local_product/mod.rs` and `jobs/mod.rs`; no compile/runtime actions; integrate after connection batch |
+
+GPT-6.1 Sol High `source_status_contract` separately traces the live repeated Nasdaq-reference
+failure blocking Alpaca reconnect (acceptance1/5), read-only source and secret-free current evidence.
+It writes only `.agents/tmp/v1-first-stock/market-reference-reconnect.md`. Outcome: first failing
+reference/currentness edge and smallest existing authoritative recovery, no inferred stale-data
+acceptance, source edits, build/process/provider mutations, or broad provider audit.
+
+Both source lanes are frozen and ownership released. Lead inspected the changed producer/consumer
+paths and is running one serialized app-library compilation selecting four critical cases: expired
+Schwab access/epoch, retained OAuth exchange custody, deferred model catalog/admission, and failed
+training process publication. The existing modeling program-identity case follows. Native deployment
+and first-use training remain unverified. No extra branches/worktrees, full CI or review round.
+
+The Nasdaq trace confirmed successful full downloads of unchanged official directory bodies. A
+publication-age gate rejects them despite fresh retrieval, blocking Alpaca reconnect. The proposed
+next bounded correction uses sealed current-directory revalidation time consistently for snapshot
+and listing approval while preserving original publication/PIT clocks. Report and primary-source
+links: `.agents/tmp/v1-first-stock/market-reference-reconnect.md`; no source change accepted yet.
+
+Lead composition also owns `application/model.rs`'s shutdown hook and the modeling crate's
+`lib.rs` export. Preparation needs only the authenticated signed release identity/revision;
+full installed-file verification remains mandatory before execution/training under the existing
+owned job budget. This avoids moving a ~61s scan into the analytical controller's15s preparation
+request and creating a guaranteed cold-start analysis failure. No timeout is increased.
+
+Startup fixes acceptance5/7's reproduced initial-attach timeout. It must retain the truthful durable
+model inventory and existing signed-environment verification at execution/training admission, with
+cancellation/shutdown and one shared runtime. No fake empty state, weakened checks, new general
+framework, extra worktree or speculative cache. Existing source inventories and only an uncovered
+critical lazy-admission case provide checks; no broad model tests or RAM measurements now.
+
 ### Tiingo contention correction — native activation verified
 
 The normal native build contains the two-file Tiingo correction: wait for the existing onboarding
@@ -29,8 +98,8 @@ regression. Lead alone owns the affected `local_product/cli_provider.rs` caller/
 token writer and publication barrier; pure receipt reads remain read-only. No new sign-in is justified.
 Watcher65111 is paused during this source batch; existing native pair stays running.
 
-The full native-set-plus-CLI build finished in7m07s, exit0. Protected CLI bundle import is running
-through the current installed service (handle87870), not React or a second credential store.
+The full native-set-plus-CLI build finished in7m07s, exit0. Protected CLI bundle import completed
+through the current installed service (handle87870, exit0), not React or a second credential store.
 
 ### Current connection recovery ownership
 

@@ -695,6 +695,9 @@ impl SchwabMarketDataDoctorExecutor {
             }
         };
 
+        // The preference response is settled; release its account slot before the next request.
+        drop(preference_permit);
+
         let probe_contract_digest = self.probes.probe_contract_digest();
         let mut detailed = Vec::new();
         let mut families = Vec::new();
