@@ -93,6 +93,7 @@ struct DesktopServiceLaunch {
     data_dir: PathBuf,
     config_path: Option<PathBuf>,
     training_release_root: Option<PathBuf>,
+    development_training_root: Option<PathBuf>,
     installation_data_root: PathBuf,
     /// Debug launcher owns replacement; this Desktop must never spawn a competitor.
     externally_managed: bool,
@@ -148,6 +149,7 @@ pub(crate) async fn connect_or_start(
             data_dir: config.data_dir().to_path_buf(),
             config_path: config_path.map(Path::to_path_buf),
             training_release_root: config.training_release_root().map(Path::to_path_buf),
+            development_training_root: config.development_training_root().map(Path::to_path_buf),
             installation_data_root,
             externally_managed: {
                 #[cfg(debug_assertions)]
@@ -237,6 +239,7 @@ async fn reconnect_or_start_until(
     }
     let mut command = Command::new(program);
     command
+        .env_remove("MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT")
         .env_remove("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM")
         .env_remove("MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM")
         .arg("--data-dir")
@@ -246,6 +249,9 @@ async fn reconnect_or_start_until(
         .stderr(Stdio::null());
     if let Some(path) = &authority.launch.config_path {
         command.arg("--config").arg(path);
+    }
+    if let Some(path) = &authority.launch.development_training_root {
+        command.env("MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT", path);
     }
     if let Some(path) = &authority.launch.training_release_root {
         command.arg("--training-release-root").arg(path);

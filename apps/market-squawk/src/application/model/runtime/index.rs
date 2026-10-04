@@ -541,7 +541,7 @@ pub enum ModelRuntimeIndexError {
 
 #[cfg(test)]
 impl IndexAdmission {
-    fn fixture(directory: u8) -> Result<Self, ModelRuntimeIndexError> {
+    pub(super) fn fixture(directory: u8) -> Result<Self, ModelRuntimeIndexError> {
         // This proof exercises opaque index retention, not model-authority admission. Keep the
         // fixture deliberately non-semantic so it cannot masquerade as an obsolete authority wire.
         let authority_bytes = b"opaque-current-authority-fixture"

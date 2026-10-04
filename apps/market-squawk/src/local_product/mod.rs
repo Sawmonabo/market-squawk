@@ -41,7 +41,6 @@ use market_squawk_domain::{
     EvidenceDigest, InstrumentDefinition, RoundingPolicy, SourceIdentifier, Timestamp,
 };
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
-use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{
     AccessControlledSecretStore, InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore,
     LocalPaths, SecretCancellation, SecretInteractionPolicy, SecretOperationControl,
@@ -69,17 +68,13 @@ pub(crate) use self::cli_provider::{
 pub use self::cli_transport::{
     CliProductError, CliProductResult, execute_cli_command, execute_installed_cli_command,
 };
+use self::executable::installed_release_programs;
 use self::executable::{
     ExecutableIdentityError, current_executable_sha256, installed_application_program,
     installed_service_program,
 };
 #[cfg(debug_assertions)]
-use self::executable::{
-    admit_development_onnx_worker, development_mcp_relay_program, development_service_program,
-    development_training_release_programs,
-};
-#[cfg(not(debug_assertions))]
-use self::executable::{admit_installed_onnx_worker, installed_release_programs};
+use self::executable::{development_mcp_relay_program, development_service_program};
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::governance::{DecisionGovernanceAdapter, ProductionFairValueGovernanceActionFactory};
 use self::market_provider_configuration::ProductionMarketProviderConfigurationResolver;
@@ -106,7 +101,8 @@ use crate::application::model::backup::{
     ModelBackupAuthority, ModelBackupError, ModelBackupLimits,
 };
 use crate::application::model::runtime::{
-    ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
+    ModelExecutionConfiguration, ProductionModelRuntime, ProductionModelRuntimeError,
+    ProductionModelRuntimeLimits,
 };
 use crate::application::model::{
     ForecastApplicationError, ForecastApplicationService, ModelDomainService,
@@ -1970,41 +1966,22 @@ fn open_model_domain(
     source_actions: crate::application::SourceAppliedCorporateActionReadCapability,
     outcome_preparation: crate::application::SourceActionPreparationCapability,
 ) -> Result<(Option<Arc<ProductionModelRuntime>>, Arc<ModelDomainService>), LocalProductError> {
-    let durable = ProductionModelRuntime::has_durable_admissions(inventory.clone())?;
-    let (runtime, snapshot) = match config.training_release_root() {
-        None if durable => return Err(LocalProductError::TrainingReleaseRequired),
-        None => (None, ProductionModelRuntime::empty_snapshot()?),
-        Some(root) => {
-            #[cfg(debug_assertions)]
-            let (application, onnx_worker_path) = development_training_release_programs(root)?;
-            #[cfg(not(debug_assertions))]
-            let (application, onnx_worker_path) = installed_release_programs()?;
-            let training =
-                verify_application_training_environment(root, &application, &onnx_worker_path)?;
-            #[cfg(debug_assertions)]
-            let onnx_worker = Some(admit_development_onnx_worker(
-                &onnx_worker_path,
-                training.onnx_worker_sha256(),
-            )?);
-            #[cfg(not(debug_assertions))]
-            let onnx_worker = Some(admit_installed_onnx_worker(training.onnx_worker_sha256())?);
-            let runtime = Arc::new(ProductionModelRuntime::try_open(
-                paths,
-                inventory,
-                training,
-                onnx_worker,
-                limits,
-            )?);
-            let snapshot = match runtime.snapshot() {
-                Ok(snapshot) => snapshot,
-                Err(ProductionModelRuntimeError::EmptyRuntime) => {
-                    ProductionModelRuntime::empty_snapshot()?
-                }
-                Err(error) => return Err(error.into()),
-            };
-            (Some(runtime), snapshot)
-        }
+    let release = if let Some(root) = config.development_training_root() {
+        Some(ModelExecutionConfiguration::source(root.to_path_buf()))
+    } else if let Some(root) = config.training_release_root() {
+        let (application, worker) = installed_release_programs()?;
+        Some(ModelExecutionConfiguration::installed(
+            root.to_path_buf(),
+            application,
+            worker,
+        ))
+    } else {
+        None
     };
+    let runtime = Arc::new(ProductionModelRuntime::try_open(
+        paths, inventory, release, limits,
+    )?);
+    let snapshot = runtime.snapshot()?;
     let evaluation_records = NonZeroUsize::new(MODEL_EVALUATION_RECORDS)
         .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
     let model = Arc::new(
@@ -2018,7 +1995,7 @@ fn open_model_domain(
         .with_source_action_reads(source_actions)
         .with_outcome_preparation(outcome_preparation),
     );
-    Ok((runtime, model))
+    Ok((Some(runtime), model))
 }
 
 /// Installed service process availability could not be established.
@@ -2058,9 +2035,6 @@ pub enum LocalProductError {
     /// System wall-clock time cannot be represented by the domain timestamp.
     #[error("local product wall clock is outside the supported timestamp range")]
     ClockRange,
-    /// Existing durable model generations require their signed training release.
-    #[error("durable model admissions require the configured signed training release")]
-    TrainingReleaseRequired,
     /// Controlled local paths could not be prepared.
     #[error(transparent)]
     Path(#[from] market_squawk_platform::PathError),
@@ -2140,9 +2114,6 @@ pub enum LocalProductError {
     /// Immutable analysis catalog construction failed.
     #[error(transparent)]
     AnalysisCatalog(#[from] crate::application::analysis::AnalysisCatalogError),
-    /// Signed training-release verification failed.
-    #[error(transparent)]
-    TrainingEnvironment(#[from] TrainingEnvironmentError),
     /// Durable model runtime construction failed.
     #[error(transparent)]
     ModelRuntime(#[from] ProductionModelRuntimeError),

@@ -40,9 +40,20 @@ pub struct OnnxWorkerProgram {
 #[derive(Debug)]
 struct WorkerProgramInner {
     executable: PathBuf,
-    digest: [u8; 32],
+    identity: WorkerProgramIdentity,
     active_generations: AtomicUsize,
     _private_generation: TempDir,
+}
+
+#[derive(Debug)]
+enum WorkerProgramIdentity {
+    InstalledDigest([u8; 32]),
+    SourceDevelopment {
+        // Identifier of bounded provenance metadata, never an executable digest.
+        provenance: [u8; 32],
+        size: u64,
+        modified: Option<std::time::SystemTime>,
+    },
 }
 
 impl OnnxWorkerProgram {
@@ -132,7 +143,84 @@ impl OnnxWorkerProgram {
         Ok(Self {
             inner: Arc::new(WorkerProgramInner {
                 executable: sealed_path,
-                digest: expected_digest,
+                identity: WorkerProgramIdentity::InstalledDigest(expected_digest),
+                active_generations: AtomicUsize::new(0),
+                _private_generation: private_generation,
+            }),
+        })
+    }
+
+    /// Copies a configured source helper into the same owned generation without hashing code.
+    /// `provenance` identifies source environment metadata, not executable contents.
+    ///
+    /// # Errors
+    /// Rejects invalid program metadata, a changing copy, or unavailable owned storage.
+    pub fn admit_source(
+        executable: impl AsRef<Path>,
+        provenance: [u8; 32],
+    ) -> Result<Self, OnnxWorkerProgramError> {
+        let path = executable.as_ref();
+        let named = fs::symlink_metadata(path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if !path.is_absolute() || !named.is_file() || named.len() == 0 || provenance == [0; 32] {
+            return Err(OnnxWorkerProgramError::Invalid);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if named.permissions().mode() & 0o111 == 0 {
+                return Err(OnnxWorkerProgramError::Invalid);
+            }
+        }
+        let source = File::open(path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let before = source
+            .metadata()
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if !before.is_file()
+            || before.len() != named.len()
+            || before.modified().ok() != named.modified().ok()
+        {
+            return Err(OnnxWorkerProgramError::Changed);
+        }
+        let private_generation = tempfile::Builder::new()
+            .prefix("market-squawk-onnx-source-")
+            .tempdir()
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let owned_path = private_generation
+            .path()
+            .join(path.file_name().ok_or(OnnxWorkerProgramError::Invalid)?);
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&owned_path)
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let copied = io::copy(
+            &mut (&source).take(before.len().saturating_add(1)),
+            &mut destination,
+        )
+        .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let after = source
+            .metadata()
+            .map_err(|_| OnnxWorkerProgramError::Changed)?;
+        if copied != before.len()
+            || after.len() != before.len()
+            || after.modified().ok() != before.modified().ok()
+        {
+            return Err(OnnxWorkerProgramError::Changed);
+        }
+        destination
+            .sync_all()
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        set_worker_permissions(&owned_path)?;
+        let owned =
+            fs::symlink_metadata(&owned_path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        Ok(Self {
+            inner: Arc::new(WorkerProgramInner {
+                executable: owned_path,
+                identity: WorkerProgramIdentity::SourceDevelopment {
+                    provenance,
+                    size: owned.len(),
+                    modified: owned.modified().ok(),
+                },
                 active_generations: AtomicUsize::new(0),
                 _private_generation: private_generation,
             }),
@@ -145,18 +233,33 @@ impl OnnxWorkerProgram {
         self.inner.active_generations.load(Ordering::Acquire)
     }
 
-    /// Returns the exact admitted helper executable digest.
+    /// Returns an installed executable digest; source generations have no content attestation.
     #[must_use]
-    pub fn digest(&self) -> [u8; 32] {
-        self.inner.digest
+    pub fn digest(&self) -> Option<[u8; 32]> {
+        match &self.inner.identity {
+            WorkerProgramIdentity::InstalledDigest(digest) => Some(*digest),
+            WorkerProgramIdentity::SourceDevelopment { .. } => None,
+        }
     }
 
     fn verify(&self) -> Result<(), WorkerError> {
-        let mut executable = File::open(&self.inner.executable).map_err(|_| WorkerError::Load)?;
-        let digest = hash_open_file(&mut executable).map_err(|_| WorkerError::Load)?;
-        (digest == self.inner.digest)
-            .then_some(())
-            .ok_or(WorkerError::Load)
+        match &self.inner.identity {
+            WorkerProgramIdentity::InstalledDigest(expected) => {
+                let mut executable =
+                    File::open(&self.inner.executable).map_err(|_| WorkerError::Load)?;
+                let digest = hash_open_file(&mut executable).map_err(|_| WorkerError::Load)?;
+                (digest == *expected).then_some(()).ok_or(WorkerError::Load)
+            }
+            WorkerProgramIdentity::SourceDevelopment { size, modified, .. } => {
+                let metadata =
+                    fs::symlink_metadata(&self.inner.executable).map_err(|_| WorkerError::Load)?;
+                (metadata.is_file()
+                    && metadata.len() == *size
+                    && metadata.modified().ok() == *modified)
+                    .then_some(())
+                    .ok_or(WorkerError::Load)
+            }
+        }
     }
 }
 
@@ -1003,7 +1106,19 @@ fn worker_runtime_semantics_digest(
         b"runtime-revision",
         u128::from(WORKER_RUNTIME_REVISION),
     );
-    bind_runtime_bytes(&mut digest, b"admitted-helper-digest", &program.digest());
+    match &program.inner.identity {
+        WorkerProgramIdentity::InstalledDigest(identity) => {
+            bind_runtime_bytes(&mut digest, b"admitted-helper-digest", identity);
+        }
+        WorkerProgramIdentity::SourceDevelopment { provenance, .. } => {
+            bind_runtime_bytes(&mut digest, b"source-development-provenance", provenance);
+            bind_runtime_bytes(
+                &mut digest,
+                b"source-generation",
+                program.inner.executable.as_os_str().as_encoded_bytes(),
+            );
+        }
+    }
     bind_runtime_bytes(
         &mut digest,
         b"protocol-semantics",
@@ -1167,7 +1282,7 @@ mod tests {
         let executable = std::env::current_exe()?;
         let program_inner = Arc::new(WorkerProgramInner {
             executable,
-            digest: [1; 32],
+            identity: WorkerProgramIdentity::InstalledDigest([1; 32]),
             active_generations: AtomicUsize::new(1),
             _private_generation: private_generation,
         });
@@ -1229,7 +1344,7 @@ mod tests {
         let executable = std::env::current_exe()?;
         let program_inner = Arc::new(WorkerProgramInner {
             executable,
-            digest: [1; 32],
+            identity: WorkerProgramIdentity::InstalledDigest([1; 32]),
             active_generations: AtomicUsize::new(1),
             _private_generation: private_generation,
         });
@@ -1296,7 +1411,7 @@ mod tests {
         let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
         let program_inner = Arc::new(WorkerProgramInner {
             executable: std::env::current_exe()?,
-            digest: [1; 32],
+            identity: WorkerProgramIdentity::InstalledDigest([1; 32]),
             active_generations: AtomicUsize::new(1),
             _private_generation: tempfile::tempdir()?,
         });
@@ -1398,7 +1513,7 @@ mod tests {
         let executable = std::env::current_exe()?;
         let program_inner = Arc::new(WorkerProgramInner {
             executable,
-            digest: [1; 32],
+            identity: WorkerProgramIdentity::InstalledDigest([1; 32]),
             active_generations: AtomicUsize::new(1),
             _private_generation: private_generation,
         });
@@ -1440,7 +1555,7 @@ mod tests {
         let first = OnnxWorkerProgram {
             inner: Arc::new(WorkerProgramInner {
                 executable: executable.clone(),
-                digest: [1; 32],
+                identity: WorkerProgramIdentity::InstalledDigest([1; 32]),
                 active_generations: AtomicUsize::new(0),
                 _private_generation: tempfile::tempdir()?,
             }),
@@ -1448,7 +1563,7 @@ mod tests {
         let second = OnnxWorkerProgram {
             inner: Arc::new(WorkerProgramInner {
                 executable,
-                digest: [2; 32],
+                identity: WorkerProgramIdentity::InstalledDigest([2; 32]),
                 active_generations: AtomicUsize::new(0),
                 _private_generation: tempfile::tempdir()?,
             }),
@@ -1460,6 +1575,20 @@ mod tests {
         assert_ne!(
             evidence,
             worker_runtime_semantics_digest(&first, Duration::from_millis(11))
+        );
+        let source_directory = tempfile::tempdir()?;
+        let source_path = source_directory.path().join("source-helper");
+        fs::write(&source_path, b"editable helper fixture")?;
+        set_worker_permissions(&source_path)?;
+        let source = OnnxWorkerProgram::admit_source(&source_path, [1; 32])?;
+        assert_eq!(source.digest(), None);
+        assert_eq!(source.verify(), Ok(()));
+        let source_evidence = worker_runtime_semantics_digest(&source, deadline);
+        assert_ne!(source_evidence, evidence);
+        let next_source_generation = OnnxWorkerProgram::admit_source(&source_path, [1; 32])?;
+        assert_ne!(
+            source_evidence,
+            worker_runtime_semantics_digest(&next_source_generation, deadline)
         );
         Ok(())
     }

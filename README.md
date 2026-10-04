@@ -315,9 +315,10 @@ with `nvm` or `nvm-windows` when available and validates it in the same process 
 `nvm` is unavailable, the command proceeds only if the active Node.js version is already exact;
 `just setup` also prepares pinned pnpm `10.31.0`.
 
-`just setup` creates the verified, reusable model and training cache at
-`.market-squawk/development-model-runtime`. `just dev` prepares that cache, then starts one visible
-Desktop, Vite and the shared service under the development launcher. Install Watchexec with
+`just setup` synchronizes locked dependencies into `python/.venv` and installs Market Squawk
+editable, including its Rust extension using Maturin's [development profile](https://www.maturin.rs/config).
+`just dev` starts one visible Desktop, Vite and the shared
+service under the development launcher. Install Watchexec with
 `brew install watchexec` on macOS or use its [official packages](https://github.com/watchexec/watchexec/blob/main/crates/cli/README.md#installation).
 UI changes use React Fast Refresh. Rust changes enter one coalesced, single-job Cargo build for the shared service/Desktop
 dependencies; a failed build leaves the working application running. Successful backend builds gracefully replace
@@ -333,21 +334,19 @@ stops its owned processes gracefully. A second launcher or unrelated existing se
 or silently adopted. Development executables are staged privately so builds can finish while the
 previous service runs, including on Windows. `just dev-web` remains frontend-only diagnostics.
 Fixed-build verification runs separately from the watcher; stop the watcher before scheduling
-manual Cargo checks. Model/training-runtime refresh still uses the commands below and its own
-verified evidence; frontend or ordinary service edits do not silently rebuild that release cache.
-Cache reuse validates the installed runtime and its sealed foundation, including signatures and
-installed file identities. Disposable Cargo release output and unfinished build records are not
-required to reuse that runtime.
+manual Cargo checks. Editable Python uses the checkout directly. After native-extension or locked
+dependency changes, stop development and run `just refresh-model-runtime` before restarting.
 
-`just setup` is safe to rerun. It preserves the managed Python environment, synchronizes the
-hash-locked dependencies, and rebuilds and installs Market Squawk's Rust-backed Python package.
-Tests that verify the signed training environment run only against the sealed installed product;
-the ordinary development suite keeps that authority boundary fail-closed.
+Source development does not build a signed Python release or scan software files before training.
+The launcher records source/native revisions, Python and dependency versions in the managed
+environment's `source-development.json`, after the previous service stops. These are development
+provenance coordinates, not an attestation of immutable source bytes. The same training driver,
+Rust candidate admission and ONNX worker enforce financial-input and model-artifact integrity.
 
-Use `just refresh-model-runtime` to rebuild the cache explicitly, `just verify-model-runtime` to
-check it without rebuilding, and `just reset-model-runtime` to remove only that reproducible cache
-after stopping the desktop and service. `just reset-dev` separately removes only the development
-workspace-data and service-authority roots.
+`just setup` is safe to rerun with development stopped. It preserves the managed Python environment
+and updates its dependencies and editable native extension. Installed-release verification remains
+a separate release workflow; source runs do not establish installed-package acceptance.
+`just reset-dev` removes only the development workspace-data and service-authority roots.
 
 Repository `just` commands, the model-runtime builder, and editor Cargo checks use one build job
 to reduce concurrent compiler memory use. This is a build setting, not an application memory

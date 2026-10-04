@@ -12,16 +12,16 @@ use market_squawk_data::{
 };
 use market_squawk_domain::ModelId;
 use market_squawk_modeling::{
-    BundleId, BundleMetadataRef, InferenceBackend, ModelBundle, OnnxWorkerProgram,
-    ProductionFeatureRegistry, recover_model_candidate,
+    BundleId, BundleMetadataRef, InferenceBackend, ModelBundle, ProductionFeatureRegistry,
+    recover_model_candidate,
 };
 use market_squawk_platform::LocalPaths;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ProductionModelRuntimeError, ProductionModelRuntimeLimits, build_backend,
-    check_admission_control, index::IndexAdmission, open_candidate_root, validate_recovered_bundle,
-    validation_deadline,
+    ModelExecutionConfiguration, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
+    build_backend, check_admission_control, index::IndexAdmission, open_candidate_root,
+    validate_recovered_bundle, validation_deadline,
 };
 
 pub(in crate::application::model) struct RuntimeInventory {
@@ -29,7 +29,7 @@ pub(in crate::application::model) struct RuntimeInventory {
     pub(in crate::application::model) head: ModelInventoryHead,
     paths: LocalPaths,
     features: Arc<ProductionFeatureRegistry>,
-    worker: Option<OnnxWorkerProgram>,
+    execution: Option<ModelExecutionConfiguration>,
     limits: ProductionModelRuntimeLimits,
     shared: Arc<SharedModels>,
 }
@@ -99,7 +99,7 @@ impl RuntimeInventory {
         catalog: ModelInventoryCatalogCapability,
         head: ModelInventoryHead,
         features: Arc<ProductionFeatureRegistry>,
-        worker: Option<OnnxWorkerProgram>,
+        execution: Option<ModelExecutionConfiguration>,
         limits: ProductionModelRuntimeLimits,
     ) -> Self {
         Self {
@@ -107,7 +107,7 @@ impl RuntimeInventory {
             catalog,
             head,
             features,
-            worker,
+            execution,
             limits,
             shared: Arc::new(SharedModels {
                 bundles: Mutex::new(BTreeMap::new()),
@@ -123,7 +123,7 @@ impl RuntimeInventory {
             catalog: self.catalog.clone(),
             head,
             features: Arc::clone(&self.features),
-            worker: self.worker.clone(),
+            execution: self.execution.clone(),
             limits: self.limits,
             shared: Arc::clone(&self.shared),
         }
@@ -420,10 +420,17 @@ impl RuntimeInventory {
         self.compile_reserved(state, bundle, policy, deadline, cancellation)
     }
 
+    pub(in crate::application::model) fn begin_shutdown(&self) {
+        if let Some(execution) = &self.execution {
+            execution.begin_shutdown();
+        }
+    }
+
     pub(in crate::application::model) fn shutdown(
         &self,
         deadline: Instant,
     ) -> Result<(), ProductionModelRuntimeError> {
+        self.begin_shutdown();
         let cancellation = CancellationToken::new();
         let mut state = self.reserve(deadline, &cancellation)?;
         self.retire_active(&mut state)?;
@@ -480,7 +487,19 @@ impl RuntimeInventory {
         // Compilation owns the slot, while waiters can still observe cancellation and deadlines.
         state.busy = true;
         drop(state);
-        let result = build_backend(Arc::clone(&bundle), policy, self.worker.as_ref());
+        let result = self
+            .execution
+            .as_ref()
+            .ok_or(ProductionModelRuntimeError::RuntimeUnavailable)
+            .and_then(|execution| {
+                let worker = if matches!(policy, super::index::StoredRuntimePolicy::Onnx { .. }) {
+                    Some(execution.worker(deadline, cancellation)?)
+                } else {
+                    None
+                };
+                execution.check(deadline, cancellation)?;
+                build_backend(Arc::clone(&bundle), policy, worker.as_ref())
+            });
         let mut state = self
             .shared
             .execution
@@ -502,7 +521,18 @@ impl RuntimeInventory {
                 return Err(error);
             }
         };
-        if let Err(error) = check_admission_control(deadline, cancellation) {
+        let control = check_admission_control(deadline, cancellation).and_then(|()| {
+            if self
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.shutdown.is_cancelled())
+            {
+                Err(market_squawk_modeling::TrainingEnvironmentError::Cancelled.into())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = control {
             if backend.retire().is_err() {
                 state.failed = true;
             }

@@ -10,9 +10,12 @@ test("serialized builds retain the running service on failure and replace only a
   const root = await mkdtemp(path.join(os.tmpdir(), "market-squawk-develop-"));
   const events = path.join(root, "events");
   const fixture = path.join(root, "child.mjs");
+  const developmentTrainingRoot = path.join(root, "python", ".venv");
+  const descriptorFile = path.join(developmentTrainingRoot, "source-development.json");
   await mkdir(path.join(root, "target", "debug"), { recursive: true });
   await mkdir(path.join(root, ".market-squawk", "dev-runtime"), { recursive: true });
-  for (const name of ["service", "mcp-relay", "capture-helper", "desktop"]) {
+  await mkdir(developmentTrainingRoot, { recursive: true });
+  for (const name of ["service", "mcp-relay", "capture-helper", "desktop", "model-validator", "onnx-worker"]) {
     await writeFile(path.join(root, "target", "debug", `market-squawk-${name}`), "staged fixture");
   }
   await writeFile(fixture, `
@@ -30,7 +33,17 @@ if (mode === 'build') {
   process.exit(number === 2 ? 1 : 0);
 } else if (mode === 'native-build') {
   log('native-build');
+} else if (mode === 'environment') {
+  const programs = Object.fromEntries(['onnx-worker', 'model-validator'].map(name =>
+    [name, generation + '/bin/market-squawk-' + name]));
+  if (!Object.values(programs).every(existsSync)) process.exit(1);
+  const name = generation.split('/').pop();
+  writeFileSync(root + '/python/.venv/source-development.json', JSON.stringify({ generation: name, programs }));
+  log('environment-publish-' + name);
 } else if (mode === 'service') {
+  if (process.env.MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT !== root + '/python/.venv') process.exit(1);
+  const environment = JSON.parse(readFileSync(root + '/python/.venv/source-development.json', 'utf8'));
+  if (environment.generation !== generation || !Object.values(environment.programs).every(existsSync)) process.exit(1);
   log('service-start-' + generation);
   const keepAlive = setInterval(() => {}, 1000);
   process.stdin.resume();
@@ -56,10 +69,11 @@ if (mode === 'build') {
     }
     throw new Error("Fixture did not reach the expected lifecycle barrier.");
   };
-  const supervisor = new DevelopmentSupervisor({ root, stopTimeout: 1000, log: () => {}, commands: {
+  const supervisor = new DevelopmentSupervisor({ root, developmentTrainingRoot, stopTimeout: 1000, log: () => {}, commands: {
     buildService: { program: process.execPath, args: [fixture, "build", root] },
     buildBoth: { program: process.execPath, args: [fixture, "build", root] },
     buildNative: { program: process.execPath, args: [fixture, "native-build", root] },
+    trainingEnvironment: (directory) => ({ program: process.execPath, args: [fixture, "environment", root, directory] }),
     service: (directory) => ({ program: process.execPath, args: [fixture, "service", root, path.basename(directory)] }),
     native: () => ({ program: process.execPath, args: [fixture, "native", root] }),
     serviceOwned: async (record) => until(async () => (await entries()).includes(`service-start-${path.basename(record.stage)}`)),
@@ -73,6 +87,7 @@ if (mode === 'build') {
     await supervisor.flush();
     const original = supervisor.service;
     const generation = path.basename(original.stage);
+    const originalDescriptor = await readFile(descriptorFile, "utf8");
     supervisor.request(SERVICE);
     const rebuilding = supervisor.flush();
     await until(async () => (await entries()).includes("build-start-2"));
@@ -83,12 +98,16 @@ if (mode === 'build') {
     assert.equal(supervisor.service, original);
     assert.equal(original.exited, false);
     assert.equal((await entries()).includes(`service-eof-${generation}`), false);
+    assert.equal(await readFile(descriptorFile, "utf8"), originalDescriptor);
     await writeFile(path.join(root, "release-3"), "");
     await rebuilding;
     const audit = await entries();
     assert.ok(audit.indexOf("build-end-2") < audit.indexOf("build-start-3"));
     assert.equal(audit.filter((entry) => entry.startsWith("build-start-")).length, 3);
-    assert.ok(audit.indexOf(`service-stop-${generation}`) < audit.indexOf(`service-start-${path.basename(supervisor.service.stage)}`));
+    const replacement = path.basename(supervisor.service.stage);
+    assert.ok(audit.indexOf(`service-stop-${generation}`) < audit.indexOf(`environment-publish-${replacement}`));
+    assert.ok(audit.indexOf(`environment-publish-${replacement}`) < audit.indexOf(`service-start-${replacement}`));
+    assert.equal(JSON.parse(await readFile(descriptorFile, "utf8")).generation, replacement);
     assert.notEqual(supervisor.service, original);
     await writeFile(path.join(root, "fail-stop"), "");
     const last = supervisor.service;
@@ -96,6 +115,7 @@ if (mode === 'build') {
     await assert.rejects(supervisor.flush(), /failed graceful shutdown.*replacement is blocked/);
     assert.equal(supervisor.service, last);
     assert.equal((await entries()).filter((entry) => entry.startsWith("service-start-")).length, 2);
+    assert.equal((await entries()).filter((entry) => entry.startsWith("environment-publish-")).length, 2);
     // A later edit must not bypass the rejected shutdown and start a duplicate.
     supervisor.request(SERVICE);
     await assert.rejects(supervisor.flush(), /replacement is blocked/);

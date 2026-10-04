@@ -8542,9 +8542,7 @@ async fn initialized_service_with_universe_fixture(
     )?;
 
     let membership_batch = if training {
-        // The six training decisions span 100..=600. Retain an original fixture
-        // publication whose declared supersession is after those decisions.
-        extraction_batch_with_membership_until(true, Timestamp::from_unix_nanos(700))?
+        python_training_fixture::macro_batch_with_membership()?
     } else {
         dataset_extraction_batch()?
     };
@@ -8961,7 +8959,7 @@ fn closed_price_return_market_bar_fixture_for_values(
     let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("alpaca-revision-1")?);
     let dataset = SourceIdentifier::try_from("alpaca-iex-bars-closed-price-return-fixture")?;
     if values.is_empty()
-        || values.len() > 18
+        || values.len() > python_training_fixture::EXAMPLES * 3
         || values.windows(2).any(|pair| pair[0].0 >= pair[1].0)
     {
         return Err("invalid bounded fixture bars".into());
@@ -11513,9 +11511,13 @@ fn closed_price_return_request_for_fixture(
             .identity();
     let mut component_specs = Vec::new();
     let mut examples = Vec::new();
-    for index in 0..if training { 6 } else { 1 } {
+    for index in 0..if training {
+        python_training_fixture::EXAMPLES
+    } else {
+        1
+    } {
         let bar_start = if training {
-            100 * (i64::try_from(index)? + 1)
+            python_training_fixture::decision_nanos(index)?
         } else {
             100
         };
@@ -11611,19 +11613,30 @@ fn closed_price_return_request_for_fixture(
                 descriptor.component_name(),
                 NonZeroU32::MIN,
             )?;
+            let (macro_effective, macro_value) = if training {
+                python_training_fixture::macro_input(index, descriptor.position())?
+            } else {
+                (90, Decimal::new(i64::from(descriptor.position()) + 1, 2))
+            };
             macro_inputs.push(FeatureLabelComponentInput::try_new(
                 specification.clone(),
                 ComponentValue::decimal(
-                    Decimal::new(i64::from(descriptor.position()) + 1, 2),
+                    macro_value,
                     Some(SourceIdentifier::try_from(descriptor.unit())?),
                     None,
                 )?,
                 vec![ComponentSelector::new(ObservationFamilyKey::Macro {
                     source_id: SourceId::try_from("fred-local-fixture")?,
-                    series: SourceIdentifier::try_from("GDP")?,
-                    effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+                    series: SourceIdentifier::try_from(if training {
+                        descriptor.indicator_id()
+                    } else {
+                        "GDP"
+                    })?,
+                    effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(
+                        macro_effective,
+                    )),
                 })],
-                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(macro_effective)),
                 None,
                 ComponentAdjustmentEvidence::NotApplicable,
             )?);
@@ -11684,8 +11697,8 @@ fn closed_price_return_request_for_fixture(
     )?;
     let policy = DatasetBuildPolicy::new(
         ChronologicalSplitPolicy::try_new(
-            Timestamp::from_unix_nanos(if training { 250 } else { 120 }),
-            Timestamp::from_unix_nanos(if training { 450 } else { 200 }),
+            Timestamp::from_unix_nanos(if training { 520 } else { 120 }),
+            Timestamp::from_unix_nanos(if training { 570 } else { 200 }),
             Timestamp::from_unix_nanos(if training { 650 } else { 300 }),
         )?,
         PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)?,
@@ -11712,10 +11725,14 @@ fn closed_price_return_request_for_fixture(
     );
     let limits = DatasetBuildLimits::try_new(
         128,
-        8,
+        if training {
+            python_training_fixture::EXAMPLES
+        } else {
+            8
+        },
         feature_dataset_macro_components_v1().len() + 2,
-        if training { 128 } else { 64 },
-        // The six-example export repeats its PIT epoch in the 21-column production schema.
+        if training { 256 } else { 64 },
+        // The training export repeats its PIT epoch in the 21-column production schema.
         // After candidate-store reservation, 4 MiB total leaves about 1 MiB for Parquet,
         // below this fixture's input/encoding workspace. Reserve about 4 MiB for the writer.
         if training {

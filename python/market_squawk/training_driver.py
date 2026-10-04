@@ -1,4 +1,4 @@
-"""Sealed production driver for deterministic training, candidate export, and admission."""
+"""Common driver for deterministic training, candidate export, and admission."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TrainingDriverError(ValueError):
-    """The sealed driver rejected input, authority, publication, or release identity."""
+    """The driver rejected input, authority, publication, or environment identity."""
 
 
 def write_proposal(
@@ -178,7 +178,7 @@ def run_worker(
     )
     completed_units = 0
     try:
-        protocol.progress("validation", "Validating sealed training inputs.", 0, 4)
+        protocol.progress("validation", "Validating training inputs.", 0, 4)
         if config_path is None:
             if authority_path is not None:
                 raise TrainingDriverError("product worker cannot accept caller authority")
@@ -209,6 +209,12 @@ def run_worker(
             request_path,
         )
         environment = training_environment_receipt()
+        candidate_metadata = json.loads(proposal.candidate.metadata_bytes)
+        if (
+            environment.sha256 != candidate_metadata["training_environment_sha256"]
+            or environment.training_code_revision != candidate_metadata["training_code_revision"]
+        ):
+            raise TrainingDriverError("training environment changed during candidate production")
         protocol.result(
             "complete",
             "Model candidate produced for Rust validation.",

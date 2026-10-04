@@ -41,6 +41,17 @@ focus or screen. Use the optional development-only embedded WebDriver path docum
 service. Do not resume global keystrokes or foreground automation while the owner works. Native
 dialog and external OAuth interaction require separate evidence; WebView checks do not prove them.
 
+## Owner correction: trusted source development — 2026-10-03
+
+Ordinary local development uses the managed editable source environment. Do not require a signed
+copy of our own Python/Rust software or repeatedly hash its installed files before startup,
+analysis preparation, training or inference. Keep one training, candidate-validation and inference
+implementation. Record source/native revisions and dependency versions honestly as development
+provenance, not immutable-code attestation. Preserve checks on financial inputs and model artifacts.
+Installed package verification belongs at install/update; changing source mode alone does not prove
+that installed-runtime scans have been removed. Current implementation and verification status live
+in the delivery ledger. This correction supersedes earlier signed-development-cache instructions.
+
 ## Owner correction: ordinary data interaction and concise copy — 2026-10-02
 
 Opening an investment or financial tab loads its required information automatically. Changing

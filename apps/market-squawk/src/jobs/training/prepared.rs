@@ -13,7 +13,8 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{CalendarDate, HistoricalStudyBasis, ModelId};
 use market_squawk_modeling::{
-    ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, VerifiedTrainingEnvironment,
+    ConfiguredTrainingEnvironment, ProductionFeatureRegistry, PythonDatasetAdmissionAuthority,
+    TrainingEnvironmentIdentity,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -50,7 +51,7 @@ impl PreparedProductTraining {
         expected_manifest: &DatasetManifestRef,
         profile: &ValidatedAnalyticalProfile,
         fold: Option<&RecommendationOosFoldV1>,
-        environment: &VerifiedTrainingEnvironment,
+        environment: &TrainingEnvironmentIdentity,
         historical_role: Option<&HistoricalFoldTrainingAuthorityV1>,
         fiscal_role: Option<&HistoricalFiscalTrainingAuthority>,
     ) -> Result<Self, TrainingJobRunnerError> {
@@ -355,7 +356,7 @@ impl PreparedProductTraining {
         staging: &TrainingStaging,
         request: &[u8],
         candidate: &market_squawk_modeling::TrainingWorkerCandidate,
-        environment: &VerifiedTrainingEnvironment,
+        environment: &ConfiguredTrainingEnvironment,
     ) -> Result<crate::application::model::runtime::ModelAdmissionRequest, TrainingJobRunnerError>
     {
         let invalid = || TrainingJobRunnerError::InvalidCandidate;
@@ -520,6 +521,22 @@ impl TrainingAdmission {
             Self::Product(value) => value.revalidate(paths, cancellation),
         }
     }
+    pub(super) fn require_environment(
+        &self,
+        environment: &ConfiguredTrainingEnvironment,
+    ) -> Result<(), TrainingJobRunnerError> {
+        if let Self::Product(prepared) = self {
+            if prepared.fixed_authority["training_environment_sha256"]
+                != json!(encode_hex(environment.receipt_sha256()))
+                || prepared.fixed_authority["training_code_revision"]
+                    != json!(environment.training_code_revision())
+            {
+                return Err(TrainingJobRunnerError::InputChanged);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn stdin(&self) -> Vec<u8> {
         match self {
             Self::Governed(_) => Vec::new(),
@@ -532,7 +549,7 @@ impl TrainingAdmission {
         staging: &TrainingStaging,
         request: &[u8],
         candidate: &market_squawk_modeling::TrainingWorkerCandidate,
-        environment: &VerifiedTrainingEnvironment,
+        environment: &ConfiguredTrainingEnvironment,
     ) -> Result<crate::application::model::runtime::ModelAdmissionRequest, TrainingJobRunnerError>
     {
         match self {
@@ -559,6 +576,8 @@ impl TrainingJobRunner {
         manifest: &DatasetManifestRef,
         profile: &ValidatedAnalyticalProfile,
         fold: Option<&RecommendationOosFoldV1>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PreparedProductTraining, TrainingJobRunnerError> {
         PreparedProductTraining::try_new(
             &self.paths,
@@ -566,9 +585,10 @@ impl TrainingJobRunner {
             manifest,
             profile,
             fold,
-            self.runtime
-                .training_environment()
-                .map_err(|_| TrainingJobRunnerError::WorkerUnavailable)?,
+            &self
+                .runtime
+                .training_identity(deadline, cancellation)
+                .map_err(TrainingJobRunnerError::Runtime)?,
             None,
             None,
         )
@@ -580,6 +600,8 @@ impl TrainingJobRunner {
         selection: &PythonDatasetSelection,
         profile: &ValidatedAnalyticalProfile,
         role: &HistoricalFoldTrainingAuthorityV1,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PreparedProductTraining, TrainingJobRunnerError> {
         PreparedProductTraining::try_new(
             &self.paths,
@@ -587,9 +609,10 @@ impl TrainingJobRunner {
             selection.identity().manifest(),
             profile,
             Some(role.fold()),
-            self.runtime
-                .training_environment()
-                .map_err(|_| TrainingJobRunnerError::WorkerUnavailable)?,
+            &self
+                .runtime
+                .training_identity(deadline, cancellation)
+                .map_err(TrainingJobRunnerError::Runtime)?,
             Some(role),
             None,
         )
@@ -600,6 +623,8 @@ impl TrainingJobRunner {
         selection: &PythonDatasetSelection,
         profile: &ValidatedAnalyticalProfile,
         role: &HistoricalFiscalTrainingAuthority,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PreparedProductTraining, TrainingJobRunnerError> {
         PreparedProductTraining::try_new(
             &self.paths,
@@ -607,9 +632,10 @@ impl TrainingJobRunner {
             selection.identity().manifest(),
             profile,
             None,
-            self.runtime
-                .training_environment()
-                .map_err(|_| TrainingJobRunnerError::WorkerUnavailable)?,
+            &self
+                .runtime
+                .training_identity(deadline, cancellation)
+                .map_err(TrainingJobRunnerError::Runtime)?,
             None,
             Some(role),
         )

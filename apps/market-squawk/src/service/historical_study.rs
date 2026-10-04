@@ -391,7 +391,13 @@ impl InstalledHistoricalStudy {
             let (_, _, _, expectation) = prepared.into_parts();
             let role = expectation.admit_training(&snapshot, &selection, plan.profile())?;
             return runner
-                .prepare_historical_fiscal_product(&selection, plan.profile(), &role)
+                .prepare_historical_fiscal_product(
+                    &selection,
+                    plan.profile(),
+                    &role,
+                    context.deadline(),
+                    context.cancellation(),
+                )
                 .map_err(super::tool_services::map_training_admission);
         }
         let role = self
@@ -405,7 +411,13 @@ impl InstalledHistoricalStudy {
             )
             .await?;
         runner
-            .prepare_historical_product(&selection, plan.profile(), &role)
+            .prepare_historical_product(
+                &selection,
+                plan.profile(),
+                &role,
+                context.deadline(),
+                context.cancellation(),
+            )
             .map_err(super::tool_services::map_training_admission)
     }
     pub(super) async fn complete_fiscal_page(
@@ -470,7 +482,13 @@ impl InstalledHistoricalStudy {
                 .admit_training(&plan, index, &dataset_job, &dataset, context)
                 .await?;
             let expected = runner
-                .prepare_historical_product(&dataset, plan.profile(), &role)
+                .prepare_historical_product(
+                    &dataset,
+                    plan.profile(),
+                    &role,
+                    context.deadline(),
+                    context.cancellation(),
+                )
                 .map_err(super::tool_services::map_training_admission)?;
             let completed = self
                 .training
@@ -756,7 +774,13 @@ impl InstalledHistoricalStudy {
                     .await?;
                 let role = expectation.admit_training(&training_job, &training, plan.profile())?;
                 let expected = runner
-                    .prepare_historical_fiscal_product(&training, plan.profile(), &role)
+                    .prepare_historical_fiscal_product(
+                        &training,
+                        plan.profile(),
+                        &role,
+                        context.deadline(),
+                        context.cancellation(),
+                    )
                     .map_err(super::tool_services::map_training_admission)?;
                 let model_job = self
                     .training

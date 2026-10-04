@@ -2,6 +2,30 @@
 
 ## Current execution — 2026-10-03
 
+### Editable source runtime — critically verified integration
+
+The source-development runtime now uses the managed editable Python environment and the existing
+training, candidate-validation and ONNX paths. Development provenance records source/native and
+dependency versions; it does not attest our code bytes. Catalog reads no longer require a usable
+training installation. The managed native refresh, service/Desktop/helper build, configuration
+isolation, provenance and launcher lifecycle checks passed. Native Desktop reached workspace ready
+without an application-password prompt. This does not establish complete quote or analysis coverage.
+
+After correcting the genuine dataset fixture to match the thirteen-feature production contract,
+all six selected Python checks passed in 23.962s: deterministic native bundle export, deterministic
+ONNX candidate/finalization, partial-input/altered-authority rejection, and all three existing dataset
+PIT/integrity checks. Evidence: `source-runtime-python-export-critical.log`; fixture build 14.05s.
+No production model-validation rule was relaxed. Source/model writers are frozen and lead owns
+integration. The active supervised app remains visible; its watcher is paused during manual checks.
+
+Next: deploy the writer correction through the same supervisor and prove the live stock workflow,
+model admission/inference and saved restart. Remove remaining recurring installed-software scans
+using the existing installation metadata contract documented in the source-runtime correction report.
+That installed correction, residual own-executable provenance reads, Schwab API/stream qualification
+and remaining provider/UI coverage are unfinished. Schwab saved OAuth refresh succeeded at access
+generation 2, but API doctor retry still reports incomplete/inconsistent evidence. No new consent
+or full-product success is claimed. No CI, release gate or whole-app RAM acceptance ran.
+
 ### Source training export — dataset repaired, validator diagnosis
 
 The corrected empty-writer admission now lets the genuine dataset fixture complete (1/1 passed
@@ -19,9 +43,23 @@ but the production recipe requires price return plus all 12 macro features. Thei
 examples also cannot fit that recipe. Correct the existing fixture and its consumers together;
 do not relax production feature admission or replace the real training/export checks.
 
+Astra's bounded implementation owns the existing `python_training_fixture.rs`, its request/market
+helpers in `tests/publication_recovery.rs`, and `python/tests/{test_data,test_training_bundle}.py`.
+Use 18 examples (14 train, 2 validation, 2 test), the full ordered 13-feature recipe, and 252 rows;
+reuse existing contract order and preserve early PIT assertions. Vary macro inputs independently
+so the training matrix is identifiable. Keep the existing 16 MiB fixture budget. Lead runs the
+same dataset/export and affected data-integrity checks after handoff; no new harness or product
+validation changes. The independently verified writer correction is pushed as `510ae9c5`.
+
 One worktree and the three intended local branches are present. Origin's extra branch is the active
 unmerged Dependabot PR #55 (`crc32fast` 1.5.2); its unique change is preserved, not treated as stale
 agent work. The local bundle-backup remote remains recovery evidence. No branch was created.
+
+Cleanup removed the superseded app-test executable `market_squawk-1dd2485f31f23c9f`
+(810,962,768 bytes) and the unused `.market-squawk/development-model-runtime` signed cache
+(about 2.3 GiB). The active editable environment, current test executable, supervised runtime,
+workspace data and recovery evidence remain. The existing writer-admission check also passed
+1/1 in 1.74s, preserving actual resource checks after the footer correction.
 
 ### Source runtime verification — editable environment refreshed
 

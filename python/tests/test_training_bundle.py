@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from contextlib import nullcontext
 from dataclasses import replace
 import hashlib
 import io
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import market_squawk
 import market_squawk.training as installed_training
@@ -37,13 +39,33 @@ from market_squawk.worker_protocol import (
     CandidateEvidence,
     WorkerProtocolWriter,
 )
-from test_data import FIXTURE_MAX_BYTES, PRODUCT_CONTRACT, _fixture
+from test_data import FIXTURE_MAX_BYTES, FIXTURE_MAX_ROWS, PRODUCT_CONTRACT, _fixture
 
 
 requires_sealed_release = unittest.skipUnless(
     market_squawk.__market_squawk_build_identity__ == "sealed-release-v1",
     "requires the sealed installed Python product",
 )
+requires_training_environment = unittest.skipUnless(
+    market_squawk.__market_squawk_build_identity__ == "sealed-release-v1"
+    or (Path(sys.prefix) / "source-development.json").is_file(),
+    "requires the configured managed training environment",
+)
+requires_source_environment = unittest.skipUnless(
+    market_squawk.__market_squawk_build_identity__ == "development-unsealed-v1"
+    and (Path(sys.prefix) / "source-development.json").is_file(),
+    "requires the configured managed editable environment",
+)
+
+
+def _features() -> list[dict[str, object]]:
+    # Native catalog order retains price return followed by the economic macro order.
+    return [
+        value
+        for value in feature_contracts(context=OperationContext(60_000, 1_000_000))
+        if value["name"] == "research.price-return"
+        or value["name"].startswith("research.macro.")
+    ]
 
 
 def _run(
@@ -52,15 +74,10 @@ def _run(
     model_id: str = "018f3c2a-91ab-7ccd-b3de-123456789abc",
     bundle_id: str = "fixture-linear",
 ) -> TrainingRun:
-    feature = next(
-        value
-        for value in feature_contracts(context=OperationContext(60_000, 1_000_000))
-        if value["name"] == "research.price-return"
-    )
     label = next(value for value in dataset.components if value.kind == "label")
     return TrainingRun(
         dataset=dataset,
-        features=[feature],
+        features=_features(),
         label=label,
         seed=17,
         missing_policy="reject",
@@ -87,11 +104,6 @@ def _driver_config(
     model_id: str,
     bundle_id: str,
 ) -> dict[str, object]:
-    feature = next(
-        value
-        for value in feature_contracts(context=OperationContext(60_000, 1_000_000))
-        if value["name"] == "research.price-return"
-    )
     label = next(value for value in dataset.components if value.kind == "label")
     return {
         "schemaVersion": 1,
@@ -100,11 +112,11 @@ def _driver_config(
             "exportSha256": digest,
             "productContract": dataset.product_contract,
             "asOfUnixNanos": 700,
-            "maximumRows": 128,
+            "maximumRows": FIXTURE_MAX_ROWS,
             "maximumBytes": 256 * 1024 * 1024,
         },
         "training": {
-            "features": [feature],
+            "features": _features(),
             "label": dict(label.mapping()),
             "seed": 17,
             "missingPolicy": "reject",
@@ -141,7 +153,7 @@ def _signed_prediction_attempt(
             "input": {
                 "bundleId": bundle_id,
                 "bundleVersion": 1,
-                "featureValues": [0.25],
+                "featureValues": [0.25] * len(_features()),
             },
         },
     )
@@ -414,9 +426,48 @@ class TrainingBundleContracts(unittest.TestCase):
                 path.chmod(mode)
             authority.chmod(authority_mode)
 
-    @requires_sealed_release
+    @requires_source_environment
+    def test_source_receipt_reports_provenance_and_rejects_runtime_mismatch(self) -> None:
+        receipt = training_environment_receipt()
+        self.assertEqual(receipt.origin, "source-development")
+        self.assertEqual(Path(receipt.source_development_root), Path(sys.prefix).resolve())
+        self.assertTrue(receipt.training_code_revision.startswith("development-"))
+        self.assertTrue(receipt.training_code_revision.endswith("-editable"))
+        self.assertIsNone(receipt.application_sha256)
+        self.assertIsNone(receipt.onnx_worker_sha256)
+        self.assertIsNone(receipt.validator_sha256)
+        descriptor = Path(sys.prefix) / "source-development.json"
+        original = descriptor.read_bytes()
+        value = json.loads(original)
+        try:
+            descriptor.write_text(json.dumps(value, indent=2), encoding="ascii")
+            self.assertEqual(training_environment_receipt().sha256, receipt.sha256)
+            for field in ("native_build_revision", "runtime_distributions"):
+                changed = json.loads(original)
+                if field == "native_build_revision":
+                    changed[field] = "development-another-native-build"
+                else:
+                    dependency = next(iter(value[field]))
+                    changed[field][dependency] = "0.0.0"
+                descriptor.write_text(json.dumps(changed, indent=2), encoding="ascii")
+                with self.subTest(mismatch=field), self.assertRaisesRegex(ValueError, "refresh"):
+                    training_environment_receipt()
+        finally:
+            descriptor.write_bytes(original)
+        self.assertEqual(training_environment_receipt().sha256, receipt.sha256)
+
+    @requires_training_environment
     def test_task11_bound_training_exports_identical_externally_authorized_bundle(self) -> None:
+        validator_scan = (
+            mock.patch(
+                "market_squawk.bundle._validator_digest",
+                side_effect=AssertionError("source validator code must not be hashed"),
+            )
+            if market_squawk.__market_squawk_build_identity__ == "development-unsealed-v1"
+            else nullcontext()
+        )
         with (
+            validator_scan,
             tempfile.TemporaryDirectory() as dataset_root,
             tempfile.TemporaryDirectory() as authority_root,
             tempfile.TemporaryDirectory() as left,
@@ -429,7 +480,7 @@ class TrainingBundleContracts(unittest.TestCase):
                 digest,
                 UtcNanoseconds(700),
                 product_contract=PRODUCT_CONTRACT,
-                max_rows=128,
+                max_rows=FIXTURE_MAX_ROWS,
                 max_bytes=FIXTURE_MAX_BYTES,
                 context=OperationContext(60_000, 1_000_000),
             )
@@ -478,7 +529,7 @@ class TrainingBundleContracts(unittest.TestCase):
             )
             self.assertEqual(run_record["trial"]["seed"], 17)
             self.assertEqual(run_record["trial"]["dataset_export_sha256"], digest)
-            self.assertEqual(run_record["trial"]["split_counts"], {"test": 2, "train": 2, "validation": 2})
+            self.assertEqual(run_record["trial"]["split_counts"], {"test": 2, "train": 14, "validation": 2})
             self.assertNotEqual(run_record["trial"]["split_sha256"], "36" * 32)
             self.assertFalse((first.root / "expectations.json").exists())
 
@@ -487,7 +538,7 @@ class TrainingBundleContracts(unittest.TestCase):
                     model_kind="linear", context=OperationContext(60_000, 1_000_000)
                 )
 
-    @requires_sealed_release
+    @requires_training_environment
     def test_partial_dataset_and_mutated_external_authority_fail_before_publication(self) -> None:
         with (
             tempfile.TemporaryDirectory() as dataset_root,
@@ -500,7 +551,7 @@ class TrainingBundleContracts(unittest.TestCase):
                 digest,
                 UtcNanoseconds(100),
                 product_contract=PRODUCT_CONTRACT,
-                max_rows=128,
+                max_rows=FIXTURE_MAX_ROWS,
                 max_bytes=FIXTURE_MAX_BYTES,
                 context=OperationContext(60_000, 1_000_000),
             )
@@ -514,7 +565,7 @@ class TrainingBundleContracts(unittest.TestCase):
                 digest,
                 UtcNanoseconds(700),
                 product_contract=PRODUCT_CONTRACT,
-                max_rows=128,
+                max_rows=FIXTURE_MAX_ROWS,
                 max_bytes=FIXTURE_MAX_BYTES,
                 context=OperationContext(60_000, 1_000_000),
             )
@@ -531,8 +582,8 @@ class TrainingBundleContracts(unittest.TestCase):
                 )
             self.assertEqual(list(Path(output_root).iterdir()), [])
 
-    @requires_sealed_release
-    def test_sealed_driver_produces_deterministic_onnx_and_exact_admission_request(self) -> None:
+    @requires_training_environment
+    def test_driver_produces_deterministic_onnx_and_exact_admission_request(self) -> None:
         model_kind = "linear"
         output_semantics = "regression"
         model_id = "018f3c2a-91ab-7ccd-b3de-123456789abc"
@@ -550,7 +601,7 @@ class TrainingBundleContracts(unittest.TestCase):
             dataset = open_dataset(
                 data_root, digest, UtcNanoseconds(700),
                 product_contract=PRODUCT_CONTRACT,
-                max_rows=128, max_bytes=FIXTURE_MAX_BYTES,
+                max_rows=FIXTURE_MAX_ROWS, max_bytes=FIXTURE_MAX_BYTES,
                 context=OperationContext(60_000, 1_000_000),
             )
             # A forward-return receipt cannot authorize probability or price labels.
@@ -701,13 +752,14 @@ class TrainingBundleContracts(unittest.TestCase):
 
             self.assertNotIn("admitted", request)
             self.assertNotIn("disposition", request)
-            rejected = _signed_prediction_attempt(
-                data_root,
-                request_root,
-                model_id=model_id,
-                bundle_id=bundle_id,
-            )
-            self.assertNotEqual(rejected.returncode, 0)
+            if market_squawk.__market_squawk_build_identity__ == "sealed-release-v1":
+                rejected = _signed_prediction_attempt(
+                    data_root,
+                    request_root,
+                    model_id=model_id,
+                    bundle_id=bundle_id,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
 
 
 if __name__ == "__main__":

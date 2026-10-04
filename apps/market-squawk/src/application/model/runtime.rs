@@ -11,10 +11,11 @@ use market_squawk_data::{
 };
 use market_squawk_domain::ModelId;
 use market_squawk_modeling::{
-    BundleId, BundleMetadataRef, ControlledModelRoot, InferenceBackend, MAX_BUNDLE_AUTHORITY_BYTES,
-    ModelAdmissionError, ModelBundle, ModelFormat, ModelRegistry, ModelRegistryError,
-    NativeBackendError, NativeLinearBackend, OnnxBackendError, OnnxModelPolicy, OnnxWorkerProgram,
-    ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, TractOnnxBackend,
+    BundleId, BundleMetadataRef, ConfiguredTrainingEnvironment, ControlledModelRoot,
+    InferenceBackend, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError, ModelBundle, ModelFormat,
+    ModelRegistry, ModelRegistryError, NativeBackendError, NativeLinearBackend, OnnxBackendError,
+    OnnxModelPolicy, OnnxWorkerProgram, ProductionFeatureRegistry, PythonDatasetAdmissionAuthority,
+    TractOnnxBackend, TrainingEnvironmentError, TrainingEnvironmentIdentity,
     VerifiedTrainingEnvironment, verify_model_candidate,
 };
 use market_squawk_platform::{LocalPaths, PathError};
@@ -375,13 +376,145 @@ impl fmt::Debug for RetainedRuntimeBackup {
     }
 }
 
+/// Explicit execution configuration, shared by the current catalog and retained read images.
+/// Reading saved models does not require a configured or usable training installation.
+#[derive(Clone)]
+pub(crate) struct ModelExecutionConfiguration {
+    origin: ModelExecutionOrigin,
+    shutdown: CancellationToken,
+}
+
+#[derive(Clone)]
+enum ModelExecutionOrigin {
+    Source(std::path::PathBuf),
+    Installed {
+        root: std::path::PathBuf,
+        application: std::path::PathBuf,
+        worker: std::path::PathBuf,
+    },
+}
+
+impl ModelExecutionConfiguration {
+    pub(crate) fn source(root: std::path::PathBuf) -> Self {
+        Self {
+            origin: ModelExecutionOrigin::Source(root),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn installed(
+        root: std::path::PathBuf,
+        application: std::path::PathBuf,
+        worker: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            origin: ModelExecutionOrigin::Installed {
+                root,
+                application,
+                worker,
+            },
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    fn for_restore(&self) -> Self {
+        Self {
+            origin: self.origin.clone(),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    fn check(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), TrainingEnvironmentError> {
+        if cancellation.is_cancelled() || self.shutdown.is_cancelled() {
+            Err(TrainingEnvironmentError::Cancelled)
+        } else if Instant::now() >= deadline {
+            Err(TrainingEnvironmentError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn environment(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ConfiguredTrainingEnvironment, ProductionModelRuntimeError> {
+        let check = || self.check(deadline, cancellation);
+        check()?;
+        match &self.origin {
+            ModelExecutionOrigin::Source(root) => {
+                ConfiguredTrainingEnvironment::open_source(root, &check).map_err(Into::into)
+            }
+            ModelExecutionOrigin::Installed {
+                root,
+                application,
+                worker,
+            } => VerifiedTrainingEnvironment::verify_application_controlled(
+                root,
+                application,
+                worker,
+                &check,
+            )
+            .map(Into::into)
+            .map_err(Into::into),
+        }
+    }
+
+    fn identity(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<TrainingEnvironmentIdentity, ProductionModelRuntimeError> {
+        let check = || self.check(deadline, cancellation);
+        check()?;
+        match &self.origin {
+            ModelExecutionOrigin::Source(_) => self
+                .environment(deadline, cancellation)
+                .map(|value| value.identity()),
+            ModelExecutionOrigin::Installed { root, .. } => {
+                TrainingEnvironmentIdentity::read_controlled(root, &check).map_err(Into::into)
+            }
+        }
+    }
+
+    fn worker(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OnnxWorkerProgram, ProductionModelRuntimeError> {
+        let environment = self.environment(deadline, cancellation)?;
+        let program = match (&self.origin, &environment) {
+            (
+                ModelExecutionOrigin::Source(_),
+                ConfiguredTrainingEnvironment::SourceDevelopment(source),
+            ) => {
+                OnnxWorkerProgram::admit_source(source.onnx_worker(), environment.receipt_sha256())?
+            }
+            (
+                ModelExecutionOrigin::Installed { worker, .. },
+                ConfiguredTrainingEnvironment::InstalledRelease(installed),
+            ) => OnnxWorkerProgram::admit(worker, installed.onnx_worker_sha256())?,
+            _ => return Err(ProductionModelRuntimeError::RuntimeUnavailable),
+        };
+        self.check(deadline, cancellation)?;
+        Ok(program)
+    }
+
+    fn begin_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+}
+
 /// Application-owned durable model admission and backend recovery authority.
 pub struct ProductionModelRuntime {
     paths: LocalPaths,
     catalog: Option<ModelInventoryCatalogCapability>,
     feature_registry: Arc<ProductionFeatureRegistry>,
-    training_environment: Option<VerifiedTrainingEnvironment>,
-    onnx_worker: Option<OnnxWorkerProgram>,
+    execution: Option<ModelExecutionConfiguration>,
     limits: ProductionModelRuntimeLimits,
     gate: Mutex<RuntimeGate>,
     admission_validation: Mutex<()>,
@@ -399,47 +532,59 @@ impl ProductionModelRuntime {
         })
     }
 
-    /// Returns the exact sealed environment shared by training execution and candidate admission.
+    /// Resolves the configured environment before execution or candidate admission.
     ///
     /// # Errors
-    ///
-    /// Returns a typed unavailable error only for an in-crate test runtime that deliberately has
-    /// no signed installed-release capability.
+    /// Missing configuration, verification failure, cancellation or deadline fails the operation
+    /// without hiding its durable inventory or publishing an execution capability.
     pub fn training_environment(
         &self,
-    ) -> Result<&VerifiedTrainingEnvironment, ProductionModelRuntimeError> {
-        self.training_environment
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ConfiguredTrainingEnvironment, ProductionModelRuntimeError> {
+        self.execution
             .as_ref()
-            .ok_or(ProductionModelRuntimeError::RuntimeUnavailable)
+            .ok_or(ProductionModelRuntimeError::RuntimeUnavailable)?
+            .environment(deadline, cancellation)
     }
 
-    /// Reports whether the fixed durable runtime index contains any admitted generation.
-    ///
-    /// The durable catalog head is read without loading admitted models. This lets
-    /// application composition distinguish a genuinely fresh model namespace from an existing
-    /// runtime that must not be hidden when its verified training-environment capability is
-    /// unavailable.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed local-path, persistence, index-validation, or resource error.
-    pub fn has_durable_admissions(
-        catalog: ModelInventoryCatalogCapability,
-    ) -> Result<bool, ProductionModelRuntimeError> {
-        Ok(catalog.head()?.sequence != 0)
+    pub(crate) fn ensure_execution_live(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProductionModelRuntimeError> {
+        check_admission_control(deadline, cancellation)?;
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.shutdown.is_cancelled())
+        {
+            return Err(TrainingEnvironmentError::Cancelled.into());
+        }
+        Ok(())
     }
 
-    /// Constructs the truthful empty model inventory used only for a fresh local namespace.
-    ///
-    /// Callers must first establish with [`Self::has_durable_admissions`] that no durable model
-    /// generation exists. Inference over this snapshot returns not-found through the normal model
-    /// domain service; it never represents an unavailable admitted generation as empty.
+    /// Authenticates recipe coordinates without granting execution or scanning installed code.
+    pub(crate) fn training_identity(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<TrainingEnvironmentIdentity, ProductionModelRuntimeError> {
+        let execution = self
+            .execution
+            .as_ref()
+            .ok_or(ProductionModelRuntimeError::RuntimeUnavailable)?;
+        execution.identity(deadline, cancellation)
+    }
+
+    /// Constructs the empty image for an empty backup or an in-crate fixture.
+    /// Production workspaces always open their actual durable catalog instead.
     ///
     /// # Errors
     ///
     /// Returns a registry error if the code-owned production limits cannot construct an empty
     /// bounded registry.
-    pub fn empty_snapshot() -> Result<ModelRuntimeSnapshot, ProductionModelRuntimeError> {
+    fn empty_snapshot() -> Result<ModelRuntimeSnapshot, ProductionModelRuntimeError> {
         let registry = Arc::new(ModelRegistry::empty());
         let image = Arc::new(ModelReadImage::try_new(registry, Vec::new())?);
         Ok(ModelRuntimeSnapshot {
@@ -456,11 +601,10 @@ impl ProductionModelRuntime {
     ///
     /// Returns a typed local-path, persistence, dataset, bundle, registry, policy, worker, or
     /// aggregate-deadline error without publishing a partial runtime.
-    pub fn try_open(
+    pub(crate) fn try_open(
         paths: &LocalPaths,
         catalog: ModelInventoryCatalogCapability,
-        training_environment: VerifiedTrainingEnvironment,
-        onnx_worker: Option<OnnxWorkerProgram>,
+        execution: Option<ModelExecutionConfiguration>,
         limits: ProductionModelRuntimeLimits,
     ) -> Result<Self, ProductionModelRuntimeError> {
         let head = catalog.head()?;
@@ -471,7 +615,7 @@ impl ProductionModelRuntime {
             catalog.clone(),
             head,
             Arc::clone(&feature_registry),
-            onnx_worker.clone(),
+            execution.clone(),
             limits,
         ));
         let image = Arc::new(ModelReadImage::from_inventory(inventory));
@@ -479,8 +623,7 @@ impl ProductionModelRuntime {
             paths: paths.clone(),
             catalog: Some(catalog),
             feature_registry,
-            training_environment: Some(training_environment),
-            onnx_worker,
+            execution,
             limits,
             admission_validation: Mutex::new(()),
             gate: Mutex::new(RuntimeGate {
@@ -494,7 +637,7 @@ impl ProductionModelRuntime {
     /// Durably admits one exact candidate or recognizes a fully identical replay.
     ///
     /// The method accepts no arbitrary local path or executable. It revalidates the configured
-    /// catalog selection and current training release, validates the new candidate in the shared
+    /// catalog selection and current training execution, validates the new candidate in the shared
     /// execution slot, commits one immutable catalog row, then publishes its inventory fence.
     ///
     /// # Errors
@@ -697,19 +840,16 @@ impl ProductionModelRuntime {
 
     pub(super) fn restore_capabilities(
         &self,
-    ) -> Result<
+    ) -> (
+        Option<ModelExecutionConfiguration>,
+        ProductionModelRuntimeLimits,
+    ) {
         (
-            VerifiedTrainingEnvironment,
-            Option<OnnxWorkerProgram>,
-            ProductionModelRuntimeLimits,
-        ),
-        ProductionModelRuntimeError,
-    > {
-        Ok((
-            self.training_environment()?.clone(),
-            self.onnx_worker.clone(),
+            self.execution
+                .as_ref()
+                .map(ModelExecutionConfiguration::for_restore),
             self.limits,
-        ))
+        )
     }
 
     pub(super) fn decode_backup_head(
@@ -765,8 +905,7 @@ impl ProductionModelRuntime {
             paths: paths.clone(),
             catalog: None,
             feature_registry: Arc::new(ProductionFeatureRegistry::try_new()?),
-            training_environment: None,
-            onnx_worker: None,
+            execution: None,
             limits,
             admission_validation: Mutex::new(()),
             gate: Mutex::new(RuntimeGate {
@@ -784,7 +923,7 @@ impl ProductionModelRuntime {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<RuntimeValidatedCandidate, ProductionModelRuntimeError> {
-        let environment = self.training_environment()?;
+        let environment = self.training_environment(deadline, cancellation)?;
         let candidate = verify_model_candidate(
             root,
             &request.metadata,
@@ -792,7 +931,7 @@ impl ProductionModelRuntime {
             request.authority_sha256,
             self.paths.root(),
             request.dataset,
-            environment,
+            &environment,
             &self.feature_registry,
             self.limits.dataset_verification,
             deadline,
@@ -822,8 +961,7 @@ impl fmt::Debug for ProductionModelRuntime {
             .field("paths", &"[PREPARED LOCAL PATHS]")
             .field("catalog", &self.catalog)
             .field("feature_registry", &self.feature_registry)
-            .field("training_environment", &"[VERIFIED TRAINING ENVIRONMENT]")
-            .field("onnx_worker", &self.onnx_worker.is_some())
+            .field("execution_configured", &self.execution.is_some())
             .field("limits", &self.limits)
             .field("gate", &"[DURABLE MODEL RUNTIME]")
             .finish()
@@ -1042,7 +1180,7 @@ impl ProductionModelRuntime {
     }
 }
 
-fn check_admission_control(
+pub(crate) fn check_admission_control(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), ProductionModelRuntimeError> {
@@ -1084,6 +1222,9 @@ fn receipt(
 /// Durable production model runtime construction, recovery, or admission failure.
 #[derive(Debug, Error)]
 pub enum ProductionModelRuntimeError {
+    /// Configured training environment could not be resolved.
+    #[error(transparent)]
+    TrainingEnvironment(#[from] TrainingEnvironmentError),
     /// Durable indexed inventory publication or integrity failed.
     #[error(transparent)]
     Inventory(#[from] ModelInventoryError),
@@ -1120,6 +1261,9 @@ pub enum ProductionModelRuntimeError {
     /// ONNX policy, runtime load, or warm-up failed.
     #[error("production ONNX model backend failed: {0}")]
     Onnx(#[from] OnnxBackendError),
+    /// Configured ONNX helper could not be admitted.
+    #[error("configured ONNX helper is unavailable: {0}")]
+    OnnxWorker(#[from] market_squawk_modeling::OnnxWorkerProgramError),
     /// An admitted ONNX generation has no exact worker capability.
     #[error("production ONNX worker authority is required")]
     MissingOnnxWorker,
@@ -1150,4 +1294,73 @@ pub enum ProductionModelRuntimeError {
     /// Bounded runtime allocation failed.
     #[error("production model runtime resource ceiling was exceeded")]
     ResourceExhausted,
+}
+
+#[cfg(test)]
+mod execution_configuration_tests {
+    use super::*;
+    use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
+    #[test]
+    fn catalog_stays_readable_when_execution_configuration_is_missing_or_cancelled()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path().join("models"))?;
+        let research = Arc::new(crate::ResearchService::initialize(
+            &paths,
+            CatalogConfig::try_new(
+                paths.catalog()?.clone(),
+                Duration::from_millis(250),
+                CatalogLimit::new(32)?,
+                CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+            )?,
+            8,
+            ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+        )?);
+        let catalog = research.analytical().model_inventory();
+        let admission = IndexAdmission::fixture(1)?;
+        catalog.publish(&ModelInventoryRecord {
+            model_id: admission.model_id,
+            model_token: uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")?,
+            bundle_id: admission.bundle_id.as_str().to_owned(),
+            bundle_version: admission.bundle_version,
+            candidate_directory: admission.candidate_directory.to_string(),
+            record: admission.encode_record()?,
+        })?;
+        let execution =
+            ModelExecutionConfiguration::source(temporary.path().join("missing-source"));
+        let runtime = Arc::new(ProductionModelRuntime::try_open(
+            &paths,
+            catalog,
+            Some(execution.clone()),
+            ProductionModelRuntimeLimits::standard()?,
+        )?);
+        let _runner = crate::jobs::TrainingJobRunner::try_new(
+            &paths,
+            Arc::clone(&runtime),
+            research,
+            4,
+            Duration::from_secs(60),
+        )?;
+        assert_eq!(runtime.snapshot()?.len(), 1);
+        assert_eq!(
+            runtime.retain_backup()?.page(0)?[0].coordinate.bundle_id,
+            admission.bundle_id
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            runtime.training_environment(deadline, &CancellationToken::new()),
+            Err(ProductionModelRuntimeError::TrainingEnvironment(
+                TrainingEnvironmentError::ControlledRoot
+            ))
+        ));
+        execution.begin_shutdown();
+        assert!(matches!(
+            runtime.training_environment(deadline, &CancellationToken::new()),
+            Err(ProductionModelRuntimeError::TrainingEnvironment(
+                TrainingEnvironmentError::Cancelled
+            ))
+        ));
+        assert_eq!(runtime.retain_backup()?.page(0)?.len(), 1);
+        Ok(())
+    }
 }

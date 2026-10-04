@@ -204,6 +204,7 @@ impl InstalledJobRunners {
                 TrainingJobRunner::try_new(
                     product.paths(),
                     runtime,
+                    product.research(),
                     RUNNER_PENDING_CAPACITY,
                     RUNNER_DEADLINE,
                 )

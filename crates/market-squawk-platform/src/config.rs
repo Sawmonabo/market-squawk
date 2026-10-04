@@ -91,6 +91,8 @@ pub enum ConfigSetting {
     SourceShutdown,
     /// Optional verified Python training-release root.
     TrainingReleaseDirectory,
+    /// Explicit managed source-development Python environment.
+    DevelopmentTrainingDirectory,
     /// Coinbase production profile.
     Coinbase,
     /// Kraken production profile.
@@ -98,7 +100,7 @@ pub enum ConfigSetting {
 }
 
 impl ConfigSetting {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::DataDirectory,
         Self::Products,
         Self::StaleAfter,
@@ -110,6 +112,7 @@ impl ConfigSetting {
         Self::CaptureShutdown,
         Self::SourceShutdown,
         Self::TrainingReleaseDirectory,
+        Self::DevelopmentTrainingDirectory,
         Self::Coinbase,
         Self::Kraken,
     ];
@@ -129,6 +132,7 @@ impl ConfigSetting {
             "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => Some(Self::CaptureShutdown),
             "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => Some(Self::SourceShutdown),
             "MARKET_SQUAWK_TRAINING_RELEASE_ROOT" => Some(Self::TrainingReleaseDirectory),
+            "MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT" => Some(Self::DevelopmentTrainingDirectory),
             "MARKET_SQUAWK_COINBASE_JSON" => Some(Self::Coinbase),
             "MARKET_SQUAWK_KRAKEN_JSON" => Some(Self::Kraken),
             _ => None,
@@ -307,6 +311,11 @@ impl ConfigProvenance {
             ConfigOrigin::Cli,
         );
         self.mark_if(
+            cli.development_training_root.is_some(),
+            ConfigSetting::DevelopmentTrainingDirectory,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
             cli.coinbase.is_some(),
             ConfigSetting::Coinbase,
             ConfigOrigin::Cli,
@@ -461,6 +470,8 @@ pub struct ConfigOverrides {
     pub source_shutdown_ms: Option<u64>,
     /// Absolute installed Python training-release root.
     pub training_release_root: Option<PathBuf>,
+    /// Managed source-development environment, exclusive with installed release configuration.
+    pub development_training_root: Option<PathBuf>,
     /// Complete validated production Coinbase source profile.
     pub coinbase: Option<CoinbaseSourceConfig>,
     /// Complete validated production Kraken public book-and-trade source profile.
@@ -565,6 +576,7 @@ pub struct AppConfig {
     capture_shutdown: Duration,
     source_shutdown: Duration,
     training_release_root: Option<PathBuf>,
+    development_training_root: Option<PathBuf>,
     coinbase: Option<CoinbaseSourceConfig>,
     kraken: Option<KrakenSourceConfig>,
     provenance: ConfigProvenance,
@@ -594,6 +606,7 @@ impl fmt::Debug for AppConfig {
             .field("capture_shutdown", &self.capture_shutdown)
             .field("source_shutdown", &self.source_shutdown)
             .field("training_release_root", &self.training_release_root)
+            .field("development_training_root", &self.development_training_root)
             .field("coinbase", &self.coinbase)
             .field("kraken", &self.kraken)
             .field("provenance", &self.provenance)
@@ -628,6 +641,7 @@ impl Default for AppConfig {
             capture_shutdown: Duration::from_millis(DEFAULT_SHUTDOWN_MS),
             source_shutdown: Duration::from_millis(DEFAULT_SOURCE_SHUTDOWN_MS),
             training_release_root: None,
+            development_training_root: None,
             coinbase: None,
             kraken: None,
             provenance: ConfigProvenance::default(),
@@ -753,6 +767,11 @@ impl AppConfig {
         self.training_release_root.as_deref()
     }
 
+    /// Returns the explicitly configured managed source-development environment.
+    pub fn development_training_root(&self) -> Option<&Path> {
+        self.development_training_root.as_deref()
+    }
+
     /// Returns the optional strict production Coinbase source profile.
     pub const fn coinbase(&self) -> Option<&CoinbaseSourceConfig> {
         self.coinbase.as_ref()
@@ -787,6 +806,7 @@ impl From<AppConfig> for ConfigOverrides {
             capture_shutdown_ms: Some(duration_millis(config.capture_shutdown)),
             source_shutdown_ms: Some(duration_millis(config.source_shutdown)),
             training_release_root: config.training_release_root,
+            development_training_root: config.development_training_root,
             coinbase: config.coinbase,
             kraken: config.kraken,
         }
@@ -840,6 +860,9 @@ impl ConfigOverrides {
         if higher.training_release_root.is_some() {
             self.training_release_root = higher.training_release_root;
         }
+        if higher.development_training_root.is_some() {
+            self.development_training_root = higher.development_training_root;
+        }
         if higher.coinbase.is_some() {
             self.coinbase = higher.coinbase;
         }
@@ -862,6 +885,7 @@ impl ConfigOverrides {
             capture_shutdown_ms: file.capture_shutdown_ms,
             source_shutdown_ms: file.source_shutdown_ms,
             training_release_root: file.training_release_root,
+            development_training_root: None,
             coinbase: file.coinbase,
             kraken: file.kraken,
         });
@@ -918,6 +942,9 @@ impl ConfigOverrides {
                 }
                 ConfigSetting::TrainingReleaseDirectory => {
                     layer.training_release_root = Some(PathBuf::from(value));
+                }
+                ConfigSetting::DevelopmentTrainingDirectory => {
+                    layer.development_training_root = Some(PathBuf::from(value));
                 }
                 ConfigSetting::Coinbase => {
                     layer.coinbase = Some(instruments::parse_environment_profile(value)?);
@@ -1018,6 +1045,15 @@ impl TryFrom<ConfigOverrides> for AppConfig {
         {
             return Err(ConfigError::InvalidTrainingReleaseDirectory);
         }
+        if values
+            .development_training_root
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+            || (values.development_training_root.is_some()
+                && values.training_release_root.is_some())
+        {
+            return Err(ConfigError::InvalidDevelopmentTrainingDirectory);
+        }
         Ok(Self {
             data_dir,
             products,
@@ -1032,6 +1068,7 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             capture_shutdown: Duration::from_millis(shutdown_ms.get()),
             source_shutdown: Duration::from_millis(source_shutdown_ms.get()),
             training_release_root: values.training_release_root,
+            development_training_root: values.development_training_root,
             coinbase: values.coinbase,
             kraken: values.kraken,
             provenance: ConfigProvenance::default(),
@@ -1091,6 +1128,11 @@ pub enum ConfigError {
     /// The optional training release root was empty or not absolute.
     #[error("training release directory is invalid")]
     InvalidTrainingReleaseDirectory,
+    /// Development must name one absolute environment and cannot select an installed release too.
+    #[error(
+        "development training root must be absolute and exclusive with the installed training release"
+    )]
+    InvalidDevelopmentTrainingDirectory,
     /// A required default was accidentally omitted by internal composition.
     #[error("configuration composition invariant failed")]
     InternalComposition,

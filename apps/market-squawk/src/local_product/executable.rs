@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use market_squawk_modeling::{OnnxWorkerProgram, OnnxWorkerProgramError};
+use market_squawk_modeling::OnnxWorkerProgramError;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -51,32 +51,6 @@ pub(super) fn installed_release_programs() -> Result<(PathBuf, PathBuf), Executa
         "{ONNX_WORKER_BASENAME}{}",
         std::env::consts::EXE_SUFFIX
     ));
-    Ok((application, worker))
-}
-
-/// Returns the verified application and ONNX worker retained inside one development model release.
-#[cfg(debug_assertions)]
-pub(super) fn development_training_release_programs(
-    release_root: &Path,
-) -> Result<(PathBuf, PathBuf), ExecutableIdentityError> {
-    if !release_root.is_absolute() {
-        return Err(ExecutableIdentityError::InvalidExecutablePath);
-    }
-    let directory = release_root.join("bin");
-    let application = development_program(
-        &directory.join(format!(
-            "{APPLICATION_BASENAME}{}",
-            std::env::consts::EXE_SUFFIX
-        )),
-        APPLICATION_BASENAME,
-    )?;
-    let worker = development_program(
-        &directory.join(format!(
-            "{ONNX_WORKER_BASENAME}{}",
-            std::env::consts::EXE_SUFFIX
-        )),
-        ONNX_WORKER_BASENAME,
-    )?;
     Ok((application, worker))
 }
 
@@ -160,36 +134,6 @@ fn validate_installed_application_permissions(
     _application: &Path,
 ) -> Result<(), ExecutableIdentityError> {
     Ok(())
-}
-
-/// Admits the exact sibling ONNX worker against its signed release-manifest digest.
-#[cfg(not(debug_assertions))]
-pub(super) fn admit_installed_onnx_worker(
-    expected_digest: [u8; 32],
-) -> Result<OnnxWorkerProgram, ExecutableIdentityError> {
-    let (_application, candidate) = installed_release_programs()?;
-    admit_onnx_worker(candidate, expected_digest)
-}
-
-/// Admits an exact ONNX worker retained inside a verified development model release.
-#[cfg(debug_assertions)]
-pub(super) fn admit_development_onnx_worker(
-    candidate: &Path,
-    expected_digest: [u8; 32],
-) -> Result<OnnxWorkerProgram, ExecutableIdentityError> {
-    let candidate = development_program(candidate, ONNX_WORKER_BASENAME)?;
-    admit_onnx_worker(candidate, expected_digest)
-}
-
-fn admit_onnx_worker(
-    candidate: PathBuf,
-    expected_digest: [u8; 32],
-) -> Result<OnnxWorkerProgram, ExecutableIdentityError> {
-    let digest = hash_stable_regular_file(&candidate)?;
-    if digest != expected_digest {
-        return Err(ExecutableIdentityError::SignedDigestMismatch);
-    }
-    OnnxWorkerProgram::admit(candidate, expected_digest).map_err(Into::into)
 }
 
 fn hash_stable_regular_file(path: &Path) -> Result<[u8; 32], ExecutableIdentityError> {

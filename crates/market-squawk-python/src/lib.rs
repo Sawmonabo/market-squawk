@@ -22,6 +22,10 @@ const PYTHON_BUILD_IDENTITY: &str = if SEALED_PYTHON_BUILD {
     "development-unsealed-v1"
 };
 const PYTHON_BUILD_IDENTITY_ATTRIBUTE: &str = "__market_squawk_build_identity__";
+const NATIVE_BUILD_REVISION: &str = match option_env!("MARKET_SQUAWK_NATIVE_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "development-unrecorded",
+};
 const NATIVE_MODULE_ALIAS: &str = "market_squawk._native";
 const PUBLIC_API: &[&str] = &[
     "BundleAuthorityRef",
@@ -201,6 +205,10 @@ fn market_squawk(module: &Bound<'_, PyModule>) -> PyResult<()> {
     }
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add(PYTHON_BUILD_IDENTITY_ATTRIBUTE, PYTHON_BUILD_IDENTITY)?;
+    module.add(
+        "__market_squawk_native_build_revision__",
+        NATIVE_BUILD_REVISION,
+    )?;
     module.add_class::<OperationContext>()?;
     module.add_function(wrap_pyfunction!(expected_model_validator_sha256, module)?)?;
     dataset::register(module)?;

@@ -55,7 +55,7 @@ TrainingEnvironmentReceipt = _native.TrainingEnvironmentReceipt
 
 
 def training_environment_receipt() -> TrainingEnvironmentReceipt:
-    """Return the builder-authored native training environment for this wheel."""
+    """Return native source provenance or verified installed-release coordinates."""
 
     return _native.training_environment_receipt()
 
@@ -582,10 +582,11 @@ class TrainingRun:
         self, model_kind: str, artifact_format: str
     ) -> dict[str, Any]:
         if not isinstance(self.environment, TrainingEnvironmentReceipt):
-            raise TypeError("training environment must be the native builder-authored receipt")
+            raise TypeError("training environment must be the native provenance receipt")
         current_environment = training_environment_receipt()
         if (
             self.environment.sha256 != current_environment.sha256
+            or self.environment.origin != current_environment.origin
             or self.environment.training_code_revision
             != current_environment.training_code_revision
         ):
@@ -1154,7 +1155,7 @@ def _onnx_scores(
 
     Gemm owns float32 accumulation and bias application. Rounding a handwritten
     affine loop after each addition is not equivalent. Only one bounded feature
-    row is retained, and the sealed environment binds the evaluator dependencies.
+    row is retained, and the configured environment binds the evaluator dependencies.
     """
 
     import numpy as np

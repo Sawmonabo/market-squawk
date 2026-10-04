@@ -2219,6 +2219,9 @@ fn map_phase_one_derived_generation_admission(
 
 pub(super) fn map_training_admission(error: crate::jobs::TrainingJobRunnerError) -> ServiceError {
     match error {
+        crate::jobs::TrainingJobRunnerError::Runtime(error) => {
+            crate::application::model::runtime_service_error(error)
+        }
         crate::jobs::TrainingJobRunnerError::InvalidLimits
         | crate::jobs::TrainingJobRunnerError::InvalidInput
         | crate::jobs::TrainingJobRunnerError::InputChanged

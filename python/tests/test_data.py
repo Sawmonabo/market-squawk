@@ -27,6 +27,7 @@ from market_squawk.finance import OperationContext
 PRODUCT_CONTRACT = "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1"
 FIXTURE_TEST = "point_in_time_builder_publishes_one_authorized_queryable_phase_one_generation"
 FIXTURE_MAX_BYTES = 64 * 1024 * 1024
+FIXTURE_MAX_ROWS = 256
 
 
 def _fixture(root: Path) -> str:
@@ -87,7 +88,7 @@ class DatasetContracts(unittest.TestCase):
             digest = _fixture(root)
             early = open_dataset(
                 root, digest, UtcNanoseconds(100),
-                max_rows=128, max_bytes=FIXTURE_MAX_BYTES,
+                max_rows=FIXTURE_MAX_ROWS, max_bytes=FIXTURE_MAX_BYTES,
                 product_contract=PRODUCT_CONTRACT,
                 context=OperationContext(60_000, 1_000_000),
             )
@@ -96,7 +97,7 @@ class DatasetContracts(unittest.TestCase):
             _verify_dataset_receipt(early, OperationContext(60_000, 1_000_000))
             boundary = open_dataset(
                 root, digest, UtcNanoseconds(110),
-                max_rows=128, max_bytes=FIXTURE_MAX_BYTES,
+                max_rows=FIXTURE_MAX_ROWS, max_bytes=FIXTURE_MAX_BYTES,
                 product_contract=PRODUCT_CONTRACT,
                 context=OperationContext(60_000, 1_000_000),
             )
@@ -106,7 +107,7 @@ class DatasetContracts(unittest.TestCase):
             _verify_dataset_receipt(boundary, OperationContext(60_000, 1_000_000))
             result = open_dataset(
                 root, digest, UtcNanoseconds(150),
-                max_rows=128, max_bytes=FIXTURE_MAX_BYTES,
+                max_rows=FIXTURE_MAX_ROWS, max_bytes=FIXTURE_MAX_BYTES,
                 product_contract=PRODUCT_CONTRACT,
                 context=OperationContext(60_000, 1_000_000),
             )
@@ -180,7 +181,7 @@ class DatasetContracts(unittest.TestCase):
             digest = _fixture(root)
             dataset = open_dataset(
                 root, digest, UtcNanoseconds(700),
-                max_rows=128, max_bytes=FIXTURE_MAX_BYTES,
+                max_rows=FIXTURE_MAX_ROWS, max_bytes=FIXTURE_MAX_BYTES,
                 product_contract=PRODUCT_CONTRACT,
                 context=OperationContext(60_000, 10_000_000),
             )

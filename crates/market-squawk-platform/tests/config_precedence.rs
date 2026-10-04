@@ -653,3 +653,42 @@ fn duplicate_and_empty_products_fail_closed() {
         assert!(error.is_err());
     }
 }
+
+#[test]
+fn source_training_is_explicit_and_cannot_mix_with_an_installed_release()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let root = directory.path().to_str().ok_or("test path encoding")?;
+    let source = environment(&[("MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT", root)]);
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &source,
+        ConfigOverrides::default(),
+    ))?;
+    assert_eq!(config.development_training_root(), Some(directory.path()));
+    assert_eq!(
+        config
+            .provenance()
+            .origin(ConfigSetting::DevelopmentTrainingDirectory),
+        ConfigOrigin::Environment
+    );
+    assert!(config.training_release_root().is_none());
+    let mixed = environment(&[
+        ("MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT", root),
+        ("MARKET_SQUAWK_TRAINING_RELEASE_ROOT", root),
+    ]);
+    assert!(matches!(
+        AppConfig::load(ConfigSources::new(None, &mixed, ConfigOverrides::default())),
+        Err(ConfigError::InvalidDevelopmentTrainingDirectory)
+    ));
+    let relative = environment(&[("MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT", "relative")]);
+    assert!(matches!(
+        AppConfig::load(ConfigSources::new(
+            None,
+            &relative,
+            ConfigOverrides::default()
+        )),
+        Err(ConfigError::InvalidDevelopmentTrainingDirectory)
+    ));
+    Ok(())
+}

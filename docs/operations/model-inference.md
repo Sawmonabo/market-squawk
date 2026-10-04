@@ -53,6 +53,19 @@ phase-one descriptor digest; that digest is not a training-ready Python export. 
 builder binds the final application, validator, ONNX worker, and supported `market-squawk-train`
 driver, while the dataset catalog independently requires an exact code-owned Training receipt.
 
+## Source development
+
+`just setup` installs locked dependencies and the editable Market Squawk package in `python/.venv`.
+`just dev` configures that environment explicitly and stages the normal validator and ONNX helper.
+Source training uses `python -I -B -m market_squawk.training_driver` and the same input, candidate
+admission and inference contracts. It records development revision/version metadata without
+signed-release admission or executable-content hashing. Installed-only digest fields are absent;
+source provenance is never presented as installed release verification.
+
+Refresh the native extension/dependencies with `just refresh-model-runtime` while development is
+stopped. Saved catalog reads remain available if execution configuration is missing or invalid.
+The sealed-release commands below apply to installed release construction, not source development.
+
 ## Safety and authority boundaries
 
 - Python research and training execute outside the live path. Production native inference runs in

@@ -367,36 +367,17 @@ and the hosted script, manifests, packages, and endpoint redirects are downloade
 
 ## Contributor source mode
 
-Source development is separate from installed-product evidence. Contributors need exact `just`
-`1.57.0`, the pinned Rust/Node.js/pnpm/uv inputs, and the host Tauri prerequisites, then run:
+Source development is separate from installed-product evidence. `just setup` prepares the pinned
+frontend and uv-managed editable Python environment. `just dev` runs one Desktop, service and Vite
+under a single serialized watcher/build queue. Python source uses the checkout; service and native
+Rust changes still require compilation. Failed builds keep the previous running application.
 
-```bash
-just setup
-just dev
-```
-
-The repository `.nvmrc` pins Node.js `24.18.0`. Every `just` frontend command selects that version
-with `nvm` or `nvm-windows` when available and validates it in the same process that runs pnpm. If
-`nvm` is unavailable, the command proceeds only when the active Node.js version is already exact;
-`just setup` also prepares pinned pnpm `10.31.0`.
-
-The setup command is repeatable: it preserves the managed Python environment, reapplies the
-hash-locked dependency set, and rebuilds and installs the repository's Rust-backed Python package.
-Signed training-environment checks remain part of sealed installed-product verification and are
-not weakened for source development.
-
-The complete development desktop uses the ignored repository-local
-`.market-squawk/development` workspace-data root and
-`.market-squawk/development-installation` service-authority root. It builds and discovers its
-required debug sibling programs without admitting that fallback into non-debug packages. The
-shared development service may outlive the desktop so CLI and MCP clients can use the same runtime.
-The verified model and training cache is separate at
-`.market-squawk/development-model-runtime`; use `just refresh-model-runtime` to rebuild it,
-`just verify-model-runtime` to check it without rebuilding, and `just reset-model-runtime` to remove
-only that reproducible cache. Stop the desktop and service before either reset. `just reset-dev`
-removes only the workspace-data and service-authority roots; neither reset touches the installed
-product. `just dev-web` runs only Vite and cannot demonstrate service, MCP, data, model, risk, or
-execution readiness.
+Development uses `MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT` for the managed venv and cannot also
+select an installed training release. The launcher writes bounded version/dependency metadata after
+the previous service stops; it does not construct a signed development release or scan its code.
+Run `just refresh-model-runtime` with development stopped after native-extension or dependency changes.
+`just reset-dev` removes the development workspace and installation-authority roots only.
+`just dev-web` runs Vite alone and does not demonstrate backend or analytical workflows.
 
 See the repository [Development instructions](../../README.md#development) for installation and the
 complete command index. A source build may demonstrate a code path; it does not inherit package

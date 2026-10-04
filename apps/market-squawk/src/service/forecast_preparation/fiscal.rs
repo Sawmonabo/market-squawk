@@ -247,6 +247,8 @@ impl InstalledForecastPreparation {
                 training_selection.identity().manifest(),
                 &profile,
                 None,
+                context.deadline(),
+                context.cancellation(),
             )
             .map_err(super::super::tool_services::map_training_admission)?;
         let training_job = training

@@ -14,7 +14,6 @@ use market_squawk_data::{
     AnalyticalReadCapability, ChartProjectionCatalogCapability, ForecastInventoryCatalogCapability,
     ForecastInventoryHead, ModelInventoryCatalogCapability, ModelInventoryRecord,
 };
-use market_squawk_modeling::{OnnxWorkerProgram, VerifiedTrainingEnvironment};
 use market_squawk_platform::{ArtifactPathError, LocalPaths, PathError};
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReadContext,
@@ -30,8 +29,8 @@ use super::{
     ModelDomainServiceError,
     forecast::{ForecastBackupCaptureError, ForecastBackupRecord},
     runtime::{
-        ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
-        RuntimeBackupCoordinate,
+        ModelExecutionConfiguration, ProductionModelRuntime, ProductionModelRuntimeError,
+        ProductionModelRuntimeLimits, RuntimeBackupCoordinate,
     },
 };
 
@@ -137,11 +136,7 @@ impl ModelBackupAuthority {
         charts: ChartProjectionCatalogCapability,
     ) -> Result<FreshModelWorkspaceTarget, ModelBackupError> {
         let (runtime_capabilities, runtime_limits) = match &self.runtime {
-            Some(runtime) => {
-                let (training_environment, onnx_worker, runtime_limits) =
-                    runtime.restore_capabilities()?;
-                (Some((training_environment, onnx_worker)), runtime_limits)
-            }
+            Some(runtime) => runtime.restore_capabilities(),
             None => (None, self.runtime_limits),
         };
         Ok(FreshModelWorkspaceTarget::new(
@@ -432,7 +427,7 @@ pub(crate) struct FreshModelWorkspaceTarget {
     catalog: ModelInventoryCatalogCapability,
     forecast_catalog: ForecastInventoryCatalogCapability,
     charts: ChartProjectionCatalogCapability,
-    runtime_capabilities: Option<(VerifiedTrainingEnvironment, Option<OnnxWorkerProgram>)>,
+    runtime_capabilities: Option<ModelExecutionConfiguration>,
     runtime_limits: ProductionModelRuntimeLimits,
 }
 
@@ -444,7 +439,7 @@ impl FreshModelWorkspaceTarget {
         catalog: ModelInventoryCatalogCapability,
         forecast_catalog: ForecastInventoryCatalogCapability,
         charts: ChartProjectionCatalogCapability,
-        runtime_capabilities: Option<(VerifiedTrainingEnvironment, Option<OnnxWorkerProgram>)>,
+        runtime_capabilities: Option<ModelExecutionConfiguration>,
         runtime_limits: ProductionModelRuntimeLimits,
     ) -> Self {
         Self {
@@ -468,7 +463,10 @@ impl std::fmt::Debug for FreshModelWorkspaceTarget {
             .field("artifacts", &"[CONTROLLED ARTIFACT REPOSITORY]")
             .field(
                 "runtime_capabilities",
-                &self.runtime_capabilities.as_ref().map(|_| "[VERIFIED]"),
+                &self
+                    .runtime_capabilities
+                    .as_ref()
+                    .map(|_| "[CONFIGURED EXECUTION]"),
             )
             .field("runtime_limits", &self.runtime_limits)
             .finish()
@@ -690,49 +688,29 @@ pub(crate) async fn restore_into_fresh_workspace(
         .catalog
         .verify(head)
         .map_err(ProductionModelRuntimeError::from)?;
-    let runtime = match (head.sequence == 0, target.runtime_capabilities) {
-        (true, None) => None,
-        (_, Some((training_environment, onnx_worker))) => {
-            let runtime = Arc::new(ProductionModelRuntime::try_open(
-                &target.paths,
-                target.catalog.clone(),
-                training_environment,
-                onnx_worker,
-                target.runtime_limits,
-            )?);
-            // Reopen each saved bundle through the production authority validator without
-            // compiling it or retaining other generations.
-            let retained = runtime.retain_backup()?;
-            let mut after = 0;
-            loop {
-                let page = retained.page(after)?;
-                if page.is_empty() {
-                    break;
-                }
-                for entry in page {
-                    ensure_live(cancellation)?;
-                    retained.bundle(&entry.coordinate)?;
-                    after = entry.sequence;
-                }
-            }
-            Some(runtime)
+    let runtime = Arc::new(ProductionModelRuntime::try_open(
+        &target.paths,
+        target.catalog.clone(),
+        target.runtime_capabilities,
+        target.runtime_limits,
+    )?);
+    // Reopen all saved artifacts through the production validator without compiling models.
+    // Execution in the restored workspace resolves its configured runtime independently.
+    let retained = runtime.retain_backup()?;
+    let mut after = 0;
+    loop {
+        let page = retained.page(after)?;
+        if page.is_empty() {
+            break;
         }
-        _ => {
-            return Err(ModelBackupError::Runtime(
-                ProductionModelRuntimeError::RuntimeUnavailable,
-            ));
+        for entry in page {
+            ensure_live(cancellation)?;
+            retained.bundle(&entry.coordinate)?;
+            after = entry.sequence;
         }
-    };
-    if cancellation.is_cancelled() {
-        return Err(ModelBackupError::Cancelled);
     }
-    let snapshot = match runtime.as_ref().map(|runtime| runtime.snapshot()) {
-        Some(Ok(snapshot)) => snapshot,
-        None | Some(Err(ProductionModelRuntimeError::EmptyRuntime)) => {
-            ProductionModelRuntime::empty_snapshot()?
-        }
-        Some(Err(error)) => return Err(error.into()),
-    };
+    ensure_live(cancellation)?;
+    let snapshot = runtime.snapshot()?;
     let model_domain = Arc::new(
         ModelDomainService::try_from_runtime_snapshot_with_forecasts(
             snapshot,
@@ -742,7 +720,7 @@ pub(crate) async fn restore_into_fresh_workspace(
         )?,
     );
     Ok(RestoredModelAuthorities {
-        _runtime: runtime,
+        _runtime: Some(runtime),
         _forecasts: forecasts,
         model_domain,
     })

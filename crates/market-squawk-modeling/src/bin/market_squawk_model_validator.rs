@@ -11,8 +11,9 @@ use market_squawk_data::{
 };
 use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
-    BundleMetadataRef, ControlledModelRoot, ProductionFeatureRegistry,
-    PythonDatasetAdmissionAuthority, verify_model_candidate, verify_validator_training_environment,
+    BundleMetadataRef, ConfiguredTrainingEnvironment, ControlledModelRoot,
+    ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, verify_model_candidate,
+    verify_validator_training_environment,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -34,9 +35,22 @@ fn main() {
 fn run() -> Result<String, ()> {
     let arguments = arguments()?;
     let validator = env::current_exe().map_err(|_| ())?;
-    let release_root = validator.parent().and_then(Path::parent).ok_or(())?;
-    let training_environment =
-        verify_validator_training_environment(release_root, &validator).map_err(|_| ())?;
+    let training_environment = if let Some(root) = &arguments.source_development_root {
+        let environment =
+            ConfiguredTrainingEnvironment::open_source(root, &|| Ok(())).map_err(|_| ())?;
+        let source = environment.source().ok_or(())?;
+        if fs::canonicalize(source.validator()).map_err(|_| ())?
+            != fs::canonicalize(&validator).map_err(|_| ())?
+        {
+            return Err(());
+        }
+        environment
+    } else {
+        let release_root = validator.parent().and_then(Path::parent).ok_or(())?;
+        verify_validator_training_environment(release_root, &validator)
+            .map(ConfiguredTrainingEnvironment::from)
+            .map_err(|_| ())?
+    };
     let candidate_path = controlled_root(&arguments.root)?;
     let authority_root = controlled_root(&arguments.authority_root)?;
     if candidate_path.starts_with(&authority_root) || authority_root.starts_with(&candidate_path) {
@@ -130,6 +144,7 @@ fn read_authority(
 }
 
 struct Arguments {
+    source_development_root: Option<PathBuf>,
     root: PathBuf,
     metadata: String,
     metadata_sha256: String,
@@ -146,7 +161,7 @@ struct Arguments {
 
 fn arguments() -> Result<Arguments, ()> {
     let values = env::args().skip(1).collect::<Vec<_>>();
-    if values.len() != 24
+    if !matches!(values.len(), 24 | 26)
         || values[0] != "--root"
         || values[2] != "--metadata"
         || values[4] != "--metadata-sha256"
@@ -159,6 +174,7 @@ fn arguments() -> Result<Arguments, ()> {
         || values[18] != "--dataset-selection-sha256"
         || values[20] != "--catalog-identity-sha256"
         || values[22] != "--dataset-product-contract"
+        || (values.len() == 26 && values[24] != "--source-development-root")
     {
         return Err(());
     }
@@ -172,6 +188,7 @@ fn arguments() -> Result<Arguments, ()> {
         parse_hex(value)?;
     }
     Ok(Arguments {
+        source_development_root: values.get(25).map(PathBuf::from),
         root: PathBuf::from(&values[1]),
         metadata: values[3].clone(),
         metadata_sha256: values[5].clone(),

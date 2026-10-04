@@ -85,7 +85,14 @@ impl InstalledProductTraining {
         let selection = self.reopen_training_dataset(&snapshot, context).await?;
         super::ensure_live(context)?;
         runner
-            .prepare_product(&selection, selection.identity().manifest(), &profile, None)
+            .prepare_product(
+                &selection,
+                selection.identity().manifest(),
+                &profile,
+                None,
+                context.deadline(),
+                context.cancellation(),
+            )
             .map_err(super::map_training_admission)
     }
 

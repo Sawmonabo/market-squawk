@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, Metadata},
     io::{Read, Write as _},
     path::Path,
     process::{ExitStatus, Stdio},
@@ -34,8 +34,8 @@ const STDOUT_FRAME_CHANNEL_CAPACITY: usize = 8;
 /// Invalid or unsafe contained worker program.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ProcessProgramError {
-    /// The program was not an absolute, regular, non-symlink executable.
-    #[error("worker program is not a sealed executable")]
+    /// The program was not an absolute executable permitted by its configured origin.
+    #[error("worker program is not a valid configured executable")]
     InvalidProgram,
     /// Program bytes did not match the admitted SHA-256 evidence.
     #[error("worker program digest does not match admission")]
@@ -45,12 +45,12 @@ pub enum ProcessProgramError {
     Unavailable,
 }
 
-/// Exact executable admitted by path, metadata, and SHA-256 content.
+/// Configured executable: sealed content or an explicitly selected source-development path.
 #[derive(Clone, Debug)]
 pub struct AdmittedProcessProgram {
     identity: SourceIdentifier,
     path: Arc<Path>,
-    digest: EvidenceDigest,
+    digest: Option<EvidenceDigest>,
 }
 
 impl AdmittedProcessProgram {
@@ -64,19 +64,7 @@ impl AdmittedProcessProgram {
         if !path.is_absolute() || expected.algorithm() != DigestAlgorithm::Sha256 {
             return Err(ProcessProgramError::InvalidProgram);
         }
-        let metadata = path
-            .symlink_metadata()
-            .map_err(|_| ProcessProgramError::Unavailable)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(ProcessProgramError::InvalidProgram);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                return Err(ProcessProgramError::InvalidProgram);
-            }
-        }
+        let metadata = executable_metadata(path, false)?;
         let canonical = path
             .canonicalize()
             .map_err(|_| ProcessProgramError::Unavailable)?;
@@ -87,7 +75,24 @@ impl AdmittedProcessProgram {
         Ok(Self {
             identity,
             path: Arc::from(canonical),
-            digest,
+            digest: Some(digest),
+        })
+    }
+
+    /// Selects a trusted local development executable without content attestation.
+    ///
+    /// Preserve the configured interpreter path: resolving a virtual environment's Python
+    /// symlink before invocation would select the base interpreter outside that environment.
+    pub fn try_admit_source(
+        identity: SourceIdentifier,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, ProcessProgramError> {
+        let path = path.as_ref();
+        executable_metadata(path, true)?;
+        Ok(Self {
+            identity,
+            path: Arc::from(path),
+            digest: None,
         })
     }
 
@@ -97,11 +102,44 @@ impl AdmittedProcessProgram {
         &self.identity
     }
 
-    /// Exact digest rechecked immediately before every spawn.
+    /// Installed executable evidence, absent for trusted source-development programs.
     #[must_use]
-    pub const fn digest(&self) -> EvidenceDigest {
+    pub const fn digest(&self) -> Option<EvidenceDigest> {
         self.digest
     }
+
+    fn verify(&self) -> Result<(), ProcessProgramError> {
+        let metadata = executable_metadata(&self.path, self.digest.is_none())?;
+        if let Some(expected) = self.digest
+            && hash_file(&self.path, metadata.len())? != expected
+        {
+            return Err(ProcessProgramError::DigestMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn executable_metadata(path: &Path, allow_symlink: bool) -> Result<Metadata, ProcessProgramError> {
+    if !path.is_absolute() {
+        return Err(ProcessProgramError::InvalidProgram);
+    }
+    let metadata = if allow_symlink {
+        path.metadata()
+    } else {
+        path.symlink_metadata()
+    }
+    .map_err(|_| ProcessProgramError::Unavailable)?;
+    if !metadata.is_file() {
+        return Err(ProcessProgramError::InvalidProgram);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(ProcessProgramError::InvalidProgram);
+        }
+    }
+    Ok(metadata)
 }
 
 fn hash_file(path: &Path, expected_len: u64) -> Result<EvidenceDigest, ProcessProgramError> {
@@ -364,16 +402,10 @@ fn run_blocking(
     stdout_frames: Option<ContainedStdoutFrameSink>,
 ) -> Result<ContainedProcessOutput, ContainedProcessError> {
     let cleanup = ProcessCleanupReservation::try_acquire()?;
-    let metadata = request
+    request
         .program
-        .path
-        .symlink_metadata()
+        .verify()
         .map_err(|_| ContainedProcessError::ProgramChanged)?;
-    let digest = hash_file(&request.program.path, metadata.len())
-        .map_err(|_| ContainedProcessError::ProgramChanged)?;
-    if digest != request.program.digest {
-        return Err(ContainedProcessError::ProgramChanged);
-    }
 
     let mut command = CommandWrap::with_new(&*request.program.path, |command| {
         command
@@ -390,21 +422,8 @@ fn run_blocking(
     let mut child = command
         .spawn()
         .map_err(|_| ContainedProcessError::Unavailable)?;
-    // `process-wrap` must ultimately spawn by path. Rechecking immediately after spawn narrows and
-    // detects path substitution; the retained digest remains the publication evidence boundary.
-    let post_spawn_metadata = match request.program.path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return fail_after_spawn(child, cleanup, ContainedProcessError::ProgramChanged);
-        }
-    };
-    let post_spawn_digest = match hash_file(&request.program.path, post_spawn_metadata.len()) {
-        Ok(digest) => digest,
-        Err(_) => {
-            return fail_after_spawn(child, cleanup, ContainedProcessError::ProgramChanged);
-        }
-    };
-    if post_spawn_digest != request.program.digest {
+    // Sealed programs retain exact content checks; source programs retain path/type checks.
+    if request.program.verify().is_err() {
         return fail_after_spawn(child, cleanup, ContainedProcessError::ProgramChanged);
     }
 

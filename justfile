@@ -1,6 +1,7 @@
 set dotenv-load := false
 set positional-arguments
 export CARGO_BUILD_JOBS := "1"
+export MARKET_SQUAWK_NATIVE_BUILD_REVISION := "development-" + `git describe --always --dirty`
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
 
 root := justfile_directory()
@@ -11,9 +12,7 @@ python_environment := join(python_project, ".venv")
 python_executable := if os_family() == "windows" { join(python_environment, "Scripts", "python.exe") } else { join(python_environment, "bin", "python") }
 development_data := join(root, ".market-squawk", "development")
 development_installation := join(root, ".market-squawk", "development-installation")
-development_model_runtime := join(root, ".market-squawk", "development-model-runtime")
-development_model_release := join(development_model_runtime, "python", "release-cp314")
-python_release_builder := join(root, "scripts", "build_python_release.py")
+
 
 # List supported developer commands.
 default:
@@ -92,7 +91,7 @@ _frontend $frontend_action:
             exec pnpm --dir "{{ desktop }}" install --frozen-lockfile
             ;;
         dev)
-            exec node "{{ root }}/scripts/develop.mjs" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
+            exec node "{{ root }}/scripts/develop.mjs" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --development-training-root "{{ python_environment }}"
             ;;
         dev-web)
             exec pnpm --dir "{{ desktop }}" dev
@@ -161,7 +160,7 @@ _frontend $frontend_action:
             exit $LASTEXITCODE
         }
         "dev" {
-            & node "{{ root }}/scripts/develop.mjs" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
+            & node "{{ root }}/scripts/develop.mjs" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --development-training-root "{{ python_environment }}"
             exit $LASTEXITCODE
         }
         "dev-web" {
@@ -191,47 +190,21 @@ _python-setup: _tools
     uv --directory "{{ python_project }}" python install 3.14.6
     uv --directory "{{ python_project }}" venv --python 3.14.6 --allow-existing .venv
     uv --directory "{{ python_project }}" pip sync --python "{{ python_executable }}" --require-hashes --strict "{{ python_requirements }}"
-    uv --directory "{{ python_project }}" pip install --python "{{ python_executable }}" --no-deps --strict --reinstall-package market-squawk "{{ python_project }}"
+    uv --directory "{{ python_project }}" pip install --python "{{ python_executable }}" --no-deps --strict --reinstall-package market-squawk --editable "{{ python_project }}"
 
 [private]
-[unix]
-_prepare-model-runtime-cache:
-    MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --prepare-cache-only
-
-[private]
-[windows]
-_prepare-model-runtime-cache:
-    $env:MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK = "1"; try { & "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --prepare-cache-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Remove-Item Env:MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK -ErrorAction SilentlyContinue }
-
-[private]
-_refresh-model-runtime:
-    "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --refresh-source-closure --lock "{{ python_project }}/wheelhouse-lock.json"
-    just _prepare-model-runtime-cache
-    "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --offline
-    "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --verify-development-runtime
-
-[private]
-[unix]
-_ensure-model-runtime:
-    if "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --verify-development-runtime; then echo "Reusing verified Market Squawk model runtime."; else just _refresh-model-runtime; fi
-
-[private]
-[windows]
-_ensure-model-runtime:
-    & "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --verify-development-runtime; if ($LASTEXITCODE -eq 0) { Write-Output "Reusing verified Market Squawk model runtime." } else { just _refresh-model-runtime; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-
-[private]
-[unix]
 _build-development-service-runtime:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT="$(< "{{ development_model_release }}/share/market-squawk/training-foundation.json")"
-    exec cargo build --locked -p market-squawk --features release-evidence --bin market-squawk-service --bin market-squawk-mcp-relay --bin market-squawk-capture-helper
+    cargo build --locked -p market-squawk -p market-squawk-modeling --features release-evidence --bin market-squawk-service --bin market-squawk-mcp-relay --bin market-squawk-capture-helper --bin market-squawk-model-validator --bin market-squawk-onnx-worker
+
+[private]
+[unix]
+_development-model-environment:
+    "{{ python_executable }}" -I -B "{{ root }}/scripts/development_model_environment.py" --source-root "{{ root }}" --development-training-root "{{ python_environment }}" --onnx-worker "{{ root }}/target/debug/market-squawk-onnx-worker" --validator "{{ root }}/target/debug/market-squawk-model-validator"
 
 [private]
 [windows]
-_build-development-service-runtime:
-    $env:MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT = [System.IO.File]::ReadAllText("{{ development_model_release }}/share/market-squawk/training-foundation.json"); try { cargo build --locked -p market-squawk --features release-evidence --bin market-squawk-service --bin market-squawk-mcp-relay --bin market-squawk-capture-helper; exit $LASTEXITCODE } finally { Remove-Item Env:MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT -ErrorAction SilentlyContinue }
+_development-model-environment:
+    & "{{ python_executable }}" -I -B "{{ root }}/scripts/development_model_environment.py" --source-root "{{ root }}" --development-training-root "{{ python_environment }}" --onnx-worker "{{ root }}/target/debug/market-squawk-onnx-worker.exe" --validator "{{ root }}/target/debug/market-squawk-model-validator.exe"; exit $LASTEXITCODE
 
 [private]
 [unix]
@@ -243,34 +216,29 @@ _python-tests:
 _python-tests:
     & "{{ python_executable }}" -m pytest "{{ python_project }}/tests"
 
-# Prepare frozen frontend, Python, Rust, and the verified development model runtime.
+# Prepare pinned frontend, Python dependencies and editable native/Python source.
 setup: _tools _python-setup
     just _frontend setup
     cargo fetch --locked
-    just _ensure-model-runtime
 
-# Rebuild the verified development model runtime after Rust, Python, or model changes.
+# Refresh locked dependencies and the editable native extension while development is stopped.
 refresh-model-runtime: _python-setup
-    just _refresh-model-runtime
-
-# Verify and reuse the current development model runtime without rebuilding it.
-verify-model-runtime:
-    "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --verify-development-runtime
 
 # Run Desktop with UI hot refresh and one coordinated Rust/service rebuild watcher.
-dev: _ensure-model-runtime (_frontend "dev")
+dev: (_frontend "dev")
 
 # Run the shared application service in the foreground against development data.
 [unix]
-dev-service: _ensure-model-runtime _build-development-service-runtime
+dev-service: _build-development-service-runtime _development-model-environment
     #!/usr/bin/env bash
     set -euo pipefail
-    exec "{{ root }}/target/debug/market-squawk-service" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"
+    export MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT="{{ python_environment }}"
+    exec "{{ root }}/target/debug/market-squawk-service" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}"
 
 # Run the shared application service in the foreground against development data.
 [windows]
-dev-service: _ensure-model-runtime _build-development-service-runtime
-    & "{{ root }}/target/debug/market-squawk-service.exe" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}" --training-release-root "{{ development_model_release }}"; exit $LASTEXITCODE
+dev-service: _build-development-service-runtime _development-model-environment
+    $env:MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT = "{{ python_environment }}"; & "{{ root }}/target/debug/market-squawk-service.exe" --data-dir "{{ development_data }}" --installation-data-root "{{ development_installation }}"; exit $LASTEXITCODE
 
 # Run only the Vite frontend for visual diagnostics; this is not the complete product.
 dev-web:
@@ -310,8 +278,3 @@ build:
 reset-dev:
     node -e "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true })" "{{ development_data }}"
     node -e "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true })" "{{ development_installation }}"
-
-# Remove only the ignored, reproducible development model-runtime cache.
-[confirm("The desktop and shared service must be stopped. Remove the verified development model-runtime cache?")]
-reset-model-runtime:
-    "{{ python_executable }}" -I "{{ python_release_builder }}" --development-runtime-root "{{ development_model_runtime }}" --reset-development-runtime

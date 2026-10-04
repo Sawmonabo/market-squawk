@@ -447,12 +447,42 @@ def _validator_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validator_path() -> tuple[Path, str]:
+def _validator_path() -> tuple[Path, str | None, Any | None]:
+    if _native.__market_squawk_build_identity__ == "development-unsealed-v1":
+        try:
+            environment = _native.training_environment_receipt()
+        except ValueError as error:
+            raise BundleExportError(str(error)) from error
+        if (
+            environment.origin != "source-development"
+            or environment.validator_path is None
+            or environment.source_development_root is None
+        ):
+            raise BundleExportError(
+                "source validator configuration is unavailable; refresh the managed environment"
+            )
+        path = Path(environment.validator_path)
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise BundleExportError("configured source Rust validator is unavailable") from error
+        executable = (
+            path.suffix.lower() == ".exe" if os.name == "nt" else metadata.st_mode & 0o111
+        )
+        if (
+            not path.is_absolute()
+            or not stat.S_ISREG(metadata.st_mode)
+            or _windows_reparse_point(metadata)
+            or not 0 < metadata.st_size <= MAX_VALIDATOR_BYTES
+            or not executable
+        ):
+            raise BundleExportError("configured source Rust validator is not a bounded executable")
+        return path, None, environment
     expected_sha256 = _expected_validator_sha256()
     path = _native_release_executable("market-squawk-model-validator")
     if _validator_digest(path) != expected_sha256:
         raise BundleExportError("Rust model bundle validator identity mismatch")
-    return path, expected_sha256
+    return path, expected_sha256, None
 
 
 def _validate_with_rust(
@@ -461,7 +491,7 @@ def _validate_with_rust(
     authority: BundleAuthorityRef,
     dataset_receipt: Any,
 ) -> None:
-    validator, validator_sha256 = _validator_path()
+    validator, validator_sha256, source_environment = _validator_path()
     command = [
         str(validator),
         "--root",
@@ -489,6 +519,10 @@ def _validate_with_rust(
         "--dataset-product-contract",
         dataset_receipt.product_contract,
     ]
+    if source_environment is not None:
+        command.extend([
+            "--source-development-root", source_environment.source_development_root,
+        ])
     try:
         completed = subprocess.run(
             command,
@@ -500,11 +534,25 @@ def _validate_with_rust(
             env=_native_subprocess_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        if _validator_digest(validator) != validator_sha256:
+        if validator_sha256 is not None and _validator_digest(validator) != validator_sha256:
             raise BundleExportError("Rust model bundle validator identity changed") from error
         raise BundleExportError("Rust model bundle validation could not complete") from error
-    if _validator_digest(validator) != validator_sha256:
+    if validator_sha256 is not None and _validator_digest(validator) != validator_sha256:
         raise BundleExportError("Rust model bundle validator identity changed")
+    if source_environment is not None:
+        try:
+            current_environment = _native.training_environment_receipt()
+        except ValueError as error:
+            raise BundleExportError(str(error)) from error
+        if (
+            current_environment.origin != source_environment.origin
+            or current_environment.sha256 != source_environment.sha256
+            or current_environment.training_code_revision
+            != source_environment.training_code_revision
+        ):
+            raise BundleExportError(
+                "source training environment changed during validation; refresh the managed environment"
+            )
     if completed.returncode != 0 or len(completed.stdout) > 4096 or len(completed.stderr) > 4096:
         raise BundleExportError("Rust model bundle validation rejected the candidate")
     try:

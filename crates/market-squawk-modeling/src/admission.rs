@@ -23,10 +23,10 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BundleError, BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot,
-    ForecastCentralStatistic, ForecastEstimatorProfile, ForecastMeasurement, ForecastOutputBinding,
-    ForecastTargetMeaning, ForecastTrainingObjective, ForecastTransform, ModelBundle,
-    ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod, VerifiedTrainingEnvironment,
+    BundleError, BundleExpectations, BundleId, BundleMetadataRef, ConfiguredTrainingEnvironment,
+    ControlledModelRoot, ForecastCentralStatistic, ForecastEstimatorProfile, ForecastMeasurement,
+    ForecastOutputBinding, ForecastTargetMeaning, ForecastTrainingObjective, ForecastTransform,
+    ModelBundle, ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod,
 };
 
 /// Maximum exact independent authority-document bytes admitted before parsing.
@@ -253,7 +253,7 @@ pub fn verify_model_candidate(
     authority_sha256: Sha256Digest,
     dataset_root: &Path,
     dataset: PythonDatasetAdmissionAuthority,
-    training_environment: &VerifiedTrainingEnvironment,
+    training_environment: &ConfiguredTrainingEnvironment,
     feature_registry: &ProductionFeatureRegistry,
     dataset_limits: PythonDatasetVerificationLimits,
     deadline: Instant,
@@ -394,7 +394,7 @@ fn authority(
     bytes: &[u8],
     expected_sha256: Sha256Digest,
     selection: &PythonDatasetSelection,
-    environment: Option<&VerifiedTrainingEnvironment>,
+    environment: Option<&ConfiguredTrainingEnvironment>,
 ) -> Result<(BundleAuthorityDocument, BundleExpectations), ModelAdmissionError> {
     if bytes.is_empty() || bytes.len() > MAX_BUNDLE_AUTHORITY_BYTES {
         return Err(ModelAdmissionError::InvalidAuthority);
@@ -418,7 +418,7 @@ fn authority(
 fn expectations(
     wire: &ExpectationsWire,
     selection: &PythonDatasetSelection,
-    environment: Option<&VerifiedTrainingEnvironment>,
+    environment: Option<&ConfiguredTrainingEnvironment>,
 ) -> Result<BundleExpectations, ModelAdmissionError> {
     let output_semantics = match wire.output_semantics.as_str() {
         "regression" => ModelOutputSemantics::Regression,

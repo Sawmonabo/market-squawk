@@ -6,8 +6,8 @@ use std::{
 use market_squawk_data::{CatalogEndpointIdentity, FeatureDatasetProductContract, Sha256Digest};
 use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
-    BundleMetadataRef, ModelOutputSemantics, OnnxFallbackPolicy, OnnxModelPolicy,
-    PythonDatasetAdmissionAuthority, TrainingWorkerCandidate, VerifiedTrainingEnvironment,
+    BundleMetadataRef, ConfiguredTrainingEnvironment, ModelOutputSemantics, OnnxFallbackPolicy,
+    OnnxModelPolicy, PythonDatasetAdmissionAuthority, TrainingWorkerCandidate,
 };
 use serde::Deserialize;
 
@@ -39,7 +39,7 @@ impl ModelAdmissionRequest {
         authority_bytes: Box<[u8]>,
         expected_authority_path: &Path,
         candidate: &TrainingWorkerCandidate,
-        environment: &VerifiedTrainingEnvironment,
+        environment: &ConfiguredTrainingEnvironment,
     ) -> Result<Self, ProductionModelRuntimeError> {
         candidate
             .verify_environment(environment)

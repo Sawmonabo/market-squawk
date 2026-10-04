@@ -18,7 +18,7 @@ const IGNORED = new Set(["target", ".git", ".agents", ".market-squawk", "node_mo
 export function changeMask(relative) {
   const name = relative.split(path.sep).join("/");
   if (name.startsWith("../") || name === ".." || name.split("/").some((part) => IGNORED.has(part))) return 0;
-  if (name.startsWith("python/")) return 0; // The model-runtime refresh workflow owns these inputs.
+  if (name.startsWith("python/")) return 0; // Editable Python loads from the checkout; native/dependency refresh is explicit.
   if (/^(?:apps|adapters|crates)\/[^/]+\/tests(?:\/|$)/.test(name)) return 0;
   if (name.startsWith("apps/market-squawk-desktop/src-tauri/")) return NATIVE;
   if (name.startsWith("apps/market-squawk-desktop/")) return 0; // Vite owns frontend HMR.
@@ -92,9 +92,10 @@ async function stopOwned(record, label, timeout, eof = false) {
 }
 
 export class DevelopmentSupervisor {
-  constructor({ root = ROOT, args = [], env = process.env, log = console.log,
+  constructor({ root = ROOT, args = [], env = process.env, log = console.log, developmentTrainingRoot,
     commands = {}, debounce = 200, stopTimeout = 60_000 } = {}) {
     Object.assign(this, { root, args, env, log, commands, debounce, stopTimeout });
+    this.developmentTrainingRoot = path.resolve(developmentTrainingRoot ?? env.MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT ?? path.join(root, "python", ".venv"));
     this.pending = 0;
     this.stages = new Set();
     this.stopping = false;
@@ -126,11 +127,12 @@ export class DevelopmentSupervisor {
   }
 
   async build(kind) {
-    // Select both packages in one invocation so Cargo shares their feature-unified
+    // Select all packages in one invocation so Cargo shares their feature-unified
     // dependency build. Fresh targets are skipped; the change mask owns restart.
-    const defaults = ["build", "--locked", "--jobs", "1", "-p", "market-squawk", "-p", "market-squawk-desktop",
+    const defaults = ["build", "--locked", "--jobs", "1", "-p", "market-squawk", "-p", "market-squawk-desktop", "-p", "market-squawk-modeling",
       "--bin", "market-squawk-service", "--bin", "market-squawk-mcp-relay",
       "--bin", "market-squawk-capture-helper", "--bin", "market-squawk-desktop",
+      "--bin", "market-squawk-model-validator", "--bin", "market-squawk-onnx-worker",
       "--features", "market-squawk/release-evidence,market-squawk-desktop/desktop-automation"];
     const command = this.commands[`build${kind[0].toUpperCase()}${kind.slice(1)}`] ?? { program: "cargo", args: defaults };
     this.log(`[dev] Building ${kind}; current processes stay running.`);
@@ -150,7 +152,8 @@ export class DevelopmentSupervisor {
     this.stages.add(directory);
     await chmod(directory, 0o700);
     const programs = [
-      ...(mask & SERVICE ? ["market-squawk-service", "market-squawk-mcp-relay", "market-squawk-capture-helper"] : []),
+      ...(mask & SERVICE ? ["market-squawk-service", "market-squawk-mcp-relay", "market-squawk-capture-helper",
+        "market-squawk-model-validator", "market-squawk-onnx-worker"] : []),
       ...(mask & NATIVE ? ["market-squawk-desktop"] : []),
     ];
     try {
@@ -177,6 +180,7 @@ export class DevelopmentSupervisor {
     const native = kind === "native";
     const serviceDirectory = native ? this.service?.stage : directory;
     const env = { ...this.env,
+      MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT: this.developmentTrainingRoot,
       MARKET_SQUAWK_DEVELOPMENT_EXTERNAL_SERVICE: "1",
       MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM: path.join(serviceDirectory, "bin", `market-squawk-service${SUFFIX}`),
       MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM: path.join(serviceDirectory, "bin", `market-squawk-mcp-relay${SUFFIX}`),
@@ -266,9 +270,28 @@ export class DevelopmentSupervisor {
       catch (error) { if (error.code !== "ENOENT") throw error; }
     }
     if (this.stopping) return;
+    // The previous service has exited before this barrier. Never change a
+    // descriptor that an active training process is still consuming during build.
+    await this.publishTrainingEnvironment(directory);
+    if (this.stopping) return;
     const record = this.start("service", directory);
     if (this.commands.serviceOwned) await this.commands.serviceOwned(record);
     else await this.waitForServiceOwnership(record, previous);
+  }
+
+  async publishTrainingEnvironment(directory) {
+    const command = this.commands.trainingEnvironment?.(directory) ?? {
+      program: path.join(this.developmentTrainingRoot, WINDOWS ? "Scripts" : "bin", `python${SUFFIX}`),
+      args: ["-I", "-B", path.join(this.root, "scripts", "development_model_environment.py"),
+        "--source-root", this.root, "--development-training-root", this.developmentTrainingRoot,
+        "--onnx-worker", path.join(directory, "bin", `market-squawk-onnx-worker${SUFFIX}`),
+        "--validator", path.join(directory, "bin", `market-squawk-model-validator${SUFFIX}`)],
+    };
+    const producer = ownedProcess(command.program, command.args, { cwd: this.root, env: this.env });
+    const result = await producer.done;
+    if (result.error || result.code !== 0) {
+      throw new Error(`Could not prepare the editable training environment (${result.error?.message ?? result.signal ?? result.code}). Run just refresh-model-runtime before restarting development.`);
+    }
   }
 
   async waitForServiceOwnership(record, previous) {
@@ -333,14 +356,16 @@ async function windowsPnpm() {
 async function main() {
   const { values } = parseArgs({ options: {
     "data-dir": { type: "string" }, "installation-data-root": { type: "string" },
-    "training-release-root": { type: "string" }, "webdriver-port": { type: "string" },
+    "development-training-root": { type: "string" }, "webdriver-port": { type: "string" },
     "webdriver-visible": { type: "boolean" },
   } });
   const args = [];
-  for (const name of ["data-dir", "installation-data-root", "training-release-root"]) {
+  for (const name of ["data-dir", "installation-data-root"]) {
     if (!values[name]) throw new Error(`Required argument: --${name}`);
     args.push(`--${name}`, path.resolve(values[name]));
   }
+  if (!values["development-training-root"]) throw new Error("Required argument: --development-training-root");
+  const developmentTrainingRoot = path.resolve(values["development-training-root"]);
   if (values["webdriver-port"] !== undefined) {
     if (!/^\d+$/.test(values["webdriver-port"]) || +values["webdriver-port"] < 1 || +values["webdriver-port"] > 65535) {
       throw new Error("--webdriver-port must be an integer from 1 to 65535.");
@@ -354,11 +379,13 @@ async function main() {
   const desktop = path.join(ROOT, "apps", "market-squawk-desktop");
   const config = JSON.parse(await readFile(path.join(desktop, "src-tauri", "tauri.conf.json"), "utf8"));
   const env = { ...process.env, CARGO_BUILD_JOBS: "1",
-    MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT: await readFile(path.join(path.resolve(values["training-release-root"]), "share", "market-squawk", "training-foundation.json"), "utf8"),
+    MARKET_SQUAWK_DEVELOPMENT_TRAINING_ROOT: developmentTrainingRoot,
     TAURI_CONFIG: JSON.stringify({ build: { devUrl: "http://127.0.0.1:1420" },
       app: { security: { devCsp: config.app.security.devCsp.replaceAll("localhost:1420", "127.0.0.1:1420") } } }),
   };
   delete env.TAURI_DEV_HOST; // Keep Vite's websocket on the same owned loopback port.
+  delete env.MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT;
+  delete env.MARKET_SQUAWK_TRAINING_RELEASE_ROOT;
   // strictPort also protects the interval after this preflight check.
   await new Promise((resolve, reject) => {
     const server = createServer();
@@ -366,7 +393,7 @@ async function main() {
     server.listen({ host: "127.0.0.1", port: 1420, exclusive: true }, () => server.close(resolve));
   });
   await mkdir(path.join(ROOT, ".market-squawk", "dev-runtime"), { recursive: true, mode: 0o700 });
-  const supervisor = new DevelopmentSupervisor({ args, env });
+  const supervisor = new DevelopmentSupervisor({ args, env, developmentTrainingRoot });
   const stop = async () => {
     try { await supervisor.shutdown(); }
     catch (error) { console.error(`[dev] ${error.message}`); process.exitCode = 1; }
@@ -393,11 +420,12 @@ async function main() {
         for (const tag of event.tags ?? []) {
           if (tag.kind !== "path") continue;
           const relative = path.relative(ROOT, tag.absolute);
-          if (relative.startsWith("python/") || relative === "scripts/build_python_release.py") {
-            if (!supervisor.modelInputsChanged) console.error("[dev] Model-runtime inputs changed. Run just refresh-model-runtime, then restart just dev; the running model runtime has not been refreshed.");
+          if (["python/pyproject.toml", "python/requirements.lock"].includes(relative)
+            || relative.startsWith("crates/market-squawk-python/")) {
+            if (!supervisor.modelInputsChanged) console.error("[dev] Native Python or dependency inputs changed. Stop just dev, run just refresh-model-runtime, then restart just dev to refresh the editable environment.");
             supervisor.modelInputsChanged = true;
           }
-          if (["scripts/develop.mjs", "Justfile", "justfile"].includes(relative)) {
+          if (["scripts/develop.mjs", "scripts/development_model_environment.py", "Justfile", "justfile"].includes(relative)) {
             console.error("[dev] Development launcher inputs changed. Restart just dev to apply them.");
           }
           supervisor.request(changeMask(relative));

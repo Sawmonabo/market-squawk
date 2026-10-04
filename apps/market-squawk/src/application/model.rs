@@ -506,6 +506,10 @@ impl ApplicationDomainService for ModelDomainService {
 
     fn begin_shutdown(&self) {
         self.lifecycle.begin_shutdown();
+        if let read_image::ModelBundleInventory::Disk(inventory) = &self.read_image.load().registry
+        {
+            inventory.begin_shutdown();
+        }
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
@@ -522,7 +526,7 @@ impl ApplicationDomainService for ModelDomainService {
 
 impl Drop for ModelDomainService {
     fn drop(&mut self) {
-        self.lifecycle.begin_shutdown();
+        self.begin_shutdown();
     }
 }
 
@@ -1659,10 +1663,16 @@ fn product_model_summary(bundle: &ModelBundle) -> Result<Value, ServiceError> {
     )
 }
 
-fn runtime_service_error(error: runtime::ProductionModelRuntimeError) -> ServiceError {
+pub(crate) fn runtime_service_error(error: runtime::ProductionModelRuntimeError) -> ServiceError {
     match error {
         runtime::ProductionModelRuntimeError::InvalidAdmission => ServiceError::InvalidRequest,
-        runtime::ProductionModelRuntimeError::ValidationDeadline => ServiceError::DeadlineExceeded,
+        runtime::ProductionModelRuntimeError::ValidationDeadline
+        | runtime::ProductionModelRuntimeError::TrainingEnvironment(
+            market_squawk_modeling::TrainingEnvironmentError::DeadlineExceeded,
+        ) => ServiceError::DeadlineExceeded,
+        runtime::ProductionModelRuntimeError::TrainingEnvironment(
+            market_squawk_modeling::TrainingEnvironmentError::Cancelled,
+        ) => ServiceError::Cancelled,
         runtime::ProductionModelRuntimeError::Admission(
             market_squawk_modeling::ModelAdmissionError::Dataset(
                 market_squawk_data::PythonDatasetCatalogError::Cancelled,

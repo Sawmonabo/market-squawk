@@ -38,6 +38,7 @@ pub struct EffectiveConfigView<'config> {
     capture_shutdown_ms: EffectiveSettingView<u128>,
     source_shutdown_ms: EffectiveSettingView<u128>,
     training_release_directory: EffectiveSettingView<Option<&'config Path>>,
+    development_training_directory: EffectiveSettingView<Option<&'config Path>>,
     coinbase_configured: EffectiveSettingView<bool>,
     kraken_configured: EffectiveSettingView<bool>,
 }
@@ -93,6 +94,10 @@ impl AppConfig {
             training_release_directory: EffectiveSettingView::new(
                 self.training_release_root(),
                 provenance.origin(ConfigSetting::TrainingReleaseDirectory),
+            ),
+            development_training_directory: EffectiveSettingView::new(
+                self.development_training_root(),
+                provenance.origin(ConfigSetting::DevelopmentTrainingDirectory),
             ),
             coinbase_configured: EffectiveSettingView::new(
                 self.coinbase().is_some(),

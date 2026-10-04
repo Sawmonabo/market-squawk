@@ -90,19 +90,19 @@ impl TrainingWorkerCandidate {
         self.catalog_identity_sha256
     }
 
-    /// Returns the claimed sealed training-environment identity.
+    /// Returns the claimed training-environment metadata identity.
     #[must_use]
     pub const fn training_environment_sha256(&self) -> [u8; 32] {
         self.training_environment_sha256
     }
 
-    /// Returns the claimed source-closure revision.
+    /// Returns the claimed training source revision.
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
     }
 
-    /// Revalidates the Python claim against the currently sealed Rust-verified environment.
+    /// Revalidates the Python claim against the explicitly configured training environment.
     ///
     /// This check is necessary but not sufficient for admission. The service must also resolve the
     /// controlled candidate/request coordinates and call [`crate::verify_model_candidate`] before
@@ -110,10 +110,10 @@ impl TrainingWorkerCandidate {
     ///
     /// # Errors
     ///
-    /// Rejects a receipt or source-closure identity mismatch.
+    /// Rejects a receipt or recorded revision mismatch.
     pub fn verify_environment(
         &self,
-        environment: &crate::VerifiedTrainingEnvironment,
+        environment: &crate::ConfiguredTrainingEnvironment,
     ) -> Result<(), TrainingWorkerProtocolError> {
         if self.training_environment_sha256 != environment.receipt_sha256()
             || self.training_code_revision() != environment.training_code_revision()

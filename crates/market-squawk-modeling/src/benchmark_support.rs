@@ -183,7 +183,7 @@ impl ReleaseEvidenceInferenceFixture {
             native_artifact_digest: native_digest,
             onnx_artifact_digest: onnx_digest,
             onnx_policy_digest: runtime.policy_digest(),
-            onnx_worker_digest: program.digest(),
+            onnx_worker_digest: worker_digest,
             onnx_runtime_semantics_digest: runtime.worker_runtime_semantics_digest(),
             onnx_warm_up_digest: runtime.warm_up_digest(),
             native_retained_bytes: native.retained_bytes(),

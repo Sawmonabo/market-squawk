@@ -10,7 +10,7 @@ use std::{
     io::Read as _,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -169,7 +169,8 @@ impl fmt::Debug for GovernedTrainingInput {
 pub struct TrainingJobRunner {
     paths: LocalPaths,
     runtime: Arc<ProductionModelRuntime>,
-    program: AdmittedProcessProgram,
+    research: Arc<crate::ResearchService>,
+    program: Mutex<Option<(AdmittedProcessProgram, bool)>>,
     kind: SourceIdentifier,
     input_authority: SourceIdentifier,
     result_authority: SourceIdentifier,
@@ -196,10 +197,11 @@ impl fmt::Debug for TrainingJobRunner {
 }
 
 impl TrainingJobRunner {
-    /// Binds the runtime's exact signed launcher to the existing contained-process authority.
+    /// Retains runtime and limits; signed launcher admission belongs to the owning training job.
     pub fn try_new(
         paths: &LocalPaths,
         runtime: Arc<ProductionModelRuntime>,
+        research: Arc<crate::ResearchService>,
         maximum_pending: usize,
         process_deadline: Duration,
     ) -> Result<Self, TrainingJobRunnerError> {
@@ -210,26 +212,11 @@ impl TrainingJobRunner {
         {
             return Err(TrainingJobRunnerError::InvalidLimits);
         }
-        let worker = runtime
-            .training_environment()
-            .map_err(|_| TrainingJobRunnerError::WorkerUnavailable)?
-            .training_worker();
-        let metadata = worker
-            .path()
-            .symlink_metadata()
-            .map_err(|_| TrainingJobRunnerError::WorkerUnavailable)?;
-        if metadata.len() != worker.size_bytes() {
-            return Err(TrainingJobRunnerError::WorkerUnavailable);
-        }
-        let program = AdmittedProcessProgram::try_admit(
-            identifier(WORKER_IDENTITY)?,
-            worker.path(),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, worker.sha256()),
-        )?;
         Ok(Self {
             paths: paths.clone(),
             runtime,
-            program,
+            research,
+            program: Mutex::new(None),
             kind: identifier(KIND)?,
             input_authority: identifier(INPUT_AUTHORITY)?,
             result_authority: identifier(RESULT_AUTHORITY)?,
@@ -239,6 +226,80 @@ impl TrainingJobRunner {
             maximum_pending,
             process_deadline,
         })
+    }
+
+    async fn admitted_program(
+        &self,
+        deadline: Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+        input: &TrainingAdmission,
+    ) -> Result<(AdmittedProcessProgram, bool), TrainingJobRunnerError> {
+        self.runtime.ensure_execution_live(deadline, cancellation)?;
+        let cached = self
+            .program
+            .lock()
+            .map_err(|_| TrainingJobRunnerError::Unavailable)?
+            .clone();
+        if let Some(program) = &cached {
+            if matches!(input, TrainingAdmission::Governed(_)) {
+                return Ok(program.clone());
+            }
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let environment = self
+            .research
+            .run_owned_research_io_joined(deadline, cancellation, move |worker_cancellation| {
+                runtime.training_environment(deadline, &worker_cancellation)
+            })
+            .await
+            .map_err(|_| {
+                crate::application::model::runtime::check_admission_control(deadline, cancellation)
+                    .err()
+                    .map(TrainingJobRunnerError::Runtime)
+                    .unwrap_or(TrainingJobRunnerError::Unavailable)
+            })??;
+        input.require_environment(&environment)?;
+        self.runtime.ensure_execution_live(deadline, cancellation)?;
+        if let Some(program) = cached {
+            return Ok(program);
+        }
+        let mut program = self
+            .program
+            .lock()
+            .map_err(|_| TrainingJobRunnerError::Unavailable)?;
+        if let Some(program) = program.as_ref() {
+            return Ok(program.clone());
+        }
+        let admitted = match &environment {
+            market_squawk_modeling::ConfiguredTrainingEnvironment::SourceDevelopment(source) => (
+                AdmittedProcessProgram::try_admit_source(
+                    identifier(WORKER_IDENTITY)?,
+                    source.interpreter(),
+                )?,
+                true,
+            ),
+            market_squawk_modeling::ConfiguredTrainingEnvironment::InstalledRelease(installed) => {
+                let worker = installed.training_worker();
+                let metadata = worker
+                    .path()
+                    .symlink_metadata()
+                    .map_err(|_| TrainingJobRunnerError::WorkerUnavailable)?;
+                if metadata.len() != worker.size_bytes() {
+                    return Err(TrainingJobRunnerError::WorkerUnavailable);
+                }
+                (
+                    AdmittedProcessProgram::try_admit(
+                        identifier(WORKER_IDENTITY)?,
+                        worker.path(),
+                        EvidenceDigest::new(DigestAlgorithm::Sha256, worker.sha256()),
+                    )?,
+                    false,
+                )
+            }
+        };
+        self.runtime.ensure_execution_live(deadline, cancellation)?;
+        *program = Some(admitted.clone());
+        Ok(admitted)
     }
 
     /// Registers one immutable training input before durable job creation.
@@ -335,6 +396,13 @@ impl TrainingJobRunner {
         input: &TrainingAdmission,
         staging: &mut TrainingStaging,
     ) -> Result<JobCompletion, JobRunError> {
+        let deadline = Instant::now()
+            .checked_add(self.process_deadline)
+            .ok_or(JobRunError::Recovery)?;
+        let (program, source_development) = self
+            .admitted_program(deadline, context.cancellation(), input)
+            .await
+            .map_err(map_admission_error)?;
         input
             .revalidate(&self.paths, context.cancellation())
             .map_err(|error| {
@@ -344,15 +412,21 @@ impl TrainingJobRunner {
                     map_admission_error(error)
                 }
             })?;
+        let mut arguments = Vec::new();
+        if source_development {
+            arguments
+                .extend(["-I", "-B", "-m", "market_squawk.training_driver"].map(str::to_owned));
+        }
+        arguments.extend(worker_arguments(context, input, staging));
         let request = ContainedProcessRequest::try_new(
-            self.program.clone(),
-            worker_arguments(context, input, staging),
+            program,
+            arguments,
             input.stdin(),
             MAXIMUM_CONFIG_BYTES as usize,
         )
         .map_err(map_process_error)?;
         let limits = ContainedProcessLimits::try_new(
-            self.process_deadline,
+            deadline.saturating_duration_since(Instant::now()),
             MAX_TRAINING_WORKER_STREAM_BYTES,
             MAX_TRAINING_WORKER_STDERR_BYTES,
         )
@@ -421,8 +495,9 @@ impl TrainingJobRunner {
                 staging,
                 &request_bytes,
                 &candidate,
-                self.runtime
-                    .training_environment()
+                &self
+                    .runtime
+                    .training_environment(deadline, context.cancellation())
                     .map_err(map_runtime_error)?,
             )
             .map_err(map_admission_error)?;
@@ -844,8 +919,17 @@ fn map_runtime_error(error: ProductionModelRuntimeError) -> JobRunError {
                 market_squawk_data::PythonDatasetCatalogError::Cancelled,
             ),
         ) => JobRunError::Cancelled,
-        ProductionModelRuntimeError::ValidationDeadline => {
+        ProductionModelRuntimeError::TrainingEnvironment(
+            market_squawk_modeling::TrainingEnvironmentError::Cancelled,
+        ) => JobRunError::Cancelled,
+        ProductionModelRuntimeError::TrainingEnvironment(
+            market_squawk_modeling::TrainingEnvironmentError::DeadlineExceeded,
+        )
+        | ProductionModelRuntimeError::ValidationDeadline => {
             failed("training-admission-deadline-exceeded", true)
+        }
+        ProductionModelRuntimeError::TrainingEnvironment(_) => {
+            failed("training-environment-rejected", false)
         }
         _ => failed("training-candidate-rejected", false),
     }
@@ -853,6 +937,7 @@ fn map_runtime_error(error: ProductionModelRuntimeError) -> JobRunError {
 
 fn map_admission_error(error: TrainingJobRunnerError) -> JobRunError {
     match error {
+        TrainingJobRunnerError::Runtime(error) => map_runtime_error(error),
         TrainingJobRunnerError::InputChanged => failed("training-input-changed", false),
         TrainingJobRunnerError::Capacity => failed("training-resource-exhausted", true),
         _ => failed("training-input-rejected", false),
@@ -866,6 +951,8 @@ fn map_cleanup_error(_error: TrainingJobRunnerError) -> JobRunError {
 /// Governed training admission, containment, candidate, or cleanup failure.
 #[derive(Debug, Error)]
 pub enum TrainingJobRunnerError {
+    #[error(transparent)]
+    Runtime(#[from] ProductionModelRuntimeError),
     #[error("training runner limits are invalid")]
     InvalidLimits,
     #[error("training input is invalid")]
@@ -970,6 +1057,21 @@ mod tests {
     -> TestResult {
         let temporary = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(temporary.path().join("market-squawk"))?;
+        let research = Arc::new(crate::ResearchService::initialize(
+            &paths,
+            market_squawk_data::CatalogConfig::try_new(
+                paths.catalog()?.clone(),
+                Duration::from_millis(250),
+                market_squawk_data::CatalogLimit::new(32)?,
+                market_squawk_data::CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+            )?,
+            8,
+            market_squawk_data::ObjectStoreConfig::try_new(
+                1024 * 1024,
+                32,
+                Duration::from_secs(60),
+            )?,
+        )?);
         let runtime = Arc::new(ProductionModelRuntime::test_fixture(&paths, None)?);
         let retained_runtime = runtime.snapshot()?;
         let model = ModelDomainService::try_from_runtime_snapshot(
@@ -980,7 +1082,8 @@ mod tests {
         let runner = Arc::new(TrainingJobRunner {
             paths: paths.clone(),
             runtime,
-            program,
+            research,
+            program: std::sync::Mutex::new(Some((program, false))),
             kind: identifier(KIND)?,
             input_authority: identifier(INPUT_AUTHORITY)?,
             result_authority: identifier(RESULT_AUTHORITY)?,
