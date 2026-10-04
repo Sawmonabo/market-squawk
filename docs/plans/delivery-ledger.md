@@ -4,7 +4,7 @@
 
 ### Current ownership — 2026-10-04
 
-Audit base: `e43ebd80` (safe Schwab diagnostics pushed). One primary worktree and three intended
+Audit base: `8bd05b7a` (option parser and account-start corrections pushed). One primary worktree and three intended
 local branches. Origin also retains open, unmerged dependency PR #55; no stale agent branch or
 linked worktree was found. No branch, workspace or target directory was created in this checkpoint.
 
@@ -67,6 +67,79 @@ is still a substantiated open finding; no synthetic receipt or skipped capabilit
 Installed-runtime and residual own-executable scan removal remain pending under the existing
 `development-model-runtime-correction.md` design. All V1 provider/UI and installed acceptance scope
 remains active.
+
+### Deployment follow-through — active
+
+The corrections are pushed as `8bd05b7a`; one existing-supervisor build is active (Cargo61950).
+Watcher26857 is resumed. Lead owns deployment and native source/workflow checks; all implementation
+files are frozen during this build. The current runtime26676/26780 still predates the correction.
+Astra `account_start_coordination` has a separate read-only investigation of repeated research-worker
+`state_lock`/`gate_admission`/`current_join` interruptions and market population reads in the existing
+redacted log. Scope: `research_service/worker.rs`, its immediate request/state owners and
+`application/market_selection/product` population consumers. Identify the actual lock/read lifetime
+and whether small screen reads unnecessarily serialize with provider capture writes. Distinguish
+source evidence from old-runtime timing; no writes, builds, runtime actions or provider requests.
+Do not expand into a general storage redesign or attribute the new deployed result before it exists.
+
+The `8bd05b7a` deployment build passed9m30s and replaced the runtime with service67737/Desktop67887
+in `generation-wxmHpJ`; prior generation was removed. Research open took58.255s and total local
+composition69.407s, exceeding native startup readiness. Actual native window showed Workspace could
+not open. Lead invoked its existing Try again action against the same running backend, then retried
+saved Schwab authorization. This is failed cold-start evidence, not complete installed acceptance.
+Astra `schwab_doctor_diagnosis` has read-only startup ownership: `local_product/mod.rs` before research
+open, `research_service.rs` constructors and directly called storage open/recovery paths. Identify
+actual scans/locks versus speculation using the new log from63972 onward. No code edits, builds,
+runtime actions or provider calls; return the smallest proved storage-open correction and critical
+recovery check. Source tokens/selection investigation remains with the other Astra lane.
+
+### Next bounded diagnosis — 2026-10-04
+
+Lead confirmed the new native runtime recovers through Try again. Saved Schwab OAuth continuation
+succeeded at access generation4; the real doctor passed the former option-family boundary and now
+fails at `LevelOneForex` with `InvalidRateAuthority` mapped from the Streamer rate adapter. This is
+not established provider throttling. Astra `account_start_coordination` owns read-only tracing of
+`provider_onboarding/service/rate_runtime.rs`, `schwab_market_doctor.rs` and their rate-policy/stream
+callers to identify the precise error mapping and a critical existing check. No code/build/runtime
+or provider actions. Startup diagnosis is complete: full SQLite integrity/foreign-key checking is
+on normal catalog open; phase timing does not yet attribute the entire58.255s to it. Lead owns that
+integration decision and runtime. Watcher26857 is paused for a coherent integration. Astra `schwab_doctor_diagnosis` owns a bounded
+startup correction in `crates/market-squawk-data/src/catalog.rs` and
+`apps/market-squawk/src/research_service.rs`: normal catalog open admits its identity/schema and
+constraints without whole-history integrity auditing; retain full checks at explicit audit,
+backup/restore boundaries. Preserve existing identity, writer/root and selected-evidence validation.
+Add phase timings for catalog/manifests/bound-store/raw-store to attribute remaining research startup.
+No new schema, migration, audit scheduler or worker. Lead owns tests and deployment; required checks
+are existing catalog tamper/roundtrip and selected history corruption-after-restart cases.
+
+### Catalog startup correction — critically verified; deployment pending
+
+Normal catalog open now retains exact application/schema identity, writer ownership, foreign-key
+constraints, WAL durability and bounded planner optimization without running whole-history SQLite
+integrity/foreign-key audits. Restored catalog admission and explicit backup/restore/audit paths
+retain their full checks. Selected data still validates original evidence. No schema, migration,
+new audit worker or compatibility path was added. Research composition records separate catalog,
+manifest, bound analytical store and raw store timings; no full cold-start success is claimed yet.
+SQLite documentation confirms the full integrity audit scales with retained rows; see the updated
+research-data-plane architecture section for primary references reviewed2026-10-04.
+
+Existing catalog checks passed5/5 in2.83s, covering durable control-record roundtrip, schema identity
+tampering and retained reference/onboarding authority. The full selected Alpaca history/restart
+case passed1/1 in20.49s and still rejects altered selected evidence. First-bind recovery passed1/1 in1.91s across every existing durable checkpoint. Evidence: `catalog-startup-critical.log`, `catalog-history-restart-critical.log`,
+`catalog-first-bind-critical.log`. Lead inspected the changed catalog and restore call chains;
+Astra startup ownership is frozen/released. No broad gate or RAM measurement ran.
+
+New source diagnosis confirms the retained Schwab aggregate window contains20/20 admissions with
+about888seconds remaining. Bootstrap plus7REST calls consume8; each fresh family connection costs
+handshake+LOGIN+SUBS, so Forex begins attempt21. The20/900s ceiling was derived from logical doctor
+family count, not a verified Schwab quota. Internal15s wait admission incorrectly maps exhaustion to
+InvalidRateAuthority. One shared Streamer connection alone still requires22 physical admissions;
+no numeric limit was raised and no charge was removed. Production rate-owner reuse and truthful
+per-service refusal/queue handling remain under bounded Astra read-only investigation.
+
+The existing native stock workflow was resumed and reached17checkpoints, then paused again with
+`analysis_source_actions_unavailable`. The original background preparation job completed, but the
+required source-action inputs remain unavailable; forecasting and saved-result acceptance are unfinished. Evidence:
+`source-8bd-workflow-{status,resume,progress}.json`. Main/release and the current workspace remain unchanged.
 
 ### Editable source runtime — critically verified integration
 

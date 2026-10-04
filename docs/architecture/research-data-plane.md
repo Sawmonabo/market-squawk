@@ -169,6 +169,27 @@ Fresh validation roots exercise the corrected format. Implementation:
 Reviewed 2026-09-30 against Apple's
 [persistent volume UUID contract](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumeuuidstring).
 
+### Catalog startup and full audits
+
+Ordinary catalog opening validates the catalog identity, active schema, writer ownership and
+artifact-root binding and enables SQLite foreign-key enforcement. It does not scan all retained
+rows and indexes before the workspace becomes available. Selected evidence still undergoes its
+existing identity, lineage and content checks when consumed. A successful open therefore is not
+a claim that every historical row has been audited.
+
+Full SQLite integrity and foreign-key checks remain in explicit catalog auditing and the existing
+backup/restore boundaries. SQLite's `integrity_check(1)` limits reported errors, not examined data;
+`quick_check` also traverses the database and is not a bounded startup substitute. Planner statistics
+use SQLite's bounded `PRAGMA optimize` mechanism. Research startup records separate catalog,
+manifest, bound analytical store and raw capture store timings to distinguish their actual costs.
+This changes the active V1 path without a schema change or migration.
+
+Reviewed 2026-10-04 against SQLite's
+[integrity checks](https://sqlite.org/pragma.html#pragma_integrity_check) and
+[planner optimization](https://sqlite.org/pragma.html#pragma_optimize).
+Implementation: [catalog lifecycle](../../crates/market-squawk-data/src/catalog.rs) and
+[research composition](../../apps/market-squawk/src/research_service.rs).
+
 ## Point-in-time construction
 
 The dataset builder consumes exact parent manifest pins and a digest-bound build specification. It

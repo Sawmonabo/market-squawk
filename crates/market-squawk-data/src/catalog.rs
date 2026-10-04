@@ -247,7 +247,8 @@ pub use sec_fund_job::{
 };
 
 impl Catalog {
-    /// Opens, hardens, migrates, and verifies a local SQLite catalog.
+    /// Opens and hardens a local SQLite catalog with exact identity and migration admission.
+    /// Whole-catalog integrity auditing remains explicit; selected reads validate their evidence.
     pub(super) fn open(config: CatalogConfig) -> Result<Self, CatalogError> {
         let cross_process_writer = config
             .location
@@ -314,6 +315,7 @@ impl Catalog {
             initialize_catalog_identity(&connection)?;
         } else {
             verify_migration_identities(&connection)?;
+            // Restored catalogs receive a full audit before any authority is admitted.
             verify_integrity(&connection)?;
         }
         config
@@ -336,7 +338,6 @@ impl Catalog {
         } else {
             verify_migration_identities(&connection)?;
         }
-        verify_integrity(&connection)?;
         let catalog = Self {
             connection,
             publication_observer: crate::ingest::DataPublicationObserverSlot::default(),

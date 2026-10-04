@@ -619,9 +619,14 @@ impl ResearchService {
         ),
         ResearchServiceError,
     > {
+        let phase_started = Instant::now();
         let authority = CatalogAuthority::open(catalog)?;
+        tracing::info!(phase = "catalog", elapsed_ms = %phase_started.elapsed().as_millis(), "research storage open phase completed");
+        let phase_started = Instant::now();
         let manifests =
             AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
+        tracing::info!(phase = "manifests", elapsed_ms = %phase_started.elapsed().as_millis(), "research storage open phase completed");
+        let phase_started = Instant::now();
         let (analytical_composition, onboarding_catalog) =
             AnalyticalDataService::open_with_provider_onboarding(
                 authority,
@@ -629,6 +634,7 @@ impl ResearchService {
                 paths.artifacts()?.clone(),
                 objects,
             )?;
+        tracing::info!(phase = "analytical_bound", elapsed_ms = %phase_started.elapsed().as_millis(), "research storage open phase completed");
         let (analytical, publisher) = analytical_composition.into_parts();
         let service = Self::from_analytical(paths, Arc::new(analytical))?;
         Ok((service, onboarding_catalog, publisher))
@@ -641,9 +647,12 @@ impl ResearchService {
     ) -> Result<Self, ResearchServiceError> {
         let application_changes = market_squawk_runtime::ApplicationChanges::default();
         let history_publications = Arc::new(tokio::sync::Notify::new());
+        let phase_started = Instant::now();
+        let provider_captures = Arc::new(paths.sealed_research_journal_store()?);
+        tracing::info!(phase = "raw_store", elapsed_ms = %phase_started.elapsed().as_millis(), "research storage open phase completed");
         Ok(Self {
             analytical,
-            provider_captures: Arc::new(paths.sealed_research_journal_store()?),
+            provider_captures,
             provider_capture_worker: ResearchIoWorker::new(),
             retained_read_worker: ResearchIoWorker::new(),
             retained_generation_worker: ResearchIoWorker::new(),
