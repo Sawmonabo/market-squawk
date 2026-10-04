@@ -2,6 +2,105 @@
 
 ## Current execution — 2026-10-03
 
+### Listing revalidation — critically verified checkpoint
+
+The two-file Nasdaq correction uses one shared successful-receipt expiry calculation in current
+publication, snapshot reuse and identity approval. Original source timestamps and point-in-time
+lineage remain unchanged. A retained receipt still expires; only a complete validated new directory
+fetch can renew current listing membership. Different retained source-contract evidence remains
+historical and causes a fresh acquisition, not an in-place rewrite or migration.
+
+Focused directory freshness check PASS1/1 in `source-runtime-app-critical.log`. Native reconnect
+is still pending deployment; this checkpoint does not claim live source activation or quote coverage.
+The same app test build also passed catalog-readability and failed-training-publication cases (3/3
+total,1.38s), and the modeling binary passed source provenance/worker semantics (2/2,0.03s).
+Compilation completed in12m10s. Subsequent naming/config-report edits still need current-source
+compilation; source runtime WIP is not included in the independent listing checkpoint.
+
+### Installed runtime follow-through — bounded read-only dependency trace
+
+Source implementation is frozen for the lead's checks. Astra High `deferred_model_startup` may
+inspect the existing installer/package activation and installed training/import/helper paths, writing
+only the installed-runtime follow-through section of the existing source-runtime correction report.
+Return concrete installer evidence already available, remaining runtime scan callsites, and the
+smallest producer/consumer change that keeps install/update verification while removing recurrent
+software scans. No code edits, new caches/frameworks, builds, Git or runtime actions. This is a
+required owner correction dependency trace, not a new acceptance review or scope expansion.
+Lead retains all source ownership and continues current focused checks concurrently.
+
+### Source runtime integration — lead verification in progress
+
+All three assigned implementation lanes are frozen and ownership released. Lead integrated the
+explicit development configuration through platform configuration, native Desktop service launch,
+model inventory/restore, prepared training and worker admission. The provisional release callback,
+verification mutex/cache and signed development launcher recipes are removed. Real catalog reads
+remain independent of execution configuration. Installed verification is still separate pending work.
+
+Launcher lifecycle check PASS1/1; JS syntax and five changed Python files parse successfully.
+One critical configuration case covers explicit source selection and rejection of mixed installed
+and source roots, an authority ambiguity not covered by existing precedence tests. Rust app/model
+library checks are compiling serially, log `source-runtime-critical-build.log`; no live training,
+forecast or restarted saved-model proof yet. No extra runtime or worktree was created. The existing
+visible app remains on its previous binary, and its watcher remains paused during this integration.
+
+Next dependency: resolve compiler/critical-check findings, refresh the one managed editable native
+environment, then deploy the same supervised generation and prove source training/admission/forecast
+and saved restart. Nasdaq revalidation is included in the focused check selection; its live reconnect
+and the pushed Schwab refresh/API/feed proof remain outstanding.
+
+### Source producer/launcher ownership — interface published
+
+The shared API is `ConfiguredTrainingEnvironment::{SourceDevelopment,InstalledRelease}` with
+common provenance identity/revision and honest installed-only proof. The configured development
+root is the managed venv, containing one bounded `source-development.json` descriptor whose
+`source_root` names the repository checkout; no signed release or code-file scan. Descriptor fields and APIs are recorded in the source-runtime agent handoff/report.
+
+| Writer | Exclusive files | Contract / check |
+| --- | --- | --- |
+| GPT-6.1 Sol High `source_python_runtime` | `crates/market-squawk-python/src/{lib.rs,receipt.rs}`, `python/market_squawk/{training.py,training_driver.py,bundle.py}`, existing `python/tests/test_training_bundle.py` only if needed | Native development receipt validates actual runtime/package versions; same training/candidate path; explicit source validator coordinate. No own-code hashes or fake release evidence. |
+| GPT-6.1 Sol High `source_dev_launcher` | `scripts/develop.mjs`, `scripts/development_model_environment.py`, existing `scripts/tests/develop.test.mjs` | Existing supervisor builds/stages same model helpers, writes descriptor only after old service stops, sets explicit source root, removes foundation injection. Lead owns Justfile/setup invocation and source configuration. |
+| Lead | `Justfile`, jobs process source admission, modeling exports and benchmark digest caller, platform config and app/Desktop composition, all docs/Git/builds | Process source constructor checks absolute executable metadata without content hashes and preserves the venv interpreter symlink path. Integrate producer/consumer together; exact checks after freeze. |
+
+No lane runs builds/tests/provider calls or restarts processes. Source generation publication must
+not mutate a descriptor used by a still-running training process. Existing generation cleanup and
+single-build ownership remain intact. No extra worktrees, copied training stack or compatibility path.
+
+### Source-runtime contract implementation — assigned after completed diagnosis
+
+The frozen report is `.agents/tmp/v1-first-stock/development-model-runtime-correction.md`.
+Use existing uv-managed editable Python, one training/validator/ONNX path, and explicit development
+provenance. No fake verified environment, source-code hashes or duplicate runner. Installed package
+verification remains separately identified; source proof must not claim installed-release approval.
+
+Astra High `deferred_model_startup` now owns only the modeling crate's `src/training_environment.rs`,
+`src/training_protocol.rs`, `src/admission.rs`, `src/onnx/worker.rs`, and
+`src/bin/market_squawk_model_validator.rs`. Publish exact neutral environment/source descriptor and
+worker signatures to the lead before dependent writers start. Implement the shared development vs
+installed provenance and canonical candidate/worker consumers; adapt only affected critical existing
+fixtures. No builds, processes, Git, app composition or Python edits. Lead owns crate exports,
+`market-squawk-jobs/src/process.rs`, platform config, app composition/runtime and all shared launcher
+wiring. Setup/Python producer lanes start only after the concrete interface handoff; no speculative
+parallel callers. Nasdaq remains independently assigned to Sol in its two existing files.
+
+The previous callback/cache WIP is provisional and may be removed when the simpler configured
+runtime replaces it. Real durable catalog behavior survives. Finish evidence remains actual source
+training -> candidate admission -> forecast -> saved restart, not merely an environment type.
+
+### Next bounded integration — source development and listing revalidation
+
+Schwab correction is pushed as `26f625f7`. Agent ownership for those files is released. Current
+startup WIP is preserved; no native rebuild is scheduled until the next coherent contracts freeze.
+
+| Owner | Exact writable files | Dependency / finish evidence |
+| --- | --- | --- |
+| GPT-6.1 Sol High `source_status_contract` | `apps/market-squawk/src/provider_activation/nasdaq_reference.rs`, `apps/market-squawk/src/provider_activation/reference_identity.rs` | Implement the frozen report's current-directory revalidation correction; reuse one helper for publication/snapshot/approval, preserve original source clocks/identity; update closest critical freshness fixture. No builds/runtime/Git. |
+| Astra High `deferred_model_startup` | Existing development-model-runtime-correction report only until API handoff | Exact source-mode producer/consumer contract; lead then assigns disjoint implementation groups, preserving shared launch authority ownership. |
+| Lead | Shared contracts/launch composition, ledger/PR, Git/runtime/build scheduling | Inspect Nasdaq handoff and source-runtime interfaces; one serialized relevant verification/deployment after freeze. OAuth source is critically verified, live API/feed proof pending. |
+
+These lanes are independent: listing revalidation repairs market reconnect, while source runtime
+removes the inappropriate signed-release dependency from local development. No branch/worktree,
+new source adapter, alternate training pipeline, migration or compatibility layer is authorized.
+
 ### Schwab refresh correction — critically verified checkpoint
 
 The focused app-library command completed in11m37s; all four selected checks passed in10.62s.

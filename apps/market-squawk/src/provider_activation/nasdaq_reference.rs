@@ -520,6 +520,13 @@ impl NasdaqReferenceUniverseService {
                 }
                 return Ok(None);
             };
+            if generation.source_revision()
+                != self.source.metadata().revision().as_source_identifier()
+            {
+                // A retained observation under a different contract is historical evidence.
+                // Only a new complete validated acquisition can establish the current contract.
+                return Ok(None);
+            }
             let digest = generation.generation_digest();
             if selected_generation.is_some_and(|expected| expected != digest) {
                 return Err(NasdaqReferenceUniverseError::SourceBinding);
@@ -637,7 +644,7 @@ impl NasdaqReferenceUniverseService {
             if !self.source.metadata().is_effective_at(now)
                 || component.received_at() > now
                 || now
-                    >= reference_fresh_until(
+                    >= current_directory_fresh_until(
                         component.source_last_modified_at(),
                         component.received_at(),
                         self.source.metadata().freshness_policy(),
@@ -790,14 +797,14 @@ impl ReferenceUniverseSnapshot {
             .first()
             .ok_or(NasdaqReferenceUniverseError::IncompleteDirectory)?;
         let mut observed_at = first.listing.observed_at;
-        let mut fresh_until = reference_fresh_until(
+        let mut fresh_until = current_directory_fresh_until(
             first.listing.source_timestamp,
             first.listing.observed_at,
             metadata.freshness_policy(),
         )?;
         for record in records.iter().skip(1) {
             observed_at = observed_at.max(record.listing.observed_at);
-            fresh_until = fresh_until.min(reference_fresh_until(
+            fresh_until = fresh_until.min(current_directory_fresh_until(
                 record.listing.source_timestamp,
                 record.listing.observed_at,
                 metadata.freshness_policy(),
@@ -815,7 +822,12 @@ impl ReferenceUniverseSnapshot {
     }
 }
 
-fn reference_fresh_until(
+/// Bounds current listing membership by the receipt of a validated complete directory fetch.
+///
+/// Original publication clocks remain lineage and point-in-time evidence. The registered age
+/// bounds limit current-directory revalidation age; an unchanged file can therefore be freshly
+/// revalidated without rewriting its source timestamp or renewing an old cached receipt.
+pub(crate) fn current_directory_fresh_until(
     source_timestamp: Timestamp,
     observed_at: Timestamp,
     policy: FreshnessPolicy,
@@ -824,15 +836,15 @@ fn reference_fresh_until(
         return Err(NasdaqReferenceUniverseError::SourceBinding);
     }
     let mut fresh_until = Timestamp::from_unix_nanos(i64::MAX);
-    for (clock, age) in [
-        (source_timestamp, policy.max_source_age_nanos()),
-        (observed_at, policy.max_transport_age_nanos()),
-        (observed_at, policy.max_market_age_nanos()),
+    for age in [
+        policy.max_source_age_nanos(),
+        policy.max_transport_age_nanos(),
+        policy.max_market_age_nanos(),
     ] {
         let age =
             i64::try_from(age).map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?;
         fresh_until = fresh_until.min(
-            clock
+            observed_at
                 .checked_add_nanos(age)
                 .map_err(|_| NasdaqReferenceUniverseError::SourceBinding)?,
         );
@@ -1299,7 +1311,7 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
             .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?,
         RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(
-                SourceIdentifier::try_from("nasdaq-symbol-directory-durable-v2")
+                SourceIdentifier::try_from("nasdaq-current-directory-reference-v1")
                     .map_err(|_| NasdaqReferenceUniverseError::InvalidConfiguration)?,
             ),
             evidence.clone(),
@@ -1339,7 +1351,7 @@ fn source_metadata() -> Result<SourceMetadata, NasdaqReferenceUniverseError> {
 
 fn contract_evidence() -> ExactPayloadEvidence {
     let digest: [u8; 32] = Sha256::digest(
-        b"market-squawk/nasdaq-symbol-directory/durable-reference/v2\0nasdaqlisted.txt\0otherlisted.txt\0complete-request-graph\0sealed-raw\0reference-only\0display-and-persist\0no-redistribution",
+        b"market-squawk/nasdaq-current-directory-reference/v1\0nasdaqlisted.txt\0otherlisted.txt\0complete-request-graph\0sealed-raw\0current-membership-revalidation-received-at\0preserved-original-source-clocks\0reference-only\0display-and-persist\0no-redistribution",
     )
     .into();
     ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256, digest))
@@ -1482,27 +1494,44 @@ mod tests {
         let mut snapshot = ReferenceUniverseSnapshot {
             records: Box::new([]),
             observed_at: source,
-            fresh_until: reference_fresh_until(source, source, policy)
+            fresh_until: current_directory_fresh_until(source, source, policy)
                 .expect("valid source clocks"),
         };
         assert!(snapshot.is_fresh_at(&metadata, before_expiry));
         assert!(!snapshot.is_fresh_at(&metadata, expiry));
 
-        // Fetching an unchanged file later does not renew its original source timestamp.
+        // Without a fresh validated receipt, the retained directory remains expired.
         let refreshed_at = expiry.checked_add_nanos(1).expect("bounded refresh");
-        snapshot.observed_at = refreshed_at;
-        snapshot.fresh_until = reference_fresh_until(source, refreshed_at, policy)
-            .expect("old source clock remains valid evidence");
-        assert_eq!(snapshot.fresh_until, expiry);
         assert!(!snapshot.is_fresh_at(&metadata, refreshed_at));
 
-        // A genuinely newer source file can replace the expired snapshot.
-        snapshot.fresh_until = reference_fresh_until(refreshed_at, refreshed_at, policy)
-            .expect("fresh replacement clocks");
+        // A complete validated current-directory fetch renews membership validation while
+        // preserving the unchanged file's original source timestamp.
+        snapshot.observed_at = refreshed_at;
+        snapshot.fresh_until = current_directory_fresh_until(source, refreshed_at, policy)
+            .expect("original source clock and fresh validation receipt");
+        let refreshed_expiry = refreshed_at
+            .checked_add_nanos(i64::try_from(DAY_NANOS).expect("bounded day"))
+            .expect("bounded validation expiry");
+        assert_eq!(snapshot.fresh_until, refreshed_expiry);
         assert!(snapshot.is_fresh_at(&metadata, refreshed_at));
         assert!(!snapshot.is_fresh_at(&metadata, expiry));
+        assert!(
+            snapshot.is_fresh_at(
+                &metadata,
+                refreshed_expiry
+                    .checked_add_nanos(-1)
+                    .expect("bounded clock"),
+            )
+        );
+        assert!(!snapshot.is_fresh_at(&metadata, refreshed_expiry));
         assert!(matches!(
-            reference_fresh_until(refreshed_at, source, policy),
+            current_directory_fresh_until(
+                refreshed_at
+                    .checked_add_nanos(1)
+                    .expect("bounded source clock"),
+                refreshed_at,
+                policy,
+            ),
             Err(NasdaqReferenceUniverseError::SourceBinding)
         ));
     }

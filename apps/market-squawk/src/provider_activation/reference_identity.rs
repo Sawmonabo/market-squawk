@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::nasdaq_reference::{
     NasdaqCurrentListing, NasdaqListingKey, NasdaqReferenceUniverseError,
-    NasdaqReferenceUniverseService,
+    NasdaqReferenceUniverseService, current_directory_fresh_until,
 };
 
 const APPROVAL_DIGEST_DOMAIN: &[u8] = b"market-squawk/market-reference-identity-approval/v2\0";
@@ -332,24 +332,12 @@ fn build_approval(
         return Ok(None);
     }
 
-    let mut expires_at = fresh_until(
+    let mut expires_at = current_directory_fresh_until(
         listing.source_timestamp(),
-        nasdaq_metadata.freshness_policy().max_source_age_nanos(),
-    )?;
-    minimize_expiry(
-        &mut expires_at,
-        fresh_until(
-            listing.observed_at(),
-            nasdaq_metadata.freshness_policy().max_transport_age_nanos(),
-        )?,
-    );
-    minimize_expiry(
-        &mut expires_at,
-        fresh_until(
-            listing.observed_at(),
-            nasdaq_metadata.freshness_policy().max_market_age_nanos(),
-        )?,
-    );
+        listing.observed_at(),
+        nasdaq_metadata.freshness_policy(),
+    )
+    .map_err(|_| MarketReferenceIdentityError::InvalidEvidence)?;
     minimize_optional_expiry(
         &mut expires_at,
         nasdaq_metadata
@@ -498,17 +486,6 @@ fn update_text(hasher: &mut Sha256, value: &str) {
 
 fn interval_contains(interval: EffectiveInterval, at: Timestamp) -> bool {
     at >= interval.starts_at() && interval.ends_at().is_none_or(|end| at < end)
-}
-
-fn fresh_until(
-    observed_at: Timestamp,
-    maximum_age_nanos: u64,
-) -> Result<Timestamp, MarketReferenceIdentityError> {
-    let nanos = i64::try_from(maximum_age_nanos)
-        .map_err(|_| MarketReferenceIdentityError::InvalidEvidence)?;
-    observed_at
-        .checked_add_nanos(nanos)
-        .map_err(|_| MarketReferenceIdentityError::InvalidEvidence)
 }
 
 fn minimize_expiry(current: &mut Timestamp, candidate: Timestamp) {
