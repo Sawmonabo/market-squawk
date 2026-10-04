@@ -309,6 +309,26 @@ async fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
         Ok(TokenDecision::Reauthorize)
     );
 
+    let extended = br#"{"access_token":"access","refresh_token":"refresh","token_type":"Bearer","expires_in":1800,"scope":"market-data","id_token":"ignored-identity","provider_extension":{"scope":"trading","expires_in":999999}}"#;
+    let (extended_tokens, extended_lifecycle) =
+        parse_token_response(extended, 1_010, refresh, bounds())
+            .unwrap_or_else(|error| panic!("token extension response rejected: {error}"));
+    assert_eq!(
+        extended_tokens.expose_access_token(),
+        tokens.expose_access_token()
+    );
+    assert_eq!(
+        extended_tokens.expose_refresh_token(),
+        tokens.expose_refresh_token()
+    );
+    assert_eq!(extended_tokens.scope(), tokens.scope());
+    assert_eq!(extended_lifecycle, lifecycle);
+    let duplicated = br#"{"access_token":"access","access_token":"replacement","refresh_token":"refresh","token_type":"Bearer","expires_in":1800,"id_token":"ignored-identity"}"#;
+    assert!(matches!(
+        parse_token_response(duplicated, 1_010, refresh, bounds()),
+        Err(SchwabAdapterError::SchemaViolation)
+    ));
+
     let quote = QuoteRequest::try_new(
         vec![
             ProviderIdentifier::try_new("AAPL").unwrap_or_else(|error| panic!("symbol: {error}")),

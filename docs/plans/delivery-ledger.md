@@ -2,6 +2,78 @@
 
 ## Current execution — 2026-10-03
 
+### Automatic Schwab setup and token decoding — integration verification
+
+| Active owner | Finishable outcome / dependency | Exclusive files | Check / release |
+| --- | --- | --- | --- |
+| Lead | Automatic Schwab setup and authenticated read, after frozen source passes native build | Shared native runtime, current source integration, docs and Git | Native enrollment/callback/doctor evidence; commit/push |
+| GPT-6.1 Sol High `tiingo_setup_recovery` | Identify current Tiingo rejection on native37 without interfering with Schwab | `.agents/tmp/v1-first-stock/tiingo-setup-recovery.md` only; source read-only | Concrete failing boundary and smallest fix; no build or runtime calls |
+
+
+Both source owners have released their frozen changes. Lead removed unrelated fixture formatting;
+the existing OAuth lifecycle test now passes with ignored extension members and rejected duplicate
+recognized credentials (9.40-second incremental-free rebuild). The existing REST evidence test
+passes in 3.36 seconds. No new test target, dependency, schema or compatibility path was added.
+
+Native Begin already automatically checks/enrolls callback trust. Enrollment now installs the exact
+public leaf in the configured default user keychain and verifies SHA-256 discoverability plus SSL
+trust before browser launch. Lead's manual repair proved keychain discoverability; app-driven fresh
+enrollment and Chrome callback acceptance remain unverified. macOS may request its own approval.
+Reqwest streams gzip-decoded JSON through the existing decoded-byte/time limits in both token and
+market-data requests. OAuth response extensions grant no additional authority.
+
+The normal supervisor completed the single native build in 6m50s and replaced the old pair with
+service55980/Desktop56038. No competing build or new workspace was started. Native attach and
+OAuth acceptance remain pending; compilation alone does not close them.
+No authenticated Schwab API success is established. Next barrier: matched native build, automatic
+certificate enrollment, fresh official consent, token exchange, then actual read-only API response.
+Startup composition/attach timeout and Tiingo activation remain separate open defects.
+
+### OAuth token response contract alignment — same checkpoint
+
+The existing adapter OAuth lifecycle/route test passes after gzip decoding (one compilation1m30s).
+Inspection found an adjacent standards defect: token responses reject all extension members even
+though RFC6749§5.1 requires ignoring unrecognized response names. Sol `source_status_contract`
+ownership extends only to Schwab `src/oauth.rs` and the existing lifecycle fixture in `src/tests.rs`:
+remove the token-wire unknown-member rejection, keep required typed/duplicate/token/expiry/body
+validation, and verify ignored extensions do not grant identity or authorization. No migration or
+compatibility stack. Native build waits until this narrow correction and automatic keychain
+installation are frozen. Existing test binary can still verify unchanged REST evidence meanwhile.
+
+### Confirmed Schwab HTTP encoding mismatch — active
+
+A safe invalid-code token request using the saved app credential pair returnedHTTP400,
+Content-Type application/json and Content-Encoding gzip despite requesting identity. No real
+code/token was used or persisted. OAuth wire explicitly disables gzip and rejects that header,
+matching the live `wire_protocol` failure. Reqwest0.13.4 with gzip is already in the workspace.
+
+GPT-6.1 Sol High `source_status_contract` owns only Schwab `src/authority.rs` and
+`src/transport/http.rs` plus their existing inline tests for maintained-library response decoding.
+Preserve HTTPS/no-redirect, streaming decoded-size/time bounds, secret redaction and canonical
+capture semantics; assess shared REST path so real quotes do not repeat the encoding failure.
+No new dependency/schema/runtime, builds, Git or provider calls. Lead owns runtime/API/checks.
+Astra `native_price_authority` now owns only `provider_onboarding/schwab_oauth_installation.rs`
+for confirmed missing public-leaf keychain discoverability: trust was recorded without certificate
+installation. Keep the exact existing leaf, user keychain and SSL-only trust. Lead alone enrolls
+the public leaf and checks Chrome; no private-key movement. One worktree/branch remains.
+
+### Native authorization result — `37a66cf7`
+
+Matched build completed6m07s and is now running under supervisor43066, watcher43081,
+service43208/Desktop43276. Old service12773 exited normally with nonzero ShutdownIncomplete:
+transport/admission/jobs/audit/repository/rendezvous all retired; Source reported its known retained
+failed exchange. No force kill, state deletion or policy change. The replacement reused the same
+workspace. Startup local-product composition took74.151s; initial Desktop attach timed out,
+then ordinary Try again connected. This remains an open startup defect, not successful startup QA.
+
+Owner completed fresh Schwab consent. Chrome still showed Privacy error: the hostname-policy
+correction is insufficient for live browser acceptance. Pinned exact-leaf callback delivery
+succeededHTTP200, but completed exchange returned fixed diagnostic `wire_protocol`; no active
+OAuth/API success. Retry ownership no longer remains stuck. Astra `native_price_authority` owns
+read-only remaining browser trust diagnosis and safe public-certificate/primary-source inspection;
+report only to existing source-status-contract.md, no browser/OS mutation or source edits. Lead
+owns API response diagnosis. Tiingo native retry also remains rejected and needs its concrete cause.
+
 ### OAuth/financial correction — critically verified, native pending
 
 TSLA grouping and both Schwab fixes are frozen. One nonincremental, single-job application-library

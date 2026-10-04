@@ -564,8 +564,8 @@ pub fn parse_token_response(
     Ok((response, lifecycle))
 }
 
+// RFC 6749 section 5.1 requires ignoring response extensions; they grant no authority here.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireTokenResponse {
     access_token: String,
     #[serde(default)]

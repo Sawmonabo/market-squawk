@@ -1,5 +1,24 @@
 # Desktop product audit — 2026-10-02 / current checkpoint 2026-10-03
 
+## Schwab automatic setup and HTTP correction — 2026-10-03
+
+The `37a66cf7` native retry proved failed-exchange recovery but did not establish OAuth/API access.
+Two further causes are confirmed. Apple's trust tool, without `-k`, records trust without installing
+the certificate in the user keychain; Chrome needs both. The corrected native setup uses the user's
+configured default keychain and checks the exact public-leaf SHA-256 before launch. This runs from
+ordinary Schwab Begin; the user should not need Terminal commands. The manual local repair is not
+proof of automatic enrollment or Chrome callback acceptance.
+
+A credentialed token request with an intentionally invalid diagnostic code returned gzip JSON
+despite requesting identity encoding. No real code or token was retained. Both OAuth and market-data
+clients now use existing reqwest gzip decoding with their decoded-body bounds. Token response
+extensions are ignored as required by OAuth, while duplicate recognized fields remain rejected.
+The existing OAuth lifecycle and REST sealed-evidence checks pass; native/browser/API proof remains
+pending. References: [Apple trust enrollment implementation](https://raw.githubusercontent.com/apple-oss-distributions/Security/main/SecurityTool/macOS/trusted_cert_add.c),
+[Chromium trust discovery](https://chromium.googlesource.com/chromium/src/+/main/net/cert/internal/trust_store_mac.cc),
+[reqwest decoding](https://docs.rs/reqwest/0.13.4/reqwest/struct.ClientBuilder.html#method.gzip),
+and [OAuth response rules](https://www.rfc-editor.org/rfc/rfc6749.html#section-5.1).
+
 ## Schwab authorization follow-up — 2026-10-03
 
 Owner browser sign-in has not yet established API access. The exact localhost callback was

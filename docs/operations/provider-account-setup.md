@@ -195,8 +195,10 @@ credential/security changes, or another documented restart condition requires it
 1. Keep only `SCHWAB_APP_KEY` and `SCHWAB_APP_SECRET` in the credential input.
 2. Register Market Squawk's code-owned callback exactly as `https://127.0.0.1:8182` with no trailing
    slash. Do not add a callback field to the credential file.
-3. Complete the Schwab authorization/consent page when the app requests it. A browser failure at the
-   loopback URL is not surprising unless the bounded local callback listener is running.
+3. Start Schwab sign-in in Desktop. On macOS, the app installs and verifies its own localhost
+   callback certificate in your default user keychain before opening the official consent page.
+   Approve the macOS prompt if shown, then complete Schwab consent. No Terminal certificate setup
+   is required. A browser certificate warning is a setup failure, not a step to bypass.
 4. Let Market Squawk exchange and rotate the complete token set in its protected secret store.
    Never paste an access or refresh token into the credential file.
 5. The runtime may call only the code-owned `/marketdata/v1` read allowlist plus the minimum

@@ -19,8 +19,8 @@ use market_squawk_sources::{
     SealedProviderCaptureSetReceipt, SealedProviderEventMicrobatchReceipt,
 };
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
-    HeaderMap, HeaderName, RETRY_AFTER, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName,
+    RETRY_AFTER, USER_AGENT,
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -154,8 +154,8 @@ pub trait SchwabHttpWire: fmt::Debug + Send + Sync {
     >;
 }
 
-/// Hardened production reqwest wire. Redirects, implicit retries, proxies, and decompression are
-/// disabled so captured bytes are the exact application payload returned by the selected route.
+/// Hardened reqwest wire: no redirects, implicit retries or proxies. Capture retains the decoded
+/// JSON entity bytes used by canonical parsing, not the compressed HTTP transfer representation.
 #[derive(Debug)]
 pub struct ReqwestSchwabHttpWire {
     client: reqwest::Client,
@@ -172,7 +172,7 @@ impl ReqwestSchwabHttpWire {
             .redirect(reqwest::redirect::Policy::none())
             .referer(false)
             .retry(reqwest::retry::never())
-            .no_gzip()
+            .gzip(true)
             .no_brotli()
             .no_deflate()
             .no_zstd()
@@ -241,7 +241,6 @@ impl SchwabHttpWire for ReqwestSchwabHttpWire {
                 .client
                 .get(request.request().wire_url().clone())
                 .header(ACCEPT, "application/json")
-                .header(ACCEPT_ENCODING, "identity")
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .header(AUTHORIZATION, authorization)
                 .send()
@@ -249,6 +248,8 @@ impl SchwabHttpWire for ReqwestSchwabHttpWire {
                 .map_err(map_reqwest_error)?;
             let status = response.status().as_u16();
             let final_url = response.url().as_str().to_owned();
+            // Gzip decoding removes compressed encoding/length headers. Collection, receipt hash,
+            // raw sealing and canonical parsing all retain the same bounded decoded entity.
             let declared_body_bytes = declared_length(response.headers())?;
             if declared_body_bytes.is_some_and(|length| {
                 usize::try_from(length).map_or(true, |length| {

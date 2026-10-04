@@ -51,6 +51,7 @@ const HTTP_1_1_ALPN: &[u8] = b"http/1.1";
 const IDENTITY_PARENT_DIRECTORY: &str = "provider-onboarding";
 const IDENTITY_DIRECTORY: &str = "schwab-oauth-loopback-v1";
 const CERTIFICATE_FILE: &str = "certificate.der";
+const CERTIFICATE_COMMON_NAME: &str = "Market Squawk Schwab OAuth loopback";
 const PRIVATE_KEY_FILE: &str = "private-key.der";
 const RECEIPT_FILE: &str = "identity.json";
 const MAXIMUM_CERTIFICATE_BYTES: u64 = 64 * 1024;
@@ -62,6 +63,7 @@ const SECURITY_TOOL: &str = "/usr/bin/security";
 const CERTIFICATE_VALIDITY_YEARS: i32 = 5;
 const TRUST_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 const TRUST_MUTATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAXIMUM_SECURITY_QUERY_BYTES: u64 = 256 * 1024;
 
 /// Secret-free failure while admitting an installation-owned callback identity.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -211,7 +213,7 @@ impl InstallationSchwabOAuthIdentity {
             .join(CERTIFICATE_FILE)
     }
 
-    /// Checks exact-host SSL trust and excludes hostname-scoped trust unsupported by Chromium.
+    /// Checks discoverability and SSL trust for the exact installation leaf.
     pub(crate) async fn trust_state(
         &self,
         cancellation: CancellationToken,
@@ -220,6 +222,27 @@ impl InstallationSchwabOAuthIdentity {
         #[cfg(target_os = "macos")]
         {
             let deadline = tokio::time::Instant::now() + TRUST_STATUS_TIMEOUT;
+            // Trust settings alone do not install certificate bytes. Chromium enumerates
+            // keychain certificates before consulting their settings, unlike verify-cert -c.
+            let mut command = Command::new(SECURITY_TOOL);
+            command.args([
+                "find-certificate",
+                "-a",
+                "-c",
+                CERTIFICATE_COMMON_NAME,
+                "-Z",
+            ]);
+            let (status, output) =
+                read_security_tool(command, deadline, cancellation.child_token()).await?;
+            let expected_hash = lower_hex(&self.certificate_sha256);
+            let discoverable = std::str::from_utf8(&output)
+                .map_err(|_error| SchwabOAuthInstallationCapabilityError::TrustEnrollment)?
+                .lines()
+                .filter_map(|line| line.strip_prefix("SHA-256 hash: "))
+                .any(|hash| hash.eq_ignore_ascii_case(&expected_hash));
+            if !status.success() || !discoverable {
+                return Ok(SchwabOAuthInstallationTrustState::SetupRequired);
+            }
             // Chromium ignores kSecTrustSettingsPolicyString even when macOS accepts the
             // requested hostname. macOS's SSL evaluation without a name cannot match that
             // restricted trust record. Require both evaluations; the second does not replace
@@ -264,35 +287,56 @@ impl InstallationSchwabOAuthIdentity {
         }
         #[cfg(target_os = "macos")]
         {
+            let deadline = tokio::time::Instant::now() + TRUST_MUTATION_TIMEOUT;
+            let mut query = Command::new(SECURITY_TOOL);
+            query.args(["default-keychain", "-d", "user"]);
+            let (status, output) =
+                read_security_tool(query, deadline, cancellation.child_token()).await?;
+            let keychain = std::str::from_utf8(&output)
+                .ok()
+                .and_then(|output| output.trim().strip_prefix('"'))
+                .and_then(|output| output.strip_suffix('"'))
+                .filter(|path| !path.contains(['\r', '\n', '\0']) && Path::new(path).is_absolute())
+                .filter(|_path| status.success())
+                .ok_or(SchwabOAuthInstallationCapabilityError::TrustEnrollment)?;
             let mut command = Command::new(SECURITY_TOOL);
             // Trust only this non-CA, server-auth leaf whose sole SAN is 127.0.0.1. Do not
             // add a hostname policy string: Chromium ignores that entire trust record.
             // The issuer is never installed and this transition preserves the server identity.
+            // Explicit -k is required: without it Apple's tool writes settings but does not
+            // add the leaf to a keychain. Use the user's configured default, not a guessed path.
             command
-                .args(["add-trusted-cert", "-r", "trustAsRoot", "-p", "ssl"])
+                .args([
+                    "add-trusted-cert",
+                    "-k",
+                    keychain,
+                    "-r",
+                    "trustAsRoot",
+                    "-p",
+                    "ssl",
+                ])
                 .arg(self.certificate_path())
                 .stdin(Stdio::null());
-            let status = match run_security_tool(
-                command,
-                TRUST_MUTATION_TIMEOUT,
-                cancellation.child_token(),
-            )
-            .await
-            {
-                Ok(status) => status,
-                Err(
-                    error @ (SchwabOAuthInstallationCapabilityError::TrustCancelled
-                    | SchwabOAuthInstallationCapabilityError::TrustTimeout),
-                ) => {
-                    if self.trust_state(CancellationToken::new()).await?
-                        == SchwabOAuthInstallationTrustState::Trusted
-                    {
-                        return Ok(SchwabOAuthInstallationTrustState::Trusted);
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(SchwabOAuthInstallationCapabilityError::TrustTimeout)?;
+            let status =
+                match run_security_tool(command, remaining, cancellation.child_token()).await {
+                    Ok(status) => status,
+                    Err(
+                        error @ (SchwabOAuthInstallationCapabilityError::TrustCancelled
+                        | SchwabOAuthInstallationCapabilityError::TrustTimeout),
+                    ) => {
+                        if self.trust_state(CancellationToken::new()).await?
+                            == SchwabOAuthInstallationTrustState::Trusted
+                        {
+                            return Ok(SchwabOAuthInstallationTrustState::Trusted);
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            };
+                    Err(error) => return Err(error),
+                };
             if !status.success()
                 || self.trust_state(CancellationToken::new()).await?
                     != SchwabOAuthInstallationTrustState::Trusted
@@ -538,7 +582,7 @@ fn publish_identity(
         .push(DnType::OrganizationName, "Market Squawk");
     leaf_params
         .distinguished_name
-        .push(DnType::CommonName, "Market Squawk Schwab OAuth loopback");
+        .push(DnType::CommonName, CERTIFICATE_COMMON_NAME);
     leaf_params.is_ca = IsCa::ExplicitNoCa;
     leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -662,6 +706,62 @@ fn verify_security_tool_path() -> Result<(), SchwabOAuthInstallationCapabilityEr
     }
     #[cfg(not(target_os = "macos"))]
     Err(SchwabOAuthInstallationCapabilityError::UnsupportedPlatform)
+}
+
+/// Captures only bounded public certificate/keychain query output, never credential data.
+#[cfg(target_os = "macos")]
+async fn read_security_tool(
+    mut command: Command,
+    deadline: tokio::time::Instant,
+    cancellation: CancellationToken,
+) -> Result<(std::process::ExitStatus, Vec<u8>), SchwabOAuthInstallationCapabilityError> {
+    use tokio::io::AsyncReadExt as _;
+
+    if cancellation.is_cancelled() {
+        return Err(SchwabOAuthInstallationCapabilityError::TrustCancelled);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(SchwabOAuthInstallationCapabilityError::TrustTimeout);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_error| SchwabOAuthInstallationCapabilityError::TrustEnrollment)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(SchwabOAuthInstallationCapabilityError::TrustEnrollment)?;
+    let mut stdout = stdout.take(MAXIMUM_SECURITY_QUERY_BYTES + 1);
+    let mut output = Vec::new();
+    let result = {
+        let completion = async {
+            let read = async {
+                stdout.read_to_end(&mut output).await?;
+                if output.len() as u64 > MAXIMUM_SECURITY_QUERY_BYTES {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                Ok(())
+            };
+            tokio::try_join!(child.wait(), read)
+                .map(|(status, ())| status)
+                .map_err(|_error| SchwabOAuthInstallationCapabilityError::TrustEnrollment)
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(SchwabOAuthInstallationCapabilityError::TrustCancelled),
+            () = tokio::time::sleep_until(deadline) => Err(SchwabOAuthInstallationCapabilityError::TrustTimeout),
+            result = completion => result,
+        }
+    };
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    result.map(|status| (status, output))
 }
 
 async fn run_security_tool(

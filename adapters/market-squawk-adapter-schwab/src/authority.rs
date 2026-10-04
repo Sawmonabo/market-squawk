@@ -21,8 +21,7 @@ use market_squawk_platform::{
     SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
 };
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
-    HeaderValue, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -301,7 +300,7 @@ pub trait SchwabOAuthWire: fmt::Debug + Send + Sync {
     >;
 }
 
-/// Hardened production token wire: HTTPS only, no redirect, proxy, retry, or decompression.
+/// Hardened token wire: HTTPS only, no redirect, proxy or retry; bounded decoded JSON bodies.
 #[derive(Debug)]
 pub struct ReqwestSchwabOAuthWire {
     client: reqwest::Client,
@@ -318,7 +317,7 @@ impl ReqwestSchwabOAuthWire {
             .redirect(reqwest::redirect::Policy::none())
             .referer(false)
             .retry(reqwest::retry::never())
-            .no_gzip()
+            .gzip(true)
             .no_brotli()
             .no_deflate()
             .no_zstd()
@@ -348,7 +347,6 @@ impl SchwabOAuthWire for ReqwestSchwabOAuthWire {
                 .client
                 .post(SCHWAB_TOKEN_ENDPOINT)
                 .header(ACCEPT, "application/json")
-                .header(ACCEPT_ENCODING, "identity")
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .header(AUTHORIZATION, authorization)
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -359,6 +357,8 @@ impl SchwabOAuthWire for ReqwestSchwabOAuthWire {
             if response.url().as_str() != SCHWAB_TOKEN_ENDPOINT {
                 return Err(SchwabOAuthWireError::Protocol);
             }
+            // Reqwest removes gzip encoding/compressed length headers and streams decoded bytes.
+            // The existing body limit applies to that JSON entity, including error responses.
             if response.headers().get_all(CONTENT_LENGTH).iter().count() > 1 {
                 return Err(SchwabOAuthWireError::Protocol);
             }
