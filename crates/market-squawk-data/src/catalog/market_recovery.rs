@@ -87,28 +87,43 @@ pub(super) fn load_provider_market_event_durable_routes(
         .canonical_market_events()
         .map_err(|_| CatalogError::InvalidRecord)?;
     check_read(deadline, cancellation)?;
+    // Discover each route once, then establish that it has at least one complete publication.
+    // Joining completeness before DISTINCT repeats publication row counts for every event.
+    // EXISTS retains the same admission predicates and stops at the first qualifying event.
     let mut statement = connection.prepare(
-        "SELECT DISTINCT indexed.dataset_id, indexed.source_id, indexed.venue_id
-         FROM provider_market_event_selection_index AS indexed
-         JOIN market_event_complete_commits AS committed
-           ON committed.dataset_id=indexed.dataset_id
-          AND committed.commit_sequence=indexed.commit_sequence
-          AND committed.publication_digest=indexed.publication_digest
-          AND committed.publication_kind=indexed.publication_kind
-         JOIN ingest_runs AS run ON run.run_id=committed.run_id
-          AND run.source_id=indexed.source_id AND run.state='succeeded'
-          AND run.completed_at_ns=committed.available_at_ns
-         WHERE indexed.instrument_id=?1
-           AND indexed.source_timestamp_ns IS NOT NULL AND indexed.source_timestamp_ns<=?2
-           AND indexed.available_at_ns<=?3 AND indexed.ingested_at_ns<=?3
-           AND committed.available_at_ns<=?3
-           AND committed.schema_name=?4 AND committed.schema_version=?5
-           AND committed.schema_fingerprint=?6
-           AND indexed.event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-           AND (?16 IS NULL OR (indexed.dataset_id COLLATE BINARY,
-               indexed.source_id COLLATE BINARY, indexed.venue_id COLLATE BINARY)>(?16,?17,?18))
-         ORDER BY indexed.dataset_id COLLATE BINARY,
-                  indexed.source_id COLLATE BINARY, indexed.venue_id COLLATE BINARY
+        "SELECT route.dataset_id, route.source_id, route.venue_id
+         FROM (
+           SELECT DISTINCT dataset_id, source_id, venue_id
+           FROM provider_market_event_selection_index
+           WHERE instrument_id=?1
+             AND source_timestamp_ns IS NOT NULL AND source_timestamp_ns<=?2
+             AND available_at_ns<=?3 AND ingested_at_ns<=?3
+             AND event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             AND (?16 IS NULL OR (dataset_id COLLATE BINARY,
+                 source_id COLLATE BINARY, venue_id COLLATE BINARY)>(?16,?17,?18))
+         ) AS route
+         WHERE EXISTS (
+           SELECT 1 FROM provider_market_event_selection_index AS indexed
+           JOIN market_event_complete_commits AS committed
+             ON committed.dataset_id=indexed.dataset_id
+            AND committed.commit_sequence=indexed.commit_sequence
+            AND committed.publication_digest=indexed.publication_digest
+            AND committed.publication_kind=indexed.publication_kind
+           JOIN ingest_runs AS run ON run.run_id=committed.run_id
+            AND run.source_id=indexed.source_id AND run.state='succeeded'
+            AND run.completed_at_ns=committed.available_at_ns
+           WHERE indexed.dataset_id=route.dataset_id
+             AND indexed.source_id=route.source_id AND indexed.venue_id=route.venue_id
+             AND indexed.instrument_id=?1
+             AND indexed.source_timestamp_ns IS NOT NULL AND indexed.source_timestamp_ns<=?2
+             AND indexed.available_at_ns<=?3 AND indexed.ingested_at_ns<=?3
+             AND committed.available_at_ns<=?3
+             AND committed.schema_name=?4 AND committed.schema_version=?5
+             AND committed.schema_fingerprint=?6
+             AND indexed.event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         )
+         ORDER BY route.dataset_id COLLATE BINARY,
+                  route.source_id COLLATE BINARY, route.venue_id COLLATE BINARY
          LIMIT ?15",
     )?;
     let mut rows = statement.query(params![

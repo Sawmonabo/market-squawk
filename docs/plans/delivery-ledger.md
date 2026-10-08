@@ -6,6 +6,47 @@ Goal active: owner reconfirmed resume after the lead mistakenly reapplied the ol
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `034f0ca067ccc039c8eae8e3f2e863149caf2f0f`. Main/release unchanged; no extra branch created.
 
+### Next bounded investigations — checkpoint c5cc4fb7 pushed
+
+The previous checkpoint is integrated and pushed. These investigations start from c5cc4fb7;
+no new production edits or competing builds are authorized for helpers. Lead owns all shared
+contracts, schema, application composition, runtime, tests, Git and ledger.
+
+| Owner | User-visible outcome and dependency | Exact writable files | Existing evidence / smallest next check |
+| --- | --- | --- | --- |
+| Astra option_rejection | Unblock real stock analysis when fresh chain symbols differ from retained contract references | `.agents/tmp/v1-first-stock/oct8-option-reference-recovery.md` only; source read-only | Parser passed; rejoin coverage fails. Trace pending-original recovery and identify exact missing-symbol cause and a coherent correction preserving original evidence. |
+| Astra schwab_stream_diagnosis | Restore saved Schwab connection without repeated sign-in | `.agents/tmp/v1-first-stock/oct8-schwab-stream-diagnosis.md` only; source read-only | OAuth refresh passed; LevelOneForex rejected InvalidRateAuthority. Trace exact rate/ack boundary and propose smallest correction plus existing critical check. |
+| Astra retained_read_diagnosis | Restore responsive cached watchlist prices | Existing report ownership unchanged | Retained route discovery exceeds request deadline; identify SQL/caller cause. |
+
+Lead additionally owns `crates/market-squawk-data/src/catalog/market_recovery.rs` and the
+existing `crates/market-squawk-data/tests/publication_recovery.rs` route assertions for the proven
+per-event completeness-query repetition. Read-only same-snapshot probe returned identical routes
+in3.882s before versus0.267s with route-level EXISTS. Preserve every time/source/schema/complete-commit
+predicate and keyset ordering. Existing restart/writer-isolation test is the critical gate; add only
+an uncovered pagination assertion. No schema change or data migration is required.
+
+Integrate the first substantiated correction with its consumer, run its critical check, then push
+before releasing implementation ownership. Full streaming fields and screen coverage remain required
+following connection recovery; passing the doctor alone cannot close that product journey.
+
+### Retained route correction — critically verified, native deployment pending
+
+The route query now discovers distinct candidate routes and uses EXISTS to establish one matching
+complete publication per route. It preserves exact instrument/event/source/time/schema predicates,
+completed run binding, publication completeness and keyset ordering. It changes no schema and adds
+no cache, data limit or migration. SQLite query-plan inspection showed correlated completeness
+counts inside the old per-event join; the correction follows the documented
+[EXISTS semantics](https://www.sqlite.org/lang_expr.html#the_exists_operator) and
+[query-plan interpretation](https://www.sqlite.org/eqp.html) (reviewed2026-10-08).
+
+Read-only comparison in one live-database snapshot returned identical routes for all nine most
+populated instruments: old total14.195s, new1.291s. This is a query measurement, not a UI latency
+or whole-app performance claim. The existing `provider_market_event_publication_is_restart_queryable`
+critical test passed1/1 in11.12s after a1m build, including time cutoffs, restart, reads during a held
+writer, and the added uncovered cursor-exhaustion assertion. Evidence: `oct8-route-nine-instruments.json`
+and `oct8-route-critical.log`. Native rebuild/deployment and actual screen verification remain next.
+Watcher60793 is temporarily suspended to serialize the lead's build; visible old service remains up.
+
 ### Option acquisition — implemented, critically verified, downstream failure exposed
 
 A source probe returned all three requested MSFT chain pages: HTTP 200, 2,835 distinct snapshots,

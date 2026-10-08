@@ -5430,6 +5430,21 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     assert_eq!(retained_routes[0].source_surface(), source.source_id());
     assert_eq!(retained_routes[0].instrument_id(), instrument);
     assert_eq!(retained_routes[0].venue_id().as_str(), "iex");
+    // A route cursor must advance after the complete route, not repeat its event rows.
+    assert!(
+        restarted
+            .provider_market_event_durable_routes(
+                instrument,
+                &[LiveEventClass::Trade],
+                Timestamp::from_unix_nanos(490),
+                Timestamp::from_unix_nanos(i64::MAX),
+                retained_routes.first(),
+                1,
+                deadline,
+                &cancellation,
+            )?
+            .is_empty()
+    );
     for (as_of, knowledge) in [(489, i64::MAX), (490, 500)] {
         assert!(
             restarted
