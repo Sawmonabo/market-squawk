@@ -24,10 +24,10 @@ use market_squawk_adapter_kraken::{
 use market_squawk_data::{
     DatasetId, DatasetSchemaRegistry, IngestError, IngestIdentity, IngestPrecommitAuthority,
     MarketEventCommitRef, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
-    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
-    ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
-    ProviderMarketEventPublicationSelector, ProviderMarketEventSelectionError,
-    ProviderMarketEventTiePolicy, RightsError, SourceOperation,
+    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventExclusionAccounting,
+    ProviderMarketEventPointInTimeRequest, ProviderMarketEventPointInTimeSelection,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderMarketEventSelectionError, ProviderMarketEventTiePolicy, RightsError, SourceOperation,
     provider_market_event_publication_digest,
 };
 use market_squawk_domain::{
@@ -895,7 +895,8 @@ impl MarketEventPointInTimeSelector {
                     maximum_candidates,
                     Some(selector.source_surface.clone()),
                 )?
-                .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation),
+                .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation)
+                .with_exclusion_accounting(ProviderMarketEventExclusionAccounting::NotRequested),
             );
         }
         let results = research

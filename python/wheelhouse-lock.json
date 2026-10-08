@@ -4628,8 +4628,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/crypto_market.rs",
-      "sha256": "6fdce052aa037e9e4b93b915e14615909f6a8ba613c47ee97bcffcb7c8922d79",
-      "size_bytes": 68836
+      "sha256": "3fc6ab3d74e85c6145e0a615ea29a654c17d0af1df9a9c2ece48e67a1568e7d6",
+      "size_bytes": 68973
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/crypto_market/kraken_rendezvous.rs",
@@ -7558,8 +7558,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/lib.rs",
-      "sha256": "a26483f7f451fdf9e65ab59e79832346915e28a0c5370720c6e393db7a8d9066",
-      "size_bytes": 25241
+      "sha256": "f05495df17ebc9b7c9e4d4d765049185f952985653a82a7a49e114a80f1578f1",
+      "size_bytes": 25281
     },
     {
       "path": "crates/market-squawk-data/src/manifest.rs",
@@ -7573,8 +7573,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/manifest/catalog.rs",
-      "sha256": "1e4b33ac0566796ffe7bd56766027e371647c54dec6851ffd9364e7bffb5d78e",
-      "size_bytes": 267117
+      "sha256": "29c105438f7cc2a51eabc49333fbf76413fe58adca54ad09e493470a3e9006f6",
+      "size_bytes": 272957
     },
     {
       "path": "crates/market-squawk-data/src/manifest/catalog/lineage.rs",
@@ -7713,8 +7713,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/provider_event_selection.rs",
-      "sha256": "2ad727d79b53218f1196316ab17c61f53dc38117c62bcc8eec91a0d7e947bca1",
-      "size_bytes": 49015
+      "sha256": "5c0bca48b0c61b2d1a23c23ed4e864ebb9931c597c4b9bbd4b71d8e7cd338705",
+      "size_bytes": 51196
     },
     {
       "path": "crates/market-squawk-data/src/provider_rate.rs",

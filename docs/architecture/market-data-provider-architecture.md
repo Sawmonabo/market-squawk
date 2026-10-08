@@ -601,6 +601,19 @@ replace it with a second database or a new data application.
 | Derived datasets | Separate immutable Parquet generations for local bars, features, statements/ratios, model inputs/outputs, backtests, and decision evidence. Each binds all source generations and implementation identities. |
 | Product reads | Fixed, bounded typed application operations over exact pins/PIT selectors. Desktop receives closed results; operator DataFusion/Python access cannot become an unbounded frontend query path. |
 
+Ordinary exact-source current-price reads use the existing source-time index to seek the newest
+eligible source/receive timestamp pair, then retain every equal pair within the request's candidate
+ceiling. Both queries share the catalog snapshot and apply original commit, availability, ingestion
+and successful-publication predicates before selection. Overflow rejects the complete request;
+selected events still pass the ordinary publication and canonical-evidence reconstruction.
+
+Historical exclusion accounting is explicit: analytical requests default to counted receipts;
+current display requests carry `NotRequested` and retain absent counts rather than fabricated zeros.
+The mode and count presence are bound into selection identity and exact-commit restart replay.
+This removes unconditional whole-history counting from current displays; restrictive historical
+cutoffs can still require scanning rejected index entries. It does not grant freshness or execution
+rights, replace source selection, or claim a history-independent latency bound.
+
 Raw-store reconciliation retains a directory cursor and one incremental hash state across bounded
 background turns. Live stage and receipt capabilities pin their objects until publication or
 release; orphan decisions use fresh indexed catalog membership under the store's mutation

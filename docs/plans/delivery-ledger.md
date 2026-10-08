@@ -4,9 +4,29 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`34dbc675`. Main/release unchanged; no extra branch created.
+`1c9c41fa`. Main/release unchanged; no extra branch created.
 
-### Current checkpoint — correct rate controls without replacing saved sign-in
+### Current checkpoint — indexed current-price selection
+
+**Implemented and critically verified; native display verification pending.** Current batch display
+reads seek eligible source/receive winners through the existing index and enumerate every winning
+tie without materializing/counting the entire exact-key history. The counted analytical path remains
+the constructor default; unrequested counts are explicitly None. Receipt identity binds accounting
+mode and presence, and exact restart carries it. Cutoffs, complete publication/source/run matching,
+canonical reconstruction, ambiguity and overflow rejection remain enforced. No schema, new cache,
+history truncation or timeout increase. Lead owns all source; helper test ownership is released.
+
+The extended existing `provider_market_event_publication_is_restart_queryable` passed1/1 in11.94s
+(1m14s compile), single-job nonincremental. It verifies counted/indexed event equivalence, invalid
+request shapes, empty receipts, reads during a held writer, late durable publications, complete ties
+and overflow, canonical corruption rejection, archive, service reopen and backup restore. The
+source-closure refresh and diff whitespace check passed. Evidence:
+`oct8-indexed-current-critical.log`, `oct8-indexed-current-source-closure.log`. Query-only diagnostic
+found one real retained quote in0.0947s plus0.00051s for its ties; it does not prove page latency.
+Resulting pushed commit pending. Next barrier is one coordinated native replacement and an actual
+watchlist/detail price read, then provider stream admission and automatic visible changes.
+
+### Prior checkpoint — correct rate controls without replacing saved sign-in
 
 **Implemented and critically verified; native verification pending.** Schwab now uses an explicit
 unknown-capacity request policy, retaining single flight, provider refusal/Retry-After, disabled
@@ -41,15 +61,65 @@ Critical evidence (single compiler job, nonincremental):
 Lead inspected and integrated the budget helper's private window-vector change and all affected
 provider/profile/activation consumers. Helpers `adapter_dictionary` and `current_display_reuse` are
 finished; all source and integration ownership is now lead-only. No additional feature lane is open.
-Resulting implementation commit/push: pending this checkpoint's integration. Next barrier is the one
+Implementation pushed as `1c9c41fa`; PR43 evidence:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6070419781 . Next barrier is the one
 supervised native replacement, saved-session doctor, then current-read correction and displayed quotes.
+
+### Next dependency prepared during the frozen native build
+
+Outcome: Overview/watchlist/detail current prices read indexed winning events instead of counting
+all historical exclusions. Prior rate checkpoint is pushed; no source edits during its native build.
+Astra `current_display_reuse` may write only
+`.agents/tmp/v1-first-stock/oct8-indexed-current-selection.patch`, a reviewable patch targeting
+`crates/market-squawk-data/src/manifest/catalog.rs`. No applying it, Git/build/runtime/provider calls.
+Lead owns public contract/export (`provider_event_selection.rs`, `lib.rs`), application batch consumer,
+existing publication-recovery test, documentation and integration. Agent must not edit these files.
+
+Frozen seam for the prepared patch: public `ProviderMarketEventExclusionAccounting::{CountAll,
+NotRequested}`; request accessor `exclusion_accounting()` and builder
+`with_exclusion_accounting(mode)`; crate-visible `validate_exclusion_accounting()` returns
+`Result<(), ProviderMarketEventSelectionError>` and rejects NotRequested unless exact source,
+instrument scope, SourceTimestamp, LatestReceivedObservation. Validate before resolving a horizon.
+`ProviderMarketEventCatalogPlan::try_new` receives `Option<ProviderMarketEventExclusionCounts>`;
+CountAll supplies Some(real counts), NotRequested supplies None. Lead binds mode/presence in digest
+and exact restart. Existing constructors default to CountAll; only ordinary select_current_batch opts
+out. SQL owner uses the existing source-time index, all eligibility predicates before winner LIMIT,
+then max+1 complete equal-time/receive ties sorted in bounded Rust memory. No new index/schema,
+whole-history aggregation, fake zero counts or actor-presence shortcut. Reuse existing candidate
+reconstruction and same snapshot. Smallest critical check is the existing publication restart test
+extended for counted/uncounted equivalence, late durable publication, ties/overflow and replay.
+Resulting current-read commit pending; native timing/display remains its completion barrier.
+
+Native replacement Cargo75390 finished successfully in7m27s; new service76175 started.
+Watcher60793 is temporarily stopped for coherent source integration, with the service retained.
+The prepared SQL patch has been inspected against existing predicates. Lead now implements the
+frozen shared request/receipt/export and application consumer contract. Astra `current_display_reuse`
+owns only `crates/market-squawk-data/tests/publication_recovery.rs` to extend the existing
+`provider_market_event_publication_is_restart_queryable` critical test: indexed/counted evidence
+equivalence, invalid shape, complete ties/overflow, late durable publication and exact restart
+across archive/reopen. No new harness, source edits outside that file, builds, Git or runtime.
+Lead schedules the single critical data test after integration. Current-read commit pending.
 
 ### Native state and remaining display blocker
 
-Supervisor60780 remains running; watcher60793 is stopped until this checkpoint is pushed. Service71694
-is still running the prior generation. Desktop71698 exited normally (exit0); WebDriver4445 now refuses
-connections. The replacement must reopen native inspection after its successful serialized build.
-No duplicate Cargo job is active after the completed critical check.
+Replacement Cargo75390 completed in7m27s. Service76175 and Desktop76180 are running
+`generation-AklwMf`. Background native bootstrap confirms current capability4, saved credential
+and the explicit null numeric capacity fields. Native `schwabOAuth/continue` reused saved sign-in
+and returned active OAuth generation6 without browser interaction. This is authorization recovery,
+not admitted streaming: onboarding remains runtime_verification_pending; the doctor logged completion
+and its persisted diagnostic confirms real-time REST quotes, option/expiration chains, market hours
+and instruments available. Price history, movers and all streaming families were marked unavailable;
+these remain probe/connection investigation, not proven upstream absences. Data activation remains
+unverified. `oct8-rate-live-doctor-summary.json` records the filtered outcomes. Other evidence:
+`oct8-rate-after-native.json`, `oct8-rate-live-continue.json`, `oct8-rate-live-session.json`.
+Watcher60793 is stopped for the current-read source integration; runtime remains running.
+
+Lead applied the reviewed indexed candidate patch and shared accounting contract, opted only
+`select_current_batch` into NotRequested, and inspected the helper's existing-test extensions.
+The single critical data test passed (`oct8-indexed-current-critical.log`). Read-only diagnostic
+on the live database found a quote winner in0.0947s and its complete tie in0.00051s; this is query-only
+evidence, not a complete application read or visible streaming proof. Source:
+`oct8-indexed-current-query-probe.json`. Current-read commit and native deployment remain pending.
 
 Fresh native inspection before Desktop exited found Overview visible with20 “unavailable” mentions.
 The prior sequence113→128 evidence proves notification delivery only, not a quote reaching a displayed
@@ -59,8 +129,8 @@ Astra's completed current-read report (`oct8-current-selection-contract.md`) ide
 source-time index and explicit optional exclusion accounting. The current batch display consumer can
 seek eligible winning timestamps and enumerate complete ties without counting every historical
 exclusion. Preserve exact snapshot/replay, cutoff predicates, candidate completeness, original
-provenance and Display permits. No selector source change is implemented yet. Lead must freeze the
-shared request/receipt contract before dispatching its bounded consumer implementation.
+provenance and Display permits. The indexed source correction is now implemented and undergoing the critical replay check;
+its native timing and visible quote behavior remain unverified.
 
 The saved-credential audit (`oct8-rate-policy-credential-refresh.md`) prevented deployment of an
 unnecessary capability5 and caught the additional rights-text fingerprint dependency. Both changes

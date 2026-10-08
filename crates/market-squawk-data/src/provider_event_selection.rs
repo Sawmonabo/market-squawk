@@ -17,7 +17,7 @@ use crate::{
 };
 
 const SELECTION_DIGEST_DOMAIN: &[u8] =
-    b"market-squawk/provider-market-event-point-in-time-selection/v1";
+    b"market-squawk/provider-market-event-point-in-time-selection/v2";
 
 /// Maximum exact event rows one point-in-time request may retain across source surfaces.
 pub const MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES: usize = 256;
@@ -40,6 +40,15 @@ pub enum ProviderMarketEventTiePolicy {
     LatestReceivedObservation,
 }
 
+/// Whether a selection also counts observations excluded across its history.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderMarketEventExclusionAccounting {
+    /// Retain exact exclusion counts for analytical inspection.
+    CountAll,
+    /// Select current observations without computing historical counts.
+    NotRequested,
+}
+
 /// Bounded immutable provider-market-event point-in-time request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMarketEventPointInTimeRequest {
@@ -52,6 +61,7 @@ pub struct ProviderMarketEventPointInTimeRequest {
     effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
     maximum_candidates: usize,
     tie_policy: ProviderMarketEventTiePolicy,
+    exclusion_accounting: ProviderMarketEventExclusionAccounting,
     exact_commit: Option<MarketEventCommitRef>,
     exact_source_surface: Option<SourceId>,
     exact_product: Option<ProviderProduct>,
@@ -275,6 +285,7 @@ impl ProviderMarketEventPointInTimeRequest {
             effective_time_basis,
             maximum_candidates,
             tie_policy: ProviderMarketEventTiePolicy::AllNewestEffectiveTimeTies,
+            exclusion_accounting: ProviderMarketEventExclusionAccounting::CountAll,
             exact_commit,
             exact_source_surface,
             exact_product,
@@ -337,6 +348,36 @@ impl ProviderMarketEventPointInTimeRequest {
         self.tie_policy
     }
 
+    /// Chooses exclusion accounting; the completed request is validated at selection time.
+    #[must_use]
+    pub const fn with_exclusion_accounting(
+        mut self,
+        accounting: ProviderMarketEventExclusionAccounting,
+    ) -> Self {
+        self.exclusion_accounting = accounting;
+        self
+    }
+
+    /// Returns whether historical exclusions are counted in the receipt.
+    pub const fn exclusion_accounting(&self) -> ProviderMarketEventExclusionAccounting {
+        self.exclusion_accounting
+    }
+
+    pub(crate) fn validate_exclusion_accounting(
+        &self,
+    ) -> Result<(), ProviderMarketEventSelectionError> {
+        if self.exclusion_accounting == ProviderMarketEventExclusionAccounting::NotRequested
+            && (self.instrument_id().is_none()
+                || self.exact_source_surface.is_none()
+                || self.effective_time_basis
+                    != ProviderMarketEventEffectiveTimeBasis::SourceTimestamp
+                || self.tie_policy != ProviderMarketEventTiePolicy::LatestReceivedObservation)
+        {
+            return Err(ProviderMarketEventSelectionError::InvalidRequest);
+        }
+        Ok(())
+    }
+
     /// Returns the complete cross-source candidate ceiling.
     pub const fn maximum_candidates(&self) -> usize {
         self.maximum_candidates
@@ -388,7 +429,11 @@ impl ProviderMarketEventPointInTimeRequest {
             self.exact_product.clone(),
             self.exact_channel.clone(),
         )
-        .map(|request| request.with_tie_policy(self.tie_policy))
+        .map(|request| {
+            request
+                .with_tie_policy(self.tie_policy)
+                .with_exclusion_accounting(self.exclusion_accounting)
+        })
     }
 }
 
@@ -691,7 +736,7 @@ pub struct ProviderMarketEventPointInTimeSelection {
     commit: MarketEventCommitRef,
     commit_available_at: Timestamp,
     sources: Box<[ProviderMarketEventSourceSelection]>,
-    exclusions: ProviderMarketEventExclusionCounts,
+    exclusions: Option<ProviderMarketEventExclusionCounts>,
     completeness: ProviderMarketEventSelectionCompleteness,
     selection_digest: EvidenceDigest,
 }
@@ -717,8 +762,8 @@ impl ProviderMarketEventPointInTimeSelection {
         &self.sources
     }
 
-    /// Returns exclusion counts retained as part of the digest-bound receipt.
-    pub const fn exclusions(&self) -> ProviderMarketEventExclusionCounts {
+    /// Returns digest-bound exclusion counts, or None when accounting was not requested.
+    pub const fn exclusions(&self) -> Option<ProviderMarketEventExclusionCounts> {
         self.exclusions
     }
 
@@ -762,7 +807,10 @@ impl ProviderMarketEventPointInTimeSelection {
         plan: ProviderMarketEventCatalogPlan,
         reconstructed: Vec<ProviderMarketEventSelectedCandidate>,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
-        if reconstructed.len() != plan.candidates.len()
+        request.validate_exclusion_accounting()?;
+        if plan.exclusions.is_some()
+            != (request.exclusion_accounting == ProviderMarketEventExclusionAccounting::CountAll)
+            || reconstructed.len() != plan.candidates.len()
             || reconstructed.len() > request.maximum_candidates
             || plan.commit.dataset_id() != request.dataset()
             || plan.commit_available_at > request.knowledge_cutoff()
@@ -870,7 +918,7 @@ pub(crate) struct ProviderMarketEventCatalogPlan {
     pub(crate) commit: MarketEventCommitRef,
     pub(crate) commit_available_at: Timestamp,
     pub(crate) candidates: Vec<ProviderMarketEventCatalogCandidate>,
-    pub(crate) exclusions: ProviderMarketEventExclusionCounts,
+    pub(crate) exclusions: Option<ProviderMarketEventExclusionCounts>,
 }
 
 impl ProviderMarketEventCatalogPlan {
@@ -878,7 +926,7 @@ impl ProviderMarketEventCatalogPlan {
         commit: MarketEventCommitRef,
         commit_available_at: Timestamp,
         candidates: Vec<ProviderMarketEventCatalogCandidate>,
-        exclusions: ProviderMarketEventExclusionCounts,
+        exclusions: Option<ProviderMarketEventExclusionCounts>,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
         if commit_available_at != commit.available_at() {
             return Err(ProviderMarketEventSelectionError::EvidenceMismatch);
@@ -1065,6 +1113,10 @@ fn selection_digest(
         ProviderMarketEventTiePolicy::AllNewestEffectiveTimeTies => 1,
         ProviderMarketEventTiePolicy::LatestReceivedObservation => 2,
     }]);
+    hash.update([match request.exclusion_accounting {
+        ProviderMarketEventExclusionAccounting::CountAll => 1,
+        ProviderMarketEventExclusionAccounting::NotRequested => 2,
+    }]);
     hash.update(
         u64::try_from(request.maximum_candidates)
             .map_err(|_| ProviderMarketEventSelectionError::DigestOverflow)?
@@ -1076,23 +1128,18 @@ fn selection_digest(
     )?;
     hash_commit(&mut hash, &selection.commit)?;
     hash.update(selection.commit_available_at.unix_nanos().to_be_bytes());
-    hash.update(selection.exclusions.missing_source_timestamp.to_be_bytes());
-    hash.update(selection.exclusions.after_as_of.to_be_bytes());
-    hash.update(selection.exclusions.available_after_knowledge.to_be_bytes());
-    hash.update(selection.exclusions.ingested_after_knowledge.to_be_bytes());
-    hash.update(
-        selection
-            .exclusions
-            .origin_published_after_knowledge
-            .to_be_bytes(),
-    );
-    hash.update(selection.exclusions.superseded_effective_time.to_be_bytes());
-    hash.update(
-        selection
-            .exclusions
-            .superseded_received_observation
-            .to_be_bytes(),
-    );
+    if let Some(exclusions) = selection.exclusions {
+        hash.update([1]);
+        hash.update(exclusions.missing_source_timestamp.to_be_bytes());
+        hash.update(exclusions.after_as_of.to_be_bytes());
+        hash.update(exclusions.available_after_knowledge.to_be_bytes());
+        hash.update(exclusions.ingested_after_knowledge.to_be_bytes());
+        hash.update(exclusions.origin_published_after_knowledge.to_be_bytes());
+        hash.update(exclusions.superseded_effective_time.to_be_bytes());
+        hash.update(exclusions.superseded_received_observation.to_be_bytes());
+    } else {
+        hash.update([0]);
+    }
     hash.update([1]);
     hash.update(
         u64::try_from(selection.sources.len())

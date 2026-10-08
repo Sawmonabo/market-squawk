@@ -62,9 +62,10 @@ use crate::{
     DatasetManifestRecord, FeatureDatasetProductContract, IngestReservation, IngestRunRecord,
     ProviderMarketEventCatalogCandidate, ProviderMarketEventCatalogPlan,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventExactPublication,
-    ProviderMarketEventExclusionCounts, ProviderMarketEventPointInTimeRequest,
-    ProviderMarketEventPublicationKind, ProviderMarketEventSelectionError, ResearchUse,
-    ResearchUseDecisionDigest, ResearchUseGraphDigest, SourceOperation,
+    ProviderMarketEventExclusionAccounting, ProviderMarketEventExclusionCounts,
+    ProviderMarketEventPointInTimeRequest, ProviderMarketEventPublicationKind,
+    ProviderMarketEventSelectionError, ResearchUse, ResearchUseDecisionDigest,
+    ResearchUseGraphDigest, SourceOperation,
 };
 
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
@@ -404,10 +405,17 @@ impl AnalyticalManifestCatalog {
         request: &ProviderMarketEventPointInTimeRequest,
         snapshot: &CatalogReadSnapshot,
     ) -> Result<Option<ProviderMarketEventCatalogPlan>, ProviderMarketEventSelectionError> {
+        request.validate_exclusion_accounting()?;
         let connection = snapshot.connection();
         let Some(selected) = selected_provider_market_event_commit(connection, request)? else {
             return Ok(None);
         };
+        if request.exclusion_accounting() == ProviderMarketEventExclusionAccounting::NotRequested {
+            return select_indexed_current_provider_market_event_candidates(
+                connection, request, &selected,
+            )
+            .map(Some);
+        }
         let clock = match request.effective_time_basis() {
             ProviderMarketEventEffectiveTimeBasis::SourceTimestamp => 0_i64,
             ProviderMarketEventEffectiveTimeBasis::ReceivedAt => 1_i64,
@@ -463,36 +471,14 @@ impl AnalyticalManifestCatalog {
             if candidates.len() == request.maximum_candidates() {
                 return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
             }
-            let publication_digest =
-                EvidenceDigest::new(DigestAlgorithm::Sha256, parse_digest(&digest)?.bytes());
-            let publication_kind =
-                parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
-            let publication_row_ordinal = u32::try_from(row.get::<_, i64>(2)?)
-                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let coordinate_digest = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                parse_digest(&row.get::<_, Vec<u8>>(3)?)?.bytes(),
-            );
-            let source_surface = SourceId::try_from(row.get::<_, String>(4)?)
-                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            candidates.push(ProviderMarketEventCatalogCandidate {
-                publication: ProviderMarketEventExactPublication::from_catalog(
-                    publication_digest,
-                    publication_kind,
-                ),
-                publication_row_ordinal,
-                coordinate_digest,
-                source_surface,
-                effective_at: Timestamp::from_unix_nanos(row.get(5)?),
-                origin_committed_at: Timestamp::from_unix_nanos(row.get(6)?),
-            });
+            candidates.push(parse_provider_market_event_candidate(row, &digest)?);
         }
         let exclusions = exclusions.ok_or(ManifestCatalogError::CorruptCatalog)?;
         ProviderMarketEventCatalogPlan::try_new(
             selected.clone(),
             selected.available_at(),
             candidates,
-            exclusions,
+            Some(exclusions),
         )
         .map(Some)
     }
@@ -3301,6 +3287,158 @@ fn selected_provider_market_event_commit(
             .ok_or(ManifestCatalogError::CorruptCatalog)
         })
         .transpose()
+}
+
+fn select_indexed_current_provider_market_event_candidates(
+    connection: &Connection,
+    request: &ProviderMarketEventPointInTimeRequest,
+    selected: &crate::MarketEventCommitRef,
+) -> Result<ProviderMarketEventCatalogPlan, ProviderMarketEventSelectionError> {
+    // The caller validates the exact-source, instrument, source-time/latest-receive shape before
+    // horizon lookup. Keep every eligibility predicate before LIMIT in both same-snapshot reads.
+    const ELIGIBLE_ROWS: &str = "FROM provider_market_event_selection_index AS indexed
+           INDEXED BY provider_market_event_active_source_time
+         CROSS JOIN market_event_complete_commits AS committed
+           ON committed.dataset_id=indexed.dataset_id
+          AND committed.commit_sequence=indexed.commit_sequence
+          AND committed.publication_digest=indexed.publication_digest
+          AND committed.publication_kind=indexed.publication_kind
+         CROSS JOIN ingest_runs AS run ON run.run_id=committed.run_id
+          AND run.source_id=indexed.source_id AND run.state='succeeded'
+          AND run.completed_at_ns=committed.available_at_ns
+         WHERE indexed.dataset_id=?1 AND indexed.commit_sequence<=?2
+           AND indexed.instrument_id=?3 AND indexed.cohort_key IS NULL
+           AND indexed.venue_id=?4 AND indexed.event_kind=?5
+           AND indexed.source_timestamp_ns IS NOT NULL
+           AND indexed.source_timestamp_ns<=?6
+           AND indexed.available_at_ns<=?7 AND indexed.ingested_at_ns<=?7
+           AND committed.available_at_ns<=?7 AND indexed.source_id=?8";
+    let instrument = request
+        .instrument_id()
+        .ok_or(ProviderMarketEventSelectionError::InvalidRequest)?
+        .as_uuid();
+    let source = request
+        .exact_source_surface()
+        .ok_or(ProviderMarketEventSelectionError::InvalidRequest)?;
+    let sequence = to_i64(selected.sequence())?;
+    let event_kind = crate::provider_event_selection::event_kind_name(request.event_kind());
+    let winner_sql = format!(
+        "SELECT indexed.source_timestamp_ns, indexed.received_at_ns
+         {ELIGIBLE_ROWS}
+         ORDER BY indexed.source_timestamp_ns DESC, indexed.received_at_ns DESC LIMIT 1"
+    );
+    let winner: Option<(i64, i64)> = connection
+        .query_row(
+            &winner_sql,
+            params![
+                request.dataset().as_str(),
+                sequence,
+                instrument.as_bytes().as_slice(),
+                request.venue_id().as_str(),
+                event_kind,
+                request.as_of_cutoff().unix_nanos(),
+                request.knowledge_cutoff().unix_nanos(),
+                source.as_str(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((source_timestamp_ns, received_at_ns)) = winner else {
+        return ProviderMarketEventCatalogPlan::try_new(
+            selected.clone(),
+            selected.available_at(),
+            Vec::new(),
+            None,
+        );
+    };
+    let retrieval_limit = request
+        .maximum_candidates()
+        .checked_add(1)
+        .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
+    // Sorting in SQL could materialize an unbounded tie before LIMIT. Read at most max+1 and
+    // reject overflow before ordering the complete, bounded winning cohort in memory instead.
+    let ties_sql = format!(
+        "SELECT indexed.publication_digest, indexed.publication_kind,
+                indexed.publication_row_ordinal, indexed.coordinate_digest, indexed.source_id,
+                indexed.source_timestamp_ns, committed.available_at_ns
+         {ELIGIBLE_ROWS}
+           AND indexed.source_timestamp_ns=?9 AND indexed.received_at_ns=?10
+         LIMIT ?11"
+    );
+    let mut statement = connection.prepare(&ties_sql)?;
+    let mut rows = statement.query(params![
+        request.dataset().as_str(),
+        sequence,
+        instrument.as_bytes().as_slice(),
+        request.venue_id().as_str(),
+        event_kind,
+        request.as_of_cutoff().unix_nanos(),
+        request.knowledge_cutoff().unix_nanos(),
+        source.as_str(),
+        source_timestamp_ns,
+        received_at_ns,
+        i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?,
+    ])?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(request.maximum_candidates())
+        .map_err(|_| ProviderMarketEventSelectionError::Allocation)?;
+    while let Some(row) = rows.next()? {
+        if candidates.len() == request.maximum_candidates() {
+            return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
+        }
+        let digest = row.get::<_, Vec<u8>>(0)?;
+        candidates.push(parse_provider_market_event_candidate(row, &digest)?);
+    }
+    candidates.sort_unstable_by(|left, right| {
+        left.source_surface
+            .as_str()
+            .cmp(right.source_surface.as_str())
+            .then_with(|| {
+                left.publication
+                    .digest()
+                    .bytes()
+                    .cmp(&right.publication.digest().bytes())
+            })
+            .then_with(|| {
+                left.publication_row_ordinal
+                    .cmp(&right.publication_row_ordinal)
+            })
+    });
+    ProviderMarketEventCatalogPlan::try_new(
+        selected.clone(),
+        selected.available_at(),
+        candidates,
+        None,
+    )
+}
+
+fn parse_provider_market_event_candidate(
+    row: &rusqlite::Row<'_>,
+    digest: &[u8],
+) -> Result<ProviderMarketEventCatalogCandidate, ManifestCatalogError> {
+    let publication_digest =
+        EvidenceDigest::new(DigestAlgorithm::Sha256, parse_digest(digest)?.bytes());
+    let publication_kind = parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
+    let publication_row_ordinal =
+        u32::try_from(row.get::<_, i64>(2)?).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let coordinate_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        parse_digest(&row.get::<_, Vec<u8>>(3)?)?.bytes(),
+    );
+    let source_surface = SourceId::try_from(row.get::<_, String>(4)?)
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    Ok(ProviderMarketEventCatalogCandidate {
+        publication: ProviderMarketEventExactPublication::from_catalog(
+            publication_digest,
+            publication_kind,
+        ),
+        publication_row_ordinal,
+        coordinate_digest,
+        source_surface,
+        effective_at: Timestamp::from_unix_nanos(row.get(5)?),
+        origin_committed_at: Timestamp::from_unix_nanos(row.get(6)?),
+    })
 }
 
 fn provider_market_event_selection_sql(request: &ProviderMarketEventPointInTimeRequest) -> String {

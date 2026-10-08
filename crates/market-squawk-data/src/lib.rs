@@ -320,11 +320,11 @@ pub use pit::{
 pub use provider_event_selection::{
     MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES, ProviderMarketEventComponentKind,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventExactPublication,
-    ProviderMarketEventExclusionCounts, ProviderMarketEventPointInTimeRequest,
-    ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
-    ProviderMarketEventSelectionCompleteness, ProviderMarketEventSelectionCoordinate,
-    ProviderMarketEventSelectionError, ProviderMarketEventSourceSelection,
-    ProviderMarketEventTiePolicy,
+    ProviderMarketEventExclusionAccounting, ProviderMarketEventExclusionCounts,
+    ProviderMarketEventPointInTimeRequest, ProviderMarketEventPointInTimeSelection,
+    ProviderMarketEventSelectedCandidate, ProviderMarketEventSelectionCompleteness,
+    ProviderMarketEventSelectionCoordinate, ProviderMarketEventSelectionError,
+    ProviderMarketEventSourceSelection, ProviderMarketEventTiePolicy,
 };
 pub(crate) use provider_event_selection::{
     ProviderMarketEventCatalogCandidate, ProviderMarketEventCatalogPlan,

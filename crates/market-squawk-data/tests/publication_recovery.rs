@@ -5287,6 +5287,12 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_market_event_publication_is_restart_queryable() -> TestResult {
+    use market_squawk_data::{
+        ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventExclusionAccounting,
+        ProviderMarketEventPointInTimeRequest, ProviderMarketEventSelectionError,
+        ProviderMarketEventTiePolicy,
+    };
+
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("provider-market-event"))?;
     let location = paths.catalog()?.clone();
@@ -5523,6 +5529,33 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     assert_eq!(selected.sources().len(), 1);
     assert_eq!(selected.commit(), &first_commit);
     assert_eq!(selected.commit_available_at(), first_commit.available_at());
+    assert_eq!(
+        selection_request.exclusion_accounting(),
+        ProviderMarketEventExclusionAccounting::CountAll
+    );
+    assert!(selected.exclusions().is_some());
+    let indexed_first_request = selection_request
+        .clone()
+        .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation)
+        .with_exclusion_accounting(ProviderMarketEventExclusionAccounting::NotRequested);
+    let indexed_first = restarted
+        .read_provider_market_event_point_in_time(
+            &indexed_first_request,
+            Arc::clone(&capture_store),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?
+        .ok_or("missing indexed first selection")?;
+    assert_eq!(indexed_first.commit(), selected.commit());
+    assert_eq!(
+        indexed_first.commit_available_at(),
+        selected.commit_available_at()
+    );
+    assert_eq!(indexed_first.sources(), selected.sources());
+    assert_eq!(indexed_first.completeness(), selected.completeness());
+    assert_eq!(indexed_first.exclusions(), None);
+    let mut indexed_selections = vec![indexed_first];
     // Query specialization must preserve unrestricted-source selection and keep
     // native instruments out of the distinct source-cohort namespace.
     let unrestricted_request =
@@ -5552,6 +5585,57 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             1,
             first_commit.clone(),
         )?;
+    // Unsupported shapes fail even when no logical horizon exists, and a later builder
+    // call cannot turn an uncounted request into an admitted historical tie request.
+    let absent_received_request = ProviderMarketEventPointInTimeRequest::try_latest(
+        DatasetId::try_from("market_squawk.absent_current_selection")?,
+        instrument,
+        retained_routes[0].venue_id().clone(),
+        LiveEventClass::Trade,
+        selection_request.as_of_cutoff(),
+        selection_request.knowledge_cutoff(),
+        ProviderMarketEventEffectiveTimeBasis::ReceivedAt,
+        1,
+        Some(source.source_id().clone()),
+    )?;
+    for invalid in [
+        unrestricted_request.clone(),
+        cohort_request.clone(),
+        absent_received_request,
+    ] {
+        let invalid = invalid
+            .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation)
+            .with_exclusion_accounting(ProviderMarketEventExclusionAccounting::NotRequested);
+        assert!(matches!(
+            restarted
+                .read_provider_market_event_point_in_time(
+                    &invalid,
+                    Arc::clone(&capture_store),
+                    deadline,
+                    cancellation.clone(),
+                )
+                .await,
+            Err(IngestError::ProviderMarketEventSelection(
+                ProviderMarketEventSelectionError::InvalidRequest
+            ))
+        ));
+    }
+    let invalid_ties = indexed_first_request
+        .clone()
+        .with_tie_policy(ProviderMarketEventTiePolicy::AllNewestEffectiveTimeTies);
+    assert!(matches!(
+        restarted
+            .read_provider_market_event_point_in_time(
+                &invalid_ties,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await,
+        Err(IngestError::ProviderMarketEventSelection(
+            ProviderMarketEventSelectionError::InvalidRequest
+        ))
+    ));
     let mut scopes = restarted
         .read_provider_market_event_point_in_time_batch(
             &[unrestricted_request, cohort_request],
@@ -5632,9 +5716,30 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             assert!(empty.sources().is_empty());
             // A selection with no candidates must still retain its real exclusion accounting.
             assert_eq!(
-                empty.exclusions().after_as_of(),
+                empty
+                    .exclusions()
+                    .ok_or("missing counted exclusions")?
+                    .after_as_of(),
                 u64::from(request.as_of_cutoff() == Timestamp::from_unix_nanos(489))
             );
+            let indexed_empty = restarted
+                .read_provider_market_event_point_in_time(
+                    &request
+                        .clone()
+                        .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation)
+                        .with_exclusion_accounting(
+                            ProviderMarketEventExclusionAccounting::NotRequested,
+                        ),
+                    Arc::clone(&capture_store),
+                    deadline,
+                    cancellation.clone(),
+                )
+                .await?
+                .ok_or("missing indexed empty receipt")?;
+            assert_eq!(indexed_empty.commit(), empty.commit());
+            assert_eq!(indexed_empty.sources(), empty.sources());
+            assert_eq!(indexed_empty.completeness(), empty.completeness());
+            assert_eq!(indexed_empty.exclusions(), None);
         }
     }
     let cancelled_batch = CancellationToken::new();
@@ -6032,6 +6137,19 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     // budget. A conflict at the newest exact receive time remains an explicit two-row tie.
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
     let mut latest_commit = None;
+    let indexed_latest_request = ProviderMarketEventPointInTimeRequest::try_latest(
+        first_commit.dataset_id().clone(),
+        instrument,
+        retained_routes[0].venue_id().clone(),
+        LiveEventClass::Trade,
+        Timestamp::from_unix_nanos(490),
+        Timestamp::from_unix_nanos(i64::MAX),
+        ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+        32,
+        Some(source.source_id().clone()),
+    )?
+    .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation)
+    .with_exclusion_accounting(ProviderMarketEventExclusionAccounting::NotRequested);
     for (batch_number, observations, expected_ties) in [
         (
             2,
@@ -6115,6 +6233,14 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     cancellation.clone(),
                 )
                 .await;
+            let indexed_during_write = restarted
+                .read_provider_market_event_point_in_time(
+                    &indexed_latest_request,
+                    Arc::clone(&capture_store),
+                    Instant::now() + Duration::from_secs(5),
+                    cancellation.clone(),
+                )
+                .await;
             let display_during_write = restarted.authorize_current_market_event_use(
                 display_request.clone(),
                 Instant::now() + Duration::from_secs(5),
@@ -6173,6 +6299,12 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             let committed = publication??;
             released?;
             assert_eq!(during_write, selected);
+            let indexed_during_write =
+                indexed_during_write?.ok_or("writer hid indexed current evidence")?;
+            assert_eq!(indexed_during_write.commit(), selected.commit());
+            assert_eq!(indexed_during_write.sources(), selected.sources());
+            assert_eq!(indexed_during_write.completeness(), selected.completeness());
+            assert_eq!(indexed_during_write.exclusions(), None);
             let batch_during_write = batch_during_write?;
             assert_eq!(batch_during_write.len(), batch_requests.len());
             for (index, result) in batch_during_write.into_iter().enumerate() {
@@ -6255,7 +6387,92 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                 .all(|candidate| candidate.coordinate().received_at()
                     == Timestamp::from_unix_nanos(600))
         );
-        assert_eq!(current.exclusions().superseded_received_observation(), 100);
+        assert_eq!(
+            current
+                .exclusions()
+                .ok_or("missing current counts")?
+                .superseded_received_observation(),
+            100
+        );
+        // These publications arrive through durable ingestion alone. A latest read must see
+        // the later receive observation and then the late equal-time conflict across hot/cold
+        // storage, while every earlier exact receipt remains unchanged.
+        let indexed_current = restarted
+            .read_provider_market_event_point_in_time(
+                &indexed_latest_request,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await?
+            .ok_or("missing indexed latest durable selection")?;
+        assert_eq!(indexed_current.commit(), current.commit());
+        assert_eq!(
+            indexed_current.commit_available_at(),
+            current.commit_available_at()
+        );
+        assert_eq!(indexed_current.sources(), current.sources());
+        assert_eq!(indexed_current.completeness(), current.completeness());
+        assert_eq!(indexed_current.exclusions(), None);
+        assert_ne!(
+            indexed_current.selection_digest(),
+            current.selection_digest()
+        );
+        assert_eq!(
+            indexed_current
+                .exact_restart_request()?
+                .exclusion_accounting(),
+            ProviderMarketEventExclusionAccounting::NotRequested
+        );
+        for prior in &indexed_selections {
+            restarted
+                .verify_provider_market_event_point_in_time_restart(
+                    prior,
+                    Arc::clone(&capture_store),
+                    deadline,
+                    cancellation.clone(),
+                )
+                .await?;
+        }
+        indexed_selections.push(indexed_current.clone());
+        // A one-row ceiling admits the first winner, then rejects max+1 equal winning ties.
+        let one_tie_request = ProviderMarketEventPointInTimeRequest::try_exact(
+            first_commit.dataset_id().clone(),
+            instrument,
+            retained_routes[0].venue_id().clone(),
+            LiveEventClass::Trade,
+            current_request.as_of_cutoff(),
+            current_request.knowledge_cutoff(),
+            ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+            1,
+            committed.clone(),
+            Some(source.source_id().clone()),
+        )?
+        .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation)
+        .with_exclusion_accounting(ProviderMarketEventExclusionAccounting::NotRequested);
+        let limited = restarted
+            .read_provider_market_event_point_in_time(
+                &one_tie_request,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await;
+        if expected_ties == 1 {
+            assert_eq!(
+                limited?
+                    .ok_or("one winning tie exceeded its ceiling")?
+                    .sources(),
+                current.sources()
+            );
+        } else {
+            assert!(matches!(
+                limited,
+                Err(IngestError::ProviderMarketEventSelection(
+                    ProviderMarketEventSelectionError::CandidateLimitExceeded
+                ))
+            ));
+        }
         assert_eq!(
             current.exact_restart_request()?.tie_policy(),
             current_request.tie_policy()
@@ -6295,7 +6512,13 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             historical.sources()[0].tied_candidates().len(),
             100 + expected_ties
         );
-        assert_eq!(historical.exclusions().superseded_received_observation(), 0);
+        assert_eq!(
+            historical
+                .exclusions()
+                .ok_or("missing historical counts")?
+                .superseded_received_observation(),
+            0
+        );
         // Different horizons and multiple publications share verification without sharing
         // selection policy. A failing request must not discard its successful siblings.
         let mixed = restarted
@@ -6305,6 +6528,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                     request.clone(),
                     current_request.clone(),
                     historical_request.clone(),
+                    indexed_latest_request.clone(),
                 ],
                 Arc::clone(&capture_store),
                 deadline,
@@ -6329,6 +6553,10 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         assert_eq!(
             mixed.next().ok_or("missing historical batch result")??,
             Some(historical.clone())
+        );
+        assert_eq!(
+            mixed.next().ok_or("missing indexed batch result")??,
+            Some(indexed_current.clone())
         );
         assert!(mixed.next().is_none());
 
@@ -6366,21 +6594,31 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
                         cancellation.clone(),
                     )
                     .await;
+                let indexed_result = restarted
+                    .read_provider_market_event_point_in_time(
+                        &indexed_latest_request,
+                        Arc::clone(&capture_store),
+                        deadline,
+                        cancellation.clone(),
+                    )
+                    .await;
                 // Restore before inspecting the result so a failed assertion leaves no mutated fixture.
                 connection.execute(
                     "UPDATE market_event_active_rows SET event_json=?1 WHERE publication_digest=?2 AND publication_row_ordinal=0",
                     params![original, digest.bytes().as_slice()],
                 )?;
                 connection.execute_batch(&trigger)?;
-                if is_selected {
-                    assert!(matches!(
-                        result,
-                        Err(IngestError::Catalog(CatalogError::CorruptCatalog))
-                    ));
-                } else {
-                    let selected =
-                        result?.ok_or("unrelated canonical row blocked current selection")?;
-                    assert_eq!(selected.sources()[0].tied_candidates().len(), 1);
+                for result in [result, indexed_result] {
+                    if is_selected {
+                        assert!(matches!(
+                            result,
+                            Err(IngestError::Catalog(CatalogError::CorruptCatalog))
+                        ));
+                    } else {
+                        let selected =
+                            result?.ok_or("unrelated canonical row blocked current selection")?;
+                        assert_eq!(selected.sources()[0].tied_candidates().len(), 1);
+                    }
                 }
             }
         }
@@ -6426,6 +6664,16 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             )?;
             assert_eq!(new_snapshot, (0, 2, 101));
             before.execute_batch("COMMIT")?;
+            for indexed in &indexed_selections {
+                restarted
+                    .verify_provider_market_event_point_in_time_restart(
+                        indexed,
+                        Arc::clone(&capture_store),
+                        Instant::now() + Duration::from_secs(10),
+                        CancellationToken::new(),
+                    )
+                    .await?;
+            }
             restarted
                 .verify_provider_market_event_point_in_time_restart(
                     &current,
@@ -6616,6 +6864,16 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
+    for indexed in &indexed_selections {
+        reopened_service
+            .verify_provider_market_event_point_in_time_restart(
+                indexed,
+                Arc::clone(&capture_store),
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+    }
     let latest_commit = latest_commit.ok_or("missing latest logical event commit")?;
     let original = reopened_service
         .read_provider_market_event_publication(
@@ -6650,6 +6908,16 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         )?,
         &CancellationToken::new(),
     )?;
+    for indexed in &indexed_selections {
+        restored
+            .verify_provider_market_event_point_in_time_restart(
+                indexed,
+                Arc::clone(&capture_store),
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+    }
     let restored_connection = rusqlite::Connection::open(restored_paths.catalog()?.path())?;
     let restored_shape: (i64, i64, i64, i64, i64, i64, i64) = restored_connection.query_row(
         "SELECT (SELECT COUNT(*) FROM market_event_commits),
