@@ -41,6 +41,9 @@ pub enum AlpacaError {
     /// A provider payload violated the selected protocol schema.
     #[error("Alpaca provider payload is invalid")]
     Protocol,
+    /// A completed option-chain request returned a non-success HTTP status.
+    #[error("Alpaca option-chain HTTP request failed with status {0}")]
+    OptionChainHttpStatus(u16),
     /// Exact raw provider responses could not satisfy the shared durable-capture contract.
     #[error("Alpaca provider response capture material is invalid")]
     CaptureMaterial,

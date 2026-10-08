@@ -410,19 +410,29 @@ impl Worker {
             () = tokio::time::sleep_until(deadline.into()) => return Err(OptionChainDemandError::Deadline),
             result = self.research.run_owned_research_read(deadline, caller, move |worker| {
                 read_catalog.latest(underlying_id, deadline, &worker)
-            }) => result.map_err(|_| OptionChainDemandError::Identity)?
-                .map_err(|_| OptionChainDemandError::Identity)?,
+            }) => result.map_err(|error| {
+                use crate::research_service::ResearchServiceError as R;
+                let failure = match error {
+                    R::Ingest(IngestError::Cancelled) => OptionChainDemandError::Cancelled,
+                    R::Ingest(IngestError::DeadlineExceeded) => OptionChainDemandError::Deadline,
+                    _ => OptionChainDemandError::Read,
+                };
+                demand_error("underlying.read.worker", failure)
+            })?
+                .map_err(|error| catalog_error("underlying.read.catalog", error))?,
         }
-            .ok_or(OptionChainDemandError::Identity)?;
+            .ok_or_else(|| {
+                demand_error("underlying.read.missing", OptionChainDemandError::Identity)
+            })?;
         let underlying = binding
             .publication_reference(&underlying_record, now)
-            .map_err(|_| OptionChainDemandError::Identity)?;
+            .map_err(|_| demand_error("underlying.reference", OptionChainDemandError::Identity))?;
         let mapping = AlpacaInstrumentMapping::try_new(
             underlying.source_symbol().as_str().to_owned(),
             underlying.instrument_id(),
             underlying.asset_class(),
         )
-        .map_err(|_| OptionChainDemandError::Identity)?;
+        .map_err(|error| adapter_error("underlying.mapping", error))?;
         // Existing catalog authority alone allocates canonical identities from original source proof.
         drop(lease);
         let originals = Arc::new(originals);
@@ -461,7 +471,7 @@ impl Worker {
                 .authority
                 .acquire_publication_authority(deadline, caller)
                 .await
-                .map_err(map_acquisition)?,
+                .map_err(|error| map_acquisition("reference.account", error))?,
             publication: operation.precommit_authority(),
             catalog: catalog.clone(),
             records: vec![underlying_record.clone()],
@@ -485,7 +495,9 @@ impl Worker {
                     underlying: underlying_record.clone(),
                     underlying_asset_namespace: binding
                         .native_identity()
-                        .ok_or(OptionChainDemandError::Identity)?
+                        .ok_or_else(|| {
+                            demand_error("underlying.native_identity", OptionChainDemandError::Identity)
+                        })?
                         .namespace
                         .clone(),
                 },
@@ -494,27 +506,13 @@ impl Worker {
                 caller.clone(),
             ) => result,
         }
-            .map_err(|error| {
-                use market_squawk_data::MarketDataInstrumentCatalogError as E;
-                let failure = match error {
-                    E::SourceIdentityConflict => "source-identity-conflict",
-                    E::PublicationAuthority(_) => "publication-authority",
-                    E::AuthorityUnavailable => "catalog-unavailable",
-                    E::DeadlineExceeded => "deadline",
-                    E::Cancelled => "cancelled",
-                    E::InvalidInput => "invalid-input",
-                    _ => "other",
-                };
-                tracing::warn!(
-                    stage = "option-reference-publication",
-                    failure,
-                    "option reference admission failed"
-                );
-                OptionChainDemandError::Identity
-            })?;
+            .map_err(|error| catalog_error("reference.publication", error))?;
         let published_records = published.into_records();
         if published_records.len() != originals.contracts().count() {
-            return Err(OptionChainDemandError::Identity);
+            return Err(demand_error(
+                "reference.record_count",
+                OptionChainDemandError::Identity,
+            ));
         }
         if published_records.len() > MAX_CONTRACTS {
             return Err(OptionChainDemandError::Capacity);
@@ -545,7 +543,7 @@ impl Worker {
                 .map_err(|_| OptionChainDemandError::Capacity)?;
             contracts.push(
                 AlpacaOptionChainContractAuthority::try_new(reference.clone(), original, now)
-                    .map_err(|_| OptionChainDemandError::Identity)?,
+                    .map_err(|error| adapter_error("contract.authority", error))?,
             );
             records.push(record);
             references.push(reference);
@@ -583,7 +581,7 @@ impl Worker {
                 },
             )
             .await
-            .map_err(map_acquisition)?;
+            .map_err(|error| map_acquisition("chain.acquire", error))?;
         let (rejoin, seal_request) = capture.into_parts();
         // Raw completed chain evidence seals even if account revocation races this continuation.
         let custody = CancellationToken::new();
@@ -603,20 +601,21 @@ impl Worker {
             self.capability,
             observed_at,
         )
-        .map_err(|_| OptionChainDemandError::Identity)?;
+        .map_err(|error| adapter_error("chain.publication_request", error))?;
         if let Some(origin) = reference_origin {
             request = request.with_reference_origin(origin);
         }
         let binding = rejoin
             .try_rejoin(sealed, request)
-            .and_then(|prepared| prepared.try_into_binding())
-            .map_err(|_| OptionChainDemandError::Acquisition)?;
+            .map_err(|error| adapter_error("chain.rejoin", error))?
+            .try_into_binding()
+            .map_err(|error| adapter_error("chain.binding", error))?;
         let digest = binding.evidence_digest().evidence();
         let account = self
             .authority
             .acquire_publication_authority(deadline, caller)
             .await
-            .map_err(map_acquisition)?;
+            .map_err(|error| map_acquisition("chain.account", error))?;
         let precommit = Arc::new(ReferencePrecommit {
             account,
             publication: operation.precommit_authority(),
@@ -751,7 +750,7 @@ impl Worker {
                     },
                 )
                 .await
-                .map_err(map_acquisition)?;
+                .map_err(|error| map_acquisition("reference.acquire", error))?;
             let contexts = retained_pages
                 .iter()
                 .map(|(context, _, _)| context.clone())
@@ -871,7 +870,7 @@ impl Worker {
             () = self.cancellation.cancelled() => return Err(OptionChainDemandError::Revoked),
             () = tokio::time::sleep_until(deadline.into()) => return Err(OptionChainDemandError::Deadline),
             result = self.authority.retained_alpaca_doctor_renewal_chain(original_at) =>
-                result.map_err(map_acquisition)?,
+                result.map_err(|error| map_acquisition("reference.renewal", error))?,
         };
         if self
             .generation
@@ -1005,8 +1004,12 @@ fn contract_reference(
     at: Timestamp,
 ) -> Result<MarketDataReference, OptionChainDemandError> {
     if record.definition().asset_class() != AssetClass::Option {
-        return Err(OptionChainDemandError::Identity);
+        return Err(demand_error(
+            "contract.asset_class",
+            OptionChainDemandError::Identity,
+        ));
     }
+    let mut failure_stage = "contract.occ_identity";
     for identifier in record.definition().identifiers() {
         if !matches!(identifier.identifier(), ExternalIdentifier::OccOption(occ) if occ == occ_identity)
         {
@@ -1015,16 +1018,18 @@ fn contract_reference(
         let Ok(binding) = MarketDataInstrumentBinding::try_from_assigned_identifier(
             MarketSubscriptionPriority::CurrentlyViewed,
             record.clone(),
-            ProviderInstrumentId::try_from(symbol).map_err(|_| OptionChainDemandError::Identity)?,
+            ProviderInstrumentId::try_from(symbol)
+                .map_err(|_| demand_error("contract.symbol", OptionChainDemandError::Identity))?,
             identifier.clone(),
         ) else {
+            failure_stage = "contract.assigned_identifier";
             continue;
         };
         return binding
             .publication_reference(record, at)
-            .map_err(|_| OptionChainDemandError::Identity);
+            .map_err(|_| demand_error("contract.reference", OptionChainDemandError::Identity));
     }
-    Err(OptionChainDemandError::Identity)
+    Err(demand_error(failure_stage, OptionChainDemandError::Identity))
 }
 
 #[derive(Debug)]
@@ -1161,23 +1166,106 @@ pub(crate) enum OptionChainDemandError {
 }
 
 fn map_acquisition(
+    stage: &'static str,
     error: crate::provider_activation::AlpacaOptionChainRuntimeError,
 ) -> OptionChainDemandError {
     use crate::provider_activation::AlpacaOptionChainRuntimeError as R;
-    use market_squawk_adapter_alpaca::AlpacaError as A;
-    match error {
-        R::Cancelled | R::Adapter(A::Cancelled) => OptionChainDemandError::Cancelled,
-        R::Adapter(A::DeadlineExceeded) => OptionChainDemandError::Deadline,
-        R::Unavailable | R::Adapter(A::Allocation | A::BodyTooLarge | A::SubscriptionLimit) => {
-            OptionChainDemandError::Capacity
-        }
+    let failure = match error {
+        R::Cancelled => OptionChainDemandError::Cancelled,
+        R::Unavailable => OptionChainDemandError::Capacity,
         R::Revoked | R::Stale => OptionChainDemandError::Revoked,
-        R::Adapter(A::InvalidAuthorization) => OptionChainDemandError::Permission,
-        R::SourceBinding | R::Adapter(A::InvalidCredentials) => OptionChainDemandError::Authority,
-        R::Adapter(A::Network) => OptionChainDemandError::Acquisition,
-        R::Adapter(error @ A::CaptureMaterial) => {
-            custody_error("acquisition.capture", None, &error)
+        R::SourceBinding => OptionChainDemandError::Authority,
+        R::Adapter(error) => return adapter_error(stage, error),
+    };
+    demand_error(stage, failure)
+}
+
+// Diagnostics contain only code-owned stages/categories and bounded numeric HTTP statuses.
+// Never format wrapped adapter/catalog errors: their sources may retain provider input.
+fn demand_error(stage: &'static str, failure: OptionChainDemandError) -> OptionChainDemandError {
+    tracing::warn!(stage, ?failure, "option demand stage failed");
+    failure
+}
+
+fn adapter_error(
+    stage: &'static str,
+    error: market_squawk_adapter_alpaca::AlpacaError,
+) -> OptionChainDemandError {
+    use OptionChainDemandError as D;
+    use market_squawk_adapter_alpaca::AlpacaError as A;
+    let http_status = match &error {
+        A::OptionChainHttpStatus(status) => Some(*status),
+        _ => None,
+    };
+    let (category, failure) = match error {
+        A::Cancelled => ("cancelled", D::Cancelled),
+        A::DeadlineExceeded => ("deadline", D::Deadline),
+        A::Allocation => ("allocation", D::Capacity),
+        A::BodyTooLarge => ("body-limit", D::Capacity),
+        A::SubscriptionLimit => ("subscription-limit", D::Capacity),
+        A::InvalidAuthorization => ("authorization", D::Permission),
+        A::OptionChainHttpStatus(401 | 403) => ("http-permission", D::Permission),
+        A::OptionChainHttpStatus(_) => ("http-status", D::Acquisition),
+        A::InvalidCredentials => ("credentials", D::Authority),
+        A::Metadata(_) => ("metadata", D::Authority),
+        A::NetworkPolicy(_) => ("network-policy", D::Authority),
+        A::InvalidTransportLimits => ("transport-limits", D::Authority),
+        A::InvalidBudget => ("budget", D::Authority),
+        A::InvalidHistoricalPlan => ("request-plan", D::InvalidDemand),
+        A::Network => ("network", D::Acquisition),
+        A::Protocol => ("protocol", D::Acquisition),
+        A::Serialization => ("serialization", D::Acquisition),
+        A::CaptureMaterial => ("capture-material", D::Custody),
+        A::CaptureRejoin { .. } => ("capture-rejoin", D::Custody),
+        A::PublicationSessionNotCurrent => ("publication-session", D::Revoked),
+        A::Identity(_) => ("identity", D::Identity),
+        A::InvalidCoverage => ("coverage", D::Identity),
+    };
+    tracing::warn!(
+        stage,
+        category,
+        http_status,
+        ?failure,
+        "option adapter stage failed"
+    );
+    failure
+}
+
+fn catalog_error(
+    stage: &'static str,
+    error: market_squawk_data::MarketDataInstrumentCatalogError,
+) -> OptionChainDemandError {
+    use OptionChainDemandError as D;
+    use market_squawk_data::{MarketDataInstrumentCatalogError as E, ParquetStoreError as P};
+    let (category, failure) = match error {
+        E::Cancelled | E::BlockingIo(P::Cancelled) => ("cancelled", D::Cancelled),
+        E::DeadlineExceeded | E::BlockingIo(P::ReadDeadlineExceeded | P::RecoveryDeadlineExceeded) => {
+            ("deadline", D::Deadline)
         }
-        R::Adapter(_) => OptionChainDemandError::Identity,
-    }
+        E::PublicationAuthority(error) => match *error {
+            IngestError::Cancelled => ("cancelled", D::Cancelled),
+            IngestError::DeadlineExceeded => ("deadline", D::Deadline),
+            _ => ("publication-authority", D::Revoked),
+        },
+        E::AuthorityUnavailable => ("catalog-unavailable", D::Authority),
+        E::SourceAuthority(_) => ("source-authority", D::Authority),
+        E::ListingAuthority(_) => ("listing-authority", D::Authority),
+        E::SourceIdentityConflict => ("source-identity-conflict", D::Identity),
+        E::ReferencePositionConflict => ("reference-position-conflict", D::Identity),
+        E::DuplicateInstrumentId => ("duplicate-instrument", D::Identity),
+        E::InvalidInput => ("invalid-input", D::Identity),
+        E::InvalidPopulationQuery | E::InvalidLimit => ("invalid-query", D::InvalidDemand),
+        E::StaleRevision => ("stale-revision", D::Identity),
+        E::EqualTimeRevisionConflict => ("revision-conflict", D::Identity),
+        E::PartialBatch { .. } => ("partial-batch", D::Identity),
+        E::BatchLimitExceeded { .. } | E::RevisionLimitExceeded | E::ResultByteLimitExceeded => {
+            ("catalog-limit", D::Capacity)
+        }
+        E::CorruptCatalog => ("catalog-corrupt", D::Read),
+        E::BlockingIo(_) => ("catalog-worker", D::Read),
+        E::Serialization(_) => ("catalog-serialization", D::Read),
+        E::Storage(_) => ("catalog-storage", D::Read),
+    };
+    tracing::warn!(stage, category, ?failure, "option catalog stage failed");
+    failure
 }

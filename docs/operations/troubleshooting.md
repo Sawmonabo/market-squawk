@@ -390,7 +390,10 @@ that parent workspace and confirm the effective values in the rust-analyzer exte
 
 Routine development uses the existing coordinated watcher: React/CSS changes use Vite refresh,
 while Rust edits share one serialized compilation and replace the running staged programs only
-on success. Do not run a second manual build merely to display the console. Batch the relevant
+on success. Watchexec watches the workspace source directories recursively and the repository root
+nonrecursively for manifests, keeping runtime/build trees outside its subscription. This uses its
+[supported path controls](https://github.com/watchexec/watchexec/blob/main/doc/watchexec.1.md)
+(checked 2026-10-08). Do not run a second manual build merely to display the console. Batch the relevant
 critical checks before the next native generation; avoid new target directories, one-off profile
 variants and executable copies for ordinary verification.
 

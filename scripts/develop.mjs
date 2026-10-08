@@ -410,9 +410,20 @@ async function main() {
     }
     supervisor.vite.done.then(() => { if (!supervisor.stopping) { console.error("[dev] Owned Vite exited; stopping development."); process.exitCode = 1; void stop(); } });
     // Watchexec's event-only handler ignores stdin EOF; it exits on termination.
-    supervisor.watcher = ownedProcess("watchexec", ["--only-emit-events", "--emit-events-to=json-stdio",
-      "--debounce=50ms", "--no-meta", "--no-follow-symlinks", "--project-origin", ROOT, "--watch", ROOT,
-      ...[...IGNORED].flatMap((name) => ["--ignore", `**/${name}/**`])], { cwd: ROOT, env, pipe: true });
+    // Watch source trees, not the runtime and build trees beside them. Root-level
+    // manifests remain watched without subscribing recursively to generated data.
+    const watchPaths = ["apps", "adapters", "crates", "vendor", "scripts", "python"];
+    const watcherArgs = ["--only-emit-events", "--emit-events-to=json-stdio",
+      "--debounce=50ms", "--no-meta", "--no-follow-symlinks", "--project-origin", ROOT,
+      "--watch-non-recursive", ROOT,
+      ...watchPaths.flatMap((name) => ["--watch", path.join(ROOT, name)]),
+      ...[...IGNORED].flatMap((name) => ["--ignore", `**/${name}/**`])];
+    // Cargo configuration is optional in a fresh checkout.
+    if (await access(path.join(ROOT, ".cargo")).then(() => true, (error) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    })) watcherArgs.push("--watch", path.join(ROOT, ".cargo"));
+    supervisor.watcher = ownedProcess("watchexec", watcherArgs, { cwd: ROOT, env, pipe: true });
     const lines = createInterface({ input: supervisor.watcher.child.stdout });
     lines.on("line", (line) => {
       try {

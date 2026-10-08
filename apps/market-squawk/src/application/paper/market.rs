@@ -1338,7 +1338,11 @@ async fn load_retained_display_evidence(
                     context.deadline(),
                     context.cancellation(),
                 )
-                .map_err(map_durable_market_ingest_error)?;
+                .map_err(|error| {
+                    tracing::warn!(%instrument, error = %error,
+                        stage = "retained-route-discovery", "retained market read failed");
+                    map_durable_market_ingest_error(error)
+                })?;
             let exhausted = page.len() < MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT;
             after = page.last().cloned();
             for route in page {
@@ -1376,7 +1380,11 @@ async fn load_retained_display_evidence(
         context.cancellation().clone(),
     )
     .await
-    .map_err(crate::application::market_selection::map_market_event_read_error)?
+    .map_err(|error| {
+        tracing::warn!(error = %error, stage = "retained-selection-batch",
+            "retained market read failed");
+        crate::application::market_selection::map_market_event_read_error(error)
+    })?
     .into_iter();
     // Group only exact selected coordinates with the same horizon, source and original
     // publication. One shared Display permit covers those inputs; it never widens selection.
@@ -1397,6 +1405,9 @@ async fn load_retained_display_evidence(
                 Ok(Some(selection)) => selections.push(selection),
                 Ok(None) => {}
                 Err(error) => {
+                    tracing::warn!(%instrument, source_id = %route.source_surface(),
+                        error = %error, stage = "retained-selection",
+                        "retained market read failed");
                     match crate::application::market_selection::map_market_event_read_error(error) {
                         ServiceError::Unavailable | ServiceError::Unauthorized => {
                             unavailable = true

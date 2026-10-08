@@ -1,6 +1,76 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-07
+## Current execution — 2026-10-08
+
+Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
+pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
+`034f0ca067ccc039c8eae8e3f2e863149caf2f0f`. Main/release unchanged; no extra branch created.
+
+### Option acquisition — implemented, critically verified, downstream failure exposed
+
+A source probe returned all three requested MSFT chain pages: HTTP 200, 2,835 distinct snapshots,
+no repeated symbols. `minuteBar`, `dailyBar` and `prevDailyBar` were present in those actual responses
+and rejected by our closed parser. The parser now accepts those ancillary fields while preserving
+all raw bytes and the existing quote/trade/Greeks interpretation. One critical parser regression
+passes 1/1: original bytes/digest, exact bid extraction and duplicate-price rejection. Test build
+1m10s. No dates, bounds, scope or financial/authority checks were weakened.
+
+Application diagnostics now retain static rejection stage/category and terminal numeric HTTP status.
+Protocol/network failures no longer masquerade as instrument identity failures; cancellation,
+deadlines and permission failures retain typed outcomes. Lead integrated the exhaustive onboarding
+error consumer. Retained market reads also expose their actual rejecting boundary.
+
+Native build passed in 7m32s; the ordinary launcher reused it in 1.32s. Candidate file hashes are in
+`oct8-built-candidate.json`; this was dirty-candidate verification, not final clean-head approval.
+New native workflow `workflow_04a4fa3b9a1955969d02f1301030ffd9` passed the former parser boundary
+and reached `chain.rejoin`, rejecting `coverage`. The retained reference set has 2,752 contracts
+while the current direct snapshot probe has 2,835. Exact reference/capture recovery needs correction;
+no completed stock analysis, training or saved Brief is claimed.
+
+### Development, collection and shutdown
+
+The old whole-root watcher used 100% CPU and missed a follow-up source write. A bounded probe of
+nonrecursive repository-root plus recursive workspace-source watches detected that write at 0.8%
+CPU after 7s. The launcher now uses those upstream-supported path controls, with existing filtering,
+serialized build queue and lifecycle unchanged. Its existing behavioral test passed 1/1 in0.55s,
+covering build failure retention and rejection of replacement after failed graceful shutdown.
+Current watcher60793 is running at0.1% sampled CPU; no Cargo process remains.
+
+Old service51060 exited with an incomplete application shutdown (IEX display drain and
+Research/Fundamental/Macro deadlines). The supervisor correctly refused automatic replacement.
+After all old processes exited, lead started normal recovery on the same preserved workspace.
+Current supervisor60780 owns service60900 and Desktop60906 in `generation-6xCan8`; Home is Ready.
+Catalog recovery took17.348s; full composition22.293s. This is not clean-restart acceptance.
+
+The collection still fails. New diagnostics locate deadlines inside retained route discovery,
+before event selection. The read-only query investigation remains pending; no arbitrary timeout,
+history limit or skipped integrity check was added.
+
+### Schwab — not complete
+
+Native Source.GetStatus at2026-10-08T19:54:32Z reported stored credentials,
+runtime_verification_pending, lifecycle stopped and zero active runtime records. Continuing the
+saved OAuth session succeeded without user sign-in (access generation5), but its doctor then failed
+LevelOneForex with streamer-rate `InvalidRateAuthority` and transport `Protocol`. Authorization is
+not complete source activation. Current code enumerates twelve selected streaming services, while
+level-one field selection includes only symbol/bid/ask/sizes/quote time. Full field consumption,
+provider-neutral screen use and installed restart proof remain open.
+
+| Owner | Outcome/dependency | Exact ownership | Next barrier |
+| --- | --- | --- | --- |
+| Lead | Integrate this verified correction, then repair the observed reference-rejoin and provider/collection failures | Git/build/runtime/ledger; option adapter/application files, onboarding error mapping, retained-read diagnostics, `scripts/develop.mjs` and its runbook paragraph | Push coherent checkpoint; refresh next failure ownership before edits |
+| Completed Astra option lane | Parser correction and typed rejection diagnosis | Files released; actual diff inspected | Critical regression and native progression recorded above |
+| Astra retained-read investigation — pending initialization | Explain demonstrated retained-route latency, preserving source integrity | Read-only source/database; only report `.agents/tmp/v1-first-stock/oct8-retained-read-diagnosis.md` writable | Concrete SQL/caller cause and smallest critical correction; no builds/Git/runtime changes |
+
+Evidence lives in `.agents/tmp/v1-first-stock/`: `oct8-option-page-shapes.json`,
+`oct8-option-parser-test.log`, `oct8-diagnostic-build.log`, `oct8-corrected-native.log`,
+`oct8-corrected-workflow-status.json`, `oct8-schwab-source-status.json`, and
+`oct8-scoped-watcher-probe.json`. The obsolete October4 runtime stage was removed after process and
+open-file checks:1,441,265,008 logical bytes reclaimed. Active data and original evidence remain.
+Only three local branches and one worktree exist. The extra origin Dependabot branch belongs to
+open unmerged PR55 and is preserved. No CI, full release gate or whole-app RAM acceptance ran.
+
+## Previous execution — 2026-10-07
 
 Base `389c08b2`, branch `feature/v1-installed-product-experience`, one worktree. The previous
 supervisor, service, Desktop, Cargo target and first-stock scratch outputs were absent at refresh.

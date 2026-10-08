@@ -276,22 +276,14 @@ impl AlpacaOptionChainClient {
                     let decision = apply_http_retry_after(budget, retry_after.as_deref(), 1_000);
                     permit.release();
                     if attempts == MAX_PAGE_ATTEMPTS {
-                        return Err(AlpacaError::Network);
+                        return Err(AlpacaError::OptionChainHttpStatus(response.status));
                     }
                     wait_for_budget_decision(budget, decision, deadline, cancellation).await?;
                     continue;
                 }
-                if response.status >= 500 {
-                    permit.release();
-                    return Err(AlpacaError::Network);
-                }
-                if matches!(response.status, 401 | 403) {
-                    permit.release();
-                    return Err(AlpacaError::InvalidAuthorization);
-                }
                 if response.status != 200 {
                     permit.release();
-                    return Err(AlpacaError::Protocol);
+                    return Err(AlpacaError::OptionChainHttpStatus(response.status));
                 }
                 permit.release();
                 break response;
@@ -775,6 +767,14 @@ struct CheckedSnapshot {
     _greeks: Option<CheckedGreeks>,
     #[serde(rename = "impliedVolatility")]
     _iv: Option<serde::de::IgnoredAny>,
+    // Ancillary bars stay in the raw response and native snapshot evidence. They do not
+    // supply quote/trade/Greeks values or replace the normalized historical-bar consumer.
+    #[serde(rename = "minuteBar")]
+    _minute_bar: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "dailyBar")]
+    _daily_bar: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "prevDailyBar")]
+    _prev_daily_bar: Option<serde::de::IgnoredAny>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -831,7 +831,15 @@ fn validate_snapshot_shape(value: &Value) -> Result<(), AlpacaError> {
     let object = value.as_object().ok_or(AlpacaError::Protocol)?;
     require_keys(
         object,
-        &["latestQuote", "latestTrade", "greeks", "impliedVolatility"],
+        &[
+            "latestQuote",
+            "latestTrade",
+            "greeks",
+            "impliedVolatility",
+            "minuteBar",
+            "dailyBar",
+            "prevDailyBar",
+        ],
     )?;
     if let Some(value) = object.get("latestQuote")
         && !value.is_null()
@@ -1518,4 +1526,61 @@ fn lower_hex(bytes: [u8; 32]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_bars_preserve_raw_evidence_and_reject_duplicate_prices()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let body = r#"{
+            "snapshots": {"MSFT261016C00500000": {
+                "latestQuote": {"bp": 1.25, "ap": 1.30, "bs": 2, "as": 3,
+                    "t": "2026-10-08T15:00:00Z"},
+                "latestTrade": {"p": 1.27, "s": 1, "t": "2026-10-08T14:45:00Z"},
+                "greeks": {"delta": 0.42}, "impliedVolatility": 0.25,
+                "minuteBar": {"o": 1.20, "h": 1.30, "l": 1.20, "c": 1.27,
+                    "v": 12, "n": 4, "vw": 1.25, "t": "2026-10-08T14:45:00Z"},
+                "dailyBar": {"o": 1.10, "h": 1.40, "l": 1.00, "c": 1.27,
+                    "v": 120, "n": 40, "vw": 1.22, "t": "2026-10-08T04:00:00Z"},
+                "prevDailyBar": {"o": 1.00, "h": 1.20, "l": 0.90, "c": 1.10,
+                    "v": 100, "n": 30, "vw": 1.05, "t": "2026-10-07T04:00:00Z"}
+            }},
+            "next_page_token": null
+        }"#;
+        let url = Url::parse("https://data.alpaca.markets/v1beta1/options/snapshots/MSFT")?;
+        let received_at = parse_timestamp("2026-10-08T15:00:01Z")?;
+        let rate = AlpacaOptionRateEvidenceV1 {
+            limit: None,
+            remaining: None,
+            reset_unix_seconds: None,
+        };
+        let page = parse_page(
+            0,
+            url.clone(),
+            None,
+            Bytes::copy_from_slice(body.as_bytes()),
+            received_at,
+            rate,
+        )?;
+        assert_eq!(page.body.as_ref(), body.as_bytes());
+        assert_eq!(page.body_digest, sha256(body.as_bytes()));
+        assert_eq!(page.snapshots.len(), 1);
+        let snapshot = page.snapshots.first().ok_or("missing snapshot")?;
+        let quote = snapshot.value.get("latestQuote").and_then(Value::as_object);
+        let quote_at = component_timestamp(quote, "t", received_at)?;
+        let currency = Currency::try_from("USD")?;
+        assert_eq!(
+            money_component(quote, "bp", currency, quote_at),
+            OptionComponent::observed(Money::new(Decimal::new(125, 2), currency), quote_at),
+        );
+        let duplicate = body.replace("\"bp\": 1.25", "\"bp\": 1.25, \"bp\": 9.99");
+        assert!(matches!(
+            parse_page(0, url, None, Bytes::from(duplicate), received_at, rate),
+            Err(AlpacaError::Protocol),
+        ));
+        Ok(())
+    }
 }

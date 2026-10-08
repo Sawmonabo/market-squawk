@@ -4220,7 +4220,10 @@ const fn map_alpaca_doctor_error(error: AlpacaError) -> ProviderOnboardingError 
     match error {
         AlpacaError::Cancelled => ProviderOnboardingError::OperationCancelled,
         AlpacaError::DeadlineExceeded => ProviderOnboardingError::ProbeDeadlineExceeded,
-        AlpacaError::InvalidAuthorization => ProviderOnboardingError::CredentialRejected,
+        AlpacaError::InvalidAuthorization | AlpacaError::OptionChainHttpStatus(401 | 403) => {
+            ProviderOnboardingError::CredentialRejected
+        }
+        AlpacaError::OptionChainHttpStatus(429) => ProviderOnboardingError::ProbeRateLimited,
         AlpacaError::InvalidBudget => ProviderOnboardingError::ProbeRateLimited,
         AlpacaError::InvalidCredentials => ProviderOnboardingError::InvalidSecretShape,
         AlpacaError::Identity(_)
@@ -4232,6 +4235,7 @@ const fn map_alpaca_doctor_error(error: AlpacaError) -> ProviderOnboardingError 
         | AlpacaError::InvalidHistoricalPlan => ProviderOnboardingError::InvalidProfile,
         AlpacaError::Serialization
         | AlpacaError::Protocol
+        | AlpacaError::OptionChainHttpStatus(_)
         | AlpacaError::CaptureMaterial
         | AlpacaError::PublicationSessionNotCurrent
         | AlpacaError::CaptureRejoin { .. }
