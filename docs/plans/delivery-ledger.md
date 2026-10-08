@@ -51,6 +51,49 @@ runtime was confirmed live at refresh (supervisor60780, watcher60793, service623
 with no Cargo/rustc process. Lead temporarily suspends only this watcher during serialized checks,
 then restores it. No provider or app process is stopped for the query edit. Resulting commit pending.
 
+### Native result for 9faa41ce — deployed, watchlist still fails
+
+The one development build passed in6m54s and the supervisor completed replacement with service64436
+and Desktop64441 in `generation-9ttUad`; prior runtime generation was reclaimed. Catalog/research open
+milestone2.728s, local composition7.305s, installed operations572ms (warm runtime, not cold-start or
+final installed acceptance). No duplicate compiler or app instance was created.
+
+A background native `register_read -> dashboard_query(Market.GetCollection, includeMarket=true)`
+using the mounted product session failed after15.042s. The Home DOM still reports Price/Change
+unavailable for its nine watchlist entries. One automatic read progressed through eight retained
+fallbacks into `previous_close` with548ms remaining, while others still expired in retained selection
+under ongoing activity. Thus the SQL correction is critically verified but the actual watchlist is
+**not fixed/live-verified**. Evidence: `oct8-selector-native-collection.json` and the new-runtime tail
+of `oct8-corrected-native.log`. Initial ad-hoc transport calls during reconnect returned not-connected;
+they are not successful read evidence.
+
+Next dependency is the complete current-observation path: shared subscription demand must feed
+existing current display actors, with selective retained recovery and completed-close reuse;
+continuously repeating full historical selection on ordinary updates remains inadequate. Retained
+selector receipts and exact financial accounting stay intact. The separate Schwab local rate-cap
+and option-reference recovery defects above also remain open. Lead owns the next shared contract;
+all diagnostic helpers have handed off (the old retained helper never initialized). PR43 query
+checkpoint evidence is comment6068523540. No whole-app RAM or final gate claim.
+
+### Shared subscription boundary — investigation completed at 9faa41ce
+
+The provider-boundary helper completed and released its report-only ownership. Lead inspected the
+existing sender, publication observer/journal, current display readers and benchmark-only resolver.
+`oct8-shared-subscription-boundary.md` identifies exact callers and the first complete integration:
+durable watchlist plus independently owned active detail share canonical Quote demand; either release
+preserves the other's feed, reconnect/slow-reader recovery uses retained evidence, and a committed
+nonstream history update uses the same notification flow. Portfolio/risk/alerts/analytics remain
+required subsequent consumers, not implicitly complete through domain invalidation.
+
+Existing adapter dynamic desired-state sender is unused. The application freezes bindings/selected
+symbols, recognizes only SUBS proofs and has a12-ACK lifetime assumption; changing sender calls alone
+would request data that publication rejects. Vendor dictionaries, service mapping and native ACK
+revision handling belong in the adapter. Lead must freeze canonical demand/lease contracts before
+assigning that lane; shared contracts/composition/transport stay lead-owned. Reuse current display
+actors for current prices so a quote notification does not trigger unconditional historical PIT
+accounting. No new broker, webhook server or duplicate price store is needed. Native verification of
+9faa41ce remains the immediate integration barrier; no new production owner has been dispatched.
+
 ### Shared retained selection — critically verified, native replacement building
 
 Lead combined candidate selection and all seven exclusion totals in one exact-key SQL statement,
