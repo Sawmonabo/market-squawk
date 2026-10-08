@@ -508,20 +508,35 @@ fn resolve_option_identity(
     original: &AlpacaOriginalOptionContract,
     budget: &mut ResultBudget,
 ) -> Result<Option<MarketDataInstrumentRecord>, Error> {
-    let sql = format!("SELECT DISTINCT {STORED_COLUMNS}
-        FROM market_data_instrument_current AS current_
+    // Seek each exact identity through the search index, then require its matching revision
+    // to remain current. Historical aliases cannot revive an obsolete option definition.
+    let sql = format!("WITH candidate_revisions AS (
+        SELECT revision_digest FROM market_data_instrument_search_terms
+        WHERE normalized_term=?1 AND term_kind='external_identifier'
+        UNION
+        SELECT revision_digest FROM market_data_instrument_search_terms
+        WHERE normalized_term=?5 AND term_kind='provider_symbol'
+          AND source_id=?2 AND display_term=?3
+        UNION
+        SELECT revision_digest FROM market_data_instrument_search_terms
+        WHERE normalized_term=?6 AND term_kind='provider_symbol'
+          AND source_id=?2 AND display_term=?4
+        )
+        SELECT {STORED_COLUMNS}
+        FROM candidate_revisions AS candidate
+        JOIN market_data_instrument_current AS current_ ON current_.revision_digest=candidate.revision_digest
         JOIN market_data_instrument_revisions AS revisions ON revisions.revision_digest=current_.revision_digest
-        JOIN market_data_instrument_search_terms AS terms ON terms.revision_digest=current_.revision_digest
-        WHERE (terms.term_kind='external_identifier' AND terms.normalized_term=?1)
-           OR (terms.term_kind='provider_symbol' AND terms.source_id=?2 AND terms.display_term IN (?3,?4))
         ORDER BY revisions.instrument_id LIMIT 3");
     let mut statement = transaction.prepare(&sql)?;
+    let provider_id = original.id().to_string();
     let rows = statement.query_map(
         params![
             normalize(&original.occ_identity().to_string()),
             source.as_str(),
             original.symbol(),
-            original.id().to_string()
+            provider_id,
+            normalize(original.symbol()),
+            normalize(&provider_id)
         ],
         decode_stored_row,
     )?;

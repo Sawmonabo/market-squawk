@@ -1,6 +1,76 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-04
+## Current execution — 2026-10-07
+
+Base `389c08b2`, branch `feature/v1-installed-product-experience`, one worktree. The previous
+supervisor, service, Desktop, Cargo target and first-stock scratch outputs were absent at refresh.
+Prior test results remain historical records; their raw logs are no longer inspectable. Lead reused
+the sole retained runtime stage (`generation-3FZVlF`, dated October 4) without copying binaries.
+Its timestamp alone does not establish exact build provenance. Original data remains preserved.
+
+### Indexed option identity checkpoint
+
+An active preparation sample placed all 158 samples of its publication worker in
+`option_reference::resolve_option_identity` / SQLite stepping while holding catalog mutation.
+The old query scanned instrument revisions for each contract. The correction selects exact OCC,
+provider-symbol and provider-UUID candidate revisions through the existing index, deduplicates them,
+and rejoins the exact current revision before unchanged identity/conflict validation. No schema,
+migration, index, deadline or permission change is involved.
+
+Lead inspected the actual patch, normalized-term producer and publication/replay consumers.
+The existing `alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity` test passed
+1/1 in 1.56s after a 6m53s single-job cold build (`CARGO_INCREMENTAL=0`, locked/offline).
+It covers publication, rollback on revocation, queued-writer revalidation and exact restart replay.
+No test was added. Diff integrity passed. No CI, broad gate or RAM acceptance ran.
+
+Read-only SQLite diagnostics returned the same absent result: 34.193ms versus 0.118ms on the
+follow-up probe (initial old-query probe 170.348ms). All three new query arms use the existing index.
+These are query diagnostics, not complete native workflow performance. The approach follows
+[SQLite's index-prefix and separate OR-candidate guidance](https://www.sqlite.org/optoverview.html#or_optimizations),
+verified through [EXPLAIN QUERY PLAN](https://www.sqlite.org/eqp.html), accessed October 7.
+Evidence: `.agents/tmp/v1-first-stock/{option-identity-critical.log,option-identity-query-plan.txt}`.
+
+### Native result and next dependency
+
+The retained stage is visible under supervisor 33213, service 33375 and Desktop 33416; WebDriver
+4445 and existing Vite 1420 are available. Rust watching is not active in this fixed-stage session.
+Home reports Workspace Ready; composition took 6.402s. A fresh collection request failed in
+15.017s. Another admitted nine retained prices but exhausted its remaining 1.790s waiting for
+previous-close admission. Crypto startup publication also failed. These remain open defects.
+
+The original analysis resumed and reached 25 checkpoints, then failed `analysis_job_failed` in
+preparation job `dec802bc-3713-4fe1-8b03-4c942f2b066d`; no saved analysis or training result exists.
+The log says option identity is missing/ambiguous. The catalog nevertheless proves the same
+2,752-option reference replay committed at 03:13:08Z October 8 (23:13 Eastern October 7), within
+current source authority. Bounded retained-field checks found no OCC/symbol mismatch or expired
+identity interval. This disproves rejection inside that transaction, but not an outer post-commit
+check or downstream acquisition failure.
+
+The error mapping conflates several adapter/protocol failures with identity rejection and discards
+some non-success HTTP status codes. No evidence establishes a particular HTTP status, provider
+absence or invalid historical date window. Deploy the exact current build first, inspect its existing
+failure diagnostics, then preserve a closed error category/status where needed before changing
+request behavior. SQL performance alone does not close this semantic failure.
+
+The independent read-only renewal trace also found that ordinary proof renewal becomes generic
+calendar unavailability before preparation freezes. Any correction must wait for the existing exact
+same-account successor under the job deadline/cancellation, then reacquire capabilities before
+publication. Never retry generic unavailability or globally resume paused workflows. This is
+investigated, not implemented. Retained-display full-publication read amplification also remains.
+
+| Owner | Outcome | Scope | Next evidence |
+| --- | --- | --- | --- |
+| Lead | Integrate the verified lookup; deploy and repeat native preparation/collection | Git, ledger, one build queue and existing runtime supervisor | Pushed commit, exact build, native result and specific remaining failure |
+| Completed Astra High lanes | Indexed lookup implementation and read-only option/renewal diagnosis | Ownership released; no further edits/builds | Reports inspected; future implementation requires a bounded assignment |
+
+Other diagnostic evidence is in existing first-stock scratch: `resumed-runtime.log`,
+`oct7-{screen,collection,workflow,workflow-latest}.json`, `oct7-preparation-sample.txt` and
+`oct7-option-identity-failure.md`. Scratch is approximately 1 MB; the rebuilt shared target is
+2.1 GB and the sole retained runtime stage 1.3 GB. No duplicate target/worktree was created.
+Fresh remote inspection confirms three local branches and one worktree. Origin's extra Dependabot
+branch belongs to open, unmerged PR #55 and is preserved. Main/release remain unchanged.
+
+## Previous checkpoint — 2026-10-04
 
 ### Latest deployed checkpoint — `71ec9b6b`
 
