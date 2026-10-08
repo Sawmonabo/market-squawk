@@ -5,6 +5,7 @@
 //! fields require an explicitly versioned dictionary bound to nonzero evidence; this crate never
 //! guesses a numeric field meaning.
 
+mod streamer_dictionary;
 mod streamer_quote;
 pub use streamer_quote::{canonicalize_streamer_quote_record, streamer_quote_source_timestamp};
 

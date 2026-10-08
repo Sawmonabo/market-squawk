@@ -651,21 +651,34 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         StreamerResponseCode::Success
     );
     assert_eq!(frame.value().data[0].content[0].fields.len(), 2);
-    let dictionary = SchwabStreamerFieldDictionary::try_new(
-        MarketDataService::LevelOneEquities,
-        SourceIdentifier::try_from("schwab-streamer-test-fixture-v1")
-            .unwrap_or_else(|error| panic!("dictionary version: {error}")),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
-        vec![
-            (1, SchwabStreamerSemanticField::BidPrice),
-            (2, SchwabStreamerSemanticField::AskPrice),
-        ],
-    )
-    .unwrap_or_else(|error| panic!("dictionary: {error}"));
+    let dictionary = SchwabStreamerFieldDictionary::official(MarketDataService::LevelOneEquities)
+        .unwrap_or_else(|error| panic!("official dictionary: {error}"));
+    assert_eq!(
+        dictionary.field_ids().collect::<Vec<_>>(),
+        vec![0, 1, 2, 4, 5, 34]
+    );
+    assert_eq!(
+        dictionary.evidence(),
+        EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            sha2::Sha256::digest(include_bytes!(
+                "../resources/market-data-documentation-20260916.json"
+            ))
+            .into(),
+        ),
+    );
     let mapped = canonicalize_streamer_batch(&frame.value().data[0], &dictionary)
         .unwrap_or_else(|error| panic!("stream canonicalization: {error}"));
     assert_eq!(mapped.len(), 1);
     assert_eq!(mapped[0].fields.len(), 2);
+    assert_eq!(
+        mapped[0].fields[0].meaning,
+        SchwabStreamerSemanticField::BidPrice
+    );
+    assert_eq!(
+        mapped[0].fields[1].meaning,
+        SchwabStreamerSemanticField::AskPrice
+    );
     let incomplete_dictionary = SchwabStreamerFieldDictionary::try_new(
         MarketDataService::LevelOneEquities,
         SourceIdentifier::try_from("schwab-streamer-test-fixture-v2")

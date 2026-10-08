@@ -1,5 +1,4 @@
 //! Sole-account native Streamer -> physical capture -> canonical store -> current Markets.
-mod dictionary;
 mod families;
 mod publication;
 use crate::application::SchwabStreamerApplicationOutcome;
@@ -299,14 +298,18 @@ async fn run_native(
     )
     .await
     .map_err(|_| ServiceError::Unavailable)?;
-    let dictionary = dictionary::dictionary(MarketDataService::LevelOneEquities)?;
+    let dictionary = SchwabStreamerFieldDictionary::official(MarketDataService::LevelOneEquities)
+        .map_err(|_| ServiceError::InvalidResult)?;
     for (service, keys) in selections {
         native
             .replace_desired(
                 StreamerSubscription::try_new(
                     service,
                     keys,
-                    dictionary::fields(service)?,
+                    SchwabStreamerFieldDictionary::official(service)
+                        .map_err(|_| ServiceError::InvalidResult)?
+                        .field_ids()
+                        .collect(),
                     admission,
                 )
                 .map_err(|_| ServiceError::InvalidResult)?,

@@ -212,7 +212,8 @@ impl Consumer {
             {
                 return Err(ServiceError::InvalidResult);
             }
-            let dictionary = super::dictionary::dictionary(batch.service)?;
+            let dictionary = SchwabStreamerFieldDictionary::official(batch.service)
+                .map_err(|_| ServiceError::InvalidResult)?;
             for (content_index, record) in canonicalize_streamer_batch(batch, &dictionary)
                 .map_err(|_| ServiceError::InvalidResult)?
                 .into_iter()
