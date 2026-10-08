@@ -464,6 +464,7 @@ export const desktopEventSchema = z
         })
         .strict(),
       z.object({ type: z.literal("resync_required") }).strict(),
+      z.object({ type: z.literal("snapshot_required") }).strict(),
       z.object({ type: z.literal("stream_disconnected") }).strict(),
     ]),
   })

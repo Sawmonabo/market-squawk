@@ -11,6 +11,7 @@ use market_squawk_platform::SecretValue;
 use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::ClientId;
 
@@ -143,11 +144,22 @@ struct ActiveCredential {
     registration: ClientCredentialRegistration,
     value: SecretValue,
     pending: Option<PendingCredential>,
+    lifetime: CancellationToken,
 }
 
 struct PendingCredential {
     registration: ClientCredentialRegistration,
     value: SecretValue,
+    lifetime: CancellationToken,
+}
+
+impl Drop for ActiveCredential {
+    fn drop(&mut self) {
+        self.lifetime.cancel();
+        if let Some(pending) = &self.pending {
+            pending.lifetime.cancel();
+        }
+    }
 }
 
 impl fmt::Debug for ActiveCredential {
@@ -209,6 +221,7 @@ impl CredentialRegistry {
                     registration: registration.clone(),
                     value: generate_credential()?,
                     pending: None,
+                    lifetime: CancellationToken::new(),
                 },
             );
             if previous.is_some() {
@@ -292,6 +305,29 @@ impl CredentialRegistry {
         Ok(credential.registration.client())
     }
 
+    /// Retains an authenticated generation's cancellation without retaining its bearer secret.
+    /// A rotation between authentication and this lookup rejects the retired generation.
+    pub(crate) fn generation_lifetime(
+        &self,
+        client_id: ClientId,
+        generation: CredentialGeneration,
+    ) -> Result<CancellationToken, CredentialError> {
+        let active = self
+            .active
+            .read()
+            .map_err(|_| CredentialError::Unavailable)?;
+        let credential = active.get(&client_id).ok_or(CredentialError::NotFound)?;
+        if credential.registration.generation() == generation {
+            Ok(credential.lifetime.clone())
+        } else if let Some(pending) = &credential.pending
+            && pending.registration.generation() == generation
+        {
+            Ok(pending.lifetime.clone())
+        } else {
+            Err(CredentialError::GenerationMismatch)
+        }
+    }
+
     /// Freezes the next generation without changing current authentication authority.
     pub fn plan_rotation(
         &self,
@@ -345,6 +381,7 @@ impl CredentialRegistry {
         current.pending = Some(PendingCredential {
             registration: plan.candidate(),
             value,
+            lifetime: CancellationToken::new(),
         });
         Ok(plan.candidate())
     }
@@ -373,6 +410,8 @@ impl CredentialRegistry {
             .pending
             .take()
             .ok_or(CredentialError::GenerationMismatch)?;
+        credential.lifetime.cancel();
+        credential.lifetime = pending.lifetime;
         credential.registration = pending.registration.clone();
         credential.value = pending.value;
         Ok(CredentialRotationOutcome {
@@ -401,7 +440,9 @@ impl CredentialRegistry {
         {
             return Err(CredentialError::GenerationMismatch);
         }
-        credential.pending = None;
+        if let Some(pending) = credential.pending.take() {
+            pending.lifetime.cancel();
+        }
         Ok(())
     }
 

@@ -822,6 +822,28 @@ request-admission boundary. Extend them in place where a provider requires more 
 - limits, endpoints, feed meanings, and callback URLs remain code-owned. The credential file may
   contain only the documented operator choices and secrets.
 
+### Shared application update delivery
+
+Provider adapters decode their own protocols into canonical observations. Application consumers
+subscribe to canonical instruments and data families, independently of provider or screen. Shared
+upstream demand must remain active until its final consumer releases it; durable watchlist/portfolio
+owners and temporary detail/chart owners have separate lifetimes. Streaming, completed REST reads
+and scheduled imports all publish through the same normalized authority and change notifications.
+Implementation and live coverage remain tracked in the delivery ledger.
+
+The existing application EventHub delivers committed domain invalidations over one authenticated
+`/app/v1/events` SSE response per client subscription. This channel is shared by all application
+domains. It is a notification channel, not a lossless financial-event archive: current-state changes
+can coalesce, and consumers read provider-neutral selectors for the actual data. Financial calculations
+that require every observation use durable evidence and checkpoints.
+
+Each response owns its activity and admission until disconnect, cancellation or credential/service
+retirement. Held subscriptions have separate admission from ordinary queries. Bounded journal pages
+use generation-scoped cursors; an expired or overflowed cursor receives an explicit snapshot-required
+baseline before subsequent updates. Desktop reloads affected snapshots without replacing the workspace
+with an error. Ordinary pages remain strictly sequenced. Upstream credentials, numeric protocol fields
+and provider service names do not cross into these consumer events.
+
 ## 11. Data-to-workflow completion contract
 
 The provider replacement is complete only when its data is usable by the workflows that caused

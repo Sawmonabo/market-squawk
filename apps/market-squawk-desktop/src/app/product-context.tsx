@@ -239,6 +239,17 @@ export function ProductProvider({
               if (subscription) void reconnect()
               return
             }
+            if (
+              event.body.type === "snapshot_required" &&
+              sameProductSession(scope, event.productSessionToken) &&
+              BigInt(event.sequence) >= BigInt(previousSequence)
+            ) {
+              previousSequence = event.sequence
+              eventCursor.current = { productSessionToken: scope, sequence: previousSequence }
+              // Subscribe before re-reading snapshots so changes during recovery remain observable.
+              domainRefresh.invalidate()
+              return
+            }
             if (rejectsProductEvent(scope, previousSequence, event)) {
               unavailable()
               return

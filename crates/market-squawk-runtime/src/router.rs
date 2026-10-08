@@ -1,5 +1,7 @@
 //! Closed loopback application routing before business-service dispatch.
 
+mod event_stream;
+
 use std::{
     collections::HashMap,
     fmt,
@@ -132,6 +134,7 @@ pub struct RuntimeRouterLimits {
     response_body_bytes: NonZeroUsize,
     event_request_bytes: NonZeroUsize,
     maximum_concurrency: NonZeroUsize,
+    maximum_event_subscriptions: NonZeroUsize,
     event_cursor_lifetime: Duration,
     input_ticket_lifetime: Duration,
     request_structure: JsonStructureLimits,
@@ -146,6 +149,7 @@ impl RuntimeRouterLimits {
         response_body_bytes: usize,
         event_request_bytes: usize,
         maximum_concurrency: usize,
+        maximum_event_subscriptions: usize,
         event_cursor_lifetime: Duration,
         input_ticket_lifetime: Duration,
         request_structure: JsonStructureLimits,
@@ -162,6 +166,8 @@ impl RuntimeRouterLimits {
             event_request_bytes: NonZeroUsize::new(event_request_bytes)
                 .ok_or(RouterError::InvalidConfiguration)?,
             maximum_concurrency: NonZeroUsize::new(maximum_concurrency)
+                .ok_or(RouterError::InvalidConfiguration)?,
+            maximum_event_subscriptions: NonZeroUsize::new(maximum_event_subscriptions)
                 .ok_or(RouterError::InvalidConfiguration)?,
             event_cursor_lifetime,
             input_ticket_lifetime,
@@ -216,6 +222,7 @@ struct RouterState {
     dispatcher: Arc<dyn ApplicationDispatcher>,
     replay: Arc<MutationReplayGuard>,
     events: Arc<EventHub>,
+    event_subscriptions: Arc<tokio::sync::Semaphore>,
     inputs: Arc<InputStager>,
     accepting: AtomicBool,
     request_cancellation: CancellationToken,
@@ -406,6 +413,10 @@ impl RuntimeRouter {
                 dispatcher,
                 replay,
                 events,
+                // Held responses have their own lifetime bound; they must not occupy query slots.
+                event_subscriptions: Arc::new(tokio::sync::Semaphore::new(
+                    limits.maximum_event_subscriptions.get(),
+                )),
                 inputs,
                 accepting: AtomicBool::new(true),
                 request_cancellation: CancellationToken::new(),
@@ -443,7 +454,7 @@ impl RuntimeRouter {
             .route("/app/v1/register-read", post(register_read))
             .route("/app/v1/invoke-read", post(invoke_read))
             .route("/app/v1/inputs", post(stage_input))
-            .route("/app/v1/events", post(read_events))
+            .route("/app/v1/events", post(event_stream::subscribe_events))
             .with_state(self.state)
             .layer(ConcurrencyLimitLayer::new(concurrency))
             .merge(cancellation);
@@ -891,52 +902,8 @@ async fn stage_input(State(state): State<Arc<RouterState>>, request: Request<Bod
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct EventReadRequest {
-    cursor: Option<EventCursor>,
-    limit: usize,
-}
-
-async fn read_events(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
-    let authentication =
-        match authenticate_transport(&state, &request, Method::POST, Some(JSON_MEDIA_TYPE)) {
-            Ok(value) => value,
-            Err(status) => return rejected(status),
-        };
-    let body = match to_bytes(request.into_body(), state.limits.event_request_bytes.get()).await {
-        Ok(body) => body,
-        Err(_) => return rejected(StatusCode::PAYLOAD_TOO_LARGE),
-    };
-    let request: EventReadRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(_) => return rejected(StatusCode::BAD_REQUEST),
-    };
-    let limit = match EventPageLimit::try_new(request.limit) {
-        Ok(limit) => limit,
-        Err(_) => return rejected(StatusCode::BAD_REQUEST),
-    };
-    let now = match wall_now() {
-        Ok(now) => now,
-        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
-    };
-    let expires_at = match add_duration(now, state.limits.event_cursor_lifetime) {
-        Ok(value) => value,
-        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
-    };
-    match state.events.read_after(
-        authentication.client_id,
-        request.cursor.as_ref(),
-        limit,
-        now,
-        expires_at,
-    ) {
-        Ok(page) => axum::Json(page).into_response(),
-        Err(_) => rejected(StatusCode::GONE),
-    }
-}
-
 struct AuthenticatedClient {
+    lifetime: CancellationToken,
     client_id: ClientId,
     generation: CredentialGeneration,
     _activity: RuntimeClientActivityGuard,
@@ -1021,7 +988,12 @@ fn authenticate_transport(
         .clients
         .begin(client_id)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let lifetime = state
+        .credentials
+        .generation_lifetime(client_id, generation)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     Ok(AuthenticatedClient {
+        lifetime,
         client_id,
         generation,
         _activity: activity,

@@ -230,17 +230,23 @@ async fn run_installed_service_authority_scenario(
             "{}",
             registration.result()
         );
-        let (events, cursor) = desktop
-            .read_events(
+        let event_page = desktop
+            .subscribe_events(
                 None,
                 EventPageLimit::try_new(4).context("construct installed event-page limit")?,
                 CancellationToken::new(),
             )
             .await
+            .context("subscribe to initial installed-service events")?
+            .next_page()
+            .await
             .context("read initial installed-service events")?;
+        assert!(!event_page.snapshot_required());
+        let events = event_page.events();
+        let cursor = event_page.cursor().clone();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], "application.changed");
-        assert_eq!(events[0]["operation"], "Source.Register");
+        assert_eq!(events[0].payload()["type"], "application.changed");
+        assert_eq!(events[0].payload()["operation"], "Source.Register");
         assert_eq!(cursor.sequence(), 1);
 
         // A protected CLI setup mutation must remain private while its change event is
@@ -287,16 +293,20 @@ async fn run_installed_service_authority_scenario(
             setup_result.result()["value"]["data"]["outcome"],
             "completed"
         );
-        let (setup_events, _) = desktop
-            .read_events(
+        let setup_page = desktop
+            .subscribe_events(
                 Some(cursor),
                 EventPageLimit::try_new(4)?,
                 CancellationToken::new(),
             )
+            .await?
+            .next_page()
             .await?;
+        assert!(!setup_page.snapshot_required());
+        let setup_events = setup_page.events();
         assert_eq!(setup_events.len(), 1);
         assert_eq!(
-            setup_events[0]["operation"],
+            setup_events[0].payload()["operation"],
             "Source.Onboarding.ApplyStaged"
         );
         let descriptors = bootstrap["application"]["operations"]
@@ -422,15 +432,23 @@ async fn run_installed_service_authority_scenario(
             .context("revoke Codex credential through desktop authority")?;
         assert_eq!(revoked.result()["value"]["accessRevoked"], true);
 
-        let (events, _) = desktop
-            .read_events(
+        let event_page = desktop
+            .subscribe_events(
                 None,
                 EventPageLimit::try_new(128)?,
                 CancellationToken::new(),
             )
+            .await?
+            .next_page()
             .await?;
+        assert!(!event_page.snapshot_required());
+        let events = event_page.events();
         for operation in ["Mcp.RotateCredential", "Mcp.RevokeCredential"] {
-            assert!(events.iter().any(|event| event["operation"] == operation));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.payload()["operation"] == operation)
+            );
         }
 
         if let Some(path) = real_alpaca_bundle_path.as_deref() {

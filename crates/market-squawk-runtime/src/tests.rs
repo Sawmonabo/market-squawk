@@ -153,7 +153,14 @@ async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> Tes
         started: tokio::sync::Notify::new(),
         stopped: Arc::new(tokio::sync::Notify::new()),
     });
-    let server = RuntimeRouter::try_new(
+    let credentials = Arc::new(credentials);
+    let changes = ApplicationChanges::default();
+    let events = Arc::new(EventHub::try_new(
+        runtime.service_generation(),
+        EventHubLimits::try_new(2, 4_096)?,
+        changes.clone(),
+    )?);
+    let router = RuntimeRouter::try_new(
         runtime,
         endpoint,
         ApplicationProtocolRange::single(ApplicationProtocolVersion::V1),
@@ -163,26 +170,24 @@ async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> Tes
             4_096,
             2_048,
             1,
+            4,
             Duration::from_secs(5),
             Duration::from_secs(5),
             structure,
             ServiceLimits::try_new(4_096, 64, 4_096, 64, structure)?,
         )?,
-        Arc::new(credentials),
+        Arc::clone(&credentials),
         dispatcher.clone(),
         Arc::new(MutationReplayGuard::try_new(ReplayLimits::try_new(2)?)?),
-        Arc::new(EventHub::try_new(
-            runtime.service_generation(),
-            EventHubLimits::try_new(2, 4_096)?,
-            ApplicationChanges::default(),
-        )?),
+        Arc::clone(&events),
         Arc::new(InputStager::new(
             paths.artifacts()?.clone(),
             runtime,
             InputStagingLimits::try_new(2, 4_096)?,
         )),
-    )?
-    .start(listener, None)?;
+    )?;
+    let activity = router.client_activity_reader();
+    let server = router.start(listener, None)?;
     let now = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?);
@@ -210,6 +215,44 @@ async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> Tes
         structure,
         Duration::from_secs(5),
     )?);
+
+    // Two response bodies share committed changes without occupying the sole query slot.
+    let stream_limit = EventPageLimit::try_new(2)?;
+    let event_client = client.with_transport_timeout(Duration::from_millis(100))?;
+    let mut first = event_client
+        .subscribe_events(None, stream_limit, CancellationToken::new())
+        .await?;
+    let mut second = event_client
+        .subscribe_events(None, stream_limit, CancellationToken::new())
+        .await?;
+    assert!(first.next_page().await?.events().is_empty());
+    assert!(second.next_page().await?.events().is_empty());
+    // A held stream outlives the ordinary finite request timeout.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    changes.record(market_squawk_services::ServiceDomain::Market);
+    let a = tokio::time::timeout(Duration::from_secs(1), first.next_page()).await??;
+    let b = tokio::time::timeout(Duration::from_secs(1), second.next_page()).await??;
+    assert_eq!(a.events(), b.events());
+    let second_cursor = b.cursor().clone();
+    assert_eq!(a.cursor().sequence(), second_cursor.sequence());
+    assert_eq!(a.events()[0].payload()["domains"], json!(["market"]));
+    assert_eq!(activity.connected_clients(), 1);
+    drop(first);
+    changes.record(market_squawk_services::ServiceDomain::Fundamental);
+    // One already-observed wake may yield an empty maintenance page. Data still arrives without polling.
+    let next = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let page = second.next_page().await?;
+            if !page.events().is_empty() {
+                break Ok::<_, ApplicationClientError>(page);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        next.events()[0].payload()["domains"],
+        json!(["fundamental"])
+    );
 
     let cancellation = CancellationToken::new();
     let read_client = Arc::clone(&client);
@@ -336,6 +379,92 @@ async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> Tes
             CancellationToken::new(),
         )
         .await?;
+    // Idle response drop releases its own activity, while another response remains independent.
+    drop(second);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while activity.connected_clients() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    // A lost handshake result (body never consumed) cannot leave subscriber activity behind.
+    let abandoned = event_client
+        .subscribe_events(
+            Some(second_cursor.clone()),
+            stream_limit,
+            CancellationToken::new(),
+        )
+        .await?;
+    drop(abandoned);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while activity.connected_clients() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    // Reconnect after retention overflow establishes an explicit baseline, then still receives
+    // subsequent commits. A new consumer also recovers without pretending missing events replayed.
+    for _ in 0..3 {
+        events.publish(json!({"type": "application.domains_changed", "domains": ["market"]}))?;
+    }
+    for cursor in [Some(second_cursor.clone()), None] {
+        let mut recovered = event_client
+            .subscribe_events(cursor, stream_limit, CancellationToken::new())
+            .await?;
+        let baseline = recovered.next_page().await?;
+        assert!(baseline.snapshot_required());
+        assert!(baseline.events().is_empty());
+        assert!(baseline.cursor().sequence() > second_cursor.sequence());
+        changes.record(market_squawk_services::ServiceDomain::Portfolio);
+        let update = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let page = recovered.next_page().await?;
+                if !page.events().is_empty() {
+                    break Ok::<_, ApplicationClientError>(page);
+                }
+            }
+        })
+        .await??;
+        assert!(!update.snapshot_required());
+        assert_eq!(
+            update.events()[0].sequence(),
+            baseline.cursor().sequence() + 1
+        );
+        assert_eq!(
+            update.events()[0].payload()["domains"],
+            json!(["portfolio"])
+        );
+    }
+    let stopped = CancellationToken::new();
+    let mut cancelled = event_client
+        .subscribe_events(Some(second_cursor.clone()), stream_limit, stopped.clone())
+        .await?;
+    let _ = cancelled.next_page().await?;
+    stopped.cancel();
+    assert_eq!(
+        cancelled.next_page().await,
+        Err(ApplicationClientError::Interrupted)
+    );
+    let mut revoked = event_client
+        .subscribe_events(Some(second_cursor), stream_limit, CancellationToken::new())
+        .await?;
+    let _ = revoked.next_page().await?;
+    credentials.revoke(client_id(5)?)?;
+    changes.record(market_squawk_services::ServiceDomain::Analysis);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        // A previously written maintenance frame may already be buffered by HTTP. No new
+        // committed update may be published after revocation, and the body must reach EOF.
+        while let Ok(page) = revoked.next_page().await {
+            assert!(page.events().is_empty());
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while activity.connected_clients() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     drop(server);
     Ok(())
 }

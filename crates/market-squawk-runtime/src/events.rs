@@ -14,6 +14,7 @@ use market_squawk_services::ServiceDomain;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::{
     ClientId, EventCursor, EventCursorError, EventPageLimit, RuntimeContractError,
@@ -22,8 +23,23 @@ use crate::{
 
 /// Coalesced committed changes shared by producers and their service's event journal.
 /// Producers record only affected domains, never payloads or one allocation per observation.
-#[derive(Clone, Debug, Default)]
-pub struct ApplicationChanges(Arc<AtomicU16>);
+#[derive(Clone, Debug)]
+pub struct ApplicationChanges(Arc<ChangeState>);
+
+#[derive(Debug)]
+struct ChangeState {
+    domains: AtomicU16,
+    wake: watch::Sender<()>,
+}
+
+impl Default for ApplicationChanges {
+    fn default() -> Self {
+        Self(Arc::new(ChangeState {
+            domains: AtomicU16::new(0),
+            wake: watch::channel(()).0,
+        }))
+    }
+}
 
 const DOMAINS: [ServiceDomain; 14] = [
     ServiceDomain::Job,
@@ -61,7 +77,10 @@ impl ApplicationChanges {
             ServiceDomain::Bot => 12,
             ServiceDomain::Execution => 13,
         };
-        self.0.fetch_or(1 << bit, Ordering::Release);
+        let mask = 1 << bit;
+        if self.0.domains.fetch_or(mask, Ordering::Release) & mask == 0 {
+            self.0.wake.send_replace(());
+        }
     }
 }
 
@@ -122,9 +141,16 @@ impl ApplicationEvent {
 pub struct EventPage {
     events: Arc<[Arc<ApplicationEvent>]>,
     cursor: EventCursor,
+    snapshot_required: bool,
 }
 
 impl EventPage {
+    /// Missing journal entries require consumers to reload their current durable snapshot.
+    #[must_use]
+    pub const fn snapshot_required(&self) -> bool {
+        self.snapshot_required
+    }
+
     /// Events ordered by increasing sequence.
     #[must_use]
     pub const fn events(&self) -> &Arc<[Arc<ApplicationEvent>]> {
@@ -175,7 +201,17 @@ impl EventHub {
     /// Publishes one bounded event without waiting for any client.
     pub fn publish(&self, payload: Value) -> Result<u64, EventReadError> {
         let mut state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
-        self.append(&mut state, payload)
+        let result = self.append(&mut state, payload);
+        drop(state);
+        if result.is_ok() {
+            self.changes.0.wake.send_replace(());
+        }
+        result
+    }
+
+    /// Register before reading the journal so a publication racing with the read cannot be lost.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.0.wake.subscribe()
     }
 
     fn append(&self, state: &mut EventState, payload: Value) -> Result<u64, EventReadError> {
@@ -198,6 +234,28 @@ impl EventHub {
         Ok(sequence)
     }
 
+    /// Establish a baseline before a consumer reloads durable state. Subsequent changes retain
+    /// sequences after this baseline, including those racing with the snapshot read.
+    pub(crate) fn snapshot_page(
+        &self,
+        client_id: ClientId,
+        expires_at: Timestamp,
+    ) -> Result<EventPage, EventReadError> {
+        let state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
+        let cursor = EventCursor::try_new(
+            client_id,
+            self.generation,
+            state.next_sequence - 1,
+            expires_at,
+        )
+        .map_err(EventReadError::Contract)?;
+        Ok(EventPage {
+            events: Arc::from([]),
+            cursor,
+            snapshot_required: true,
+        })
+    }
+
     /// Returns a bounded page or requires snapshot resynchronization after any gap.
     pub fn read_after(
         &self,
@@ -216,7 +274,7 @@ impl EventHub {
                 .map_err(EventReadError::Cursor)?;
         }
         let mut state = self.state.lock().map_err(|_| EventReadError::Unavailable)?;
-        let dirty = self.changes.0.swap(0, Ordering::AcqRel);
+        let dirty = self.changes.0.domains.swap(0, Ordering::AcqRel);
         if dirty != 0 {
             let domains: Vec<_> = DOMAINS
                 .iter()
@@ -229,7 +287,7 @@ impl EventHub {
             });
             if let Err(error) = self.append(&mut state, payload) {
                 // Preserve both this batch and any producer updates racing with the drain.
-                self.changes.0.fetch_or(dirty, Ordering::Release);
+                self.changes.0.domains.fetch_or(dirty, Ordering::Release);
                 return Err(error);
             }
         }
@@ -259,6 +317,7 @@ impl EventHub {
         Ok(EventPage {
             events,
             cursor: next,
+            snapshot_required: false,
         })
     }
 }

@@ -1119,6 +1119,7 @@ async fn compose_transport(
         RESPONSE_BODY_BYTES,
         EVENT_REQUEST_BYTES,
         RUNTIME_CONCURRENCY,
+        RUNTIME_CONCURRENCY, // Separate held-response capacity; never consumes query slots.
         CURSOR_LIFETIME,
         INPUT_TICKET_LIFETIME,
         structure,

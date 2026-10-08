@@ -64,6 +64,7 @@ ed25519-dalek = { version = "=3.0.0", features = ["signature"] }
 olpc-cjson = "=0.1.4"
 fs2 = "0.4"
 futures-util = "0.3"
+sse-stream = "=0.2.5"
 getrandom = "=0.3.4"
 httpdate = { version = "=1.0.3", default-features = false }
 # Shared runtime and provider OAuth transports use bounded HTTP/1 primitives.

@@ -1,5 +1,8 @@
 //! Authenticated loopback implementation of the native application client.
 
+mod event_subscription;
+pub use event_subscription::ApplicationEventSubscription;
+
 use std::{
     fmt, io,
     sync::Arc,
@@ -12,7 +15,6 @@ use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_platform::SecretValue;
 use market_squawk_services::{JsonStructureLimits, RequestId, validate_json_contract};
 use reqwest::{Client, Method, Response, redirect::Policy};
-use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -24,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AppRequestEnvelope, AppResponseEnvelope, ApplicationClient, ApplicationClientError,
     ApplicationRequestScope, CLIENT_ID_HEADER, CREDENTIAL_GENERATION_HEADER, EventCursor,
-    EventPage, EventPageLimit, INPUT_LENGTH_HEADER, INPUT_MEDIA_TYPE_HEADER, INPUT_SHA256_HEADER,
+    EventPageLimit, INPUT_LENGTH_HEADER, INPUT_MEDIA_TYPE_HEADER, INPUT_SHA256_HEADER,
     INSTALLATION_ID_HEADER, InputAdmission, InputTicket, RendezvousRecord,
     SERVICE_GENERATION_HEADER, WORKSPACE_ID_HEADER,
 };
@@ -89,7 +91,7 @@ impl LoopbackApplicationClient {
         let http = Client::builder()
             .redirect(Policy::none())
             .no_proxy()
-            .timeout(transport_timeout)
+            .connect_timeout(transport_timeout)
             .build()
             .map_err(|_| ApplicationClientError::Unavailable)?;
         Ok(Self {
@@ -343,10 +345,14 @@ impl LoopbackApplicationClient {
     }
 
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.authenticated_request(method, path)
+            .timeout(self.transport_timeout)
+    }
+
+    fn authenticated_request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.endpoint))
-            .timeout(self.transport_timeout)
             .header(reqwest::header::HOST, &self.host)
             .header(
                 CLIENT_ID_HEADER,
@@ -462,63 +468,13 @@ impl ApplicationClient for LoopbackApplicationClient {
         .map_err(|_| ApplicationClientError::InvalidResponse)
     }
 
-    async fn read_events(
+    async fn subscribe_events(
         &self,
         cursor: Option<EventCursor>,
         limit: EventPageLimit,
         cancellation: CancellationToken,
-    ) -> Result<(Arc<[Value]>, EventCursor), ApplicationClientError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            cursor: &'a Option<EventCursor>,
-            limit: usize,
-        }
-        let send = self
-            .request(Method::POST, "/app/v1/events")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&Request {
-                cursor: &cursor,
-                limit: limit.get(),
-            })
-            .send();
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(ApplicationClientError::Interrupted),
-            response = send => response.map_err(|_| ApplicationClientError::Unavailable)?,
-        };
-        let bytes = self.response_bytes(response, &cancellation).await?;
-        let page: EventPage =
-            serde_json::from_slice(&bytes).map_err(|_| ApplicationClientError::InvalidResponse)?;
-        let now = client_wall_now()?;
-        let expected_generation = self.scope.runtime().service_generation();
-        page.cursor()
-            .ensure_current(self.scope.client_id(), expected_generation, now)
-            .map_err(|_| ApplicationClientError::InvalidResponse)?;
-        if page.events().len() > limit.get() {
-            return Err(ApplicationClientError::InvalidResponse);
-        }
-        let mut expected_sequence = cursor.as_ref().map_or(0, EventCursor::sequence);
-        let mut values = Vec::with_capacity(page.events().len());
-        for event in page.events().iter() {
-            expected_sequence = expected_sequence
-                .checked_add(1)
-                .ok_or(ApplicationClientError::InvalidResponse)?;
-            if event.generation() != expected_generation || event.sequence() != expected_sequence {
-                return Err(ApplicationClientError::InvalidResponse);
-            }
-            validate_json_contract(
-                event.payload(),
-                self.response_structure,
-                self.maximum_response_bytes,
-            )
-            .map_err(|_| ApplicationClientError::InvalidResponse)?;
-            values.push(event.payload().clone());
-        }
-        if page.cursor().sequence() != expected_sequence {
-            return Err(ApplicationClientError::InvalidResponse);
-        }
-        let values: Arc<[Value]> = values.into();
-        Ok((values, page.cursor().clone()))
+    ) -> Result<ApplicationEventSubscription, ApplicationClientError> {
+        ApplicationEventSubscription::open(self, cursor, limit, cancellation).await
     }
 }
 

@@ -1507,6 +1507,17 @@ impl DesktopEvent {
         }
     }
 
+    pub(crate) const fn snapshot_required(
+        product_session_token: ProductSessionToken,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            product_session_token,
+            sequence,
+            body: DesktopEventBody::SnapshotRequired,
+        }
+    }
+
     pub(crate) const fn resync_required(
         product_session_token: ProductSessionToken,
         sequence: u64,
@@ -1541,6 +1552,7 @@ enum DesktopEventBody {
         domains: Vec<DesktopInvalidationDomain>,
     },
     ResyncRequired,
+    SnapshotRequired,
     StreamDisconnected,
 }
 

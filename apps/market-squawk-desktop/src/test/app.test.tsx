@@ -2453,10 +2453,20 @@ describe("Market Squawk desktop boundary", () => {
         })
       })
       expect(summary.getByText("Ready")).toBeTruthy()
+      // A journal gap reloads snapshots while retaining the live subscription and workspace.
+      await act(async () => {
+        subscriptions[1]!.onEvent({ productSessionToken: blockedBootstrap.productSessionToken,
+          sequence: "40", body: { type: "snapshot_required" } })
+        subscriptions[1]!.onEvent({ productSessionToken: blockedBootstrap.productSessionToken,
+          sequence: "41", body: { type: "invalidate", domains: ["market"] } })
+      })
+      expect(summary.getByText("Ready")).toBeTruthy()
+      expect(screen.queryByText("Loading workspace…")).toBeNull()
+      expect(subscriptions[1]!.unsubscribe).not.toHaveBeenCalled()
       await act(async () => {
         subscriptions[1]!.onEvent({
           productSessionToken: blockedBootstrap.productSessionToken,
-          sequence: "1",
+          sequence: "41",
           body: { type: "stream_disconnected" },
         })
       })

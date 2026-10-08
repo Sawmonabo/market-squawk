@@ -1,6 +1,5 @@
 use std::{
     num::NonZeroU64,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -714,11 +713,11 @@ pub trait ApplicationClient: std::fmt::Debug + Send + Sync {
         cancellation: CancellationToken,
     ) -> Result<InputTicket, ApplicationClientError>;
 
-    /// Reads one bounded event page; cursor errors require a fresh snapshot.
-    async fn read_events(
+    /// Opens a body-owned stream of bounded journal pages; cursor errors require a fresh snapshot.
+    async fn subscribe_events(
         &self,
         cursor: Option<EventCursor>,
         limit: EventPageLimit,
         cancellation: CancellationToken,
-    ) -> Result<(Arc<[Value]>, EventCursor), ApplicationClientError>;
+    ) -> Result<crate::ApplicationEventSubscription, ApplicationClientError>;
 }

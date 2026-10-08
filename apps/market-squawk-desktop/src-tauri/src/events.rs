@@ -3,7 +3,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use market_squawk_runtime::{
@@ -24,7 +23,6 @@ use crate::{
 };
 
 const EVENT_PAGE_LIMIT: usize = 128;
-const EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Default)]
 pub(crate) struct DesktopEventSubscriptions {
@@ -205,49 +203,58 @@ async fn forward_service_events(
         Ok(cursor) => cursor.clone(),
         Err(_error) => return,
     };
+    let mut subscription = match application
+        .subscribe_events(cursor.clone(), limit, cancellation.child_token())
+        .await
+    {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            forward_subscription_error(
+                error,
+                product_session_token,
+                cursor.as_ref().map_or(0, EventCursor::sequence),
+                &cancellation,
+                &on_event,
+            );
+            return;
+        }
+    };
     loop {
         let previous_sequence = cursor.as_ref().map_or(0, EventCursor::sequence);
-        let page = application
-            .read_events(cursor.clone(), limit, cancellation.child_token())
-            .await;
-        let (values, next) = match page {
+        let page = match subscription.next_page().await {
             Ok(page) => page,
-            Err(ApplicationClientError::Interrupted) if cancellation.is_cancelled() => return,
-            Err(ApplicationClientError::Unavailable | ApplicationClientError::Interrupted) => {
-                let _ = on_event.send(DesktopEvent::stream_disconnected(
+            Err(error) => {
+                forward_subscription_error(
+                    error,
                     product_session_token,
                     previous_sequence,
-                ));
-                return;
-            }
-            Err(ApplicationClientError::Rejected | ApplicationClientError::InvalidResponse) => {
-                let _ = on_event.send(DesktopEvent::resync_required(
-                    product_session_token,
-                    previous_sequence,
-                ));
+                    &cancellation,
+                    &on_event,
+                );
                 return;
             }
         };
-        for (offset, value) in values.iter().enumerate() {
+        if page.snapshot_required()
+            && on_event
+                .send(DesktopEvent::snapshot_required(
+                    product_session_token,
+                    page.cursor().sequence(),
+                ))
+                .is_err()
+        {
+            return;
+        }
+        for value in page.events().iter() {
             if cancellation.is_cancelled() {
                 return;
             }
-            let Ok(offset) = u64::try_from(offset) else {
-                return;
-            };
-            let Some(sequence) = previous_sequence
-                .checked_add(offset)
-                .and_then(|value| value.checked_add(1))
-            else {
-                let _ = on_event.send(DesktopEvent::resync_required(
-                    product_session_token,
-                    previous_sequence,
-                ));
-                return;
-            };
-            let Some(event) =
-                authority_changed(product_session_token, sequence, value, &operations)
-            else {
+            let sequence = value.sequence();
+            let Some(event) = authority_changed(
+                product_session_token,
+                sequence,
+                value.payload(),
+                &operations,
+            ) else {
                 let _ = on_event.send(DesktopEvent::resync_required(
                     product_session_token,
                     previous_sequence,
@@ -258,8 +265,7 @@ async fn forward_service_events(
                 return;
             }
         }
-        let page_drained = values.len() < limit.get();
-        cursor = Some(next);
+        cursor = Some(page.cursor().clone());
         let cursor_retained = match retained_cursor.lock() {
             Ok(mut retained) => {
                 *retained = cursor.clone();
@@ -274,13 +280,29 @@ async fn forward_service_events(
             ));
             return;
         }
-        // Keep the existing polling cadence when caught up, including continuous market
-        // updates. Only a full retained page warrants immediately draining another page.
-        if page_drained {
-            tokio::select! {
-                () = cancellation.cancelled() => return,
-                () = tokio::time::sleep(EMPTY_POLL_INTERVAL) => {}
-            }
+    }
+}
+
+fn forward_subscription_error(
+    error: ApplicationClientError,
+    product_session_token: ProductSessionToken,
+    previous_sequence: u64,
+    cancellation: &CancellationToken,
+    on_event: &Channel<DesktopEvent>,
+) {
+    match error {
+        ApplicationClientError::Interrupted if cancellation.is_cancelled() => {}
+        ApplicationClientError::Unavailable | ApplicationClientError::Interrupted => {
+            let _ = on_event.send(DesktopEvent::stream_disconnected(
+                product_session_token,
+                previous_sequence,
+            ));
+        }
+        ApplicationClientError::Rejected | ApplicationClientError::InvalidResponse => {
+            let _ = on_event.send(DesktopEvent::resync_required(
+                product_session_token,
+                previous_sequence,
+            ));
         }
     }
 }

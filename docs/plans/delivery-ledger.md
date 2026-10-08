@@ -6,6 +6,51 @@ Goal active: owner reconfirmed resume after the lead mistakenly reapplied the ol
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `034f0ca067ccc039c8eae8e3f2e863149caf2f0f`. Main/release unchanged; no extra branch created.
 
+### Active shared subscription transport — 5cf28794 refresh
+
+Previous turn is progress:3d00c0fd/5cf28794 are pushed, dictionary critical check and application check
+passed. Supervisor build69109 completed in5m42s; service69886/Desktop69887 remain visible while the
+watcher60793 is suspended for the coherent source/check interval. No competing compiler is running.
+
+Small integrated dependency checkpoint: replace finite500ms event polling with one authenticated,
+body-owned shared event subscription using the existing EventHub and publication observer. This
+provides actual pushed updates for all existing domains/consumers and the transport lifetime needed
+by transient canonical demand, without a second broker or empty lifetime-only connection. It does
+not by itself add upstream symbol demand or fix retained-price selection; those remain next required
+producer/consumer wiring. Latest-state invalidation can coalesce; sequence gaps require retained
+snapshot recovery and never imply delivery of every financial event.
+
+Frozen client seam: `ApplicationClient::subscribe_events(cursor, limit, cancellation)` returns
+`ApplicationEventSubscription`; `next_page(&mut self)` returns the existing validated `EventPage`
+with exact events/cursor and an explicit `snapshot_required` flag, or `ApplicationClientError`. The response owns client activity and
+stream admission until drop, cancels on credential/service generation invalidation, and keeps
+ordinary reads/cancellation independent. Use Axum's SSE response and the already-locked sse-stream0.2.5
+decoder with a predecode frame byte ceiling. No hand-built SSE parser, new server or lifetime TTL.
+Keep heartbeat transport maintenance separate from data polling; client response total timeout is
+replaced only for this held stream with bounded handshake and explicit cancellation.
+
+| Owner | Exclusive files / start barrier | Required critical evidence / next dependency |
+| --- | --- | --- |
+| Lead | runtime `events.rs`, `auth.rs`, `router.rs`, `client.rs`, `contracts.rs`, new focused runtime event subscription module if needed; Cargo manifests/lock, service composition test callers, ledger/Git/build/runtime | Existing real-listener cancellation test extended for two independent streams, immediate committed notifications, drop/revocation/idle lifetime and control availability. Existing overflow/resync test retained. Begin source edits only after current build completes; suspend watcher during coherent edit/check. |
+| GPT-6.1 Sol High Desktop | `apps/market-squawk-desktop/src-tauri/src/events.rs` only, after lead signals build complete | Replace polling with held subscription; preserve exact cursor/event validation, same-session reconnect, unmount/cancellation and resync mapping. No React changes, builds, Git, runtime or tests. Lead checks actual native integration. |
+
+Recovery correction within this checkpoint: inspection found that an expired/overflowed cursor cannot establish a new baseline and React treats resync as terminal unavailability. Lead additionally owns `src/app/product-context.tsx`, native event forwarding and the runtime page contract to deliver an explicit snapshot-required baseline and resume updates. Existing real-listener critical test will cover reconnect after journal overflow; snapshots are re-read, never treated as replayed financial events. The Desktop helper has finished and released its file.
+
+Critical checks: runtime library8/8 passed (0.23s), including two real TCP subscribers,
+independent drop/query cancellation, finite-timeout independence, credential revocation and reconnect
+through retention overflow. One new decoder-bound test covers an otherwise unchecked resource failure:
+unfinished SSE frames across chunk/line-ending boundaries. Existing Desktop session-recovery test
+extended for snapshot baseline then contiguous updates passed1/1 (10 unrelated skipped); TypeScript
+build passed. Application `control_plane` composition-test compile passed in4m28s with existing warnings; this verifies the updated native/MCP client test callers compile, not that the installed scenario ran. Watcher60793 resumed after checks; its single build71129 is compiling the native/service replacement against the integrated source. Existing service69886/Desktop69887 stay running until replacement succeeds. No manual second Cargo build is authorized while71129 runs. Native/service build71129 passed in7m47s; supervisor started service71694 and Desktop71698 from generation-QBGD1r and reclaimed the old stage. Actual background WebDriver inspection reports workspace ready, event connection connected, sequence113 then128 without page interaction; no workspace-loading or disconnected banner. Evidence: `oct8-shared-event-native.json` and `oct8-shared-event-native-sequence-{1,2}.json`. The first raw eval attempts timed out because they omitted the plugin callback; corrected callback-style reads passed. This verifies live native notification delivery, not complete market/provider or installed workflows. Lead owns all integrated files;
+Desktop helper scope released. Resulting implementation commit pending below. Only the provider numeric dictionary relocation from
+3d00c0fd is complete: remaining Schwab-specific application orchestration still needs the agreed
+canonical source/subscription boundary; this transport change does not claim that relocation complete.
+Source closure regenerated with dependency/artifact authorities unchanged; only `sources` changed.
+Previous goal turn: progress (source implementation and critical checks). This continuation: progress
+(native compile/live delivery evidence and integration). No pause or final acceptance is claimed. All remaining data-family,
+upstream independent demand, selected-current-read, Schwab rate and option-reference defects remain
+required; this checkpoint is a real shared-consumer transport dependency, not streaming completion.
+
 ### Current integration — 3d00c0fd adapter boundary
 
 Previous turn made concrete progress:9faa41ce is pushed, existing critical test passed and native
