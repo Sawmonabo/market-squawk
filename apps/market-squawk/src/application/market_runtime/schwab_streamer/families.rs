@@ -56,7 +56,7 @@ impl Proofs {
                 capture.service_responses().iter().any(|response| {
                     response.service() == service
                         && response.command() == "SUBS"
-                        && response.status_code() == 0
+                        && response.succeeded()
                 })
             }) else {
                 // No same-family success evidence: canonical mapping remains unavailable; raw is sealed.

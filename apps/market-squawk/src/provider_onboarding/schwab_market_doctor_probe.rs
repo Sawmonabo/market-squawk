@@ -1472,7 +1472,7 @@ fn observe_streamer_capture(
                 .map_err(|error| failed("handoff-evidence", error))
                 .map(Some)
         }
-        [response] if response.status_code() == 0 => {
+        [response] if response.succeeded() => {
             if accumulator.is_some() {
                 return Err(failed(
                     "duplicate-ack",
@@ -1514,7 +1514,7 @@ fn successful_streamer_handoff_evidence(
     let response = input.service_response();
     if handoff.service() != service
         || response.service() != service
-        || response.status_code() != 0
+        || !response.succeeded()
         || response.round_trip_latency_ms().is_none()
         || handoff.capture_count() < 2
         || input.provider_records() == 0
@@ -1530,7 +1530,8 @@ fn successful_streamer_handoff_evidence(
         .last()
         .map(|frame| frame.received_at())
         .ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
-    let status = SchwabMarketDoctorProbeStatus::Streamer(0);
+    let status =
+        SchwabMarketDoctorProbeStatus::streamer(response.status_code(), response.command())?;
     let rate_observation = SchwabMarketDoctorRateObservation::try_new(
         SchwabMarketDoctorProbeScope::Streamer(family),
         status,
@@ -1582,7 +1583,7 @@ fn rejected_streamer_capture_evidence(
     };
     let receipt = capture.streamer_receipt();
     if response.service() != service
-        || response.status_code() == 0
+        || response.succeeded()
         || response.request_payload_sha256().is_none()
         || response.sealed_capture_receipt_sha256() != capture.persisted_receipt().receipt_digest()
         || response.round_trip_latency_ms().is_none()
@@ -1590,7 +1591,8 @@ fn rejected_streamer_capture_evidence(
         return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence);
     }
     let observed_at = timestamp_from_millis(response.received_at_unix_millis())?;
-    let status = SchwabMarketDoctorProbeStatus::Streamer(response.status_code());
+    let status =
+        SchwabMarketDoctorProbeStatus::streamer(response.status_code(), response.command())?;
     let rate_observation = SchwabMarketDoctorRateObservation::try_new(
         SchwabMarketDoctorProbeScope::Streamer(family),
         status,

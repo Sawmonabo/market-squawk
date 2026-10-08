@@ -210,14 +210,28 @@ impl SchwabMarketDoctorRateObservation {
 #[serde(tag = "transport", content = "status", rename_all = "snake_case")]
 pub(crate) enum SchwabMarketDoctorProbeStatus {
     Http(u16),
-    Streamer(i64),
+    Streamer { code: i64, command: &'static str },
 }
 
 impl SchwabMarketDoctorProbeStatus {
-    const fn accepted(self) -> bool {
+    pub(super) fn streamer(code: i64, command: &str) -> Result<Self, SchwabMarketDataDoctorError> {
+        let command = match command {
+            "LOGIN" => "LOGIN",
+            "SUBS" => "SUBS",
+            "ADD" => "ADD",
+            "UNSUBS" => "UNSUBS",
+            _ => return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence),
+        };
+        Ok(Self::Streamer { code, command })
+    }
+
+    pub(crate) fn accepted(self) -> bool {
         match self {
             Self::Http(status) => status >= 200 && status <= 299,
-            Self::Streamer(code) => code == 0,
+            Self::Streamer { code, command } => {
+                market_squawk_adapter_schwab::StreamerResponseCode::new(code)
+                    .is_success_for(command)
+            }
         }
     }
 }
@@ -1186,7 +1200,11 @@ impl SchwabStreamerRequestPermit for SchwabDoctorStreamerRequestPermit {
             }
             self.permit
                 .observe(
-                    SchwabMarketDoctorProbeStatus::Streamer(acknowledgement.status_code()),
+                    SchwabMarketDoctorProbeStatus::streamer(
+                        acknowledgement.status_code(),
+                        acknowledgement.command(),
+                    )
+                    .map_err(|_| SchwabTransportError::Protocol)?,
                     cancellation,
                     deadline,
                 )

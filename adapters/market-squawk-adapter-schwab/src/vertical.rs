@@ -1083,7 +1083,7 @@ fn validate_ack_capture(
     if response.service() != service
         || response.command() != "SUBS"
         || response.request_id().is_empty()
-        || response.status_code() != 0
+        || !response.succeeded()
         || response.round_trip_latency_ms().is_none()
         || request_payload_sha256.algorithm() != DigestAlgorithm::Sha256
         || request_payload_sha256.bytes() == [0; 32]

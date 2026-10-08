@@ -712,6 +712,50 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         Err(SchwabAdapterError::InvalidStreamerState)
     );
     assert_eq!(controller.socket_connected(generation), Ok(()));
+    assert_eq!(
+        controller.login_accepted(generation),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    );
+    assert!(matches!(
+        controller.login_request(bootstrap.value(), ""),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    ));
+    assert_eq!(
+        controller.login_accepted(generation),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    );
+    let assert_coordinates = |request: &crate::TransientStreamerRequest,
+                              command: &str,
+                              customer: &str,
+                              correlation: &str| {
+        let wire: serde_json::Value = serde_json::from_slice(request.expose_body())
+            .unwrap_or_else(|error| panic!("command wire: {error}"));
+        assert_eq!(wire["requests"].as_array().map(Vec::len), Some(1));
+        let request_wire = &wire["requests"][0];
+        assert_eq!(request_wire["command"], command);
+        assert_eq!(request_wire["SchwabClientCustomerId"], customer);
+        assert_eq!(request_wire["SchwabClientCorrelId"], correlation);
+        if command != "LOGIN" {
+            assert!(request_wire["parameters"].get("Authorization").is_none());
+            let encoded = String::from_utf8_lossy(request.expose_body());
+            assert!(!encoded.contains("streamer-test-access-token"));
+            assert!(!encoded.contains("must-not-escape"));
+            assert!(!encoded.contains("ACCOUNT_ACTIVITY"));
+        }
+    };
+    let login = controller
+        .login_request(bootstrap.value(), "streamer-test-access-token")
+        .unwrap_or_else(|error| panic!("LOGIN request: {error}"));
+    assert_coordinates(&login, "LOGIN", "customer", "correlation");
+    drop(login);
+    let debug = format!("{controller:?}");
+    assert!(!debug.contains("\"customer\""));
+    assert!(!debug.contains("\"correlation\""));
+    assert!(!debug.contains("streamer-test-access-token"));
+    assert!(matches!(
+        controller.login_request(bootstrap.value(), "streamer-test-access-token"),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    ));
     assert_eq!(controller.login_accepted(generation), Ok(()));
     assert_eq!(controller.state(), ConnectionState::Active(generation));
     let requests = controller
@@ -719,7 +763,110 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         .unwrap_or_else(|error| panic!("desired replay: {error}"));
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].command(), "SUBS");
-    assert!(!String::from_utf8_lossy(requests[0].expose_body()).contains("ACCOUNT_ACTIVITY"));
+    assert_coordinates(&requests[0], "SUBS", "customer", "correlation");
+    let replacement = controller
+        .replace_desired(subscription.clone())
+        .unwrap_or_else(|error| panic!("active SUBS: {error}"))
+        .expect("active replacement must encode SUBS");
+    assert_coordinates(&replacement, "SUBS", "customer", "correlation");
+    let addition = StreamerSubscription::try_new(
+        MarketDataService::LevelOneEquities,
+        vec![ProviderIdentifier::try_new("MSFT").expect("bounded addition symbol")],
+        vec![0, 1, 2],
+        stream_admission,
+    )
+    .expect("bounded addition");
+    let added = controller
+        .add_desired(addition.clone())
+        .unwrap_or_else(|error| panic!("active ADD: {error}"))
+        .expect("active addition must encode ADD");
+    assert_coordinates(&added, "ADD", "customer", "correlation");
+    let removed = controller
+        .remove_desired(addition)
+        .unwrap_or_else(|error| panic!("active UNSUBS: {error}"))
+        .expect("active removal must encode UNSUBS");
+    assert_coordinates(&removed, "UNSUBS", "customer", "correlation");
+
+    assert_eq!(controller.disconnected(generation), Ok(()));
+    let next_generation = ConnectionGeneration::new(NonZeroU64::new(2).expect("next generation"));
+    assert_eq!(controller.begin_connect(next_generation), Ok(()));
+    assert_eq!(controller.socket_connected(next_generation), Ok(()));
+    assert_eq!(
+        controller.login_accepted(next_generation),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    );
+    let mut next_preference: serde_json::Value = serde_json::from_slice(preference)
+        .unwrap_or_else(|error| panic!("next preference fixture: {error}"));
+    next_preference["streamerInfo"][0]["schwabClientCustomerId"] =
+        serde_json::json!("next-customer");
+    next_preference["streamerInfo"][0]["schwabClientCorrelId"] =
+        serde_json::json!("next-correlation");
+    let next_preference = serde_json::to_vec(&next_preference)
+        .unwrap_or_else(|error| panic!("next preference encoding: {error}"));
+    let next_bootstrap = parse_user_preference(&next_preference, bounds())
+        .unwrap_or_else(|error| panic!("next bootstrap: {error}"));
+    let next_login = controller
+        .login_request(next_bootstrap.value(), "streamer-test-access-token")
+        .unwrap_or_else(|error| panic!("next LOGIN: {error}"));
+    assert_coordinates(&next_login, "LOGIN", "next-customer", "next-correlation");
+    drop(next_login);
+    assert_eq!(controller.login_accepted(next_generation), Ok(()));
+    let replayed = controller
+        .replay_desired()
+        .unwrap_or_else(|error| panic!("next desired replay: {error}"));
+    assert_eq!(replayed.len(), 1);
+    assert_coordinates(&replayed[0], "SUBS", "next-customer", "next-correlation");
+    assert_eq!(controller.disconnected(next_generation), Ok(()));
+    assert!(matches!(
+        controller.replay_desired(),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    ));
+
+    for command in ["LOGIN", "SUBS", "ADD", "UNSUBS"] {
+        assert!(StreamerResponseCode::Success.is_success_for(command));
+        assert!(!StreamerResponseCode::SymbolLimit.is_success_for(command));
+        assert!(!StreamerResponseCode::Other(21).is_success_for(command));
+        assert!(!StreamerResponseCode::Other(999).is_success_for(command));
+    }
+    for (code, command) in [(26, "SUBS"), (27, "UNSUBS"), (28, "ADD")] {
+        let response = serde_json::to_vec(&serde_json::json!({
+            "response": [{
+                "service": "LEVELONE_EQUITIES", "command": command,
+                "requestid": "2", "timestamp": 1710000000000_u64,
+                "content": {"code": code, "msg": "command succeeded"}
+            }]
+        }))
+        .expect("bounded successful reply fixture");
+        let parsed = parse_streamer_frame(&response, bounds())
+            .unwrap_or_else(|error| panic!("command success response: {error}"));
+        let response = &parsed.value().responses[0];
+        assert_eq!(response.code, StreamerResponseCode::Other(code));
+        assert!(response.code.is_success_for(&response.command));
+        for candidate in ["LOGIN", "SUBS", "ADD", "UNSUBS", "VIEW"] {
+            assert_eq!(
+                response.code.is_success_for(candidate),
+                candidate == command
+            );
+        }
+    }
+    assert!(!StreamerResponseCode::Other(29).is_success_for("VIEW"));
+
+    let encoding_limited = StreamerAdmission::new(
+        RequestAdmission::new(nonzero(1), nonzero(1)),
+        nonzero(1),
+        nonzero(16),
+    );
+    let mut encoding_limited = DesiredStateController::new(encoding_limited);
+    assert_eq!(encoding_limited.begin_connect(generation), Ok(()));
+    assert_eq!(encoding_limited.socket_connected(generation), Ok(()));
+    assert!(matches!(
+        encoding_limited.login_request(bootstrap.value(), "streamer-test-access-token"),
+        Err(SchwabAdapterError::RequestNotAdmitted)
+    ));
+    assert_eq!(
+        encoding_limited.login_accepted(generation),
+        Err(SchwabAdapterError::InvalidStreamerState)
+    );
 
     let one_service_admission = StreamerAdmission::new(admission(), nonzero(1), nonzero(16));
     let mut bounded = DesiredStateController::new(one_service_admission);
@@ -2115,7 +2262,7 @@ impl SchwabStreamerRequestPermit for MockStreamerRequestRatePermit {
                 self.request_payload_bytes
             );
             assert!(acknowledgement.transport_ordinal().is_some());
-            if acknowledgement.status_code() == 0 {
+            if acknowledgement.succeeded() {
                 self.budget
                     .record_success()
                     .map_err(|_| SchwabTransportError::Protocol)?;
@@ -2246,7 +2393,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         br#"{"response":[{"service":"ADMIN","command":"LOGIN","requestid":"1","timestamp":1710000000000,"content":{"code":0,"msg":"OK"}}]}"#,
     );
     let equities_subscribed = Bytes::from_static(
-        br#"{"response":[{"service":"LEVELONE_EQUITIES","command":"SUBS","requestid":"2","timestamp":1710000000001,"content":{"code":0,"msg":"OK"}}]}"#,
+        br#"{"response":[{"service":"LEVELONE_EQUITIES","command":"SUBS","requestid":"2","timestamp":1710000000001,"content":{"code":26,"msg":"SUBS succeeded"}}]}"#,
     );
     let options_subscribed = Bytes::from_static(
         br#"{"response":[{"service":"LEVELONE_OPTIONS","command":"SUBS","requestid":"3","timestamp":1710000000002,"content":{"code":0,"msg":"OK"}}]}"#,
@@ -2451,7 +2598,8 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .unwrap_or_else(|error| panic!("typed Streamer doctor handoff: {error}"));
     assert_eq!(equities_streamer_doctor.provider_records(), 1);
     let service_response = equities_streamer_doctor.acknowledgement();
-    assert_eq!(service_response.status_code(), 0);
+    assert_eq!(service_response.status_code(), 26);
+    assert!(service_response.succeeded());
     let stream_capacity = service_response
         .capacity_observation()
         .unwrap_or_else(|error| panic!("sealed Streamer capacity evidence: {error}"));
@@ -3195,6 +3343,26 @@ impl SchwabStreamerConnection for MockStreamerConnection {
                 .and_then(serde_json::Value::as_str)
                 .ok_or(SchwabTransportError::Protocol)?
                 .to_owned();
+            assert_eq!(
+                request
+                    .get("SchwabClientCustomerId")
+                    .and_then(serde_json::Value::as_str),
+                Some("customer")
+            );
+            assert_eq!(
+                request
+                    .get("SchwabClientCorrelId")
+                    .and_then(serde_json::Value::as_str),
+                Some("correlation")
+            );
+            if command != "LOGIN" {
+                assert!(
+                    request
+                        .get("parameters")
+                        .and_then(|parameters| parameters.get("Authorization"))
+                        .is_none()
+                );
+            }
             self.state
                 .lock()
                 .map_err(|_| SchwabTransportError::Protocol)?

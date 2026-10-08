@@ -212,7 +212,7 @@ impl SchwabStreamerRequestPermit for SchwabStreamerAccountRatePermit {
             {
                 return Err(SchwabTransportError::Protocol);
             }
-            let result = if acknowledgement.status_code() == 0 {
+            let result = if acknowledgement.succeeded() {
                 self.budget
                     .record_success()
                     .map_err(map_streamer_budget_error)

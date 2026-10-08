@@ -314,11 +314,29 @@ pub enum ConnectionState {
     Closing(ConnectionGeneration),
 }
 
+/// Private connection coordinates retained only after LOGIN request encoding succeeds.
+struct StreamerSessionCoordinates {
+    generation: ConnectionGeneration,
+    customer_id: Zeroizing<String>,
+    correlation_id: Zeroizing<String>,
+}
+
+impl fmt::Debug for StreamerSessionCoordinates {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamerSessionCoordinates")
+            .field("generation", &self.generation)
+            .field("coordinates", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Serialized one-connection desired-state controller.
 #[derive(Debug)]
 pub struct DesiredStateController {
     state: ConnectionState,
     last_generation: Option<ConnectionGeneration>,
+    session_coordinates: Option<StreamerSessionCoordinates>,
     desired: BTreeMap<MarketDataService, StreamerSubscription>,
     next_request_id: NonZeroU64,
     admission: StreamerAdmission,
@@ -329,6 +347,7 @@ impl DesiredStateController {
         Self {
             state: ConnectionState::Disconnected,
             last_generation: None,
+            session_coordinates: None,
             desired: BTreeMap::new(),
             next_request_id: NonZeroU64::MIN,
             admission,
@@ -367,7 +386,12 @@ impl DesiredStateController {
         &mut self,
         generation: ConnectionGeneration,
     ) -> Result<(), SchwabAdapterError> {
-        if self.state != ConnectionState::AwaitingLogin(generation) {
+        if self.state != ConnectionState::AwaitingLogin(generation)
+            || self
+                .session_coordinates
+                .as_ref()
+                .is_none_or(|coordinates| coordinates.generation != generation)
+        {
             return Err(SchwabAdapterError::InvalidStreamerState);
         }
         self.state = ConnectionState::Active(generation);
@@ -381,6 +405,7 @@ impl DesiredStateController {
         {
             return Err(SchwabAdapterError::InvalidStreamerState);
         }
+        self.session_coordinates = None;
         self.state = ConnectionState::Disconnected;
         Ok(())
     }
@@ -484,30 +509,54 @@ impl DesiredStateController {
         bootstrap: &StreamerBootstrap,
         access_token: &str,
     ) -> Result<TransientStreamerRequest, SchwabAdapterError> {
-        if !matches!(self.state, ConnectionState::AwaitingLogin(_))
+        let ConnectionState::AwaitingLogin(generation) = self.state else {
+            return Err(SchwabAdapterError::InvalidStreamerState);
+        };
+        if self.session_coordinates.is_some()
             || access_token.is_empty()
             || access_token.len() > MAX_BOOTSTRAP_VALUE_BYTES
         {
             return Err(SchwabAdapterError::InvalidStreamerState);
         }
         let request_id = self.take_request_id()?;
-        TransientStreamerRequest::login(
+        let request = TransientStreamerRequest::login(
             bootstrap,
             access_token,
             request_id,
             self.admission.request(),
-        )
+        )?;
+        self.session_coordinates = Some(StreamerSessionCoordinates {
+            generation,
+            customer_id: Zeroizing::new(bootstrap.customer_id.to_string()),
+            correlation_id: Zeroizing::new(bootstrap.correlation_id.to_string()),
+        });
+        Ok(request)
     }
     fn subscription_request(
         &mut self,
         subscription: &StreamerSubscription,
         command: StreamerCommand,
     ) -> Result<TransientStreamerRequest, SchwabAdapterError> {
+        let ConnectionState::Active(generation) = self.state else {
+            return Err(SchwabAdapterError::InvalidStreamerState);
+        };
+        if self
+            .session_coordinates
+            .as_ref()
+            .is_none_or(|coordinates| coordinates.generation != generation)
+        {
+            return Err(SchwabAdapterError::InvalidStreamerState);
+        }
         let request_id = self.take_request_id()?;
+        let coordinates = self
+            .session_coordinates
+            .as_ref()
+            .ok_or(SchwabAdapterError::InvalidStreamerState)?;
         TransientStreamerRequest::subscription(
             subscription,
             command,
             request_id,
+            coordinates,
             self.admission.request(),
         )
     }
@@ -565,6 +614,7 @@ impl TransientStreamerRequest {
         subscription: &StreamerSubscription,
         command: StreamerCommand,
         request_id: NonZeroU64,
+        coordinates: &StreamerSessionCoordinates,
         admission: RequestAdmission,
     ) -> Result<Self, SchwabAdapterError> {
         #[derive(Serialize)]
@@ -584,10 +634,12 @@ impl TransientStreamerRequest {
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let request = WireMarketRequest {
+        let request = WireRequest {
             service: subscription.service.as_str(),
             command: command.as_str(),
             requestid: request_id.get().to_string(),
+            customer_id: &coordinates.customer_id,
+            correlation_id: &coordinates.correlation_id,
             parameters: Parameters { keys, fields },
         };
         Self::encode(
@@ -670,13 +722,6 @@ struct WireRequest<'a, T> {
     correlation_id: &'a str,
     parameters: T,
 }
-#[derive(Serialize)]
-struct WireMarketRequest<T> {
-    service: &'static str,
-    command: &'static str,
-    requestid: String,
-    parameters: T,
-}
 
 /// Closed Streamer response code; unknown codes retain their provider value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -686,7 +731,20 @@ pub enum StreamerResponseCode {
     Other(i64),
 }
 impl StreamerResponseCode {
-    fn new(value: i64) -> Self {
+    /// Recognizes provider success without discarding its original numeric status.
+    /// Command-specific success cannot authorize another command or unsupported VIEW.
+    pub fn is_success_for(&self, command: &str) -> bool {
+        match self {
+            Self::Success => true,
+            Self::Other(26) => command == "SUBS",
+            Self::Other(27) => command == "UNSUBS",
+            Self::Other(28) => command == "ADD",
+            Self::SymbolLimit | Self::Other(_) => false,
+        }
+    }
+
+    /// Retains the original provider status, including command-specific successes.
+    pub const fn new(value: i64) -> Self {
         match value {
             0 => Self::Success,
             19 => Self::SymbolLimit,

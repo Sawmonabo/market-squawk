@@ -4,7 +4,71 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`1c9c41fa`. Main/release unchanged; no extra branch created.
+`7193df15`. Main/release unchanged; no extra branch created.
+
+### Schwab command correction — verification checkpoint
+
+Implemented and critically verified; live/installed streaming still unproven. All subscription
+commands now carry private connection-generation coordinates, and transport/rate/capture/doctor/
+publication consumers share command-aware success classification while preserving exact numeric
+reply codes. Existing adapter tests2/2 passed0.27s (compile1m12s); source closure and whitespace check
+passed. The full supervised native build78495 passed5m43s. Service78916/Desktop78917 now run
+`generation-Ug3Qjh`; watcher60793 is stopped and no compiler remains. Evidence:
+`oct8-schwab-wire-critical.log`, `oct8-schwab-wire-source-closure.log`, `oct8-corrected-native.log`.
+
+Native saved-session Continue returned `connection_setup_rejected` before a new doctor-completion
+record. Read-only inspection still reports credential_stored=true and runtime_verification_pending.
+The first automation error formatter lost the structured error; the corrected bounded attempt
+retained its public code/message in `oct8-schwab-wire-native-continue.json`. Inspection evidence:
+`oct8-schwab-wire-native-inspect.json`. Do not infer provider denial, lost credentials or successful
+activation from that generic rejection. Next provider dependency is locate this lifecycle rejection,
+then repeat actual quote→stored selection→native displayed update. Other malformed doctor field/key
+selections remain open family-level remediation; no all-family acceptance claim.
+
+Astra's history diagnostic is complete: exact VTI discovery168ms; narrow join-order variant4.3ms
+versus131–137ms with identical rows; selected-manifest integrity SQL1.4ms. Diagnostic SQLite3.50.4
+is not bundled3.53.2, and statistics exist without provable freshness. No query rewrite is yet
+accepted: inspect the native read path before applying a hint. Report: `oct8-previous-close-diagnosis.md`.
+All helper ownership is released. Lead owns remaining integration, Git and runtime checks.
+
+### Active integration — visible market updates
+
+Previous goal turn: status response only; no implementation progress. Native replacement76649 has
+now completed (6m07s); service77733/Desktop77739 run generation-pJg4kx. Watcher60793 is stopped;
+no compiler is active. Native Home still shows price/change dashes: nine retained rows completed,
+then previous-close lookup exhausted the15s request deadline. This is a failed displayed-price
+check, not visible streaming acceptance (`oct8-indexed-native-overview.json`, native log).
+
+Lead owns the Schwab wire patch integration and exact consumers: adapter streamer.rs, tests.rs,
+transport/streamer.rs, vertical.rs; application provider_onboarding/schwab_market_doctor.rs,
+schwab_market_doctor_probe.rs, service/rate_runtime.rs, provider_rate/schwab_streamer.rs and
+application/market_runtime/schwab_streamer/families.rs. Preserve original reply codes, classify
+success against the correlated command and pass private session coordinates on every command.
+Existing lifecycle and microbatch tests cover the missing wire/ACK contract; then one native build
+and real displayed quote verification. Patch prepared, not yet verified; pushed fix commit pending.
+
+Astra current_display_reuse owns only `.agents/tmp/v1-first-stock/oct8-previous-close-diagnosis.md`:
+read-only diagnosis of the remaining15s collection failure through durable_product.rs, previous_close.rs
+and actual selected storage/ResearchIoWorker. Identify repeated/full-history or serialization costs and
+the smallest cohesive correction that keeps independent price data visible while comparisons load.
+No source edits, provider calls, Git, runtime changes or builds. Lead owns all integration/source.
+Dependencies: provider correction and price-read diagnosis are independent; compile only after freeze.
+Next evidence barrier remains actual quotes changing native watchlist and investment details without
+Refresh, followed by restart. No new data/source/product-completion claim.
+
+The Schwab wire/command correction is integrated locally. Existing adapter lifecycle and real
+microbatch capture→ACK→canonical quote publication checks passed2/2 (0.27s; compile1m12s), including
+code26 retained as26 and counted as success, private command coordinates and reconnect replacement.
+Source closure refreshed. Supervisor native build78495 is live; source frozen until its terminal
+result. App compilation/live behavior remains pending; watcher is active for this coordinated build.
+
+Astra previous-close report is complete and inspected. `fallback_completed9` means nine processed
+instruments, not necessarily nine non-null prices. The observed wait is inside latest-window
+selection before projection/rights. Next bounded evidence task: Astra current_display_reuse may
+append ONLY its existing diagnosis report using read-only SQLite query plans/timing for the exact
+current history selector and one actual watchlist instrument. No secrets/raw captures, writes,
+provider calls, runtime changes, Git or builds. Identify measured bottleneck before choosing a
+query rewrite or request-local reuse; root owns all source/contracts/consumer separation.
 
 ### Current checkpoint — indexed current-price selection
 
@@ -23,8 +87,41 @@ and overflow, canonical corruption rejection, archive, service reopen and backup
 source-closure refresh and diff whitespace check passed. Evidence:
 `oct8-indexed-current-critical.log`, `oct8-indexed-current-source-closure.log`. Query-only diagnostic
 found one real retained quote in0.0947s plus0.00051s for its ties; it does not prove page latency.
-Resulting pushed commit pending. Next barrier is one coordinated native replacement and an actual
+Pushed `7193df15`; PR43 evidence https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6070588486 .
+Supervisor Cargo76649 is the only live native replacement build; source remains frozen. Next barrier is an actual
 watchlist/detail price read, then provider stream admission and automatic visible changes.
+
+### Parallel dependency while native source is frozen
+
+GPT-6.1 Sol High `schwab_probe_failures` owns only
+`.agents/tmp/v1-first-stock/oct8-schwab-probe-failures.md`. Read-only source diagnosis of why the
+persisted doctor reports every streaming family unavailable despite successful OAuth and REST quote
+access. Trace production probe construction, LOGIN/subscription replies, rate policy and failure
+classification; distinguish app rejection from provider denial, missing traffic and malformed request.
+No provider calls, secrets/raw capture reads, database mutation, Git/build/runtime or source edits.
+Use the filtered live outcome `oct8-rate-live-doctor-summary.json` and current source. Report concrete
+producer/consumer fix and smallest existing check; explicitly mark absent raw response evidence.
+Lead owns all code, integration and live evidence. This investigation does not assert provider absence
+or broaden the current indexed-read checkpoint. Resulting provider-fix commit pending diagnosis.
+
+The probe report is complete and inspected. It substantiates missing session coordinates on every
+market command and rejection of documented command-specific successes26–28, with affected rate,
+sealed ACK, doctor and canonical publication consumers. Exact live codes remain uninspected; no
+upstream-absence claim. It also identifies malformed generic doctor field/key selections for some
+families; these remain required remediation. Source: `oct8-schwab-probe-failures.md`.
+
+Next bounded preparation: the same Sol helper owns only
+`.agents/tmp/v1-first-stock/oct8-schwab-streamer-wire.patch`, unapplied patch for adapter `src/streamer.rs`
+and its existing `src/tests.rs` parsing/lifecycle test. Freeze one public adapter predicate:
+`StreamerResponseCode::is_success_for(&self, command: &str) -> bool`, preserving raw codes
+(Success0, Other26–28 only matching SUBS/UNSUBS/ADD; no new VIEW admission). Bind private zeroizing
+customer/correlation coordinates from a successfully encoded LOGIN into controller connection state,
+clear on disconnect, and reuse WireRequest for market commands. No token retention or public
+identifier fields. Lead owns transport, vertical/capacity, doctor/status/rate and application consumers,
+all application composition, Git/build/runtime and integration; no applying patch during native build.
+Critical gap: existing fake provider did not inspect command coordinates or command-specific success.
+Smallest checks: existing adapter lifecycle/parsing and microbatch handoff tests, then actual native
+doctor and displayed quotes. Resulting fix commit pending integrated verification.
 
 ### Prior checkpoint — correct rate controls without replacing saved sign-in
 
@@ -65,40 +162,12 @@ Implementation pushed as `1c9c41fa`; PR43 evidence:
 https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6070419781 . Next barrier is the one
 supervised native replacement, saved-session doctor, then current-read correction and displayed quotes.
 
-### Next dependency prepared during the frozen native build
+### Indexed-read integration ownership closed
 
-Outcome: Overview/watchlist/detail current prices read indexed winning events instead of counting
-all historical exclusions. Prior rate checkpoint is pushed; no source edits during its native build.
-Astra `current_display_reuse` may write only
-`.agents/tmp/v1-first-stock/oct8-indexed-current-selection.patch`, a reviewable patch targeting
-`crates/market-squawk-data/src/manifest/catalog.rs`. No applying it, Git/build/runtime/provider calls.
-Lead owns public contract/export (`provider_event_selection.rs`, `lib.rs`), application batch consumer,
-existing publication-recovery test, documentation and integration. Agent must not edit these files.
-
-Frozen seam for the prepared patch: public `ProviderMarketEventExclusionAccounting::{CountAll,
-NotRequested}`; request accessor `exclusion_accounting()` and builder
-`with_exclusion_accounting(mode)`; crate-visible `validate_exclusion_accounting()` returns
-`Result<(), ProviderMarketEventSelectionError>` and rejects NotRequested unless exact source,
-instrument scope, SourceTimestamp, LatestReceivedObservation. Validate before resolving a horizon.
-`ProviderMarketEventCatalogPlan::try_new` receives `Option<ProviderMarketEventExclusionCounts>`;
-CountAll supplies Some(real counts), NotRequested supplies None. Lead binds mode/presence in digest
-and exact restart. Existing constructors default to CountAll; only ordinary select_current_batch opts
-out. SQL owner uses the existing source-time index, all eligibility predicates before winner LIMIT,
-then max+1 complete equal-time/receive ties sorted in bounded Rust memory. No new index/schema,
-whole-history aggregation, fake zero counts or actor-presence shortcut. Reuse existing candidate
-reconstruction and same snapshot. Smallest critical check is the existing publication restart test
-extended for counted/uncounted equivalence, late durable publication, ties/overflow and replay.
-Resulting current-read commit pending; native timing/display remains its completion barrier.
-
-Native replacement Cargo75390 finished successfully in7m27s; new service76175 started.
-Watcher60793 is temporarily stopped for coherent source integration, with the service retained.
-The prepared SQL patch has been inspected against existing predicates. Lead now implements the
-frozen shared request/receipt/export and application consumer contract. Astra `current_display_reuse`
-owns only `crates/market-squawk-data/tests/publication_recovery.rs` to extend the existing
-`provider_market_event_publication_is_restart_queryable` critical test: indexed/counted evidence
-equivalence, invalid shape, complete ties/overflow, late durable publication and exact restart
-across archive/reopen. No new harness, source edits outside that file, builds, Git or runtime.
-Lead schedules the single critical data test after integration. Current-read commit pending.
+Lead inspected/applied `oct8-indexed-current-selection.patch`, implemented the public accounting
+contract/export and batch consumer, and integrated Astra's existing publication-recovery test.
+All source is committed/pushed in7193df15; those helper scopes are released. Earlier query reports
+remain diagnostic evidence, not additional active assignments.
 
 ### Native state and remaining display blocker
 
@@ -112,14 +181,14 @@ and instruments available. Price history, movers and all streaming families were
 these remain probe/connection investigation, not proven upstream absences. Data activation remains
 unverified. `oct8-rate-live-doctor-summary.json` records the filtered outcomes. Other evidence:
 `oct8-rate-after-native.json`, `oct8-rate-live-continue.json`, `oct8-rate-live-session.json`.
-Watcher60793 is stopped for the current-read source integration; runtime remains running.
+Watcher60793 resumed for Cargo76649; the prior service/Desktop remain running during compilation.
 
 Lead applied the reviewed indexed candidate patch and shared accounting contract, opted only
 `select_current_batch` into NotRequested, and inspected the helper's existing-test extensions.
 The single critical data test passed (`oct8-indexed-current-critical.log`). Read-only diagnostic
 on the live database found a quote winner in0.0947s and its complete tie in0.00051s; this is query-only
 evidence, not a complete application read or visible streaming proof. Source:
-`oct8-indexed-current-query-probe.json`. Current-read commit and native deployment remain pending.
+`oct8-indexed-current-query-probe.json`. Current-read code is pushed; native deployment remains pending.
 
 Fresh native inspection before Desktop exited found Overview visible with20 “unavailable” mentions.
 The prior sequence113→128 evidence proves notification delivery only, not a quote reaching a displayed

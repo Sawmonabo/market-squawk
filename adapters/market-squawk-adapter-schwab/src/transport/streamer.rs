@@ -437,9 +437,14 @@ impl SchwabStreamerServiceResponseEvidence {
         &self.request_id
     }
 
-    /// Exact provider response code (`0` is success; other values are provider errors).
+    /// Exact provider response code; success is interpreted against the correlated command.
     pub const fn status_code(&self) -> i64 {
         self.status_code
+    }
+
+    /// Whether the original reply succeeds for its correlated command.
+    pub fn succeeded(&self) -> bool {
+        StreamerResponseCode::new(self.status_code).is_success_for(&self.command)
     }
 
     pub const fn provider_timestamp_millis(&self) -> Option<u64> {
@@ -469,7 +474,7 @@ impl SchwabStreamerServiceResponseEvidence {
         let latency_ms = self
             .round_trip_latency_ms
             .ok_or(SchwabTransportError::Protocol)?;
-        let succeeded = self.status_code == 0;
+        let succeeded = self.succeeded();
         CapacityObservation::from_transport(
             CapacityUnit::Requests,
             1,
@@ -1339,6 +1344,11 @@ impl SchwabStreamerRequestAcknowledgement {
     pub const fn status_code(&self) -> i64 {
         self.status_code
     }
+
+    /// Whether the original reply succeeds for its correlated command.
+    pub fn succeeded(&self) -> bool {
+        StreamerResponseCode::new(self.status_code).is_success_for(&self.command)
+    }
     pub const fn transport_ordinal(&self) -> Option<NonZeroU64> {
         self.transport_ordinal
     }
@@ -1840,7 +1850,7 @@ impl SchwabStreamerExecutor {
                             {
                                 return Err(SchwabTransportError::Protocol);
                             }
-                            let succeeded = response.code == StreamerResponseCode::Success;
+                            let succeeded = response.code.is_success_for(&response.command);
                             settle_streamer_request(
                                 sent,
                                 None,
@@ -1980,7 +1990,7 @@ impl SchwabStreamerExecutor {
                                         {
                                             response_error.get_or_insert(error);
                                         }
-                                        if response.code != StreamerResponseCode::Success {
+                                        if !response.code.is_success_for(&response.command) {
                                             response_error
                                                 .get_or_insert(SchwabTransportError::Adapter);
                                         }

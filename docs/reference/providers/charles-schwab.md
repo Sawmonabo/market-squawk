@@ -94,6 +94,14 @@ The currently selected Streamer services are:
   the existing set and adds keys.
 - **APPLICATION POLICY:** One serialized desired-state controller owns login, subscriptions,
   reconnect, and replacement/addition commands.
+- **VERIFIED PROVIDER FACT (retained official Streamer contract, rechecked 2026-10-08):** Every
+  command carries `SchwabClientCustomerId` and `SchwabClientCorrelId`. Code `0` is general success;
+  `26`, `27` and `28` acknowledge successful `SUBS`, `UNSUBS` and `ADD`, respectively. Interpret
+  these codes only against the correlated command, preserving the original numeric reply.
+- **APPLICATION POLICY:** Connection coordinates remain private to the adapter, are bound to the
+  encoded LOGIN generation, and are cleared on disconnect. Transport, rate feedback, sealed
+  acknowledgement validation and publication use the same adapter success interpretation. An ACK
+  alone does not prove received data or a displayed update; current evidence remains in the ledger.
 
 **APPLICATION POLICY:** No other `trader/v1` route is part of this data contract.
 

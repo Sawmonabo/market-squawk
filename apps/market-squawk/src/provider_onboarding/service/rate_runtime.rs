@@ -330,7 +330,7 @@ impl SchwabMarketDoctorRatePermit for SchwabMarketDoctorProbeRatePermit {
                 || observation.retry_after().is_some()
                     && matches!(
                         observation.status(),
-                        SchwabMarketDoctorProbeStatus::Streamer(_)
+                        SchwabMarketDoctorProbeStatus::Streamer { .. }
                     )
             {
                 return Err(SchwabMarketDataDoctorError::InvalidRateAuthority);
@@ -354,10 +354,10 @@ impl SchwabMarketDoctorRatePermit for SchwabMarketDoctorProbeRatePermit {
                 {
                     self.inner.record_success().map_err(map_doctor_rate_error)?;
                 }
-                SchwabMarketDoctorProbeStatus::Streamer(0) => {
+                status @ SchwabMarketDoctorProbeStatus::Streamer { .. } if status.accepted() => {
                     self.inner.record_success().map_err(map_doctor_rate_error)?;
                 }
-                SchwabMarketDoctorProbeStatus::Streamer(_) => {
+                SchwabMarketDoctorProbeStatus::Streamer { .. } => {
                     self.inner
                         .observe_provider_refusal()
                         .await
