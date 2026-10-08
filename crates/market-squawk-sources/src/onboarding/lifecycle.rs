@@ -1186,9 +1186,7 @@ impl OnboardingLifecycle {
                     let pending_renewal = self.state == OnboardingState::RuntimeVerificationPending
                         && self.active_generation.is_none()
                         && self.candidate_generation == Some(generation)
-                        && self
-                            .generation_alpaca_paper_iex_doctor_receipt(generation)
-                            .is_some();
+                        && self.generation_runtime_evidence(generation).is_some();
                     let renewal = targets_active_generation || pending_renewal;
                     if renewal {
                         self.validate_runtime_renewal(
@@ -2097,8 +2095,7 @@ impl OnboardingLifecycle {
         let pending_renewal = self.state == OnboardingState::RuntimeVerificationPending
             && self.active_generation.is_none()
             && self.candidate_generation == Some(generation)
-            && record.state == CredentialGenerationState::VerifiedLeastPrivilege
-            && evidence.alpaca_paper_iex_receipt().is_some();
+            && record.state == CredentialGenerationState::VerifiedLeastPrivilege;
         let active_renewal = self.state == OnboardingState::RenewalRequired
             && self.active_generation == Some(generation)
             && self.candidate_generation.is_none()
@@ -2134,6 +2131,12 @@ impl OnboardingLifecycle {
                     .as_ref()
                     .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
                     .ok_or(OnboardingStateError::EvidenceMismatch)?;
+                if pending_renewal
+                    && (observed_at < prior.exclusive_expires_at()
+                        || next.verified_at() < prior.exclusive_expires_at())
+                {
+                    return Err(OnboardingStateError::InvalidEvidence);
+                }
                 if next.predecessor_digest() != Some(prior.receipt_sha256())
                     || next.verified_at() <= prior.verified_at()
                     || !next.same_authority_as(prior)

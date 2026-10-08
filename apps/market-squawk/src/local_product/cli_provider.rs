@@ -2484,7 +2484,11 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         let view = runtime
             .apply(session_id, action, cancellation)
             .await
-            .map_err(map_schwab_oauth_error)?;
+            .map_err(|error| {
+                let failure = map_schwab_oauth_error(error);
+                tracing::warn!(stage = "oauth_lifecycle", ?failure, "Schwab connection recovery rejected");
+                failure
+            })?;
         if !matches!(
             action,
             SchwabOAuthLifecycleAction::Begin | SchwabOAuthLifecycleAction::Continue
@@ -2500,12 +2504,19 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
                 SchwabOAuthRuntimeError::ReauthorizationRequired
                 | SchwabOAuthRuntimeError::AuthorizationExchangeInFlight,
             ) => return Ok(view),
-            Err(error) => return Err(map_schwab_oauth_error(error)),
+            Err(error) => {
+                let failure = map_schwab_oauth_error(error);
+                tracing::warn!(stage = "market_authority", ?failure, "Schwab connection recovery rejected");
+                return Err(failure);
+            }
         };
         let current = authority
             .current_receipt()
             .await
-            .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
+            .map_err(|_error| {
+                tracing::warn!(stage = "current_token_receipt", "Schwab connection recovery rejected");
+                ProviderPortalActivationError::Unavailable
+            })?;
         let view = SchwabOAuthLifecycleView::active(session_id, action, current)
             .map_err(map_schwab_oauth_error)?;
         let preparation = self
@@ -2516,7 +2527,11 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
                 CancellationToken::new(),
             )
             .await
-            .map_err(map_schwab_doctor_onboarding_error)?;
+            .map_err(|error| {
+                let failure = map_schwab_doctor_onboarding_error(error);
+                tracing::warn!(stage = "market_verification_preparation", ?failure, "Schwab connection recovery rejected");
+                failure
+            })?;
         if matches!(&preparation, SchwabMarketDoctorRunPreparation::Current) {
             return Ok(view);
         }

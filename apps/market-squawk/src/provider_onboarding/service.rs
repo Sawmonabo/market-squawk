@@ -108,6 +108,8 @@ mod census_doctor;
 mod eia_doctor;
 mod lifecycle_runtime;
 mod rate_runtime;
+#[cfg(test)]
+mod schwab_recovery_tests;
 
 use rate_runtime::{ProbeRateAuthority, ProbeRatePermit};
 
@@ -729,9 +731,9 @@ impl ProviderOnboardingService {
     /// Serializes initial Schwab doctor admission and exact active-generation renewal.
     ///
     /// A current receipt for the same OAuth token generation needs no provider call. Once an
-    /// active receipt expires, this method records `RenewalRequired` before issuing the only lease
-    /// that can replace it. Candidate receipts are never replaced in place because they have not
-    /// yet crossed application-owned runtime activation.
+    /// active receipt expires, this method records `RenewalRequired` before issuing its successor
+    /// lease. An expired initial candidate can renew the same evidence chain while remaining
+    /// pending; only the separate activation operation may start its market runtime.
     pub(crate) async fn prepare_schwab_market_doctor_run(
         &self,
         session_id: Uuid,
@@ -785,8 +787,12 @@ impl ProviderOnboardingService {
         {
             return Ok(SchwabMarketDoctorRunPreparation::Current);
         }
-        if lifecycle.active_generation() != Some(generation)
-            || lifecycle.candidate_generation().is_some()
+        let pending_renewal = lifecycle.state() == OnboardingState::RuntimeVerificationPending
+            && lifecycle.active_generation().is_none()
+            && lifecycle.candidate_generation() == Some(generation);
+        if !pending_renewal
+            && (lifecycle.active_generation() != Some(generation)
+                || lifecycle.candidate_generation().is_some())
         {
             return Err(ProviderOnboardingError::ActivationUnavailable);
         }
@@ -818,6 +824,7 @@ impl ProviderOnboardingService {
                 )?;
                 self.catalog.resume_provider_onboarding(session_id)?
             }
+            OnboardingState::RuntimeVerificationPending if pending_renewal => resumed,
             OnboardingState::RenewalRequired => resumed,
             _ => return Err(ProviderOnboardingError::InvalidSessionState),
         };
@@ -865,9 +872,14 @@ impl ProviderOnboardingService {
         let (resumed, _profile) = self.current_schwab_oauth_bootstrap_session(lease)?;
         let lifecycle = resumed.lifecycle();
         let generation = lease.generation();
-        let predecessor_digest = if lifecycle.state() == OnboardingState::RenewalRequired
-            && lifecycle.active_generation() == Some(generation)
-            && lifecycle.candidate_generation().is_none()
+        let pending_renewal = lifecycle.state() == OnboardingState::RuntimeVerificationPending
+            && lifecycle.active_generation().is_none()
+            && lifecycle.candidate_generation() == Some(generation)
+            && lifecycle.generation_runtime_evidence(generation).is_some();
+        let predecessor_digest = if pending_renewal
+            || (lifecycle.state() == OnboardingState::RenewalRequired
+                && lifecycle.active_generation() == Some(generation)
+                && lifecycle.candidate_generation().is_none())
         {
             Some(
                 lifecycle

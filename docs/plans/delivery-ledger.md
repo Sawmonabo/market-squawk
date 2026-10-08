@@ -4,7 +4,81 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`7193df15`. Main/release unchanged; no extra branch created.
+`4977816a`. Main/release unchanged; no extra branch created.
+
+### Pending Schwab recovery — critically verified checkpoint
+
+Implemented same-credential renewal for an expired initial Schwab verification through preparation,
+authority binding, durable catalog append and lifecycle validation. The candidate remains pending
+until separate valid activation; prior identity/currentness checks remain enforced. Closed recovery
+stage logs disclose no response/credential data. No schema, credential replacement or new workspace.
+
+Critical checks passed on the frozen source: lifecycle1/1,0.02s (compile14.56s), and real
+service→catalog→reopen1/1,3.53s (compile6m22s). The latter also expires the setup reservation,
+checks Current/Deferred, renews token generation on the same credential and reopens exact evidence.
+Logs: `oct8-pending-doctor-{lifecycle,service}.log`. All helper ownership released; lead owns
+integration, Git and native verification. Source closure refresh then one supervised native build
+is next. Live saved-session recovery and visible streaming remain unproven; pushed commit pending.
+
+Native observation before deployment: Home currently renders prices/changes for all nine starters
+(`oct8-pending-recovery-before-desktop.json`), while a separate native collection request timed out.
+This proves recovered displayed data, not streaming. SQL diagnosis defers a speculative route walker:
+VTI57–71ms alone cannot explain12.7s before comparison; next latency evidence needs cumulative
+native phase timing. No performance or installed-workflow acceptance claim.
+
+### Current recovery work — pending activation and Desktop prices
+
+Previous turn was a status report only (no progress). Revalidated clean4977816a and live
+service78916/Desktop78917; supervisor60780 live, watcher60793 stopped. Lead owns source,
+shared lifecycle contracts, integration, Git and the only build/runtime schedule.
+
+Astra pending_doctor_recovery owns ONLY `.agents/tmp/v1-first-stock/oct8-pending-doctor-recovery.md`:
+read-only bounded diagnosis of Schwab candidate doctor re-verification after an expired or failed
+initial receipt. Trace service preparation/binding/publication, shared lifecycle renewal validation
+and existing critical tests; propose the smallest complete correction with exact files/tests.
+No source edits, Git/builds, runtime changes, secrets, provider calls or additional agents.
+Dependency: native Continue is rejected while credential_stored=true and runtime_verification_pending.
+Source currently permits pending renewal only for Alpaca and rejects Schwab candidate rechecks.
+This is a confirmed code gap; whether it caused this exact live rejection still needs evidence.
+Lead independently inspects native price-read latency and public connection diagnostics.
+Completion evidence: retained failed candidate can recheck using saved OAuth, preserve predecessor
+identity, activate only with valid evidence, then actual native quote updates. Pushed fix pending.
+
+The new native query again failed at15s (`oct8-native-price-profile-query.json`). A real
+service sample (`oct8-native-price-sample.txt`) locates CPU work in durable-route discovery and
+latest-history-window SQL; no blocked-mutex diagnosis follows from it. Native stage log shows
+~12.7s consumed before previous-close and ~2.3s there. The sample is latency diagnosis only,
+not whole-app resource acceptance.
+Astra current_display_reuse may append ONLY its existing `oct8-previous-close-diagnosis.md`:
+inspect this sample and exact durable-route discovery SQL/index plan using read-only catalog
+metadata for the already identified VTI instrument. Measure original predicate-preserving route
+query and identify a narrowly supported correction. No writes, captures/secrets, provider calls,
+Git/builds/runtime changes or source edits. Lead retains all shared source ownership.
+
+Implementation ownership: lead corrects `provider_onboarding/service.rs`,
+`market-squawk-data/src/catalog_capabilities.rs` and sources `onboarding/lifecycle.rs` together.
+Allow expired pending Schwab doctor evidence to renew on the same verified credential, bind its
+exact predecessor and preserve explicit activation checks. No schema or new setup session.
+Astra pending_doctor_recovery, after finishing its report, owns ONLY sources
+`crates/market-squawk-sources/src/onboarding/tests.rs` for a focused lifecycle regression using
+existing fixtures: expired pending receipt renews on exact same authority, bad predecessor/early
+renewal rejected, pending remains pending until valid explicit Activate. No builds or source edits
+outside that file. Lead will compile once after freeze, then native retry on the retained session.
+
+GPT-6.1 Sol High schwab_recovery_test owns ONLY new
+`apps/market-squawk/src/provider_onboarding/service/schwab_recovery_tests.rs`, a single critical
+integration case for the uncovered service→binding→catalog restart path. Reuse existing service
+fixtures/APIs; no production seams, broad matrix or builds. Lead adds module declaration and owns
+all production edits. Verify Current/Deferred then expired Ready, exact predecessor, same stored
+credential and pending state after service reopen. Source lifecycle test covers rejection details.
+
+Frozen pending-recovery candidate: sources lifecycle critical case PASS1/1,0.02s
+(compile14.56s), `oct8-pending-doctor-lifecycle.log`. Lead inspected all production changes and
+both test bodies; app service→catalog→restart case is compiling serially in session98501,
+`oct8-pending-doctor-service.log`. Helper source ownership released; runtime watcher remains stopped.
+Closed failure-stage logs added in `local_product/cli_provider.rs` preserve the public failure
+category without logging OAuth responses or credentials. Existing4977816a PR evidence confirmed:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6070901080 .
 
 ### Schwab command correction — verification checkpoint
 
