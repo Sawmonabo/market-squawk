@@ -416,50 +416,7 @@ impl AnalyticalManifestCatalog {
             .maximum_candidates()
             .checked_add(1)
             .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
-        let exact_key_rows = provider_market_event_selection_rows_sql(
-            request,
-            ProviderMarketEventSelectionQuery::Candidates,
-        );
-        let sql = format!(
-            "{exact_key_rows}, keyed_rows AS (
-             SELECT indexed.publication_digest, indexed.publication_kind,
-                    indexed.publication_row_ordinal, indexed.coordinate_digest,
-                    indexed.source_id, indexed.received_at_ns,
-                    CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
-                         ELSE indexed.received_at_ns END AS effective_at_ns,
-                    committed.available_at_ns AS origin_committed_at_ns
-             FROM exact_key_rows AS indexed
-             JOIN market_event_complete_commits AS committed
-               ON committed.dataset_id=indexed.dataset_id
-              AND committed.commit_sequence=indexed.commit_sequence
-              AND committed.publication_digest=indexed.publication_digest
-              AND committed.publication_kind=indexed.publication_kind
-             JOIN ingest_runs AS run ON run.run_id=committed.run_id
-              AND run.source_id=indexed.source_id AND run.state='succeeded'
-              AND run.completed_at_ns=committed.available_at_ns
-             WHERE ((?6=0 AND indexed.source_timestamp_ns IS NOT NULL
-                               AND indexed.source_timestamp_ns<=?7)
-                    OR (?6=1 AND indexed.received_at_ns<=?7))
-               AND indexed.available_at_ns<=?8
-               AND indexed.ingested_at_ns<=?8
-               AND committed.available_at_ns<=?8
-         ), newest_by_source AS (
-             SELECT *, MAX(effective_at_ns) OVER (
-                 PARTITION BY source_id
-             ) AS newest_effective_at_ns,
-             MAX(received_at_ns) OVER (
-                 PARTITION BY source_id, effective_at_ns
-             ) AS newest_received_at_ns
-             FROM keyed_rows
-         )
-         SELECT publication_digest, publication_kind, publication_row_ordinal,
-                coordinate_digest, source_id, effective_at_ns, origin_committed_at_ns
-         FROM newest_by_source
-         WHERE effective_at_ns=newest_effective_at_ns
-           AND (?14=0 OR received_at_ns=newest_received_at_ns)
-         ORDER BY source_id, publication_digest, publication_row_ordinal
-         LIMIT ?10",
-        );
+        let sql = provider_market_event_selection_sql(request);
         let mut statement = connection.prepare(&sql)?;
         let instrument = request.instrument_id().map(|id| id.as_uuid());
         let mut rows = statement.query(params![
@@ -486,14 +443,28 @@ impl AnalyticalManifestCatalog {
         candidates
             .try_reserve_exact(request.maximum_candidates())
             .map_err(|_| ProviderMarketEventSelectionError::Allocation)?;
+        let mut exclusions = None;
         while let Some(row) = rows.next()? {
+            if exclusions.is_none() {
+                exclusions = Some(ProviderMarketEventExclusionCounts::from_catalog(
+                    exclusion_count(row.get(7)?)?,
+                    exclusion_count(row.get(8)?)?,
+                    exclusion_count(row.get(9)?)?,
+                    exclusion_count(row.get(10)?)?,
+                    exclusion_count(row.get(11)?)?,
+                    exclusion_count(row.get(12)?)?,
+                    exclusion_count(row.get(13)?)?,
+                ));
+            }
+            // The aggregate still returns one row when there are no eligible candidates.
+            let Some(digest) = row.get::<_, Option<Vec<u8>>>(0)? else {
+                continue;
+            };
             if candidates.len() == request.maximum_candidates() {
                 return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
             }
-            let publication_digest = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                parse_digest(&row.get::<_, Vec<u8>>(0)?)?.bytes(),
-            );
+            let publication_digest =
+                EvidenceDigest::new(DigestAlgorithm::Sha256, parse_digest(&digest)?.bytes());
             let publication_kind =
                 parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
             let publication_row_ordinal = u32::try_from(row.get::<_, i64>(2)?)
@@ -516,12 +487,7 @@ impl AnalyticalManifestCatalog {
                 origin_committed_at: Timestamp::from_unix_nanos(row.get(6)?),
             });
         }
-        let exclusions = provider_market_event_exclusion_counts(
-            connection,
-            request,
-            to_i64(selected.sequence())?,
-            clock,
-        )?;
+        let exclusions = exclusions.ok_or(ManifestCatalogError::CorruptCatalog)?;
         ProviderMarketEventCatalogPlan::try_new(
             selected.clone(),
             selected.available_at(),
@@ -3337,38 +3303,21 @@ fn selected_provider_market_event_commit(
         .transpose()
 }
 
-enum ProviderMarketEventSelectionQuery {
-    Candidates,
-    Exclusions,
-}
-
-fn provider_market_event_selection_rows_sql(
-    request: &ProviderMarketEventPointInTimeRequest,
-    query: ProviderMarketEventSelectionQuery,
-) -> String {
-    // Keep the admitted request shape visible to SQLite's index planner. All values
-    // remain bound parameters; only these closed SQL fragments vary between shapes.
+fn provider_market_event_selection_sql(request: &ProviderMarketEventPointInTimeRequest) -> String {
+    // All values remain bound parameters. These closed request shapes expose the key to SQLite.
     let identity = if request.instrument_id().is_some() {
         "indexed.instrument_id=?3 AND indexed.cohort_key IS NULL"
     } else {
-        match query {
-            ProviderMarketEventSelectionQuery::Candidates => {
-                "indexed.instrument_id IS NULL AND indexed.cohort_key=?11 \
-                 AND indexed.provider_product=?12 AND indexed.provider_channel=?13"
-            }
-            ProviderMarketEventSelectionQuery::Exclusions => {
-                "indexed.instrument_id IS NULL AND indexed.cohort_key=?10 \
-                 AND indexed.provider_product=?11 AND indexed.provider_channel=?12"
-            }
-        }
+        "indexed.instrument_id IS NULL AND indexed.cohort_key=?11 \
+         AND indexed.provider_product=?12 AND indexed.provider_channel=?13"
     };
     let source = if request.exact_source_surface().is_some() {
         "indexed.source_id=?9"
     } else {
         "?9 IS NULL"
     };
-    // Select the exact key before the completeness joins can choose a source-wide
-    // run scan. Keep all row clocks here so exclusion accounting remains complete.
+    // Read and validate the exact-key history once for both selection and exclusion accounting.
+    // CROSS JOIN keeps this key outermost; materialization alone allowed a corpus-wide run scan.
     format!(
         "WITH exact_key_rows AS MATERIALIZED (
              SELECT indexed.dataset_id, indexed.commit_sequence,
@@ -3382,35 +3331,21 @@ fn provider_market_event_selection_rows_sql(
                AND indexed.venue_id=?4
                AND indexed.event_kind=?5
                AND {source}
-         )"
-    )
-}
-
-fn provider_market_event_exclusion_counts(
-    connection: &Connection,
-    request: &ProviderMarketEventPointInTimeRequest,
-    commit_sequence: i64,
-    clock: i64,
-) -> Result<ProviderMarketEventExclusionCounts, ManifestCatalogError> {
-    let instrument = request.instrument_id().map(|id| id.as_uuid());
-    let exact_key_rows = provider_market_event_selection_rows_sql(
-        request,
-        ProviderMarketEventSelectionQuery::Exclusions,
-    );
-    let sql = format!(
-        "{exact_key_rows}, keyed_rows AS MATERIALIZED (
-             SELECT indexed.source_id, indexed.source_timestamp_ns, indexed.received_at_ns,
+         ), keyed_rows AS MATERIALIZED (
+             SELECT indexed.publication_digest, indexed.publication_kind,
+                    indexed.publication_row_ordinal, indexed.coordinate_digest,
+                    indexed.source_id, indexed.source_timestamp_ns, indexed.received_at_ns,
                     indexed.available_at_ns, indexed.ingested_at_ns,
                     CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
                          ELSE indexed.received_at_ns END AS effective_at_ns,
                     committed.available_at_ns AS origin_committed_at_ns
              FROM exact_key_rows AS indexed
-             JOIN market_event_complete_commits AS committed
+             CROSS JOIN market_event_complete_commits AS committed
                ON committed.dataset_id=indexed.dataset_id
               AND committed.commit_sequence=indexed.commit_sequence
               AND committed.publication_digest=indexed.publication_digest
               AND committed.publication_kind=indexed.publication_kind
-             JOIN ingest_runs AS run ON run.run_id=committed.run_id
+             CROSS JOIN ingest_runs AS run ON run.run_id=committed.run_id
               AND run.source_id=indexed.source_id AND run.state='succeeded'
               AND run.completed_at_ns=committed.available_at_ns
          ), eligible AS (
@@ -3427,7 +3362,7 @@ fn provider_market_event_exclusion_counts(
                AND available_at_ns<=?8
                AND ingested_at_ns<=?8
                AND origin_committed_at_ns<=?8
-         )
+         ), exclusion_counts AS (
          SELECT
            COALESCE((SELECT COUNT(*) FROM keyed_rows
                      WHERE ?6=0 AND source_timestamp_ns IS NULL), 0),
@@ -3454,51 +3389,25 @@ fn provider_market_event_exclusion_counts(
            COALESCE((SELECT COUNT(*) FROM eligible
                      WHERE effective_at_ns<newest_effective_at_ns), 0),
            COALESCE((SELECT COUNT(*) FROM eligible
-                     WHERE ?13=1 AND effective_at_ns=newest_effective_at_ns
-                       AND received_at_ns<newest_received_at_ns), 0)",
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let counts: (i64, i64, i64, i64, i64, i64, i64) = statement.query_row(
-        params![
-            request.dataset().as_str(),
-            commit_sequence,
-            instrument.as_ref().map(|id| id.as_bytes().as_slice()),
-            request.venue_id().as_str(),
-            crate::provider_event_selection::event_kind_name(request.event_kind()),
-            clock,
-            request.as_of_cutoff().unix_nanos(),
-            request.knowledge_cutoff().unix_nanos(),
-            request.exact_source_surface().map(SourceId::as_str),
-            request.cohort_key().map(|key| key.as_str()),
-            request
-                .exact_product()
-                .map(|value| value.as_source_identifier().as_str()),
-            request
-                .exact_channel()
-                .map(|value| value.as_source_identifier().as_str()),
-            request.tie_policy() == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
-        ],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        },
-    )?;
-    Ok(ProviderMarketEventExclusionCounts::from_catalog(
-        exclusion_count(counts.0)?,
-        exclusion_count(counts.1)?,
-        exclusion_count(counts.2)?,
-        exclusion_count(counts.3)?,
-        exclusion_count(counts.4)?,
-        exclusion_count(counts.5)?,
-        exclusion_count(counts.6)?,
-    ))
+                     WHERE ?14=1 AND effective_at_ns=newest_effective_at_ns
+                       AND received_at_ns<newest_received_at_ns), 0)
+         ), candidates AS (
+         SELECT publication_digest, publication_kind, publication_row_ordinal,
+                coordinate_digest, source_id, effective_at_ns, origin_committed_at_ns
+         FROM eligible
+         WHERE effective_at_ns=newest_effective_at_ns
+           AND (?14=0 OR received_at_ns=newest_received_at_ns)
+         ORDER BY source_id, publication_digest, publication_row_ordinal
+         LIMIT ?10
+         )
+         SELECT candidates.publication_digest, candidates.publication_kind,
+                candidates.publication_row_ordinal, candidates.coordinate_digest,
+                candidates.source_id, candidates.effective_at_ns,
+                candidates.origin_committed_at_ns, exclusion_counts.*
+         FROM exclusion_counts LEFT JOIN candidates ON TRUE
+         ORDER BY candidates.source_id, candidates.publication_digest,
+                  candidates.publication_row_ordinal",
+    )
 }
 
 fn exclusion_count(value: i64) -> Result<u64, ManifestCatalogError> {

@@ -6,6 +6,73 @@ Goal active: owner reconfirmed resume after the lead mistakenly reapplied the ol
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `034f0ca067ccc039c8eae8e3f2e863149caf2f0f`. Main/release unchanged; no extra branch created.
 
+### Owner correction — provider-neutral application streaming
+
+The owner identified Schwab protocol logic under `application/market_runtime/schwab_streamer/`.
+Confirmed misplaced responsibilities include numeric field dictionaries and vendor service mapping.
+Ordinary application streaming must request canonical instruments and event capabilities through a
+provider-neutral interface. Adapter-owned code translates subscriptions and handles Schwab wire
+protocol, field semantics and provider-native sequencing/recovery. Shared application services retain
+canonical persistence, selection, user demand and business workflows. Only the composition/settings
+boundary selects and configures a concrete adapter. A directory rename alone does not close this.
+
+Lead owns the neutral contract/composition correction and provider-boundary audit before expanding
+Schwab fields. The ongoing read-only selector investigation remains independent. Preserve existing
+capture/evidence, cancellation, reconnect and shutdown semantics when relocating responsibilities;
+no second stream stack or compatibility wrapper. Completion requires a watched-symbol update through
+the neutral interface into durable normalized data and the actual watchlist, not merely moved files.
+
+### Current bounded work — refreshed at 0dab19e2
+
+Owner clarification: shared subscriptions serve watchlists, charts, portfolio valuation, risk,
+alerts and analytical workflows. Provider streams, request responses and scheduled ingestion enter
+one normalized publication flow. Reuse the existing shared journal/notification mechanism; no second
+broker or HTTP webhook server is implied. Deduplicate overlapping upstream demand, preserve other
+consumers when one unsubscribes, and recover slow/reconnecting consumers from retained data. Typed
+instrument/family selection and durable replay need implementation evidence; coarse domain
+notifications alone do not close this requirement.
+
+| Owner | Outcome / dependency | Exact writable scope | Critical check / current blocker |
+| --- | --- | --- | --- |
+| Lead | Faster retained prices for every shared consumer; integrate proven query ordering before the next measured selector optimization | `crates/market-squawk-data/src/manifest/catalog.rs`, existing `tests/publication_recovery.rs` only if a new uncovered gap appears; ledger, shared contracts/composition/schema/Git/builds reserved to lead | Existing restart/PIT/tie/exclusion/cancellation test; same-snapshot rows and counts. Four join changes remove broad run scans but measured 20-request batch still takes20.837s; not full UI acceptance. |
+| GPT-6.1 Sol High provider boundary | Identify the first complete adapter-to-neutral-subscription checkpoint without duplicating current event machinery | `.agents/tmp/v1-first-stock/oct8-shared-subscription-boundary.md` only; all source read-only | Exact existing contracts, callers, shared ownership, minimal producer/consumer change and existing check; no builds, Git, runtime or provider calls. |
+
+The lead extended the proven ordering correction to one SQL statement sharing exact-key rows,
+completeness checks and eligible rows between candidates and all seven exclusion totals. A read-only
+same-snapshot probe preserved every candidate/count and reduced the largest quote from5.058s for
+two ordered queries to2.858s combined. This remains diagnostic, not UI acceptance. Removed the
+superseded duplicate query path; no schema or receipt contract changed. Existing empty-selection
+fixture now asserts its actual after-cutoff count (critical gap: LEFT JOIN must preserve accounting
+when there are no candidates). Combined critical check is running; baseline run alone is not evidence
+for the final edit.
+
+Previous selector and option diagnoses are complete; their source ownership is released. Current
+runtime was confirmed live at refresh (supervisor60780, watcher60793, service62398, Desktop62399),
+with no Cargo/rustc process. Lead temporarily suspends only this watcher during serialized checks,
+then restores it. No provider or app process is stopped for the query edit. Resulting commit pending.
+
+### Shared retained selection — critically verified, native replacement building
+
+Lead combined candidate selection and all seven exclusion totals in one exact-key SQL statement,
+removing duplicate history/completeness work and fixing the broad outer run scan. No receipt,
+clock, tie, source, corruption, deadline or cancellation rule changed. Empty selections retain
+actual exclusion totals through the same statement. The existing critical restart test passed1/1
+in11.18s after52.15s compilation, including the added empty-result after-cutoff assertion. Evidence:
+`oct8-selector-combined-critical.log`. The earlier test run is baseline only.
+
+Read-only same-snapshot comparison against0dab19e2 covered20 quote/trade requests across nine
+instruments and ten routes, including crypto routes. All candidate rows and seven counts matched.
+Total SQL time changed from51.374s to10.393s. This excludes raw reconstruction and the
+UI, so no screen deadline or complete subscription acceptance is claimed. Evidence:
+`oct8-selector-nine-instruments.json`. Join ordering follows SQLite's documented
+[CROSS JOIN semantics](https://www.sqlite.org/optoverview.html#manual_control_of_query_plans_using_cross_join),
+reviewed2026-10-08. No schema, migration, arbitrary data ceiling or timeout increase was introduced.
+
+The existing watcher was restored; its single Cargo build64025 is compiling the coherent source
+while the prior visible Desktop/service remain available. Native watchlist verification follows
+that successful replacement. Resulting pushed commit is this checkpoint; shared subscription boundary
+helper remains read-only and independently identifies the first two-consumer integration slice.
+
 ### Next bounded investigations — checkpoint c5cc4fb7 pushed
 
 The previous checkpoint is integrated and pushed. These investigations start from c5cc4fb7;

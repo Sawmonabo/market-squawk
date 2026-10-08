@@ -5628,7 +5628,13 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         if request == &selection_request {
             assert_eq!(result, Some(selected.clone()));
         } else {
-            assert!(result.is_some_and(|selection| selection.sources().is_empty()));
+            let empty = result.ok_or("missing empty selection receipt")?;
+            assert!(empty.sources().is_empty());
+            // A selection with no candidates must still retain its real exclusion accounting.
+            assert_eq!(
+                empty.exclusions().after_as_of(),
+                u64::from(request.as_of_cutoff() == Timestamp::from_unix_nanos(489))
+            );
         }
     }
     let cancelled_batch = CancellationToken::new();
