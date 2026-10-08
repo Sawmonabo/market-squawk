@@ -43,7 +43,7 @@ impl ProviderAdapterActivation {
         check_operation(deadline, &cancellation)?;
         issuer.validate_listing(&official_listing, metadata::timestamp()?).map_err(|_| ServiceError::Unavailable)?;
         activation
-            .require_current()
+            .require_runtime_current()
             .await
             .map_err(|_| ServiceError::Unauthorized)?;
         let source = metadata::metadata(activation)?;
@@ -116,7 +116,7 @@ impl ProviderAdapterActivation {
         .map_err(|_| ServiceError::Unauthorized)?;
         {
             let guard = activation
-                .currentness()
+                .runtime_currentness()
                 .try_acquire_publication_authority()
                 .map_err(|_| ServiceError::Unauthorized)?;
             guard
@@ -197,7 +197,7 @@ impl ProviderAdapterActivation {
             biased;
             () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
             () = tokio::time::sleep_until(deadline.into()) => return Err(ServiceError::DeadlineExceeded),
-            attempt = activation.acquire_publication_attempt() => attempt.map_err(|_| ServiceError::Unauthorized)?,
+            attempt = activation.acquire_runtime_publication_attempt() => attempt.map_err(|_| ServiceError::Unauthorized)?,
         };
         let receipt = epoch.receipt();
         let authority = self
@@ -233,7 +233,7 @@ impl ProviderAdapterActivation {
         epoch
             .validate_current(receipt)
             .map_err(|_| ServiceError::Unauthorized)?;
-        if !activation.currentness().is_active_now() {
+        if !activation.runtime_currentness().is_current_now() {
             return Err(ServiceError::Unauthorized);
         }
         let permit = match reservation.commit_dispatch() {
@@ -293,7 +293,7 @@ impl ProviderAdapterActivation {
                 official_listing,
                 expected_current,
                 epoch,
-                activation.currentness(),
+                activation.runtime_currentness(),
                 deadline,
                 cancellation.child_token(),
             )

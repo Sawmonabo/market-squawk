@@ -49,7 +49,7 @@ impl ProviderAdapterActivation {
         instruments: &[SchwabQuoteReferenceBinding],
     ) -> Result<ResearchProviderRuntimeGeneration, ServiceError> {
         activation
-            .require_current()
+            .require_runtime_current()
             .await
             .map_err(|_| ServiceError::Unauthorized)?;
         let contract = QuoteSourceContract {
@@ -74,10 +74,10 @@ impl ProviderAdapterActivation {
         bootstrap: &market_squawk_adapter_schwab::StreamerBootstrap,
     ) -> Result<ResearchProviderRuntimeGeneration, ServiceError> {
         let oauth = activation
-            .current_oauth_receipt()
+            .runtime_oauth_receipt()
             .await
             .map_err(|_| ServiceError::Unauthorized)?;
-        activation.require_current().await.map_err(|_| ServiceError::Unauthorized)?;
+        activation.require_runtime_current().await.map_err(|_| ServiceError::Unauthorized)?;
         let observed_at = super::schwab::system_timestamp().map_err(|_| ServiceError::Unavailable)?;
         let doctor = activation.doctor_receipt();
         let credential = oauth.credential_authority();
@@ -157,7 +157,7 @@ impl ProviderAdapterActivation {
         .and_then(|generation| generation.with_runtime_verification(lease))
         .map_err(|_| ServiceError::Unauthorized)?;
         let guard = activation
-            .currentness()
+            .runtime_currentness()
             .try_acquire_publication_authority()
             .map_err(|_| ServiceError::Unauthorized)?;
         guard

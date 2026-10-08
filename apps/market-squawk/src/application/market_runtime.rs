@@ -1202,7 +1202,7 @@ impl MarketRuntimeRegistry {
                 error: ServiceError::Unavailable,
             };
         }
-        let active_lease = if request.surface() == AccountMarketSurface::AlpacaBasic {
+        let active_lease = if matches!(request.surface(), AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData) {
             match publication_authority.commit_prepared_activation(&account_lease) {
                 Ok(active) => active,
                 Err(error) => {
@@ -1233,6 +1233,9 @@ impl MarketRuntimeRegistry {
                 entry,
                 error: ServiceError::Unauthorized,
             };
+        }
+        if let MarketRuntime::Account(group) = &entry.runtime {
+            group.seal_preparation();
         }
         // Durable Active and the exact runtime remain serialized by one onboarding mutation
         // authority until this infallible registry insertion completes.

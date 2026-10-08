@@ -147,7 +147,7 @@ impl Consumer {
         if observed < received {
             return Err(ServiceError::InvalidResult);
         }
-        let (token, epoch) = tokio::select! {biased; ()=cancellation.cancelled()=>return Err(ServiceError::Cancelled), ()=tokio::time::sleep_until(deadline.into())=>return Err(ServiceError::DeadlineExceeded), value=self.activation.acquire_publication_attempt()=>value.map_err(|_|ServiceError::Unauthorized)?,};
+        let (token, epoch) = tokio::select! {biased; ()=cancellation.cancelled()=>return Err(ServiceError::Cancelled), ()=tokio::time::sleep_until(deadline.into())=>return Err(ServiceError::DeadlineExceeded), value=self.activation.acquire_runtime_publication_attempt()=>value.map_err(|_|ServiceError::Unauthorized)?,};
         drop(token);
         let oauth = epoch.receipt();
         if oauth.generation() != sealed.streamer_receipt().token_generation() {
@@ -369,7 +369,7 @@ impl Consumer {
         .map_err(|_| ServiceError::InvalidResult)?;
         let account = self
             .activation
-            .currentness()
+            .runtime_currentness()
             .try_acquire_publication_authority()
             .map_err(|_| ServiceError::Unauthorized)?;
         let request = SchwabStreamerQuotePublicationRequest::new(
@@ -464,7 +464,7 @@ impl Consumer {
         }
         let _current_account = self
             .activation
-            .currentness()
+            .runtime_currentness()
             .try_acquire_publication_authority()
             .map_err(|_| ServiceError::Unauthorized)?;
         if had_current_quote {

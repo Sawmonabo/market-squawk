@@ -3,7 +3,10 @@
 use std::{
     collections::BTreeSet,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -69,8 +72,8 @@ const SCHWAB_QUOTE_FRESHNESS_MARGIN_DIVISOR: u64 = 2;
 
 /// Non-clone owner of one callable Schwab read-only market-data epoch.
 ///
-/// It retains the exact active onboarding lease, durable doctor receipt, protected OAuth market
-/// authority, account-lifetime authority, and shared provider-rate authority. It exposes no
+/// It retains the exact prepared or active onboarding lease, durable doctor receipt, protected
+/// OAuth market authority, account-lifetime authority, and shared provider-rate authority. It exposes no
 /// account, position, transaction, order, or money-movement operation.
 pub struct SchwabMarketDataAccountActivation {
     authority: Arc<ProviderAccountRuntimeAuthority>,
@@ -79,6 +82,7 @@ pub struct SchwabMarketDataAccountActivation {
     doctor_generation: Mutex<SchwabDoctorGenerationDisposition>,
     market_hours_demand: tokio::sync::Mutex<()>,
     streamer_owner: Arc<tokio::sync::Mutex<()>>,
+    preparation_complete: Arc<AtomicBool>,
 }
 
 /// One selected current source on the sole account group; REST and Streamer never both own it.
@@ -312,6 +316,52 @@ impl SchwabMarketDataAccountActivation {
         self.authority.currentness()
     }
 
+    /// Startup admission for the unpublished runtime; promotion permanently requires Active.
+    pub(crate) fn runtime_currentness(&self) -> ProviderAccountRuntimeCurrentness {
+        self.authority
+            .runtime_currentness(Arc::clone(&self.preparation_complete))
+    }
+
+    /// Called only under onboarding mutation ownership after exact activation is committed,
+    /// before the ready runtime is inserted into the public registry.
+    pub(crate) fn seal_runtime_preparation(&self) {
+        self.preparation_complete.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn runtime_oauth_receipt(
+        &self,
+    ) -> Result<SchwabOAuthAuthorityReceipt, SchwabMarketDataActivationError> {
+        self.runtime_currentness()
+            .acquire_publication_authority()
+            .await?;
+        let receipt = self.oauth.current_receipt().await?;
+        self.require_doctor_generation(receipt.generation().get())?;
+        self.runtime_currentness()
+            .acquire_publication_authority()
+            .await?;
+        Ok(receipt)
+    }
+
+    pub(crate) async fn require_runtime_current(&self) -> Result<(), SchwabMarketDataActivationError> {
+        self.runtime_oauth_receipt().await.map(|_| ())
+    }
+
+    /// Acquires an exact token epoch for the private startup or the subsequently active runtime.
+    pub(crate) async fn acquire_runtime_publication_attempt(
+        &self,
+    ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabMarketDataActivationError>
+    {
+        self.runtime_currentness()
+            .acquire_publication_authority()
+            .await?;
+        let (token, epoch) = self.oauth.acquire_publication_attempt().await?;
+        self.require_doctor_generation(epoch.receipt().generation().get())?;
+        self.runtime_currentness()
+            .acquire_publication_authority()
+            .await?;
+        Ok((token, epoch))
+    }
+
     pub async fn require_current(&self) -> Result<(), SchwabMarketDataActivationError> {
         self.current_oauth_receipt().await.map(|_| ())
     }
@@ -503,7 +553,7 @@ impl ProviderAdapterActivation {
         {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
-        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire(
+        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
             ProviderMarketAccount::SchwabMarketData,
             lease,
             Arc::clone(&self.onboarding),
@@ -516,11 +566,12 @@ impl ProviderAdapterActivation {
             doctor,
             market_hours_demand: tokio::sync::Mutex::new(()),
             streamer_owner: Arc::new(tokio::sync::Mutex::new(())),
+            preparation_complete: Arc::new(AtomicBool::new(false)),
             doctor_generation: Mutex::new(SchwabDoctorGenerationDisposition::Current(
                 current.generation().get(),
             )),
         };
-        activation.require_current().await?;
+        activation.require_runtime_current().await?;
         Ok(activation)
     }
 
@@ -551,7 +602,7 @@ impl ProviderAdapterActivation {
             () = cancellation.cancelled() => {
                 return Err(SchwabMarketRuntimeStartError::Cancelled);
             }
-            current = activation.require_current() => current?,
+            current = activation.require_runtime_current() => current?,
         }
         let now = system_timestamp()?;
         let doctor = activation.doctor_receipt().clone();
@@ -626,7 +677,7 @@ impl ProviderAdapterActivation {
             () = cancellation.cancelled() => {
                 return Err(SchwabMarketRuntimeStartError::Cancelled);
             }
-            receipt = activation.current_oauth_receipt() => receipt?,
+            receipt = activation.runtime_oauth_receipt() => receipt?,
         };
         if oauth_receipt.generation().get() != doctor.access_token_generation()
             || oauth_receipt

@@ -164,7 +164,7 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
             ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
         )?;
     let recovered =
-        ProviderOnboardingService::try_new_with_provider_rate(catalog, secrets, provider_rate)?;
+        ProviderOnboardingService::try_new_with_provider_rate(catalog, secrets, provider_rate.clone())?;
     let resumed = recovered.catalog.resume_provider_onboarding(session_id)?;
     let lifecycle = resumed.lifecycle();
     assert_eq!(resumed.reservation().session_id(), session_id);
@@ -188,12 +188,27 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
         retained_receipt(&recovered, session_id, credential.0)?,
         renewed
     );
+    assert_eq!(
+        recovered.resume(session_id)?.next_action(),
+        crate::provider_onboarding::OnboardingNextAction::VerifyAndActivate
+    );
     assert!(matches!(
         recovered
             .prepare_schwab_market_doctor_run(session_id, 2, CancellationToken::new())
             .await?,
         SchwabMarketDoctorRunPreparation::Current
     ));
+    let config = market_squawk_platform::AppConfig::load(market_squawk_platform::ConfigSources::new(
+        None, &std::collections::BTreeMap::<std::ffi::OsString, std::ffi::OsString>::new(),
+        market_squawk_platform::ConfigOverrides {
+            data_dir: Some(directory.path().join("account-runtime")),
+            ..Default::default()
+        },
+    ))?;
+    let lease = recovered.prepared_activation_lease(session_id)?;
+    crate::provider_activation::assert_schwab_prepared_publication_transition(
+        Arc::new(recovered), lease, &config, provider_rate,
+    ).await?;
     Ok(())
 }
 

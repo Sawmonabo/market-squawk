@@ -551,7 +551,7 @@ impl SchwabRestQuoteProducer {
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 return Err(SchwabRestQuoteRuntimeError::Deadline);
             }
-            current = self.activation.require_current() => current?,
+            current = self.activation.require_runtime_current() => current?,
         }
         let (now, valid_through) = authority_window(cancellation, deadline)?;
         if !self.activation.doctor_receipt().is_current_at(now)
@@ -570,7 +570,7 @@ impl SchwabRestQuoteProducer {
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 return Err(SchwabRestQuoteRuntimeError::Deadline);
             }
-            attempt = self.activation.acquire_publication_attempt() => attempt?,
+            attempt = self.activation.acquire_runtime_publication_attempt() => attempt?,
         };
         let (token, oauth_epoch) = attempt;
         let oauth = oauth_epoch.receipt();

@@ -1437,6 +1437,65 @@ fn observe_streamer_capture(
         .collect::<Vec<_>>();
     let frame_count = capture.streamer_receipt().frame_count();
     let accumulator_present = accumulator.is_some();
+    let response = responses.first();
+    let command = response.map(|response| response.command());
+    let request_evidence_present =
+        response.map(|response| response.request_payload_sha256().is_some());
+    let request_digest_valid = response.map(|response| {
+        response.request_payload_sha256().is_some_and(|digest| {
+            digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32]
+        })
+    });
+    let latency_present = response.map(|response| response.round_trip_latency_ms().is_some());
+    let sealed_receipt_matches = response.map(|response| {
+        response.sealed_capture_receipt_sha256() == capture.persisted_receipt().receipt_digest()
+    });
+    let ordinal_match_count = response.map(|response| {
+        capture
+            .frames()
+            .iter()
+            .filter(|frame| frame.transport_ordinal() == response.transport_ordinal())
+            .count()
+    });
+    let event_match_count = response.map(|response| {
+        capture
+            .frames()
+            .iter()
+            .filter(|frame| frame.event_id() == response.event_id())
+            .count()
+    });
+    let body_match_count = response.map(|response| {
+        capture
+            .frames()
+            .iter()
+            .filter(|frame| frame.payload_digest() == response.payload_digest())
+            .count()
+    });
+    let timestamp_match_count = response.map(|response| {
+        capture
+            .frames()
+            .iter()
+            .filter(|frame| frame.received_at_unix_millis() == response.received_at_unix_millis())
+            .count()
+    });
+    let exact_frame_match_count = response.map(|response| {
+        capture
+            .frames()
+            .iter()
+            .filter(|frame| {
+                frame.transport_ordinal() == response.transport_ordinal()
+                    && frame.event_id() == response.event_id()
+                    && frame.payload_digest() == response.payload_digest()
+                    && frame.received_at_unix_millis() == response.received_at_unix_millis()
+                    && frame.generation() == response.generation()
+            })
+            .count()
+    });
+    let parse_frame_failure_count = capture
+        .parsed_frames()
+        .iter()
+        .filter(|frame| frame.is_none())
+        .count();
     let failed = |reason: &'static str, error: SchwabMarketDataDoctorError| {
         tracing::warn!(
             stage = "streamer-capture",
@@ -1447,6 +1506,17 @@ fn observe_streamer_capture(
             status_code = ?responses.first().map(|response| response.status_code()),
             frame_count,
             accumulator_present,
+            ?command,
+            ?request_evidence_present,
+            ?request_digest_valid,
+            ?latency_present,
+            ?sealed_receipt_matches,
+            ?ordinal_match_count,
+            ?event_match_count,
+            ?body_match_count,
+            ?timestamp_match_count,
+            ?exact_frame_match_count,
+            parse_frame_failure_count,
             ?error,
             "Schwab doctor capture validation failed"
         );

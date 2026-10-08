@@ -4,7 +4,67 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`4977816a`. Main/release unchanged; no extra branch created.
+`b88567da`. Main/release unchanged; no extra branch created.
+
+### Current integration — Schwab first activation
+
+Previous turn yielded new native evidence: b88567da native build passed7m52s; service81947
+and Desktop81948 run the replacement. Native inspection still reports pending initial activation.
+Watcher60793 stopped for serialized edits. The read-only activation report is complete; its owner
+released. Source confirms initial staging requires Active while promotion handles only Alpaca.
+
+Outcome: saved OAuth and valid doctor can start the shared account runtime, publish normalized
+quotes, and drive native automatic updates. Dependencies: pending-renewal checkpoint is pushed;
+first runtime activation and actual display updates remain missing/unverified.
+
+| Owner | Exact file ownership | Critical evidence / next dependency |
+| --- | --- | --- |
+| Astra schwab_prepared_authority | provider_activation/schwab.rs, schwab_reference.rs, schwab_quote_metadata.rs, schwab_streamer.rs under apps/market-squawk/src; existing provider_activation/account.rs only if required for scoped prepared admission | Reuse existing prepared-or-active authority for startup; preserve active-only exposed publication and cleanup. Return exact remaining callers/test gap; no builds/Git/runtime changes. |
+| Lead | local_product/schwab_market_runtime.rs, application/market_runtime.rs, source lifecycle/contracts/Desktop controls, shared files, tests/integration/Git | Carry prepared target, atomic ready-to-Active commit and shared explicit Start; run existing critical harness after freeze and native source-to-screen check. |
+
+Native saved-session Continue now succeeds on b88567da (oct8-pending-recovery-native-continue.json);
+this is recovery evidence, not streaming. Additional ownership: Astra also owns
+provider_rate/schwab_streamer.rs for stage admission; lead owns provider_onboarding/service.rs
+owned-read methods and application/research/ingest/schwab_instrument_reference.rs plus runtime
+REST/stream publication consumers. Startup staging must close to Active admission at promotion;
+ordinary exposed reads retain the existing registry/lifecycle barrier.
+
+Fresh b88567da verification reached a successful LevelOneEquities status_code0 reply, then failed
+locally in ack-capture validation (frame_count4, response_count1, accumulator_presentfalse).
+This is an application evidence-validation defect until traced; not an upstream missing entitlement.
+GPT-6.1 Sol High schwab_ack_capture owns ONLY provider_onboarding/schwab_market_doctor_probe.rs
+and existing adjacent probe tests for this exact ACK/capture integrity failure. No builds, Git,
+provider calls, runtime changes or other source ownership. Trace four-frame response selection,
+correct exact ACK receipt matching and extend existing critical test if uncovered. Lead integrates
+with first-activation patch before the single native build; all other shared files remain lead-owned.
+
+No new branch/worktree. Resulting checkpoint pending. No live streaming or installed completion claim.
+
+Current candidate frozen for Rust session90807 (`oct8-schwab-first-activation-critical.log`).
+Astra and Sol helper ownership released. Shared account publication guard records prepared/Active
+admission after acquiring onboarding read ownership; Schwab seals prepared access under the same
+writer that activates and publishes its ready registry entry. Initial exact Start is available in
+Settings; CLI/MCP retain shared lifecycle commands. Required source token/reference/publication
+consumers updated, and group monitoring uses existing prepared-until-admitted behavior.
+
+Critical Desktop control regression PASS1/1,2ms (run1.40s); TypeScript project check PASS.
+An initial TypeScript command at repository root failed because root has no tsconfig; corrected
+command ran in Desktop. The extended existing Schwab recovery case reuses its real restored
+credential/doctor fixture for prepared publication→writer wait→Active→revocation; compilation ongoing.
+Doctor ACK cause remains unresolved: closed diagnostic fields added without weakening validation.
+Native build/retry follows the test outcome; no complete streaming or performance acceptance.
+
+First-activation critical result: Rust session90807 terminal0; compile4m08s, extended real
+Schwab recovery/publication/activation/revocation test PASS1/1,3.60s. Existing shared-read writer/
+revocation case PASS1/1,0.37s on the same test binary. Source-closure refresh terminal0 and diff
+check pass. Desktop control and TypeScript checks passed as above. Implemented and critically
+verified only; native activation/streaming awaits replacement and exact ACK diagnosis.
+Lead inspected all changed consumers; helpers released. Integration commit follows, then one
+supervised native build. No whole-app resource/final acceptance; target22G,tmp710M,dev-runtime1.4G.
+One worktree verified; main/release untouched. An origin Dependabot branch exists independently;
+no branch created by this work. Next data-coverage barrier also includes replacing the resolver's
+benchmark-only initial binding set with shared actual consumer demand; first activation alone
+cannot establish streaming for all nine watchlist investments.
 
 ### Pending Schwab recovery — critically verified checkpoint
 
@@ -18,13 +78,29 @@ service→catalog→reopen1/1,3.53s (compile6m22s). The latter also expires the 
 checks Current/Deferred, renews token generation on the same credential and reopens exact evidence.
 Logs: `oct8-pending-doctor-{lifecycle,service}.log`. All helper ownership released; lead owns
 integration, Git and native verification. Source closure refresh then one supervised native build
-is next. Live saved-session recovery and visible streaming remain unproven; pushed commit pending.
+is next. Live saved-session recovery and visible streaming remain unproven; pushed `b88567da`.
 
 Native observation before deployment: Home currently renders prices/changes for all nine starters
 (`oct8-pending-recovery-before-desktop.json`), while a separate native collection request timed out.
 This proves recovered displayed data, not streaming. SQL diagnosis defers a speculative route walker:
 VTI57–71ms alone cannot explain12.7s before comparison; next latency evidence needs cumulative
 native phase timing. No performance or installed-workflow acceptance claim.
+
+Source closure and diff checks passed; `b88567da` pushed. The existing supervisor is now
+compiling native replacement in Cargo PID80821 (parent60780); current service78916/Desktop78917
+remain alive until success. This is the only compiler job, root target reused. Do not start another
+build or modify source before its terminal result. Next: inspect exact native build outcome, stop
+watcher for serialized diagnostics, then saved-session Continue and actual quote-display proof.
+
+While native Cargo80821 compiles the frozen recovery checkpoint, GPT-6.1 Sol High
+schwab_activation_path owns ONLY `.agents/tmp/v1-first-stock/oct8-schwab-activation-path.md`.
+Trace the actual Desktop/CLI/MCP path from a fresh current Schwab doctor receipt to first runtime
+start: Settings activationKind currently returnsNone, RuntimeVerificationPending next action always
+OAuth, and local_product/market_provider_configuration.rs standard resolver rejects Schwab.
+Determine whether the separate Schwab resolver completes the shared configuration/activation path
+or an essential caller is missing. Read only, concise exact producers/consumers and critical check;
+no source edits, builds/Git, runtime/DB/provider calls or extra agents. Lead owns shared contracts,
+composition and native retry. This does not claim these source observations prove a missing path yet.
 
 ### Current recovery work — pending activation and Desktop prices
 

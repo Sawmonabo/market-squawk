@@ -2557,6 +2557,28 @@ describe("Market Squawk desktop boundary", () => {
     expect(lifecycleControls({ ...source, lifecycle: {
       ...source.lifecycle, publicConfigurationSha256: undefined,
     } }).some((control) => control.action === "retry")).toBe(false)
+
+    const schwab = {
+      ...source,
+      id: "schwab.trader-api-market-data",
+      lifecycle: {
+        ...source.lifecycle,
+        provider: "schwab.trader-api-market-data",
+        state: "stopped" as const,
+        startEligibility: "not_applicable" as const,
+        blocker: null,
+      },
+    }
+    expect(lifecycleControls(schwab).find((control) => control.action === "start")).toEqual({
+      action: "start", label: "Start", destructive: false,
+      request: {
+        provider: schwab.id,
+        expectedStateRevision: "3",
+        onboardingSessionId: source.lifecycle.configurationSessionId,
+        publicConfigurationSha256: source.lifecycle.publicConfigurationSha256,
+      },
+    })
+    expect(lifecycleControls(schwab).some((control) => control.action === "retry")).toBe(false)
   })
 
   it("keeps provider plumbing behind Settings onboarding", async () => {

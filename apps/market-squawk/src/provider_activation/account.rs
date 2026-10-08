@@ -1,6 +1,9 @@
 //! Shared account identity, budget, and lifetime authority for market-data providers.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use market_squawk_data::{CatalogAuthority, ResumedProviderOnboarding};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
@@ -198,6 +201,7 @@ pub(super) struct ProviderAccountRuntimeAuthority {
 #[derive(Clone)]
 pub(crate) struct ProviderAccountRuntimeCurrentness {
     authority: Weak<ProviderAccountRuntimeAuthority>,
+    preparation_complete: Option<Arc<AtomicBool>>,
 }
 
 impl ProviderAccountRuntimeCurrentness {
@@ -216,14 +220,16 @@ impl ProviderAccountRuntimeCurrentness {
         let onboarding = authority
             .onboarding
             .try_acquire_owned_runtime_read_authority()?;
-        authority.require_current_with(&onboarding)?;
+        let admission = self.publication_admission();
+        authority.require_publication_current_with(&onboarding, admission)?;
         Ok(ProviderAccountPublicationAuthority {
             authority,
             onboarding,
+            admission,
         })
     }
 
-    /// Waits for publication ownership, then validates the exact active lease under that guard.
+    /// Waits for publication ownership, then validates the exact lease and runtime phase.
     /// Call only after provider acquisition; the caller bounds the wait by its deadline and
     /// cancellation and retains the returned authority through the existing commit boundary.
     pub(crate) async fn acquire_publication_authority(
@@ -237,11 +243,40 @@ impl ProviderAccountRuntimeCurrentness {
             .onboarding
             .acquire_owned_runtime_read_authority()
             .await;
-        authority.require_current_with(&onboarding)?;
+        let admission = self.publication_admission();
+        authority.require_publication_current_with(&onboarding, admission)?;
         Ok(ProviderAccountPublicationAuthority {
             authority,
             onboarding,
+            admission,
         })
+    }
+
+    // Snapshot only while onboarding read ownership is held. Promotion seals the phase under
+    // mutation ownership, so a publication cannot retain prepared admission across promotion.
+    fn publication_admission(&self) -> AccountPublicationAdmission {
+        if self
+            .preparation_complete
+            .as_ref()
+            .is_some_and(|complete| !complete.load(Ordering::Acquire))
+        {
+            AccountPublicationAdmission::PreparedOrActive
+        } else {
+            AccountPublicationAdmission::Active
+        }
+    }
+
+    /// Checks runtime dispatch admission, with prepared access only until startup is sealed.
+    pub(crate) fn is_current_now(&self) -> bool {
+        let Some(authority) = self.authority.upgrade() else {
+            return false;
+        };
+        let Ok(onboarding) = authority.onboarding.try_acquire_owned_runtime_read_authority() else {
+            return false;
+        };
+        authority
+            .require_publication_current_with(&onboarding, self.publication_admission())
+            .is_ok()
     }
 
     /// Reopens retained doctor evidence under the same current account admission.
@@ -273,7 +308,7 @@ impl ProviderAccountRuntimeCurrentness {
 
     /// Returns whether the exact retained account lease is staged or active.
     ///
-    /// This narrower startup allowance exists only for the Alpaca staged-publication interval.
+    /// This allowance is for account startup before registry publication.
     pub(crate) async fn is_prepared_or_active(&self) -> bool {
         let Some(authority) = self.authority.upgrade() else {
             return false;
@@ -323,12 +358,20 @@ impl ProviderAccountRuntimeCurrentness {
 pub(crate) struct ProviderAccountPublicationAuthority {
     authority: Arc<ProviderAccountRuntimeAuthority>,
     onboarding: ProviderOnboardingOwnedReadAuthority,
+    admission: AccountPublicationAdmission,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AccountPublicationAdmission {
+    Active,
+    PreparedOrActive,
 }
 
 impl ProviderAccountPublicationAuthority {
     /// Revalidates durable currentness before the publication catalog lock is acquired.
     pub(crate) fn require_current(&self) -> Result<(), crate::ProviderOnboardingError> {
-        self.authority.require_current_with(&self.onboarding)
+        self.authority
+            .require_publication_current_with(&self.onboarding, self.admission)
     }
 
     /// Revalidates the exact account lease against the already locked publication catalog.
@@ -337,11 +380,22 @@ impl ProviderAccountPublicationAuthority {
         catalog: &CatalogAuthority,
     ) -> Result<(), crate::ProviderOnboardingError> {
         let previous = self.authority.snapshot()?;
-        self.onboarding.require_active_in_catalog_with_snapshot(
-            catalog,
-            &self.authority.lease,
-            previous.as_ref(),
-        )
+        match self.admission {
+            AccountPublicationAdmission::Active => {
+                self.onboarding.require_active_in_catalog_with_snapshot(
+                    catalog,
+                    &self.authority.lease,
+                    previous.as_ref(),
+                )
+            }
+            AccountPublicationAdmission::PreparedOrActive => {
+                self.onboarding.require_prepared_or_active_in_catalog_with_snapshot(
+                    catalog,
+                    &self.authority.lease,
+                    previous.as_ref(),
+                )
+            }
+        }
     }
 }
 
@@ -425,6 +479,17 @@ impl ProviderAccountRuntimeAuthority {
     pub(super) fn currentness(self: &Arc<Self>) -> ProviderAccountRuntimeCurrentness {
         ProviderAccountRuntimeCurrentness {
             authority: Arc::downgrade(self),
+            preparation_complete: None,
+        }
+    }
+
+    pub(super) fn runtime_currentness(
+        self: &Arc<Self>,
+        preparation_complete: Arc<AtomicBool>,
+    ) -> ProviderAccountRuntimeCurrentness {
+        ProviderAccountRuntimeCurrentness {
+            authority: Arc::downgrade(self),
+            preparation_complete: Some(preparation_complete),
         }
     }
 
@@ -467,12 +532,20 @@ impl ProviderAccountRuntimeAuthority {
         Ok(())
     }
 
-    fn require_current_with(
+    fn require_publication_current_with(
         &self,
         onboarding: &ProviderOnboardingOwnedReadAuthority,
+        admission: AccountPublicationAdmission,
     ) -> Result<(), crate::ProviderOnboardingError> {
         let previous = self.snapshot()?;
-        let current = onboarding.require_active_with_snapshot(&self.lease, previous.as_ref())?;
+        let current = match admission {
+            AccountPublicationAdmission::Active => {
+                onboarding.require_active_with_snapshot(&self.lease, previous.as_ref())?
+            }
+            AccountPublicationAdmission::PreparedOrActive => {
+                onboarding.require_prepared_or_active_with_snapshot(&self.lease, previous.as_ref())?
+            }
+        };
         self.retain_snapshot(current)
     }
 
@@ -596,4 +669,51 @@ pub enum ProviderAccountActivationError {
     /// The configured control-state path is unavailable or unsafe.
     #[error(transparent)]
     Path(#[from] market_squawk_platform::PathError),
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_schwab_prepared_publication_transition(
+    onboarding: Arc<ProviderOnboardingService>,
+    lease: ProviderActivationLease,
+    config: &AppConfig,
+    rate: ProviderRateAuthority,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
+        ProviderMarketAccount::SchwabMarketData, lease.clone(), Arc::clone(&onboarding), config, rate,
+    )?);
+    let strict = authority.currentness();
+    let phase = Arc::new(AtomicBool::new(false));
+    let runtime = authority.runtime_currentness(Arc::clone(&phase));
+    let retained = runtime.clone();
+    assert!(!strict.is_active().await);
+    assert!(strict.try_acquire_publication_authority().is_err());
+    let publication = runtime.acquire_publication_authority().await?;
+    publication.require_current()?;
+    assert!(runtime.is_current_now());
+
+    // Promotion must wait for the exact catalog publication guard, not invalidate it midway.
+    let mut mutation = Box::pin(onboarding.acquire_runtime_mutation_authority());
+    assert!(futures_util::poll!(mutation.as_mut()).is_pending());
+    publication.require_current()?;
+    drop(publication);
+    let mutation = tokio::time::timeout(std::time::Duration::from_secs(1), mutation).await?;
+    mutation.commit_prepared_activation(&lease)?;
+    mutation.require_active(&lease)?;
+    phase.store(true, Ordering::Release);
+    drop(mutation);
+    assert!(strict.is_active().await);
+    let active_publication = retained.acquire_publication_authority().await?;
+    active_publication.require_current()?;
+    assert!(matches!(active_publication.admission, AccountPublicationAdmission::Active));
+    drop(active_publication);
+
+    let mutation = onboarding.acquire_runtime_mutation_authority().await;
+    mutation.invalidate_activation_recipe(
+        lease.session_id(), EvidenceDigest::new(DigestAlgorithm::Sha256, [87; 32]),
+    )?;
+    drop(mutation);
+    assert!(!strict.is_active().await);
+    assert!(!retained.is_current_now());
+    assert!(retained.try_acquire_publication_authority().is_err());
+    Ok(())
 }

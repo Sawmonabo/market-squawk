@@ -541,7 +541,7 @@ async fn current_oauth_receipt(
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             return Err(SchwabRestQuoteSessionRuntimeError::Deadline);
         }
-        current = activation.require_current() => {
+        current = activation.require_runtime_current() => {
             current.map_err(SchwabRestQuoteRuntimeError::from)?;
         }
     }
@@ -551,7 +551,7 @@ async fn current_oauth_receipt(
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             Err(SchwabRestQuoteSessionRuntimeError::Deadline)
         }
-        receipt = activation.current_oauth_receipt() => receipt
+        receipt = activation.runtime_oauth_receipt() => receipt
             .map_err(SchwabRestQuoteRuntimeError::from)
             .map_err(Into::into),
     }
@@ -1139,7 +1139,7 @@ impl SchwabRestQuoteSealFirstSink {
         let account = match &self.activation {
             Some(activation) => Some(
                 activation
-                    .currentness()
+                    .runtime_currentness()
                     .try_acquire_publication_authority()
                     .map_err(|_| SchwabRestQuoteSinkError::InvalidReceipt)?,
             ),

@@ -11,6 +11,7 @@ import type {
 type RecordValue = Record<string, unknown>
 
 const LIVE_SOURCES = new Set([
+  "schwab.trader-api-market-data",
   "coinbase.public-market-data",
   "coinbase.exchange-direct-market-data",
   "kraken.spot-public-market-data",
@@ -22,6 +23,7 @@ const PUBLIC_LIVE_SOURCES = new Set([
   "kraken.spot-public-market-data",
 ])
 const ACCOUNT_GROUP_SOURCES = new Set([
+  "schwab.trader-api-market-data",
   "alpaca.basic-market-data",
   "kraken.spot-authenticated-level3-market-data",
 ])
@@ -1125,6 +1127,8 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
                     ...exactConfiguration,
                   }),
                 ]
+            : hasConfiguration && ACCOUNT_GROUP_SOURCES.has(source.id)
+              ? [control("start", "Start", { ...base, ...exactConfiguration })]
             : hasConfiguration
             ? [
                 control("retry", "Resume", {

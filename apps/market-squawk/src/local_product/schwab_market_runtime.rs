@@ -276,8 +276,9 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
         let lease = self
             .onboarding
             .activation_lease(request.onboarding_session_id())
+            .or_else(|_| self.onboarding.prepared_activation_lease(request.onboarding_session_id()))
             .map_err(|error| {
-                tracing::warn!(%error, "active Schwab onboarding lease is unavailable");
+                tracing::warn!(%error, "prepared Schwab onboarding lease is unavailable");
                 ServiceError::Unauthorized
             })?;
         if lease.surface_id().as_str() != request.surface().surface_id()

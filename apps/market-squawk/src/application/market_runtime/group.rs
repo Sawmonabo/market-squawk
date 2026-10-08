@@ -376,7 +376,7 @@ impl AccountMarketRuntimeGroup {
                     descriptors: vec![descriptor].into_boxed_slice(),
                     kraken_descriptor: None,
                     currentness,
-                    currentness_mode: AccountCurrentnessMode::ActiveOnly,
+                    currentness_mode: AccountCurrentnessMode::PreparedOrActiveUntilAdmission,
                     metadata,
                     routes,
                     durable_reads: vec![durable_read],
@@ -554,6 +554,13 @@ impl AccountMarketRuntimeGroup {
 
     pub(super) const fn activation_lease(&self) -> &ProviderActivationLease {
         &self.activation_lease
+    }
+
+    /// Closes initial staging while the registry holds onboarding mutation authority.
+    pub(super) fn seal_preparation(&self) {
+        if let AccountMarketRuntime::Schwab(runtime) = &self.runtime {
+            runtime._account_owner.seal_runtime_preparation();
+        }
     }
 
     /// Opens the one-way read gate after the matching durable lifecycle transition is Active.

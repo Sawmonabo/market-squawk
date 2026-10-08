@@ -3933,8 +3933,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime.rs",
-      "sha256": "d1265270158bb28042eb834b539c6e5cfd28772a644b67d10b9da67cc74c38d9",
-      "size_bytes": 187769
+      "sha256": "be0de887cdef12d29b0cea47d44a99cd585c929753ee5379ad4ec6c4b9a80ad0",
+      "size_bytes": 187930
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/account_stop.rs",
@@ -3998,8 +3998,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/group.rs",
-      "sha256": "9254c2e5491faf079e57cd76b346d268d9817d3d0021ae15e9c5614c97ebdb6e",
-      "size_bytes": 72355
+      "sha256": "e0bc80d3e47e80a04ee43302d03211c9745bcf825a54d63fa7113ba904c3eb7c",
+      "size_bytes": 72657
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/kraken.rs",
@@ -4018,8 +4018,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab.rs",
-      "sha256": "3029feae6259bfa5b8666f483879f5e5631e9736ea6ca8429d4859e42bd9d8ff",
-      "size_bytes": 41646
+      "sha256": "4a8e4b71184663a34288f119d9b31f91f66889426f441bbe9e9aaa5478ff5333",
+      "size_bytes": 41662
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_current.rs",
@@ -4028,8 +4028,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_sink.rs",
-      "sha256": "bd2ca7b5bc51ea9fb506a84fd9fe09db939f6621f87841d4f6c0382e51ad5cb1",
-      "size_bytes": 76558
+      "sha256": "a8665344545b44632b06f44bc90e9c2f1476d9b9a7e8e13f0a2e9a386d0fd8f7",
+      "size_bytes": 76574
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer.rs",
@@ -4043,8 +4043,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer/publication.rs",
-      "sha256": "5117735ac64b4138956fadd79c767f864b4e30cf25ba3b20503d0e50ffac5ffd",
-      "size_bytes": 20205
+      "sha256": "0e609b3cff588e70a240b06842f0bde8c6cd3ed0fd5a797dd144d8e072f15ae1",
+      "size_bytes": 20229
     },
     {
       "path": "apps/market-squawk/src/application/market_selection/candidate.rs",
@@ -5498,8 +5498,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/schwab_market_runtime.rs",
-      "sha256": "9bc9dd5e765a95b6f7b8511b1bef4ea00adcbfa6724e238bd9052dd2dec85e76",
-      "size_bytes": 17589
+      "sha256": "17b3cde1a783ed88cb2c2fbe759f5091e60b1251aeb799b355895b7a94165c76",
+      "size_bytes": 17692
     },
     {
       "path": "apps/market-squawk/src/local_product/source_lifecycle.rs",
@@ -5753,8 +5753,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/account.rs",
-      "sha256": "20302f4b6e1b7583d6f930bd91869461e1555dc38eb32cdc5c913d2799538413",
-      "size_bytes": 24737
+      "sha256": "5ed03d7d296ce4144cd283167d306608db44b9d210da11ac8cc5c457326eebe4",
+      "size_bytes": 29549
     },
     {
       "path": "apps/market-squawk/src/provider_activation/alpaca.rs",
@@ -5828,8 +5828,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/mod.rs",
-      "sha256": "fb820b32f271ad0f7aab8e21a72d77114300e6ebd4b872ca5a6afe6651f01d6e",
-      "size_bytes": 137612
+      "sha256": "cccca60da393e1c2efabf4cab6ac91e630946cc996b3f89dbceb6599cc4d33dc",
+      "size_bytes": 137696
     },
     {
       "path": "apps/market-squawk/src/provider_activation/nasdaq_reference.rs",
@@ -5843,8 +5843,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab.rs",
-      "sha256": "96f02d622ed82c6614c0f4065228d96f9bb275300e47721108c2d111cc63e7e7",
-      "size_bytes": 44300
+      "sha256": "68156741037faa2eb6abe47048d59a7a208707f851e3acb69173e019f3c0045f",
+      "size_bytes": 46421
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab_market_hours.rs",
@@ -5863,13 +5863,13 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab_quote_metadata.rs",
-      "sha256": "608d138b420da7ae191252c0764a8348ae215d50e3354de58b9a1b2c03e852bb",
-      "size_bytes": 18661
+      "sha256": "8debcd5657e502c4153a7de00a27100704cad35ba3a9fd4b3294068f15e2465e",
+      "size_bytes": 18685
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab_reference.rs",
-      "sha256": "52693e55603e3d6eff35c814ffd79b1fc359ac6f6ecd37ef8068854944458e4c",
-      "size_bytes": 14057
+      "sha256": "6b41e4f612d8f458a7bdc76364899449532cc649f109f8df0ba29d11874d3172",
+      "size_bytes": 14098
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab_reference/metadata.rs",
@@ -5878,8 +5878,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab_streamer.rs",
-      "sha256": "f4ae5210e79a3e3e1ac80fffc03aadbecd2b6a33f76e7699feaeec9ccfc10e0c",
-      "size_bytes": 12196
+      "sha256": "2bf25b4946bbab846cd287a4b740ac326c8e579f66bd6359f682bb89735a9a44",
+      "size_bytes": 12224
     },
     {
       "path": "apps/market-squawk/src/provider_activation/specs.rs",
@@ -5928,8 +5928,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/contracts.rs",
-      "sha256": "3f786a0e57eb24c153b59ea08a8abd12c7688577cd097c4ed324f8458a1f43c3",
-      "size_bytes": 41345
+      "sha256": "de588efbe0be82ca802ae294d86c08277cc3b816391a1cd6ac6f27e20dcbaf91",
+      "size_bytes": 41895
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/credential_bundle.rs",
@@ -5953,8 +5953,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_market_doctor_probe.rs",
-      "sha256": "44c27a1bd8abc5c0815767acaca96fe06ec3432ec84d588563604247b0818fb8",
-      "size_bytes": 76747
+      "sha256": "4c5bf9d14b41be2d8389c7304793582993553f7688714aad4dda0478cfaba4d3",
+      "size_bytes": 79434
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_market_doctor_runtime.rs",
@@ -5973,8 +5973,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service.rs",
-      "sha256": "881ea5689257d9f933dca543debd3802bfa8be0515bc47c92d6d369960c5af79",
-      "size_bytes": 218193
+      "sha256": "0add72cbd4f3084787a78c3039a9e9be08a4b74dd9c0be84087a5b9913004ce8",
+      "size_bytes": 219165
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/bea_doctor.rs",
@@ -6003,8 +6003,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/schwab_recovery_tests.rs",
-      "sha256": "150b9645074cd491a4ca56b5bb42d45784711ae5c60e7b0f73df97897dcd4faa",
-      "size_bytes": 11742
+      "sha256": "fa8f020907cff7cc67f508eb348719371fe18cef215f4ad93b0274f4bf70c127",
+      "size_bytes": 12487
     },
     {
       "path": "apps/market-squawk/src/provider_rate.rs",
@@ -6013,8 +6013,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_rate/schwab_streamer.rs",
-      "sha256": "3a1a593c19acb7075cc4501b4f93ec2909930684e43280ffa1b162d16c034d4b",
-      "size_bytes": 22129
+      "sha256": "60418a76ab3e4b735639632d24f46928bb3c5c6e4449dc8121da74ec31616497",
+      "size_bytes": 22156
     },
     {
       "path": "apps/market-squawk/src/provider_rate/tiingo.rs",

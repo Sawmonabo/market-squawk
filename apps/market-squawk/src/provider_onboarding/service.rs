@@ -3362,6 +3362,27 @@ impl ProviderOnboardingReadAuthority<'_> {
 }
 
 impl ProviderOnboardingOwnedReadAuthority {
+    pub(crate) fn require_prepared_or_active_with_snapshot(
+        &self,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<Arc<ResumedProviderOnboarding>, ProviderOnboardingError> {
+        let resumed = self.service.catalog
+            .resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
+        self.service.require_prepared_or_active_from_resumed(&resumed, expected)?;
+        Ok(resumed)
+    }
+
+    pub(crate) fn require_prepared_or_active_in_catalog_with_snapshot(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &ProviderActivationLease,
+        previous: Option<&Arc<ResumedProviderOnboarding>>,
+    ) -> Result<(), ProviderOnboardingError> {
+        let resumed = catalog.resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
+        self.service.require_prepared_or_active_from_resumed(&resumed, expected)
+    }
+
     pub(crate) fn require_active_with_snapshot(
         &self,
         expected: &ProviderActivationLease,
@@ -4315,7 +4336,7 @@ fn unix_seconds_now() -> Result<u64, ProviderOnboardingError> {
     }
 }
 
-fn system_timestamp() -> Result<Timestamp, ProviderOnboardingError> {
+pub(super) fn system_timestamp() -> Result<Timestamp, ProviderOnboardingError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ProviderOnboardingError::Clock)?;

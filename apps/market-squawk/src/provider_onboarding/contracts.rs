@@ -812,7 +812,18 @@ pub(super) fn session_view(
             OnboardingState::RuntimeVerificationPending
                 if profile.id() == super::SCHWAB_MARKET_DATA_SURFACE_ID =>
             {
-                OnboardingNextAction::CompleteOAuthAuthorization
+                let ready = generation
+                    .and_then(|generation| lifecycle.generation_schwab_market_data_doctor_receipt(generation))
+                    .is_some_and(|receipt| {
+                        receipt.admits_source_start()
+                            && super::service::system_timestamp()
+                                .is_ok_and(|now| receipt.is_current_at(now))
+                    });
+                if ready {
+                    OnboardingNextAction::VerifyAndActivate
+                } else {
+                    OnboardingNextAction::CompleteOAuthAuthorization
+                }
             }
             OnboardingState::RuntimeVerificationPending
                 if lifecycle.active_generation().is_some() =>

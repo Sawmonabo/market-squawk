@@ -1,4 +1,4 @@
-//! Real read-only UserPreference bootstrap on the same active account and request budget.
+//! Real read-only UserPreference bootstrap on the same staged or active account and budget.
 use super::{ProviderAdapterActivation, SchwabMarketDataAccountActivation};
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, ReadOnlyRequest, RequestAdmission, RestExecutionOutcome,
@@ -54,7 +54,7 @@ impl ProviderAdapterActivation {
             biased;
             () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
             () = tokio::time::sleep_until(deadline.into()) => return Err(ServiceError::DeadlineExceeded),
-            value = activation.acquire_publication_attempt() => value.map_err(|_| ServiceError::Unauthorized)?,
+            value = activation.acquire_runtime_publication_attempt() => value.map_err(|_| ServiceError::Unauthorized)?,
         };
         let oauth = epoch.receipt();
         let policy = activation
@@ -82,7 +82,7 @@ impl ProviderAdapterActivation {
         epoch
             .validate_current(oauth)
             .map_err(|_| ServiceError::Unauthorized)?;
-        if !activation.currentness().is_active_now() {
+        if !activation.runtime_currentness().is_current_now() {
             return Err(ServiceError::Unauthorized);
         }
         let permit = match reservation.commit_dispatch() {
@@ -144,7 +144,7 @@ impl ProviderAdapterActivation {
             return Err(ServiceError::Unavailable);
         };
         if !rate_ok
-            || !activation.currentness().is_active_now()
+            || !activation.runtime_currentness().is_current_now()
             || provider.receipt().credential_authority() != oauth.credential_authority()
             || provider.bootstrap().value().market_data_principal_sha256()
                 != activation
@@ -238,7 +238,7 @@ impl ProviderAdapterActivation {
                 }
             }
             let oauth = activation
-                .current_oauth_receipt()
+                .runtime_oauth_receipt()
                 .await
                 .map_err(|_| ServiceError::Unauthorized)?;
             let publication = self

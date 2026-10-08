@@ -94,7 +94,7 @@ impl SchwabStreamerRuntimeAuthority for SchwabStreamerAccountRateAuthority {
     > {
         Box::pin(async move {
             self.require_current()?;
-            if !self.currentness.is_active_now()
+            if !self.currentness.is_current_now()
                 || self
                     .state
                     .lock()
@@ -136,7 +136,7 @@ impl SchwabStreamerRuntimeAuthority for SchwabStreamerAccountRateAuthority {
     > {
         Box::pin(async move {
             self.require_current()?;
-            if !self.currentness.is_active_now()
+            if !self.currentness.is_current_now()
                 || request_id.is_empty()
                 || request_payload_bytes == 0
                 || request_payload_sha256.bytes() == [0; 32]
@@ -338,7 +338,7 @@ const fn map_streamer_budget_error(reason: BudgetUnavailableReason) -> SchwabTra
 
 impl SchwabStreamerAccountRateAuthority {
     fn require_current(&self) -> Result<(), SchwabTransportError> {
-        if !self.currentness.is_active_now() {
+        if !self.currentness.is_current_now() {
             return Err(SchwabTransportError::TokenRefreshRequired);
         }
         self.activation
@@ -394,7 +394,7 @@ impl SchwabAccessTokenSource for BoundTokenSource {
             let (token, epoch) = self
                 .authority
                 .activation
-                .acquire_publication_attempt()
+                .acquire_runtime_publication_attempt()
                 .await
                 .map_err(|_| TokenAuthorityError::ReauthorizationRequired)?;
             if epoch.receipt() != self.authority.oauth_receipt {
@@ -436,7 +436,7 @@ impl GovernedSchwabStreamer {
             return Err(SchwabTransportError::InvalidConfiguration);
         }
         activation
-            .require_current()
+            .require_runtime_current()
             .await
             .map_err(|_| SchwabTransportError::TokenRefreshRequired)?;
         let policy = activation
@@ -457,12 +457,12 @@ impl GovernedSchwabStreamer {
             .register_budget(declaration)
             .map_err(|_| SchwabTransportError::Protocol)?;
         let oauth_receipt = activation
-            .current_oauth_receipt()
+            .runtime_oauth_receipt()
             .await
             .map_err(|_| SchwabTransportError::TokenRefreshRequired)?;
         let authority = Arc::new(SchwabStreamerAccountRateAuthority {
             admitted_services: services,
-            currentness: activation.currentness(),
+            currentness: activation.runtime_currentness(),
             activation,
             oauth_receipt,
             budget: Arc::new(budget),

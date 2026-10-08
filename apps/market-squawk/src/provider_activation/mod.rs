@@ -1,6 +1,8 @@
 //! Lease-gated construction of production live and research adapters.
 
 mod account;
+#[cfg(test)]
+pub(crate) use account::assert_schwab_prepared_publication_transition;
 mod alpaca;
 pub(crate) use alpaca::{AlpacaOptionChainRuntimeAuthority, AlpacaOptionChainRuntimeError};
 mod alpaca_option_chain;
