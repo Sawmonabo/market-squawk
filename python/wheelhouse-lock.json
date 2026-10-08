@@ -2758,8 +2758,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/client.rs",
-      "sha256": "3fdabd82c110acc100f5b519e6449124968cb61e5c6cfb0e69eac268efcba7af",
-      "size_bytes": 67928
+      "sha256": "d69ffd9b5894e166174143ba47cc5ddeb78abcb1dde34742e893edc554d3aea1",
+      "size_bytes": 67946
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/client/company_directory.rs",
@@ -3118,8 +3118,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-treasury/src/vertical.rs",
-      "sha256": "2e25f999e221af7548002f1baf3c82157808fe6be3835af6355381411e3fcdf5",
-      "size_bytes": 72943
+      "sha256": "f95ec1f5d8776e0137a0c931ca6b7421a026b8f643e0a8ce3bae24cd21c1cee0",
+      "size_bytes": 72955
     },
     {
       "path": "adapters/market-squawk-adapter-yahoo/Cargo.toml",
@@ -5128,8 +5128,8 @@
     },
     {
       "path": "apps/market-squawk/src/live_source/crypto_reference.rs",
-      "sha256": "b94635f6912c06cf0696630932a6a2c1c04d6a3ce8aceb8e38f8c06063d816b7",
-      "size_bytes": 34546
+      "sha256": "2f0583f04999a3ccb727ffdce3675ad5fda69b6cfcae149c979dce419dc60585",
+      "size_bytes": 34533
     },
     {
       "path": "apps/market-squawk/src/live_source/crypto_reference_transport.rs",
@@ -5833,8 +5833,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/nasdaq_reference.rs",
-      "sha256": "5b8bc7a4d443b810ec52c74d6a3d873b932121edd1ca8be1092a02087e4ff67d",
-      "size_bytes": 63263
+      "sha256": "f9ed3b4d9c4b8625097de3df7854230f669259611172e2bb222d07e4f9780f33",
+      "size_bytes": 63338
     },
     {
       "path": "apps/market-squawk/src/provider_activation/reference_identity.rs",
@@ -5928,8 +5928,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/contracts.rs",
-      "sha256": "0acc134ca329a3cbe1cc71fa4f6475c38a217ecbaa4674809119854a72005c43",
-      "size_bytes": 41315
+      "sha256": "3f786a0e57eb24c153b59ea08a8abd12c7688577cd097c4ed324f8458a1f43c3",
+      "size_bytes": 41345
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/credential_bundle.rs",
@@ -5973,23 +5973,23 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service.rs",
-      "sha256": "1674344ec625f5edfb89bf5b308b98d39bcec4377e7a23ce61aa506833206b99",
-      "size_bytes": 215181
+      "sha256": "451109d3e49d1557b45908f788eb1ded54b0c0e3fef5966b00f9038aa63d7cea",
+      "size_bytes": 217451
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/bea_doctor.rs",
-      "sha256": "ddd4639b064f67b0bfa99677d277618912636b84690ee2bc5f8de60f3522f1a1",
-      "size_bytes": 8061
+      "sha256": "d76611eb1b8813c123e82153e09a4fb17b3bb13d9d9455cab53218d336e2978f",
+      "size_bytes": 8018
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/census_doctor.rs",
-      "sha256": "b709f424874782012f72bf6023e144b549a8e863e0d297ea5332f48efd168925",
-      "size_bytes": 4585
+      "sha256": "30a32c8650de7d54f2b4cd745d4554fc5efb6e7e40f9ce57f7474bde423861a3",
+      "size_bytes": 4542
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/eia_doctor.rs",
-      "sha256": "fb8131d3c878156798de0a335e83306f533607b6f84c665517491ad4c7f82a6c",
-      "size_bytes": 9340
+      "sha256": "6b6d1da890a39de7a558677cc76de2da6309cc07ba3dc4f4d293072eb19f1e9e",
+      "size_bytes": 9293
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/lifecycle_runtime.rs",
@@ -5998,8 +5998,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/rate_runtime.rs",
-      "sha256": "fc1cf63fc3e87030b3a54e1c3009b9469ae583edfcb346e1f58d6615e64c1ec6",
-      "size_bytes": 29875
+      "sha256": "d6379ab7c964f3bd93a49c9d841f869e500c41a27bef62007daf766ea739a680",
+      "size_bytes": 29989
     },
     {
       "path": "apps/market-squawk/src/provider_rate.rs",
@@ -7718,8 +7718,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/provider_rate.rs",
-      "sha256": "81a0763fab5fc5120cbdba84da82c91a973e48c3b1de743e7000282451adcaf1",
-      "size_bytes": 165835
+      "sha256": "6250b26bab0a0f7ad9fc55d654e7f0acc370038e9e76672a2f0f93c771ed34cd",
+      "size_bytes": 175716
     },
     {
       "path": "crates/market-squawk-data/src/publication_coordinator.rs",
@@ -10048,13 +10048,13 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/built_in_profiles.rs",
-      "sha256": "1480cc9add11f0493c9ed8e9fc1cbce588a6fba69a3e1af4bc813749edacf159",
-      "size_bytes": 132388
+      "sha256": "d5efcbb33ae2a1e779e318aaddeaab9b72a6cbe8ea16b3043f1e2d47b2a6ac3c",
+      "size_bytes": 133169
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/capability.rs",
-      "sha256": "cd633300812d4db53198365ca1a26b906348930fa96340550c880eaae02a2017",
-      "size_bytes": 28626
+      "sha256": "d08a9b103ce8a2a078204d80db88f1fe34388b1e2799555bfe44ee0818eeb801",
+      "size_bytes": 28577
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/lifecycle.rs",
@@ -10063,8 +10063,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/profile.rs",
-      "sha256": "98945a3c9511b39ee3dc1f95a576bc0fac066dfe02d6f4d7a6396924723a0cce",
-      "size_bytes": 28913
+      "sha256": "9c9383b4b03ca0954f45c4f7634ce2c81cf9d67e5a05eea7dad0b8053d986015",
+      "size_bytes": 30880
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/public_configuration.rs",
@@ -10083,8 +10083,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/tests.rs",
-      "sha256": "2d768565e2e67e58c0e296a93b514a4ce4f3f747fea0b6b874711884f5800ea8",
-      "size_bytes": 78795
+      "sha256": "7f081d1e35cb826a9ff9c16ae11d8c905d03af8c23dc362c1a5b52c92c12adc1",
+      "size_bytes": 79906
     },
     {
       "path": "crates/market-squawk-sources/src/order.rs",
@@ -10103,8 +10103,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/checkpoint.rs",
-      "sha256": "c0c8d7ec2dae4b894925447f9dc9f9da988d6253e7d0e0718162266814db666e",
-      "size_bytes": 13196
+      "sha256": "d5001b611d0e9bff984bd66c138cee6d6254e036e1023cea05e2f4ab5eb89c3a",
+      "size_bytes": 12378
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/coordinator.rs",
@@ -10123,13 +10123,13 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/coordinator/tests.rs",
-      "sha256": "06263538006125325705119d45eab4140b36fbee3b9c2f6596a18f3be60b1eab",
-      "size_bytes": 33041
+      "sha256": "633984150eb5b0ebfbd25a1b27852e991b2e2105133dd5ce6ce93f6e9a8dbd0d",
+      "size_bytes": 33194
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/identity.rs",
-      "sha256": "12d7e6c6258f36016452092f1e9326680722277c59bf3f400d4c422db4189606",
-      "size_bytes": 31395
+      "sha256": "c4f69126b2cee6b04b05bdd9add86953040d7ca7d472fcc20055814977222f78",
+      "size_bytes": 33788
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence.rs",
@@ -10158,18 +10158,18 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence/tests/terminalization.rs",
-      "sha256": "d351f57530be1be66faa58b059816eb4c44adf498ad43410f7222c6f1e5bafd8",
-      "size_bytes": 20601
+      "sha256": "9d6afd821b20bce776a02c9c3c08c6baaed9592c49a0e36421c1286a5860065d",
+      "size_bytes": 19461
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence/tests/terminalization/availability_changed.rs",
-      "sha256": "670060bcefe8602c8168051dc0befdfef2d2daa2bafcf674347cb1d4b0781cd4",
-      "size_bytes": 3580
+      "sha256": "4877a3030a9e8b68fc8d3fb4d40c17b5d50d27681510b10c7a41f21155127279",
+      "size_bytes": 3263
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence/tests/terminalization/branch_matrix.rs",
-      "sha256": "83f8be505cb12533c5b819bb3f3d9c56d87b1a81e4e9256656f94d7e87f75977",
-      "size_bytes": 25262
+      "sha256": "eb45de47e27a81de25bc284c34aaa051f3c9ec851481a8a3b470c22668c7c6d4",
+      "size_bytes": 25562
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence/tests/terminalization/branch_matrix/permit.rs",
@@ -10178,13 +10178,13 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence/tests/terminalization/concurrency.rs",
-      "sha256": "ba8c7d73705178d333ab8ca53b45da2d5c1a1b9ffb591a96da230490bf597303",
-      "size_bytes": 10611
+      "sha256": "b69c95dd2f4208e691bc939ed530207a1009116e3f4d0608ef25fd7629ca14da",
+      "size_bytes": 10294
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence/tests/terminalization/lifecycle.rs",
-      "sha256": "8925139662f684234e46ad76b8fe3bcd2747b17cc5f2c6e146859ca95ec819f3",
-      "size_bytes": 21336
+      "sha256": "309c40608ec882b425abcb315a62a2f76a1d5268b945c530c563eca9e2f51bdf",
+      "size_bytes": 20702
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/retry_after.rs",
@@ -10193,8 +10193,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/runtime.rs",
-      "sha256": "b867c21e0cec3b8dd65f15636d2f88fe99ceccd7cd34bf7f40d7cfb5fd1f2789",
-      "size_bytes": 59563
+      "sha256": "b729459dcceac1b626e87da93e2397126d1f5f242f34e5ad8571928aa24d52d2",
+      "size_bytes": 58490
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/runtime/failure.rs",
@@ -10203,8 +10203,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/runtime_types.rs",
-      "sha256": "b606291f2e06ad5c8a1ccd38e52d95efb4ef3d040173356aae4c36c5c9e8d023",
-      "size_bytes": 8482
+      "sha256": "ccd3edcd94c2e73ad52799f5d99e7dbf1dff846048bb4152adad60a9960d3c3a",
+      "size_bytes": 7767
     },
     {
       "path": "crates/market-squawk-sources/src/policy/endpoint.rs",
@@ -10213,13 +10213,13 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/provider_rate.rs",
-      "sha256": "3cdbfca651e99916b8b9bba141251506cb0f4d50be15a4f9e2f26f2a2cbf9c12",
-      "size_bytes": 56498
+      "sha256": "f7e46ee3dc9d62595ff988e9cc28b48c0709266ae11045d8a466cd33f1647be3",
+      "size_bytes": 58396
     },
     {
       "path": "crates/market-squawk-sources/src/policy/tests.rs",
-      "sha256": "e09300a08f7d1e7ef66fe2bec45bd1805f0b392b074f61af681d4f7a561c8122",
-      "size_bytes": 45384
+      "sha256": "964f3e039a726b40d8faa8055ca32f609520a8426ebd62460c70ff20dd81a9ba",
+      "size_bytes": 53363
     },
     {
       "path": "crates/market-squawk-sources/src/registry.rs",

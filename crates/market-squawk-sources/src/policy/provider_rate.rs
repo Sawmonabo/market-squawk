@@ -620,6 +620,19 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         Ok(registration)
     }
 
+    /// Registers explicitly unknown numeric capacity, removing an obsolete request quota only
+    /// from a drained exact collision group. Concurrency, refusal/cooldown, disabled state and
+    /// weighted limits must not be relaxed. Existing handles must become invalid after a change.
+    /// Implementations that cannot perform this atomic transition reject it.
+    fn register_unknown_capacity(
+        &self,
+        _run_id: ProviderRateRunId,
+        _declaration: &ProviderRateDeclaration,
+        _now: Timestamp,
+    ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
+
     /// Reserves one concurrency slot without charging any request window.
     fn try_reserve(
         &self,
@@ -950,6 +963,33 @@ impl ProviderRateAuthority {
         declaration: ProviderRateDeclaration,
     ) -> Result<SharedProviderBudget, BudgetPoolError> {
         let binding = self.register_binding(&declaration)?;
+        SharedProviderBudget::new_with_provider_rate(declaration.policy, binding)
+    }
+
+    /// Registers a code-owned unknown-capacity policy, explicitly retiring obsolete request
+    /// windows once its exact durable scope is drained. Ordinary registration never changes
+    /// policy. Provider cooldown and disable decisions survive this control-plane transition.
+    pub fn register_unknown_capacity_budget(
+        &self,
+        declaration: ProviderRateDeclaration,
+    ) -> Result<SharedProviderBudget, BudgetPoolError> {
+        if declaration.policy.window_count() != 0 {
+            return Err(BudgetPoolError::ConflictingPolicy);
+        }
+        let (_, registration) = self
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.register_unknown_capacity(run_id, &declaration, now)
+            })
+            .map_err(map_store_registration_error)?;
+        if registration.policy_digest() != declaration.policy_digest()
+            || registration.declaration_digest() != declaration.declaration_digest()
+        {
+            return Err(BudgetPoolError::Persistence);
+        }
+        let binding = ProviderRateBinding {
+            authority: self.clone(),
+            registration,
+        };
         SharedProviderBudget::new_with_provider_rate(declaration.policy, binding)
     }
 

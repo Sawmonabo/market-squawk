@@ -111,9 +111,9 @@ impl SecEdgarSource {
         let budget_policy = metadata
             .budget_policy()
             .ok_or(SecClientError::MissingSharedBudget)?;
-        if budget_policy.requests_per_window() != SEC_APPLICATION_REQUESTS_PER_SECOND
-            || budget_policy.requests_per_window() > SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND
-            || budget_policy.window_nanos() != ONE_SECOND_NANOS
+        if budget_policy.requests_per_window() != Some(SEC_APPLICATION_REQUESTS_PER_SECOND)
+            || budget_policy.requests_per_window() > Some(SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND)
+            || budget_policy.window_nanos() != Some(ONE_SECOND_NANOS)
             || budget_policy.window_count() != 1
             || budget_policy.max_concurrent() != SEC_APPLICATION_MAX_CONCURRENT_REQUESTS
             || budget_policy.scope().as_source_identifier().as_str() != SEC_PROVIDER_RATE_SCOPE

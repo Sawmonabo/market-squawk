@@ -116,7 +116,7 @@ impl ProbeRateAuthority {
         let mut scopes: BTreeMap<ProbeRateScopeKey, Arc<ProbeRateScope>> = BTreeMap::new();
         let mut policies = BTreeMap::new();
         for profile in profiles.iter() {
-            let descriptor = profile.capability().rate_policy();
+            let descriptor = profile.rate_policy();
             let policy = descriptor
                 .enforcement_policy()
                 .cloned()
@@ -215,9 +215,12 @@ impl ProbeRateAuthority {
                 ),
             }
             .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
-            let budget = provider_rate
-                .register_budget(declaration)
-                .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+            let budget = if declaration.policy().window_count() == 0 {
+                provider_rate.register_unknown_capacity_budget(declaration)
+            } else {
+                provider_rate.register_budget(declaration)
+            }
+            .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
             return acquire_aggregate_budget(budget, cancellation).await;
         }
         binding.scope.acquire(cancellation).await
@@ -228,7 +231,7 @@ impl ProbeRateAuthority {
         profile: &ProviderOnboardingProfile,
         authorization_subject: SourceIdentifier,
     ) -> Result<SchwabMarketDoctorProbeRateAuthority, ProviderOnboardingError> {
-        let descriptor = profile.capability().rate_policy().clone();
+        let descriptor = profile.rate_policy().clone();
         let binding = self
             .policies
             .get(descriptor.policy_id())
@@ -411,7 +414,7 @@ impl ProbeRateScope {
                 sliding_releases,
             });
         }
-        if windows.is_empty() || policy.max_concurrent() == 0 {
+        if policy.max_concurrent() == 0 {
             return Err(ProviderOnboardingError::InvalidProfile);
         }
         Ok(Self {
@@ -725,7 +728,7 @@ async fn wait_for_aggregate_rate(
         .checked_add(wait)
         .ok_or(ProviderOnboardingError::Clock)?;
     if now >= operation_deadline || wake >= operation_deadline {
-        return Err(ProviderOnboardingError::ProbeRateLimited);
+        return Err(ProviderOnboardingError::ProbeDeadlineExceeded);
     }
     tokio::select! {
         biased;
@@ -741,7 +744,7 @@ async fn wait_for_probe_rate(
 ) -> Result<(), ProviderOnboardingError> {
     let now = Instant::now();
     if now >= operation_deadline || blocked_until >= operation_deadline {
-        return Err(ProviderOnboardingError::ProbeRateLimited);
+        return Err(ProviderOnboardingError::ProbeDeadlineExceeded);
     }
     tokio::select! {
         biased;

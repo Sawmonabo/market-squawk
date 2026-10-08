@@ -107,6 +107,22 @@ data. **APPLICATION POLICY:** Schwab capacity is governed by one shared adaptive
 actual requested/returned rows, partial results, latency, bytes, HTTP 429/retry evidence, stream
 acknowledgements, queue pressure, and normal-session soak results.
 
+The active Schwab request policy represents numeric capacity as unknown, with no invented
+request-count window. Shared concurrency and provider refusal/Retry-After remain enforced. A
+code-owned policy correction can remove obsolete request windows only after the exact stored
+scope drains; cooldown, disable decisions and stale-handle rejection survive the correction.
+This admission policy does not establish successful Streamer service coverage or screen delivery;
+those require separate live producer-to-consumer evidence.
+Current rate enforcement belongs to the onboarding profile, independently of the immutable
+capability used to bind saved consent and credential identity. Scheduling, Settings disclosure and
+activation leases consume that one descriptor. This request-window correction preserves the
+admitted evidence, account collision scope, concurrency, backoff and refusal behavior; full
+policy comparisons still reject stale operational authority. `admitted_rights_duties` preserves the
+original authorization evidence, including its former rate-policy description; it does not describe
+current scheduling. The separately exposed `rate_policy` is the current operational authority.
+This rate correction does not require provider reconsent.
+
+
 **APPLICATION POLICY:** The selected stack remains usable with IEX, indicative, provider-qualified,
 and partial evidence. It must never advertise unavailable SIP, NBBO, OPRA, complete index/bond
 coverage, or consolidated full-depth semantics.

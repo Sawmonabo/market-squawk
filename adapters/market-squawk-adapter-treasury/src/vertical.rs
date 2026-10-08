@@ -1563,8 +1563,8 @@ pub(crate) fn treasury_rate_policy_digest(
     if policy.scope().as_source_identifier().as_str() != "us-treasury"
         || policy.scope().authorization_account().is_some()
         || policy.window_count() != 1
-        || policy.requests_per_window() != 1
-        || policy.window_nanos() != 1_000_000_000
+        || policy.requests_per_window() != Some(1)
+        || policy.window_nanos() != Some(1_000_000_000)
         || policy
             .window(0)
             .is_none_or(|window| window.semantics() != BudgetWindowSemantics::Sliding)

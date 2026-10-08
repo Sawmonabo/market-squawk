@@ -260,8 +260,12 @@ impl NasdaqReferenceUniverseService {
             .metadata()
             .budget_policy()
             .ok_or(NasdaqReferenceUniverseError::InvalidConfiguration)?;
-        let delay =
-            Duration::from_nanos(budget.window_nanos().max(budget.backoff().maximum_nanos()));
+        let delay = Duration::from_nanos(
+            budget
+                .window_nanos()
+                .unwrap_or(0)
+                .max(budget.backoff().maximum_nanos()),
+        );
         *refresh = Some(
             Instant::now()
                 .checked_add(delay)

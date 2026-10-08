@@ -319,18 +319,55 @@ mod tests {
     }
 
     #[test]
-    fn conjunctive_budget_policy_preserves_legacy_wire_and_enforces_invariants()
+    fn budget_policy_roundtrip_preserves_explicit_capacity_and_enforces_invariants()
     -> Result<(), Box<dyn std::error::Error>> {
-        let legacy = policy()?;
-        let legacy_json = serde_json::to_string(&legacy)?;
+        let known = policy()?;
+        let known_json = serde_json::to_value(&known)?;
+        assert_eq!(known_json["requests_per_window"], serde_json::json!(2));
+        assert_eq!(known_json["window_nanos"], serde_json::json!(100));
+        assert_eq!(known_json["weighted_windows"], serde_json::json!([]));
         assert_eq!(
-            legacy_json,
-            r#"{"scope":{"provider":"provider","authorization_account":null},"requests_per_window":2,"window_nanos":100,"max_concurrent":1,"backoff":{"initial_nanos":10,"maximum_nanos":100,"jitter_basis_points":1000}}"#
+            serde_json::from_value::<ProviderBudgetPolicy>(known_json.clone())?,
+            known
+        );
+
+        let unknown = ProviderBudgetPolicy::try_new_unknown_capacity(
+            known.scope().clone(),
+            NonZeroU16::MIN,
+            known.backoff(),
+        )?;
+        let unknown_json = serde_json::to_value(&unknown)?;
+        assert_eq!(
+            unknown_json.get("requests_per_window"),
+            Some(&serde_json::Value::Null)
         );
         assert_eq!(
-            serde_json::from_str::<ProviderBudgetPolicy>(&legacy_json)?,
-            legacy
+            unknown_json.get("window_nanos"),
+            Some(&serde_json::Value::Null)
         );
+        assert_eq!(
+            serde_json::from_value::<ProviderBudgetPolicy>(unknown_json.clone())?,
+            unknown
+        );
+        for field in ["requests_per_window", "window_nanos"] {
+            let mut missing = unknown_json.clone();
+            let _removed = missing
+                .as_object_mut()
+                .ok_or("policy must be an object")?
+                .remove(field);
+            assert!(serde_json::from_value::<ProviderBudgetPolicy>(missing).is_err());
+
+            let mut unpaired_null = known_json.clone();
+            unpaired_null[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<ProviderBudgetPolicy>(unpaired_null).is_err());
+        }
+        let mut missing_capacity = unknown_json;
+        let object = missing_capacity
+            .as_object_mut()
+            .ok_or("policy must be an object")?;
+        let _requests = object.remove("requests_per_window");
+        let _duration = object.remove("window_nanos");
+        assert!(serde_json::from_value::<ProviderBudgetPolicy>(missing_capacity).is_err());
 
         let windows = [
             ProviderBudgetWindow::try_new(
@@ -345,15 +382,18 @@ mod tests {
             )?,
         ];
         let conjunctive = ProviderBudgetPolicy::try_new_conjunctive(
-            legacy.scope().clone(),
+            known.scope().clone(),
             &windows,
             NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
-            legacy.backoff(),
+            known.backoff(),
         )?;
         assert_eq!(conjunctive.window_count(), 2);
         assert_eq!(conjunctive.window(0), Some(windows[0]));
         assert_eq!(conjunctive.window(1), Some(windows[1]));
-        assert!(serde_json::to_string(&conjunctive)?.contains("additional_windows"));
+        assert_eq!(
+            serde_json::from_value::<ProviderBudgetPolicy>(serde_json::to_value(&conjunctive)?)?,
+            conjunctive
+        );
 
         let duplicate_duration = [
             windows[0],
@@ -365,19 +405,28 @@ mod tests {
         ];
         assert_eq!(
             ProviderBudgetPolicy::try_new_conjunctive(
-                legacy.scope().clone(),
-                &duplicate_duration,
-                NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
-                legacy.backoff(),
+                known.scope().clone(),
+                &[],
+                NonZeroU16::MIN,
+                known.backoff(),
             ),
             Err(NetworkPolicyError::InvalidBudgetPolicy)
         );
         assert_eq!(
             ProviderBudgetPolicy::try_new_conjunctive(
-                legacy.scope().clone(),
+                known.scope().clone(),
+                &duplicate_duration,
+                NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+                known.backoff(),
+            ),
+            Err(NetworkPolicyError::InvalidBudgetPolicy)
+        );
+        assert_eq!(
+            ProviderBudgetPolicy::try_new_conjunctive(
+                known.scope().clone(),
                 &windows,
                 NonZeroU16::new(2).ok_or("concurrency must be nonzero")?,
-                legacy.backoff(),
+                known.backoff(),
             ),
             Err(NetworkPolicyError::InvalidBudgetPolicy)
         );
@@ -388,10 +437,10 @@ mod tests {
         )?];
         assert_eq!(
             ProviderBudgetPolicy::try_new_conjunctive(
-                legacy.scope().clone(),
+                known.scope().clone(),
                 &oversized_sliding,
                 NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
-                legacy.backoff(),
+                known.backoff(),
             ),
             Err(NetworkPolicyError::InvalidBudgetPolicy)
         );
@@ -616,36 +665,157 @@ mod tests {
 
     #[test]
     fn refusal_escalation_and_retry_after_only_extend_shared_cooldown()
-    -> Result<(), NetworkPolicyError> {
-        let clock = Arc::new(ManualClock::new(100, 1_000));
-        let budget = SharedProviderBudget::new(
-            policy()?,
-            MonotonicInstant::from_nanos(1_000),
-            clock.clone(),
-        );
-        assert!(
-            matches!(budget.apply_refusal(0), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_010)
-        );
-        assert!(
-            matches!(budget.apply_refusal(0), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_020)
-        );
-        assert!(
-            matches!(budget.apply_retry_after(RetryAfter::Delay(NonZeroU64::new(5).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?)), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_020)
-        );
-        assert!(
-            matches!(budget.apply_retry_after(RetryAfter::AtWallClock(Timestamp::from_unix_nanos(150))), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_050)
-        );
-        assert!(matches!(
-            budget.apply_retry_after(RetryAfter::Delay(
-                NonZeroU64::new(101).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?
-            )),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::RetryAfterExceedsPolicy)
-        ));
-        assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
-        ));
-        assert!(clock.set(1_000_000, 2_000));
+    -> Result<(), Box<dyn std::error::Error>> {
+        let numeric = policy()?;
+        let unknown = ProviderBudgetPolicy::try_new_unknown_capacity(
+            numeric.scope().clone(),
+            NonZeroU16::MIN,
+            numeric.backoff(),
+        )?;
+        for configured in [numeric, unknown] {
+            let clock = Arc::new(ManualClock::new(100, 1_000));
+            let unknown_capacity = configured.window_count() == 0;
+            let budget = SharedProviderBudget::new(
+                configured,
+                MonotonicInstant::from_nanos(1_000),
+                clock.clone(),
+            );
+            // The existing numeric test did not cover dispatch without any request window.
+            let pending = if unknown_capacity {
+                assert_eq!(budget.policy().requests_per_window(), None);
+                assert_eq!(budget.policy().window_nanos(), None);
+                for _ in 0..25 {
+                    let BudgetDecision::Ready(permit) = budget.try_acquire() else {
+                        return Err("unknown request capacity acquired a numeric limit".into());
+                    };
+                    permit.release();
+                }
+                let BudgetDecision::Ready(permit) = budget.try_acquire() else {
+                    return Err("unknown-capacity request was not admitted".into());
+                };
+                assert!(matches!(
+                    budget.try_acquire(),
+                    BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+                ));
+                permit.release();
+                let BudgetReservationDecision::Ready(reservation) = budget.try_reserve_request()
+                else {
+                    return Err("unknown-capacity reservation was not admitted".into());
+                };
+                Some(reservation)
+            } else {
+                None
+            };
+            assert!(
+                matches!(budget.apply_refusal(0), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_010)
+            );
+            assert!(
+                matches!(budget.apply_refusal(0), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_020)
+            );
+            if let Some(reservation) = pending {
+                assert!(matches!(
+                    reservation.commit_dispatch(),
+                    BudgetDispatchDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_020
+                ));
+            }
+            assert!(
+                matches!(budget.apply_retry_after(RetryAfter::Delay(NonZeroU64::new(5).ok_or("retry delay must be nonzero")?)), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_020)
+            );
+            assert!(
+                matches!(budget.apply_retry_after(RetryAfter::AtWallClock(Timestamp::from_unix_nanos(150))), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_050)
+            );
+
+            if unknown_capacity {
+                let saved = ClockObservation::new(
+                    Timestamp::from_unix_nanos(100),
+                    MonotonicInstant::from_nanos(1_000),
+                );
+                let checkpoint = {
+                    let state = budget
+                        .allocation
+                        .state
+                        .lock()
+                        .map_err(|_| "state poisoned")?;
+                    checkpoint_from_runtime(budget.policy(), &state, saved, 1, false)?
+                };
+                assert_eq!(checkpoint.windows.len(), 0);
+                assert_eq!(checkpoint.in_flight, 0);
+                assert_eq!(checkpoint.consecutive_refusals, 2);
+                let checkpoint: BudgetCheckpointState =
+                    serde_json::from_slice(&serde_json::to_vec(&checkpoint)?)?;
+                let restart_clock = Arc::new(ManualClock::new(120, 5_000));
+                let restarted = SharedProviderBudget::new(
+                    budget.policy().clone(),
+                    MonotonicInstant::from_nanos(5_000),
+                    restart_clock.clone(),
+                );
+                *restarted
+                    .allocation
+                    .state
+                    .lock()
+                    .map_err(|_| "state poisoned")? = runtime_state_from_checkpoint(
+                    restarted.policy(),
+                    &checkpoint,
+                    restart_clock
+                        .observation()
+                        .map_err(|_| "clock unavailable")?,
+                )?;
+                assert!(matches!(
+                    restarted.try_acquire(),
+                    BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 5_030
+                ));
+                assert!(restart_clock.set(149, 5_029));
+                assert!(matches!(
+                    restarted.try_acquire(),
+                    BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 5_030
+                ));
+                assert!(restart_clock.set(150, 5_030));
+                let BudgetDecision::Ready(permit) = restarted.try_acquire() else {
+                    return Err("restored cooldown did not expire at its exact deadline".into());
+                };
+                permit.release();
+                assert_eq!(restarted.record_success(), Ok(()));
+                assert_eq!(
+                    restarted
+                        .allocation
+                        .state
+                        .lock()
+                        .map_err(|_| "state poisoned")?
+                        .consecutive_refusals,
+                    0
+                );
+                assert!(restart_clock.set(149, 5_029));
+                assert_eq!(
+                    restarted.remaining_wait(MonotonicInstant::from_nanos(5_030)),
+                    Err(BudgetUnavailableReason::ClockRegression)
+                );
+            }
+            assert!(matches!(
+                budget.apply_retry_after(RetryAfter::Delay(
+                    NonZeroU64::new(101).ok_or("retry delay must be nonzero")?
+                )),
+                BudgetDecision::Unavailable(BudgetUnavailableReason::RetryAfterExceedsPolicy)
+            ));
+            assert!(matches!(
+                budget.try_acquire(),
+                BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
+            ));
+            if unknown_capacity {
+                let observation = clock.observation().map_err(|_| "clock unavailable")?;
+                let checkpoint = {
+                    let state = budget
+                        .allocation
+                        .state
+                        .lock()
+                        .map_err(|_| "state poisoned")?;
+                    checkpoint_from_runtime(budget.policy(), &state, observation, 1, false)?
+                };
+                let restored =
+                    runtime_state_from_checkpoint(budget.policy(), &checkpoint, observation)?;
+                assert!(restored.disabled);
+                assert!(restored.windows.is_empty());
+            }
+        }
         Ok(())
     }
 
@@ -824,7 +994,7 @@ mod tests {
                     let Ok(mut state) = budget.allocation.state.lock() else {
                         return Err(NetworkPolicyError::InvalidBudgetPolicy);
                     };
-                    state.window_started_at = MonotonicInstant::from_nanos(1);
+                    state.last_observed_at = MonotonicInstant::from_nanos(1);
                 }
                 AvailabilityFailureCase::CoolingDown => {
                     let Ok(mut state) = budget.allocation.state.lock() else {
@@ -837,13 +1007,24 @@ mod tests {
                     let Ok(mut state) = budget.allocation.state.lock() else {
                         return Err(NetworkPolicyError::InvalidBudgetPolicy);
                     };
-                    state.window_started_at = MonotonicInstant::from_nanos(u64::MAX);
+                    state
+                        .windows
+                        .first_mut()
+                        .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?
+                        .window_started_at = MonotonicInstant::from_nanos(u64::MAX);
                 }
                 AvailabilityFailureCase::RequestWindowExhausted => {
                     let Ok(mut state) = budget.allocation.state.lock() else {
                         return Err(NetworkPolicyError::InvalidBudgetPolicy);
                     };
-                    state.requests_used = budget.policy().requests_per_window();
+                    state
+                        .windows
+                        .first_mut()
+                        .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?
+                        .requests_used = budget
+                        .policy()
+                        .requests_per_window()
+                        .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
                 }
                 AvailabilityFailureCase::ConcurrencyExhausted => {
                     let Ok(mut state) = budget.allocation.state.lock() else {
@@ -982,17 +1163,12 @@ mod tests {
             Timestamp::from_unix_nanos(1_000),
             MonotonicInstant::from_nanos(1_000),
         );
-        let state = BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 1,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        };
+        let mut state = BudgetState::new(&policy, observation.monotonic);
+        state
+            .windows
+            .first_mut()
+            .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?
+            .requests_used = 1;
         let valid = checkpoint_from_runtime(&policy, &state, observation, 1, false)
             .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
         assert!(validate_checkpoint(&policy, &valid, observation).is_ok());
@@ -1004,7 +1180,10 @@ mod tests {
             .first_mut()
             .and_then(BudgetWindowCheckpointState::tumbling_mut)
             .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
-        *requests_used = policy.requests_per_window() + 1;
+        *requests_used = policy
+            .requests_per_window()
+            .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?
+            + 1;
         assert_eq!(
             validate_checkpoint(&policy, &excessive_requests, observation),
             Err(AuthorityPersistenceError::InvalidState)
@@ -1095,14 +1274,15 @@ mod tests {
             MonotonicInstant::from_nanos(100),
         );
         let mut state = BudgetState::new(&policy, saved.monotonic);
-        state.primary_sliding_releases.extend([
+        let primary = state.windows.first_mut().ok_or("primary window missing")?;
+        primary.sliding_releases.extend([
             MonotonicInstant::from_nanos(150),
             MonotonicInstant::from_nanos(190),
         ]);
-        state.requests_used = 2;
+        primary.requests_used = 2;
         let additional = state
-            .additional_windows
-            .first_mut()
+            .windows
+            .get_mut(1)
             .ok_or("additional window missing")?;
         additional
             .sliding_releases
@@ -1120,7 +1300,10 @@ mod tests {
         )?;
         assert_eq!(
             restored
-                .primary_sliding_releases
+                .windows
+                .first()
+                .ok_or("restored primary window missing")?
+                .sliding_releases
                 .iter()
                 .map(|deadline| deadline.as_nanos())
                 .collect::<Vec<_>>(),
@@ -1128,8 +1311,8 @@ mod tests {
         );
         assert_eq!(
             restored
-                .additional_windows
-                .first()
+                .windows
+                .get(1)
                 .ok_or("restored additional window missing")?
                 .sliding_releases
                 .front()

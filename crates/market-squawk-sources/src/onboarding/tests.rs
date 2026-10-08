@@ -1370,12 +1370,35 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
 fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() -> TestResult {
     let profiles = built_in_provider_profiles()?;
     for profile in profiles.iter() {
-        let descriptor = profile.capability().rate_policy();
+        let descriptor = profile.rate_policy();
         let policy = descriptor
             .enforcement_policy()
             .ok_or("current profile omitted rate enforcement")?;
         assert!(!policy.scope().as_source_identifier().as_str().is_empty());
-        assert!(policy.window_count() >= 1);
+        if profile.id() == SCHWAB_MARKET_DATA_SURFACE_ID {
+            assert_eq!(policy.window_count(), 0);
+            assert_eq!(policy.requests_per_window(), None);
+            assert_eq!(policy.max_concurrent(), 1);
+            assert_eq!(profile.capability().revision().get(), 4);
+            assert_eq!(
+                profile.rights_decision_digest().bytes(),
+                [
+                    164, 108, 225, 133, 28, 167, 27, 89, 242, 4, 120, 19, 168, 69, 11, 19, 219, 78,
+                    54, 108, 44, 8, 66, 112, 168, 194, 254, 91, 217, 225, 234, 83
+                ]
+            );
+            assert_eq!(
+                profile.capability().content_digest().bytes(),
+                [
+                    0x07, 0x68, 0xde, 0x8c, 0x69, 0xca, 0x14, 0x56, 0xd4, 0xf8, 0xe1, 0xea, 0xc7,
+                    0xfa, 0xd8, 0x37, 0x42, 0xd6, 0x49, 0x57, 0xa2, 0x39, 0xa1, 0x0f, 0x35, 0x36,
+                    0x97, 0x46, 0x56, 0xfd, 0x16, 0x52
+                ]
+            );
+        } else {
+            assert_eq!(descriptor, profile.capability().rate_policy());
+            assert!(policy.window_count() >= 1);
+        }
         assert!(policy.max_concurrent() >= 1);
         assert!(descriptor.enforcement_revision().is_some());
         assert!(descriptor.endpoint_class().is_some());
@@ -1552,8 +1575,8 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         sec_budget.scope().as_source_identifier().as_str(),
         SEC_EDGAR_RATE_SCOPE
     );
-    assert_eq!(sec_budget.requests_per_window(), 2);
-    assert_eq!(sec_budget.window_nanos(), 1_000_000_000);
+    assert_eq!(sec_budget.requests_per_window(), Some(2));
+    assert_eq!(sec_budget.window_nanos(), Some(1_000_000_000));
     assert_eq!(sec_budget.max_concurrent(), 1);
     assert_eq!(sec_budget.weighted_window_count(), 0);
     let hidden_source_ids = [
@@ -1589,12 +1612,12 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             budget.scope().as_source_identifier().as_str(),
             authority.rate_scope()
         );
-        assert_eq!(budget.window_nanos(), 1_000_000_000);
+        assert_eq!(budget.window_nanos(), Some(1_000_000_000));
         assert_eq!(budget.max_concurrent(), 1);
         assert_eq!(endpoint.request_bounds().max_redirects(), 0);
         assert!(endpoint.client_profile().automatic_redirects_disabled());
         if index == 0 {
-            assert_eq!(budget.requests_per_window(), 2);
+            assert_eq!(budget.requests_per_window(), Some(2));
             assert_eq!(
                 authority.request_header_class(),
                 FilingTaxonomyRequestHeaderClass::SecIdentifyingContact
@@ -1604,7 +1627,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
                 1024 * 1024 * 1024
             );
         } else {
-            assert_eq!(budget.requests_per_window(), 1);
+            assert_eq!(budget.requests_per_window(), Some(1));
             assert_eq!(budget.weighted_window_count(), 2);
             assert_eq!(
                 budget.weighted_window(0).map(|window| (

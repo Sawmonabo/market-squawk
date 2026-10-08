@@ -8,7 +8,9 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use super::{CredentialKind, ProviderCapability, RightsAdmissionState, SetupMode};
+use super::{
+    CredentialKind, ProviderCapability, RatePolicyDescriptor, RightsAdmissionState, SetupMode,
+};
 use crate::{
     ApiEndpointRule, EndpointPolicy, HttpRequestBounds, NetworkPolicyError, PathScope,
     QueryParameterRule, QuerySensitivity,
@@ -432,6 +434,7 @@ pub struct ProviderOnboardingProfile {
     display_name: &'static str,
     historical_capabilities: Box<[ProviderCapability]>,
     capability: ProviderCapability,
+    operational_rate_policy: RatePolicyDescriptor,
     zero_fee: ZeroFeeStatus,
     account: Requirement,
     credential: Requirement,
@@ -459,6 +462,7 @@ pub(crate) struct ProviderOnboardingProfileInput {
     pub display_name: &'static str,
     pub historical_capabilities: Vec<ProviderCapability>,
     pub capability: ProviderCapability,
+    pub operational_rate_policy: RatePolicyDescriptor,
     pub zero_fee: ZeroFeeStatus,
     pub account: Requirement,
     pub credential: Requirement,
@@ -525,6 +529,10 @@ impl ProviderOnboardingProfile {
         if input.id.is_empty()
             || input.display_name.is_empty()
             || !history_valid
+            || !operational_rate_policy_valid(
+                input.capability.rate_policy(),
+                &input.operational_rate_policy,
+            )
             || input.id != input.capability.surface_id().as_str()
             || input.handoff_url != input.capability.official_entry_uri()
             || input.evidence.is_empty()
@@ -561,6 +569,7 @@ impl ProviderOnboardingProfile {
             display_name: input.display_name,
             historical_capabilities: input.historical_capabilities.into_boxed_slice(),
             capability: input.capability,
+            operational_rate_policy: input.operational_rate_policy,
             zero_fee: input.zero_fee,
             account: input.account,
             credential: input.credential,
@@ -596,6 +605,11 @@ impl ProviderOnboardingProfile {
     /// Returns the exact catalog capability.
     pub const fn capability(&self) -> &ProviderCapability {
         &self.capability
+    }
+
+    /// Returns the current policy used for scheduling, disclosure and activation budgets.
+    pub const fn rate_policy(&self) -> &RatePolicyDescriptor {
+        &self.operational_rate_policy
     }
 
     /// Iterates every immutable capability revision in contiguous order.
@@ -656,7 +670,8 @@ impl ProviderOnboardingProfile {
         &self.probe
     }
 
-    /// Returns operation-specific rights and duties.
+    /// Returns operation-specific rights and immutable admitted duties.
+    /// Current scheduling controls are exposed separately by `rate_policy`.
     pub const fn rights(&self) -> (&'static [DataUseRight], &'static [&'static str]) {
         (self.rights, self.rights_duties)
     }
@@ -670,7 +685,7 @@ impl ProviderOnboardingProfile {
             .find(|evidence| evidence.source_id == source_id)
     }
 
-    /// Returns the canonical digest of the complete code-owned rights decision.
+    /// Returns the canonical digest of the immutable admitted rights decision.
     pub fn rights_decision_digest(&self) -> EvidenceDigest {
         let mut hasher = Sha256::new();
         hasher.update(b"market-squawk/provider-rights/v2\0");
@@ -784,4 +799,33 @@ pub enum ProviderProfileError {
     /// A bounded provider identity was invalid.
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
+}
+
+// Rate corrections do not change saved consent or credential identity. Only removal of an
+// unsupported numeric request quota may differ from the immutable admission descriptor.
+fn operational_rate_policy_valid(
+    admitted: &RatePolicyDescriptor,
+    current: &RatePolicyDescriptor,
+) -> bool {
+    if admitted == current {
+        return current.enforcement_policy().is_some();
+    }
+    let (Some(old), Some(new)) = (admitted.enforcement_policy(), current.enforcement_policy())
+    else {
+        return false;
+    };
+    admitted.policy_id() == current.policy_id()
+        && admitted.evidence_digest() == current.evidence_digest()
+        && admitted.endpoint_class() == current.endpoint_class()
+        && admitted.scope_evidence_digest() == current.scope_evidence_digest()
+        && admitted.unknown_is_conservative() == current.unknown_is_conservative()
+        && admitted.refresh_on_http_429() == current.refresh_on_http_429()
+        && current.enforcement_revision() > admitted.enforcement_revision()
+        && old.scope() == new.scope()
+        && old.max_concurrent() == new.max_concurrent()
+        && old.backoff() == new.backoff()
+        && old.weighted_window_count() == 0
+        && new.weighted_window_count() == 0
+        && old.window_count() > 0
+        && new.window_count() == 0
 }

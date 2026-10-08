@@ -81,7 +81,7 @@ pub(super) fn coinbase_reference_budget() -> Result<ProviderBudgetPolicy, Crypto
         .map_err(|_| CryptoReferenceError::InvalidEvidence)?;
     profiles
         .get("coinbase.public-market-data")
-        .and_then(|profile| profile.capability().rate_policy().enforcement_policy())
+        .and_then(|profile| profile.rate_policy().enforcement_policy())
         .cloned()
         .ok_or(CryptoReferenceError::InvalidEvidence)
 }

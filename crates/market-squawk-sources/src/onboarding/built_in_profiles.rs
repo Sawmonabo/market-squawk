@@ -26,8 +26,6 @@ const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const HOUR_NANOS: u64 = 60 * MINUTE_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
-const SCHWAB_MARKET_DATA_DOCTOR_ATTEMPTS: u32 = 20;
-const SCHWAB_MARKET_DATA_DOCTOR_WINDOW_NANOS: u64 = 15 * MINUTE_NANOS;
 const LEGACY_REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
     DigestAlgorithm::Sha256,
     [
@@ -1127,9 +1125,8 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             current,
         )
     } else if spec.id == SCHWAB_MARKET_DATA_PROFILE {
-        // Preserve revision three's local-placeholder policy exactly. Revision four binds the
-        // network User Preference bootstrap and the complete twenty-attempt entitlement doctor to
-        // one conservative application/account budget without presenting it as a Schwab limit.
+        // Capability revisions retain immutable evidence for saved authorization/receipts.
+        // Operational rate controls are supplied separately without changing saved consent.
         let revision_three = build_capability(
             &spec,
             ProviderCapabilityRevision::new(3)?,
@@ -1145,7 +1142,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 false,
             )?,
         )?;
-        let current = build_capability(
+        let revision_four = build_capability(
             &spec,
             ProviderCapabilityRevision::new(4)?,
             prior_credential_kind,
@@ -1156,13 +1153,20 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 ProviderCapabilityRevision::new(3)?,
                 SourceIdentifier::try_from("schwab.trader-api-market-data.entitlement-doctor.v1")?,
                 PROVIDER_RELEASE_REPORT_DIGEST,
-                built_in_budget(&spec, true)?,
+                simple_budget(
+                    "schwab-trader-api",
+                    Some("schwab.trader-api.account-template"),
+                    20,
+                    15 * MINUTE_NANOS,
+                    1,
+                    built_in_budget(&spec, false)?.backoff(),
+                )?,
                 true,
             )?,
         )?;
         (
             vec![legacy_capability, revision_two, revision_three],
-            current,
+            revision_four,
         )
     } else if spec.id == ALPACA_BASIC_PROFILE {
         // Preserve the exact revision-three provider-fact budget. Revision four separates that
@@ -1245,7 +1249,9 @@ fn build_current_eia(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, Pro
     finish_profile(spec, Vec::new(), capability)
 }
 
-fn build_current_census(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
+fn build_current_census(
+    spec: BuiltInSpec,
+) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
     let revision = ProviderCapabilityRevision::new(1)?;
     let capability = build_capability(
         &spec,
@@ -1296,11 +1302,26 @@ fn finish_profile(
     capability: ProviderCapability,
 ) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
+    let operational_rate_policy = if spec.id == SCHWAB_MARKET_DATA_PROFILE {
+        RatePolicyDescriptor::try_new_enforced(
+            SourceIdentifier::try_from(current_rate_policy(&spec))?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            true,
+            ProviderCapabilityRevision::new(4)?,
+            SourceIdentifier::try_from("schwab.trader-api-market-data.entitlement-doctor.v1")?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            built_in_budget(&spec, true)?,
+            true,
+        )?
+    } else {
+        capability.rate_policy().clone()
+    };
     ProviderOnboardingProfile::try_new(ProviderOnboardingProfileInput {
         id: spec.id,
         display_name: spec.display_name,
         historical_capabilities,
         capability,
+        operational_rate_policy,
         zero_fee: spec.zero_fee,
         account: spec.account,
         credential: if credentialed {
@@ -1585,26 +1606,27 @@ fn built_in_budget(
             backoff,
         ),
         SCHWAB_MARKET_DATA_PROFILE => {
-            // Revision three retains its one-per-minute local-placeholder budget. The current
-            // twenty-per-fifteen-minute ceiling is Market Squawk application policy, not a
-            // provider-published Schwab limit. Single flight plus 429/Retry-After feedback keeps
-            // the complete bounded doctor inside one shared account scope.
-            simple_budget(
-                "schwab-trader-api",
-                Some("schwab.trader-api.account-template"),
-                if current_revision {
-                    SCHWAB_MARKET_DATA_DOCTOR_ATTEMPTS
-                } else {
-                    1
-                },
-                if current_revision {
-                    SCHWAB_MARKET_DATA_DOCTOR_WINDOW_NANOS
-                } else {
-                    MINUTE_NANOS
-                },
-                1,
-                backoff,
-            )
+            if current_revision {
+                // No provider-published numeric capacity is established by this profile.
+                // Enforce single flight and shared refusal/Retry-After instead of inventing one.
+                Ok(ProviderBudgetPolicy::try_new_unknown_capacity(
+                    BudgetScope::with_authorization_account(
+                        SourceIdentifier::try_from("schwab-trader-api")?,
+                        SourceIdentifier::try_from("schwab.trader-api.account-template")?,
+                    ),
+                    NonZeroU16::MIN,
+                    backoff,
+                )?)
+            } else {
+                simple_budget(
+                    "schwab-trader-api",
+                    Some("schwab.trader-api.account-template"),
+                    1,
+                    MINUTE_NANOS,
+                    1,
+                    backoff,
+                )
+            }
         }
         // These remaining refresh-required profiles use local non-network probes. Their
         // one-per-minute placeholder budgets are not recurring provider capacity and confer no
@@ -1980,7 +2002,7 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("schwab.market-data.read"),
         permissions: &["market-data.read", "streamer-bootstrap.read"],
-        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; the provider-native read-only REST/Streamer core, protected OAuth lifecycle, exact User Preference bootstrap, and bounded twenty-attempt entitlement doctor authority are present, while complete activation-to-publication binding, PIT typed reads, product composition, and restart/release proof remain incomplete",
+        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; the provider-native read-only REST/Streamer core, protected OAuth lifecycle, exact User Preference bootstrap, and bounded entitlement doctor authority are present, while complete activation-to-publication binding, PIT typed reads, product composition, and restart/release proof remain incomplete",
         quality: DataQuality::DirectUnverified,
         probe: VerificationProbe::network(
             ProbeTransport::HttpGet,
@@ -1994,6 +2016,7 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
             "allowlist only market-data routes plus trader/v1/userPreference fields required for Streamer bootstrap; never admit account, position, order, or trading authority",
             "retain Schwab endpoint or Streamer service, provider symbol, named venue/book, account realm, event and receive clocks, sequence, reconnect, and delay or indicative fields",
             "admit at most one Streamer connection and one provider attempt in flight across the application/account scope",
+            // Immutable admission evidence; current enforcement is profile.rate_policy().
             "enforce the Market Squawk ceiling of twenty provider attempts per fifteen minutes for the exact User Preference plus seven REST plus twelve Streamer doctor probes; this is not a provider-published Schwab limit",
             "refresh shared capacity on HTTP 429, honor valid server Retry-After feedback, and lower admission from refusals, partial returns, latency, bytes, acknowledgements, and queue pressure",
         ],

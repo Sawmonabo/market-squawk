@@ -158,17 +158,7 @@ fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
         .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
     let checkpoint = checkpoint_from_runtime(
         declaration.policy(),
-        &BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        },
+        &BudgetState::new(declaration.policy(), observation.monotonic),
         observation,
         1,
         false,
@@ -219,17 +209,7 @@ fn admitted_fatal_operation_prevents_clean_write_even_when_terminal_store_fails(
     let clock = Arc::new(BlockingFailClock::new(observation));
     let checkpoint = checkpoint_from_runtime(
         declaration.policy(),
-        &BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        },
+        &BudgetState::new(declaration.policy(), observation.monotonic),
         observation,
         1,
         false,

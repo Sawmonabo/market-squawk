@@ -9,25 +9,16 @@ pub(in crate::policy) fn checkpoint_from_runtime(
     availability_generation: u64,
     terminal: bool,
 ) -> Result<BudgetCheckpointState, AuthorityPersistenceError> {
-    if state.additional_windows.len() + 1 != policy.window_count() {
+    if state.windows.len() != policy.window_count()
+        || observation.monotonic < state.last_observed_at
+    {
         return Err(AuthorityPersistenceError::InvalidState);
     }
-    let primary = policy
-        .window(0)
-        .ok_or(AuthorityPersistenceError::InvalidState)?;
     let mut windows = Vec::new();
     windows
         .try_reserve(policy.window_count())
         .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
-    windows.push(window_checkpoint_from_runtime(
-        primary,
-        state.window_started_at,
-        state.restored_window_ends_at,
-        state.requests_used,
-        &state.primary_sliding_releases,
-        observation,
-    )?);
-    for (window, runtime) in policy.windows().skip(1).zip(&state.additional_windows) {
+    for (window, runtime) in policy.windows().zip(&state.windows) {
         windows.push(window_checkpoint_from_runtime(
             window,
             runtime.window_started_at,
@@ -152,26 +143,10 @@ pub(in crate::policy) fn runtime_state_from_checkpoint(
 ) -> Result<BudgetState, AuthorityPersistenceError> {
     validate_checkpoint(policy, checkpoint, observation)?;
     let mut state = BudgetState::new(policy, observation.monotonic);
-    restore_window_state(
-        policy
-            .window(0)
-            .ok_or(AuthorityPersistenceError::InvalidState)?,
-        checkpoint
-            .windows
-            .as_slice()
-            .first()
-            .ok_or(AuthorityPersistenceError::InvalidState)?,
-        &mut state.window_started_at,
-        &mut state.restored_window_ends_at,
-        &mut state.requests_used,
-        &mut state.primary_sliding_releases,
-        observation,
-    )?;
     for ((window, checkpoint_window), runtime) in policy
         .windows()
-        .skip(1)
-        .zip(checkpoint.windows.as_slice().iter().skip(1))
-        .zip(&mut state.additional_windows)
+        .zip(checkpoint.windows.as_slice())
+        .zip(&mut state.windows)
     {
         restore_window_state(
             window,

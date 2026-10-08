@@ -16,32 +16,17 @@ pub(in crate::policy) fn evaluate_budget_windows(
     state: &mut BudgetState,
     now: MonotonicInstant,
 ) -> Result<BudgetWindowsAvailability, BudgetUnavailableReason> {
-    if state.additional_windows.len() + 1 != policy.window_count() {
+    if state.windows.len() != policy.window_count() {
         return Err(BudgetUnavailableReason::StateCorrupt);
+    }
+    if now < state.last_observed_at {
+        return Err(BudgetUnavailableReason::ClockRegression);
     }
     let mut availability = BudgetWindowsAvailability {
         blocker: None,
         sliding_deadlines: [None; MAX_PROVIDER_BUDGET_WINDOWS],
     };
-    let primary = policy
-        .window(0)
-        .ok_or(BudgetUnavailableReason::StateCorrupt)?;
-    evaluate_budget_window(
-        primary,
-        &mut state.window_started_at,
-        &mut state.restored_window_ends_at,
-        &mut state.requests_used,
-        &mut state.primary_sliding_releases,
-        now,
-        0,
-        &mut availability,
-    )?;
-    for (index, (window, window_state)) in policy
-        .windows()
-        .skip(1)
-        .zip(&mut state.additional_windows)
-        .enumerate()
-    {
+    for (index, (window, window_state)) in policy.windows().zip(&mut state.windows).enumerate() {
         evaluate_budget_window(
             window,
             &mut window_state.window_started_at,
@@ -49,10 +34,11 @@ pub(in crate::policy) fn evaluate_budget_windows(
             &mut window_state.requests_used,
             &mut window_state.sliding_releases,
             now,
-            index + 1,
+            index,
             &mut availability,
         )?;
     }
+    state.last_observed_at = now;
     Ok(availability)
 }
 
@@ -143,21 +129,13 @@ fn validate_budget_windows(
     state: &BudgetState,
     now: MonotonicInstant,
 ) -> Result<(), BudgetUnavailableReason> {
-    if state.additional_windows.len() + 1 != policy.window_count() {
+    if state.windows.len() != policy.window_count() {
         return Err(BudgetUnavailableReason::StateCorrupt);
     }
-    let primary = policy
-        .window(0)
-        .ok_or(BudgetUnavailableReason::StateCorrupt)?;
-    validate_budget_window(
-        primary,
-        state.window_started_at,
-        state.restored_window_ends_at,
-        state.requests_used,
-        &state.primary_sliding_releases,
-        now,
-    )?;
-    for (window, window_state) in policy.windows().skip(1).zip(&state.additional_windows) {
+    if now < state.last_observed_at {
+        return Err(BudgetUnavailableReason::ClockRegression);
+    }
+    for (window, window_state) in policy.windows().zip(&state.windows) {
         validate_budget_window(
             window,
             window_state.window_started_at,
@@ -219,6 +197,9 @@ fn admit_budget_windows(
     state: &mut BudgetState,
     availability: BudgetWindowsAvailability,
 ) -> Result<bool, BudgetUnavailableReason> {
+    if state.windows.len() != policy.window_count() {
+        return Err(BudgetUnavailableReason::StateCorrupt);
+    }
     for (index, window) in policy.windows().enumerate() {
         if window.semantics() == BudgetWindowSemantics::Sliding
             && availability
@@ -231,26 +212,8 @@ fn admit_budget_windows(
             return Err(BudgetUnavailableReason::StateCorrupt);
         }
     }
-    let primary_deadline = availability.sliding_deadlines.first().copied().flatten();
-    admit_budget_window(
-        policy
-            .window(0)
-            .ok_or(BudgetUnavailableReason::StateCorrupt)?,
-        &mut state.requests_used,
-        &mut state.primary_sliding_releases,
-        primary_deadline,
-    );
-    for (index, (window, window_state)) in policy
-        .windows()
-        .skip(1)
-        .zip(&mut state.additional_windows)
-        .enumerate()
-    {
-        let deadline = availability
-            .sliding_deadlines
-            .get(index + 1)
-            .copied()
-            .flatten();
+    for (index, (window, window_state)) in policy.windows().zip(&mut state.windows).enumerate() {
+        let deadline = availability.sliding_deadlines.get(index).copied().flatten();
         admit_budget_window(
             window,
             &mut window_state.requests_used,
@@ -258,15 +221,11 @@ fn admit_budget_windows(
             deadline,
         );
     }
-    let primary_exhausted = policy
-        .window(0)
-        .is_some_and(|window| state.requests_used >= window.requests_per_window());
-    let additional_exhausted = policy
+    let exhausted = policy
         .windows()
-        .skip(1)
-        .zip(&state.additional_windows)
+        .zip(&state.windows)
         .any(|(window, runtime)| runtime.requests_used >= window.requests_per_window());
-    Ok(primary_exhausted || additional_exhausted)
+    Ok(exhausted)
 }
 
 fn admit_budget_window(
@@ -363,7 +322,7 @@ impl SharedProviderBudget {
             let Ok(mut state) = self.allocation.state.lock() else {
                 return;
             };
-            state.requests_used = state.requests_used.saturating_add(1);
+            state.in_flight = state.in_flight.saturating_add(1);
             panic!("test-only admitted budget-state unwind");
         }));
         unwind.is_err() && self.allocation.state.is_poisoned()

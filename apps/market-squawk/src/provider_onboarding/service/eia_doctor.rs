@@ -38,7 +38,6 @@ impl ProviderOnboardingService {
             let limits = EiaParseLimits::production_defaults();
             let subject = ProviderRateDeclaration::governed_provider_subject(
                 profile
-                    .capability()
                     .rate_policy()
                     .enforcement_policy()
                     .ok_or(ProviderOnboardingError::InvalidProfile)?
@@ -184,7 +183,7 @@ impl ProviderOnboardingService {
             .probe_rates
             .acquire(
                 profile,
-                profile.capability().rate_policy(),
+                profile.rate_policy(),
                 Some(subject),
                 cancellation.clone(),
             )

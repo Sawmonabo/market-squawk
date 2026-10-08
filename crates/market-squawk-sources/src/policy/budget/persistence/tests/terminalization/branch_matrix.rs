@@ -34,17 +34,7 @@ fn global_fault_fixture() -> TestResult<GlobalFaultFixture> {
         .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
     let peer_checkpoint = checkpoint_from_runtime(
         peer_declaration.policy(),
-        &BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        },
+        &BudgetState::new(peer_declaration.policy(), observation.monotonic),
         observation,
         1,
         false,
@@ -186,7 +176,7 @@ fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResul
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
-                    .window_started_at = MonotonicInstant::from_nanos(1);
+                    .last_observed_at = MonotonicInstant::from_nanos(1);
             }
             AvailabilityFatalCase::DeadlineOverflow => {
                 fixture.clock.set(i64::MAX, u64::MAX)?;
@@ -196,6 +186,9 @@ fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResul
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
+                    .windows
+                    .first_mut()
+                    .ok_or("numeric request window missing")?
                     .window_started_at = MonotonicInstant::from_nanos(u64::MAX);
             }
             AvailabilityFatalCase::PersistenceFailure => {
@@ -274,7 +267,7 @@ fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
-                    .window_started_at = MonotonicInstant::from_nanos(1);
+                    .last_observed_at = MonotonicInstant::from_nanos(1);
             }
             AcquireFatalCase::WindowDeadlineOverflow => {
                 fixture.clock.set(i64::MAX, u64::MAX)?;
@@ -284,6 +277,9 @@ fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
+                    .windows
+                    .first_mut()
+                    .ok_or("numeric request window missing")?
                     .window_started_at = MonotonicInstant::from_nanos(u64::MAX);
             }
             AcquireFatalCase::RequestsCounterCorrupt => {
@@ -293,6 +289,9 @@ fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
+                    .windows
+                    .first_mut()
+                    .ok_or("numeric request window missing")?
                     .requests_used = u32::MAX;
             }
             AcquireFatalCase::InFlightCounterCorrupt => {
@@ -658,13 +657,24 @@ fn cooldown_quota_concurrency_and_post_mint_generation_changes_remain_transient(
         .state
         .lock()
         .map_err(|_| "budget state lock poisoned")?
-        .requests_used = quota.budget.policy().requests_per_window();
+        .windows
+        .first_mut()
+        .ok_or("numeric request window missing")?
+        .requests_used = quota
+        .budget
+        .policy()
+        .requests_per_window()
+        .ok_or("numeric request window missing")?;
     assert!(matches!(
         quota.budget.availability_lease(),
         Err(BudgetUnavailableReason::RequestWindowExhausted)
     ));
     assert!(quota.session.is_available());
-    let next_window = quota.budget.policy().window_nanos();
+    let next_window = quota
+        .budget
+        .policy()
+        .window_nanos()
+        .ok_or("numeric request window missing")?;
     quota.clock.set(
         i64::try_from(next_window).map_err(|_| "window does not fit wall clock")? + 100,
         next_window,

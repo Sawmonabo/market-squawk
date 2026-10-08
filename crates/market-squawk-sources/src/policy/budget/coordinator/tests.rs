@@ -379,6 +379,24 @@ mod coordinator_tests {
             .map_err(|reason| std::io::Error::other(format!("clock unavailable: {reason:?}")))?
             .monotonic;
         let budget = SharedProviderBudget::new(policy, starts_at, clock.clone());
+        let expected_window_storage = {
+            let state = budget
+                .allocation
+                .state
+                .lock()
+                .map_err(|_| "budget state lock poisoned")?;
+            assert_eq!(state.windows.len(), 1);
+            let window = state
+                .windows
+                .first()
+                .ok_or("numeric request window missing")?;
+            assert_eq!(window.sliding_releases.capacity(), 0);
+            state
+                .windows
+                .capacity()
+                .checked_mul(std::mem::size_of_val(window))
+                .ok_or("budget window storage charge overflow")?
+        };
         let lease = budget.availability_lease().map_err(|reason| {
             std::io::Error::other(format!("budget lease unavailable: {reason:?}"))
         })?;
@@ -387,6 +405,7 @@ mod coordinator_tests {
                 BudgetAllocation,
             >())
             .and_then(|bytes| bytes.checked_add(expected_dynamic))
+            .and_then(|bytes| bytes.checked_add(expected_window_storage))
             .and_then(|bytes| bytes.checked_add(clock.shared_allocation_charge()))
             .ok_or("shared budget allocation charge overflow")?;
 
@@ -732,17 +751,7 @@ mod coordinator_tests {
         let observation = clock
             .observation()
             .map_err(|reason| format!("test clock unavailable: {reason:?}"))?;
-        let state = BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        };
+        let state = BudgetState::new(first.policy(), observation.monotonic);
         let first_checkpoint =
             checkpoint_from_runtime(first.policy(), &state, observation, 1, false)?;
         let mut invalid_checkpoint =
@@ -753,7 +762,11 @@ mod coordinator_tests {
             .first_mut()
             .and_then(BudgetWindowCheckpointState::tumbling_mut)
             .ok_or("checkpoint window was not tumbling")?;
-        *requests_used = second.policy().requests_per_window() + 1;
+        *requests_used = second
+            .policy()
+            .requests_per_window()
+            .ok_or("numeric request window missing")?
+            + 1;
         let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore);
         let session = AuthorityDurabilitySession::open(store, observation.wall_clock)?;
         let mut coordinator = ProcessBudgetCoordinator::new(4);
@@ -775,17 +788,7 @@ mod coordinator_tests {
         let orphan_policy = resolved_policy("orphan-clean-group", 2)?;
         let orphan_checkpoint = checkpoint_from_runtime(
             orphan_policy.policy(),
-            &BudgetState {
-                window_started_at: observation.monotonic,
-                restored_window_ends_at: None,
-                requests_used: 0,
-                primary_sliding_releases: VecDeque::new(),
-                additional_windows: Vec::new(),
-                in_flight: 0,
-                unavailable_until: None,
-                disabled: false,
-                consecutive_refusals: 0,
-            },
+            &BudgetState::new(orphan_policy.policy(), observation.monotonic),
             observation,
             1,
             false,

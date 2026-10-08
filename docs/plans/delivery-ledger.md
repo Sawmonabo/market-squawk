@@ -4,7 +4,69 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`840ed393`. Main/release unchanged; no extra branch created.
+`34dbc675`. Main/release unchanged; no extra branch created.
+
+### Current checkpoint — correct rate controls without replacing saved sign-in
+
+**Implemented and critically verified; native verification pending.** Schwab now uses an explicit
+unknown-capacity request policy, retaining single flight, provider refusal/Retry-After, disabled
+state and monotonic-clock checks. The invented20/900 quota no longer controls current requests.
+A required profile rate descriptor is the single source for scheduling, Settings disclosure and
+activation budgets. Immutable capability4 and the original admitted rights fingerprint are retained
+exactly; `admitted_rights_duties` is labelled original evidence, separately from current `rate_policy`.
+No credential/OAuth transfer, new capability revision, catalog rewrite or schema migration.
+
+The durable correction atomically retires numeric windows only for a drained exact collision scope,
+with unchanged concurrency/backoff and no weighted/extension state. It retains cooldown/refusal and
+disabled state, rejects stale handles, and leaves ordinary conflicting registration rejected. Numeric
+policies for other providers retain their existing limits. Full descriptor and lease-budget equality
+checks remain in place; the evidence-document digest alone is not operational-policy equality.
+
+Critical evidence (single compiler job, nonincremental):
+
+- Existing source policy checks78/78,0.56s (`oct8-unknown-capacity-critical.log`). Covers zero-window
+  serialization, malformed missing/half-null fields, concurrency/refusal, clock and checkpoint recovery.
+- Existing durable rate checks4/4,0.24s (`oct8-unknown-capacity-durable.log`). Added the uncovered drained
+  correction/stale-handle/cooldown/disabled-reopen case, including25 sequential unknown-capacity requests.
+- Existing profile check1/1,0.01s (`oct8-operational-rate-profile.log`), including exact installed
+  capability4 and rights digests, current unknown capacity and unchanged other-provider descriptors.
+- Extended existing startup reconciliation check1/1,4.53s after6m04s compilation
+  (`oct8-operational-rate-startup.log`): same stored Schwab credential coordinate/value and bootstrap
+  authority across reopen; serialized Settings policy equals the current descriptor; existing cancelled
+  credential deletion remains checked. First new assertion hit a private-field compile error; it now
+  checks the serialized response. The final run passed with the final source.
+- Source closure refresh succeeded (`oct8-operational-rate-source-closure.log`); only tracked source
+  identities changed. `git diff --check` passed. No live or installed completion claim from fixtures.
+
+Lead inspected and integrated the budget helper's private window-vector change and all affected
+provider/profile/activation consumers. Helpers `adapter_dictionary` and `current_display_reuse` are
+finished; all source and integration ownership is now lead-only. No additional feature lane is open.
+Resulting implementation commit/push: pending this checkpoint's integration. Next barrier is the one
+supervised native replacement, saved-session doctor, then current-read correction and displayed quotes.
+
+### Native state and remaining display blocker
+
+Supervisor60780 remains running; watcher60793 is stopped until this checkpoint is pushed. Service71694
+is still running the prior generation. Desktop71698 exited normally (exit0); WebDriver4445 now refuses
+connections. The replacement must reopen native inspection after its successful serialized build.
+No duplicate Cargo job is active after the completed critical check.
+
+Fresh native inspection before Desktop exited found Overview visible with20 “unavailable” mentions.
+The prior sequence113→128 evidence proves notification delivery only, not a quote reaching a displayed
+price. `Market.GetCollection` still hits15s deadlines. Visible streaming-price updates remain unverified.
+
+Astra's completed current-read report (`oct8-current-selection-contract.md`) identifies the existing
+source-time index and explicit optional exclusion accounting. The current batch display consumer can
+seek eligible winning timestamps and enumerate complete ties without counting every historical
+exclusion. Preserve exact snapshot/replay, cutoff predicates, candidate completeness, original
+provenance and Display permits. No selector source change is implemented yet. Lead must freeze the
+shared request/receipt contract before dispatching its bounded consumer implementation.
+
+The saved-credential audit (`oct8-rate-policy-credential-refresh.md`) prevented deployment of an
+unnecessary capability5 and caught the additional rights-text fingerprint dependency. Both changes
+were corrected before native replacement. The separate recognized-historical-capability cleanup defect
+remains recorded lifecycle remediation: preserve recognized saved evidence without granting stale
+runtime authority. Keeping exact capability4 avoids that path here; it does not fix the general defect.
 
 ### Integrated shared update transport — 840ed393
 

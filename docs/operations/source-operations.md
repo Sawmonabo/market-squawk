@@ -112,7 +112,7 @@ CONFIG=/absolute/operator-owned/market-squawk/config.toml
 | Layer | What it proves | What it does not prove |
 | --- | --- | --- |
 | Credential-bundle disposition | The exact selected provider was disabled, reused saved setup, needs a probe, stored an unverified credential, or could not match its code-owned profile | Provider verification, entitlement, activation, collection, publication, product availability, or trading authority |
-| Code-owned profile | Reviewed setup requirements, release state, declared coverage, quality ceiling, rights decision, duties, probe, and evidence revision | Current connectivity, active adapter, observed data quality, or execution eligibility |
+| Code-owned profile | Reviewed setup requirements, release state, declared coverage, quality ceiling, admitted rights evidence, current rate controls, probe, and evidence revision | Current connectivity, active adapter, observed data quality, or execution eligibility |
 | Catalog registration | Exact profile revision and canonical bytes are durably retained | Onboarding completed or any runtime started |
 | Onboarding session | Provider handoff, public configuration, credential generation when applicable, verification, and rights state progressed through a durable lifecycle | Research adapter registration unless activation evidence also succeeded |
 | Research-adapter activation | An immutable lease and exact provider request admitted one extraction adapter and durable restart recipe | A live venue stream, an extracted dataset, or automated-action authority |
@@ -500,8 +500,9 @@ fails.
 - Command exits `0`.
 - `profile.id` is the exact requested surface.
 - `outcome` is `inserted` or idempotent `replay`.
-- Returned profile contains the expected code-owned release state, rights, duties, evidence, and
-  official handoff.
+- Returned profile contains the expected code-owned release state, rights, evidence, and official
+  handoff. `admitted_rights_duties` retains the original authorization evidence; `rate_policy`
+  describes current scheduling controls, independently of the saved authorization identity.
 
 ### Settings setup and activation
 

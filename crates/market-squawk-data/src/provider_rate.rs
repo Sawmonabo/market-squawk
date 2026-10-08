@@ -547,6 +547,109 @@ impl ProviderRateStore for SqliteProviderRateStore {
         }
     }
 
+    fn register_unknown_capacity(
+        &self,
+        run_id: ProviderRateRunId,
+        declaration: &ProviderRateDeclaration,
+        now: Timestamp,
+    ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+        declaration
+            .validate()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        if declaration.policy().window_count() != 0
+            || declaration.policy().weighted_window_count() != 0
+        {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        validate_run(&transaction, run_id, now)?;
+        // Normal requests reuse the exact declaration without scanning collision groups.
+        if existing_declaration(
+            &transaction,
+            sha256_bytes(declaration.declaration_digest())?,
+        )?
+        .is_some()
+        {
+            let registration = register_in_open_transaction(&transaction, declaration, now)?;
+            transaction.commit().map_err(map_sql)?;
+            return Ok(registration);
+        }
+        let keys = encode_collision_keys(declaration)?;
+        let groups = matching_groups(&transaction, &keys)?;
+        if let [group_id] = groups.as_slice() {
+            let mut group = load_group_by_id(&transaction, *group_id)?;
+            if group.policy_digest != sha256_bytes(declaration.policy_digest())? {
+                // This operation removes only request windows. It cannot change any other
+                // enforcement dimension or broaden an overlapping public/account identity.
+                if group.policy.window_count() == 0
+                    || group.policy.weighted_window_count() != 0
+                    || group.policy.max_concurrent() != declaration.policy().max_concurrent()
+                    || group.policy.backoff() != declaration.policy().backoff()
+                {
+                    return Err(ProviderRateStoreError::Conflict);
+                }
+                let incompatible: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM provider_rate_declarations
+                     WHERE group_id = ?1 AND (collision_keys != ?2 OR policy_digest != ?3)",
+                        params![group_id, &keys, group.policy_digest],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_sql)?;
+                let active: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM provider_rate_requests WHERE group_id = ?1",
+                        [group_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_sql)?;
+                let extensions: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM provider_rate_extensions AS e
+                     JOIN provider_rate_declarations AS d USING(declaration_digest)
+                     WHERE d.group_id = ?1",
+                        [group_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_sql)?;
+                if incompatible != 0 || active != 0 || extensions != 0 {
+                    return Err(ProviderRateStoreError::Conflict);
+                }
+                group.state.advance(&group.policy, now)?;
+                group.state.windows.clear();
+                group.policy = Box::new(declaration.policy().clone());
+                group.policy_digest = sha256_bytes(declaration.policy_digest())?;
+                let json = serde_json::to_vec(&group.policy)
+                    .map_err(|_| ProviderRateStoreError::Corrupt)?;
+                transaction
+                    .execute(
+                        "UPDATE provider_rate_groups SET policy_digest = ?1, policy_json = ?2
+                     WHERE group_id = ?3 AND state_version = ?4",
+                        params![group.policy_digest, json, group_id, group.version],
+                    )
+                    .map_err(map_sql)?;
+                persist_group(&transaction, &mut group, now)?;
+                // Keep collision rows until the new declaration is inserted into the same group.
+                let registration = register_in_open_transaction(&transaction, declaration, now)?;
+                transaction
+                    .execute(
+                        "DELETE FROM provider_rate_declarations
+                     WHERE group_id = ?1 AND declaration_digest != ?2",
+                        params![group_id, sha256_bytes(registration.declaration_digest())?],
+                    )
+                    .map_err(map_sql)?;
+                transaction.commit().map_err(map_sql)?;
+                return Ok(registration);
+            }
+        } else if !groups.is_empty() {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+        let registration = register_in_open_transaction(&transaction, declaration, now)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(registration)
+    }
+
     fn try_reserve(
         &self,
         run_id: ProviderRateRunId,
@@ -4210,6 +4313,110 @@ mod tests {
             store.commit_dispatch(run_id, registration, delayed, dispatched_at)?,
             ProviderRateDispatchDecision::WaitUntil(Timestamp::from_unix_nanos(121_000_000_000))
         );
+        Ok(())
+    }
+
+    // The existing dispatch tests do not cover a policy correction over retained account state.
+    #[test]
+    fn unknown_capacity_replaces_only_drained_quota_and_preserves_provider_restrictions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for disabled in [false, true] {
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("provider-rate.sqlite3");
+            let store = SqliteProviderRateStore::try_open(&path)?;
+            let now = Timestamp::from_unix_nanos(1_000_000_000);
+            let run_id = store.start_run(now)?;
+            let known = test_declaration("capacity-correction", 20, "https://capacity.test/data")?;
+            let unknown = ProviderRateDeclaration::try_for_endpoint(
+                ProviderBudgetPolicy::try_new_unknown_capacity(
+                    known.policy().scope().clone(),
+                    NonZeroU16::MIN,
+                    known.policy().backoff(),
+                )?,
+                &EndpointPolicy::try_new(["https://capacity.test/data"])?,
+            )?;
+            let old = store.register(run_id, &known, now)?;
+            assert!(matches!(
+                store.register(run_id, &unknown, now),
+                Err(ProviderRateStoreError::Conflict)
+            ));
+            let ProviderRateReservationDecision::Ready(reservation) =
+                store.try_reserve(run_id, old, now)?
+            else {
+                return Err("fixture reservation was not admitted".into());
+            };
+            assert!(matches!(
+                store.register_unknown_capacity(run_id, &unknown, now),
+                Err(ProviderRateStoreError::Conflict)
+            ));
+            store.apply_refusal(run_id, old, now, 0)?;
+            let delay = if disabled {
+                61_000_000_000
+            } else {
+                5_000_000_000
+            };
+            store.apply_retry_after(
+                run_id,
+                old,
+                now,
+                RetryAfter::Delay(NonZeroU64::new(delay).ok_or("delay")?),
+            )?;
+            store.cancel_reservation(run_id, old, reservation)?;
+            let current = store.register_unknown_capacity(run_id, &unknown, now)?;
+            assert_eq!(current.group_id(), old.group_id());
+            assert_ne!(current.policy_digest(), old.policy_digest());
+            assert!(matches!(
+                store.try_reserve(run_id, old, now),
+                Err(ProviderRateStoreError::Conflict)
+            ));
+            assert!(matches!(
+                store.register(run_id, &known, now),
+                Err(ProviderRateStoreError::Conflict)
+            ));
+            let expected = if disabled {
+                ProviderRateAvailability::Unavailable(BudgetUnavailableReason::Disabled)
+            } else {
+                ProviderRateAvailability::WaitUntil(Timestamp::from_unix_nanos(6_000_000_000))
+            };
+            assert_eq!(store.inspect_availability(run_id, current, now)?, expected);
+            {
+                let connection = store.connection()?;
+                let retained = load_group(&connection, current)?;
+                assert_eq!(retained.state.consecutive_refusals, 1);
+                assert!(retained.state.windows.is_empty());
+            }
+            drop(store);
+            let store = SqliteProviderRateStore::try_open(&path)?;
+            let restart = Timestamp::from_unix_nanos(2_000_000_000);
+            let run_id = store.start_run(restart)?;
+            let current = store.register(run_id, &unknown, restart)?;
+            assert_eq!(
+                store.inspect_availability(run_id, current, restart)?,
+                expected
+            );
+            if !disabled {
+                let ready = Timestamp::from_unix_nanos(6_000_000_000);
+                for _ in 0..25 {
+                    let ProviderRateReservationDecision::Ready(reservation) =
+                        store.try_reserve(run_id, current, ready)?
+                    else {
+                        return Err("unknown capacity introduced a request limit".into());
+                    };
+                    assert_eq!(
+                        store.try_reserve(run_id, current, ready)?,
+                        ProviderRateReservationDecision::Unavailable(
+                            BudgetUnavailableReason::ConcurrencyExhausted
+                        )
+                    );
+                    let ProviderRateDispatchDecision::Ready(permit) =
+                        store.commit_dispatch(run_id, current, reservation, ready)?
+                    else {
+                        return Err("unknown capacity rejected dispatch".into());
+                    };
+                    store.release(run_id, current, permit)?;
+                }
+            }
+        }
         Ok(())
     }
 

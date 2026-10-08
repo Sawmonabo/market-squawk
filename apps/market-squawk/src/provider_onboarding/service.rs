@@ -2409,12 +2409,7 @@ impl ProviderOnboardingService {
         policy.authorize_request(endpoint)?;
         let mut rate_permit = self
             .probe_rates
-            .acquire(
-                profile,
-                profile.capability().rate_policy(),
-                None,
-                cancellation.clone(),
-            )
+            .acquire(profile, profile.rate_policy(), None, cancellation.clone())
             .await?;
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
         if profile.id() == "federal-reserve-board.data-download-program"
@@ -2563,7 +2558,6 @@ impl ProviderOnboardingService {
         }
         let authorization_subject = ProviderRateDeclaration::governed_provider_subject(
             profile
-                .capability()
                 .rate_policy()
                 .enforcement_policy()
                 .ok_or(ProviderOnboardingError::InvalidProfile)?
@@ -2575,7 +2569,7 @@ impl ProviderOnboardingService {
             .probe_rates
             .acquire(
                 profile,
-                profile.capability().rate_policy(),
+                profile.rate_policy(),
                 Some(&authorization_subject),
                 cancellation.clone(),
             )
@@ -2736,7 +2730,6 @@ impl ProviderOnboardingService {
             )
             .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
         let policy = profile
-            .capability()
             .rate_policy()
             .enforcement_policy()
             .cloned()
@@ -3106,11 +3099,7 @@ impl ProviderOnboardingService {
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
             runtime_verification_evidence,
-            provider_budget_policy: profile
-                .capability()
-                .rate_policy()
-                .enforcement_policy()
-                .cloned(),
+            provider_budget_policy: profile.rate_policy().enforcement_policy().cloned(),
             generation,
             secret_reference,
             verification_expires_at: runtime_projection.verification_expires_at,
@@ -3214,11 +3203,7 @@ impl ProviderOnboardingService {
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
             runtime_verification_evidence,
-            provider_budget_policy: profile
-                .capability()
-                .rate_policy()
-                .enforcement_policy()
-                .cloned(),
+            provider_budget_policy: profile.rate_policy().enforcement_policy().cloned(),
             generation,
             secret_reference,
             verification_expires_at: runtime_projection.verification_expires_at,
@@ -4742,6 +4727,33 @@ mod tests {
                 evidence_digest: event_digest(b"user-cancelled", *cancelled_session, None),
             },
         )?;
+        // A rate-control correction must not replace the saved application credential.
+        let schwab = profiles
+            .get(SCHWAB_MARKET_DATA_SURFACE_ID)
+            .ok_or("missing Schwab profile")?;
+        let schwab_request = OnboardingReservationRequest::try_new(
+            schwab.capability(),
+            ProviderPublicConfiguration::default(),
+            schwab.capability().maximum_authority().clone(),
+            SourceIdentifier::try_from("startup-recovery-test")?,
+            SourceIdentifier::try_from("saved-schwab-rate-correction")?,
+            wall_deadline(SESSION_DURATION)?,
+            0,
+        )?;
+        let schwab_session = service
+            .catalog
+            .reserve_provider_onboarding(&schwab_request)?
+            .session_id();
+        let schwab_value = r#"{"version":1,"app_key":"fixture-key","app_secret":"fixture-secret"}"#;
+        service.submit_secret_blocking(
+            schwab_session,
+            SecretValue::new(schwab_value.to_owned())?,
+            SecretCancellation::new(),
+        )?;
+        service
+            .prepare_schwab_oauth_bootstrap(schwab_session, CancellationToken::new())
+            .await?;
+        let schwab_coordinate = service.retained_credential_coordinate(schwab_session)?;
         let ProviderOnboardingService { catalog, .. } = service;
         let remaining = setup_deadline
             .unix_nanos()
@@ -4754,6 +4766,41 @@ mod tests {
             Arc::clone(&secrets),
             provider_rate,
         )?;
+        assert_eq!(
+            recovered.retained_credential_coordinate(schwab_session)?,
+            schwab_coordinate
+        );
+        let saved_schwab = read_secret_reference(
+            secrets.as_ref(),
+            schwab_session,
+            &schwab_coordinate.1,
+            SecretCancellation::new(),
+            SecretInteractionPolicy::Forbid,
+        )?;
+        assert_eq!(saved_schwab.expose_secret(), schwab_value);
+        recovered
+            .prepare_schwab_oauth_bootstrap(schwab_session, CancellationToken::new())
+            .await?;
+        assert_eq!(
+            recovered.retained_credential_coordinate(schwab_session)?,
+            schwab_coordinate
+        );
+        let rate_view = ProviderProfileView::from(schwab);
+        let disclosed = serde_json::to_value(rate_view)?;
+        let disclosed_policy: market_squawk_sources::RatePolicyDescriptor = serde_json::from_value(
+            disclosed
+                .get("rate_policy")
+                .ok_or("missing disclosed rate policy")?
+                .clone(),
+        )?;
+        assert_eq!(disclosed_policy, *schwab.rate_policy());
+        assert_eq!(
+            disclosed_policy
+                .enforcement_policy()
+                .ok_or("missing current rate policy")?
+                .window_count(),
+            0
+        );
         let resumed = recovered.resume(*pending_session)?;
         assert_eq!(resumed.state(), OnboardingState::StoredUnverified);
         assert_eq!(
