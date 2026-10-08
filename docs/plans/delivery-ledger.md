@@ -16,7 +16,7 @@ contracts, schema, application composition, runtime, tests, Git and ledger.
 | --- | --- | --- | --- |
 | Astra option_rejection | Unblock real stock analysis when fresh chain symbols differ from retained contract references | `.agents/tmp/v1-first-stock/oct8-option-reference-recovery.md` only; source read-only | Parser passed; rejoin coverage fails. Trace pending-original recovery and identify exact missing-symbol cause and a coherent correction preserving original evidence. |
 | Astra schwab_stream_diagnosis | Restore saved Schwab connection without repeated sign-in | `.agents/tmp/v1-first-stock/oct8-schwab-stream-diagnosis.md` only; source read-only | OAuth refresh passed; LevelOneForex rejected InvalidRateAuthority. Trace exact rate/ack boundary and propose smallest correction plus existing critical check. |
-| Astra retained_read_diagnosis | Restore responsive cached watchlist prices | Existing report ownership unchanged | Retained route discovery exceeds request deadline; identify SQL/caller cause. |
+| Lead (uninitialized retained-read helper interrupted) | Restore responsive cached watchlist prices | Route implementation/test below | Root completed query diagnosis and correction; native verification pending. |
 
 Lead additionally owns `crates/market-squawk-data/src/catalog/market_recovery.rs` and the
 existing `crates/market-squawk-data/tests/publication_recovery.rs` route assertions for the proven
@@ -29,7 +29,48 @@ Integrate the first substantiated correction with its consumer, run its critical
 before releasing implementation ownership. Full streaming fields and screen coverage remain required
 following connection recovery; passing the doctor alone cannot close that product journey.
 
-### Retained route correction — critically verified, native deployment pending
+### Current failure diagnoses — 2026-10-08 follow-up
+
+Route correction committed/pushed as `bd3d3569`. The single supervisor is compiling that frozen
+source; old Desktop/service stay available. PR43 evidence for preceding `c5cc4fb7` is comment
+6068053582. The retained-read helper never initialized and was interrupted; root completed its
+bounded query investigation rather than waiting or dispatching a duplicate.
+
+Schwab diagnosis: current read-only durable rate state confirms20 admitted attempts in a20/900s
+application-defined window (started_at_ns1791489499016688000). The doctor performs8 bootstrap/REST
+attempts and3 physical admissions per connected family; family5 hits the local ceiling. No Forex
+wire refusal is established. Required correction: explicit unknown numeric capacity within the
+shared rate authority, preserving single-flight, observed refusal/Retry-After cooldown and durable
+state; truthful deadline/error mapping. Merely raising20 or changing collision identity is rejected.
+The subsequent shared-connection and service-refusal isolation work remains required, followed by
+full fields/provider-neutral consumers. Exact bounded dependency report:
+`.agents/tmp/v1-first-stock/oct8-schwab-stream-diagnosis.md`.
+
+Option diagnosis: the actual sealed native October8 chain has2,835 symbols versus2,752 in its
+October3 retained contract originals:307 new snapshot symbols and224 older references absent from
+snapshot. Repeated recovery reuses those same stale references. The financial lane is finishing
+the smallest evidence-preserving recovery proposal; no production change is accepted yet.
+
+### Native deployment result and next selector dependency
+
+`bd3d3569` native build passed in7m01s. The existing supervisor completed replacement of old
+service60900/Desktop60906 and started service62398/Desktop62399 in `generation-4lJbNN` without
+its prior shutdown refusal. Catalog opened in2.188s; composition8.163s. These warm-run timings do
+not prove cold-start acceptance. Old owned runtime generation was automatically reclaimed.
+
+The watchlist is still not live-verified: post-replacement logs locate its next deadline inside
+`retained-selection-batch`, after route discovery. The background collection call failed; the
+WebDriver error envelope itself returnedHTTP500 and supplies no successful product receipt.
+Source inspection finds full exact-key history materialization and per-event complete-commit joins
+in selection/exclusion accounting. No claim that a query speedup fixed the full screen is made.
+
+Next Astra selector diagnosis owns only `.agents/tmp/v1-first-stock/oct8-selector-read-diagnosis.md`.
+Source read-only: `crates/market-squawk-data/src/manifest/catalog.rs`, `ingest/market_event_read.rs`
+and exact callers. Outcome: prove the remaining selector cost and propose the smallest complete
+correction preserving PIT, exclusions, ties, cancellation and corruption checks. No builds/tests,
+Git/runtime/provider calls. Root retains production files, shared schema/contracts and scheduling.
+
+### Retained route correction — critically verified, native boundary progressed
 
 The route query now discovers distinct candidate routes and uses EXISTS to establish one matching
 complete publication per route. It preserves exact instrument/event/source/time/schema predicates,
@@ -44,8 +85,8 @@ populated instruments: old total14.195s, new1.291s. This is a query measurement,
 or whole-app performance claim. The existing `provider_market_event_publication_is_restart_queryable`
 critical test passed1/1 in11.12s after a1m build, including time cutoffs, restart, reads during a held
 writer, and the added uncovered cursor-exhaustion assertion. Evidence: `oct8-route-nine-instruments.json`
-and `oct8-route-critical.log`. Native rebuild/deployment and actual screen verification remain next.
-Watcher60793 is temporarily suspended to serialize the lead's build; visible old service remains up.
+and `oct8-route-critical.log`. Native deployment succeeded as recorded above; the next selector boundary still fails.
+Watcher60793 is active; supervisor60780 owns the current visible runtime. No compiler is running.
 
 ### Option acquisition — implemented, critically verified, downstream failure exposed
 
@@ -101,7 +142,7 @@ provider-neutral screen use and installed restart proof remain open.
 | --- | --- | --- | --- |
 | Lead | Integrate this verified correction, then repair the observed reference-rejoin and provider/collection failures | Git/build/runtime/ledger; option adapter/application files, onboarding error mapping, retained-read diagnostics, `scripts/develop.mjs` and its runbook paragraph | Push coherent checkpoint; refresh next failure ownership before edits |
 | Completed Astra option lane | Parser correction and typed rejection diagnosis | Files released; actual diff inspected | Critical regression and native progression recorded above |
-| Astra retained-read investigation — pending initialization | Explain demonstrated retained-route latency, preserving source integrity | Read-only source/database; only report `.agents/tmp/v1-first-stock/oct8-retained-read-diagnosis.md` writable | Concrete SQL/caller cause and smallest critical correction; no builds/Git/runtime changes |
+| Astra selector diagnosis | Explain the remaining retained-selection deadline | Read-only source/database; only report `.agents/tmp/v1-first-stock/oct8-selector-read-diagnosis.md` writable | Exact cause and correction preserving financial evidence; no builds/Git/runtime changes |
 
 Evidence lives in `.agents/tmp/v1-first-stock/`: `oct8-option-page-shapes.json`,
 `oct8-option-parser-test.log`, `oct8-diagnostic-build.log`, `oct8-corrected-native.log`,
