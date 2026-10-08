@@ -6,6 +6,75 @@ Goal active: owner reconfirmed resume after the lead mistakenly reapplied the ol
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `034f0ca067ccc039c8eae8e3f2e863149caf2f0f`. Main/release unchanged; no extra branch created.
 
+### Current integration — 3d00c0fd adapter boundary
+
+Previous turn made concrete progress:9faa41ce is pushed, existing critical test passed and native
+replacement was exercised; watchlist remains failing. Current work completes the adapter boundary
+needed by shared subscriptions, while investigating reuse of admitted current observations at the
+remaining screen failure. No complete streaming/product claim follows from relocating fields.
+
+| Owner | Finishable outcome / dependency | Exclusive files | Smallest critical evidence / next dependency |
+| --- | --- | --- | --- |
+| GPT-6.1 Sol High adapter dictionary | Existing production stream subscriptions obtain their official field IDs/semantic dictionary from the adapter, eliminating numeric protocol tables from ordinary application code | `adapters/market-squawk-adapter-schwab/src/canonical/streamer_dictionary.rs` (new), `src/canonical.rs` only dictionary impl/module declaration; `adapters/market-squawk-adapter-schwab/resources/market-data-documentation-20260916.json` (resource copy/move coordinated with lead) | Preserve current field sets/meanings and retained evidence digest; no field expansion until real mapping is reviewed. Lead integrates all app callers/removes old module/resource only after checking other uses; existing adapter dictionary parsing check. |
+| GPT-6 Astra High current presentation | Determine whether admitted stale actor quote/trade evidence can safely satisfy ordinary last-price display without repeating retained history on each notification; implement only a demonstrated semantics-preserving correction | `apps/market-squawk/src/application/paper/market/durable_product.rs`; existing `product.rs` only relevant retained-display helper/test if needed | Preserve richer/newer retained evidence, authorization, original clocks and completed-close comparison. No fake freshness, timeout raise or skipped integrity. If missing projection completeness prevents safe fix, report exact dependency instead. No builds/runtime/Git. |
+| Lead | Freeze and integrate canonical subscription ownership contract; wire adapter API to existing producers before dispatching dependent clients | Shared source/services/runtime contracts, composition, manifests/schema/transports, application `market_runtime/schwab_streamer.rs` and its `dictionary.rs`/`families.rs`/`publication.rs`, ledger, Git and all builds/runtime | Maintain independent owner lifetimes, deduplicated upstream desire and existing current actor/publication paths. Full two-consumer journey is still required. |
+
+Both helper lanes handed off. Adapter producer/caller integration is now lead-owned; the official
+mapping is used for desired fields and publication parsing, with the old app table/resource removed.
+The existing native parser check now consumes the production dictionary and asserts bid/ask meanings
+and source digest (gap: fixture dictionaries did not exercise production numeric semantics).
+
+Current-display helper found no safe local shortcut and made no edits: durable-only publications can
+be newer/richer than actor state; actor presence does not preserve retained trade ambiguity. Next
+read-path dependency is a complete selection bound to durable publication/source/authority revisions,
+not a stale-row bypass. See exact source findings in the helper handoff; both source scopes released.
+
+Next independent bounded investigation: GPT-6.1 Sol High shared_subscription_boundary owns only
+`.agents/tmp/v1-first-stock/oct8-subscription-client-lifetime.md`; trace existing Desktop/CLI/MCP
+session teardown and identity to identify a concrete shared-demand owner lifecycle. Source read-only;
+no builds/Git/runtime/provider calls. Deliver exact existing APIs and smallest integrated change,
+including disconnect/crash and lost acquire response. Lead retains all contract/source writes and
+runs the adapter critical check before accepting further implementation.
+
+Client-lifetime investigation completed and inspected: transient owners will be held by an
+authenticated streaming response on the existing service listener; its response body owns release.
+Named client UUIDs are shared across invocations and cannot identify a view. Existing MCP response
+body permit custody provides the local ownership pattern; existing finite event polling and ordinary
+read cancellation do not already provide this behavior. Keep durable collection/portfolio owners
+service-lived and reuse the current event journal. Next producer/consumer checkpoint must verify
+idle disconnect, lost handshake, overlapping owner release and credential-generation cancellation,
+then a real quote reaches both watchlist and detail. No separate webhook service or arbitrary TTL.
+Report: `oct8-subscription-client-lifetime.md`. Helper released its report-only scope.
+
+Upstream review for that decision: [Axum SSE](https://docs.rs/axum/0.8.9/axum/response/sse/index.html)
+uses the repository's locked0.8.9 implementation and supports held response/keepalive. Tokio's
+[watch](https://docs.rs/tokio/latest/tokio/sync/watch/index.html) retains latest state while
+[broadcast](https://docs.rs/tokio/latest/tokio/sync/broadcast/index.html) signals lag; latest docs
+currently1.53.2, so confirmed relevant watch behavior against local locked1.53.1 source. These are
+mechanism references, not evidence that application demand lifetimes are implemented.
+
+Implementation commit `3d00c0fd` integrates the adapter's production dictionary into both subscription
+selection and canonical publication, removes the old application dictionary and moves its official
+resource unchanged. All12 field sets/meanings/version remain unchanged. Source closure was regenerated
+with the existing tool:64 added paths,2 removed paths,432 refreshed entries from accumulated current
+source changes; dependency/artifact authorities were confirmed unchanged. No per-frame blob hashing.
+
+Critical evidence: existing `rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semantics`
+passed1/1 (0.02s; compilation1m31s), now using the production dictionary and checking exact bid/ask
+meanings/digest. Full `cargo check --locked --offline -j1 -p market-squawk --lib` passed in6m13s;
+existing warnings remain. Logs: `oct8-adapter-dictionary-critical.log` and
+`oct8-adapter-dictionary-app-check.log`. `git diff --check` passed. Both Cargo commands used
+CARGO_INCREMENTAL=0/CARGO_BUILD_JOBS=1 with no competing build/new target. This is implemented and
+critically verified only; native dynamic subscriptions/screens and installed workflow remain open.
+
+Lead restores the suspended watcher after these checks; visible service/Desktop have stayed running.
+Next dependency: implement body-owned transient demand plus durable internal demand and adapter
+revision/ACK admission together, then prove watchlist/detail independent release and actual data.
+The invented Schwab20/900 rate limit and option-reference recovery also remain open and must not be
+mistaken for upstream missing data. All helpers handed off; lead owns shared contracts/integration.
+One worktree and only main/release/feature local branches verified. Disk during this interval:
+target12GB, scratch699MB, active runtime stage1.4GB; no whole-app RAM measurement performed.
+
 ### Owner correction — provider-neutral application streaming
 
 The owner identified Schwab protocol logic under `application/market_runtime/schwab_streamer/`.
