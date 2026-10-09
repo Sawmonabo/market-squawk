@@ -291,7 +291,7 @@ impl MarketRuntimeGroupGeneration {
         update_text(&mut hasher, request.surface().surface_id())?;
         hasher.update(request.onboarding_session_id().as_bytes());
         update_evidence(&mut hasher, request.expected_public_configuration_digest());
-        update_evidence(
+        update_optional_evidence(
             &mut hasher,
             request.expected_runtime_verification_receipt_digest(),
         );
@@ -355,8 +355,8 @@ impl MarketRuntimeGroupGeneration {
                     .content_digest(),
             );
             update_text(&mut hasher, source.provider().as_str())?;
-            let channel_count = u64::try_from(channels.len())
-                .map_err(|_| ServiceError::InvalidRequest)?;
+            let channel_count =
+                u64::try_from(channels.len()).map_err(|_| ServiceError::InvalidRequest)?;
             hasher.update(channel_count.to_be_bytes());
             for live in channels {
                 update_text(
@@ -429,7 +429,7 @@ fn update_metadata(hasher: &mut Sha256, metadata: &[&SourceMetadata]) -> Result<
 fn update_lease(hasher: &mut Sha256, lease: &ProviderActivationLease) {
     update_evidence(hasher, lease.capability_digest());
     update_evidence(hasher, lease.rights_decision_digest());
-    update_evidence(hasher, lease.runtime_evidence_digest());
+    update_optional_evidence(hasher, lease.runtime_evidence_digest());
     update_optional_evidence(hasher, lease.account_digest());
     update_optional_evidence(hasher, lease.verification_evidence_digest());
 }

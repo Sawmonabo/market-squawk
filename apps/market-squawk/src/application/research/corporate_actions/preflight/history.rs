@@ -177,7 +177,7 @@ impl SourceActionPreparationCapability {
             AccountMarketSurface::AlpacaBasic,
             runtime.onboarding_session_id(),
             runtime.public_configuration_digest(),
-            runtime.runtime_evidence_digest(),
+            Some(runtime.runtime_evidence_digest()),
             runtime.credential_generation(),
         )?;
         progress("history-plan-admission");

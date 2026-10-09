@@ -59,7 +59,7 @@ pub(crate) struct MarketProviderGroupLifecycleEvidence {
     surface_id: SourceIdentifier,
     onboarding_session_id: Uuid,
     public_configuration_digest: EvidenceDigest,
-    runtime_verification_receipt_digest: EvidenceDigest,
+    runtime_verification_receipt_digest: Option<EvidenceDigest>,
     credential_generation: market_squawk_platform::SecretGeneration,
     group_generation: MarketRuntimeGroupGeneration,
 }
@@ -77,7 +77,7 @@ impl MarketProviderGroupLifecycleEvidence {
         self.public_configuration_digest
     }
 
-    pub(crate) const fn runtime_verification_receipt_digest(&self) -> EvidenceDigest {
+    pub(crate) const fn runtime_verification_receipt_digest(&self) -> Option<EvidenceDigest> {
         self.runtime_verification_receipt_digest
     }
 
@@ -174,7 +174,7 @@ enum AccountCurrentnessMode {
 struct AccountRuntimeStartContext {
     evidence: MarketProviderGroupLifecycleEvidence,
     activation_lease: ProviderActivationLease,
-    verification_expires_at: market_squawk_domain::Timestamp,
+    verification_expires_at: Option<market_squawk_domain::Timestamp>,
     cleanup_budget: Duration,
     group_cancellation: CancellationToken,
     read_admission: DisplayMarketReadAdmission,
@@ -261,10 +261,14 @@ impl AccountMarketRuntimeGroup {
             PreparedAccountMarketRuntimeStart::Schwab(prepared) => prepared.activation_lease(),
         }
         .clone();
-        let verification_expires_at = activation_lease
-            .verification_expires_at()
-            .ok_or(ServiceError::Unauthorized)
-            .map_err(AccountRuntimeStartFailure::before_owner)?;
+        let verification_expires_at = activation_lease.verification_expires_at();
+        if request.surface() != AccountMarketSurface::SchwabMarketData
+            && verification_expires_at.is_none()
+        {
+            return Err(AccountRuntimeStartFailure::before_owner(
+                ServiceError::Unauthorized,
+            ));
+        }
         let group_cancellation = lifecycle.child_token();
         let read_admission = DisplayMarketReadAdmission::closed();
         let context = AccountRuntimeStartContext {
@@ -476,7 +480,7 @@ impl AccountMarketRuntimeGroup {
                 return Err(AccountRuntimeStartFailure::after_cleanup(error, cleanup));
             }
         }
-        let expiry_delay = match duration_until(verification_expires_at) {
+        let expiry_delay = match verification_expires_at.map(duration_until).transpose() {
             Ok(delay) => delay,
             Err(error) => {
                 let cleanup = cleanup_account_runtime(
@@ -1542,7 +1546,7 @@ fn spawn_account_currentness_monitor(
     mode: AccountCurrentnessMode,
     read_admission: DisplayMarketReadAdmission,
     lifecycle: CancellationToken,
-    expiry_delay: Duration,
+    expiry_delay: Option<Duration>,
 ) -> tokio::task::JoinHandle<()> {
     spawn_account_currentness_monitor_with_check(
         move |require_active| {
@@ -1567,14 +1571,19 @@ fn spawn_account_currentness_monitor_with_check<Check, CheckFuture>(
     mode: AccountCurrentnessMode,
     read_admission: DisplayMarketReadAdmission,
     lifecycle: CancellationToken,
-    expiry_delay: Duration,
+    expiry_delay: Option<Duration>,
 ) -> tokio::task::JoinHandle<()>
 where
     Check: FnMut(bool) -> CheckFuture + Send + 'static,
     CheckFuture: std::future::Future<Output = bool> + Send + 'static,
 {
     tokio::spawn(async move {
-        let expiry = tokio::time::sleep(expiry_delay);
+        let expiry = async move {
+            match expiry_delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(expiry);
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1893,7 +1902,7 @@ mod tests {
             AccountCurrentnessMode::ActiveOnly,
             read_admission.clone(),
             lifecycle.clone(),
-            Duration::from_secs(60),
+            None,
         );
         tokio::time::timeout(Duration::from_millis(250), started_rx)
             .await

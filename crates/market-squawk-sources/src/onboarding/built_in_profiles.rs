@@ -88,7 +88,6 @@ const FRED_PROFILE: &str = FRED_ALFRED_API_SURFACE_ID;
 const ALPACA_BASIC_PROFILE: &str = "alpaca.basic-market-data";
 const NASDAQ_REFERENCE_PROFILE: &str = "nasdaq-trader-symbol-directory-reference";
 const SCHWAB_MARKET_DATA_PROFILE: &str = "schwab.trader-api-market-data";
-const SCHWAB_USER_PREFERENCE_PROBE_URL: &str = "https://api.schwabapi.com/trader/v1/userPreference";
 const YAHOO_ENRICHMENT_PROFILE: &str = "yahoo-finance.experimental-enrichment";
 const IEX_HIST_PROFILE: &str = "iex.hist-feed-files";
 const OCC_REFERENCE_PROFILE: &str = "occ.options-reference";
@@ -923,6 +922,24 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
     if spec.id == CENSUS_PROFILE {
         return build_current_census(spec);
     }
+    if spec.id == SCHWAB_MARKET_DATA_PROFILE {
+        let capability = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(1)?,
+            initial_credential_kind(spec.id, true),
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(1)?,
+                SourceIdentifier::try_from("schwab.trader-api-market-data.request-policy.v1")?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
+            )?,
+        )?;
+        return finish_profile(spec, Vec::new(), capability);
+    }
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
     let prior_credential_kind = initial_credential_kind(spec.id, credentialed);
     let legacy_capability = build_capability_with_rights_state(
@@ -1124,50 +1141,6 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             vec![legacy_capability, revision_two, revision_three],
             current,
         )
-    } else if spec.id == SCHWAB_MARKET_DATA_PROFILE {
-        // Capability revisions retain immutable evidence for saved authorization/receipts.
-        // Operational rate controls are supplied separately without changing saved consent.
-        let revision_three = build_capability(
-            &spec,
-            ProviderCapabilityRevision::new(3)?,
-            prior_credential_kind,
-            RatePolicyDescriptor::try_new_enforced(
-                SourceIdentifier::try_from(spec.rate_policy)?,
-                PROVIDER_RELEASE_REPORT_DIGEST,
-                true,
-                ProviderCapabilityRevision::new(2)?,
-                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
-                PROVIDER_RELEASE_REPORT_DIGEST,
-                built_in_budget(&spec, false)?,
-                false,
-            )?,
-        )?;
-        let revision_four = build_capability(
-            &spec,
-            ProviderCapabilityRevision::new(4)?,
-            prior_credential_kind,
-            RatePolicyDescriptor::try_new_enforced(
-                SourceIdentifier::try_from(current_rate_policy(&spec))?,
-                PROVIDER_RELEASE_REPORT_DIGEST,
-                true,
-                ProviderCapabilityRevision::new(3)?,
-                SourceIdentifier::try_from("schwab.trader-api-market-data.entitlement-doctor.v1")?,
-                PROVIDER_RELEASE_REPORT_DIGEST,
-                simple_budget(
-                    "schwab-trader-api",
-                    Some("schwab.trader-api.account-template"),
-                    20,
-                    15 * MINUTE_NANOS,
-                    1,
-                    built_in_budget(&spec, false)?.backoff(),
-                )?,
-                true,
-            )?,
-        )?;
-        (
-            vec![legacy_capability, revision_two, revision_three],
-            revision_four,
-        )
     } else if spec.id == ALPACA_BASIC_PROFILE {
         // Preserve the exact revision-three provider-fact budget. Revision four separates that
         // 200/min historical fact from Market Squawk's 150/min application ceiling and requires
@@ -1302,20 +1275,7 @@ fn finish_profile(
     capability: ProviderCapability,
 ) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
-    let operational_rate_policy = if spec.id == SCHWAB_MARKET_DATA_PROFILE {
-        RatePolicyDescriptor::try_new_enforced(
-            SourceIdentifier::try_from(current_rate_policy(&spec))?,
-            PROVIDER_RELEASE_REPORT_DIGEST,
-            true,
-            ProviderCapabilityRevision::new(4)?,
-            SourceIdentifier::try_from("schwab.trader-api-market-data.entitlement-doctor.v1")?,
-            PROVIDER_RELEASE_REPORT_DIGEST,
-            built_in_budget(&spec, true)?,
-            true,
-        )?
-    } else {
-        capability.rate_policy().clone()
-    };
+    let operational_rate_policy = capability.rate_policy().clone();
     ProviderOnboardingProfile::try_new(ProviderOnboardingProfileInput {
         id: spec.id,
         display_name: spec.display_name,
@@ -1399,7 +1359,6 @@ fn build_capability_with_rights_state(
                 || (spec.id == TREASURY_FISCAL_PROFILE && revision.get() >= 4)
                 || (spec.id == FEDERAL_RESERVE_BOARD_PROFILE && revision.get() >= 4)
                 || (spec.id == ALPACA_BASIC_PROFILE && revision.get() >= 4)
-                || (spec.id == SCHWAB_MARKET_DATA_PROFILE && revision.get() >= 4)
             {
                 2
             } else {
@@ -1455,7 +1414,7 @@ fn capability_evidence(
 ) -> Result<Vec<EvidenceBinding>, ProviderProfileError> {
     let (report_source, report_digest) = if (revision.get() >= 3
         && has_provider_release_revision(spec.id))
-        || matches!(spec.id, FRED_PROFILE | EIA_PROFILE)
+        || matches!(spec.id, FRED_PROFILE | EIA_PROFILE | SCHWAB_MARKET_DATA_PROFILE)
     {
         (
             "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25",
@@ -1475,7 +1434,7 @@ fn capability_evidence(
         ));
     }
     if (is_selected_architecture_profile(spec.id) || spec.id == "bls.v2-registered")
-        && (revision.get() >= 3 || matches!(spec.id, FRED_PROFILE | EIA_PROFILE))
+        && (revision.get() >= 3 || matches!(spec.id, FRED_PROFILE | EIA_PROFILE | SCHWAB_MARKET_DATA_PROFILE))
     {
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE)?,
@@ -2002,13 +1961,11 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("schwab.market-data.read"),
         permissions: &["market-data.read", "streamer-bootstrap.read"],
-        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; the provider-native read-only REST/Streamer core, protected OAuth lifecycle, exact User Preference bootstrap, and bounded entitlement doctor authority are present, while complete activation-to-publication binding, PIT typed reads, product composition, and restart/release proof remain incomplete",
+        coverage: "Optional owner-enabled target for Schwab Trader API market-data REST quotes, price history, option and expiration chains, movers, market hours, instruments/reference data, and one Streamer connection carrying selected level-one, named-book, chart, and screener services; source semantics remain provider/service-specific and never imply SIP, NBBO, OPRA, consolidated depth, account access, or execution; configured application credentials and protected OAuth authorize requested reads, actual responses determine family availability, and User Preference is used only for Streamer bootstrap; full product and installed restart proof remain incomplete",
         quality: DataQuality::DirectUnverified,
-        probe: VerificationProbe::network(
-            ProbeTransport::HttpGet,
-            SCHWAB_USER_PREFERENCE_PROBE_URL,
-            None,
-        )?,
+        probe: VerificationProbe::local(
+            "Validate the configured application key and secret envelope locally; provider access uses protected OAuth and actual requested responses",
+        ),
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "import only the application key and secret pair; authorization codes, access tokens, and refresh tokens may enter only the application-owned protected OAuth/token authority",
@@ -2016,8 +1973,6 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
             "allowlist only market-data routes plus trader/v1/userPreference fields required for Streamer bootstrap; never admit account, position, order, or trading authority",
             "retain Schwab endpoint or Streamer service, provider symbol, named venue/book, account realm, event and receive clocks, sequence, reconnect, and delay or indicative fields",
             "admit at most one Streamer connection and one provider attempt in flight across the application/account scope",
-            // Immutable admission evidence; current enforcement is profile.rate_policy().
-            "enforce the Market Squawk ceiling of twenty provider attempts per fifteen minutes for the exact User Preference plus seven REST plus twelve Streamer doctor probes; this is not a provider-published Schwab limit",
             "refresh shared capacity on HTTP 429, honor valid server Retry-After feedback, and lower admission from refusals, partial returns, latency, bytes, acknowledgements, and queue pressure",
         ],
         persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
@@ -2027,7 +1982,7 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
         evidence: SCHWAB_MARKET_DATA_EVIDENCE,
         rate_policy: "schwab.trader-api-market-data.pending-rate-policy.v1",
         refresh_trigger: "SCHWAB-TRADER-API-MARKET-DATA",
-        handoff_instruction: "Import the configured Schwab application key and secret pair, complete provider-controlled OAuth authorization, then run the code-owned User Preference bootstrap and bounded entitlement doctor. The profile remains unavailable until complete activation-to-publication binding, PIT reads, product composition, and restart/release proof are delivered.",
+        handoff_instruction: "Import the Schwab application key and secret pair, then complete Schwab sign-in. Requested data uses the saved authorization; reconnect only when Schwab requires it.",
     })
 }
 

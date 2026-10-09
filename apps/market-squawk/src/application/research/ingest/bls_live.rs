@@ -767,7 +767,7 @@ mod tests {
                 rights_basis,
                 digest(4),
                 digest(5),
-                now.checked_add_nanos(60_000_000_000)?,
+                Some(now.checked_add_nanos(60_000_000_000)?),
                 vec![subject.clone()],
                 vec![SourceOperation::Persist],
             )?,

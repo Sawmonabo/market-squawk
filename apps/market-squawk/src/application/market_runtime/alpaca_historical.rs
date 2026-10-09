@@ -490,7 +490,9 @@ impl AlpacaHistoricalCapabilityOwner {
         let credential_generation = lease.generation().ok_or(ServiceError::Unavailable)?;
         let account_digest = lease.account_digest().ok_or(ServiceError::Unavailable)?;
         let public_configuration_digest = lease.public_configuration_digest();
-        let runtime_evidence_digest = lease.runtime_evidence_digest();
+        let runtime_evidence_digest = lease
+            .runtime_evidence_digest()
+            .ok_or(ServiceError::Unavailable)?;
         if cancellation.is_cancelled()
             || account_binding.account() != ProviderMarketAccount::AlpacaBasic
             || lease.surface_id().as_str() != ProviderMarketAccount::AlpacaBasic.surface_id()

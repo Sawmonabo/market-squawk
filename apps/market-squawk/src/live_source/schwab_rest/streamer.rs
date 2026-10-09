@@ -130,6 +130,7 @@ impl SchwabRestQuoteCurrentSessionInput {
         sealed: &SchwabSealedStreamerCapture,
         metadata: &SourceMetadata,
         qualification: &SchwabMarketDataQualification,
+        oauth: SchwabOAuthAuthorityReceipt,
         deadline: Instant,
     ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
         require_deadline(deadline)?;
@@ -142,11 +143,15 @@ impl SchwabRestQuoteCurrentSessionInput {
         let service = qualification
             .streamer_service()
             .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        if !parsed
-            .value()
-            .data
-            .iter()
-            .any(|batch| batch.service == service)
+        if qualification.token_generation() != oauth.generation()
+            || qualification.credential_authority() != oauth.credential_authority()
+            || sealed.streamer_receipt().token_generation() != oauth.generation()
+            || sealed.streamer_receipt().credential_authority() != oauth.credential_authority()
+            || !parsed
+                .value()
+                .data
+                .iter()
+                .any(|batch| batch.service == service)
             || parsed.raw_sha256() != sealed_frame.payload_digest().bytes()
             || sealed_frame.generation().get() != self.session.generation().get()
             || sealed.streamer_receipt().generation().get() != self.session.generation().get()
@@ -169,6 +174,7 @@ impl SchwabRestQuoteCurrentSessionInput {
             let observed_at = timestamp_from_millis(sealed_frame.received_at_unix_millis())?;
             self.record_current_health(
                 metadata,
+                oauth,
                 live,
                 observed_at,
                 None,
@@ -388,6 +394,7 @@ impl SchwabRestQuoteCurrentSessionInput {
             let observed_at = frame.received_at();
             self.record_current_health(
                 metadata,
+                oauth,
                 live,
                 observed_at,
                 latest,
@@ -414,6 +421,7 @@ impl SchwabRestQuoteCurrentSessionInput {
             .collect::<Vec<_>>();
         let mut qualified = self.qualify_decoded(
             metadata,
+            oauth,
             live,
             evidence.payload_digest,
             &venue,

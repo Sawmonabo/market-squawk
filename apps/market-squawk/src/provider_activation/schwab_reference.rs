@@ -11,7 +11,9 @@ use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, RequestAdmission, RestExecutionOutcome, RestTransportBounds,
     SchwabRestExecutor, SchwabTransportTelemetry, build_instrument_by_cusip_request,
 };
-use market_squawk_data::{ListingReferenceRecord, MarketDataInstrumentRecord, OfficialIssuerInstrumentReference};
+use market_squawk_data::{
+    ListingReferenceRecord, MarketDataInstrumentRecord, OfficialIssuerInstrumentReference,
+};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
@@ -41,13 +43,15 @@ impl ProviderAdapterActivation {
         cancellation: CancellationToken,
     ) -> Result<MarketDataInstrumentRecord, ServiceError> {
         check_operation(deadline, &cancellation)?;
-        issuer.validate_listing(&official_listing, metadata::timestamp()?).map_err(|_| ServiceError::Unavailable)?;
+        issuer
+            .validate_listing(&official_listing, metadata::timestamp()?)
+            .map_err(|_| ServiceError::Unavailable)?;
         activation
             .require_runtime_current()
             .await
             .map_err(|_| ServiceError::Unauthorized)?;
         let source = metadata::metadata(activation)?;
-        // A restart of the same live doctor/lease reuses the catalog-minted reference. Re-fetching
+        // A restart of the same configured lease reuses the catalog-minted reference. Re-fetching
         // would mint another revision and break the unchanged exact quote generation unnecessarily.
         if let Some(expected) = expected_current.as_ref() {
             let at = metadata::timestamp()?;
@@ -94,9 +98,7 @@ impl ProviderAdapterActivation {
             super::provider_research_rights_basis(lease).map_err(|_| ServiceError::Unauthorized)?,
             lease.rights_decision_digest(),
             EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into()),
-            lease
-                .verification_expires_at()
-                .ok_or(ServiceError::Unauthorized)?,
+            lease.verification_expires_at(),
             vec![dataset],
             super::lease_research_operations(lease),
         )
@@ -112,7 +114,6 @@ impl ProviderAdapterActivation {
             source,
             rights.clone(),
         )
-        .and_then(|generation| generation.with_runtime_verification(lease))
         .map_err(|_| ServiceError::Unauthorized)?;
         {
             let guard = activation
@@ -204,7 +205,6 @@ impl ProviderAdapterActivation {
             .research
             .acquire_schwab_instrument_reference_publication(
                 generation,
-                activation.doctor_receipt().clone(),
                 activation.oauth_receipt_currentness(),
                 receipt,
                 deadline,

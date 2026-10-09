@@ -10,7 +10,7 @@ impl SchwabMarketPublicationClosure {
     pub(crate) async fn publish_already_sealed_daily_price_history(
         &self,
         sealed: SchwabSealedRestResponse,
-        request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+        request: SchwabDailyPriceHistoryPublicationRequest,
         oauth_epoch: SchwabOAuthPublicationEpoch,
         account: crate::provider_activation::ProviderAccountPublicationAuthority,
         record: market_squawk_data::MarketDataInstrumentRecord,
@@ -27,8 +27,7 @@ impl SchwabMarketPublicationClosure {
         self.rights
             .validate_subject(Some(sealed.persisted_receipt().capture().dataset()))
             .map_err(|_| SchwabMarketPublicationError::AuthorityInvalid)?;
-        self.validate_doctor_family(SchwabMarketDataFamily::PriceHistory, observed_at)?;
-        self.validate_doctor_oauth(oauth, observed_at)?;
+        self.validate_oauth_authority(oauth, observed_at)?;
         if sealed.route() != ReadOnlyRoute::PriceHistory
             || sealed.receipt().credential_authority() != oauth.credential_authority()
             || sealed.receipt().token_generation() != oauth.generation()

@@ -28,8 +28,7 @@ use crate::{
         MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
         MarketReferenceIdentityRequest, MarketReferenceIdentityResolution,
         MarketSubscriptionPriority, PreparedSchwabMarketRuntimeStart,
-        SchwabMarketDataAccountActivation,
-        SchwabQuoteReferenceBinding,
+        SchwabMarketDataAccountActivation, SchwabQuoteReferenceBinding,
         nasdaq_reference::{NasdaqListingKey, NasdaqReferenceUniverseService},
     },
 };
@@ -92,7 +91,9 @@ impl ProductionSchwabMarketRuntimeResolver {
             .as_ref()
             .ok_or(ServiceError::Unavailable)?;
         let mut records = Vec::new();
-        for issuer in OfficialIssuerInstrumentReference::predeclared_benchmarks().map_err(|_| ServiceError::InvalidResult)? {
+        for issuer in OfficialIssuerInstrumentReference::predeclared_benchmarks()
+            .map_err(|_| ServiceError::InvalidResult)?
+        {
             ensure_before(&self.accepting, deadline, cancellation)?;
             let key = NasdaqListingKey::new(
                 market_squawk_domain::ProviderInstrumentId::try_from(issuer.symbol().as_str())
@@ -108,7 +109,12 @@ impl ProductionSchwabMarketRuntimeResolver {
                 return Err(ServiceError::Unavailable);
             }
             let listing = reader
-                .exact_current(issuer.symbol().as_str(), issuer.venue(), deadline, cancellation)
+                .exact_current(
+                    issuer.symbol().as_str(),
+                    issuer.venue(),
+                    deadline,
+                    cancellation,
+                )
                 .map_err(|_| request_state_error(deadline, cancellation))?
                 .ok_or(ServiceError::Unavailable)?;
             let at = system_timestamp()?;
@@ -152,7 +158,8 @@ impl ProductionSchwabMarketRuntimeResolver {
         let mut quotes = Vec::new();
         let mut display = Vec::new();
         let mut approvals = Vec::new();
-        let issuers = OfficialIssuerInstrumentReference::predeclared_benchmarks().map_err(|_| ServiceError::InvalidResult)?;
+        let issuers = OfficialIssuerInstrumentReference::predeclared_benchmarks()
+            .map_err(|_| ServiceError::InvalidResult)?;
         let reader = self
             .listing_reference
             .as_ref()
@@ -276,7 +283,10 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
         let lease = self
             .onboarding
             .activation_lease(request.onboarding_session_id())
-            .or_else(|_| self.onboarding.prepared_activation_lease(request.onboarding_session_id()))
+            .or_else(|_| {
+                self.onboarding
+                    .prepared_activation_lease(request.onboarding_session_id())
+            })
             .map_err(|error| {
                 tracing::warn!(%error, "prepared Schwab onboarding lease is unavailable");
                 ServiceError::Unauthorized
@@ -312,33 +322,40 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
         let resolved = self
             .resolve_bindings(records, deadline, &cancellation)
             .await?;
-        let streamer_admitted = activation
-            .doctor_receipt()
-            .observation()
-            .families
-            .iter()
-            .any(|family| {
-                family.family == market_squawk_sources::SchwabMarketDataFamily::LevelOneEquities
-                    && matches!(
-                        family.disposition,
-                        market_squawk_sources::RuntimeCapabilityDisposition::Available
-                            | market_squawk_sources::RuntimeCapabilityDisposition::Degraded
+        // Select the supported Streamer quote path from its actual native bootstrap. Its
+        // optional availability does not authorize or reject the independent REST quote path.
+        match self
+            .provider_activation
+            .acquire_schwab_streamer_bootstrap(&activation, deadline, &cancellation)
+            .await
+        {
+            Ok(bootstrap) => {
+                return self
+                    .provider_activation
+                    .prepare_schwab_streamer_market_runtime_start(
+                        activation,
+                        bootstrap,
+                        resolved.quotes,
+                        resolved.display,
+                        resolved.approvals,
+                        self.market_data_instruments.clone(),
+                        self.listing_reference.clone(),
+                        deadline,
+                        cancellation,
                     )
-            });
-        if streamer_admitted {
-            return self
-                .provider_activation
-                .prepare_schwab_streamer_market_runtime_start(
-                    activation,
-                    resolved.quotes,
-                    resolved.display,
-                    resolved.approvals,
-                    self.market_data_instruments.clone(),
-                    self.listing_reference.clone(),
-                    deadline,
-                    cancellation,
-                )
-                .await;
+                    .await;
+            }
+            Err(ServiceError::Unavailable) => {
+                ensure_before(&self.accepting, deadline, &cancellation)?;
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+                    () = tokio::time::sleep_until(deadline.into()) => return Err(ServiceError::DeadlineExceeded),
+                    current = activation.require_runtime_current() => current.map_err(|_| ServiceError::Unauthorized)?,
+                }
+                tracing::warn!("Schwab Streamer bootstrap is unavailable; preparing REST quotes");
+            }
+            Err(error) => return Err(error),
         }
         let generation = self
             .provider_activation

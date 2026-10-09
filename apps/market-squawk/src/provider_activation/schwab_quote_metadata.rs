@@ -58,10 +58,7 @@ impl ProviderAdapterActivation {
             dataset: DATASET,
             channels: vec![quote_channel("schwab-rest", "schwab-rest-quotes")?],
             endpoint: "https://api.schwabapi.com/marketdata/v1/quotes",
-            delay: activation
-                .doctor_receipt()
-                .quote_delay()
-                .ok_or(ServiceError::Unavailable)?,
+            delay: CoverageDelay::Unknown,
         };
         self.register_schwab_quote_source_generation(activation, instruments, contract)
             .await
@@ -73,28 +70,10 @@ impl ProviderAdapterActivation {
         instruments: &[SchwabQuoteReferenceBinding],
         bootstrap: &market_squawk_adapter_schwab::StreamerBootstrap,
     ) -> Result<ResearchProviderRuntimeGeneration, ServiceError> {
-        let oauth = activation
-            .runtime_oauth_receipt()
-            .await
-            .map_err(|_| ServiceError::Unauthorized)?;
         activation
             .require_runtime_current()
             .await
             .map_err(|_| ServiceError::Unauthorized)?;
-        let observed_at =
-            super::schwab::system_timestamp().map_err(|_| ServiceError::Unavailable)?;
-        let doctor = activation.doctor_receipt();
-        if !doctor.is_current_at(observed_at) || !oauth.matches_market_data_authorization(doctor) {
-            return Err(ServiceError::Unauthorized);
-        }
-        if bootstrap.market_data_principal_sha256()
-            != activation
-                .doctor_receipt()
-                .market_data_principal_sha256()
-                .bytes()
-        {
-            return Err(ServiceError::Unauthorized);
-        }
         // Desired read-only scope is registration, never proof of family availability.
         // Same-service sealed ACK/data later supplies the actual publication qualification.
         let selections = schwab_streamer_selections(instruments.iter())?;
@@ -137,9 +116,7 @@ impl ProviderAdapterActivation {
             super::provider_research_rights_basis(lease).map_err(|_| ServiceError::Unauthorized)?,
             lease.rights_decision_digest(),
             EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into()),
-            lease
-                .verification_expires_at()
-                .ok_or(ServiceError::Unauthorized)?,
+            lease.verification_expires_at(),
             vec![dataset],
             super::lease_research_operations(lease),
         )
@@ -155,7 +132,6 @@ impl ProviderAdapterActivation {
             metadata,
             rights.clone(),
         )
-        .and_then(|generation| generation.with_runtime_verification(lease))
         .map_err(|_| ServiceError::Unauthorized)?;
         let guard = activation
             .runtime_currentness()
@@ -217,7 +193,10 @@ fn metadata(
         serde_json::to_vec(&contract.channels).map_err(|_| ServiceError::Internal)?;
     hash.update((channel_bytes.len() as u64).to_be_bytes());
     hash.update(channel_bytes);
-    hash.update(activation.doctor_receipt().receipt_sha256().bytes());
+    hash.update(lease.capability_digest().bytes());
+    hash.update(lease.public_configuration_digest().bytes());
+    hash.update(lease.rights_decision_digest().bytes());
+    hash.update(activation.account_binding().verification_evidence().bytes());
     for binding in &ordered {
         hash.update(binding.instrument_id().as_uuid().as_bytes());
         hash.update(binding.canonical_record().revision_digest().bytes());

@@ -17,7 +17,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 impl ProviderAdapterActivation {
-    /// Acquires dynamic zeroizing socket coordinates; a doctor hash cannot reconstruct them.
+    /// Acquires the actual dynamic zeroizing socket coordinates for Streamer only.
     pub(crate) async fn acquire_schwab_streamer_bootstrap(
         &self,
         activation: &SchwabMarketDataAccountActivation,
@@ -107,6 +107,7 @@ impl ProviderAdapterActivation {
             | RestExecutionOutcome::InvalidUserPreference { receipt, .. } => receipt,
             _ => return Err(ServiceError::InvalidResult),
         };
+        let authorization_refused = receipt.status() == 401;
         let rate_ok = if receipt.status() == 429 {
             matches!(
                 apply_http_retry_after(
@@ -140,17 +141,16 @@ impl ProviderAdapterActivation {
         epoch
             .validate_current(oauth)
             .map_err(|_| ServiceError::Unauthorized)?;
+        if authorization_refused {
+            return Err(ServiceError::Unauthorized);
+        }
         let RestExecutionOutcome::AcceptedUserPreference(provider) = outcome else {
             return Err(ServiceError::Unavailable);
         };
         if !rate_ok
             || !activation.runtime_currentness().is_current_now()
             || provider.receipt().credential_authority() != oauth.credential_authority()
-            || provider.bootstrap().value().market_data_principal_sha256()
-                != activation
-                    .doctor_receipt()
-                    .market_data_principal_sha256()
-                    .bytes()
+            || provider.receipt().token_generation() != oauth.generation()
         {
             return Err(ServiceError::Unauthorized);
         }
@@ -183,6 +183,7 @@ impl ProviderAdapterActivation {
     pub(crate) async fn prepare_schwab_streamer_market_runtime_start(
         &self,
         activation: std::sync::Arc<SchwabMarketDataAccountActivation>,
+        bootstrap: SchwabUserPreferenceEvidence,
         instruments: Vec<super::SchwabQuoteReferenceBinding>,
         display_bindings: Vec<super::MarketDataInstrumentBinding>,
         approvals: Vec<super::MarketReferenceIdentityApprovalV1>,
@@ -191,9 +192,6 @@ impl ProviderAdapterActivation {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<super::PreparedSchwabMarketRuntimeStart, ServiceError> {
-        let bootstrap = self
-            .acquire_schwab_streamer_bootstrap(&activation, deadline, &cancellation)
-            .await?;
         let generation = self
             .register_schwab_streamer_generation(
                 &activation,
@@ -245,7 +243,6 @@ impl ProviderAdapterActivation {
                 .research_mutation
                 .bind_schwab_streamer_publication_package(
                     &generation,
-                    activation.doctor_receipt().clone(),
                     activation.oauth_receipt_currentness(),
                     oauth,
                 )

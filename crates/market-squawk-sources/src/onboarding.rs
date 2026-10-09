@@ -42,12 +42,9 @@ pub use runtime_verification::{
     AlpacaDoctorRateEvidence, AlpacaDoctorRenewalChain, AlpacaDoctorStreamObservation,
     AlpacaPaperIexDoctorReceiptInput, AlpacaPaperIexDoctorReceiptV1, AlpacaRateLimitField,
     AlpacaRetryAfterEvidence, MAX_ALPACA_PAPER_IEX_DOCTOR_RECEIPT_BYTES,
-    MAX_SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_BYTES, RuntimeCapabilityDisposition,
-    RuntimeVerificationContext, RuntimeVerificationDigestV1, RuntimeVerificationEvidence,
-    RuntimeVerificationEvidenceError, SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_SCHEMA,
-    SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorObservation,
-    SchwabMarketDataDoctorReceiptInput, SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily,
-    SchwabMarketDataFamilyEvidence, SchwabUserPreferenceDoctorEvidence,
+    RuntimeCapabilityDisposition, RuntimeVerificationContext, RuntimeVerificationDigestV1,
+    RuntimeVerificationEvidence, RuntimeVerificationEvidenceError, SCHWAB_MARKET_DATA_SURFACE_ID,
+    SchwabMarketDataFamily,
 };
 pub use source_authority::{
     FASB_XBRL_TAXONOMY_AUTHORITY, FASB_XBRL_TAXONOMY_RATE_SCOPE, FASB_XBRL_TAXONOMY_SOURCE_ID,

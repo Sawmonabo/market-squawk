@@ -236,7 +236,7 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
                 || record.public_configuration_digest()
                     != Some(request.expected_public_configuration_digest())
                 || record.runtime_verification_receipt_digest()
-                    != Some(request.expected_runtime_verification_receipt_digest())
+                    != request.expected_runtime_verification_receipt_digest()
                 || record.credential_generation() != Some(request.expected_credential_generation())
             {
                 return Ok(());
@@ -342,7 +342,7 @@ impl ProductionSourceLifecycleAuthority {
                 || record.public_configuration_digest()
                     != Some(request.expected_public_configuration_digest())
                 || record.runtime_verification_receipt_digest()
-                    != Some(request.expected_runtime_verification_receipt_digest())
+                    != request.expected_runtime_verification_receipt_digest()
                 || record.credential_generation() != Some(request.expected_credential_generation())
             {
                 return Ok(());

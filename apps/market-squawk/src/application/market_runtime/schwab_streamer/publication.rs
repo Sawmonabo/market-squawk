@@ -200,10 +200,15 @@ impl Consumer {
                 continue;
             };
             let qualification = SchwabMarketDataQualification::try_from_streamer_handoff(
-                self.activation.doctor_receipt(),
                 handoff,
                 received,
                 oauth,
+                market_squawk_domain::SourceIdentifier::try_from(
+                    self.generation.session_id().to_string().as_str(),
+                )
+                .map_err(|_| ServiceError::InvalidResult)?,
+                self.generation.parent_rights_authorization_evidence(),
+                self.generation.capability_digest(),
             )
             .map_err(|_| ServiceError::Unavailable)?;
             if qualifications
@@ -322,9 +327,7 @@ impl Consumer {
                 selected_services.insert(batch.service);
             }
         }
-        let observational_only = self.generation.metadata().coverage().live_channels().len() != 1
-            || self.generation.metadata().coverage().delay()
-                == market_squawk_domain::CoverageDelay::Unknown;
+        let observational_only = self.generation.metadata().coverage().live_channels().len() != 1;
         let current_evidence = if current_records.is_empty() || observational_only {
             None
         } else {
@@ -356,6 +359,7 @@ impl Consumer {
                 &sealed,
                 self.generation.metadata(),
                 health_qualification,
+                oauth,
                 deadline,
             )
             .map_err(|_| ServiceError::Unavailable)?;

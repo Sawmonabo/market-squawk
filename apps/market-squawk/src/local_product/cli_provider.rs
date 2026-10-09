@@ -2,7 +2,7 @@
 
 mod ephemeral;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
@@ -82,10 +82,8 @@ use crate::provider_activation::{
     TiingoAdapterActivation, YahooAdapterActivation, selected_regional_source_config,
 };
 use crate::provider_onboarding::{
-    SchwabMarketDoctorRunPreparation, SchwabMarketDoctorRuntimeCoordinator,
-    SchwabMarketDoctorRuntimeTerminal, SchwabOAuthBrowserError, SchwabOAuthLifecycleAction,
-    SchwabOAuthLifecycleView, SchwabOAuthMarketAuthority, SchwabOAuthRuntime,
-    SchwabOAuthRuntimeError,
+    SchwabOAuthBrowserError, SchwabOAuthLifecycleAction, SchwabOAuthLifecycleView,
+    SchwabOAuthMarketAuthority, SchwabOAuthRuntime, SchwabOAuthRuntimeError,
 };
 use crate::{
     BlsAdapterActivation, EiaAdapterActivation, FredAdapterActivation, ProviderActivationLease,
@@ -96,7 +94,6 @@ use crate::{
     StartOnboardingRequest, TreasuryAdapterActivation,
 };
 
-use super::LocalProduct;
 use super::provider_activation_state::{
     ActivationEvidenceCandidate, DurableActivationQuarantineReason, DurableActivationRecipeState,
     DurableProviderActivationState, RESTORABLE_RESEARCH_SURFACES, SERIALIZED_RESEARCH_SURFACES,
@@ -104,7 +101,6 @@ use super::provider_activation_state::{
 
 const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
-const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
 const MAXIMUM_BLS_SERIES: usize = 1_000;
 const SECOND_NANOS: u64 = 1_000_000_000;
@@ -141,11 +137,9 @@ pub(crate) struct ProviderResearchActivationService {
     state: DurableProviderActivationState,
     tasks: Arc<ProviderActivationTaskAuthority>,
     treasury_publication: Arc<OnceLock<TreasuryPublicationRuntime>>,
-    schwab_doctor_tasks: Arc<SchwabMarketDoctorTaskAuthority>,
     schwab_oauth_lifecycle: Arc<SchwabOAuthServiceLifecycle>,
     schwab_oauth: Arc<OnceCell<Arc<SchwabOAuthRuntime>>>,
     schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
-    schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
 }
 
 enum ResearchSetupInput {
@@ -181,7 +175,6 @@ impl ProviderResearchActivationService {
         activation: Arc<ProviderAdapterActivation>,
         state: DurableProviderActivationState,
         schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
-        schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
     ) -> Self {
         Self {
             paths,
@@ -190,11 +183,9 @@ impl ProviderResearchActivationService {
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
             treasury_publication: Arc::new(OnceLock::new()),
-            schwab_doctor_tasks: Arc::new(SchwabMarketDoctorTaskAuthority::new()),
             schwab_oauth_lifecycle: Arc::new(SchwabOAuthServiceLifecycle::new()),
             schwab_oauth: Arc::new(OnceCell::new()),
             schwab_oauth_factory,
-            schwab_doctor,
         }
     }
 
@@ -1289,166 +1280,6 @@ impl ProviderActivationTaskAuthority {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SchwabMarketDoctorTaskKey {
-    session_id: Uuid,
-    authorization_generation: u64,
-    authorization_scope_sha256: EvidenceDigest,
-}
-
-struct RetainedSchwabMarketDoctorTask {
-    key: SchwabMarketDoctorTaskKey,
-    cancellation: CancellationToken,
-    task: JoinHandle<()>,
-}
-
-/// One application-owned supervisor for Schwab doctor work.
-///
-/// The retained key coalesces repeated Connections requests for the same OAuth grant and scope.
-/// A changed grant or scope cancels and joins its predecessor before it can start, while unlink
-/// and shutdown retain the same drain authority.
-struct SchwabMarketDoctorTaskAuthority {
-    accepting: AtomicBool,
-    shutdown: CancellationToken,
-    task: AsyncMutex<Option<RetainedSchwabMarketDoctorTask>>,
-}
-
-impl SchwabMarketDoctorTaskAuthority {
-    fn new() -> Self {
-        Self {
-            accepting: AtomicBool::new(true),
-            shutdown: CancellationToken::new(),
-            task: AsyncMutex::new(None),
-        }
-    }
-
-    async fn schedule<F, Fut>(
-        &self,
-        key: SchwabMarketDoctorTaskKey,
-        work: F,
-    ) -> Result<(), CliProviderActivationError>
-    where
-        F: FnOnce(CancellationToken) -> Fut,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        if !self.accepting.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
-        let mut slot = self.task.lock().await;
-        if slot
-            .as_ref()
-            .is_some_and(|retained| retained.key == key && !retained.task.is_finished())
-        {
-            return Ok(());
-        }
-        if let Some(predecessor) = slot.take() {
-            if !predecessor.task.is_finished() {
-                predecessor.cancellation.cancel();
-            }
-            predecessor
-                .task
-                .await
-                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        }
-        if !self.accepting.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
-        let cancellation = self.shutdown.child_token();
-        let task_cancellation = cancellation.clone();
-        *slot = Some(RetainedSchwabMarketDoctorTask {
-            key,
-            cancellation,
-            task: tokio::spawn(work(task_cancellation)),
-        });
-        Ok(())
-    }
-
-    async fn cancel_session(
-        &self,
-        session_id: Uuid,
-        cancellation: CancellationToken,
-    ) -> Result<(), CliProviderActivationError> {
-        let mut slot = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
-            slot = self.task.lock() => slot,
-        };
-        let Some(retained) = slot.as_mut() else {
-            return Ok(());
-        };
-        if retained.key.session_id != session_id {
-            return Ok(());
-        }
-        retained.cancellation.cancel();
-        let joined = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
-            joined = &mut retained.task => joined,
-        };
-        drop(slot.take());
-        joined.map_err(|_error| CliProviderActivationError::StateUnavailable)
-    }
-
-    fn begin_shutdown(&self) {
-        self.accepting.store(false, Ordering::Release);
-        self.shutdown.cancel();
-    }
-
-    fn begin_credential_suspension(&self) {
-        self.accepting.store(false, Ordering::Release);
-    }
-
-    async fn suspend_credentials(
-        &self,
-        deadline: Instant,
-    ) -> Result<(), CliProviderActivationError> {
-        self.begin_credential_suspension();
-        let deadline = TokioInstant::from_std(deadline);
-        let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
-            .await
-            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-        if let Some(retained) = slot.as_mut() {
-            retained.cancellation.cancel();
-            let joined = tokio::time::timeout_at(deadline, &mut retained.task)
-                .await
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-            *slot = None;
-            joined.map_err(|_| CliProviderActivationError::StateUnavailable)?;
-        }
-        Ok(())
-    }
-
-    fn resume_credentials(&self) -> Result<(), CliProviderActivationError> {
-        if self.shutdown.is_cancelled() {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
-        self.accepting.store(true, Ordering::Release);
-        if self.shutdown.is_cancelled() {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
-        Ok(())
-    }
-
-    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), CliProviderActivationError> {
-        self.begin_shutdown();
-        let deadline = TokioInstant::from_std(deadline);
-        let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
-            .await
-            .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        let Some(mut retained) = slot.take() else {
-            return Ok(());
-        };
-        match tokio::time::timeout_at(deadline, &mut retained.task).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_error)) => Err(CliProviderActivationError::StateUnavailable),
-            Err(_elapsed) => {
-                *slot = Some(retained);
-                Err(CliProviderActivationError::StateUnavailable)
-            }
-        }
-    }
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "durable recipe, runtime candidate, and cancellation authority remain explicit"
@@ -2468,12 +2299,6 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         cancellation: CancellationToken,
     ) -> Result<SchwabOAuthLifecycleView, ProviderPortalActivationError> {
         self.require_credential_access()?;
-        if action == SchwabOAuthLifecycleAction::Unlink {
-            self.schwab_doctor_tasks
-                .cancel_session(session_id, cancellation.child_token())
-                .await
-                .map_err(map_portal_activation_error)?;
-        }
         let runtime = self
             .schwab_oauth_lifecycle
             .runtime(
@@ -2494,78 +2319,6 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
                 );
                 failure
             })?;
-        if !matches!(
-            action,
-            SchwabOAuthLifecycleAction::Begin | SchwabOAuthLifecycleAction::Continue
-        ) {
-            return Ok(view);
-        }
-        let authority = match runtime
-            .market_authority(session_id, CancellationToken::new())
-            .await
-        {
-            Ok(authority) => authority,
-            Err(
-                SchwabOAuthRuntimeError::ReauthorizationRequired
-                | SchwabOAuthRuntimeError::AuthorizationExchangeInFlight,
-            ) => return Ok(view),
-            Err(error) => {
-                let failure = map_schwab_oauth_error(error);
-                tracing::warn!(
-                    stage = "market_authority",
-                    ?failure,
-                    "Schwab connection recovery rejected"
-                );
-                return Err(failure);
-            }
-        };
-        let current = authority.current_receipt().await.map_err(|_error| {
-            tracing::warn!(
-                stage = "current_token_receipt",
-                "Schwab connection recovery rejected"
-            );
-            ProviderPortalActivationError::Unavailable
-        })?;
-        let view = SchwabOAuthLifecycleView::active(session_id, action, current)
-            .map_err(map_schwab_oauth_error)?;
-        let preparation = self
-            .onboarding
-            .prepare_schwab_market_doctor_run(
-                session_id,
-                current.authorization_generation(),
-                current.authorization_scope_sha256(),
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| {
-                let failure = map_schwab_doctor_onboarding_error(error);
-                tracing::warn!(
-                    stage = "market_verification_preparation",
-                    ?failure,
-                    "Schwab connection recovery rejected"
-                );
-                failure
-            })?;
-        if matches!(&preparation, SchwabMarketDoctorRunPreparation::Current) {
-            return Ok(view);
-        }
-        let doctor = self
-            .schwab_doctor
-            .as_ref()
-            .cloned()
-            .ok_or(ProviderPortalActivationError::Unavailable)?;
-        let key = SchwabMarketDoctorTaskKey {
-            session_id,
-            authorization_generation: current.authorization_generation(),
-            authorization_scope_sha256: current.authorization_scope_sha256(),
-        };
-        self.schwab_doctor_tasks
-            .schedule(key, move |completion| async move {
-                run_schwab_market_doctor_task(doctor, authority, key, preparation, completion)
-                    .await;
-            })
-            .await
-            .map_err(map_portal_activation_error)?;
         Ok(view)
     }
 
@@ -2575,11 +2328,6 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
     ) -> Result<(), ProviderPortalActivationError> {
         self.schwab_oauth_lifecycle
             .begin_credential_suspension(self.schwab_oauth.get());
-        self.schwab_doctor_tasks.begin_credential_suspension();
-        self.schwab_doctor_tasks
-            .suspend_credentials(deadline)
-            .await
-            .map_err(map_portal_activation_error)?;
         self.schwab_oauth_lifecycle
             .suspend_credentials(&self.schwab_oauth, deadline)
             .await
@@ -2589,15 +2337,11 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         self.require_credential_access()?;
         self.schwab_oauth_lifecycle
             .resume_credentials(&self.schwab_oauth)
-            .await?;
-        self.schwab_doctor_tasks
-            .resume_credentials()
-            .map_err(map_portal_activation_error)
+            .await
     }
 
     fn begin_shutdown(&self) {
         self.tasks.begin_shutdown();
-        self.schwab_doctor_tasks.begin_shutdown();
         self.schwab_oauth_lifecycle
             .begin_shutdown(self.schwab_oauth.get());
     }
@@ -2607,65 +2351,12 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         deadline: Instant,
     ) -> Result<(), ProviderPortalActivationError> {
         let tasks = self.tasks.finish_shutdown(deadline);
-        let schwab_doctor_tasks = self.schwab_doctor_tasks.finish_shutdown(deadline);
         let oauth = self
             .schwab_oauth_lifecycle
             .finish_shutdown(&self.schwab_oauth, deadline);
-        let (tasks, schwab_doctor_tasks, oauth) = tokio::join!(tasks, schwab_doctor_tasks, oauth);
+        let (tasks, oauth) = tokio::join!(tasks, oauth);
         tasks.map_err(map_portal_activation_error)?;
-        schwab_doctor_tasks.map_err(map_portal_activation_error)?;
         oauth
-    }
-}
-
-async fn run_schwab_market_doctor_task(
-    doctor: Arc<SchwabMarketDoctorRuntimeCoordinator>,
-    authority: SchwabOAuthMarketAuthority,
-    key: SchwabMarketDoctorTaskKey,
-    preparation: SchwabMarketDoctorRunPreparation,
-    cancellation: CancellationToken,
-) {
-    let current = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return,
-        current = authority.current_receipt() => match current {
-            Ok(current) => current,
-            Err(error) => {
-                tracing::warn!(%error, "Schwab market-data verification authority is unavailable");
-                return;
-            }
-        }
-    };
-    if current.authorization_generation() != key.authorization_generation
-        || current.authorization_scope_sha256() != key.authorization_scope_sha256
-    {
-        tracing::warn!(
-            "Schwab market-data verification was superseded by a changed authorization grant or scope"
-        );
-        return;
-    }
-    let lease = match preparation {
-        SchwabMarketDoctorRunPreparation::Ready(lease) => lease,
-        SchwabMarketDoctorRunPreparation::Current => return,
-    };
-    match doctor
-        .run(
-            lease,
-            authority,
-            cancellation,
-            Instant::now() + SCHWAB_MARKET_DOCTOR_DURATION,
-        )
-        .await
-    {
-        Ok(SchwabMarketDoctorRuntimeTerminal::Observed(_)) => {
-            tracing::info!("Schwab market-data verification completed");
-        }
-        Ok(SchwabMarketDoctorRuntimeTerminal::SetupRequired(_)) => {
-            tracing::warn!("Schwab market-data verification requires owner setup");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "Schwab market-data verification failed");
-        }
     }
 }
 
@@ -5267,15 +4958,6 @@ fn map_schwab_oauth_error(error: SchwabOAuthRuntimeError) -> ProviderPortalActiv
     }
 }
 
-fn map_schwab_doctor_onboarding_error(
-    error: ProviderOnboardingError,
-) -> ProviderPortalActivationError {
-    match error {
-        ProviderOnboardingError::OperationCancelled => ProviderPortalActivationError::Cancelled,
-        _ => ProviderPortalActivationError::Unavailable,
-    }
-}
-
 /// Closed provider-activation failure without path, secret, or response-body disclosure.
 #[derive(Debug, Error)]
 pub enum CliProviderActivationError {
@@ -5450,7 +5132,7 @@ mod tests {
             surface,
             session,
             configuration,
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
+            None,
             market_squawk_platform::SecretGeneration::new(1)?,
         )?;
         let generation = MarketRuntimeGroupGeneration::try_from_expected_digest(
@@ -5510,59 +5192,6 @@ mod tests {
                 .await
                 .is_complete()
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn schwab_doctor_scheduler_coalesces_replacement_and_unlink_drain() -> TestResult {
-        let tasks = SchwabMarketDoctorTaskAuthority::new();
-        let session_id = Uuid::new_v4();
-        let first_key = SchwabMarketDoctorTaskKey {
-            session_id,
-            authorization_generation: 1,
-            authorization_scope_sha256: EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
-        };
-        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let first_starts = Arc::clone(&starts);
-        let (first_started_tx, first_started_rx) = oneshot::channel();
-        tasks
-            .schedule(first_key, move |cancellation| async move {
-                first_starts.fetch_add(1, Ordering::SeqCst);
-                let _sent = first_started_tx.send(());
-                cancellation.cancelled().await;
-            })
-            .await?;
-        tokio::time::timeout(Duration::from_secs(1), first_started_rx).await??;
-
-        let duplicate_starts = Arc::clone(&starts);
-        tasks
-            .schedule(first_key, move |_cancellation| async move {
-                duplicate_starts.fetch_add(1, Ordering::SeqCst);
-            })
-            .await?;
-        assert_eq!(starts.load(Ordering::SeqCst), 1);
-
-        let replacement_key = SchwabMarketDoctorTaskKey {
-            session_id,
-            authorization_generation: 1,
-            authorization_scope_sha256: EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
-        };
-        let replacement_starts = Arc::clone(&starts);
-        let (replacement_started_tx, replacement_started_rx) = oneshot::channel();
-        tasks
-            .schedule(replacement_key, move |cancellation| async move {
-                replacement_starts.fetch_add(1, Ordering::SeqCst);
-                let _sent = replacement_started_tx.send(());
-                cancellation.cancelled().await;
-            })
-            .await?;
-        tokio::time::timeout(Duration::from_secs(1), replacement_started_rx).await??;
-        assert_eq!(starts.load(Ordering::SeqCst), 2);
-
-        tasks
-            .cancel_session(session_id, CancellationToken::new())
-            .await?;
-        assert!(tasks.task.lock().await.is_none());
         Ok(())
     }
 
@@ -6061,7 +5690,6 @@ mod tests {
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
             None,
-            None,
         );
         let _cancelled = cancellation
             .cancel_from_portal(recovery_lease.session_id(), CancellationToken::new())
@@ -6173,7 +5801,6 @@ mod tests {
             product.provider_activation(),
             product.provider_activation_state().clone(),
             None,
-            None,
         );
         // No issuer is selected. Connecting must retain the callable source without fetching
         // company history; that work belongs to the selected-investment preparation job.
@@ -6276,7 +5903,6 @@ mod tests {
             product.provider_activation(),
             product.provider_activation_state().clone(),
             None,
-            None,
         );
 
         activation
@@ -6356,7 +5982,6 @@ mod tests {
             product.provider_onboarding(),
             product.provider_activation(),
             product.provider_activation_state().clone(),
-            None,
             None,
         );
 
@@ -6461,7 +6086,6 @@ mod tests {
             recovered.provider_onboarding(),
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
-            None,
             None,
         );
         assert_eq!(

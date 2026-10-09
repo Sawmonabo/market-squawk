@@ -147,7 +147,7 @@ struct ActivationEvidence {
     public_configuration_digest: EvidenceDigest,
     account_binding_digest: Option<EvidenceDigest>,
     verification_response_digest: Option<EvidenceDigest>,
-    runtime_response_digest: EvidenceDigest,
+    runtime_response_digest: Option<EvidenceDigest>,
     authority_effective_at_unix_nanos: i64,
     verification_expires_at_unix_nanos: Option<i64>,
     data_use_admission: BTreeMap<&'static str, bool>,

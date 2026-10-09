@@ -438,7 +438,7 @@ fn realtime_delay_conflicts(
     delay: SchwabMarketDataDelay,
 ) -> Result<bool, SchwabRestQuotePublicationError> {
     Ok(match quote.realtime() {
-        NativeField::Value(true) => delay != SchwabMarketDataDelay::RealTime,
+        NativeField::Value(true) => matches!(delay, SchwabMarketDataDelay::Delayed(_)),
         NativeField::Value(false) => delay == SchwabMarketDataDelay::RealTime,
         NativeField::Absent | NativeField::Null => false,
     })

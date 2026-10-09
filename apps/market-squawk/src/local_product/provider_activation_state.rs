@@ -347,7 +347,7 @@ pub(super) enum DurableSourceLifecyclePhase {
 pub(super) struct AccountAllocationCoordinates {
     session_id: Uuid,
     configuration_sha256: String,
-    verification_sha256: String,
+    verification_sha256: Option<String>,
     credential_generation: u64,
     physical_generation_sha256: String,
 }
@@ -362,11 +362,9 @@ impl AccountAllocationCoordinates {
             configuration_sha256: lower_hex(
                 &request.expected_public_configuration_digest().bytes(),
             ),
-            verification_sha256: lower_hex(
-                &request
-                    .expected_runtime_verification_receipt_digest()
-                    .bytes(),
-            ),
+            verification_sha256: request
+                .expected_runtime_verification_receipt_digest()
+                .map(|digest| lower_hex(&digest.bytes())),
             credential_generation: request.expected_credential_generation().get(),
             physical_generation_sha256: lower_hex(&generation.digest().bytes()),
         }
@@ -389,10 +387,13 @@ impl AccountAllocationCoordinates {
             return Err(DurableProviderActivationStateError::InvalidLifecycle);
         }
         for text in [
-            &self.configuration_sha256,
-            &self.verification_sha256,
-            &self.physical_generation_sha256,
-        ] {
+            Some(&self.configuration_sha256),
+            self.verification_sha256.as_ref(),
+            Some(&self.physical_generation_sha256),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if digest_from_lower_hex(text)?.bytes() == [0; 32] {
                 return Err(DurableProviderActivationStateError::InvalidLifecycle);
             }
@@ -451,7 +452,17 @@ impl PendingAccountLifecycle {
             .transpose()
     }
 
-    fn validate(&self) -> Result<(), DurableProviderActivationStateError> {
+    fn validate(&self, surface: &str) -> Result<(), DurableProviderActivationStateError> {
+        for allocation in [&self.predecessor, &self.successor, &self.retired_successor]
+            .into_iter()
+            .flatten()
+        {
+            if allocation.verification_sha256.is_none()
+                != (surface == ProviderMarketAccount::SchwabMarketData.surface_id())
+            {
+                return Err(DurableProviderActivationStateError::InvalidLifecycle);
+            }
+        }
         if let Some(predecessor) = &self.predecessor {
             predecessor.validate()?;
         }
@@ -742,7 +753,7 @@ impl DurableProviderActivationState {
         command_digest: EvidenceDigest,
         pending: PendingAccountLifecycle,
     ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
-        pending.validate()?;
+        pending.validate(surface)?;
         let cancels_activation = expected.account.as_ref().is_some_and(|original| {
             if original.finished
                 || !matches!(
@@ -802,7 +813,7 @@ impl DurableProviderActivationState {
         expected: &DurableSourceLifecycleRecord,
         pending: PendingAccountLifecycle,
     ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
-        pending.validate()?;
+        pending.validate(surface)?;
         if self.source_lifecycle_record(surface)? != *expected
             || expected.phase != DurableSourceLifecyclePhase::Applying
             || expected.account.is_some()
@@ -826,7 +837,7 @@ impl DurableProviderActivationState {
         phase: DurableSourceLifecyclePhase,
         successor: Option<PreparedMarketProviderConfigurationRequest>,
     ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
-        pending.validate()?;
+        pending.validate(surface)?;
         if pending.finished
             != matches!(
                 phase,
@@ -873,7 +884,7 @@ impl DurableProviderActivationState {
             record.public_configuration_digest =
                 Some(request.expected_public_configuration_digest());
             record.runtime_verification_receipt_digest =
-                Some(request.expected_runtime_verification_receipt_digest());
+                request.expected_runtime_verification_receipt_digest();
             record.credential_generation = Some(request.expected_credential_generation());
         }
         if phase == DurableSourceLifecyclePhase::Removed {
@@ -2144,7 +2155,7 @@ fn decode_source_lifecycle(
         return Err(DurableProviderActivationStateError::InvalidLifecycle);
     }
     if let Some(account) = &wire.account {
-        account.validate()?;
+        account.validate(surface_id)?;
         if AccountMarketSurface::parse(surface_id).is_none()
             || wire.transition_sha256.is_none()
             || account.finished
@@ -2192,10 +2203,16 @@ fn decode_source_lifecycle(
         .map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)?;
     let command_identity_valid = operation_id.is_some() == command_digest.is_some()
         && command_digest.is_some() == transition_digest.is_some();
-    let runtime_binding_valid = runtime_verification_receipt_digest.is_some()
-        == credential_generation.is_some()
-        && (runtime_verification_receipt_digest.is_none()
-            || (wire.session_id.is_some() && public_configuration_digest.is_some()));
+    let runtime_binding_valid =
+        if surface_id == ProviderMarketAccount::SchwabMarketData.surface_id() {
+            runtime_verification_receipt_digest.is_none()
+                && (credential_generation.is_none()
+                    || (wire.session_id.is_some() && public_configuration_digest.is_some()))
+        } else {
+            runtime_verification_receipt_digest.is_some() == credential_generation.is_some()
+                && (runtime_verification_receipt_digest.is_none()
+                    || (wire.session_id.is_some() && public_configuration_digest.is_some()))
+        };
     if !command_identity_valid
         || (wire.phase == DurableSourceLifecyclePhase::Applying && transition_digest.is_none())
         || !runtime_binding_valid

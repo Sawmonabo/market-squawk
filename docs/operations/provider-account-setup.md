@@ -123,8 +123,9 @@ Configured while its data remains Probe required, Setup required, Degraded, or U
 the complete chain above permits a workflow to be enabled.
 
 For Schwab specifically, `SCHWAB_ENABLED=true` means the owner wants the optional read-only
-market-data OAuth/doctor and currently admitted Schwab data lanes. It never authorizes account,
-position, transaction, or order use. The product becomes Available only after current consent,
+market-data OAuth connection and supported read-only data lanes. It never authorizes account,
+position, transaction, or order use. Saved diagnostic probes do not gate this connection; actual
+requested responses establish family availability. The product becomes Available only after current consent,
 entitlement, raw/canonical publication, typed reads, and the focused workflow proof. If the owner
 unlinks/revokes Schwab, its access and refresh generations are invalidated and Schwab-backed
 workflows become Unavailable without affecting Alpaca or public sources. For IEX HIST, enablement
@@ -201,7 +202,9 @@ credential/security changes, or another documented restart condition requires it
    is required. A browser certificate warning is a setup failure, not a step to bypass.
 4. Let Market Squawk exchange and rotate the complete token set in its protected secret store.
    Never paste an access or refresh token into the credential file.
-5. The runtime may call only the code-owned `/marketdata/v1` read allowlist plus the minimum
+5. Saved sign-in permits requested market-data reads without a separate verification probe.
+   Actual token expiry or provider permission failures are handled on the affected connection.
+6. The runtime may call only the code-owned `/marketdata/v1` read allowlist plus the minimum
    read-only `/trader/v1/userPreference` Streamer bootstrap. It discards unrelated preference
    fields and never calls account, position, transaction, order, preview, replace, or cancel paths.
 

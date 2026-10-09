@@ -11,19 +11,13 @@ use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
     BudgetReservationDecision, BudgetUnavailableReason, BudgetWindowSemantics, ProbeTransport,
     ProviderBudgetPolicy, ProviderBudgetWindow, ProviderOnboardingProfile, ProviderProfileRegistry,
-    ProviderRateAuthority, ProviderRateDeclaration, RatePolicyDescriptor,
-    SCHWAB_MARKET_DATA_SURFACE_ID, SharedProviderBudget, apply_http_retry_after,
+    ProviderRateAuthority, ProviderRateDeclaration, RatePolicyDescriptor, SharedProviderBudget,
+    apply_http_retry_after,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::ProviderOnboardingError;
-use crate::provider_onboarding::schwab_market_doctor::{
-    DoctorFuture, SchwabMarketDataDoctorError, SchwabMarketDoctorProbeScope,
-    SchwabMarketDoctorProbeStatus, SchwabMarketDoctorRateAuthority,
-    SchwabMarketDoctorRateObservation, SchwabMarketDoctorRatePermit,
-};
-
 pub(super) const PROBE_OPERATION_DURATION: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -71,29 +65,6 @@ struct ProbeRateWindowState {
 pub(super) struct ProbeRatePermit {
     authority: ProbeRatePermitAuthority,
     pub(super) deadline: Instant,
-}
-
-/// Exact Schwab doctor view over the application's private shared probe-rate authority.
-///
-/// The wrapper owns only a cloned handle to the same durable budgets and one code-owned profile.
-/// It cannot register a different provider, policy, or authorization subject after construction.
-#[derive(Debug)]
-pub(super) struct SchwabMarketDoctorProbeRateAuthority {
-    inner: ProbeRateAuthority,
-    profile: ProviderOnboardingProfile,
-    descriptor: RatePolicyDescriptor,
-    authorization_subject: SourceIdentifier,
-    rate_policy_digest: EvidenceDigest,
-}
-
-#[derive(Debug)]
-struct SchwabMarketDoctorProbeRatePermit {
-    inner: ProbeRatePermit,
-    scope: SchwabMarketDoctorProbeScope,
-    doctor_deadline: Instant,
-    rate_policy_digest: EvidenceDigest,
-    dispatch_committed: bool,
-    observation_recorded: bool,
 }
 
 #[derive(Debug)]
@@ -224,163 +195,6 @@ impl ProbeRateAuthority {
             return acquire_aggregate_budget(budget, cancellation).await;
         }
         binding.scope.acquire(cancellation).await
-    }
-
-    pub(super) fn schwab_market_doctor(
-        &self,
-        profile: &ProviderOnboardingProfile,
-        authorization_subject: SourceIdentifier,
-    ) -> Result<SchwabMarketDoctorProbeRateAuthority, ProviderOnboardingError> {
-        let descriptor = profile.rate_policy().clone();
-        let binding = self
-            .policies
-            .get(descriptor.policy_id())
-            .ok_or(ProviderOnboardingError::InvalidProfile)?;
-        let policy = descriptor
-            .enforcement_policy()
-            .ok_or(ProviderOnboardingError::InvalidProfile)?;
-        if self.provider_rate.is_none()
-            || profile.id() != SCHWAB_MARKET_DATA_SURFACE_ID
-            || binding.descriptor != descriptor
-            || policy.scope().authorization_account().is_none()
-            || policy.weighted_window_count() != 0
-            || descriptor.refresh_on_http_429() != Some(true)
-            || authorization_subject.as_str().is_empty()
-        {
-            return Err(ProviderOnboardingError::InvalidProfile);
-        }
-        Ok(SchwabMarketDoctorProbeRateAuthority {
-            inner: self.clone(),
-            profile: profile.clone(),
-            descriptor,
-            authorization_subject,
-            rate_policy_digest: profile.capability().rate_policy().evidence_digest(),
-        })
-    }
-}
-
-impl SchwabMarketDoctorRateAuthority for SchwabMarketDoctorProbeRateAuthority {
-    fn acquire<'a>(
-        &'a self,
-        scope: SchwabMarketDoctorProbeScope,
-        cancellation: CancellationToken,
-        deadline: Instant,
-    ) -> DoctorFuture<'a, Box<dyn SchwabMarketDoctorRatePermit>> {
-        Box::pin(async move {
-            ensure_doctor_rate_active(&cancellation, deadline)?;
-            let mut permit = self
-                .inner
-                .acquire(
-                    &self.profile,
-                    &self.descriptor,
-                    Some(&self.authorization_subject),
-                    cancellation.clone(),
-                )
-                .await
-                .map_err(map_doctor_rate_error)?;
-            permit.deadline = permit.deadline.min(deadline);
-            ensure_doctor_rate_active(&cancellation, permit.deadline)?;
-            Ok(Box::new(SchwabMarketDoctorProbeRatePermit {
-                inner: permit,
-                scope,
-                doctor_deadline: deadline,
-                rate_policy_digest: self.rate_policy_digest,
-                dispatch_committed: false,
-                observation_recorded: false,
-            }) as Box<dyn SchwabMarketDoctorRatePermit>)
-        })
-    }
-}
-
-impl SchwabMarketDoctorRatePermit for SchwabMarketDoctorProbeRatePermit {
-    fn rate_policy_digest(&self) -> EvidenceDigest {
-        self.rate_policy_digest
-    }
-
-    fn commit_dispatch<'a>(
-        &'a mut self,
-        cancellation: &'a CancellationToken,
-        deadline: Instant,
-    ) -> DoctorFuture<'a, ()> {
-        Box::pin(async move {
-            self.require_exact_call(cancellation, deadline)?;
-            if self.dispatch_committed || self.observation_recorded {
-                return Err(SchwabMarketDataDoctorError::InvalidRateAuthority);
-            }
-            self.inner
-                .commit_dispatch(cancellation)
-                .await
-                .map_err(map_doctor_rate_error)?;
-            self.dispatch_committed = true;
-            Ok(())
-        })
-    }
-
-    fn observe<'a>(
-        &'a mut self,
-        observation: &'a SchwabMarketDoctorRateObservation,
-        cancellation: &'a CancellationToken,
-        deadline: Instant,
-    ) -> DoctorFuture<'a, ()> {
-        Box::pin(async move {
-            self.require_exact_call(cancellation, deadline)?;
-            if !self.dispatch_committed
-                || self.observation_recorded
-                || observation.scope() != self.scope
-                || observation.retry_after().is_some()
-                    && matches!(
-                        observation.status(),
-                        SchwabMarketDoctorProbeStatus::Streamer { .. }
-                    )
-            {
-                return Err(SchwabMarketDataDoctorError::InvalidRateAuthority);
-            }
-            match observation.status() {
-                SchwabMarketDoctorProbeStatus::Http(429) => self
-                    .inner
-                    .observe_http_429(observation.retry_after())
-                    .await
-                    .map_err(map_doctor_rate_error)?,
-                SchwabMarketDoctorProbeStatus::Http(_) if observation.retry_after().is_some() => {
-                    self.inner
-                        .observe_http_429(observation.retry_after())
-                        .await
-                        .map_err(map_doctor_rate_error)?;
-                }
-                SchwabMarketDoctorProbeStatus::Http(status)
-                    if (200..=299).contains(&status)
-                        || (status == 101
-                            && matches!(self.scope, SchwabMarketDoctorProbeScope::Streamer(_))) =>
-                {
-                    self.inner.record_success().map_err(map_doctor_rate_error)?;
-                }
-                status @ SchwabMarketDoctorProbeStatus::Streamer { .. } if status.accepted() => {
-                    self.inner.record_success().map_err(map_doctor_rate_error)?;
-                }
-                SchwabMarketDoctorProbeStatus::Streamer { .. } => {
-                    self.inner
-                        .observe_provider_refusal()
-                        .await
-                        .map_err(map_doctor_rate_error)?;
-                }
-                SchwabMarketDoctorProbeStatus::Http(_) => {}
-            }
-            self.observation_recorded = true;
-            Ok(())
-        })
-    }
-}
-
-impl SchwabMarketDoctorProbeRatePermit {
-    fn require_exact_call(
-        &self,
-        cancellation: &CancellationToken,
-        deadline: Instant,
-    ) -> Result<(), SchwabMarketDataDoctorError> {
-        if deadline != self.doctor_deadline {
-            return Err(SchwabMarketDataDoctorError::InvalidRateAuthority);
-        }
-        ensure_doctor_rate_active(cancellation, self.inner.deadline)
     }
 }
 
@@ -638,21 +452,6 @@ impl ProbeRatePermit {
         }
     }
 
-    async fn observe_provider_refusal(&self) -> Result<(), ProviderOnboardingError> {
-        match &self.authority {
-            ProbeRatePermitAuthority::Aggregate {
-                budget,
-                reservation: None,
-                permit: Some(_),
-            } => match budget.apply_refusal(0) {
-                BudgetDecision::WaitUntil(_) => Ok(()),
-                _ => Err(ProviderOnboardingError::ProbeRateLimited),
-            },
-            // Production Schwab doctor requires the shared durable authority.
-            _ => Err(ProviderOnboardingError::InvalidSessionState),
-        }
-    }
-
     pub(super) fn record_success(&self) -> Result<(), ProviderOnboardingError> {
         match &self.authority {
             ProbeRatePermitAuthority::Legacy { .. } => Ok(()),
@@ -758,26 +557,4 @@ fn parse_retry_after_seconds(field: &[u8]) -> Option<u64> {
         return None;
     }
     std::str::from_utf8(field).ok()?.parse().ok()
-}
-
-fn ensure_doctor_rate_active(
-    cancellation: &CancellationToken,
-    deadline: Instant,
-) -> Result<(), SchwabMarketDataDoctorError> {
-    if cancellation.is_cancelled() {
-        Err(SchwabMarketDataDoctorError::Cancelled)
-    } else if Instant::now() >= deadline {
-        Err(SchwabMarketDataDoctorError::Deadline)
-    } else {
-        Ok(())
-    }
-}
-
-fn map_doctor_rate_error(error: ProviderOnboardingError) -> SchwabMarketDataDoctorError {
-    match error {
-        ProviderOnboardingError::OperationCancelled => SchwabMarketDataDoctorError::Cancelled,
-        ProviderOnboardingError::ProbeDeadlineExceeded => SchwabMarketDataDoctorError::Deadline,
-        ProviderOnboardingError::Clock => SchwabMarketDataDoctorError::Clock,
-        _ => SchwabMarketDataDoctorError::InvalidRateAuthority,
-    }
 }

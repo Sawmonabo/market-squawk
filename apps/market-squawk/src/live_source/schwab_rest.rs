@@ -18,10 +18,10 @@ use bytes::Bytes;
 use market_squawk_adapter_schwab::{
     ExecutedRestResponse, NativeField, NativeScalar, ParsedNative, ProviderIdentifier,
     QuoteComponentField, QuoteResponse, RawRestResponseReceipt, ReadOnlyRoute, RestItemAccounting,
-    SchwabMarketDataDelay, SchwabQuote, SchwabRestPayload,
+    SchwabMarketDataDelay, SchwabOAuthAuthorityReceipt, SchwabQuote, SchwabRestPayload,
 };
 use market_squawk_domain::{
-    CaptureIntegrityState, ConnectionGeneration, CoverageDelay, ExactPayloadEvidence, InstrumentId,
+    CaptureIntegrityState, ConnectionGeneration, ExactPayloadEvidence, InstrumentId,
     MarketDataReference, SnapshotApplicability, SourceIdentifier, StreamIntegrityState, Timestamp,
     VenueId, VenueSymbol,
 };
@@ -119,6 +119,7 @@ pub(crate) struct SchwabRestQuoteCurrentRequest<'a> {
     metadata: &'a SourceMetadata,
     venue_id: &'a VenueId,
     delay: SchwabMarketDataDelay,
+    oauth: SchwabOAuthAuthorityReceipt,
     instruments: &'a [SchwabRestQuoteCurrentInstrument],
     deadline: Instant,
 }
@@ -129,6 +130,7 @@ impl<'a> SchwabRestQuoteCurrentRequest<'a> {
         metadata: &'a SourceMetadata,
         venue_id: &'a VenueId,
         delay: SchwabMarketDataDelay,
+        oauth: SchwabOAuthAuthorityReceipt,
         instruments: &'a [SchwabRestQuoteCurrentInstrument],
         deadline: Instant,
     ) -> Self {
@@ -137,6 +139,7 @@ impl<'a> SchwabRestQuoteCurrentRequest<'a> {
             metadata,
             venue_id,
             delay,
+            oauth,
             instruments,
             deadline,
         }
@@ -506,6 +509,7 @@ impl SchwabRestQuoteCurrentSessionInput {
                 .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
             self.record_current_health(
                 request.metadata,
+                request.oauth,
                 live,
                 observed_at,
                 None,
@@ -524,6 +528,7 @@ impl SchwabRestQuoteCurrentSessionInput {
         };
         self.qualify_decoded(
             request.metadata,
+            request.oauth,
             request
                 .metadata
                 .coverage()
@@ -540,9 +545,14 @@ impl SchwabRestQuoteCurrentSessionInput {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "qualification retains exact response, OAuth, capture and route coordinates"
+    )]
     fn qualify_decoded(
         &mut self,
         metadata: &SourceMetadata,
+        oauth: SchwabOAuthAuthorityReceipt,
         live: &LiveCoverageDeclaration,
         payload_digest: [u8; 32],
         venue: &VenueId,
@@ -565,6 +575,7 @@ impl SchwabRestQuoteCurrentSessionInput {
         };
         self.record_current_health(
             metadata,
+            oauth,
             live,
             validated_at,
             decoded.latest_source_at,
@@ -689,19 +700,23 @@ impl SchwabRestQuoteCurrentSessionInput {
     fn record_current_health(
         &mut self,
         metadata: &SourceMetadata,
+        oauth: SchwabOAuthAuthorityReceipt,
         live: &LiveCoverageDeclaration,
         observed_at: Timestamp,
         latest_source_at: Option<Timestamp>,
         payload_digest: [u8; 32],
     ) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
+        // Configured rights have no saved-probe expiry. This response's actual access token
+        // bounds runtime authority, while any narrower configured interval still applies.
+        let access_deadline = oauth_access_deadline(oauth, observed_at)?;
         let authorization_deadline = metadata
             .authorization()
             .inclusive_authorization_deadline()
-            .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+            .map_or(access_deadline, |deadline| deadline.min(access_deadline));
         let coverage_deadline = metadata
             .coverage()
             .inclusive_coverage_deadline()
-            .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+            .map_or(access_deadline, |deadline| deadline.min(access_deadline));
         let health = SourceHealthSnapshot::try_new(
             &self.session,
             observed_at,
@@ -856,6 +871,8 @@ fn validate_request(
     let requested = u64::try_from(request.instruments.len())
         .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Allocation)?;
     if receipt.route() != ReadOnlyRoute::Quotes
+        || receipt.token_generation() != request.oauth.generation()
+        || receipt.credential_authority() != request.oauth.credential_authority()
         || !(200..=299).contains(&receipt.status())
         || receipt.body_sha256() != parsed.raw_sha256()
         || receipt.body_bytes()
@@ -878,7 +895,6 @@ fn validate_request(
             .coverage()
             .topology()
             .contains_venue(request.venue_id)
-        || !delay_matches(request.metadata.coverage().delay(), request.delay)
     {
         return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
     }
@@ -1018,7 +1034,9 @@ fn realtime_delay_conflicts(
     delay: SchwabMarketDataDelay,
 ) -> Result<bool, SchwabRestQuoteCurrentUnavailable> {
     Ok(match quote.realtime() {
-        NativeField::Value(true) => delay != SchwabMarketDataDelay::RealTime,
+        // Unknown is an aggregate response result: mixed native statuses may retain true
+        // rows without proving real-time timing for the whole response.
+        NativeField::Value(true) => matches!(delay, SchwabMarketDataDelay::Delayed(_)),
         NativeField::Value(false) => delay == SchwabMarketDataDelay::RealTime,
         NativeField::Absent | NativeField::Null => false,
     })
@@ -1170,12 +1188,27 @@ fn copy_exact_body(body: &[u8]) -> Result<Bytes, SchwabRestQuoteCurrentUnavailab
     Ok(Bytes::from(owned))
 }
 
-fn delay_matches(declared: CoverageDelay, observed: SchwabMarketDataDelay) -> bool {
-    match (declared, observed) {
-        (CoverageDelay::RealTime, SchwabMarketDataDelay::RealTime) => true,
-        (CoverageDelay::Delayed(expected), SchwabMarketDataDelay::Delayed(actual)) => {
-            expected == actual.get()
-        }
-        _ => false,
+/// Bounds runtime health by the original request token's half-open access interval.
+fn oauth_access_deadline(
+    oauth: SchwabOAuthAuthorityReceipt,
+    observed_at: Timestamp,
+) -> Result<Timestamp, SchwabRestQuoteCurrentUnavailable> {
+    let issued_at = oauth
+        .access_issued_at_unix_seconds()
+        .checked_mul(1_000_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+    let expires_at = oauth
+        .access_expires_at_unix_seconds()
+        .checked_mul(1_000_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+    if observed_at < issued_at || observed_at >= expires_at {
+        return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
     }
+    expires_at
+        .checked_sub_nanos(1)
+        .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)
 }

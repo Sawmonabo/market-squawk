@@ -54,7 +54,7 @@ pub(crate) struct PreparedMarketProviderConfigurationRequest {
     surface: AccountMarketSurface,
     onboarding_session_id: Uuid,
     expected_public_configuration_digest: EvidenceDigest,
-    expected_runtime_verification_receipt_digest: EvidenceDigest,
+    expected_runtime_verification_receipt_digest: Option<EvidenceDigest>,
     expected_credential_generation: SecretGeneration,
 }
 
@@ -64,14 +64,17 @@ impl PreparedMarketProviderConfigurationRequest {
         surface: AccountMarketSurface,
         onboarding_session_id: Uuid,
         expected_public_configuration_digest: EvidenceDigest,
-        expected_runtime_verification_receipt_digest: EvidenceDigest,
+        expected_runtime_verification_receipt_digest: Option<EvidenceDigest>,
         expected_credential_generation: SecretGeneration,
     ) -> Result<Self, ServiceError> {
         if onboarding_session_id.is_nil()
             || expected_public_configuration_digest.algorithm() != DigestAlgorithm::Sha256
             || expected_public_configuration_digest.bytes() == [0; 32]
-            || expected_runtime_verification_receipt_digest.algorithm() != DigestAlgorithm::Sha256
-            || expected_runtime_verification_receipt_digest.bytes() == [0; 32]
+            || expected_runtime_verification_receipt_digest.is_some_and(|digest| {
+                digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
+            })
+            || (surface == AccountMarketSurface::SchwabMarketData)
+                != expected_runtime_verification_receipt_digest.is_none()
         {
             return Err(ServiceError::InvalidRequest);
         }
@@ -96,7 +99,9 @@ impl PreparedMarketProviderConfigurationRequest {
         self.expected_public_configuration_digest
     }
 
-    pub(crate) const fn expected_runtime_verification_receipt_digest(self) -> EvidenceDigest {
+    pub(crate) const fn expected_runtime_verification_receipt_digest(
+        self,
+    ) -> Option<EvidenceDigest> {
         self.expected_runtime_verification_receipt_digest
     }
 

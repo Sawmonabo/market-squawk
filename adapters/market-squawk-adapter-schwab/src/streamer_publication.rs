@@ -164,11 +164,18 @@ impl<'a> SchwabStreamerQuotePublicationRequest<'a> {
     /// Revalidates the current account/OAuth authority and each opaque same-family original proof.
     pub fn validate_current_authority(
         &self,
-        doctor: &market_squawk_sources::SchwabMarketDataDoctorReceiptV1,
         oauth: crate::SchwabOAuthAuthorityReceipt,
         observed_at: Timestamp,
+        session_identifier: &SourceIdentifier,
+        entitlement_evidence: EvidenceDigest,
+        capability_evidence: EvidenceDigest,
     ) -> Result<(), SchwabStreamerPublicationError> {
-        if !doctor.is_current_at(observed_at) {
+        let current_seconds = u64::try_from(observed_at.unix_nanos())
+            .map_err(|_| SchwabStreamerPublicationError::InvalidEvidence)?
+            / 1_000_000_000;
+        if current_seconds < oauth.access_issued_at_unix_seconds()
+            || current_seconds >= oauth.access_expires_at_unix_seconds()
+        {
             return Err(SchwabStreamerPublicationError::InvalidEvidence);
         }
         for qualification in self
@@ -195,10 +202,12 @@ impl<'a> SchwabStreamerQuotePublicationRequest<'a> {
                 return Err(SchwabStreamerPublicationError::InvalidEvidence);
             }
             let expected = crate::SchwabMarketDataQualification::try_from_streamer_handoff(
-                doctor,
                 proof,
                 qualification.response_observed_at(),
                 oauth,
+                session_identifier.clone(),
+                entitlement_evidence,
+                capability_evidence,
             )
             .map_err(|_| SchwabStreamerPublicationError::InvalidEvidence)?;
             if &expected != qualification {

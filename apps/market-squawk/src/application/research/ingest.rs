@@ -326,7 +326,7 @@ impl ResearchRightsAuthority {
         basis: RightsBasis,
         parent_authorization_evidence: EvidenceDigest,
         authorization_evidence: EvidenceDigest,
-        authorization_expires_at: Timestamp,
+        authorization_expires_at: Option<Timestamp>,
         exact_subjects: Vec<SourceIdentifier>,
         permitted_operations: Vec<SourceOperation>,
     ) -> Result<Self, ResearchIngestCompositionError> {
@@ -351,7 +351,7 @@ impl ResearchRightsAuthority {
             basis,
             parent_authorization_evidence,
             authorization_evidence,
-            authorization_expires_at: Some(authorization_expires_at),
+            authorization_expires_at,
             exact_subjects: Some(exact_subjects),
             permitted_operations,
         })

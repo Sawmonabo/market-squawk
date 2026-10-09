@@ -1,8 +1,7 @@
 //! Closed, durable runtime-verification evidence for provider onboarding.
 
 use market_squawk_domain::{
-    CalendarDate, CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier,
-    Timestamp,
+    CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::SecretGeneration;
 use rust_decimal::Decimal;
@@ -21,12 +20,6 @@ pub const ALPACA_PAPER_IEX_DOCTOR_RECEIPT_SCHEMA: &str = "market-squawk.alpaca-p
 pub const MAX_ALPACA_PAPER_IEX_DOCTOR_RECEIPT_BYTES: usize = 16 * 1024;
 /// Canonical onboarding surface for the owner-enabled Schwab market-data runtime.
 pub const SCHWAB_MARKET_DATA_SURFACE_ID: &str = "schwab.trader-api-market-data";
-/// Schema identity for the self-digested Schwab market-data doctor receipt.
-pub const SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_SCHEMA: &str =
-    "market-squawk.schwab-market-data-doctor/v1";
-/// Maximum canonical bytes retained by one Schwab market-data doctor receipt.
-pub const MAX_SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_BYTES: usize = 16 * 1024;
-
 const ALPACA_PAPER_IEX_DOCTOR_IMPLEMENTATION_REVISION: &str =
     "market-squawk.alpaca-paper-iex-doctor-implementation.v3";
 const ALPACA_PAPER_IEX_DOCTOR_CONTRACT_DOMAIN: &[u8] =
@@ -54,16 +47,6 @@ const ALPACA_DOCTOR_BATCH_SYMBOLS: [&str; ALPACA_DOCTOR_BATCH_REQUESTED as usize
     "GOOGL", "GS", "HD", "HON", "IBM", "INTC", "ISRG", "JNJ", "JPM", "KO", "LIN", "LLY", "LMT",
     "LOW", "MA", "MCD", "META", "MRK", "MS", "MSFT", "NFLX", "NVDA", "ORCL", "PEP", "PG",
 ];
-const SCHWAB_MARKET_DATA_DOCTOR_IMPLEMENTATION_REVISION: &str =
-    "market-squawk.schwab-market-data-doctor-implementation.v2";
-const SCHWAB_MARKET_DATA_DOCTOR_CONTRACT_DOMAIN: &[u8] =
-    b"market-squawk/schwab-market-data-doctor-contract/v1\0";
-const SCHWAB_MARKET_DATA_PROVIDER_OBSERVATION_ORIGIN: &str =
-    "market-squawk.schwab-market-data-doctor.provider-observed.v1";
-const SCHWAB_ACCESS_TOKEN_MAX_LIFETIME_NANOS: i64 = 30 * 60 * 1_000_000_000;
-const SCHWAB_REFRESH_TOKEN_LIFETIME_NANOS: i64 = 7 * 24 * 60 * 60 * 1_000_000_000;
-const MAX_SCHWAB_USER_PREFERENCE_BYTES: u64 = 8 * 1024 * 1024;
-
 /// Immutable reservation coordinates required before typed runtime evidence can be admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeVerificationContext {
@@ -921,517 +904,6 @@ pub enum SchwabMarketDataFamily {
     ScreenerOption,
 }
 
-const SCHWAB_MARKET_DATA_FAMILIES: [SchwabMarketDataFamily; 19] = [
-    SchwabMarketDataFamily::Quotes,
-    SchwabMarketDataFamily::PriceHistory,
-    SchwabMarketDataFamily::OptionChains,
-    SchwabMarketDataFamily::ExpirationChains,
-    SchwabMarketDataFamily::Movers,
-    SchwabMarketDataFamily::MarketHours,
-    SchwabMarketDataFamily::Instruments,
-    SchwabMarketDataFamily::LevelOneEquities,
-    SchwabMarketDataFamily::LevelOneOptions,
-    SchwabMarketDataFamily::LevelOneFutures,
-    SchwabMarketDataFamily::LevelOneFuturesOptions,
-    SchwabMarketDataFamily::LevelOneForex,
-    SchwabMarketDataFamily::NyseBook,
-    SchwabMarketDataFamily::NasdaqBook,
-    SchwabMarketDataFamily::OptionsBook,
-    SchwabMarketDataFamily::ChartEquity,
-    SchwabMarketDataFamily::ChartFutures,
-    SchwabMarketDataFamily::ScreenerEquity,
-    SchwabMarketDataFamily::ScreenerOption,
-];
-
-/// Secret-free evidence retained from the minimum Schwab User Preference bootstrap.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchwabUserPreferenceDoctorEvidence {
-    pub endpoint_contract_sha256: EvidenceDigest,
-    pub request_sha256: EvidenceDigest,
-    pub response_sha256: EvidenceDigest,
-    pub status_code: u16,
-    pub response_bytes: u64,
-    pub received_at: Timestamp,
-    pub latency_nanos: u64,
-    /// Digest of the provider-authored customer/principal coordinates; no account body is kept.
-    pub market_data_principal_sha256: EvidenceDigest,
-    /// Digest of the exact retained Streamer socket and correlation/bootstrap coordinates.
-    pub streamer_bootstrap_sha256: EvidenceDigest,
-    /// Exact retained market-data/level-two offer evidence, when supplied by the provider.
-    pub market_data_offer_sha256: Option<EvidenceDigest>,
-}
-
-impl SchwabUserPreferenceDoctorEvidence {
-    fn validate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
-        for digest in [
-            self.endpoint_contract_sha256,
-            self.request_sha256,
-            self.response_sha256,
-            self.market_data_principal_sha256,
-            self.streamer_bootstrap_sha256,
-        ] {
-            require_sha256(digest)?;
-        }
-        if let Some(digest) = self.market_data_offer_sha256 {
-            require_sha256(digest)?;
-        }
-        if !(200..=299).contains(&self.status_code)
-            || self.response_bytes == 0
-            || self.response_bytes > MAX_SCHWAB_USER_PREFERENCE_BYTES
-        {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        Ok(())
-    }
-}
-
-/// One exact family disposition from the bounded Schwab entitlement doctor.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchwabMarketDataFamilyEvidence {
-    pub family: SchwabMarketDataFamily,
-    pub disposition: RuntimeCapabilityDisposition,
-    pub disposition_evidence_sha256: EvidenceDigest,
-    /// Exact semantic/provider response digest when the family was actually probed.
-    pub observation_sha256: Option<EvidenceDigest>,
-    pub observed_at: Option<Timestamp>,
-}
-
-impl SchwabMarketDataFamilyEvidence {
-    fn validate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
-        require_sha256(self.disposition_evidence_sha256)?;
-        if let Some(digest) = self.observation_sha256 {
-            require_sha256(digest)?;
-        }
-        match (self.disposition, self.observation_sha256, self.observed_at) {
-            (RuntimeCapabilityDisposition::NotProbed, None, None) => Ok(()),
-            (
-                RuntimeCapabilityDisposition::Available
-                | RuntimeCapabilityDisposition::Degraded
-                | RuntimeCapabilityDisposition::Unavailable,
-                Some(_),
-                Some(_),
-            ) => Ok(()),
-            _ => Err(RuntimeVerificationEvidenceError::InvalidEvidence),
-        }
-    }
-
-    const fn admits_source_start(&self) -> bool {
-        matches!(
-            self.disposition,
-            RuntimeCapabilityDisposition::Available | RuntimeCapabilityDisposition::Degraded
-        )
-    }
-}
-
-/// Provider-observed, secret-free input consumed by the durable Schwab doctor receipt.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchwabMarketDataDoctorObservation {
-    pub provider_observation_origin: SourceIdentifier,
-    pub access_token_generation: u64,
-    pub authorization_generation: u64,
-    pub authorization_scope_sha256: EvidenceDigest,
-    pub access_issued_at: Timestamp,
-    pub access_expires_at: Timestamp,
-    pub refresh_authorized_at: Timestamp,
-    pub refresh_expires_at: Timestamp,
-    pub user_preference: SchwabUserPreferenceDoctorEvidence,
-    /// Exact quote-delivery qualification from the sealed quote probe.
-    ///
-    /// `None` means the provider response did not establish either real-time delivery or a
-    /// positive numeric delay and therefore cannot admit the current-quote source.
-    pub quote_delay: Option<CoverageDelay>,
-    /// Every closed family appears exactly once in canonical enum order.
-    pub families: Box<[SchwabMarketDataFamilyEvidence]>,
-    pub completed_at: Timestamp,
-}
-
-impl SchwabMarketDataDoctorObservation {
-    /// Returns the only provider-observation origin admitted by receipt version 1.
-    pub fn provider_observed_origin() -> Result<SourceIdentifier, RuntimeVerificationEvidenceError>
-    {
-        SourceIdentifier::try_from(SCHWAB_MARKET_DATA_PROVIDER_OBSERVATION_ORIGIN)
-            .map_err(|_| RuntimeVerificationEvidenceError::InvalidEvidence)
-    }
-
-    /// Returns the provider-observed market-data principal digest.
-    pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
-        self.user_preference.market_data_principal_sha256
-    }
-
-    /// Returns the trusted completion time after every included probe.
-    pub const fn completed_at(&self) -> Timestamp {
-        self.completed_at
-    }
-
-    /// Returns the provider-qualified quote delay, or `None` when timing remained unknown.
-    pub const fn quote_delay(&self) -> Option<CoverageDelay> {
-        self.quote_delay
-    }
-
-    fn validate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
-        if self.provider_observation_origin != Self::provider_observed_origin()?
-            || self.authorization_generation == 0
-            || self.authorization_generation > self.access_token_generation
-            || self.access_issued_at >= self.access_expires_at
-            || self.refresh_authorized_at >= self.refresh_expires_at
-            || self.access_issued_at < self.refresh_authorized_at
-            || self.access_issued_at >= self.refresh_expires_at
-            || self.completed_at < self.user_preference.received_at
-            || self.completed_at < self.access_issued_at
-            || self.completed_at >= self.access_expires_at
-        {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        let access_lifetime = self
-            .access_expires_at
-            .unix_nanos()
-            .checked_sub(self.access_issued_at.unix_nanos())
-            .ok_or(RuntimeVerificationEvidenceError::InvalidEvidence)?;
-        let refresh_lifetime = self
-            .refresh_expires_at
-            .unix_nanos()
-            .checked_sub(self.refresh_authorized_at.unix_nanos())
-            .ok_or(RuntimeVerificationEvidenceError::InvalidEvidence)?;
-        if access_lifetime > SCHWAB_ACCESS_TOKEN_MAX_LIFETIME_NANOS
-            || refresh_lifetime != SCHWAB_REFRESH_TOKEN_LIFETIME_NANOS
-            || self.families.len() != SCHWAB_MARKET_DATA_FAMILIES.len()
-        {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        require_sha256(self.authorization_scope_sha256)?;
-        self.user_preference.validate()?;
-        if matches!(
-            self.quote_delay,
-            Some(CoverageDelay::Delayed(0) | CoverageDelay::NotApplicable | CoverageDelay::Unknown)
-        ) {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        for (evidence, expected) in self.families.iter().zip(SCHWAB_MARKET_DATA_FAMILIES) {
-            if evidence.family != expected
-                || evidence
-                    .observed_at
-                    .is_some_and(|observed_at| observed_at > self.completed_at)
-            {
-                return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-            }
-            evidence.validate()?;
-        }
-        let quote = self
-            .families
-            .iter()
-            .find(|evidence| evidence.family == SchwabMarketDataFamily::Quotes)
-            .ok_or(RuntimeVerificationEvidenceError::InvalidEvidence)?;
-        if self.quote_delay.is_some() && !quote.admits_source_start() {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        Ok(())
-    }
-}
-
-/// Fixed closed input to one version-1 Schwab market-data doctor receipt.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchwabMarketDataDoctorReceiptInput {
-    pub surface_id: SourceIdentifier,
-    pub session_identifier: SourceIdentifier,
-    pub application_credential_generation: SecretGeneration,
-    pub application_credential_reference_sha256: EvidenceDigest,
-    pub capability_revision: ProviderCapabilityRevision,
-    pub capability_digest: EvidenceDigest,
-    pub public_configuration_digest: EvidenceDigest,
-    pub rights_decision_digest: EvidenceDigest,
-    pub rate_policy_digest: EvidenceDigest,
-    pub data_quality: DataQuality,
-    pub observation: SchwabMarketDataDoctorObservation,
-    pub exclusive_expires_at: Timestamp,
-    pub predecessor_digest: Option<EvidenceDigest>,
-}
-
-/// Self-digested, secret-free Schwab market-data doctor receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchwabMarketDataDoctorReceiptV1 {
-    schema: SourceIdentifier,
-    doctor_revision: SourceIdentifier,
-    doctor_contract_digest: EvidenceDigest,
-    input: SchwabMarketDataDoctorReceiptInput,
-    receipt_sha256: EvidenceDigest,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SchwabMarketDataDoctorReceiptWire {
-    schema: SourceIdentifier,
-    doctor_revision: SourceIdentifier,
-    doctor_contract_digest: EvidenceDigest,
-    input: SchwabMarketDataDoctorReceiptInput,
-    receipt_sha256: EvidenceDigest,
-}
-
-impl SchwabMarketDataDoctorReceiptV1 {
-    pub fn try_new(
-        input: SchwabMarketDataDoctorReceiptInput,
-    ) -> Result<Self, RuntimeVerificationEvidenceError> {
-        validate_schwab_receipt_input(&input)?;
-        let schema = SourceIdentifier::try_from(SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_SCHEMA)
-            .map_err(|_| RuntimeVerificationEvidenceError::InvalidEvidence)?;
-        let doctor_revision =
-            SourceIdentifier::try_from(SCHWAB_MARKET_DATA_DOCTOR_IMPLEMENTATION_REVISION)
-                .map_err(|_| RuntimeVerificationEvidenceError::InvalidEvidence)?;
-        let doctor_contract_digest = schwab_doctor_contract_digest(
-            input.capability_revision,
-            input.capability_digest,
-            &doctor_revision,
-        );
-        let receipt_sha256 = schwab_receipt_content_digest(
-            &schema,
-            &doctor_revision,
-            doctor_contract_digest,
-            &input,
-        )?;
-        let receipt = Self {
-            schema,
-            doctor_revision,
-            doctor_contract_digest,
-            input,
-            receipt_sha256,
-        };
-        receipt.revalidate()?;
-        Ok(receipt)
-    }
-
-    pub const fn surface_id(&self) -> &SourceIdentifier {
-        &self.input.surface_id
-    }
-    pub const fn session_identifier(&self) -> &SourceIdentifier {
-        &self.input.session_identifier
-    }
-    pub const fn application_credential_generation(&self) -> SecretGeneration {
-        self.input.application_credential_generation
-    }
-    pub const fn application_credential_reference_sha256(&self) -> EvidenceDigest {
-        self.input.application_credential_reference_sha256
-    }
-    pub const fn authorization_generation(&self) -> u64 {
-        self.input.observation.authorization_generation
-    }
-    pub const fn authorization_scope_sha256(&self) -> EvidenceDigest {
-        self.input.observation.authorization_scope_sha256
-    }
-    pub const fn access_token_generation(&self) -> u64 {
-        self.input.observation.access_token_generation
-    }
-    pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
-        self.input.observation.market_data_principal_sha256()
-    }
-    pub const fn capability_revision(&self) -> ProviderCapabilityRevision {
-        self.input.capability_revision
-    }
-    pub const fn capability_digest(&self) -> EvidenceDigest {
-        self.input.capability_digest
-    }
-    pub const fn public_configuration_digest(&self) -> EvidenceDigest {
-        self.input.public_configuration_digest
-    }
-    pub const fn rights_decision_digest(&self) -> EvidenceDigest {
-        self.input.rights_decision_digest
-    }
-    pub const fn rate_policy_digest(&self) -> EvidenceDigest {
-        self.input.rate_policy_digest
-    }
-    pub const fn verified_at(&self) -> Timestamp {
-        self.input.observation.completed_at
-    }
-    pub const fn exclusive_expires_at(&self) -> Timestamp {
-        self.input.exclusive_expires_at
-    }
-    pub const fn predecessor_digest(&self) -> Option<EvidenceDigest> {
-        self.input.predecessor_digest
-    }
-    pub const fn receipt_sha256(&self) -> EvidenceDigest {
-        self.receipt_sha256
-    }
-    pub const fn observation(&self) -> &SchwabMarketDataDoctorObservation {
-        &self.input.observation
-    }
-
-    /// Returns exact quote-delivery timing retained from the sealed provider response.
-    pub const fn quote_delay(&self) -> Option<CoverageDelay> {
-        self.input.observation.quote_delay()
-    }
-
-    pub fn canonical_json(&self) -> Result<Vec<u8>, RuntimeVerificationEvidenceError> {
-        let bytes = serde_json::to_vec(self)
-            .map_err(|_| RuntimeVerificationEvidenceError::Serialization)?;
-        if bytes.is_empty() || bytes.len() > MAX_SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_BYTES {
-            return Err(RuntimeVerificationEvidenceError::ResourceLimit);
-        }
-        Ok(bytes)
-    }
-
-    pub fn is_current_at(&self, observed_at: Timestamp) -> bool {
-        self.verified_at() <= observed_at && observed_at < self.exclusive_expires_at()
-    }
-
-    pub fn admits_source_start(&self) -> bool {
-        self.quote_delay().is_some()
-            && self
-                .input
-                .observation
-                .families
-                .iter()
-                .find(|evidence| evidence.family == SchwabMarketDataFamily::Quotes)
-                .is_some_and(SchwabMarketDataFamilyEvidence::admits_source_start)
-    }
-
-    pub(crate) fn revalidate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
-        if self.schema.as_str() != SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_SCHEMA {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        validate_schwab_receipt_input(&self.input)?;
-        let expected_revision =
-            SourceIdentifier::try_from(SCHWAB_MARKET_DATA_DOCTOR_IMPLEMENTATION_REVISION)
-                .map_err(|_| RuntimeVerificationEvidenceError::InvalidEvidence)?;
-        let expected_contract = schwab_doctor_contract_digest(
-            self.input.capability_revision,
-            self.input.capability_digest,
-            &expected_revision,
-        );
-        if self.doctor_revision != expected_revision
-            || self.doctor_contract_digest != expected_contract
-            || schwab_receipt_content_digest(
-                &self.schema,
-                &self.doctor_revision,
-                self.doctor_contract_digest,
-                &self.input,
-            )? != self.receipt_sha256
-            || self.input.predecessor_digest == Some(self.receipt_sha256)
-        {
-            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-        }
-        let _ = self.canonical_json()?;
-        Ok(())
-    }
-
-    pub(crate) fn same_authority_as(&self, prior: &Self) -> bool {
-        self.input.surface_id == prior.input.surface_id
-            && self.input.session_identifier == prior.input.session_identifier
-            && self.input.application_credential_generation
-                == prior.input.application_credential_generation
-            && self.input.application_credential_reference_sha256
-                == prior.input.application_credential_reference_sha256
-            && self.market_data_principal_sha256() == prior.market_data_principal_sha256()
-            && self.input.capability_revision == prior.input.capability_revision
-            && self.input.capability_digest == prior.input.capability_digest
-            && self.input.public_configuration_digest == prior.input.public_configuration_digest
-            && self.input.rights_decision_digest == prior.input.rights_decision_digest
-            && self.input.rate_policy_digest == prior.input.rate_policy_digest
-            && self.input.data_quality == prior.input.data_quality
-            && self.doctor_revision == prior.doctor_revision
-            && self.doctor_contract_digest == prior.doctor_contract_digest
-    }
-}
-
-impl<'de> Deserialize<'de> for SchwabMarketDataDoctorReceiptV1 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = SchwabMarketDataDoctorReceiptWire::deserialize(deserializer)?;
-        let receipt = Self {
-            schema: wire.schema,
-            doctor_revision: wire.doctor_revision,
-            doctor_contract_digest: wire.doctor_contract_digest,
-            input: wire.input,
-            receipt_sha256: wire.receipt_sha256,
-        };
-        receipt.revalidate().map_err(serde::de::Error::custom)?;
-        Ok(receipt)
-    }
-}
-
-#[derive(Serialize)]
-struct SchwabReceiptDigestMaterial<'a> {
-    schema: &'a SourceIdentifier,
-    doctor_revision: &'a SourceIdentifier,
-    doctor_contract_digest: EvidenceDigest,
-    input: &'a SchwabMarketDataDoctorReceiptInput,
-}
-
-fn validate_schwab_receipt_input(
-    input: &SchwabMarketDataDoctorReceiptInput,
-) -> Result<(), RuntimeVerificationEvidenceError> {
-    input.observation.validate()?;
-    for digest in [
-        input.application_credential_reference_sha256,
-        input.capability_digest,
-        input.public_configuration_digest,
-        input.rights_decision_digest,
-        input.rate_policy_digest,
-    ] {
-        require_sha256(digest)?;
-    }
-    if input.surface_id.as_str() != SCHWAB_MARKET_DATA_SURFACE_ID
-        || !canonical_uuid_text(input.session_identifier.as_str())
-        || input.data_quality != DataQuality::DirectUnverified
-        || !input
-            .observation
-            .families
-            .iter()
-            .any(SchwabMarketDataFamilyEvidence::admits_source_start)
-    {
-        return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-    }
-    if let Some(digest) = input.predecessor_digest {
-        require_sha256(digest)?;
-    }
-    let maximum_receipt_expiry = input.observation.refresh_expires_at.unix_nanos();
-    if input.exclusive_expires_at.unix_nanos() != maximum_receipt_expiry
-        || input.exclusive_expires_at <= input.observation.completed_at
-    {
-        return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
-    }
-    Ok(())
-}
-
-fn schwab_doctor_contract_digest(
-    capability_revision: ProviderCapabilityRevision,
-    capability_digest: EvidenceDigest,
-    doctor_revision: &SourceIdentifier,
-) -> EvidenceDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(SCHWAB_MARKET_DATA_DOCTOR_CONTRACT_DOMAIN);
-    hasher.update(capability_revision.get().to_be_bytes());
-    hasher.update(capability_digest.bytes());
-    hasher.update(doctor_revision.as_str().as_bytes());
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
-}
-
-fn schwab_receipt_content_digest(
-    schema: &SourceIdentifier,
-    doctor_revision: &SourceIdentifier,
-    doctor_contract_digest: EvidenceDigest,
-    input: &SchwabMarketDataDoctorReceiptInput,
-) -> Result<EvidenceDigest, RuntimeVerificationEvidenceError> {
-    let bytes = serde_json::to_vec(&SchwabReceiptDigestMaterial {
-        schema,
-        doctor_revision,
-        doctor_contract_digest,
-        input,
-    })
-    .map_err(|_| RuntimeVerificationEvidenceError::Serialization)?;
-    if bytes.is_empty() || bytes.len() > MAX_SCHWAB_MARKET_DATA_DOCTOR_RECEIPT_BYTES {
-        return Err(RuntimeVerificationEvidenceError::ResourceLimit);
-    }
-    Ok(EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        Sha256::digest(bytes).into(),
-    ))
-}
-
 /// Legacy digest-only runtime evidence retained without semantic drift.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1462,8 +934,6 @@ pub enum RuntimeVerificationEvidence {
     DigestV1(RuntimeVerificationDigestV1),
     /// Full, self-digested Alpaca Paper/IEX doctor receipt.
     AlpacaPaperIexDoctorReceiptV1(Box<AlpacaPaperIexDoctorReceiptV1>),
-    /// Full, self-digested Schwab read-only market-data doctor receipt.
-    SchwabMarketDataDoctorReceiptV1(Box<SchwabMarketDataDoctorReceiptV1>),
 }
 
 impl RuntimeVerificationEvidence {
@@ -1479,7 +949,6 @@ impl RuntimeVerificationEvidence {
         match self {
             Self::DigestV1(evidence) => evidence.evidence_digest(),
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => receipt.receipt_sha256(),
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => receipt.receipt_sha256(),
         }
     }
 
@@ -1487,15 +956,7 @@ impl RuntimeVerificationEvidence {
     pub fn alpaca_paper_iex_receipt(&self) -> Option<&AlpacaPaperIexDoctorReceiptV1> {
         match self {
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => Some(receipt),
-            Self::DigestV1(_) | Self::SchwabMarketDataDoctorReceiptV1(_) => None,
-        }
-    }
-
-    /// Returns the exact Schwab receipt when this is the typed market-data evidence variant.
-    pub fn schwab_market_data_receipt(&self) -> Option<&SchwabMarketDataDoctorReceiptV1> {
-        match self {
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => Some(receipt),
-            Self::DigestV1(_) | Self::AlpacaPaperIexDoctorReceiptV1(_) => None,
+            Self::DigestV1(_) => None,
         }
     }
 
@@ -1504,7 +965,6 @@ impl RuntimeVerificationEvidence {
         match self {
             Self::DigestV1(_) => true,
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => receipt.is_current_at(observed_at),
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => receipt.is_current_at(observed_at),
         }
     }
 
@@ -1518,7 +978,6 @@ impl RuntimeVerificationEvidence {
         match self {
             Self::DigestV1(_) => true,
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => receipt.admits_source_start(),
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => receipt.admits_source_start(),
         }
     }
 
@@ -1527,7 +986,6 @@ impl RuntimeVerificationEvidence {
         match self {
             Self::DigestV1(_) => None,
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => Some(receipt.exclusive_expires_at()),
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => Some(receipt.exclusive_expires_at()),
         }
     }
 
@@ -1536,7 +994,6 @@ impl RuntimeVerificationEvidence {
         match self {
             Self::DigestV1(_) => None,
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => Some(receipt.verified_at()),
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => Some(receipt.verified_at()),
         }
     }
 
@@ -1547,9 +1004,6 @@ impl RuntimeVerificationEvidence {
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => {
                 Some(receipt.market_data_principal_sha256())
             }
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => {
-                Some(receipt.market_data_principal_sha256())
-            }
         }
     }
 
@@ -1557,7 +1011,6 @@ impl RuntimeVerificationEvidence {
         match self {
             Self::DigestV1(evidence) => require_nonzero(evidence.evidence_digest()),
             Self::AlpacaPaperIexDoctorReceiptV1(receipt) => receipt.revalidate(),
-            Self::SchwabMarketDataDoctorReceiptV1(receipt) => receipt.revalidate(),
         }
     }
 }

@@ -27,8 +27,7 @@ use crate::{
     NativeNumber, NativeScalar, OptionChain, OptionContract, OptionContractField, OptionSide,
     ParsedNative, ProviderIdentifier, QuoteComponentField, SchwabCapabilityCurrentness,
     SchwabInstrument, SchwabOAuthAuthorityReceipt, SchwabPriceHistoryCapabilityObservation,
-    SchwabQuote, SchwabUserPreferenceEvidence, StreamerDataBatch, StreamerMetadataField,
-    StreamerNativeValue,
+    SchwabQuote, StreamerDataBatch, StreamerMetadataField, StreamerNativeValue,
 };
 
 /// Exact Schwab symbol bound to a shared provider-instrument identity by external registry proof.
@@ -278,7 +277,6 @@ fn named_number<K: Eq>(
 pub(crate) struct SchwabDailyPriceHistoryCandidateRequest<'a> {
     pub(crate) capability: SchwabPriceHistoryCapabilityObservation,
     pub(crate) oauth_authority: SchwabOAuthAuthorityReceipt,
-    pub(crate) user_preference: &'a SchwabUserPreferenceEvidence,
     pub(crate) receipt: &'a crate::RawRestResponseReceipt,
     pub(crate) payload: &'a crate::SchwabRestPayload,
     pub(crate) accounting: crate::RestItemAccounting,
@@ -304,8 +302,6 @@ pub(crate) struct SchwabDailyPriceHistoryCandidateRequest<'a> {
 pub(crate) struct SchwabPendingPriceHistoryCandidate {
     pub(crate) capability: SchwabPriceHistoryCapabilityObservation,
     pub(crate) oauth_authority: SchwabOAuthAuthorityReceipt,
-    pub(crate) user_preference_observation_sha256: [u8; 32],
-    pub(crate) market_data_permission: Option<Box<str>>,
     pub(crate) response_observation_sha256: [u8; 32],
     pub(crate) requested_start: Timestamp,
     pub(crate) requested_end: Timestamp,
@@ -398,7 +394,6 @@ pub(crate) fn prepare_price_history_candidate(
         .ok_or(SchwabCanonicalError::PendingHistoryBinding)?;
     if request.capability.currentness_from_receipt(
         request.oauth_authority,
-        request.user_preference,
         request.receipt,
         request.accounting,
         ingested_seconds,
@@ -481,14 +476,6 @@ pub(crate) fn prepare_price_history_candidate(
         });
     }
 
-    let user_preference_observation_sha256 =
-        crate::vertical::user_preference_receipt_digest(request.user_preference);
-    let market_data_permission = request
-        .user_preference
-        .bootstrap()
-        .value()
-        .market_data_permission()
-        .map(Into::into);
     let response_observation_sha256 =
         crate::vertical::rest_receipt_digest_from_parts(request.receipt, request.accounting);
     let accounting = request.accounting;
@@ -509,7 +496,6 @@ pub(crate) fn prepare_price_history_candidate(
         oauth_refresh_expires_at_unix_seconds: request
             .oauth_authority
             .refresh_expires_at_unix_seconds(),
-        user_preference_observation_sha256,
         response_observation_sha256,
         request_url: receipt.request_url(),
         request_sha256: receipt.request_sha256(),
@@ -551,8 +537,6 @@ pub(crate) fn prepare_price_history_candidate(
     Ok(SchwabPendingPriceHistoryCandidate {
         capability: request.capability,
         oauth_authority: request.oauth_authority,
-        user_preference_observation_sha256,
-        market_data_permission,
         response_observation_sha256,
         requested_start,
         requested_end,
@@ -585,7 +569,6 @@ struct PendingHistoryDigestWire<'a> {
     oauth_access_expires_at_unix_seconds: u64,
     oauth_refresh_authorized_at_unix_seconds: u64,
     oauth_refresh_expires_at_unix_seconds: u64,
-    user_preference_observation_sha256: [u8; 32],
     response_observation_sha256: [u8; 32],
     request_url: &'a str,
     request_sha256: [u8; 32],

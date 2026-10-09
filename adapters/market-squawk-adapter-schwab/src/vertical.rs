@@ -2,30 +2,26 @@
 //!
 //! A successful request from one Schwab family never authorizes another family. Raw market-data
 //! capture is handed to the shared provider-capture authority; this module retains only the
-//! minimum parsed User Preference evidence needed to establish a price-history capability.
+//! observations needed to qualify the actual requested response.
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::time::Duration;
 
 use market_squawk_domain::{
-    CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, MarketDepth, ProviderChannel,
-    ProviderProduct, SourceIdentifier, Timestamp,
+    DataQuality, DigestAlgorithm, EvidenceDigest, MarketDepth, ProviderChannel, ProviderProduct,
+    SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{
-    RuntimeCapabilityDisposition, SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily,
-};
+use market_squawk_sources::{RuntimeCapabilityDisposition, SchwabMarketDataFamily};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenGeneration, ConnectionGeneration,
-    ExecutedRestResponse, MarketDataService, ReadOnlyRoute, SchwabCredentialAuthorityBinding,
-    SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabSealedStreamerCapture,
-    SchwabStreamerServiceResponseEvidence, SchwabUserPreferenceEvidence,
+    AccessTokenGeneration, ConnectionGeneration, ExecutedRestResponse, MarketDataService,
+    ReadOnlyRoute, SchwabCredentialAuthorityBinding, SchwabOAuthAuthorityReceipt,
+    SchwabRestPayload, SchwabSealedStreamerCapture, SchwabStreamerServiceResponseEvidence,
 };
 
-/// One independently probed read-only Schwab market-data family.
+/// One observed read-only Schwab market-data family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchwabObservedCapabilityFamily {
     Quotes,
@@ -66,7 +62,7 @@ impl SchwabMarketDataDepth {
     }
 }
 
-/// Opaque, family-scoped authority minted only from a current Schwab doctor receipt.
+/// Opaque qualification of one actual response under configured rights and current OAuth.
 ///
 /// Callers can retain or clone this proof, but cannot manufacture any of its market semantics or
 /// receipt digests independently.
@@ -79,7 +75,8 @@ pub struct SchwabMarketDataQualification {
     token_generation: AccessTokenGeneration,
     credential_authority: SchwabCredentialAuthorityBinding,
     session_identifier: SourceIdentifier,
-    market_data_principal_sha256: EvidenceDigest,
+    market_data_principal_sha256: Option<EvidenceDigest>,
+    request_evidence: Option<EvidenceDigest>,
     receipt_evidence: EvidenceDigest,
     observation_evidence: EvidenceDigest,
     disposition_evidence: EvidenceDigest,
@@ -94,110 +91,164 @@ pub struct SchwabMarketDataQualification {
 }
 
 impl SchwabMarketDataQualification {
-    pub fn try_from_doctor_receipt(
-        doctor: &SchwabMarketDataDoctorReceiptV1,
-        family: SchwabMarketDataFamily,
-        response_observed_at: Timestamp,
+    /// Qualifies this actual response, without requiring a prior family probe.
+    pub fn try_from_rest_response(
+        response: &ExecutedRestResponse,
         oauth_authority: SchwabOAuthAuthorityReceipt,
+        session_identifier: SourceIdentifier,
+        entitlement_evidence: EvidenceDigest,
+        capability_evidence: EvidenceDigest,
     ) -> Result<Self, SchwabVerticalError> {
-        let token_generation = oauth_authority.generation();
-        let credential_authority = oauth_authority.credential_authority();
-        let market_data_principal_sha256 = doctor.market_data_principal_sha256();
-        let evidence = doctor
-            .observation()
-            .families
-            .iter()
-            .find(|evidence| evidence.family == family)
-            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
-        let family_observed_at = evidence
-            .observed_at
-            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
-        let observation_evidence = evidence
-            .observation_sha256
-            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
-        let receipt_evidence = doctor.receipt_sha256();
-        let entitlement_evidence = doctor.rights_decision_digest();
-        let capability_evidence = doctor.capability_digest();
-        for digest in [
-            receipt_evidence,
-            observation_evidence,
-            evidence.disposition_evidence_sha256,
+        Self::try_from_rest_parts(
+            response.capture().receipt(),
+            response.payload(),
+            response.accounting(),
+            oauth_authority,
+            session_identifier,
             entitlement_evidence,
             capability_evidence,
-            credential_authority.application_credential_reference_sha256(),
-            market_data_principal_sha256,
-        ] {
-            require_qualification_digest(digest)?;
-        }
-        if !doctor.is_current_at(response_observed_at)
-            || !oauth_authority.matches_market_data_authorization(doctor)
-            || family_observed_at > doctor.verified_at()
-            || family_observed_at > response_observed_at
-            || !matches!(
-                evidence.disposition,
-                RuntimeCapabilityDisposition::Available | RuntimeCapabilityDisposition::Degraded
-            )
+        )
+    }
+
+    /// Qualifies the original already sealed response using the same response validation.
+    pub fn try_from_sealed_rest_response(
+        response: &crate::SchwabSealedRestResponse,
+        oauth_authority: SchwabOAuthAuthorityReceipt,
+        session_identifier: SourceIdentifier,
+        entitlement_evidence: EvidenceDigest,
+        capability_evidence: EvidenceDigest,
+    ) -> Result<Self, SchwabVerticalError> {
+        let parts = response.parts();
+        Self::try_from_rest_parts(
+            &parts.receipt,
+            &parts.payload,
+            parts.accounting,
+            oauth_authority,
+            session_identifier,
+            entitlement_evidence,
+            capability_evidence,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "original response and configured authority remain explicit"
+    )]
+    fn try_from_rest_parts(
+        receipt: &crate::RawRestResponseReceipt,
+        payload: &SchwabRestPayload,
+        accounting: crate::RestItemAccounting,
+        oauth_authority: SchwabOAuthAuthorityReceipt,
+        session_identifier: SourceIdentifier,
+        entitlement_evidence: EvidenceDigest,
+        capability_evidence: EvidenceDigest,
+    ) -> Result<Self, SchwabVerticalError> {
+        let family = match (receipt.route(), payload) {
+            (ReadOnlyRoute::Quotes | ReadOnlyRoute::SingleQuote, SchwabRestPayload::Quotes(_)) => {
+                SchwabMarketDataFamily::Quotes
+            }
+            (ReadOnlyRoute::Chains, SchwabRestPayload::OptionChain(_)) => {
+                SchwabMarketDataFamily::OptionChains
+            }
+            (ReadOnlyRoute::ExpirationChain, SchwabRestPayload::Expirations(_)) => {
+                SchwabMarketDataFamily::ExpirationChains
+            }
+            (ReadOnlyRoute::PriceHistory, SchwabRestPayload::PriceHistory(_)) => {
+                SchwabMarketDataFamily::PriceHistory
+            }
+            (
+                ReadOnlyRoute::Markets | ReadOnlyRoute::SingleMarket,
+                SchwabRestPayload::MarketHours(_),
+            ) => SchwabMarketDataFamily::MarketHours,
+            (ReadOnlyRoute::Movers, SchwabRestPayload::Movers(_)) => SchwabMarketDataFamily::Movers,
+            (
+                ReadOnlyRoute::Instruments | ReadOnlyRoute::InstrumentByCusip,
+                SchwabRestPayload::Instruments(_),
+            ) => SchwabMarketDataFamily::Instruments,
+            _ => return Err(SchwabVerticalError::InvalidCapabilityEvidence),
+        };
+        let response_observed_at = millis_timestamp(receipt.received_at_unix_millis())
+            .ok_or(SchwabVerticalError::Overflow)?;
+        validate_qualification_authority(
+            oauth_authority,
+            response_observed_at,
+            entitlement_evidence,
+            capability_evidence,
+        )?;
+        if receipt.status() != 200
+            || receipt.token_generation() != oauth_authority.generation()
+            || receipt.credential_authority() != oauth_authority.credential_authority()
+            || receipt.body_sha256() != payload.raw_sha256()
+            || accounting.requested == 0
+            || accounting.returned == 0
+            || accounting.provider_records == 0
         {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
-
-        let (product, channel, depth) = qualification_semantics(family);
-        let feed = SourceIdentifier::try_from(channel)
-            .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?;
-        let provider_product = ProviderProduct::new(
-            SourceIdentifier::try_from(product)
-                .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?,
-        );
-        let provider_channel = ProviderChannel::new(feed.clone());
-        let delay = match (family, doctor.quote_delay()) {
-            (SchwabMarketDataFamily::Quotes, Some(CoverageDelay::RealTime)) => {
+        let disposition = if accounting.missing == 0 && accounting.unexpected == 0 {
+            RuntimeCapabilityDisposition::Available
+        } else {
+            RuntimeCapabilityDisposition::Degraded
+        };
+        // Real-time status belongs to this response. Missing/false status proves no delay duration.
+        let delay = match payload {
+            SchwabRestPayload::Quotes(quotes)
+                if !quotes.value().quotes().is_empty()
+                    && quotes.value().quotes().iter().all(|quote| {
+                        matches!(quote.realtime(), crate::NativeField::Value(true))
+                    }) =>
+            {
                 SchwabMarketDataDelay::RealTime
-            }
-            (SchwabMarketDataFamily::Quotes, Some(CoverageDelay::Delayed(value))) => {
-                SchwabMarketDataDelay::Delayed(
-                    NonZeroU64::new(value).ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?,
-                )
-            }
-            (SchwabMarketDataFamily::Quotes, None) => {
-                return Err(SchwabVerticalError::InvalidCapabilityEvidence);
             }
             _ => SchwabMarketDataDelay::Unknown,
         };
-        let quality = if matches!(delay, SchwabMarketDataDelay::Delayed(_)) {
-            DataQuality::OfficialDelayed
-        } else {
-            DataQuality::DirectUnverified
-        };
+        let (product, channel, depth) = qualification_semantics(family);
+        let feed = SourceIdentifier::try_from(channel)
+            .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?;
+        let receipt_evidence =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, receipt_digest(receipt, accounting));
+        let observation_evidence =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.body_sha256());
+        let request_evidence =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.request_sha256());
+        for digest in [receipt_evidence, observation_evidence, request_evidence] {
+            require_qualification_digest(digest)?;
+        }
         Ok(Self {
             family,
-            disposition: evidence.disposition,
+            disposition,
             response_observed_at,
-            family_observed_at,
-            token_generation,
-            credential_authority,
-            session_identifier: doctor.session_identifier().clone(),
-            market_data_principal_sha256,
+            family_observed_at: response_observed_at,
+            token_generation: oauth_authority.generation(),
+            credential_authority: oauth_authority.credential_authority(),
+            session_identifier,
+            market_data_principal_sha256: None,
+            request_evidence: Some(request_evidence),
             receipt_evidence,
             observation_evidence,
-            disposition_evidence: evidence.disposition_evidence_sha256,
+            disposition_evidence: receipt_evidence,
             entitlement_evidence,
             capability_evidence,
+            provider_product: ProviderProduct::new(
+                SourceIdentifier::try_from(product)
+                    .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?,
+            ),
+            provider_channel: ProviderChannel::new(feed.clone()),
             feed,
             depth,
             delay,
-            quality,
-            provider_product,
-            provider_channel,
+            quality: DataQuality::DirectUnverified,
         })
     }
 
     /// Qualifies only the service proved by this original sealed SUBS acknowledgement and data.
-    /// The doctor supplies current account/rights authority, not another family's availability.
     pub fn try_from_streamer_handoff(
-        doctor: &SchwabMarketDataDoctorReceiptV1,
         handoff: &SchwabStreamerFamilyDoctorHandoff,
         response_observed_at: Timestamp,
         oauth_authority: SchwabOAuthAuthorityReceipt,
+        session_identifier: SourceIdentifier,
+        entitlement_evidence: EvidenceDigest,
+        capability_evidence: EvidenceDigest,
     ) -> Result<Self, SchwabVerticalError> {
         let family = match handoff.service() {
             MarketDataService::LevelOneEquities => SchwabMarketDataFamily::LevelOneEquities,
@@ -216,22 +267,30 @@ impl SchwabMarketDataQualification {
             MarketDataService::ScreenerOption => SchwabMarketDataFamily::ScreenerOption,
         };
         let credential_authority = oauth_authority.credential_authority();
-        if !doctor.is_current_at(response_observed_at)
-            || !oauth_authority.matches_market_data_authorization(doctor)
-            || handoff.token_generation() != oauth_authority.generation()
+        validate_qualification_authority(
+            oauth_authority,
+            response_observed_at,
+            entitlement_evidence,
+            capability_evidence,
+        )?;
+        validate_qualification_authority(
+            oauth_authority,
+            handoff.observed_at,
+            entitlement_evidence,
+            capability_evidence,
+        )?;
+        if handoff.token_generation() != oauth_authority.generation()
             || handoff.credential_authority() != credential_authority
-            || handoff.session_identifier() != doctor.session_identifier()
-            || handoff.market_data_principal_sha256() != doctor.market_data_principal_sha256()
+            || handoff.session_identifier() != &session_identifier
             || handoff.observed_at > response_observed_at
-            || !doctor.is_current_at(handoff.observed_at)
             || handoff.provider_records() == 0
         {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
         for digest in [
-            doctor.receipt_sha256(),
-            doctor.rights_decision_digest(),
-            doctor.capability_digest(),
+            entitlement_evidence,
+            capability_evidence,
+            handoff.market_data_principal_sha256(),
             handoff.capture_set_sha256(),
         ] {
             require_qualification_digest(digest)?;
@@ -246,13 +305,14 @@ impl SchwabMarketDataQualification {
             family_observed_at: handoff.observed_at,
             token_generation: oauth_authority.generation(),
             credential_authority,
-            session_identifier: doctor.session_identifier().clone(),
-            market_data_principal_sha256: doctor.market_data_principal_sha256(),
-            receipt_evidence: doctor.receipt_sha256(),
+            session_identifier,
+            market_data_principal_sha256: Some(handoff.market_data_principal_sha256()),
+            request_evidence: None,
+            receipt_evidence: handoff.capture_set_sha256(),
             observation_evidence: handoff.capture_set_sha256(),
             disposition_evidence: handoff.capture_set_sha256(),
-            entitlement_evidence: doctor.rights_decision_digest(),
-            capability_evidence: doctor.capability_digest(),
+            entitlement_evidence,
+            capability_evidence,
             provider_product: ProviderProduct::new(
                 SourceIdentifier::try_from(product)
                     .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?,
@@ -286,7 +346,7 @@ impl SchwabMarketDataQualification {
     pub const fn session_identifier(&self) -> &SourceIdentifier {
         &self.session_identifier
     }
-    pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
+    pub const fn market_data_principal_sha256(&self) -> Option<EvidenceDigest> {
         self.market_data_principal_sha256
     }
     pub const fn receipt_evidence(&self) -> EvidenceDigest {
@@ -338,14 +398,6 @@ impl SchwabMarketDataQualification {
         family_streamer_service(self.family)
     }
 
-    pub(crate) fn validates_rest_response(
-        &self,
-        family: SchwabMarketDataFamily,
-        response: &ExecutedRestResponse,
-    ) -> bool {
-        self.validates_rest_receipt(family, response.capture().receipt())
-    }
-
     pub(crate) fn validates_rest_receipt(
         &self,
         family: SchwabMarketDataFamily,
@@ -353,6 +405,11 @@ impl SchwabMarketDataQualification {
     ) -> bool {
         self.family == family
             && self.rest_service().is_some()
+            && receipt.status() == 200
+            && self.observation_evidence.bytes() == receipt.body_sha256()
+            && self
+                .request_evidence
+                .is_some_and(|digest| digest.bytes() == receipt.request_sha256())
             && receipt.token_generation() == self.token_generation
             && receipt.credential_authority() == self.credential_authority
             && millis_timestamp(receipt.received_at_unix_millis())
@@ -388,11 +445,11 @@ impl SchwabMarketDataQualification {
             && handoff.token_generation() == self.token_generation
             && handoff.credential_authority() == self.credential_authority
             && handoff.session_identifier() == &self.session_identifier
-            && handoff.market_data_principal_sha256() == self.market_data_principal_sha256
+            && Some(handoff.market_data_principal_sha256()) == self.market_data_principal_sha256
             && receipt.token_generation() == self.token_generation
             && receipt.credential_authority() == self.credential_authority
             && receipt.session_identifier() == &self.session_identifier
-            && receipt.market_data_principal_sha256() == self.market_data_principal_sha256
+            && Some(receipt.market_data_principal_sha256()) == self.market_data_principal_sha256
             && handoff.generation() == receipt.generation()
             && (last_ack_ordinal.is_some_and(|last| frame.transport_ordinal() > last)
                 || handoff
@@ -411,6 +468,32 @@ impl SchwabMarketDataQualification {
             && millis_timestamp(frame.received_at_unix_millis())
                 .is_some_and(|received_at| received_at == self.response_observed_at)
     }
+}
+
+fn validate_qualification_authority(
+    oauth: SchwabOAuthAuthorityReceipt,
+    observed_at: Timestamp,
+    rights: EvidenceDigest,
+    capability: EvidenceDigest,
+) -> Result<(), SchwabVerticalError> {
+    let seconds = u64::try_from(observed_at.unix_nanos())
+        .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?
+        / 1_000_000_000;
+    if seconds < oauth.access_issued_at_unix_seconds()
+        || seconds >= oauth.access_expires_at_unix_seconds()
+    {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    }
+    for digest in [
+        rights,
+        capability,
+        oauth
+            .credential_authority()
+            .application_credential_reference_sha256(),
+    ] {
+        require_qualification_digest(digest)?;
+    }
+    Ok(())
 }
 
 fn require_qualification_digest(digest: EvidenceDigest) -> Result<(), SchwabVerticalError> {
@@ -1320,144 +1403,56 @@ pub enum SchwabCapabilityCurrentness {
     Expired,
     TokenGenerationChanged,
     OAuthAuthorityChanged,
-    PrincipalChanged,
-    BootstrapChanged,
-    ProbeChanged,
+    ResponseChanged,
 }
 
-/// Fresh User Preference plus exact daily price-history response evidence.
-#[derive(Clone, Copy, Eq, PartialEq)]
+/// Evidence for one exact daily-history response; no unrelated bootstrap grants access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchwabPriceHistoryCapabilityObservation {
     observed_at_unix_seconds: u64,
-    expires_at_unix_seconds: u64,
     oauth_authority: SchwabOAuthAuthorityReceipt,
-    market_data_principal_sha256: [u8; 32],
-    user_preference_receipt_sha256: [u8; 32],
     price_history_receipt_sha256: [u8; 32],
-    request_sha256: [u8; 32],
-    response_sha256: [u8; 32],
-    returned_candles: u64,
-    receipt_sha256: [u8; 32],
-}
-
-impl fmt::Debug for SchwabPriceHistoryCapabilityObservation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SchwabPriceHistoryCapabilityObservation")
-            .field("family", &self.family())
-            .field("observed_at_unix_seconds", &self.observed_at_unix_seconds)
-            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
-            .field("oauth_authority", &self.oauth_authority)
-            .field("market_data_principal", &"[ONE-WAY BINDING]")
-            .field("user_preference_receipt", &"[DIGEST]")
-            .field("price_history_receipt", &"[DIGEST]")
-            .field("returned_candles", &self.returned_candles)
-            .field("receipt", &"[DIGEST]")
-            .finish()
-    }
 }
 
 impl SchwabPriceHistoryCapabilityObservation {
-    /// Observes only an exact daily, frequency-one, explicit-range price-history probe.
+    /// Observes the actual daily, frequency-one, explicit-range response.
     pub fn try_observe(
         oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference_probe: &SchwabUserPreferenceEvidence,
-        price_history_probe: &ExecutedRestResponse,
+        price_history_response: &ExecutedRestResponse,
         observed_at_unix_seconds: u64,
-        valid_for: Duration,
     ) -> Result<Self, SchwabVerticalError> {
-        let preference_receipt = user_preference_probe.receipt();
-        let history_receipt = price_history_probe.capture().receipt();
-        let bootstrap = user_preference_probe.bootstrap();
-        let SchwabRestPayload::PriceHistory(history) = price_history_probe.payload() else {
+        let receipt = price_history_response.capture().receipt();
+        let SchwabRestPayload::PriceHistory(history) = price_history_response.payload() else {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         };
-        let Some((_start, _end)) = exact_daily_range(history_receipt.request_url()) else {
-            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
-        };
-        let preference_accounting = user_preference_probe.accounting();
-        let history_accounting = price_history_probe.accounting();
-        let expires_at_unix_seconds = observed_at_unix_seconds
-            .checked_add(valid_for.as_secs())
-            .ok_or(SchwabVerticalError::Overflow)?;
-        if valid_for.is_zero()
-            || valid_for > Duration::from_secs(ACCESS_TOKEN_MAX_LIFETIME_SECONDS)
+        let accounting = price_history_response.accounting();
+        if exact_daily_range(receipt.request_url()).is_none()
             || observed_at_unix_seconds < oauth_authority.access_issued_at_unix_seconds()
             || observed_at_unix_seconds >= oauth_authority.access_expires_at_unix_seconds()
-            || expires_at_unix_seconds > oauth_authority.access_expires_at_unix_seconds()
-            || oauth_authority.generation() != preference_receipt.token_generation()
-            || oauth_authority.generation() != history_receipt.token_generation()
-            || oauth_authority.credential_authority() != preference_receipt.credential_authority()
-            || oauth_authority.credential_authority() != history_receipt.credential_authority()
-            || preference_receipt.route() != ReadOnlyRoute::UserPreference
-            || history_receipt.route() != ReadOnlyRoute::PriceHistory
-            || preference_receipt.token_generation() != history_receipt.token_generation()
-            || preference_receipt.status() != 200
-            || history_receipt.status() != 200
-            || preference_receipt.body_sha256() != bootstrap.raw_sha256()
-            || history_receipt.body_sha256() != history.raw_sha256()
-            || bootstrap.value().market_data_principal_sha256() == [0; 32]
-            || preference_accounting.requested != 1
-            || preference_accounting.returned != 1
-            || preference_accounting.missing != 0
-            || preference_accounting.unexpected != 0
-            || preference_accounting.provider_records != 1
-            || history_accounting.requested != 1
-            || history_accounting.returned != 1
-            || history_accounting.missing != 0
-            || history_accounting.unexpected != 0
-            || history_accounting.provider_records == 0
+            || receipt.received_at_unix_millis() / 1_000 > observed_at_unix_seconds
+            || receipt.received_at_unix_millis() / 1_000
+                < oauth_authority.access_issued_at_unix_seconds()
+            || oauth_authority.generation() != receipt.token_generation()
+            || oauth_authority.credential_authority() != receipt.credential_authority()
+            || receipt.route() != ReadOnlyRoute::PriceHistory
+            || receipt.status() != 200
+            || receipt.body_sha256() != history.raw_sha256()
+            || accounting.requested != 1
+            || accounting.returned != 1
+            || accounting.missing != 0
+            || accounting.unexpected != 0
+            || accounting.provider_records == 0
             || history.value().empty
             || history.value().candles().is_empty()
-            || u64::try_from(history.value().candles().len())
-                .ok()
-                .is_none_or(|count| count != history_accounting.provider_records)
-            || preference_receipt.received_at_unix_millis()
-                > history_receipt.received_at_unix_millis()
+            || u64::try_from(history.value().candles().len()).ok()
+                != Some(accounting.provider_records)
         {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
-        validate_observed_clock(
-            preference_receipt.received_at_unix_millis(),
-            observed_at_unix_seconds,
-            valid_for,
-        )?;
-        validate_observed_clock(
-            history_receipt.received_at_unix_millis(),
-            observed_at_unix_seconds,
-            valid_for,
-        )?;
-        if expires_at_unix_seconds <= observed_at_unix_seconds {
-            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
-        }
-        let market_data_principal_sha256 = bootstrap.value().market_data_principal_sha256();
-        let user_preference_receipt_sha256 = user_preference_receipt_digest(user_preference_probe);
-        let price_history_receipt_sha256 = rest_receipt_digest(price_history_probe);
-        let request_sha256 = history_receipt.request_sha256();
-        let response_sha256 = history_receipt.body_sha256();
-        let returned_candles = history_accounting.provider_records;
-        let receipt_sha256 = capability_digest(
-            observed_at_unix_seconds,
-            expires_at_unix_seconds,
-            oauth_authority,
-            market_data_principal_sha256,
-            user_preference_receipt_sha256,
-            price_history_receipt_sha256,
-            request_sha256,
-            response_sha256,
-            returned_candles,
-        );
         Ok(Self {
             observed_at_unix_seconds,
-            expires_at_unix_seconds,
             oauth_authority,
-            market_data_principal_sha256,
-            user_preference_receipt_sha256,
-            price_history_receipt_sha256,
-            request_sha256,
-            response_sha256,
-            returned_candles,
-            receipt_sha256,
+            price_history_receipt_sha256: rest_receipt_digest(price_history_response),
         })
     }
 
@@ -1465,24 +1460,22 @@ impl SchwabPriceHistoryCapabilityObservation {
         SchwabObservedCapabilityFamily::DailyPriceHistory
     }
     pub const fn receipt_sha256(self) -> [u8; 32] {
-        self.receipt_sha256
+        self.price_history_receipt_sha256
     }
     pub const fn expires_at_unix_seconds(self) -> u64 {
-        self.expires_at_unix_seconds
+        self.oauth_authority.access_expires_at_unix_seconds()
     }
 
     pub fn currentness(
         self,
         oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference_probe: &SchwabUserPreferenceEvidence,
-        price_history_probe: &ExecutedRestResponse,
+        price_history_response: &ExecutedRestResponse,
         now_unix_seconds: u64,
     ) -> SchwabCapabilityCurrentness {
         self.currentness_from_receipt(
             oauth_authority,
-            user_preference_probe,
-            price_history_probe.capture().receipt(),
-            price_history_probe.accounting(),
+            price_history_response.capture().receipt(),
+            price_history_response.accounting(),
             now_unix_seconds,
         )
     }
@@ -1490,58 +1483,29 @@ impl SchwabPriceHistoryCapabilityObservation {
     pub(crate) fn currentness_from_receipt(
         self,
         oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference_probe: &SchwabUserPreferenceEvidence,
         receipt: &crate::RawRestResponseReceipt,
-        history_accounting: crate::RestItemAccounting,
+        accounting: crate::RestItemAccounting,
         now_unix_seconds: u64,
     ) -> SchwabCapabilityCurrentness {
         if now_unix_seconds < self.observed_at_unix_seconds
-            || now_unix_seconds >= self.expires_at_unix_seconds
             || now_unix_seconds < oauth_authority.access_issued_at_unix_seconds()
             || now_unix_seconds >= oauth_authority.access_expires_at_unix_seconds()
         {
             return SchwabCapabilityCurrentness::Expired;
         }
-        let preference_receipt = user_preference_probe.receipt();
-        if preference_receipt.token_generation() != oauth_authority.generation()
-            || receipt.token_generation() != oauth_authority.generation()
-        {
+        if receipt.token_generation() != oauth_authority.generation() {
             return SchwabCapabilityCurrentness::TokenGenerationChanged;
         }
-        if preference_receipt.credential_authority() != oauth_authority.credential_authority()
-            || receipt.credential_authority() != oauth_authority.credential_authority()
+        if receipt.credential_authority() != oauth_authority.credential_authority()
+            || oauth_authority != self.oauth_authority
         {
             return SchwabCapabilityCurrentness::OAuthAuthorityChanged;
-        }
-        if oauth_authority != self.oauth_authority {
-            return SchwabCapabilityCurrentness::OAuthAuthorityChanged;
-        }
-        let bootstrap = user_preference_probe.bootstrap();
-        if bootstrap.value().market_data_principal_sha256() != self.market_data_principal_sha256 {
-            return SchwabCapabilityCurrentness::PrincipalChanged;
-        }
-        let accounting = user_preference_probe.accounting();
-        if preference_receipt.route() != ReadOnlyRoute::UserPreference
-            || preference_receipt.status() != 200
-            || preference_receipt.body_sha256() != bootstrap.raw_sha256()
-            || accounting.requested != 1
-            || accounting.returned != 1
-            || accounting.missing != 0
-            || accounting.unexpected != 0
-            || accounting.provider_records != 1
-            || user_preference_receipt_digest(user_preference_probe)
-                != self.user_preference_receipt_sha256
-            || preference_receipt.received_at_unix_millis() > receipt.received_at_unix_millis()
-        {
-            return SchwabCapabilityCurrentness::BootstrapChanged;
         }
         if receipt.route() != ReadOnlyRoute::PriceHistory
-            || receipt.request_sha256() != self.request_sha256
-            || receipt.body_sha256() != self.response_sha256
-            || rest_receipt_digest_from_parts(receipt, history_accounting)
+            || rest_receipt_digest_from_parts(receipt, accounting)
                 != self.price_history_receipt_sha256
         {
-            return SchwabCapabilityCurrentness::ProbeChanged;
+            return SchwabCapabilityCurrentness::ResponseChanged;
         }
         SchwabCapabilityCurrentness::Current
     }
@@ -1597,24 +1561,6 @@ fn millis_timestamp(value: u64) -> Option<Timestamp> {
         .map(Timestamp::from_unix_nanos)
 }
 
-fn validate_observed_clock(
-    received_at_unix_millis: u64,
-    observed_at_unix_seconds: u64,
-    valid_for: Duration,
-) -> Result<(), SchwabVerticalError> {
-    let ceiling = observed_at_unix_seconds
-        .checked_add(1)
-        .and_then(|value| value.checked_mul(1_000))
-        .and_then(|value| value.checked_sub(1))
-        .ok_or(SchwabVerticalError::Overflow)?;
-    let maximum_age =
-        u64::try_from(valid_for.as_millis()).map_err(|_| SchwabVerticalError::Overflow)?;
-    if received_at_unix_millis > ceiling || ceiling - received_at_unix_millis > maximum_age {
-        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
-    }
-    Ok(())
-}
-
 pub(crate) fn rest_receipt_digest(response: &ExecutedRestResponse) -> [u8; 32] {
     receipt_digest(response.capture().receipt(), response.accounting())
 }
@@ -1624,10 +1570,6 @@ pub(crate) fn rest_receipt_digest_from_parts(
     accounting: crate::RestItemAccounting,
 ) -> [u8; 32] {
     receipt_digest(receipt, accounting)
-}
-
-pub(crate) fn user_preference_receipt_digest(response: &SchwabUserPreferenceEvidence) -> [u8; 32] {
-    receipt_digest(response.receipt(), response.accounting())
 }
 
 fn receipt_digest(
@@ -1665,55 +1607,6 @@ fn receipt_digest(
     ] {
         hasher.update(value.to_be_bytes());
     }
-    hasher.finalize().into()
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "all observed evidence stays explicit"
-)]
-fn capability_digest(
-    observed_at: u64,
-    expires_at: u64,
-    oauth_authority: SchwabOAuthAuthorityReceipt,
-    principal: [u8; 32],
-    preference_receipt: [u8; 32],
-    history_receipt: [u8; 32],
-    request: [u8; 32],
-    response: [u8; 32],
-    returned_candles: u64,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/schwab-daily-price-history-capability/v1");
-    hasher.update(observed_at.to_be_bytes());
-    hasher.update(expires_at.to_be_bytes());
-    hasher.update(oauth_authority.generation().get().to_be_bytes());
-    hasher.update(
-        oauth_authority
-            .access_issued_at_unix_seconds()
-            .to_be_bytes(),
-    );
-    hasher.update(
-        oauth_authority
-            .access_expires_at_unix_seconds()
-            .to_be_bytes(),
-    );
-    hasher.update(
-        oauth_authority
-            .refresh_authorized_at_unix_seconds()
-            .to_be_bytes(),
-    );
-    hasher.update(
-        oauth_authority
-            .refresh_expires_at_unix_seconds()
-            .to_be_bytes(),
-    );
-    hasher.update(principal);
-    hasher.update(preference_receipt);
-    hasher.update(history_receipt);
-    hasher.update(request);
-    hasher.update(response);
-    hasher.update(returned_candles.to_be_bytes());
     hasher.finalize().into()
 }
 

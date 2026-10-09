@@ -19,10 +19,7 @@ use market_squawk_domain::{
     RevisionBoundPayloadEvidence, SourceIdentifier, Timestamp,
 };
 use market_squawk_services::ServiceError;
-use market_squawk_sources::{
-    RuntimeCapabilityDisposition, SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily,
-    SourceMetadata,
-};
+use market_squawk_sources::SourceMetadata;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -47,7 +44,6 @@ pub(crate) struct SchwabInstrumentReferencePublicationAuthority {
     research: Arc<ResearchService>,
     operation: ResearchProviderPublicationOperation,
     coordinates: SchwabCaptureCoordinates,
-    doctor: SchwabMarketDataDoctorReceiptV1,
     oauth: SchwabOAuthReceiptCurrentness,
     receipt: market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt,
 }
@@ -56,7 +52,6 @@ impl ProductionResearchIngestCoordinator {
     pub(crate) async fn acquire_schwab_instrument_reference_publication(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
-        doctor: SchwabMarketDataDoctorReceiptV1,
         oauth: SchwabOAuthReceiptCurrentness,
         receipt: market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt,
         deadline: Instant,
@@ -65,24 +60,16 @@ impl ProductionResearchIngestCoordinator {
         Arc<SchwabInstrumentReferencePublicationAuthority>,
         SchwabInstrumentReferencePublicationError,
     > {
-        if doctor.surface_id().as_str() != market_squawk_sources::SCHWAB_MARKET_DATA_SURFACE_ID
-            || generation.profile().as_str() != SCHWAB_INSTRUMENT_REFERENCE_PROFILE
+        if generation.profile().as_str() != SCHWAB_INSTRUMENT_REFERENCE_PROFILE
             || generation.metadata().source_id().as_str() != SCHWAB_INSTRUMENT_REFERENCE_SOURCE
             || generation.metadata().capabilities().live()
             || !generation.metadata().coverage().live_channels().is_empty()
             || generation.session_id() != oauth.session_id()
-            || doctor.session_identifier().as_str() != generation.session_id().to_string()
-            || generation.credential_generation()
-                != Some(doctor.application_credential_generation())
-            || generation.capability_revision() != doctor.capability_revision()
-            || generation.capability_digest() != doctor.capability_digest()
-            || generation.parent_rights_authorization_evidence() != doctor.rights_decision_digest()
-            || generation
-                .metadata()
-                .authorization()
-                .evidence()
-                .content_digest()
-                != doctor.receipt_sha256()
+            || generation.secret_reference().is_none()
+            || generation.credential_generation() != Some(receipt.credential_authority().application_credential_generation())
+            || market_squawk_adapter_schwab::SchwabCredentialAuthorityBinding::try_from_application_credential(
+                generation.secret_reference().ok_or(ServiceError::Unauthorized)?
+            )? != receipt.credential_authority()
         {
             return Err(ServiceError::Unauthorized.into());
         }
@@ -103,7 +90,6 @@ impl ProductionResearchIngestCoordinator {
             research: Arc::clone(&self.research),
             operation,
             coordinates,
-            doctor,
             oauth,
             receipt,
         });
@@ -125,22 +111,9 @@ impl SchwabInstrumentReferencePublicationAuthority {
             .validate_precommit()
             .map_err(|_| ServiceError::Unauthorized)?;
         self.oauth
-            .validate_current_receipt(self.receipt)
+            .validate_current_authorization(self.receipt)
             .map_err(|_| ServiceError::Unauthorized)?;
-        let observation = self.doctor.observation();
-        if !self.doctor.admits_source_start()
-            || !self.doctor.is_current_at(now)
-            || !self.metadata().is_effective_at(now)
-            || !self.receipt.matches_market_data_authorization(&self.doctor)
-            || !observation.families.iter().any(|family| {
-                family.family == SchwabMarketDataFamily::Instruments
-                    && matches!(
-                        family.disposition,
-                        RuntimeCapabilityDisposition::Available
-                            | RuntimeCapabilityDisposition::Degraded
-                    )
-            })
-        {
+        if !self.metadata().is_effective_at(now) {
             return Err(ServiceError::Unauthorized);
         }
         self.operation.rights().validate_at(now)

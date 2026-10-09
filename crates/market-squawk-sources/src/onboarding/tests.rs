@@ -830,7 +830,7 @@ fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal
 }
 
 #[test]
-fn schwab_pending_doctor_renewal_preserves_candidate_until_explicit_activation() -> TestResult {
+fn schwab_configured_credentials_admit_without_saved_runtime_probe() -> TestResult {
     let profiles = built_in_provider_profiles()?;
     let profile = profiles
         .get(SCHWAB_MARKET_DATA_SURFACE_ID)
@@ -879,226 +879,42 @@ fn schwab_pending_doctor_renewal_preserves_candidate_until_explicit_activation()
     ] {
         lifecycle.apply(capability, event, Timestamp::from_unix_nanos(100))?;
     }
-    let initial_input = schwab_pending_doctor_input(profile, session, configuration)?;
-    let initial = SchwabMarketDataDoctorReceiptV1::try_new(initial_input.clone())?;
-    let initial_digest = initial.receipt_sha256();
-    lifecycle.apply(
-        capability,
-        OnboardingEvent::RuntimeVerified {
-            generation: Some(generation),
-            evidence: RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(
-                initial,
-            )),
-        },
-        Timestamp::from_unix_nanos(1_100),
-    )?;
-
-    let renewal_time = Timestamp::from_unix_nanos(2_100);
-    let mut renewed_input = initial_input.clone();
-    renewed_input.predecessor_digest = Some(initial_digest);
-    renewed_input.observation.access_token_generation = 2;
-    renewed_input.observation.authorization_generation = 2;
-    renewed_input.observation.refresh_authorized_at =
-        Timestamp::from_unix_nanos(3_100 - 604_800_000_000_000);
-    renewed_input.observation.refresh_expires_at = Timestamp::from_unix_nanos(3_100);
-    renewed_input.observation.access_issued_at = Timestamp::from_unix_nanos(2_000);
-    renewed_input.observation.access_expires_at = Timestamp::from_unix_nanos(3_100);
-    renewed_input.observation.completed_at = renewal_time;
-    renewed_input.observation.user_preference.received_at = renewal_time;
-    for family in &mut renewed_input.observation.families {
-        family.observed_at = Some(renewal_time);
-    }
-    renewed_input.exclusive_expires_at = Timestamp::from_unix_nanos(3_100);
-
-    // Neither an early commit nor evidence collected before the old receipt expired renews it.
-    let mut early_input = initial_input;
-    early_input.predecessor_digest = Some(initial_digest);
-    early_input.observation.completed_at = Timestamp::from_unix_nanos(1_200);
-    early_input.observation.access_expires_at = Timestamp::from_unix_nanos(2_200);
-    // The grant deadline remains unchanged when only an access token rotates.
-    for observed_at in [Timestamp::from_unix_nanos(1_300), Timestamp::from_unix_nanos(1_400)] {
-        let early = SchwabMarketDataDoctorReceiptV1::try_new(early_input.clone())?;
-        assert!(matches!(
-            lifecycle.apply(
-                capability,
-                OnboardingEvent::RuntimeVerified {
-                    generation: Some(generation),
-                    evidence: RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(
-                        Box::new(early),
-                    ),
-                },
-                observed_at,
-            ),
-            Err(OnboardingStateError::InvalidEvidence)
-        ));
-    }
+    assert_eq!(lifecycle.generation_runtime_evidence(generation), None);
+    assert_eq!(lifecycle.active_generation(), None);
+    assert_eq!(lifecycle.candidate_generation(), Some(generation));
+    // A placeholder probe cannot stand in for actual OAuth/request authorization.
     assert!(
         lifecycle
             .apply(
                 capability,
-                OnboardingEvent::Activate {
-                    generation: Some(generation),
-                },
-                renewal_time,
-            )
-            .is_err()
-    );
-
-    for mismatch in 0..5 {
-        let mut rejected = renewed_input.clone();
-        match mismatch {
-            0 => rejected.predecessor_digest = Some(digest(77)),
-            1 => rejected.public_configuration_digest = digest(78),
-            2 => rejected.application_credential_generation = SecretGeneration::new(2)?,
-            3 => rejected.application_credential_reference_sha256 = digest(79),
-            _ => {
-                rejected
-                    .observation
-                    .user_preference
-                    .market_data_principal_sha256 = digest(80)
-            }
-        }
-        let rejected = SchwabMarketDataDoctorReceiptV1::try_new(rejected)?;
-        assert!(matches!(
-            lifecycle.apply(
-                capability,
                 OnboardingEvent::RuntimeVerified {
                     generation: Some(generation),
-                    evidence: RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(
-                        Box::new(rejected),
-                    ),
+                    evidence: RuntimeVerificationEvidence::digest_v1(digest(74))?,
                 },
-                renewal_time,
-            ),
-            Err(OnboardingStateError::EvidenceMismatch)
-        ));
-        assert_eq!(
-            lifecycle.state(),
-            OnboardingState::RuntimeVerificationPending
-        );
-        assert_eq!(
-            lifecycle.generation_runtime_digest(generation),
-            Some(initial_digest)
-        );
-    }
-
-    let renewed = SchwabMarketDataDoctorReceiptV1::try_new(renewed_input)?;
-    let renewed_digest = renewed.receipt_sha256();
-    assert_eq!(renewed.access_token_generation(), 2);
-    assert_eq!(
-        lifecycle.apply(
-            capability,
-            OnboardingEvent::RuntimeVerified {
-                generation: Some(generation),
-                evidence: RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(
-                    renewed,
-                )),
-            },
-            renewal_time,
-        )?,
-        OnboardingState::RuntimeVerificationPending
-    );
-    assert_eq!(lifecycle.active_generation(), None);
-    assert_eq!(lifecycle.candidate_generation(), Some(generation));
-    assert_eq!(lifecycle.generation_reference(generation), Some(&reference));
-    assert_eq!(
-        lifecycle.generation_state(generation),
-        Some(CredentialGenerationState::VerifiedLeastPrivilege)
-    );
-    assert_eq!(
-        lifecycle.generation_runtime_digest(generation),
-        Some(renewed_digest)
+                Timestamp::from_unix_nanos(101),
+            )
+            .is_err()
     );
     assert_eq!(
         lifecycle.apply(
             capability,
             OnboardingEvent::Activate {
-                generation: Some(generation),
+                generation: Some(generation)
             },
-            renewal_time,
+            Timestamp::from_unix_nanos(102),
         )?,
         OnboardingState::ActiveScoped
     );
     assert_eq!(lifecycle.active_generation(), Some(generation));
-    assert_eq!(lifecycle.candidate_generation(), None);
+    assert_eq!(lifecycle.generation_reference(generation), Some(&reference));
+    assert!(
+        lifecycle.active_generation_is_fully_admitted(
+            capability,
+            Timestamp::from_unix_nanos(1_000_000)
+        )?
+    );
+    assert_eq!(lifecycle.generation_runtime_digest(generation), None);
     Ok(())
-}
-
-fn schwab_pending_doctor_input(
-    profile: &ProviderOnboardingProfile,
-    session_identifier: SourceIdentifier,
-    public_configuration_digest: EvidenceDigest,
-) -> TestResult<SchwabMarketDataDoctorReceiptInput> {
-    let observed_at = Timestamp::from_unix_nanos(1_000);
-    let expires_at = Timestamp::from_unix_nanos(2_000);
-    let families = [
-        SchwabMarketDataFamily::Quotes,
-        SchwabMarketDataFamily::PriceHistory,
-        SchwabMarketDataFamily::OptionChains,
-        SchwabMarketDataFamily::ExpirationChains,
-        SchwabMarketDataFamily::Movers,
-        SchwabMarketDataFamily::MarketHours,
-        SchwabMarketDataFamily::Instruments,
-        SchwabMarketDataFamily::LevelOneEquities,
-        SchwabMarketDataFamily::LevelOneOptions,
-        SchwabMarketDataFamily::LevelOneFutures,
-        SchwabMarketDataFamily::LevelOneFuturesOptions,
-        SchwabMarketDataFamily::LevelOneForex,
-        SchwabMarketDataFamily::NyseBook,
-        SchwabMarketDataFamily::NasdaqBook,
-        SchwabMarketDataFamily::OptionsBook,
-        SchwabMarketDataFamily::ChartEquity,
-        SchwabMarketDataFamily::ChartFutures,
-        SchwabMarketDataFamily::ScreenerEquity,
-        SchwabMarketDataFamily::ScreenerOption,
-    ]
-    .map(|family| SchwabMarketDataFamilyEvidence {
-        family,
-        disposition: RuntimeCapabilityDisposition::Available,
-        disposition_evidence_sha256: digest(81),
-        observation_sha256: Some(digest(82)),
-        observed_at: Some(observed_at),
-    });
-    Ok(SchwabMarketDataDoctorReceiptInput {
-        surface_id: profile.capability().surface_id().clone(),
-        session_identifier,
-        application_credential_generation: SecretGeneration::new(1)?,
-        application_credential_reference_sha256: digest(83),
-        capability_revision: profile.capability().revision(),
-        capability_digest: profile.capability().content_digest(),
-        public_configuration_digest,
-        rights_decision_digest: profile.rights_decision_digest(),
-        rate_policy_digest: profile.capability().rate_policy().evidence_digest(),
-        data_quality: DataQuality::DirectUnverified,
-        observation: SchwabMarketDataDoctorObservation {
-            provider_observation_origin:
-                SchwabMarketDataDoctorObservation::provider_observed_origin()?,
-            access_token_generation: 1,
-            authorization_generation: 1,
-            authorization_scope_sha256: digest(89),
-            access_issued_at: Timestamp::from_unix_nanos(100),
-            access_expires_at: expires_at,
-            refresh_authorized_at: Timestamp::from_unix_nanos(2_000 - 604_800_000_000_000),
-            refresh_expires_at: expires_at,
-            user_preference: SchwabUserPreferenceDoctorEvidence {
-                endpoint_contract_sha256: digest(84),
-                request_sha256: digest(85),
-                response_sha256: digest(86),
-                status_code: 200,
-                response_bytes: 128,
-                received_at: observed_at,
-                latency_nanos: 10,
-                market_data_principal_sha256: digest(87),
-                streamer_bootstrap_sha256: digest(88),
-                market_data_offer_sha256: None,
-            },
-            quote_delay: Some(market_squawk_domain::CoverageDelay::RealTime),
-            families: Box::new(families),
-            completed_at: observed_at,
-        },
-        exclusive_expires_at: expires_at,
-        predecessor_digest: None,
-    })
 }
 
 #[test]
@@ -1651,22 +1467,9 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             assert_eq!(policy.window_count(), 0);
             assert_eq!(policy.requests_per_window(), None);
             assert_eq!(policy.max_concurrent(), 1);
-            assert_eq!(profile.capability().revision().get(), 4);
-            assert_eq!(
-                profile.rights_decision_digest().bytes(),
-                [
-                    164, 108, 225, 133, 28, 167, 27, 89, 242, 4, 120, 19, 168, 69, 11, 19, 219, 78,
-                    54, 108, 44, 8, 66, 112, 168, 194, 254, 91, 217, 225, 234, 83
-                ]
-            );
-            assert_eq!(
-                profile.capability().content_digest().bytes(),
-                [
-                    0x07, 0x68, 0xde, 0x8c, 0x69, 0xca, 0x14, 0x56, 0xd4, 0xf8, 0xe1, 0xea, 0xc7,
-                    0xfa, 0xd8, 0x37, 0x42, 0xd6, 0x49, 0x57, 0xa2, 0x39, 0xa1, 0x0f, 0x35, 0x36,
-                    0x97, 0x46, 0x56, 0xfd, 0x16, 0x52
-                ]
-            );
+            assert_eq!(profile.capability().revision().get(), 1);
+            assert_eq!(descriptor, profile.capability().rate_policy());
+            assert_eq!(profile.capability_history().count(), 1);
         } else {
             assert_eq!(descriptor, profile.capability().rate_policy());
             assert!(policy.window_count() >= 1);

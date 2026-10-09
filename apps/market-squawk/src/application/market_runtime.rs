@@ -1202,7 +1202,10 @@ impl MarketRuntimeRegistry {
                 error: ServiceError::Unavailable,
             };
         }
-        let active_lease = if matches!(request.surface(), AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData) {
+        let active_lease = if matches!(
+            request.surface(),
+            AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData
+        ) {
             match publication_authority.commit_prepared_activation(&account_lease) {
                 Ok(active) => active,
                 Err(error) => {
@@ -3868,7 +3871,7 @@ struct AccountRuntimeEvidenceCoordinates<'a> {
     surface_id: &'a str,
     onboarding_session_id: uuid::Uuid,
     public_configuration_digest: EvidenceDigest,
-    runtime_verification_receipt_digest: EvidenceDigest,
+    runtime_verification_receipt_digest: Option<EvidenceDigest>,
     credential_generation: SecretGeneration,
 }
 
@@ -4505,7 +4508,7 @@ mod tests {
             AccountMarketSurface::AlpacaBasic,
             uuid::Uuid::new_v4(),
             digest(1),
-            digest(2),
+            Some(digest(2)),
             SecretGeneration::new(1).expect("generation"),
         )
         .expect("exact request");
@@ -4660,7 +4663,7 @@ mod tests {
             AccountMarketSurface::AlpacaBasic,
             session_id,
             public_configuration_digest,
-            runtime_receipt_digest,
+            Some(runtime_receipt_digest),
             credential_generation,
         )
         .expect("exact request");
@@ -4668,7 +4671,7 @@ mod tests {
             surface_id: AccountMarketSurface::AlpacaBasic.surface_id(),
             onboarding_session_id: session_id,
             public_configuration_digest,
-            runtime_verification_receipt_digest: runtime_receipt_digest,
+            runtime_verification_receipt_digest: Some(runtime_receipt_digest),
             credential_generation,
         };
         assert_eq!(
@@ -4680,7 +4683,7 @@ mod tests {
                 request,
                 Some(session_id),
                 AccountRuntimeEvidenceCoordinates {
-                    runtime_verification_receipt_digest: digest(4),
+                    runtime_verification_receipt_digest: Some(digest(4)),
                     ..exact
                 },
             ),

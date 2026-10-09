@@ -4,9 +4,51 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`4dcf22ba`. Main/release unchanged; no extra branch created.
+`166fea9a`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
+
+Acceptance 1/5/7: remove the redundant saved Schwab diagnostic gate so configured credentials and
+actual protected OAuth can serve requested data without a stale probe disabling the connection.
+Integration base `166fea9a`; critical checks passed; resulting pushed commit recorded after integration.
+
+Implemented in the current tree: optional runtime probe coordinates (Schwab requires None; other
+providers retain their existing checks); removed full-family doctor scheduler, producer modules,
+receipt types and orphan rate glue; actual REST/Streamer qualification; history independent of
+UserPreference; stable grant ownership across token refresh; actual token/revocation/precommit and
+source cleanup retained. Native Streamer bootstrap is reused by existing preparation; only optional
+bootstrap unavailability selects REST, not authentication or later registration/cleanup failures.
+Unknown response timing stays honest and nonexecutable; current health uses actual token expiry.
+
+All implementation lanes are frozen/released. Lead owns remaining integration, source closure,
+critical checks, Git/PR and subsequent native deployment. Disjoint completed ownership: AstraHigh
+adapter qualification/history/tests; Sol6.1High onboarding/CLI/recovery test; Sol6.1High activation/
+metadata/rate and later current-display bridge; Sol6.1High publication/actual bootstrap selection.
+Lead integrated shared source/lease/lifecycle schemas, optional-evidence callers, history/calendar
+child consumers and documentation. Final inspection found the active built-in profile still advertised
+the deleted doctor and retained its obsolete capability budgets. Lead also owns
+source onboarding `built_in_profiles.rs`: one current V1 Schwab profile,
+local credential-envelope validation, existing shared request budget, no old probe revisions.
+No new branch/worktree/runtime workspace has been created.
+
+Critical evidence: configured-no-probe source lifecycle PASS 1/1; existing shared rate-policy check
+PASS 1/1; actual adapter REST/history/options publication PASS 1/1 (3.43s) and actual Streamer frame
+publication PASS 1/1 (0.25s). Final service binary: production account construction, requested REST
+quote, automatic OAuth refresh, revocation and protected-state/catalog restart PASS 1/1 (4.68s);
+original publication generation across refresh with revoked-epoch rejection PASS 1/1 (8.89s);
+failed-start ProcessShutdown/owned cleanup PASS 1/1 (1.35s); pending-currentness cancellation and
+join PASS 1/1 (0.00s). Final service compilation 6m05s. No repeated compilation for those checks.
+Integration failures corrected: removed constructor/lifetime callers; scripted HTTP content type;
+fixture current OAuth epoch; credential-state expectation after activation; fresh catalog
+registration starting at revision one without historical probe capabilities. The fixed-digest compatibility assertions were replaced by current shared-budget and
+single-capability checks. Single-job, nonincremental builds use the existing target directory.
+Logs use `oct8-no-doctor-*` under `.agents/tmp/v1-first-stock`. No live or installed acceptance claim.
+
+Next dependency: push this critically verified checkpoint, then fresh authorized native workspace and actual
+start/shutdown/restart proof. All-nine canonical shared demand, last-trade/partial-field semantics,
+full financial/Desktop/provider journeys, final packages and whole-app RAM remain incomplete.
+
+### Earlier checkpoint evidence (historical; not active assignments)
 
 Pushed `4dcf22ba`; PR43 evidence:
 https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6072573411 .

@@ -41,7 +41,6 @@ use crate::{
     SchwabMarketDataQualification, SchwabOAuthAuthorityReceipt,
     SchwabPriceHistoryCapabilityObservation, SchwabResolvedProviderIdentity,
     SchwabRestCaptureSealRejoin, SchwabRestPayload, SchwabSealedRestResponse, SchwabTransportError,
-    SchwabUserPreferenceEvidence,
 };
 use market_squawk_domain::{
     BarTimeSemantics, BarTimestampBasis, Currency, InstrumentId, MarketBarAdjustment,
@@ -167,10 +166,9 @@ pub trait SchwabDailyPriceHistoryCalendarRangeReceipt: std::fmt::Debug + Send + 
 
 /// Semantic and application-lineage inputs for one accepted daily price-history response.
 #[derive(Debug)]
-pub struct SchwabDailyPriceHistoryPublicationRequest<'a> {
+pub struct SchwabDailyPriceHistoryPublicationRequest {
     capability: SchwabPriceHistoryCapabilityObservation,
     oauth_authority: SchwabOAuthAuthorityReceipt,
-    user_preference: &'a SchwabUserPreferenceEvidence,
     extraction_request: ExtractionRequest,
     instrument_id: InstrumentId,
     instrument_revision_digest: EvidenceDigest,
@@ -182,7 +180,7 @@ pub struct SchwabDailyPriceHistoryPublicationRequest<'a> {
     ingested_at: Timestamp,
 }
 
-impl<'a> SchwabDailyPriceHistoryPublicationRequest<'a> {
+impl SchwabDailyPriceHistoryPublicationRequest {
     /// Constructs the complete semantic input. Validation occurs against the consumed response.
     #[allow(
         clippy::too_many_arguments,
@@ -191,7 +189,6 @@ impl<'a> SchwabDailyPriceHistoryPublicationRequest<'a> {
     pub fn new(
         capability: SchwabPriceHistoryCapabilityObservation,
         oauth_authority: SchwabOAuthAuthorityReceipt,
-        user_preference: &'a SchwabUserPreferenceEvidence,
         extraction_request: ExtractionRequest,
         instrument_id: InstrumentId,
         instrument_revision_digest: EvidenceDigest,
@@ -205,7 +202,6 @@ impl<'a> SchwabDailyPriceHistoryPublicationRequest<'a> {
         Self {
             capability,
             oauth_authority,
-            user_preference,
             extraction_request,
             instrument_id,
             instrument_revision_digest,
@@ -250,7 +246,7 @@ impl ExecutedRestResponse {
         self,
         coordinates: SchwabCaptureCoordinates,
         event_id: Uuid,
-        request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+        request: SchwabDailyPriceHistoryPublicationRequest,
     ) -> Result<
         (
             SchwabPendingDailyPriceHistoryPublication,
@@ -279,7 +275,7 @@ impl SchwabSealedRestResponse {
     /// Maps the original physically sealed response without reconstructing or cloning its raw body.
     pub fn into_daily_price_history_publication(
         self,
-        request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+        request: SchwabDailyPriceHistoryPublicationRequest,
     ) -> Result<SchwabSealedDailyPriceHistoryPublication, SchwabPriceHistoryPublicationError> {
         let parts = self.into_parts();
         let mapping = DailyHistoryMapping::prepare(
@@ -295,7 +291,7 @@ impl SchwabSealedRestResponse {
 
 impl DailyHistoryMapping {
     fn prepare(
-        request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+        request: SchwabDailyPriceHistoryPublicationRequest,
         coordinates: &SchwabCaptureCoordinates,
         receipt: &crate::RawRestResponseReceipt,
         payload: &SchwabRestPayload,
@@ -304,7 +300,6 @@ impl DailyHistoryMapping {
         let SchwabDailyPriceHistoryPublicationRequest {
             capability,
             oauth_authority,
-            user_preference,
             extraction_request,
             instrument_id,
             instrument_revision_digest,
@@ -339,7 +334,6 @@ impl DailyHistoryMapping {
         let candidate = prepare_price_history_candidate(SchwabDailyPriceHistoryCandidateRequest {
             capability,
             oauth_authority,
-            user_preference,
             receipt,
             payload,
             accounting,
@@ -692,7 +686,6 @@ struct SchwabPriceHistoryNativeSidecarV1<'a> {
     qualification_family: SchwabMarketDataFamily,
     qualification_observed_at: Timestamp,
     qualification_response_observed_at: Timestamp,
-    market_data_permission: Option<&'a str>,
     previous_close_state: &'static str,
     previous_close: Option<&'a str>,
     previous_close_date_state: &'static str,
@@ -702,7 +695,6 @@ struct SchwabPriceHistoryNativeSidecarV1<'a> {
     unknown_field_paths: &'a [Box<str>],
     unknown_field_digest: [u8; 32],
     capability_receipt_sha256: [u8; 32],
-    user_preference_observation_sha256: [u8; 32],
     response_observation_sha256: [u8; 32],
     oauth_generation: u64,
     oauth_access_issued_at_unix_seconds: u64,
@@ -796,7 +788,6 @@ fn native_lineage(
             qualification_family: market_data.qualification.family(),
             qualification_observed_at: market_data.qualification.family_observed_at(),
             qualification_response_observed_at: market_data.qualification.response_observed_at(),
-            market_data_permission: candidate.market_data_permission.as_deref(),
             previous_close_state,
             previous_close,
             previous_close_date_state,
@@ -806,7 +797,6 @@ fn native_lineage(
             unknown_field_paths: unknown.paths(),
             unknown_field_digest: unknown.digest(),
             capability_receipt_sha256: candidate.capability.receipt_sha256(),
-            user_preference_observation_sha256: candidate.user_preference_observation_sha256,
             response_observation_sha256: candidate.response_observation_sha256,
             oauth_generation: candidate.oauth_authority.generation().get(),
             oauth_access_issued_at_unix_seconds: candidate

@@ -13,7 +13,7 @@ use market_squawk_domain::{
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
     ProviderCapabilityRevision, RuntimeVerificationEvidence, SEC_EDGAR_PROFILE_ID,
-    SEC_EDGAR_SOURCE_ID, SchwabMarketDataDoctorReceiptV1, SourceMetadata, SourceMetadataProvider,
+    SEC_EDGAR_SOURCE_ID, SourceMetadata, SourceMetadataProvider,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -134,7 +134,9 @@ impl ResearchProviderRuntimeGeneration {
         mut self,
         lease: &crate::ProviderActivationLease,
     ) -> Result<Self, ResearchIngestCompositionError> {
-        let evidence = lease.runtime_verification_evidence();
+        let Some(evidence) = lease.runtime_verification_evidence() else {
+            return Ok(self);
+        };
         if evidence.verified_at().is_none() {
             return Ok(self);
         }
@@ -252,7 +254,6 @@ impl ResearchProviderRuntimeGeneration {
             credential_generation: Option<SecretGeneration>,
             secret_reference: Option<&'a SecretRef>,
             authority_effective_at: Timestamp,
-            #[serde(skip_serializing_if = "Option::is_none")]
             runtime_verification_digest: Option<EvidenceDigest>,
             metadata: &'a SourceMetadata,
             rights_source_id: &'a market_squawk_domain::SourceId,
@@ -439,24 +440,6 @@ impl ResearchProviderRuntimeGeneration {
                     && current.rate_policy_digest() == prior.rate_policy_digest()
                     && current.doctor_revision() == prior.doctor_revision()
                     && current.doctor_contract_digest() == prior.doctor_contract_digest()
-            }
-            (
-                RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(current),
-                RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(prior),
-            ) => {
-                current.surface_id() == prior.surface_id()
-                    && current.session_identifier() == prior.session_identifier()
-                    && current.application_credential_generation()
-                        == prior.application_credential_generation()
-                    && current.application_credential_reference_sha256()
-                        == prior.application_credential_reference_sha256()
-                    && current.market_data_principal_sha256()
-                        == prior.market_data_principal_sha256()
-                    && current.capability_revision() == prior.capability_revision()
-                    && current.capability_digest() == prior.capability_digest()
-                    && current.public_configuration_digest() == prior.public_configuration_digest()
-                    && current.rights_decision_digest() == prior.rights_decision_digest()
-                    && current.rate_policy_digest() == prior.rate_policy_digest()
             }
             _ => false,
         }
@@ -941,6 +924,7 @@ pub(super) fn test_schwab_composite_market_runtime_admission(
     Arc<dyn super::schwab_market::SchwabMarketRuntimeAdmission>,
     ResearchIngestCompositionError,
 > {
+    validate_schwab_oauth_binding(generation, &oauth, oauth_receipt)?;
     let generation_digest = generation.generation_digest()?;
     Ok(Arc::new(SchwabCompositeMarketRuntimeAdmission {
         generation_digest,
@@ -950,6 +934,27 @@ pub(super) fn test_schwab_composite_market_runtime_admission(
     }))
 }
 
+fn validate_schwab_oauth_binding(
+    generation: &ResearchProviderRuntimeGeneration,
+    oauth: &SchwabOAuthReceiptCurrentness,
+    receipt: SchwabOAuthAuthorityReceipt,
+) -> Result<(), ResearchIngestCompositionError> {
+    let reference = generation
+        .secret_reference()
+        .ok_or(ResearchIngestCompositionError::InvalidRuntimeGeneration)?;
+    let credential = market_squawk_adapter_schwab::SchwabCredentialAuthorityBinding::try_from_application_credential(reference)
+        .map_err(|_| ResearchIngestCompositionError::InvalidRuntimeGeneration)?;
+    if oauth.session_id() != generation.session_id()
+        || generation.credential_generation() != Some(reference.generation())
+        || receipt.credential_authority() != credential
+    {
+        return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+    }
+    oauth
+        .validate_current_receipt(receipt)
+        .map_err(|_| ResearchIngestCompositionError::StaleRuntimeGeneration)
+}
+
 impl SchwabCompositeMarketRuntimeAdmission {
     fn ensure_exact_current(&self) -> Result<(), ResearchIngestCompositionError> {
         self.admission.ensure_live()?;
@@ -957,7 +962,7 @@ impl SchwabCompositeMarketRuntimeAdmission {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
         self.oauth
-            .validate_current_receipt(self.oauth_receipt)
+            .validate_current_authorization(self.oauth_receipt)
             .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
         self.admission.ensure_live()
     }
@@ -979,7 +984,9 @@ impl super::schwab_market::SchwabMarketRuntimeAdmission for SchwabCompositeMarke
         receipt: SchwabOAuthAuthorityReceipt,
     ) -> Result<(), ResearchIngestCompositionError> {
         self.admission.ensure_live()?;
-        if receipt != self.oauth_receipt {
+        if receipt.credential_authority() != self.oauth_receipt.credential_authority()
+            || receipt.authorization_generation() != self.oauth_receipt.authorization_generation()
+        {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
         self.oauth
@@ -1903,12 +1910,11 @@ impl ResearchProviderRuntimeMutationAuthority {
     /// publisher and provider-neutral durable-read channel.
     #[allow(
         clippy::too_many_arguments,
-        reason = "generation, doctor, OAuth, analytical dataset, and operation lifetime remain explicit"
+        reason = "generation, OAuth, analytical dataset, and operation lifetime remain explicit"
     )]
     pub(crate) fn bind_schwab_rest_quote_publication_package(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
-        doctor: SchwabMarketDataDoctorReceiptV1,
         oauth: SchwabOAuthReceiptCurrentness,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
         analytical_dataset: DatasetId,
@@ -1923,8 +1929,7 @@ impl ResearchProviderRuntimeMutationAuthority {
             return Err(SchwabMarketPublicationError::AuthorityInvalid);
         }
         let package = {
-            let closure =
-                self.bind_schwab_publication_closure(generation, doctor, oauth, oauth_receipt)?;
+            let closure = self.bind_schwab_publication_closure(generation, oauth, oauth_receipt)?;
             let generation_authority =
                 closure.bind_rest_quote_sink(operation_timeout, analytical_dataset.clone())?;
             let point_in_time = MarketEventPointInTimeSelector::new(
@@ -1942,16 +1947,15 @@ impl ResearchProviderRuntimeMutationAuthority {
         Ok(package)
     }
 
-    /// Binds the exact registered MarketCalendar family, original OAuth receipt and doctor.
+    /// Binds the exact registered MarketCalendar family, original OAuth receipt.
     /// The returned owner seals native outcomes and publishes through ordinary immutable research manifests.
     #[allow(
         clippy::too_many_arguments,
-        reason = "generation, doctor, and original OAuth remain explicit"
+        reason = "generation and original OAuth remain explicit"
     )]
     pub(crate) fn bind_schwab_market_hours_publication_package(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
-        doctor: SchwabMarketDataDoctorReceiptV1,
         oauth: SchwabOAuthReceiptCurrentness,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
     ) -> Result<
@@ -1968,21 +1972,17 @@ impl ResearchProviderRuntimeMutationAuthority {
         {
             return Err(SchwabMarketPublicationError::AuthorityInvalid);
         }
-        let closure =
-            self.bind_schwab_publication_closure(generation, doctor, oauth, oauth_receipt)?;
+        let closure = self.bind_schwab_publication_closure(generation, oauth, oauth_receipt)?;
         super::schwab_market::SchwabMarketHoursGenerationAuthority::try_new(closure)
     }
 
     fn bind_schwab_publication_closure(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
-        doctor: SchwabMarketDataDoctorReceiptV1,
         oauth: SchwabOAuthReceiptCurrentness,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
     ) -> Result<Arc<SchwabMarketPublicationClosure>, SchwabMarketPublicationError> {
-        if oauth.session_id() != generation.session_id() {
-            return Err(SchwabMarketPublicationError::AuthorityInvalid);
-        }
+        validate_schwab_oauth_binding(generation, &oauth, oauth_receipt)?;
         let generation_digest = generation.generation_digest()?;
         let authority = self
             .coordinator
@@ -2022,7 +2022,6 @@ impl ResearchProviderRuntimeMutationAuthority {
             Arc::clone(&self.coordinator.research),
             generation.clone(),
             current.rights.clone(),
-            doctor,
             admission,
         )?);
         Ok(closure)
@@ -2031,7 +2030,6 @@ impl ResearchProviderRuntimeMutationAuthority {
     pub(crate) fn bind_schwab_streamer_publication_package(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
-        doctor: SchwabMarketDataDoctorReceiptV1,
         oauth: SchwabOAuthReceiptCurrentness,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
     ) -> Result<SchwabStreamerPublicationPackage, SchwabMarketPublicationError> {
@@ -2041,8 +2039,7 @@ impl ResearchProviderRuntimeMutationAuthority {
         {
             return Err(SchwabMarketPublicationError::AuthorityInvalid);
         }
-        let closure =
-            self.bind_schwab_publication_closure(generation, doctor, oauth, oauth_receipt)?;
+        let closure = self.bind_schwab_publication_closure(generation, oauth, oauth_receipt)?;
         let authority =
             Arc::new(super::schwab_market::SchwabStreamerGenerationAuthority::try_new(closure)?);
         let selector = MarketEventPointInTimeSelector::new(
@@ -2928,10 +2925,7 @@ mod tests {
         ChecksumValidationProfile, CoverageTopology, EndpointPolicy, FreshnessPolicy,
         HistoricalCapability, InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule,
         LiveProtocolProfile, NetworkAccessPolicy, ProviderBudgetPolicy, ProviderCapabilityRevision,
-        ProviderNumericPolicy, RuntimeCapabilityDisposition, SCHWAB_MARKET_DATA_SURFACE_ID,
-        SchwabMarketDataDoctorObservation, SchwabMarketDataDoctorReceiptInput,
-        SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SchwabMarketDataFamilyEvidence,
-        SchwabUserPreferenceDoctorEvidence, SemanticInterpretationProfile,
+        ProviderNumericPolicy, SCHWAB_MARKET_DATA_SURFACE_ID, SemanticInterpretationProfile,
         SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
         SourceMetadataInput, SourceProtocolProfile,
     };
@@ -2963,29 +2957,9 @@ mod tests {
         let (oauth, _, reference) =
             scripted_market_authority(directory.path().join("renewal"), session, 1_800, 60, 0)
                 .await?;
-        let prior_doctor = doctor_receipt(session, digest(31), digest(32), oauth.issued_receipt())?;
-        let (_, epoch) = SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
-            &oauth,
-            &prior_doctor,
-        )
-        .await?;
+        let (_, epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth).await?;
         epoch.validate_current(epoch.receipt())?;
-        let mut renewed_input: SchwabMarketDataDoctorReceiptInput =
-            serde_json::from_value(serde_json::to_value(&prior_doctor)?["input"].clone())?;
-        let renewed_at = prior_doctor
-            .verified_at()
-            .checked_add_nanos(1_000_000_000)?;
-        renewed_input.observation.completed_at = renewed_at;
-        renewed_input.observation.user_preference.received_at = renewed_at;
-        for family in renewed_input.observation.families.iter_mut() {
-            if family.observed_at.is_some() {
-                family.observed_at = Some(renewed_at);
-            }
-        }
-        // A publication slot may skip intermediate doctor renewals. The current lease, not
-        // adjacency to the last used slot, proves the durable verification chain.
-        renewed_input.predecessor_digest = Some(digest(35));
-        let renewed_doctor = SchwabMarketDataDoctorReceiptV1::try_new(renewed_input)?;
         let source = SourceId::try_from("schwab-trader-api")?;
         let metadata = quote_metadata(
             source.clone(),
@@ -2998,45 +2972,29 @@ mod tests {
             source,
             RightsBasis::reviewed_terms("https://developer.schwab.com/terms", digest(33))?,
             digest(32),
-            Some(prior_doctor.exclusive_expires_at()),
+            None,
             vec![SourceOperation::Persist],
         )?;
-        let mut prior = ResearchProviderRuntimeGeneration::try_new(
-            // Renewal is authorized by the typed receipt, never a hard-coded profile name.
-            SourceIdentifier::try_from("account-publication-renewal-test")?,
+        let prior = ResearchProviderRuntimeGeneration::try_new(
+            SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)?,
             session,
             ProviderCapabilityRevision::new(1)?,
             digest(31),
             Some(reference.generation()),
             Some(reference),
-            prior_doctor.verified_at(),
+            timestamp_seconds(epoch.receipt().access_issued_at_unix_seconds())?,
             metadata,
             rights,
         )?;
-        prior.runtime_verification = Some(
-            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(prior_doctor)),
-        );
+        assert!(prior.runtime_verification.is_none());
         let mut renewed = prior.clone();
-        renewed.authority_effective_at = renewed_at;
-        renewed.rights.authorization_expires_at = Some(renewed_doctor.exclusive_expires_at());
-        renewed.runtime_verification = Some(
-            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(Box::new(renewed_doctor)),
-        );
+        renewed.authority_effective_at = prior
+            .authority_effective_at
+            .checked_add_nanos(1_000_000_000)?;
+        assert!(!renewed.is_exact_successor_of(&prior)?);
+        renewed.session_id = Uuid::new_v4();
         assert!(renewed.is_exact_successor_of(&prior)?);
         assert!(!prior.is_exact_successor_of(&renewed)?);
-        let mut unverified = renewed.clone();
-        unverified.runtime_verification = None;
-        assert!(!unverified.is_exact_successor_of(&prior)?);
-        assert_ne!(
-            unverified.generation_digest()?,
-            renewed.generation_digest()?
-        );
-        let mut stale = renewed.clone();
-        stale.runtime_verification = prior.runtime_verification.clone();
-        assert!(!stale.is_exact_successor_of(&prior)?);
-        let mut changed_rights = renewed.clone();
-        changed_rights.rights.parent_authorization_evidence = digest(36);
-        assert!(!changed_rights.is_exact_successor_of(&prior)?);
 
         for expected in [
             ProviderPublicationCancellationCause::Deadline,
@@ -3106,7 +3064,7 @@ mod tests {
             drop(operation);
             tokio::time::timeout(Duration::from_secs(1), drain).await??;
             assert!(admission.revocation_drained());
-            // Current-doctor recovery can mint a new admission for the same provider authority.
+            // Recovery can mint a new admission for the same configured provider authority.
             let restored = ResearchProviderAdmission::new(Some(&prior))?;
             assert!(restored.admits_generation(&prior)?);
             assert!(
@@ -3143,21 +3101,15 @@ mod tests {
             0,
         )
         .await?;
-        let original_doctor =
-            doctor_receipt(session_id, digest(31), digest(32), oauth.issued_receipt())?;
-        let (token, epoch) = SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
-            &oauth,
-            &original_doctor,
-        )
-        .await?;
+        let (token, epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth).await?;
         let oauth_receipt = epoch.receipt();
-        let (durable, evidence, binding) = quote_publication_fixture(
+        let (durable, evidence, binding, _) = quote_publication_fixture(
             directory.path(),
             session_id,
             secret_reference,
             oauth.clone(),
             oauth_receipt,
-            original_doctor,
         )?;
         let generation = market_squawk_domain::ConnectionGeneration::new(1)?;
         let bridge_calls = Arc::new(AtomicUsize::new(0));
@@ -3199,30 +3151,33 @@ mod tests {
             0,
         )
         .await?;
-        let original_rotation_receipt = rotating.issued_receipt();
-        let original_rotation_doctor = doctor_receipt(
-            session_id,
-            digest(31),
-            digest(32),
+        let original_rotation_receipt = rotating.current_receipt().await?;
+        let (rotating_durable, rotating_evidence, rotating_binding, rotating_generation) =
+            quote_publication_fixture(
+                &directory.path().join("rotating-publication"),
+                session_id,
+                rotating_reference,
+                rotating.clone(),
+                original_rotation_receipt,
+            )?;
+        let rotating_admission = test_schwab_composite_market_runtime_admission(
+            &rotating_generation,
+            rotating.receipt_currentness(),
             original_rotation_receipt,
         )?;
+        let original_generation_digest = rotating_generation.generation_digest()?;
         let (rotated_token, rotated_epoch) =
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
-                &rotating,
-                &original_rotation_doctor,
-            )
-            .await?;
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&rotating).await?;
         assert_eq!(rotating_wire.exchange_count(), 2);
         assert_eq!(rotated_epoch.receipt().generation().get(), 2);
         assert_eq!(
             rotated_token.generation(),
             rotated_epoch.receipt().generation()
         );
-        assert_eq!(original_rotation_doctor.access_token_generation(), 1);
-        assert!(
-            rotated_epoch
-                .receipt()
-                .matches_market_data_authorization(&original_rotation_doctor)
+        assert_eq!(original_rotation_receipt.generation().get(), 1);
+        assert_eq!(
+            original_rotation_receipt.authorization_generation(),
+            rotated_epoch.receipt().authorization_generation()
         );
         assert!(
             rotating
@@ -3231,14 +3186,19 @@ mod tests {
                 .is_err()
         );
         rotated_epoch.validate_current(rotated_epoch.receipt())?;
-        let (rotating_durable, rotating_evidence, rotating_binding) = quote_publication_fixture(
-            &directory.path().join("rotating-publication"),
-            session_id,
-            rotating_reference,
-            rotating.clone(),
-            rotated_epoch.receipt(),
-            original_rotation_doctor,
-        )?;
+        rotating_admission.ensure_live()?;
+        rotating_admission.validate_oauth_current(rotated_epoch.receipt())?;
+        assert!(
+            rotating_admission
+                .validate_oauth_current(original_rotation_receipt)
+                .is_err()
+        );
+        assert_eq!(
+            rotating_admission.generation_digest(),
+            Some(original_generation_digest)
+        );
+        assert!(rotating_generation.runtime_verification.is_none());
+
         let rotating_bridge_calls = Arc::new(AtomicUsize::new(0));
         let rotating_sink = SchwabRestQuoteSealFirstSink::new(
             Arc::clone(&rotating_durable),
@@ -3266,8 +3226,7 @@ mod tests {
             "same-grant refresh was rejected before current quote qualification"
         );
 
-        // Restored access expiry must reach the sole writer's refresh path before doctor
-        // admission. Pure receipt inspection remains read-only and rejects the expired epoch.
+        // Restored access expiry must reach the sole writer's refresh path before requests. Pure receipt inspection remains read-only and rejects the expired epoch.
         let (expired, expired_wire, _) = scripted_market_authority(
             directory.path().join("expired-bootstrap"),
             session_id,
@@ -3317,13 +3276,8 @@ mod tests {
                 .validate_current_receipt(prior)
                 .is_err()
         );
-        let expired_token_doctor = doctor_receipt(session_id, digest(31), digest(32), prior)?;
         let (_, current_epoch) =
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
-                &expired,
-                &expired_token_doctor,
-            )
-            .await?;
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&expired).await?;
         assert_eq!(current_epoch.receipt(), refreshed);
         current_epoch.validate_current(refreshed)?;
         assert_eq!(expired_wire.exchange_count(), 2);
@@ -3593,12 +3547,12 @@ mod tests {
         secret_reference: SecretRef,
         oauth: SchwabOAuthMarketAuthority,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
-        doctor: SchwabMarketDataDoctorReceiptV1,
     ) -> Result<
         (
             Arc<super::super::schwab_market::SchwabRestQuoteGenerationAuthority>,
             SchwabRestQuoteSourceEvidence,
             SchwabRestQuoteInstrumentBinding,
+            ResearchProviderRuntimeGeneration,
         ),
         Box<dyn std::error::Error>,
     > {
@@ -3621,7 +3575,7 @@ mod tests {
             RightsBasis::reviewed_terms("https://developer.schwab.com/terms", digest(33))?,
             parent_rights,
             digest(34),
-            timestamp_seconds(oauth_receipt.refresh_expires_at_unix_seconds())?,
+            None,
             vec![SourceIdentifier::try_from("schwab-rest-quotes-aapl")?],
             vec![SourceOperation::Persist],
         )?;
@@ -3656,16 +3610,15 @@ mod tests {
         )?;
         let durable = super::super::schwab_market::SchwabRestQuoteGenerationAuthority::bind_test_rest_quote_sink(
             research,
-            generation,
+            generation.clone(),
             rights,
-            doctor.clone(),
             oauth,
             oauth_receipt,
             Duration::from_secs(5),
         )?;
         let evidence =
-            SchwabRestQuoteSourceEvidence::try_new(metadata, VenueId::try_from("schwab")?, doctor)?;
-        Ok((durable, evidence, binding))
+            SchwabRestQuoteSourceEvidence::try_new(metadata, VenueId::try_from("schwab")?)?;
+        Ok((durable, evidence, binding, generation))
     }
 
     fn quote_metadata(
@@ -3721,7 +3674,7 @@ mod tests {
                 CoverageTopology::single_venue(VenueId::try_from("schwab")?),
                 InstrumentCoverage::enumerated(vec![instrument_id])?,
                 Some(live),
-                CoverageDelay::RealTime,
+                CoverageDelay::Unknown,
                 DeliveryEvidence::AuthorizedBroker,
             )?,
             DataQuality::DirectUnverified,
@@ -3845,106 +3798,6 @@ mod tests {
             &source_id,
         )
         .map_err(Into::into)
-    }
-
-    fn doctor_receipt(
-        session_id: Uuid,
-        capability_digest: EvidenceDigest,
-        rights_decision_digest: EvidenceDigest,
-        oauth: SchwabOAuthAuthorityReceipt,
-    ) -> Result<SchwabMarketDataDoctorReceiptV1, Box<dyn std::error::Error>> {
-        let completed_at = timestamp_seconds(oauth.access_issued_at_unix_seconds())?;
-        let access_expires_at = timestamp_seconds(oauth.access_expires_at_unix_seconds())?;
-        let refresh_expires_at = timestamp_seconds(oauth.refresh_expires_at_unix_seconds())?;
-        let families = schwab_families()
-            .into_iter()
-            .map(|family| {
-                let available = family == SchwabMarketDataFamily::Quotes;
-                SchwabMarketDataFamilyEvidence {
-                    family,
-                    disposition: if available {
-                        RuntimeCapabilityDisposition::Available
-                    } else {
-                        RuntimeCapabilityDisposition::NotProbed
-                    },
-                    disposition_evidence_sha256: digest(20),
-                    observation_sha256: available.then(|| digest(21)),
-                    observed_at: available.then_some(completed_at),
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Ok(SchwabMarketDataDoctorReceiptV1::try_new(
-            SchwabMarketDataDoctorReceiptInput {
-                surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)?,
-                session_identifier: SourceIdentifier::try_from(session_id.to_string())?,
-                application_credential_generation: SecretGeneration::new(1)?,
-                application_credential_reference_sha256: oauth
-                    .credential_authority()
-                    .application_credential_reference_sha256(),
-                capability_revision: ProviderCapabilityRevision::new(1)?,
-                capability_digest,
-                public_configuration_digest: digest(22),
-                rights_decision_digest,
-                rate_policy_digest: digest(23),
-                data_quality: DataQuality::DirectUnverified,
-                observation: SchwabMarketDataDoctorObservation {
-                    provider_observation_origin:
-                        SchwabMarketDataDoctorObservation::provider_observed_origin()?,
-                    access_token_generation: oauth.generation().get(),
-                    authorization_generation: oauth.authorization_generation(),
-                    authorization_scope_sha256: oauth.authorization_scope_sha256(),
-                    access_issued_at: completed_at,
-                    access_expires_at,
-                    refresh_authorized_at: timestamp_seconds(
-                        oauth.refresh_authorized_at_unix_seconds(),
-                    )?,
-                    refresh_expires_at,
-                    user_preference: SchwabUserPreferenceDoctorEvidence {
-                        endpoint_contract_sha256: digest(24),
-                        request_sha256: digest(25),
-                        response_sha256: digest(26),
-                        status_code: 200,
-                        response_bytes: 1,
-                        received_at: completed_at,
-                        latency_nanos: 1,
-                        market_data_principal_sha256: digest(27),
-                        streamer_bootstrap_sha256: digest(28),
-                        market_data_offer_sha256: None,
-                    },
-                    quote_delay: Some(CoverageDelay::RealTime),
-                    families,
-                    completed_at,
-                },
-                exclusive_expires_at: refresh_expires_at,
-                predecessor_digest: None,
-            },
-        )?)
-    }
-
-    fn schwab_families() -> [SchwabMarketDataFamily; 19] {
-        use SchwabMarketDataFamily::*;
-        [
-            Quotes,
-            PriceHistory,
-            OptionChains,
-            ExpirationChains,
-            Movers,
-            MarketHours,
-            Instruments,
-            LevelOneEquities,
-            LevelOneOptions,
-            LevelOneFutures,
-            LevelOneFuturesOptions,
-            LevelOneForex,
-            NyseBook,
-            NasdaqBook,
-            OptionsBook,
-            ChartEquity,
-            ChartFutures,
-            ScreenerEquity,
-            ScreenerOption,
-        ]
     }
 
     fn parse_bounds() -> market_squawk_adapter_schwab::ParseBounds {

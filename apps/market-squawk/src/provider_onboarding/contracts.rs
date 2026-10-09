@@ -427,7 +427,7 @@ pub struct ProviderActivationLease {
     public_configuration: ProviderPublicConfiguration,
     account_digest: Option<EvidenceDigest>,
     verification_evidence_digest: Option<EvidenceDigest>,
-    runtime_verification_evidence: RuntimeVerificationEvidence,
+    runtime_verification_evidence: Option<RuntimeVerificationEvidence>,
     provider_budget_policy: Option<ProviderBudgetPolicy>,
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
@@ -645,13 +645,15 @@ impl ProviderActivationLease {
     }
 
     /// Returns the exact successful provider response or local-verifier evidence.
-    pub fn runtime_evidence_digest(&self) -> EvidenceDigest {
-        self.runtime_verification_evidence.evidence_digest()
+    pub fn runtime_evidence_digest(&self) -> Option<EvidenceDigest> {
+        self.runtime_verification_evidence
+            .as_ref()
+            .map(RuntimeVerificationEvidence::evidence_digest)
     }
 
     /// Returns the complete retained runtime-verification evidence.
-    pub const fn runtime_verification_evidence(&self) -> &RuntimeVerificationEvidence {
-        &self.runtime_verification_evidence
+    pub const fn runtime_verification_evidence(&self) -> Option<&RuntimeVerificationEvidence> {
+        self.runtime_verification_evidence.as_ref()
     }
 
     /// Returns the exact admitted provider budget policy for this capability revision.
@@ -698,10 +700,7 @@ impl std::fmt::Debug for ProviderActivationLease {
                 "verification_evidence_digest",
                 &self.verification_evidence_digest,
             )
-            .field(
-                "runtime_evidence_digest",
-                &self.runtime_verification_evidence.evidence_digest(),
-            )
+            .field("runtime_evidence_digest", &self.runtime_evidence_digest())
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
@@ -723,7 +722,7 @@ pub(super) struct ProviderActivationLeaseInput {
     pub public_configuration: ProviderPublicConfiguration,
     pub account_digest: Option<EvidenceDigest>,
     pub verification_evidence_digest: Option<EvidenceDigest>,
-    pub runtime_verification_evidence: RuntimeVerificationEvidence,
+    pub runtime_verification_evidence: Option<RuntimeVerificationEvidence>,
     pub provider_budget_policy: Option<ProviderBudgetPolicy>,
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,
@@ -812,18 +811,7 @@ pub(super) fn session_view(
             OnboardingState::RuntimeVerificationPending
                 if profile.id() == super::SCHWAB_MARKET_DATA_SURFACE_ID =>
             {
-                let ready = generation
-                    .and_then(|generation| lifecycle.generation_schwab_market_data_doctor_receipt(generation))
-                    .is_some_and(|receipt| {
-                        receipt.admits_source_start()
-                            && super::service::system_timestamp()
-                                .is_ok_and(|now| receipt.is_current_at(now))
-                    });
-                if ready {
-                    OnboardingNextAction::VerifyAndActivate
-                } else {
-                    OnboardingNextAction::CompleteOAuthAuthorization
-                }
+                OnboardingNextAction::VerifyAndActivate
             }
             OnboardingState::RuntimeVerificationPending
                 if lifecycle.active_generation().is_some() =>

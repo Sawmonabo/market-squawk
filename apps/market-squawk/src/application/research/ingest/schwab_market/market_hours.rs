@@ -40,8 +40,7 @@ impl SchwabMarketPublicationClosure {
             sealed.persisted_receipt().capture().source_id(),
             sealed.persisted_receipt().capture().metadata_revision(),
         )?;
-        self.validate_doctor_family(SchwabMarketDataFamily::MarketHours, observed_at)?;
-        self.validate_doctor_oauth(oauth, observed_at)?;
+        self.validate_oauth_authority(oauth, observed_at)?;
         if sealed.family() != market_squawk_adapter_schwab::SchwabRestFamily::MarketHours
             || !matches!(
                 sealed.route(),
@@ -69,11 +68,13 @@ impl SchwabMarketPublicationClosure {
         if Instant::now() >= deadline {
             return Err(SchwabMarketPublicationError::Deadline);
         }
-        let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
-            &self.doctor,
-            SchwabMarketDataFamily::MarketHours,
-            observed_at,
+        let qualification = SchwabMarketDataQualification::try_from_sealed_rest_response(
+            &sealed,
             oauth,
+            SourceIdentifier::try_from(self.generation.session_id().to_string().as_str())
+                .map_err(|_| SchwabMarketPublicationError::AuthorityInvalid)?,
+            self.generation.parent_rights_authorization_evidence(),
+            self.generation.capability_digest(),
         )
         .map_err(|_| SchwabMarketPublicationError::AuthorityInvalid)?;
         let lease = self

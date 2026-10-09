@@ -197,22 +197,26 @@ configuration, storage, scheduler, or frontend data path.
 
 | Seam | Current status and required integration |
 | --- | --- |
-| Provider onboarding and secret store | OAuth and doctor activation code exists in `apps/market-squawk/src/provider_onboarding/` and `provider_activation/schwab.rs`; no current installed OAuth session was available for this review |
+| Provider onboarding and secret store | Configured credentials and OAuth activation code exist in `apps/market-squawk/src/provider_onboarding/` and `provider_activation/schwab.rs`; no current installed OAuth session was available for this review |
 | Shared provider rate authority | Schwab REST and Streamer rate wrappers exist under `apps/market-squawk/src/provider_rate/`; full live capacity evidence remains open |
 | Live source and capture | REST and Streamer adapter/capture code exists in `adapters/market-squawk-adapter-schwab/`; installed live acceptance remains open |
 | Canonical schemas | Quote, option, and market-event paths are present in the V1 candidate; daily price history remains unclassified and cannot publish canonical daily bars |
 | Runtime composition | Typed activation code exists under `apps/market-squawk/src/provider_activation/`; full installed shutdown/restart has not been proven |
 | Product reads | Keep ordinary reads provider-independent and prove Desktop/CLI/MCP behavior from the installed service before marking this seam complete |
 
-## Doctor and end-to-end acceptance gates
+## Connection access and end-to-end acceptance
 
-Doctor must prove, without displaying secrets or account data:
+**APPLICATION POLICY (owner correction, 2026-10-08):** Configured application credentials and
+current protected OAuth authorize read-only requests. A saved diagnostic report is not an
+independent permission gate. Ordinary access does not run a mandatory all-family probe, require a
+saved probe receipt, or wait for an unrelated Streamer bootstrap. Actual requested responses and
+Streamer acknowledgements establish their own family availability and data semantics.
 
-1. configured application and exact callback;
-2. authorization/refresh session state and next expiry;
-3. authenticated market-data schema/OpenAPI digest;
-4. quote, history, chain, instrument, market-hours, and Streamer entitlement by data family;
-5. observed limits/non-findings, partial results, and circuit health.
+Refresh preserves the current authorization; per-request token identity, expiry, revocation and
+clean disconnect still apply. REST history does not require UserPreference. The actual native
+bootstrap is used only for Streamer; if it is unavailable, the supported REST quote path remains
+independent. Authentication failures and later failed runtime cleanup are not hidden by fallback.
+Implementation and live acceptance evidence remain in the delivery ledger.
 
 Availability requires all of:
 

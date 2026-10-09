@@ -1596,6 +1596,36 @@ impl SchwabOAuthReceiptCurrentness {
         self.session_id
     }
 
+    /// Runtime configuration survives access-token rotation within the same authorization.
+    /// Individual publications must still validate their exact response receipt and epoch.
+    pub(crate) fn validate_current_authorization(
+        &self,
+        expected: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        if self.currentness.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        let current = self
+            .currentness
+            .current
+            .lock()
+            .map_err(|_| SchwabOAuthRuntimeError::MarketEpochUnavailable)?;
+        let current = current
+            .as_ref()
+            .ok_or(SchwabOAuthRuntimeError::MarketAuthorityRevoked)?;
+        if current.currentness.is_cancelled()
+            || current.receipt.credential_authority() != expected.credential_authority()
+            || current.receipt.authorization_generation() != expected.authorization_generation()
+        {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        validate_receipt_time(current.receipt)?;
+        if self.currentness.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_current_receipt(
         &self,
         receipt: SchwabOAuthAuthorityReceipt,

@@ -104,9 +104,10 @@ Handle invalid tokens separately from insufficient permission for a requested op
 described by [RFC 6750 section 3.1](https://www.rfc-editor.org/rfc/rfc6750#section-3.1).
 Refresh handling follows [RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6)
 and [RFC 9700 section 4.14](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14).
-This is the target design: the token-refresh mismatch is corrected, but complete removal of
-saved-probe admission remains pending. Current implementation and live evidence are in the ledger;
-older doctor-gated diagrams below describe the implementation being replaced, not this correction.
+The configured Schwab lease carries no saved probe receipt or probe-expiry timer. The runtime
+qualifies actual REST responses and native Streamer acknowledgements; the diagnostic receipt
+producer and full-family scheduler are removed. Current verification and live evidence are in the
+delivery ledger; this design statement is not evidence of installed workflow completion.
 
 **RUNTIME-MEASURED VALUE:** this approved app/account returned equities, ETFs, indexes, mutual
 funds, forex, futures, options, history, hours, movers, and fundamentals; accepted 500/500 symbols
@@ -269,9 +270,8 @@ flowchart LR
     Doctor --> Fast["FAST: promoted REST snapshots"]
     Doctor --> Warm["WARM: disjoint adaptive universe"]
     Doctor --> Options["OPTIONS: only if indicative entitlement passes"]
-    Schwab["Owner-enabled Schwab OAuth"] --> SchwabDoctor["OAuth + REST + Streamer + delay/capacity doctor"]
-    SchwabDoctor --> OwnerLive["OWNER-LIVE: one multiplexed Streamer"]
-    SchwabDoctor --> OwnerRest["OWNER-REST: priority and multi-asset reads"]
+    Schwab["Configured credentials + current Schwab OAuth"] --> OwnerLive["OWNER-LIVE: actual bootstrap + multiplexed Streamer"]
+    Schwab --> OwnerRest["OWNER-REST: requested multi-asset reads"]
     Yahoo["Yahoo: adaptive explicit-demand enrichment"] --> Canonical["Canonical provenance, clocks, quality"]
     Reference["Nasdaq / OCC / Cboe daily reference"] --> Canonical
     Tiingo["Tiingo: optional bounded NAV/EOD"] --> Canonical
@@ -496,8 +496,8 @@ path is live:
 
 ```mermaid
 flowchart LR
-    Config["Imported secret or no-key profile"] --> Doctor["Entitlement, feed, schema, and rate doctor"]
-    Doctor --> Capture["Bounded raw response or stream-frame capture"]
+    Config["Imported secret or no-key profile"] --> Access["Configured access + actual requested response"]
+    Access --> Capture["Bounded raw response or stream-frame capture"]
     Capture --> Publish["Content-addressed raw object + immutable canonical generation"]
     Publish --> Select["PIT selector + fixed typed application operation"]
     Select --> Workflow["Desktop / CLI / MCP workflow"]
@@ -514,7 +514,7 @@ reusing an older state.
 | --- | --- | --- |
 | Documented | Current first-party contract or explicitly pinned experimental source contract | Planning only |
 | Configured | Strict import receipt or enabled no-key profile; no secret in the receipt | Setup may show “configured,” never “available” |
-| Entitled | Read-only doctor proves account realm, feed, endpoint shape, clocks, limits/headers, and requested-versus-returned behavior | Provider may accept bounded work |
+| Entitled | Configured access and actual provider authorization for the requested operation; family availability and timing come from returned data, without a Schwab all-family probe | Provider may accept bounded work |
 | Producing | Runtime captures validated observations under the admitted contract | Operator health only; capture is not publication |
 | Published | Raw evidence and canonical rows are durably committed under an immutable manifest | Eligible for selection |
 | Queryable | A fixed typed operation selects the exact generation with freshness and PIT checks | CLI/MCP/application read is available |

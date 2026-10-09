@@ -21,7 +21,6 @@ use market_squawk_platform::{
     SecretKey, SecretMutationKind, SecretMutationPlan, SecretOperationControl,
     SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
 };
-use market_squawk_sources::SchwabMarketDataDoctorReceiptV1;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, USER_AGENT,
 };
@@ -645,22 +644,6 @@ impl SchwabOAuthAuthorityReceipt {
     /// Effective access scope identity; it does not establish market-data entitlements.
     pub const fn authorization_scope_sha256(self) -> EvidenceDigest {
         self.authorization_scope_sha256
-    }
-    /// Matches retained capability evidence to the current grant and application credential.
-    pub fn matches_market_data_authorization(
-        self,
-        doctor: &SchwabMarketDataDoctorReceiptV1,
-    ) -> bool {
-        self.authorization_generation == doctor.authorization_generation()
-            && self.authorization_scope_sha256 == doctor.authorization_scope_sha256()
-            && self
-                .credential_authority
-                .application_credential_generation()
-                == doctor.application_credential_generation()
-            && self
-                .credential_authority
-                .application_credential_reference_sha256()
-                == doctor.application_credential_reference_sha256()
     }
     pub const fn credential_authority(self) -> SchwabCredentialAuthorityBinding {
         self.credential_authority

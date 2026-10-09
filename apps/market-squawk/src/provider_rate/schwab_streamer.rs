@@ -13,7 +13,6 @@ use market_squawk_adapter_schwab::{
     StreamerRunExit, StreamerSubscription, StreamerTransportBounds, TokenAuthorityError,
     TransientAccessToken,
 };
-use market_squawk_domain::Timestamp;
 use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservationDecision,
     BudgetUnavailableReason, SharedProviderBudget,
@@ -23,7 +22,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -345,26 +344,10 @@ impl SchwabStreamerAccountRateAuthority {
             .oauth_receipt_currentness()
             .validate_current_receipt(self.oauth_receipt)
             .map_err(|_| SchwabTransportError::TokenRefreshRequired)?;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| SchwabTransportError::Protocol)?
-            .as_nanos();
-        let now = Timestamp::from_unix_nanos(
-            i64::try_from(nanos).map_err(|_| SchwabTransportError::Overflow)?,
-        );
-        let doctor = self.activation.doctor_receipt();
-        if !doctor.is_current_at(now)
-            || !self.oauth_receipt.matches_market_data_authorization(doctor)
-            || self.admitted_services.is_empty()
-            || self.admitted_services.len() > 12
-            || self.admitted_services.iter().any(|service| {
-                !doctor
-                    .observation()
-                    .families
-                    .iter()
-                    .any(|family| streamer_service(family.family) == Some(*service))
-            })
-        {
+        self.activation
+            .validate_oauth_authorization(self.oauth_receipt)
+            .map_err(|_| SchwabTransportError::TokenRefreshRequired)?;
+        if self.admitted_services.is_empty() || self.admitted_services.len() > 12 {
             return Err(SchwabTransportError::TokenRefreshRequired);
         }
         // This authorizes a bounded authenticated read-only request, not family availability.
@@ -507,60 +490,6 @@ impl GovernedSchwabStreamer {
         cancellation: CancellationToken,
     ) -> Result<StreamerRunExit, SchwabTransportError> {
         self.authority.require_current()?;
-        if bootstrap.market_data_principal_sha256()
-            != self
-                .authority
-                .activation
-                .doctor_receipt()
-                .market_data_principal_sha256()
-                .bytes()
-        {
-            return Err(SchwabTransportError::Protocol);
-        }
         self.executor.run(bootstrap, sink, cancellation).await
-    }
-}
-
-const fn streamer_service(
-    family: market_squawk_sources::SchwabMarketDataFamily,
-) -> Option<MarketDataService> {
-    match family {
-        market_squawk_sources::SchwabMarketDataFamily::LevelOneEquities => {
-            Some(MarketDataService::LevelOneEquities)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::LevelOneOptions => {
-            Some(MarketDataService::LevelOneOptions)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::LevelOneFutures => {
-            Some(MarketDataService::LevelOneFutures)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::LevelOneFuturesOptions => {
-            Some(MarketDataService::LevelOneFuturesOptions)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::LevelOneForex => {
-            Some(MarketDataService::LevelOneForex)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::NyseBook => {
-            Some(MarketDataService::NyseBook)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::NasdaqBook => {
-            Some(MarketDataService::NasdaqBook)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::OptionsBook => {
-            Some(MarketDataService::OptionsBook)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::ChartEquity => {
-            Some(MarketDataService::ChartEquity)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::ChartFutures => {
-            Some(MarketDataService::ChartFutures)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::ScreenerEquity => {
-            Some(MarketDataService::ScreenerEquity)
-        }
-        market_squawk_sources::SchwabMarketDataFamily::ScreenerOption => {
-            Some(MarketDataService::ScreenerOption)
-        }
-        _ => None,
     }
 }

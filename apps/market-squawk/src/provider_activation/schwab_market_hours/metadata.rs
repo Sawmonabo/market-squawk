@@ -24,17 +24,20 @@ pub(super) fn metadata(
     activation: &SchwabMarketDataAccountActivation,
 ) -> Result<SourceMetadata, ServiceError> {
     let lease = activation.lease();
-    let expiry = lease
-        .verification_expires_at()
-        .ok_or(ServiceError::Unauthorized)?;
-    let effective = EffectiveInterval::new(lease.authority_effective_at(), Some(expiry))
-        .map_err(|_| ServiceError::InvalidResult)?;
+    let effective = EffectiveInterval::new(
+        lease.authority_effective_at(),
+        lease.verification_expires_at(),
+    )
+    .map_err(|_| ServiceError::InvalidResult)?;
     // This digest identifies the code-owned acquisition declaration. Actual provider assertions
     // are supplied later by the original sealed response, never by this metadata digest.
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/schwab-market-hours-source/v1\0");
     hash.update(include_bytes!("metadata.rs"));
-    hash.update(activation.doctor_receipt().receipt_sha256().bytes());
+    hash.update(lease.capability_digest().bytes());
+    hash.update(lease.public_configuration_digest().bytes());
+    hash.update(lease.rights_decision_digest().bytes());
+    hash.update(activation.account_binding().verification_evidence().bytes());
     let declaration = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         hash.finalize().into(),

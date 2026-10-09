@@ -62,7 +62,7 @@ impl ProviderMarketAccount {
         match self {
             Self::AlpacaBasic => "alpaca-market-data-principal-",
             Self::KrakenLevel3 => "kraken-l3-account-",
-            Self::SchwabMarketData => "schwab-market-data-principal-",
+            Self::SchwabMarketData => "schwab-market-data-application-",
         }
     }
 
@@ -97,14 +97,14 @@ impl ProviderAccountBinding {
         let budget = lease
             .provider_budget_policy()
             .ok_or(ProviderAccountActivationError::SourceBinding)?;
-        let digest = lease
-            .account_digest()
+        let verification_evidence = lease
+            .verification_evidence_digest()
             .ok_or(ProviderAccountActivationError::SourceBinding)?;
-        let verification_evidence = if account == ProviderMarketAccount::SchwabMarketData {
-            lease.runtime_evidence_digest()
+        let digest = if account == ProviderMarketAccount::SchwabMarketData {
+            verification_evidence
         } else {
             lease
-                .verification_evidence_digest()
+                .account_digest()
                 .ok_or(ProviderAccountActivationError::SourceBinding)?
         };
         if lease.surface_id().as_str() != account.surface_id() {
@@ -123,7 +123,9 @@ impl ProviderAccountBinding {
         if account == ProviderMarketAccount::AlpacaBasic {
             let receipt = lease
                 .runtime_verification_evidence()
-                .alpaca_paper_iex_receipt()
+                .and_then(
+                    market_squawk_sources::RuntimeVerificationEvidence::alpaca_paper_iex_receipt,
+                )
                 .ok_or(ProviderAccountActivationError::SourceBinding)?;
             if receipt.market_data_principal_sha256() != digest
                 || !receipt.admits_source_start()
@@ -132,21 +134,9 @@ impl ProviderAccountBinding {
                 return Err(ProviderAccountActivationError::SourceBinding);
             }
         } else if account == ProviderMarketAccount::SchwabMarketData {
-            let receipt = lease
-                .runtime_verification_evidence()
-                .schwab_market_data_receipt()
-                .ok_or(ProviderAccountActivationError::SourceBinding)?;
-            if receipt.surface_id().as_str() != account.surface_id()
-                || uuid::Uuid::parse_str(receipt.session_identifier().as_str())
-                    != Ok(lease.session_id())
-                || receipt.market_data_principal_sha256() != digest
-                || receipt.application_credential_generation()
-                    != lease
-                        .generation()
-                        .ok_or(ProviderAccountActivationError::SourceBinding)?
-                || receipt.receipt_sha256() != verification_evidence
-                || !receipt.admits_source_start()
-                || lease.verification_expires_at() != Some(receipt.exclusive_expires_at())
+            if lease.runtime_verification_evidence().is_some()
+                || lease.account_digest().is_some()
+                || lease.verification_expires_at().is_some()
             {
                 return Err(ProviderAccountActivationError::SourceBinding);
             }
@@ -271,7 +261,10 @@ impl ProviderAccountRuntimeCurrentness {
         let Some(authority) = self.authority.upgrade() else {
             return false;
         };
-        let Ok(onboarding) = authority.onboarding.try_acquire_owned_runtime_read_authority() else {
+        let Ok(onboarding) = authority
+            .onboarding
+            .try_acquire_owned_runtime_read_authority()
+        else {
             return false;
         };
         authority
@@ -349,7 +342,7 @@ impl ProviderAccountRuntimeCurrentness {
                 .is_none_or(|expires_at| at < expires_at)
             && lease
                 .runtime_verification_evidence()
-                .admits_activation_at(at)
+                .is_none_or(|evidence| evidence.admits_activation_at(at))
     }
 }
 
@@ -388,13 +381,13 @@ impl ProviderAccountPublicationAuthority {
                     previous.as_ref(),
                 )
             }
-            AccountPublicationAdmission::PreparedOrActive => {
-                self.onboarding.require_prepared_or_active_in_catalog_with_snapshot(
+            AccountPublicationAdmission::PreparedOrActive => self
+                .onboarding
+                .require_prepared_or_active_in_catalog_with_snapshot(
                     catalog,
                     &self.authority.lease,
                     previous.as_ref(),
-                )
-            }
+                ),
         }
     }
 }
@@ -542,9 +535,8 @@ impl ProviderAccountRuntimeAuthority {
             AccountPublicationAdmission::Active => {
                 onboarding.require_active_with_snapshot(&self.lease, previous.as_ref())?
             }
-            AccountPublicationAdmission::PreparedOrActive => {
-                onboarding.require_prepared_or_active_with_snapshot(&self.lease, previous.as_ref())?
-            }
+            AccountPublicationAdmission::PreparedOrActive => onboarding
+                .require_prepared_or_active_with_snapshot(&self.lease, previous.as_ref())?,
         };
         self.retain_snapshot(current)
     }
@@ -678,9 +670,15 @@ pub(crate) async fn assert_schwab_prepared_publication_transition(
     config: &AppConfig,
     rate: ProviderRateAuthority,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
-        ProviderMarketAccount::SchwabMarketData, lease.clone(), Arc::clone(&onboarding), config, rate,
-    )?);
+    let authority = Arc::new(
+        ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
+            ProviderMarketAccount::SchwabMarketData,
+            lease.clone(),
+            Arc::clone(&onboarding),
+            config,
+            rate,
+        )?,
+    );
     let strict = authority.currentness();
     let phase = Arc::new(AtomicBool::new(false));
     let runtime = authority.runtime_currentness(Arc::clone(&phase));
@@ -704,12 +702,16 @@ pub(crate) async fn assert_schwab_prepared_publication_transition(
     assert!(strict.is_active().await);
     let active_publication = retained.acquire_publication_authority().await?;
     active_publication.require_current()?;
-    assert!(matches!(active_publication.admission, AccountPublicationAdmission::Active));
+    assert!(matches!(
+        active_publication.admission,
+        AccountPublicationAdmission::Active
+    ));
     drop(active_publication);
 
     let mutation = onboarding.acquire_runtime_mutation_authority().await;
     mutation.invalidate_activation_recipe(
-        lease.session_id(), EvidenceDigest::new(DigestAlgorithm::Sha256, [87; 32]),
+        lease.session_id(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [87; 32]),
     )?;
     drop(mutation);
     assert!(!strict.is_active().await);

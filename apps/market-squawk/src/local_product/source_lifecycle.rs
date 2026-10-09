@@ -1069,7 +1069,7 @@ impl ProductionSourceLifecycleAuthority {
                 return Err(SourceLifecycleError::Conflict);
             }
             if let Some((actual, _)) = observed {
-                if current.runtime_verification_receipt_digest().is_some()
+                if current.credential_generation().is_some()
                     && actual != account_group_request_from_record(surface, &current)?
                 {
                     return Err(SourceLifecycleError::Conflict);
@@ -2895,7 +2895,7 @@ fn account_group_request_from_values(
         surface,
         session_id.ok_or(SourceLifecycleError::Unauthorized)?,
         public_configuration_digest.ok_or(SourceLifecycleError::Unauthorized)?,
-        runtime_verification_receipt_digest.ok_or(SourceLifecycleError::Unauthorized)?,
+        runtime_verification_receipt_digest,
         credential_generation.ok_or(SourceLifecycleError::Unauthorized)?,
     )
     .map_err(|_error| SourceLifecycleError::InvalidResult)
@@ -3147,14 +3147,17 @@ impl LifecycleOutcome {
         let generation = lease
             .generation()
             .ok_or(SourceLifecycleError::InvalidResult)?;
-        if lease.runtime_evidence_digest().bytes() == [0; 32] {
+        if lease
+            .runtime_evidence_digest()
+            .is_some_and(|digest| digest.bytes() == [0; 32])
+        {
             return Err(SourceLifecycleError::InvalidResult);
         }
         Ok(Self {
             phase: DurableSourceLifecyclePhase::Stopped,
             session_id: Some(lease.session_id()),
             public_configuration_digest: Some(lease.public_configuration_digest()),
-            runtime_verification_receipt_digest: Some(lease.runtime_evidence_digest()),
+            runtime_verification_receipt_digest: lease.runtime_evidence_digest(),
             credential_generation: Some(generation),
             previous_generation: None,
         })
@@ -3169,11 +3172,13 @@ impl LifecycleOutcome {
             .ok_or(SourceLifecycleError::InvalidResult)?;
         if self.session_id != Some(lease.session_id())
             || self.public_configuration_digest != Some(lease.public_configuration_digest())
-            || lease.runtime_evidence_digest().bytes() == [0; 32]
+            || lease
+                .runtime_evidence_digest()
+                .is_some_and(|digest| digest.bytes() == [0; 32])
         {
             return Err(SourceLifecycleError::InvalidResult);
         }
-        self.runtime_verification_receipt_digest = Some(lease.runtime_evidence_digest());
+        self.runtime_verification_receipt_digest = lease.runtime_evidence_digest();
         self.credential_generation = Some(generation);
         Ok(())
     }

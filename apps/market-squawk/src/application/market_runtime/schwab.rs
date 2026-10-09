@@ -23,8 +23,7 @@ use market_squawk_data::{ListingReferenceGenerationReceipt, ListingReferenceRead
 use market_squawk_domain::{ConnectionGeneration, InstrumentId, SourceId, Timestamp, VenueId};
 use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetReservationDecision, BudgetUnavailableReason,
-    ProviderRateAuthority, ProviderRateDeclaration, RuntimeCapabilityDisposition,
-    SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SharedProviderBudget, SourceMetadata,
+    ProviderRateAuthority, ProviderRateDeclaration, SharedProviderBudget, SourceMetadata,
     apply_http_retry_after,
 };
 use tokio_util::sync::CancellationToken;
@@ -56,33 +55,26 @@ pub(crate) trait SchwabRestQuoteEventSink: std::fmt::Debug + Send + Sync {
     fn publish(&self, batch: SchwabRestQuoteBatch) -> SinkFuture<'_>;
 }
 
-/// Exact durable doctor authority retained until response-time qualification.
+/// Configured source metadata retained until actual response qualification.
 #[derive(Clone, Debug)]
 pub(crate) struct SchwabRestQuoteSourceEvidence {
     metadata: SourceMetadata,
     venue_id: VenueId,
-    doctor_receipt: SchwabMarketDataDoctorReceiptV1,
 }
 
 impl SchwabRestQuoteSourceEvidence {
     pub(crate) fn try_new(
         metadata: SourceMetadata,
         venue_id: VenueId,
-        doctor_receipt: SchwabMarketDataDoctorReceiptV1,
     ) -> Result<Self, SchwabRestQuoteRuntimeError> {
         if metadata.provider().as_str() != SCHWAB_PROVIDER
             || !metadata.capabilities().live()
             || metadata.budget_policy().is_none()
             || metadata.coverage().live().is_none()
-            || !doctor_receipt.admits_source_start()
         {
             return Err(SchwabRestQuoteRuntimeError::SourceEvidence);
         }
-        Ok(Self {
-            metadata,
-            venue_id,
-            doctor_receipt,
-        })
+        Ok(Self { metadata, venue_id })
     }
 
     pub(crate) const fn metadata(&self) -> &SourceMetadata {
@@ -91,10 +83,6 @@ impl SchwabRestQuoteSourceEvidence {
 
     pub(crate) const fn venue_id(&self) -> &VenueId {
         &self.venue_id
-    }
-
-    pub(crate) const fn doctor_receipt(&self) -> &SchwabMarketDataDoctorReceiptV1 {
-        &self.doctor_receipt
     }
 }
 
@@ -473,9 +461,6 @@ impl SchwabRestQuoteProducer {
         sink: Arc<dyn SchwabRestQuoteEventSink>,
     ) -> Result<Self, SchwabRestQuoteRuntimeError> {
         if activation.lease().provider_budget_policy() != evidence.metadata().budget_policy()
-            || activation.lease().runtime_evidence_digest()
-                != activation.doctor_receipt().receipt_sha256()
-            || !doctor_admits_quotes(&activation)
             || bindings.is_empty()
             || bindings.len() > bounds.request_admission.max_items()
             || nasdaq_generation.is_some()
@@ -554,10 +539,7 @@ impl SchwabRestQuoteProducer {
             current = self.activation.require_runtime_current() => current?,
         }
         let (now, valid_through) = authority_window(cancellation, deadline)?;
-        if !self.activation.doctor_receipt().is_current_at(now)
-            || !self.evidence.metadata().is_effective_at(now)
-            || !doctor_admits_quotes(&self.activation)
-        {
+        if !self.evidence.metadata().is_effective_at(now) {
             return Err(SchwabRestQuoteRuntimeError::RefreshRequired);
         }
         let generation = self.connection_generation;
@@ -577,9 +559,8 @@ impl SchwabRestQuoteProducer {
         oauth_epoch
             .validate_current(oauth)
             .map_err(|_error| SchwabRestQuoteRuntimeError::RefreshRequired)?;
-        if token.generation() != oauth.generation()
-            || !oauth.matches_market_data_authorization(self.activation.doctor_receipt())
-        {
+        self.activation.validate_oauth_authorization(oauth)?;
+        if token.generation() != oauth.generation() {
             return Err(SchwabRestQuoteRuntimeError::RefreshRequired);
         }
         let (dispatch_at, dispatch_valid_through) = authority_window(cancellation, deadline)?;
@@ -886,22 +867,6 @@ fn budget_control_failure(decision: BudgetDecision) -> Option<BudgetUnavailableR
             Some(BudgetUnavailableReason::StateCorrupt)
         }
     }
-}
-
-fn doctor_admits_quotes(activation: &SchwabMarketDataAccountActivation) -> bool {
-    activation
-        .doctor_receipt()
-        .observation()
-        .families
-        .iter()
-        .any(|family| {
-            family.family == SchwabMarketDataFamily::Quotes
-                && matches!(
-                    family.disposition,
-                    RuntimeCapabilityDisposition::Available
-                        | RuntimeCapabilityDisposition::Degraded
-                )
-        })
 }
 
 fn classify_quote_outcome(

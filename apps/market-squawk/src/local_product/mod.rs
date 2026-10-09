@@ -139,9 +139,9 @@ use crate::provider_activation::{
 };
 use crate::provider_onboarding::{
     InstallationSchwabOAuthBrowser, InstallationSchwabOAuthIdentity,
-    InstallationSchwabOAuthTlsAcceptor, SchwabMarketDoctorRuntimeCoordinator,
-    SchwabOAuthMarketDrain, SchwabOAuthMarketDrainError, SchwabOAuthMarketDrainFuture,
-    SchwabOAuthMarketDrainPurpose, SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
+    InstallationSchwabOAuthTlsAcceptor, SchwabOAuthMarketDrain, SchwabOAuthMarketDrainError,
+    SchwabOAuthMarketDrainFuture, SchwabOAuthMarketDrainPurpose, SchwabOAuthRuntime,
+    SchwabOAuthRuntimeConfiguration,
 };
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
@@ -878,18 +878,6 @@ impl LocalProduct {
                 research.application_changes(),
             )?;
             let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
-            let schwab_market_doctor = schwab_oauth_installation
-                .as_ref()
-                .map(|_installation| {
-                    SchwabMarketDoctorRuntimeCoordinator::try_production(
-                        Arc::clone(&onboarding),
-                        Arc::clone(&research),
-                        paths.control_root()?.root(),
-                    )
-                    .map(Arc::new)
-                    .map_err(|_error| LocalProductError::ProviderVerification)
-                })
-                .transpose()?;
             let schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory> = schwab_oauth_installation
                 .map(|installation| {
                     let workspace_paths = paths.clone();
@@ -922,7 +910,6 @@ impl LocalProduct {
                 Arc::clone(&provider_activation),
                 provider_activation_state.clone(),
                 schwab_oauth_factory,
-                schwab_market_doctor,
             ));
             prepared_schwab.bind_portal(Arc::clone(&portal_activation))?;
             let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =

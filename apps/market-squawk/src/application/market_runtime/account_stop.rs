@@ -414,19 +414,16 @@ fn validate_schwab_oauth_entry(
         .runtime
         .account_evidence()
         .ok_or(ServiceError::InvalidRequest)?;
-    let receipt = entry
+    let lease = entry
         .runtime
         .account_activation_lease()
-        .and_then(|lease| {
-            lease
-                .runtime_verification_evidence()
-                .schwab_market_data_receipt()
-        })
         .ok_or(ServiceError::InvalidRequest)?;
+    let credential = market_squawk_adapter_schwab::SchwabCredentialAuthorityBinding::try_from_application_credential(
+        lease.secret_reference().ok_or(ServiceError::InvalidRequest)?,
+    ).map_err(|_| ServiceError::InvalidRequest)?;
     if group.onboarding_session_id() != session_id
-        || uuid::Uuid::parse_str(receipt.session_identifier().as_str()) != Ok(session_id)
-        || current
-            .is_some_and(|current| current.generation().get() < receipt.access_token_generation())
+        || lease.session_id() != session_id
+        || current.is_some_and(|current| current.credential_authority() != credential)
     {
         return Err(ServiceError::InvalidRequest);
     }

@@ -3231,9 +3231,7 @@ fn fred_research_rights(
         basis,
         lease.rights_decision_digest(),
         authorization_evidence,
-        lease
-            .verification_expires_at()
-            .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
+        lease.verification_expires_at(),
         vec![series],
         lease_research_operations(lease),
     )

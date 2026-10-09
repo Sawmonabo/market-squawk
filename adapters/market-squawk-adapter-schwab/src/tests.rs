@@ -20,12 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use market_squawk_domain::{
     AuthorizationBasis, BarTimeSemantics, BarTimestampBasis, CanonicalStateDigest,
-    CanonicalizationRule, CoverageDelay, CoverageStatus, Currency, DataQuality,
-    DecodedLiveProvenanceInput, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, LiveEventClass, LiveEvidenceBinding, LiveProvenance,
-    LotSize, MarketBarAdjustment, MarketBarSessionEvidence, MarketBarSessionKind, MarketEvent,
-    MetadataRevision, OptionComponentState, PayloadHash, PayloadReference, ProviderInstrumentId,
-    RuleVersion, SourceId, SourceIdentifier, TickSize, Timestamp, VenueId,
+    CanonicalizationRule, CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId,
+    LiveEventClass, LiveEvidenceBinding, LiveProvenance, MarketBarAdjustment,
+    MarketBarSessionEvidence, MarketBarSessionKind, MarketEvent, MetadataRevision,
+    OptionComponentState, PayloadHash, PayloadReference, ProviderInstrumentId, RuleVersion,
+    SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{
     EncryptedFileSecretStore, LocalPaths, LocalSecretStoreError, SealedResearchJournalStore,
@@ -33,11 +33,7 @@ use market_squawk_platform::{
     SecretOperationControl, SecretRef, SecretStore, SecretValue,
 };
 use market_squawk_sources::{
-    AvailabilityEvidence, DiscoveryRequest, ExtractionRequest, OptionMarketBatchKind,
-    ProviderCapabilityRevision, RuntimeCapabilityDisposition, SCHWAB_MARKET_DATA_SURFACE_ID,
-    SchwabMarketDataDoctorObservation, SchwabMarketDataDoctorReceiptInput,
-    SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SchwabMarketDataFamilyEvidence,
-    SchwabUserPreferenceDoctorEvidence, SourceObject,
+    AvailabilityEvidence, DiscoveryRequest, ExtractionRequest, OptionMarketBatchKind, SourceObject,
 };
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1148,39 +1144,8 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         token.credential_authority(),
         oauth_receipt.credential_authority()
     );
-    let preference_request = crate::ReadOnlyRequest::user_preference(admission())
-        .unwrap_or_else(|error| panic!("preference request: {error}"));
-    let preference = execute_user_preference_fixture(
-        &preference_request,
-        br#"{
-          "accounts":[{"accountNumber":"must-not-enter-raw-capture"}],
-          "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
-          "offers":[{"mktDataPermission":"NP"}]
-        }"#,
-        &token,
-        token_admission,
-    )
-    .await;
-    let changed_preference = execute_user_preference_fixture(
-        &preference_request,
-        br#"{
-          "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
-          "offers":[{"mktDataPermission":"NP"}],
-          "changedBootstrapField":true
-        }"#,
-        &token,
-        token_admission,
-    )
-    .await;
     let market_data_session = SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
         .unwrap_or_else(|error| panic!("market-data qualification session: {error}"));
-    let market_data_principal_sha256 = EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        preference
-            .bootstrap()
-            .value()
-            .market_data_principal_sha256(),
-    );
     let start_millis = 1_704_067_200_000;
     let end_millis = 1_704_153_600_000;
     let history_request = PriceHistoryRequest::new(
@@ -1205,14 +1170,9 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
     let history =
         execute_market_fixture(&history_request, history_body, &token, token_admission).await;
     let observed_at = history.capture().receipt().received_at_unix_millis() / 1_000;
-    let capability = SchwabPriceHistoryCapabilityObservation::try_observe(
-        oauth_receipt,
-        &preference,
-        &history,
-        observed_at,
-        Duration::from_secs(10),
-    )
-    .unwrap_or_else(|error| panic!("history capability: {error}"));
+    let capability =
+        SchwabPriceHistoryCapabilityObservation::try_observe(oauth_receipt, &history, observed_at)
+            .unwrap_or_else(|error| panic!("history capability: {error}"));
     let different_series_oauth = SchwabOAuthAuthorityReceipt::for_test(
         oauth_receipt.generation(),
         SchwabCredentialAuthorityBinding::for_test(
@@ -1225,10 +1185,8 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
     assert_eq!(
         SchwabPriceHistoryCapabilityObservation::try_observe(
             different_series_oauth,
-            &preference,
             &history,
             observed_at,
-            Duration::from_secs(10),
         ),
         Err(crate::SchwabVerticalError::InvalidCapabilityEvidence)
     );
@@ -1236,10 +1194,8 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
     assert_eq!(
         SchwabPriceHistoryCapabilityObservation::try_observe(
             oauth_receipt,
-            &preference,
             &history,
-            observed_at,
-            Duration::from_secs(60),
+            oauth_receipt.access_expires_at_unix_seconds(),
         ),
         Err(crate::SchwabVerticalError::InvalidCapabilityEvidence)
     );
@@ -1308,10 +1264,9 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         receipt_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [27; 32]),
         periods: vec![time_semantics.clone()].into_boxed_slice(),
     });
-    let request_for = |user_preference| SchwabDailyPriceHistoryCandidateRequest {
+    let request_for = || SchwabDailyPriceHistoryCandidateRequest {
         capability,
         oauth_authority: oauth_receipt,
-        user_preference,
         receipt: history.capture().receipt(),
         payload: history.payload(),
         accounting: history.accounting(),
@@ -1328,12 +1283,9 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         ingested_at: received_at,
     };
 
-    assert!(matches!(
-        prepare_price_history_candidate(request_for(&changed_preference)),
-        Err(SchwabCanonicalError::PendingHistoryBinding)
-    ));
-    let candidate = prepare_price_history_candidate(request_for(&preference))
-        .unwrap_or_else(|error| panic!("pending history candidate: {error}"));
+    let candidate = prepare_price_history_candidate(request_for()).unwrap_or_else(|error| {
+        panic!("pending history candidate without UserPreference: {error}")
+    });
     assert_eq!(candidate.instrument_id(), instrument_id);
     assert_eq!(candidate.provider_instrument_id().as_str(), "SPY");
     assert_eq!(candidate.provider_symbol().as_str(), "SPY");
@@ -1391,20 +1343,20 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
     .unwrap_or_else(|error| panic!("history extraction request: {error}"));
     let market_data = SchwabPriceHistoryMarketDataEvidence::try_new(
         venue_id.clone(),
-        test_market_data_qualification_for_authority(
-            SchwabMarketDataFamily::PriceHistory,
-            received_at,
+        SchwabMarketDataQualification::try_from_rest_response(
+            &history,
             oauth_receipt,
             market_data_session.clone(),
-            market_data_principal_sha256,
-        ),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]),
+        )
+        .expect("actual history response qualification without a probe"),
     )
     .unwrap_or_else(|error| panic!("history market-data evidence: {error}"));
     assert_eq!(market_data.delay(), SchwabMarketDataDelay::Unknown);
     let publication_request = SchwabDailyPriceHistoryPublicationRequest::new(
         capability,
         oauth_receipt,
-        &preference,
         extraction_request,
         instrument_id,
         instrument_revision_digest,
@@ -1462,14 +1414,6 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         Err(crate::SchwabPriceHistoryPublicationError::SemanticsUnverified)
     ));
 
-    assert_eq!(preference.receipt().route(), ReadOnlyRoute::UserPreference);
-    assert_eq!(preference.accounting().provider_records, 1);
-    assert_eq!(
-        preference.bootstrap().value().market_data_permission(),
-        Some("NP")
-    );
-    assert!(!format!("{preference:?}").contains("must-not-enter-raw-capture"));
-
     let quote_request = QuoteRequest::try_new(
         vec![
             ProviderIdentifier::try_new("AAPL")
@@ -1504,12 +1448,60 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         .unwrap_or_else(|error| panic!("quote instrument: {error}"));
     let quote_venue = VenueId::try_from("schwab-us-equities")
         .unwrap_or_else(|error| panic!("quote venue: {error}"));
-    let quote_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::Quotes,
-        quote_received_at,
+    let quote_qualification =
+        test_rest_qualification(&sealed_quote, oauth_receipt, quote_session.clone());
+    assert_eq!(quote_qualification.market_data_principal_sha256(), None);
+    assert_eq!(quote_qualification.delay(), SchwabMarketDataDelay::RealTime);
+    assert_eq!(
+        quote_qualification.observation_evidence().bytes(),
+        sealed_quote.receipt().body_sha256()
+    );
+    assert!(
+        SchwabMarketDataQualification::try_from_sealed_rest_response(
+            &sealed_quote,
+            different_series_oauth,
+            quote_session.clone(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]),
+        )
+        .is_err()
+    );
+    let unknown_quote = execute_market_fixture(
+        quote_request.request(),
+        br#"{"AAPL":{"assetMainType":"EQUITY","realtime":false,"quote":{"bidPrice":100.125,"askPrice":100.25,"bidSize":2,"askSize":3}}}"#,
+        &token, token_admission,
+    ).await;
+    let unknown_qualification = SchwabMarketDataQualification::try_from_rest_response(
+        &unknown_quote,
         oauth_receipt,
         quote_session.clone(),
-        market_data_principal_sha256,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]),
+    )
+    .expect("actual response without real-time entitlement still qualifies honestly");
+    assert_eq!(
+        unknown_qualification.delay(),
+        SchwabMarketDataDelay::Unknown
+    );
+    assert!(!quote_qualification.validates_rest_receipt(
+        market_squawk_sources::SchwabMarketDataFamily::Quotes,
+        unknown_quote.capture().receipt(),
+    ));
+    let wrong_token = SchwabOAuthAuthorityReceipt::for_test(
+        AccessTokenGeneration::new(
+            NonZeroU64::new(oauth_receipt.generation().get() + 1).expect("next token"),
+        ),
+        oauth_receipt.credential_authority(),
+    );
+    assert!(
+        SchwabMarketDataQualification::try_from_rest_response(
+            &unknown_quote,
+            wrong_token,
+            quote_session.clone(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]),
+        )
+        .is_err()
     );
     let quote_product = quote_qualification.provider_product().clone();
     let quote_channel = quote_qualification.provider_channel().clone();
@@ -1718,6 +1710,8 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("chain received timestamp overflow")),
     );
+    let chain_qualification =
+        test_rest_qualification(&sealed_chain, oauth_receipt, market_data_session.clone());
     let chain_outcome = sealed_chain
         .into_option_publication(SchwabRestOptionPublicationRequest::new(
             SchwabRestOptionUnderlyingRequest::new(
@@ -1736,13 +1730,7 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
                     VenueId::try_from("schwab-us-options")
                         .unwrap_or_else(|error| panic!("option venue: {error}")),
                 ),
-                test_market_data_qualification_for_authority(
-                    SchwabMarketDataFamily::OptionChains,
-                    chain_received_at,
-                    oauth_receipt,
-                    market_data_session.clone(),
-                    market_data_principal_sha256,
-                ),
+                chain_qualification,
                 currency,
             )
             .unwrap_or_else(|error| panic!("option market-data evidence: {error}")),
@@ -1801,6 +1789,8 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("expiration received timestamp overflow")),
     );
+    let expiration_qualification =
+        test_rest_qualification(&sealed_expirations, oauth_receipt, market_data_session);
     let expiration_outcome = sealed_expirations
         .into_option_publication(SchwabRestOptionPublicationRequest::new(
             SchwabRestOptionUnderlyingRequest::new(
@@ -1814,13 +1804,7 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
                     VenueId::try_from("schwab-us-options")
                         .unwrap_or_else(|error| panic!("expiration venue: {error}")),
                 ),
-                test_market_data_qualification_for_authority(
-                    SchwabMarketDataFamily::ExpirationChains,
-                    expiration_received_at,
-                    oauth_receipt,
-                    market_data_session,
-                    market_data_principal_sha256,
-                ),
+                expiration_qualification,
                 currency,
             )
             .unwrap_or_else(|error| panic!("expiration market-data evidence: {error}")),
@@ -2130,20 +2114,6 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
         initial.authorization_generation(),
         initial.generation().get()
     );
-    let observed_at = Timestamp::from_unix_nanos(
-        i64::try_from(now)
-            .expect("doctor observation seconds")
-            .checked_mul(1_000_000_000)
-            .expect("doctor observation nanoseconds"),
-    );
-    let original_doctor = test_market_data_doctor_for_authority(
-        SchwabMarketDataFamily::Quotes,
-        observed_at,
-        initial,
-        SourceIdentifier::try_from("018f76a0-3d3b-7d62-a60b-0242ac120002").expect("doctor test session"),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [82; 32]),
-    );
-    assert!(initial.matches_market_data_authorization(&original_doctor));
     drop(refreshed.authority);
     let authority = ProtectedSchwabOAuthAuthority::try_open(
         &refreshed.state_root,
@@ -2181,7 +2151,6 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
         narrowed.authorization_scope_sha256(),
         initial.authorization_scope_sha256()
     );
-    assert!(!narrowed.matches_market_data_authorization(&original_doctor));
     let mut normalized_scope_hash = sha2::Sha256::new();
     normalized_scope_hash.update(b"market-squawk.schwab.oauth-authorization-scope/v1\0");
     normalized_scope_hash.update([1]);
@@ -2233,15 +2202,6 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
         restored.authorization_scope_sha256(),
         initial.authorization_scope_sha256()
     );
-    assert!(restored.matches_market_data_authorization(&original_doctor));
-    let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
-        &original_doctor,
-        SchwabMarketDataFamily::Quotes,
-        observed_at,
-        restored,
-    )
-    .expect("original capability doctor survives access refresh");
-    assert_eq!(qualification.token_generation(), restored.generation());
     drop(authority);
 
     let authority = ProtectedSchwabOAuthAuthority::try_open(
@@ -2299,7 +2259,6 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
         new_grant.authorization_scope_sha256(),
         initial.authorization_scope_sha256()
     );
-    assert!(!new_grant.matches_market_data_authorization(&original_doctor));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2998,12 +2957,11 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         raw_only.streamer_receipt().credential_authority(),
     );
     let streamer_principal = raw_only.streamer_receipt().market_data_principal_sha256();
-    let raw_only_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::LevelOneEquities,
+    let raw_only_qualification = test_streamer_qualification(
+        &equities_streamer_doctor,
         raw_only_received_at,
         streamer_oauth_authority,
         session_identifier.clone(),
-        streamer_principal,
     );
     assert!(
         !raw_only_qualification.validates_streamer_publication_coordinate(
@@ -3064,67 +3022,55 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         sealed.streamer_receipt().market_data_principal_sha256(),
         streamer_principal
     );
-    let equities_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::LevelOneEquities,
+    let equities_qualification = test_streamer_qualification(
+        &equities_streamer_doctor,
         received_at,
         streamer_oauth_authority,
         session_identifier.clone(),
-        streamer_principal,
     );
-    let options_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::LevelOneOptions,
+    let options_qualification = test_streamer_qualification(
+        &options_streamer_doctor,
         received_at,
         streamer_oauth_authority,
         session_identifier.clone(),
-        streamer_principal,
     );
-    let wrong_series_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::LevelOneEquities,
-        received_at,
-        SchwabOAuthAuthorityReceipt::for_test(
-            sealed.streamer_receipt().token_generation(),
-            SchwabCredentialAuthorityBinding::for_test(
-                streamer_oauth_authority
-                    .credential_authority()
-                    .application_credential_generation(),
-                92,
-            ),
+    assert_eq!(
+        equities_qualification.market_data_principal_sha256(),
+        Some(streamer_principal)
+    );
+    let rights = EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]);
+    let capability = EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]);
+    let wrong_series = SchwabOAuthAuthorityReceipt::for_test(
+        sealed.streamer_receipt().token_generation(),
+        SchwabCredentialAuthorityBinding::for_test(
+            streamer_oauth_authority
+                .credential_authority()
+                .application_credential_generation(),
+            92,
         ),
-        session_identifier.clone(),
-        streamer_principal,
-    );
-    let wrong_principal_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::LevelOneEquities,
-        received_at,
-        streamer_oauth_authority,
-        session_identifier.clone(),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [93; 32]),
-    );
-    let wrong_session_qualification = test_market_data_qualification_for_authority(
-        SchwabMarketDataFamily::LevelOneEquities,
-        received_at,
-        streamer_oauth_authority,
-        SourceIdentifier::try_from("d184e132-2f48-49df-98ff-d24898f8907a")
-            .unwrap_or_else(|error| panic!("wrong Streamer session: {error}")),
-        streamer_principal,
     );
     assert!(
-        [
-            wrong_series_qualification,
-            wrong_principal_qualification,
-            wrong_session_qualification,
-        ]
-        .iter()
-        .all(
-            |qualification| !qualification.validates_streamer_publication_coordinate(
-                MarketDataService::LevelOneEquities,
-                &equities_streamer_doctor,
-                &sealed,
-                0,
-                0,
-                0,
-            )
+        SchwabMarketDataQualification::try_from_streamer_handoff(
+            &equities_streamer_doctor,
+            received_at,
+            wrong_series,
+            session_identifier.clone(),
+            rights,
+            capability,
         )
+        .is_err()
+    );
+    assert!(
+        SchwabMarketDataQualification::try_from_streamer_handoff(
+            &equities_streamer_doctor,
+            received_at,
+            streamer_oauth_authority,
+            SourceIdentifier::try_from("d184e132-2f48-49df-98ff-d24898f8907a")
+                .expect("wrong session"),
+            rights,
+            capability,
+        )
+        .is_err()
     );
     let equities_record = test_streamer_quote_record_request(
         &coordinates,
@@ -3152,11 +3098,43 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         "schwab-us-options",
         51,
     );
+    let publication_request = SchwabStreamerQuotePublicationRequest::new(
+        vec![&equities_streamer_doctor, &options_streamer_doctor],
+        vec![equities_record, options_record],
+    );
+    publication_request
+        .validate_current_authority(
+            streamer_oauth_authority,
+            received_at,
+            &session_identifier,
+            rights,
+            capability,
+        )
+        .expect("native proofs with current configured authority");
+    assert!(
+        publication_request
+            .validate_current_authority(
+                wrong_series,
+                received_at,
+                &session_identifier,
+                rights,
+                capability,
+            )
+            .is_err()
+    );
+    assert!(
+        publication_request
+            .validate_current_authority(
+                streamer_oauth_authority,
+                received_at,
+                &session_identifier,
+                EvidenceDigest::new(DigestAlgorithm::Sha256, [94; 32]),
+                capability,
+            )
+            .is_err()
+    );
     let outcome = sealed
-        .into_level_one_quote_publication(SchwabStreamerQuotePublicationRequest::new(
-            vec![&equities_streamer_doctor, &options_streamer_doctor],
-            vec![equities_record, options_record],
-        ))
+        .into_level_one_quote_publication(publication_request)
         .unwrap_or_else(|error| panic!("typed Streamer publication: {error}"));
     let SchwabStreamerQuotePublicationOutcome::Published(publication) = outcome else {
         panic!("complete Level-One quote should publish a typed event batch");
@@ -3532,18 +3510,6 @@ async fn assert_sealed_rest_family(
         received_at_unix_millis
     );
     sealed
-}
-
-async fn execute_user_preference_fixture(
-    request: &crate::ReadOnlyRequest,
-    body: &'static [u8],
-    token: &TransientAccessToken,
-    token_admission: AccessTokenAdmission,
-) -> crate::SchwabUserPreferenceEvidence {
-    match execute_fixture(request, body, token, token_admission).await {
-        RestExecutionOutcome::AcceptedUserPreference(response) => response,
-        other => panic!("unexpected User Preference outcome: {other:?}"),
-    }
 }
 
 async fn execute_fixture(
@@ -4139,149 +4105,36 @@ fn test_streamer_quote_record_request(
     )
 }
 
-fn test_market_data_qualification_for_authority(
-    family: SchwabMarketDataFamily,
-    response_observed_at: Timestamp,
-    oauth_authority: SchwabOAuthAuthorityReceipt,
-    session_identifier: SourceIdentifier,
-    market_data_principal_sha256: EvidenceDigest,
+fn test_rest_qualification(
+    response: &crate::SchwabSealedRestResponse,
+    oauth: SchwabOAuthAuthorityReceipt,
+    session: SourceIdentifier,
 ) -> SchwabMarketDataQualification {
-    let receipt = test_market_data_doctor_for_authority(
-        family,
-        response_observed_at,
-        oauth_authority,
-        session_identifier,
-        market_data_principal_sha256,
-    );
-    SchwabMarketDataQualification::try_from_doctor_receipt(
-        &receipt,
-        family,
-        response_observed_at,
-        oauth_authority,
+    SchwabMarketDataQualification::try_from_sealed_rest_response(
+        response,
+        oauth,
+        session,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]),
     )
-    .unwrap_or_else(|error| panic!("test market-data qualification: {error}"))
+    .expect("actual sealed response qualification")
 }
 
-fn test_market_data_doctor_for_authority(
-    family: SchwabMarketDataFamily,
-    response_observed_at: Timestamp,
-    oauth_authority: SchwabOAuthAuthorityReceipt,
-    session_identifier: SourceIdentifier,
-    market_data_principal_sha256: EvidenceDigest,
-) -> SchwabMarketDataDoctorReceiptV1 {
-    let token_generation = oauth_authority.generation();
-    let issued_at = Timestamp::from_unix_nanos(
-        response_observed_at
-            .unix_nanos()
-            .checked_sub(60_000_000_000)
-            .unwrap_or_else(|| panic!("test qualification issue time underflow")),
-    );
-    let access_expires_at = Timestamp::from_unix_nanos(
-        response_observed_at
-            .unix_nanos()
-            .checked_add(600_000_000_000)
-            .unwrap_or_else(|| panic!("test qualification access expiry overflow")),
-    );
-    let refresh_expires_at = Timestamp::from_unix_nanos(
-        issued_at
-            .unix_nanos()
-            .checked_add(604_800_000_000_000)
-            .unwrap_or_else(|| panic!("test qualification refresh expiry overflow")),
-    );
-    let exclusive_expires_at = refresh_expires_at;
-    let digest = |byte| EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
-    let families = schwab_market_data_families()
-        .into_iter()
-        .map(|candidate| {
-            let observed = candidate == family;
-            SchwabMarketDataFamilyEvidence {
-                family: candidate,
-                disposition: if observed {
-                    RuntimeCapabilityDisposition::Available
-                } else {
-                    RuntimeCapabilityDisposition::NotProbed
-                },
-                disposition_evidence_sha256: digest(71),
-                observation_sha256: observed.then(|| digest(72)),
-                observed_at: observed.then_some(response_observed_at),
-            }
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
-        surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)
-            .unwrap_or_else(|error| panic!("test qualification surface: {error}")),
-        session_identifier,
-        application_credential_generation: oauth_authority
-            .credential_authority()
-            .application_credential_generation(),
-        application_credential_reference_sha256: oauth_authority
-            .credential_authority()
-            .application_credential_reference_sha256(),
-        capability_revision: ProviderCapabilityRevision::new(1)
-            .unwrap_or_else(|error| panic!("test capability revision: {error}")),
-        capability_digest: digest(73),
-        public_configuration_digest: digest(74),
-        rights_decision_digest: digest(75),
-        rate_policy_digest: digest(76),
-        data_quality: DataQuality::DirectUnverified,
-        observation: SchwabMarketDataDoctorObservation {
-            provider_observation_origin:
-                SchwabMarketDataDoctorObservation::provider_observed_origin()
-                    .unwrap_or_else(|error| panic!("test provider observation origin: {error}")),
-            access_token_generation: token_generation.get(),
-            authorization_generation: oauth_authority.authorization_generation(),
-            authorization_scope_sha256: oauth_authority.authorization_scope_sha256(),
-            access_issued_at: issued_at,
-            access_expires_at,
-            refresh_authorized_at: issued_at,
-            refresh_expires_at,
-            user_preference: SchwabUserPreferenceDoctorEvidence {
-                endpoint_contract_sha256: digest(77),
-                request_sha256: digest(78),
-                response_sha256: digest(79),
-                status_code: 200,
-                response_bytes: 1,
-                received_at: response_observed_at,
-                latency_nanos: 1,
-                market_data_principal_sha256,
-                streamer_bootstrap_sha256: digest(81),
-                market_data_offer_sha256: None,
-            },
-            quote_delay: (family == SchwabMarketDataFamily::Quotes)
-                .then_some(CoverageDelay::RealTime),
-            families,
-            completed_at: response_observed_at,
-        },
-        exclusive_expires_at,
-        predecessor_digest: None,
-    })
-    .unwrap_or_else(|error| panic!("test market-data doctor receipt: {error}"))
-}
-
-fn schwab_market_data_families() -> [SchwabMarketDataFamily; 19] {
-    use SchwabMarketDataFamily::*;
-    [
-        Quotes,
-        PriceHistory,
-        OptionChains,
-        ExpirationChains,
-        Movers,
-        MarketHours,
-        Instruments,
-        LevelOneEquities,
-        LevelOneOptions,
-        LevelOneFutures,
-        LevelOneFuturesOptions,
-        LevelOneForex,
-        NyseBook,
-        NasdaqBook,
-        OptionsBook,
-        ChartEquity,
-        ChartFutures,
-        ScreenerEquity,
-        ScreenerOption,
-    ]
+fn test_streamer_qualification(
+    handoff: &crate::SchwabStreamerFamilyDoctorHandoff,
+    observed_at: Timestamp,
+    oauth: SchwabOAuthAuthorityReceipt,
+    session: SourceIdentifier,
+) -> SchwabMarketDataQualification {
+    SchwabMarketDataQualification::try_from_streamer_handoff(
+        handoff,
+        observed_at,
+        oauth,
+        session,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [75; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [73; 32]),
+    )
+    .expect("actual same-socket ACK/data qualification")
 }
 
 fn capture_coordinates() -> SchwabCaptureCoordinates {

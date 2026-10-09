@@ -188,7 +188,7 @@ impl MarketRuntimeRegistry {
                     let lease = group.activation_lease();
                     let Some(doctor) = lease
                         .runtime_verification_evidence()
-                        .alpaca_paper_iex_receipt()
+                        .and_then(market_squawk_sources::RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
                     else {
                         return Ok(false);
                     };

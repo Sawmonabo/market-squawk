@@ -1,4 +1,4 @@
-//! Exact read-only Schwab OAuth and doctor activation for one account market runtime.
+//! Exact read-only Schwab OAuth activation for one account market runtime.
 
 use std::{
     collections::BTreeSet,
@@ -12,7 +12,8 @@ use std::{
 
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, ProviderIdentifier, RequestAdmission, RestTransportBounds,
-    SchwabOAuthAuthorityReceipt, SchwabTransportTelemetry, TransientAccessToken,
+    SchwabCredentialAuthorityBinding, SchwabOAuthAuthorityReceipt, SchwabTransportTelemetry,
+    TransientAccessToken,
 };
 use market_squawk_data::{
     DatasetId, ListingReferenceGenerationReceipt, ListingReferenceReadCapability,
@@ -22,10 +23,7 @@ use market_squawk_domain::{
     AssignmentVerification, DataQuality, EffectiveInterval, IdentifierEntitlement, LiveEventClass,
     Timestamp, VenueId,
 };
-use market_squawk_sources::{
-    ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorReceiptV1,
-    SourceMetadata,
-};
+use market_squawk_sources::{ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SourceMetadata};
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
@@ -72,13 +70,13 @@ const SCHWAB_QUOTE_FRESHNESS_MARGIN_DIVISOR: u64 = 2;
 
 /// Non-clone owner of one callable Schwab read-only market-data epoch.
 ///
-/// It retains the exact prepared or active onboarding lease, durable doctor receipt, protected
-/// OAuth market authority, account-lifetime authority, and shared provider-rate authority. It exposes no
+/// It retains the exact prepared or active onboarding lease, protected OAuth authorization,
+/// account-lifetime authority, and shared provider-rate authority. It exposes no
 /// account, position, transaction, order, or money-movement operation.
 pub struct SchwabMarketDataAccountActivation {
     authority: Arc<ProviderAccountRuntimeAuthority>,
     oauth: SchwabOAuthMarketAuthority,
-    doctor: SchwabMarketDataDoctorReceiptV1,
+    oauth_authorization: SchwabOAuthAuthorityReceipt,
     market_hours_demand: tokio::sync::Mutex<()>,
     streamer_owner: Arc<tokio::sync::Mutex<()>>,
     preparation_complete: Arc<AtomicBool>,
@@ -293,15 +291,24 @@ impl SchwabMarketDataAccountActivation {
     ) -> Result<SchwabOAuthAuthorityReceipt, SchwabMarketDataActivationError> {
         self.authority.require_current().await?;
         let receipt = self.oauth.current_receipt().await?;
-        if !receipt.matches_market_data_authorization(&self.doctor) {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
+        self.validate_oauth_authorization(receipt)?;
         self.authority.require_current().await?;
         Ok(receipt)
     }
 
-    pub(crate) const fn doctor_receipt(&self) -> &SchwabMarketDataDoctorReceiptV1 {
-        &self.doctor
+    /// Keeps runtime ownership on the configured application and original OAuth grant. Scope and
+    /// token clocks remain actual request evidence, not proof that a data family is available.
+    pub(crate) fn validate_oauth_authorization(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), SchwabMarketDataActivationError> {
+        if receipt.credential_authority() != self.oauth_authorization.credential_authority()
+            || receipt.authorization_generation()
+                != self.oauth_authorization.authorization_generation()
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn currentness(&self) -> ProviderAccountRuntimeCurrentness {
@@ -327,9 +334,7 @@ impl SchwabMarketDataAccountActivation {
             .acquire_publication_authority()
             .await?;
         let receipt = self.oauth.current_receipt().await?;
-        if !receipt.matches_market_data_authorization(&self.doctor) {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
+        self.validate_oauth_authorization(receipt)?;
         self.runtime_currentness()
             .acquire_publication_authority()
             .await?;
@@ -351,12 +356,7 @@ impl SchwabMarketDataAccountActivation {
             .acquire_publication_authority()
             .await?;
         let (token, epoch) = self.oauth.acquire_publication_attempt().await?;
-        if !epoch
-            .receipt()
-            .matches_market_data_authorization(&self.doctor)
-        {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
+        self.validate_oauth_authorization(epoch.receipt())?;
         self.runtime_currentness()
             .acquire_publication_authority()
             .await?;
@@ -370,20 +370,15 @@ impl SchwabMarketDataAccountActivation {
     /// Acquires one exact token/publication attempt behind the serialized OAuth barrier.
     ///
     /// A protected refresh may advance the access-token generation within the same authorization.
-    /// The retained doctor must still match the grant, scope, and application credentials; the
-    /// returned epoch binds the exact current token for dispatch and publication.
+    /// The original grant and application credentials retain runtime ownership; the returned
+    /// epoch binds the exact current token for dispatch and publication.
     pub(crate) async fn acquire_publication_attempt(
         &self,
     ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabMarketDataActivationError>
     {
         self.authority.require_current().await?;
         let (token, epoch) = self.oauth.acquire_publication_attempt().await?;
-        if !epoch
-            .receipt()
-            .matches_market_data_authorization(&self.doctor)
-        {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
+        self.validate_oauth_authorization(epoch.receipt())?;
         Ok((token, epoch))
     }
 
@@ -413,9 +408,6 @@ impl SchwabMarketDataAccountActivation {
             || metadata.provider().as_str() != SCHWAB_QUOTE_PROVIDER
             || metadata.budget_policy() != self.lease().provider_budget_policy()
             || !metadata.is_effective_at(at)
-            || !self.doctor.is_current_at(at)
-            || !self.doctor.admits_source_start()
-            || self.doctor.receipt_sha256() != self.lease().runtime_evidence_digest()
             || validate_exact_schwab_quote_bindings(
                 bindings,
                 metadata,
@@ -434,13 +426,9 @@ impl SchwabMarketDataAccountActivation {
     #[cfg(test)]
     pub(crate) async fn acquire_test_publication_attempt(
         oauth: &SchwabOAuthMarketAuthority,
-        doctor: &SchwabMarketDataDoctorReceiptV1,
     ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabMarketDataActivationError>
     {
         let (token, epoch) = oauth.acquire_publication_attempt().await?;
-        if !epoch.receipt().matches_market_data_authorization(doctor) {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
         Ok((token, epoch))
     }
 }
@@ -451,7 +439,10 @@ impl std::fmt::Debug for SchwabMarketDataAccountActivation {
             .debug_struct("SchwabMarketDataAccountActivation")
             .field("authority", &self.authority)
             .field("oauth", &"[PROTECTED TOKEN AUTHORITY]")
-            .field("doctor_receipt", &self.doctor.receipt_sha256())
+            .field(
+                "authorization_generation",
+                &self.oauth_authorization.authorization_generation(),
+            )
             .finish()
     }
 }
@@ -490,7 +481,7 @@ impl ProviderAdapterActivation {
         .await
     }
 
-    /// Activates the OAuth authorization proven by the retained durable Schwab doctor receipt.
+    /// Activates a configured application with its existing protected OAuth authorization.
     pub(crate) async fn activate_schwab_market_data_account(
         &self,
         lease: ProviderActivationLease,
@@ -500,28 +491,21 @@ impl ProviderAdapterActivation {
         if cancellation.is_cancelled() {
             return Err(SchwabMarketDataActivationError::Cancelled);
         }
-        let binding = ProviderAccountBinding::try_from_lease(
-            ProviderMarketAccount::SchwabMarketData,
-            &lease,
-        )?;
         if oauth.session_id() != lease.session_id() {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
-        let doctor = lease
-            .runtime_verification_evidence()
-            .schwab_market_data_receipt()
-            .cloned()
-            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let credential = SchwabCredentialAuthorityBinding::try_from_application_credential(
+            lease
+                .secret_reference()
+                .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?,
+        )
+        .map_err(|_| SchwabMarketDataActivationError::AuthorityMismatch)?;
         let current = oauth.current_receipt().await?;
         if cancellation.is_cancelled() {
             return Err(SchwabMarketDataActivationError::Cancelled);
         }
-        if doctor.receipt_sha256() != binding.verification_evidence()
-            || !current.matches_market_data_authorization(&doctor)
-            || doctor.market_data_principal_sha256()
-                != lease
-                    .account_digest()
-                    .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?
+        if current.credential_authority() != credential
+            || lease.generation() != Some(credential.application_credential_generation())
         {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
@@ -537,7 +521,7 @@ impl ProviderAdapterActivation {
         let activation = SchwabMarketDataAccountActivation {
             authority,
             oauth,
-            doctor,
+            oauth_authorization: current,
             market_hours_demand: tokio::sync::Mutex::new(()),
             streamer_owner: Arc::new(tokio::sync::Mutex::new(())),
             preparation_complete: Arc::new(AtomicBool::new(false)),
@@ -550,7 +534,7 @@ impl ProviderAdapterActivation {
     ///
     /// The caller supplies only a generation already registered by the application research
     /// authority and a bounded set minted from canonical definition/reference capabilities. This
-    /// boundary revalidates both against the exact current doctor and source metadata before it
+    /// boundary revalidates both against the configured authority and source metadata before it
     /// binds durable publication. It never derives canonical identity from a ticker or provider
     /// response.
     pub(crate) async fn prepare_schwab_market_runtime_start(
@@ -576,7 +560,6 @@ impl ProviderAdapterActivation {
             current = activation.require_runtime_current() => current?,
         }
         let now = system_timestamp()?;
-        let doctor = activation.doctor_receipt().clone();
         let metadata = generation.metadata();
         if generation.profile().as_str() != SCHWAB_MARKET_DATA_SURFACE_ID
             || super::require_runtime_lease(&generation, activation.lease()).is_err()
@@ -586,9 +569,6 @@ impl ProviderAdapterActivation {
             || metadata.quality_ceiling() != DataQuality::DirectUnverified
             || metadata.budget_policy() != activation.lease().provider_budget_policy()
             || !metadata.is_effective_at(now)
-            || !doctor.is_current_at(now)
-            || !doctor.admits_source_start()
-            || doctor.receipt_sha256() != activation.lease().runtime_evidence_digest()
         {
             return Err(SchwabMarketRuntimeStartError::AuthorityMismatch);
         }
@@ -600,12 +580,6 @@ impl ProviderAdapterActivation {
             return Err(SchwabMarketRuntimeStartError::GenerationUnavailable);
         }
 
-        let doctor_delay = doctor
-            .quote_delay()
-            .ok_or(SchwabMarketRuntimeStartError::QuoteDelayUnknown)?;
-        if metadata.coverage().delay() != doctor_delay {
-            return Err(SchwabMarketRuntimeStartError::QuoteDelayUnknown);
-        }
         let live = metadata
             .coverage()
             .live()
@@ -650,18 +624,13 @@ impl ProviderAdapterActivation {
             }
             receipt = activation.runtime_oauth_receipt() => receipt?,
         };
-        if !oauth_receipt.matches_market_data_authorization(&doctor) {
-            return Err(SchwabMarketRuntimeStartError::AuthorityMismatch);
-        }
-        let evidence =
-            SchwabRestQuoteSourceEvidence::try_new(metadata.clone(), venue, doctor.clone())?;
+        let evidence = SchwabRestQuoteSourceEvidence::try_new(metadata.clone(), venue)?;
         let analytical_dataset = DatasetId::try_from(super::MARKET_EVENT_ANALYTICAL_DATASET)
             .map_err(|_error| SchwabMarketRuntimeStartError::InvalidControls)?;
         let publication = self
             .research_mutation
             .bind_schwab_rest_quote_publication_package(
                 &generation,
-                doctor,
                 oauth,
                 oauth_receipt,
                 analytical_dataset,
@@ -989,14 +958,10 @@ pub(super) fn system_timestamp() -> Result<Timestamp, SchwabMarketRuntimeStartEr
 pub(crate) enum SchwabMarketRuntimeStartError {
     #[error("Schwab market runtime preparation was cancelled")]
     Cancelled,
-    #[error(
-        "Schwab market runtime authority does not match the active OAuth authorization and doctor"
-    )]
+    #[error("Schwab market runtime authority does not match the configured OAuth authorization")]
     AuthorityMismatch,
     #[error("the exact registered Schwab publication generation is unavailable")]
     GenerationUnavailable,
-    #[error("Schwab quote delay is unknown or conflicts with registered source metadata")]
-    QuoteDelayUnknown,
     #[error("Schwab quote source evidence is incomplete or inconsistent")]
     SourceEvidence,
     #[error("Schwab quote runtime requires current accepted canonical provider identity")]
@@ -1024,7 +989,7 @@ pub(crate) enum SchwabMarketRuntimeStartError {
 pub enum SchwabMarketDataActivationError {
     #[error("Schwab market-data activation was cancelled")]
     Cancelled,
-    #[error("Schwab OAuth, doctor, account, or onboarding authority does not match")]
+    #[error("Schwab OAuth, application, or onboarding authority does not match")]
     AuthorityMismatch,
     #[error(transparent)]
     Account(#[from] ProviderAccountActivationError),

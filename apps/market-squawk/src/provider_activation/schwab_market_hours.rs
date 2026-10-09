@@ -131,9 +131,7 @@ impl ProviderAdapterActivation {
             super::provider_research_rights_basis(lease).map_err(|_| ServiceError::Unauthorized)?,
             lease.rights_decision_digest(),
             EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into()),
-            lease
-                .verification_expires_at()
-                .ok_or(ServiceError::Unauthorized)?,
+            lease.verification_expires_at(),
             vec![dataset],
             super::lease_research_operations(lease),
         )
@@ -149,7 +147,6 @@ impl ProviderAdapterActivation {
             source,
             rights.clone(),
         )
-        .and_then(|generation| generation.with_runtime_verification(lease))
         .map_err(|_| ServiceError::Unauthorized)?;
         {
             let account = activation
@@ -227,7 +224,6 @@ impl ProviderAdapterActivation {
             .research_mutation
             .bind_schwab_market_hours_publication_package(
                 generation,
-                activation.doctor_receipt().clone(),
                 activation.oauth_receipt_currentness(),
                 oauth,
             )

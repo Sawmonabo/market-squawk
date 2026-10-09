@@ -804,10 +804,9 @@ impl GenerationRecord {
 
     fn fully_admitted(&self, capability: &ProviderCapability, observed_at: Timestamp) -> bool {
         let authority_is_current = match self.runtime_evidence.as_ref() {
-            Some(
-                RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(_)
-                | RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(_),
-            ) => self.verification.is_some(),
+            Some(RuntimeVerificationEvidence::AlpacaPaperIexDoctorReceiptV1(_)) => {
+                self.verification.is_some()
+            }
             _ => self
                 .verification
                 .as_ref()
@@ -818,10 +817,14 @@ impl GenerationRecord {
             && authority_is_current
             && self.rights_digest.is_some()
             && self.rate_policy_digest == Some(capability.rate_policy().evidence_digest())
-            && self
-                .runtime_evidence
-                .as_ref()
-                .is_some_and(|evidence| evidence.admits_activation_at(observed_at))
+            && if capability.surface_id().as_str() == super::SCHWAB_MARKET_DATA_SURFACE_ID {
+                // The OAuth owner admits actual requests; saved probes grant no authority.
+                self.runtime_evidence.is_none()
+            } else {
+                self.runtime_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.admits_activation_at(observed_at))
+            }
     }
 }
 
@@ -1276,18 +1279,11 @@ impl OnboardingLifecycle {
                 let currentness_deadline = self
                     .generation_alpaca_paper_iex_doctor_receipt(generation)
                     .map(super::AlpacaPaperIexDoctorReceiptV1::exclusive_expires_at)
-                    .or_else(|| {
-                        self.generation_schwab_market_data_doctor_receipt(generation)
-                            .map(super::SchwabMarketDataDoctorReceiptV1::exclusive_expires_at)
-                    })
                     .or_else(|| verification.expires_at());
                 if self.state != OnboardingState::ActiveScoped
                     || self.active_generation != Some(generation)
                     || currentness_deadline != Some(expires_at)
-                    || (observed_at < expires_at
-                        && self
-                            .generation_schwab_market_data_doctor_receipt(generation)
-                            .is_none())
+                    || observed_at < expires_at
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -1851,15 +1847,6 @@ impl OnboardingLifecycle {
             .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
     }
 
-    /// Returns the typed Schwab market-data doctor receipt for one exact generation.
-    pub fn generation_schwab_market_data_doctor_receipt(
-        &self,
-        generation: SecretGeneration,
-    ) -> Option<&super::SchwabMarketDataDoctorReceiptV1> {
-        self.generation_runtime_evidence(generation)
-            .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
-    }
-
     /// Revalidates the exact active generation's complete admission at a trusted read time.
     pub fn active_generation_is_fully_admitted(
         &self,
@@ -2074,13 +2061,6 @@ impl OnboardingLifecycle {
                 }
                 self.validate_alpaca_receipt_binding(capability, generation, receipt)
             }
-            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(receipt) => {
-                let generation = generation.ok_or(OnboardingStateError::GenerationMismatch)?;
-                if receipt.predecessor_digest().is_some() {
-                    return Err(OnboardingStateError::InvalidEvidence);
-                }
-                self.validate_schwab_receipt_binding(capability, generation, receipt)
-            }
         }
     }
 
@@ -2127,44 +2107,7 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::EvidenceMismatch);
                 }
             }
-            RuntimeVerificationEvidence::SchwabMarketDataDoctorReceiptV1(next) => {
-                self.validate_schwab_receipt_binding(capability, generation, next)?;
-                let prior = record
-                    .runtime_evidence
-                    .as_ref()
-                    .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
-                    .ok_or(OnboardingStateError::EvidenceMismatch)?;
-                let same_grant =
-                    next.authorization_generation() == prior.authorization_generation();
-                let same_scope =
-                    next.authorization_scope_sha256() == prior.authorization_scope_sha256();
-                // Routine token rotation needs no new capability observation. Changed consent or
-                // scope may be verified immediately without waiting for the old grant to expire.
-                if pending_renewal
-                    && same_grant
-                    && same_scope
-                    && (observed_at < prior.exclusive_expires_at()
-                        || next.verified_at() < prior.exclusive_expires_at())
-                {
-                    return Err(OnboardingStateError::InvalidEvidence);
-                }
-                if next.authorization_generation() < prior.authorization_generation()
-                    || next.access_token_generation() < prior.access_token_generation()
-                    || (same_grant
-                        && (next.observation().refresh_authorized_at
-                            != prior.observation().refresh_authorized_at
-                            || next.observation().refresh_expires_at
-                                != prior.observation().refresh_expires_at))
-                {
-                    return Err(OnboardingStateError::EvidenceMismatch);
-                }
-                if next.predecessor_digest() != Some(prior.receipt_sha256())
-                    || next.verified_at() <= prior.verified_at()
-                    || !next.same_authority_as(prior)
-                {
-                    return Err(OnboardingStateError::EvidenceMismatch);
-                }
-            }
+
             RuntimeVerificationEvidence::DigestV1(_) => {
                 return Err(OnboardingStateError::EvidenceMismatch);
             }
@@ -2206,41 +2149,6 @@ impl OnboardingLifecycle {
             || receipt.rate_policy_digest() != capability.rate_policy().evidence_digest()
             || !principal_matches
             || !authority_is_nonexpiring
-        {
-            return Err(OnboardingStateError::EvidenceMismatch);
-        }
-        Ok(())
-    }
-
-    fn validate_schwab_receipt_binding(
-        &self,
-        capability: &ProviderCapability,
-        generation: SecretGeneration,
-        receipt: &super::SchwabMarketDataDoctorReceiptV1,
-    ) -> Result<(), OnboardingStateError> {
-        let record = self.generation(generation)?;
-        let context = self
-            .runtime_verification_context
-            .as_ref()
-            .ok_or(OnboardingStateError::EvidenceMismatch)?;
-        let application_credential_is_verified =
-            record.verification.as_ref().is_some_and(|verification| {
-                verification.expires_at().is_none()
-                    && verification.bindings().account_digest().is_none()
-            });
-        if receipt.surface_id() != &self.surface_id
-            || receipt.surface_id() != capability.surface_id()
-            || receipt.application_credential_generation() != generation
-            || receipt.capability_revision() != self.capability_revision
-            || receipt.capability_revision() != capability.revision()
-            || receipt.capability_digest() != self.capability_digest
-            || receipt.capability_digest() != capability.content_digest()
-            || receipt.session_identifier() != context.session_identifier()
-            || receipt.public_configuration_digest() != context.public_configuration_digest()
-            || record.rights_digest != Some(receipt.rights_decision_digest())
-            || record.rate_policy_digest != Some(receipt.rate_policy_digest())
-            || receipt.rate_policy_digest() != capability.rate_policy().evidence_digest()
-            || !application_credential_is_verified
         {
             return Err(OnboardingStateError::EvidenceMismatch);
         }
