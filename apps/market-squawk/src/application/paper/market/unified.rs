@@ -1258,9 +1258,13 @@ fn durable_source_candidate(
         .ok_or(ServiceError::Unavailable)?;
     let provenance = market_event_provenance(primary.event());
     let live = evidence
-        .metadata
+        .component_metadata(primary)
+        .ok_or(ServiceError::InvalidResult)?
         .coverage()
-        .live()
+        .live_for(
+            provenance.binding().provider_product(),
+            provenance.binding().provider_channel(),
+        )
         .ok_or(ServiceError::InvalidResult)?;
     if provenance.source_id() != &evidence.source_id
         || provenance.instrument_id() != Some(definition.instrument_id())
@@ -3034,7 +3038,14 @@ fn exact_selected_durable<'snapshot>(
         let Some(primary) = evidence.evidence_candidate() else {
             return false;
         };
-        let Some(live) = evidence.metadata.coverage().live() else {
+        let binding = market_event_provenance(primary.event()).binding();
+        let Some(metadata) = evidence.component_metadata(primary) else {
+            return false;
+        };
+        let Some(live) = metadata
+            .coverage()
+            .live_for(binding.provider_product(), binding.provider_channel())
+        else {
             return false;
         };
         evidence.metadata.provider() == identity.provider()
@@ -4359,4 +4370,80 @@ fn selection_error(error: MarketSelectionError) -> ServiceError {
         }
         _ => ServiceError::InvalidResult,
     }
+}
+
+/// Extends the retained publication fixture through the ordinary candidate and selection path.
+#[cfg(test)]
+pub(super) fn assert_retained_channel_selection(
+    route: DurableMarketRouteEvidence,
+    record: &MarketDataInstrumentRecord,
+    at: Timestamp,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let primary = route.evidence_candidate().ok_or("missing primary")?;
+    let binding = market_event_provenance(primary.event()).binding().clone();
+    let definition =
+        UnifiedInstrumentDefinition::try_new(route.instrument_id, None, Some(record), at)?;
+    let operations = super::presentation_surface_operations()?;
+    let mut policies = Vec::new();
+    super::push_surface_policy(
+        &mut policies,
+        &route.surface_id,
+        &route.metadata,
+        definition.asset_class(),
+        operations,
+        route.display_rights(operations, at)?,
+    )?;
+    let candidate = durable_source_candidate(
+        &route,
+        definition,
+        &policies[0],
+        at,
+        definition.definition_revision_digest(),
+    )?;
+    assert_eq!(candidate.identity().product(), binding.provider_product());
+    assert_eq!(candidate.identity().feed(), binding.provider_channel());
+    assert_eq!(candidate.capabilities().depth(), None);
+    let identity = candidate.identity();
+    let wrong = SourceCandidate::try_new(
+        CandidateIdentity::new(
+            identity.provider().clone(),
+            ProviderProduct::new(SourceIdentifier::try_from("unrelated-product")?),
+            ProviderChannel::new(SourceIdentifier::try_from("unrelated-channel")?),
+            identity.source_id().clone(),
+            identity.venue_id().cloned(),
+            identity.instrument_id(),
+            identity.observation_id().clone(),
+            identity.definition_revision_digest(),
+        ),
+        candidate.capabilities(),
+        candidate.timestamps(),
+        CandidateAdmissionState::new(
+            candidate.admission().health(),
+            candidate.admission().budget(),
+            policies[0].rights.admission()?,
+            candidate.admission().integrity(),
+            candidate.admission().execution_eligibility(),
+        ),
+    )?;
+    let evidence =
+        DurableMarketEvidenceSet::try_new(vec![route.source_id.clone()], vec![route], 1)?;
+    for (candidate, expected) in [(candidate, true), (wrong, false)] {
+        let selected = select_market_source(
+            MarketSelectionPolicy::v1(2)?,
+            presentation_request(
+                definition.asset_class(),
+                at,
+                definition.definition_revision_digest(),
+            )?,
+            vec![candidate],
+        )?;
+        let selected = selected
+            .selected()
+            .ok_or("retained fixture candidate not selected")?;
+        assert_eq!(
+            exact_selected_durable(&evidence, selected)?.is_some(),
+            expected
+        );
+    }
+    Ok(())
 }

@@ -293,7 +293,10 @@ impl DurableMarketRouteEvidence {
                         .ok_or_else(|| invalid("component_metadata_missing"))?;
                     let live = original
                         .coverage()
-                        .live()
+                        .live_for(
+                            provenance.binding().provider_product(),
+                            provenance.binding().provider_channel(),
+                        )
                         .ok_or_else(|| invalid("component_live_coverage_missing"))?;
                     if original.source_id() != &source_id
                         || original.provider() != metadata.provider()
@@ -348,7 +351,10 @@ impl DurableMarketRouteEvidence {
         };
         let live = metadata
             .coverage()
-            .live()
+            .live_for(
+                cohort_binding.provider_product(),
+                cohort_binding.provider_channel(),
+            )
             .ok_or_else(|| invalid("live_coverage_missing"))?;
         for (stage, matches) in [
             ("cohort_source", cohort_binding.source_id() == &source_id),
@@ -2680,5 +2686,97 @@ pub(crate) async fn assert_retained_quote_trade_components(
     assert!(runtime.candidate(LiveEventClass::Quote).is_some());
     assert!(runtime.candidate(LiveEventClass::Trade).is_none());
     assert!(runtime.display_authorizations.is_empty());
+
+    // Reuse the real retained receipts with declaration variants. This tests channel selection,
+    // not a new provider acquisition, and never rewrites the persisted metadata or captures.
+    let mixed_trade = retained_channel_variant(trade_metadata, true)?;
+    let mixed_quote = retained_channel_variant(quote_metadata, true)?;
+    assert!(mixed_trade.coverage().live().is_none());
+    assert!(mixed_quote.coverage().live().is_none());
+    let mut mixed = DurableMarketRouteEvidence::try_new(
+        route.surface_id.clone(),
+        mixed_quote.clone(),
+        route.source_id.clone(),
+        instrument,
+        route.venue_id.clone(),
+        route.selections.clone(),
+        Some(vec![mixed_trade, mixed_quote.clone()]),
+    )?
+    .ok_or("missing multi-channel retained route")?;
+    mixed.display_authorizations = route.display_authorizations.clone();
+    unified::assert_retained_channel_selection(mixed, record, reference_at)?;
+    assert!(
+        DurableMarketRouteEvidence::try_new(
+            route.surface_id.clone(),
+            mixed_quote,
+            route.source_id.clone(),
+            instrument,
+            route.venue_id.clone(),
+            runtime.selections.clone(),
+            None,
+        )?
+        .is_some()
+    );
+    let wrong = retained_channel_variant(quote_metadata, false)?;
+    assert!(
+        DurableMarketRouteEvidence::try_new(
+            route.surface_id.clone(),
+            wrong,
+            route.source_id.clone(),
+            instrument,
+            route.venue_id.clone(),
+            runtime.selections.clone(),
+            None,
+        )
+        .is_err()
+    );
     Ok(())
+}
+
+#[cfg(test)]
+fn retained_channel_variant(
+    metadata: &SourceMetadata,
+    retain_original: bool,
+) -> Result<SourceMetadata, Box<dyn std::error::Error>> {
+    use market_squawk_domain::{ProviderChannel, ProviderProduct};
+    use market_squawk_sources::{LiveCoverageDeclaration, SourceCoverage, SourceMetadataInput};
+    let original = metadata
+        .coverage()
+        .live()
+        .ok_or("single-channel fixture required")?;
+    let decoy = LiveCoverageDeclaration::try_new(
+        ProviderProduct::new(SourceIdentifier::try_from("unrelated-product")?),
+        ProviderChannel::new(SourceIdentifier::try_from("unrelated-channel")?),
+        original.rules().to_vec(),
+    )?;
+    let channels = if retain_original {
+        vec![original.clone(), decoy]
+    } else {
+        vec![decoy]
+    };
+    let coverage = metadata.coverage();
+    Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+        metadata.schema_version(),
+        metadata.source_id().clone(),
+        metadata.revision_evidence().clone(),
+        metadata.source_class(),
+        metadata.provider().clone(),
+        metadata.authorization().clone(),
+        SourceCoverage::try_instrument_channels(
+            coverage.evidence().clone(),
+            coverage.effective_interval(),
+            coverage.asset_classes().to_vec(),
+            coverage.topology().clone(),
+            coverage.instruments().clone(),
+            channels,
+            coverage.delay(),
+            coverage.delivery(),
+        )?,
+        metadata.quality_ceiling(),
+        metadata.network_policy().clone(),
+        metadata.freshness_policy(),
+        metadata.budget_policy().cloned(),
+        metadata.capabilities(),
+        metadata.protocol_profile().clone(),
+    ))?)
 }

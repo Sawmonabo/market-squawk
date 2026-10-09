@@ -4278,8 +4278,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/paper/market.rs",
-      "sha256": "64ba09b29a8be275b78d1a073a2429183fef106f459147f1513ceb0c76eb9b3f",
-      "size_bytes": 103254
+      "sha256": "8bef5385c94b62019078fdfff878047f10c60475040943e695373bea0acf0411",
+      "size_bytes": 106915
     },
     {
       "path": "apps/market-squawk/src/application/paper/market/candidate.rs",
@@ -4313,8 +4313,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/paper/market/unified.rs",
-      "sha256": "b665f45224e42587347803f15027212a10dcff5085c7402e03b998c3d522635d",
-      "size_bytes": 178043
+      "sha256": "8f789799e00da8957bfc0f88e80aafff38f111bf28307d10f9ade8cc94c98cdb",
+      "size_bytes": 181408
     },
     {
       "path": "apps/market-squawk/src/application/paper/product.rs",

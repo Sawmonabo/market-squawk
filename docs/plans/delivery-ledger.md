@@ -2,21 +2,24 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed implementation checkpoint **1148dd81** repairs the confirmed recursive catalog
-lock in Schwab quote/Streamer precommit. Earlier **ac32f267** added event-driven capacity waiting
-and repaired reference/retained-quote handling. Full V1 and all-nine acceptance remain open.
+Current pushed head **6bf7aca9** records the native result of **1148dd81** (recursive
+catalog-lock repair); **ac32f267** added event-driven provider capacity waiting. Full V1 and
+all-nine acceptance remain open. The preceding question turn refreshed source evidence but made
+no implementation progress. This continuation verified critical-check session46553 is still live.
 
 | Owner | Concrete outcome and exact files | Evidence / next dependency |
 | --- | --- | --- |
-| Lead | Integrated `application/research/ingest/schwab_market.rs`, closure and ledger; Git/build/runtime ownership | Exact OAuth revocation fixture PASS1/1 (8.60s), matching build PASS5m01s. Native first Schwab publication2rows/sequence11132 and sourceStatus1.07s prove catalog progress. Watchlist still fails2.65s on multi-channel display metadata; next producer/consumer checkpoint. |
-| GPT-6 Astra High sec_concurrency_policy | Read-only multi-channel reader diagnosis; only `oct9-multichannel-display.md` writable | Exact provider-neutral reader correction and existing critical fixture seam; no source/build/Git/runtime. Earlier two-slot and reentry reports frozen. |
+| Lead | Retained multi-channel watchlist display: `application/paper/market.rs`, `market/unified.rs`; closure, ledger, Git/build/runtime | Four exact-channel lookups implemented; existing real retained quote/trade fixture extended for multiple declarations and wrong-channel rejection. Existing queued_alpaca_capture_survives_session_end_and_successor_publishes PASS1/1 (0.75s; single-job compile4m07s). Source closure and diff checks passed. Commit/push pending, then one matching managed replacement and all-nine native reads. |
+| Astra High sec_concurrency_policy | Completed read-only diagnoses, no active source ownership | Multi-channel correction report and first Streamer-disconnect report frozen. Disconnect cause is still flattened at runtime; safe stage diagnostics are the next streaming dependency. SEC two-download/shared quota correction remains required afterward. |
 
-Supervisor47522 owns service47657/Desktop47675 on the same workspace; watcher47538 stopped,
-no compiler. Old deadlocked service44399 failed graceful shutdown60s and required targeted process
-termination before restart; this is not shutdown acceptance. SQLite quick_check=ok. Credentials
-were preserved. Schwab subsequently reports blocked/provider_availability after stream disconnect;
-first committed rows do not prove continuous streaming or all-nine coverage.
-PR43 implementation evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6074987041.
+Supervisor47522 owns service47657/Desktop47675 on the same workspace; watcher47538 stopped
+with no compiler after the focused check passed. Current visible build predates the pending fix.
+Old deadlocked service44399 failed graceful shutdown60s and required targeted termination; this
+is not shutdown acceptance. SQLite quick_check=ok. Credentials were preserved. First native
+Schwab publication committed2rows/sequence11132 and sourceStatus returned1.07s. Watchlist still
+fails on the old build with component_live_coverage_missing. Streamer subsequently disconnected;
+continuous streaming and all-nine coverage are not yet verified.
+PR43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6075076803.
 Actual chart history uses Alpaca; separately defective Schwab history scaffolding has no caller.
 
 
@@ -244,6 +247,15 @@ identification, closure/ledger/runtime. Split catalog-independent lease checks f
 use existing require_catalog_current inside catalog callbacks, normal require_current before lock.
 Retain OAuth, generation, selection, currentness, expiry and revocation checks. Astra read-only
 fixture diagnosis owns `oct9-schwab-catalog-reentry.md`; no source/build/runtime authority.
+
+### Independent Streamer disconnect diagnosis
+
+Astra High sec_concurrency_policy owns a read-only trace of the first actual `Unavailable` after successful Streamer publication on runtime47657. Only writable `.agents/tmp/v1-first-stock/oct9-streamer-post-publication-disconnect.md`; source `application/market_runtime/schwab_streamer.rs` and its called receive/publication/current bridge boundaries, current native log and existing price-semantics report are read-only. Outcome: identify the earliest concrete failing contract and smallest existing check, distinguish established cause from missing safe diagnostics. No runtime/network, secret payloads, builds, Git or production edits. Lead continues the frozen retained-display critical compile. This is diagnosis, not another implementation batch.
+
+### Active multi-channel retained display correction — acceptance1/5/6
+
+Lead owns `apps/market-squawk/src/application/paper/market.rs` and `market/unified.rs`, source closure and ledger. Astra diagnosis is complete and frozen. Outcome: all nine watchlist entries and investment reads remain usable with the genuinely published multi-channel Schwab rows. Existing exact `SourceCoverage::live_for` must use each sealed product/channel and original component revision; no provider branches, first-channel fallback or combined depth.
+Critical uncovered gap: existing retained quote/trade fixture exercises multiple revisions but only one declared channel. Extend its existing helper with valid multi-channel declaration variants over the real selected receipts, including exact candidate/selection and wrong-channel rejection. Run existing `queued_alpaca_capture_survives_session_end_and_successor_publishes`, then one matching native replacement and all-nine reads. Keep active stream availability and unrelated history/financial defects explicit. Pushed commit pending. No other source owner/compiler; watcher47538 stopped.
 
 ### Native reentry result and next display barrier
 
@@ -11388,3 +11400,7 @@ completed preparation, persisted its result artifact and returned20bars, with no
 Astra recovery diagnosis finished read-only. It rules out direct freshness-only cancellation and
 identifies the shutdown-versus-lifecycle deadline ownership mismatch; the initial generic
 publication revocation still requires a fixed-stage discriminator. All agent ownership released.
+
+### Multi-channel retained display critical result — 2026-10-09
+
+Four production lookups now select the sealed provider-product/channel; candidate matching uses the original component metadata revision. Existing real retained quote/trade fixture extended with multi-channel declarations, valid selected-candidate matching and wrong-channel rejection; PASS1/1 in0.75s after4m07s single-job compile. Source closure and diff checks passed. Fixture declaration variants are not genuine Schwab acquisition evidence. Next: managed native replacement, nine watchlist/details reads, then exact Streamer disconnect attribution. No provider-specific reader branching or weakened evidence checks.
