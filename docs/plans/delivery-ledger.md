@@ -2,25 +2,28 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed head **6bf7aca9** records the native result of **1148dd81** (recursive
-catalog-lock repair); **ac32f267** added event-driven provider capacity waiting. Full V1 and
-all-nine acceptance remain open. The preceding question turn refreshed source evidence but made
-no implementation progress. This continuation verified critical-check session46553 is still live.
+Current pushed implementation **70b0d2aa** fixes retained multi-channel display. It follows
+**1148dd81** (catalog-lock repair) and **ac32f267** (event-driven capacity waiting). Full V1,
+continuous streaming, all data families and installed acceptance remain open.
 
 | Owner | Concrete outcome and exact files | Evidence / next dependency |
 | --- | --- | --- |
-| Lead | Retained multi-channel watchlist display: `application/paper/market.rs`, `market/unified.rs`; closure, ledger, Git/build/runtime | Four exact-channel lookups implemented; existing real retained quote/trade fixture extended for multiple declarations and wrong-channel rejection. Existing queued_alpaca_capture_survives_session_end_and_successor_publishes PASS1/1 (0.75s; single-job compile4m07s). Source closure and diff checks passed. Commit/push pending, then one matching managed replacement and all-nine native reads. |
-| Astra High sec_concurrency_policy | Completed read-only diagnoses, no active source ownership | Multi-channel correction report and first Streamer-disconnect report frozen. Disconnect cause is still flattened at runtime; safe stage diagnostics are the next streaming dependency. SEC two-download/shared quota correction remains required afterward. |
+| Lead | Integrated `application/paper/market.rs`, `market/unified.rs`; closure, ledger, Git/build/runtime | Critical retained-publication regression PASS1/1; matching native build PASS5m37s. Actual native collection9/9 and detail queries9/9 return price/change/history token after replacement. Watchlist screenshot inspected. Next: attribute continuing Streamer disconnect at its existing consumer/native error boundary, then fix the established cause. |
+| Astra High nvda_ratio_context | Read-only ratio diagnosis complete, no active writer | Two missing NVDA margins belong to incompatible filing contexts; calculator correctly rejects cross-filing division. Original selected/excluded source rows still need bounded inspection. Report frozen; no numeric patch or upstream-absence claim. |
 
-Supervisor47522 owns service47657/Desktop47675 on the same workspace; watcher47538 stopped
-with no compiler after the focused check passed. Current visible build predates the pending fix.
-Old deadlocked service44399 failed graceful shutdown60s and required targeted termination; this
-is not shutdown acceptance. SQLite quick_check=ok. Credentials were preserved. First native
-Schwab publication committed2rows/sequence11132 and sourceStatus returned1.07s. Watchlist still
-fails on the old build with component_live_coverage_missing. Streamer subsequently disconnected;
-continuous streaming and all-nine coverage are not yet verified.
-PR43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6075076803.
-Actual chart history uses Alpaca; separately defective Schwab history scaffolding has no caller.
+Supervisor47522 now owns service52214/Desktop52227 on the same workspace; watcher47538 stopped
+and no compiler active. Managed replacement observed old service47657/Desktop47675 exit without
+forced termination and started the matching generation-ojGV4q. Credentials were preserved.
+Native collection returned9/9 in8.39s; independent detail queries returned9/9 in3.20–4.76s.
+These are stored/previous-close values with their original clocks, not live-price acceptance or
+instant-cache performance. Current watchlist screen displays nine prices/changes with green/red
+changes and no multi-channel error. Only that viewport was visually inspected; chart, financial
+and all-screen acceptance is still incomplete.
+PR43 critical evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6075202637.
+Next streaming blocker: repeated generic Unavailable disconnect still loses its first cause.
+Implement safe static stage/closed-error attribution only in the existing Streamer worker and
+consumer before changing behavior. SEC two-download policy and independent parsing limit remain
+pending; use the completed concurrency report without a second quota authority.
 
 
 Housekeeping refreshed: one primary worktree and only feature/main/release local branches. The
@@ -11404,3 +11407,15 @@ publication revocation still requires a fixed-stage discriminator. All agent own
 ### Multi-channel retained display critical result — 2026-10-09
 
 Four production lookups now select the sealed provider-product/channel; candidate matching uses the original component metadata revision. Existing real retained quote/trade fixture extended with multi-channel declarations, valid selected-candidate matching and wrong-channel rejection; PASS1/1 in0.75s after4m07s single-job compile. Source closure and diff checks passed. Fixture declaration variants are not genuine Schwab acquisition evidence. Next: managed native replacement, nine watchlist/details reads, then exact Streamer disconnect attribution. No provider-specific reader branching or weakened evidence checks.
+
+### Independent NVDA missing-ratio diagnosis — acceptance1/2/5
+
+While the matching70b0d2aa native build runs, Astra High `nvda_ratio_context` owns ONLY `.agents/tmp/v1-first-stock/oct9-nvda-ratio-context.md`. Read-only source/evidence diagnosis of the observed two missing annual ratios: retained annual context ending2026-01-25 has revenue/net income split between2026-02-25 and2026-05-12 filing groups. Existing evidence `oct9-nvda-ratio-missing-inputs.json`; all-nine financial baseline already recorded. Determine whether producer grouping, exact-period selection or genuinely absent source inputs cause the missing outputs; identify smallest correct financial fix and existing critical test. Do not combine filings speculatively or discard PIT/revision semantics. No source/Git/build/runtime/provider/credential work. Lead owns pending native display verification and all shared files. Completion evidence is grounded source trace and proposed bounded correction, not financial acceptance.
+
+### Native multi-channel display result — 2026-10-09
+
+Pushed70b0d2aa; existing retained-publication regression PASS1/1 and closure/diff checks passed. Matching managed build PASS5m37s; old service/native processes exited through the supervisor without targeted termination. New service52214/Desktop52227; watcher47538 stopped afterward, no second compiler. Actual native GetCollection9/9 returned8.39s; each of nine GetInstrument requests returned one matching investment with price/change/historyToken in3.20–4.76s. Evidence: `oct9-multichannel-native-collection.json`, `oct9-multichannel-native-details.json`. This is service read evidence through the native bridge, not full detail-screen/chart/financial acceptance.
+
+Native Home DOM and screenshots `oct9-multichannel-native-home.png`, `oct9-multichannel-native-watchlist.png` captured through the embedded WebDriver without global focus/keystrokes and inspected by the lead. Watchlist displays all nine compact symbol/price/change rows; green/red changes aligned inside its panel. Hidden accessibility text is not rendered as visible redundant descriptions. No price/selection field was synthesized. Retained asks remain absent for some original observations; freshness false and stored/previous-close labels remain truthful. All-screen competitor audit, live currentness and cached responsiveness remain open.
+
+Independent NVDA diagnosis is complete: `.agents/tmp/v1-first-stock/oct9-nvda-ratio-context.md`. Public first-page evidence lacks original excluded coordinates, so a numeric correction is not supported yet. Do not merge February/May envelopes or treat public32-item pages as full history. Next bounded check: original annual numerator/revenue occurrences and selection dispositions in the same retained generation, plus remaining ratio pages. No code/test/provider work by that agent.
