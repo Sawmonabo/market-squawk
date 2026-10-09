@@ -231,9 +231,18 @@ async fn run(
     if let Err(error) = outcome {
         tracing::warn!(?error, "Schwab current stream disconnected");
     }
+    let cleanup = native_cleanup.and(source_drain).and(current_drain);
+    if cleanup.is_err() {
+        tracing::warn!(
+            ?native_cleanup,
+            ?source_drain,
+            ?current_drain,
+            "Schwab Streamer cleanup incomplete"
+        );
+    }
     StreamerWorkerOutcome {
         run: outcome,
-        cleanup: native_cleanup.and(source_drain).and(current_drain),
+        cleanup,
     }
 }
 async fn run_native(
@@ -355,6 +364,14 @@ async fn run_native(
         }
     }
     let native_result = transport.await;
+    if let Ok(Err(error)) = &native_result {
+        // Closed secret-free enum; never log the native frame or bootstrap material.
+        tracing::warn!(
+            ?error,
+            consumer_failed = failure.is_some(),
+            "Schwab Streamer native transport ended"
+        );
+    }
     if let Err(error) = &native_result {
         tracing::error!(%error, "Schwab native transport owner join failed");
         *native_cleanup = Err(ServiceError::Unavailable);

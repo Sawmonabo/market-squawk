@@ -4033,8 +4033,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer.rs",
-      "sha256": "5c30ecdc0975c7721500aa5c50ee5864b99b12dd478d6189dd735796c8bb0c54",
-      "size_bytes": 14457
+      "sha256": "6131ba56e97791ea270adf9224991879892a906e74839b9184f2978f26624adb",
+      "size_bytes": 14969
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer/families.rs",
@@ -4043,8 +4043,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer/publication.rs",
-      "sha256": "6c513153f3f57a3e381635678218608117463b7c40a186c9160ced6182d44597",
-      "size_bytes": 20417
+      "sha256": "57f13c93b8c37b261f37838d156dcea810df6b483b15b9690bf5930c37544cfd",
+      "size_bytes": 22993
     },
     {
       "path": "apps/market-squawk/src/application/market_selection/candidate.rs",

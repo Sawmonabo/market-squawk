@@ -32,6 +32,7 @@ pub(super) struct Consumer {
     selected: std::collections::BTreeMap<MarketDataService, BTreeSet<String>>,
     ready: Option<oneshot::Sender<()>>,
     physical_capture_failed: bool,
+    failure_reported: bool,
 }
 impl Consumer {
     #[allow(
@@ -78,6 +79,7 @@ impl Consumer {
             selected,
             ready: Some(ready),
             physical_capture_failed: false,
+            failure_reported: false,
         })
     }
     pub(super) fn capture_cleanup(&self) -> Result<(), ServiceError> {
@@ -93,6 +95,45 @@ impl Consumer {
         current: &mut SchwabRestQuoteCurrentSessionInput,
         parse: ParseBounds,
         cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let generation = batch.receipt().generation().get();
+        let first_ordinal = batch.receipt().first_ordinal().get();
+        let mut stage = "capture_seal";
+        let mut published = false;
+        let outcome = self
+            .consume_batch(
+                batch,
+                current,
+                parse,
+                cancellation,
+                &mut stage,
+                &mut published,
+            )
+            .await;
+        if let Err(error) = outcome {
+            if !self.failure_reported {
+                self.failure_reported = true;
+                tracing::warn!(
+                    stage,
+                    published,
+                    generation,
+                    first_ordinal,
+                    ?error,
+                    "Schwab Streamer first consumer failure"
+                );
+            }
+        }
+        outcome
+    }
+
+    async fn consume_batch(
+        &mut self,
+        batch: StreamerMicrobatch,
+        current: &mut SchwabRestQuoteCurrentSessionInput,
+        parse: ParseBounds,
+        cancellation: &CancellationToken,
+        stage: &mut &'static str,
+        published: &mut bool,
     ) -> Result<(), ServiceError> {
         let original = if batch.frames().len() == 1 {
             Some((
@@ -121,6 +162,7 @@ impl Consumer {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(20))
             .ok_or(ServiceError::Internal)?;
+        *stage = "capture_generation";
         if sealed.streamer_receipt().generation().get() != current.connection_generation().get() {
             return Err(ServiceError::InvalidResult);
         }
@@ -130,12 +172,14 @@ impl Consumer {
             .filter_map(Option::as_ref)
             .any(|frame| !frame.value().data.is_empty());
         if !sealed.service_responses().is_empty() {
+            *stage = "control_evidence";
             self.proofs.retain_control(sealed)?;
             return Ok(());
         }
         if !has_data {
             return Ok(());
         }
+        *stage = "data_evidence";
         self.proofs.observe_data(&sealed)?;
         let (kind, body) = original.ok_or(ServiceError::InvalidResult)?;
         if sealed.frames().len() != 1 {
@@ -147,12 +191,14 @@ impl Consumer {
         if observed < received {
             return Err(ServiceError::InvalidResult);
         }
+        *stage = "publication_authorization";
         let (token, epoch) = tokio::select! {biased; ()=cancellation.cancelled()=>return Err(ServiceError::Cancelled), ()=tokio::time::sleep_until(deadline.into())=>return Err(ServiceError::DeadlineExceeded), value=self.activation.acquire_runtime_publication_attempt()=>value.map_err(|_|ServiceError::Unauthorized)?,};
         drop(token);
         let oauth = epoch.receipt();
         if oauth.generation() != sealed.streamer_receipt().token_generation() {
             return Err(ServiceError::Unauthorized);
         }
+        *stage = "reference_bindings";
         self.activation
             .validate_current_quote_bindings(
                 self.generation.metadata(),
@@ -163,6 +209,7 @@ impl Consumer {
                 true,
             )
             .map_err(|_| ServiceError::Unavailable)?;
+        *stage = "listing_currentness";
         if let Some(expected) = &self.nasdaq_generation {
             if self
                 .listing
@@ -176,6 +223,7 @@ impl Consumer {
                 return Err(ServiceError::Unavailable);
             }
         }
+        *stage = "canonical_currentness";
         for (binding, _) in &self.bindings {
             if self
                 .canonical
@@ -199,6 +247,7 @@ impl Consumer {
             let Some(handoff) = self.proofs.handoff(batch.service) else {
                 continue;
             };
+            *stage = "family_qualification";
             let qualification = SchwabMarketDataQualification::try_from_streamer_handoff(
                 handoff,
                 received,
@@ -217,6 +266,7 @@ impl Consumer {
             {
                 return Err(ServiceError::InvalidResult);
             }
+            *stage = "family_records";
             let dictionary = SchwabStreamerFieldDictionary::official(batch.service)
                 .map_err(|_| ServiceError::InvalidResult)?;
             for (content_index, record) in canonicalize_streamer_batch(batch, &dictionary)
@@ -278,6 +328,7 @@ impl Consumer {
                         }
                     }
                 }
+                *stage = "family_provenance";
                 let provenance = super::families::provenance(
                     self.generation.metadata(),
                     &sealed,
@@ -291,6 +342,7 @@ impl Consumer {
                     received,
                     observed,
                 )?;
+                *stage = "family_publication_request";
                 if class == LiveEventClass::Quote {
                     let reference = reference.ok_or(ServiceError::InvalidResult)?;
                     if batch.service == MarketDataService::LevelOneEquities {
@@ -327,6 +379,7 @@ impl Consumer {
                 selected_services.insert(batch.service);
             }
         }
+        *stage = "current_capture";
         let observational_only = self.generation.metadata().coverage().live_channels().len() != 1;
         let current_evidence = if current_records.is_empty() || observational_only {
             None
@@ -353,6 +406,7 @@ impl Consumer {
         let health_qualification = qualifications
             .get(&health_service)
             .ok_or(ServiceError::InvalidResult)?;
+        *stage = "current_qualification";
         let qualified = current
             .qualify_streamer_current(
                 current_evidence,
@@ -362,7 +416,11 @@ impl Consumer {
                 oauth,
                 deadline,
             )
-            .map_err(|_| ServiceError::Unavailable)?;
+            .map_err(|error| {
+                tracing::warn!(?error, "Schwab Streamer current qualification rejected");
+                ServiceError::Unavailable
+            })?;
+        *stage = "publication_selection";
         let selection = SchwabQuotePublicationSelection::try_new(
             qualified.source_lease().clone(),
             qualified.selected_provider_identities().to_vec(),
@@ -371,11 +429,13 @@ impl Consumer {
             observed,
         )
         .map_err(|_| ServiceError::InvalidResult)?;
+        *stage = "account_currentness";
         let account = self
             .activation
             .runtime_currentness()
             .try_acquire_publication_authority()
             .map_err(|_| ServiceError::Unauthorized)?;
+        *stage = "publication_request";
         let request = SchwabStreamerQuotePublicationRequest::new(
             selected_services
                 .iter()
@@ -403,6 +463,7 @@ impl Consumer {
             deadline,
             cancellation.clone(),
         );
+        *stage = "durable_publication";
         let outcome = self
             .publication
             .authority
@@ -419,6 +480,8 @@ impl Consumer {
             )
             .await
             .map_err(|_| ServiceError::Unavailable)?;
+        *published = matches!(&outcome, SchwabStreamerApplicationOutcome::Published(_));
+        *stage = "publication_disposition";
         let dispositions = match &outcome {
             SchwabStreamerApplicationOutcome::Published(published) => published.dispositions(),
             SchwabStreamerApplicationOutcome::SealedRaw(raw) => raw.dispositions(),
@@ -435,6 +498,7 @@ impl Consumer {
         let durably_published = matches!(&outcome, SchwabStreamerApplicationOutcome::Published(_));
         if let SchwabStreamerApplicationOutcome::Published(published) = outcome {
             let generation = published.generation();
+            *stage = "publication_receipt";
             let receipt = MarketEventPublicationReceipt::try_new(
                 generation.restart_selector().commit().clone(),
                 generation.publication_digest(),
@@ -446,6 +510,7 @@ impl Consumer {
                 generation.event_count(),
             )
             .map_err(|_| ServiceError::InvalidResult)?;
+            *stage = "retain_publication";
             self.publication
                 .durable_writer
                 .retain(receipt)
@@ -455,6 +520,7 @@ impl Consumer {
         if cancellation.is_cancelled() {
             return Err(ServiceError::Cancelled);
         }
+        *stage = "postcommit_canonical";
         for (binding, _) in &self.bindings {
             if self
                 .canonical
@@ -466,15 +532,20 @@ impl Consumer {
                 return Err(ServiceError::Unavailable);
             }
         }
+        *stage = "postcommit_account";
         let _current_account = self
             .activation
             .runtime_currentness()
             .try_acquire_publication_authority()
             .map_err(|_| ServiceError::Unauthorized)?;
+        *stage = "current_display_publication";
         if had_current_quote {
             let result = current
                 .publish_qualified_streamer(qualified, deadline)
-                .map_err(|_| ServiceError::Unavailable)?;
+                .map_err(|error| {
+                    tracing::warn!(?error, "Schwab Streamer current display rejected");
+                    ServiceError::Unavailable
+                })?;
             if result.published() > 0 {
                 if let Some(ready) = self.ready.take() {
                     let _ = ready.send(());
