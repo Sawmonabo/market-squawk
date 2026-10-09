@@ -318,17 +318,37 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
         let activation = Arc::new(activation);
         let records = self
             .bootstrap_instrument_references(&activation, deadline, &cancellation)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "reference_bootstrap",
+                    "Schwab startup failed"
+                );
+            })?;
         let resolved = self
             .resolve_bindings(records, deadline, &cancellation)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "reference_bindings",
+                    "Schwab startup failed"
+                );
+            })?;
         // Select the supported Streamer quote path from its actual native bootstrap. Its
         // optional availability does not authorize or reject the independent REST quote path.
         match self
             .provider_activation
             .acquire_schwab_streamer_bootstrap(&activation, deadline, &cancellation)
             .await
-        {
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "streamer_bootstrap",
+                    "Schwab startup failed"
+                );
+            }) {
             Ok(bootstrap) => {
                 return self
                     .provider_activation
@@ -343,7 +363,10 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
                         deadline,
                         cancellation,
                     )
-                    .await;
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(?error, stage = "streamer_prepare", "Schwab startup failed");
+                    });
             }
             Err(ServiceError::Unavailable) => {
                 ensure_before(&self.accepting, deadline, &cancellation)?;

@@ -23,7 +23,9 @@ use market_squawk_domain::{
     AssignmentVerification, DataQuality, EffectiveInterval, IdentifierEntitlement, LiveEventClass,
     Timestamp, VenueId,
 };
-use market_squawk_sources::{ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SourceMetadata};
+use market_squawk_sources::{
+    ProviderRateAuthority, ProviderRateDeclaration, SCHWAB_MARKET_DATA_SURFACE_ID, SourceMetadata,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
@@ -282,6 +284,20 @@ impl SchwabMarketDataAccountActivation {
         self.authority.binding()
     }
 
+    /// Uses the same account-qualified policy for metadata, validation, and request admission.
+    pub(crate) fn provider_rate_declaration(
+        &self,
+    ) -> Result<ProviderRateDeclaration, SchwabMarketDataActivationError> {
+        ProviderRateDeclaration::try_for_authorization_subject(
+            self.lease()
+                .provider_budget_policy()
+                .cloned()
+                .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?,
+            self.account_binding().subject(),
+        )
+        .map_err(|_| SchwabMarketDataActivationError::AuthorityMismatch)
+    }
+
     pub(crate) fn oauth_receipt_currentness(&self) -> SchwabOAuthReceiptCurrentness {
         self.oauth.receipt_currentness()
     }
@@ -398,6 +414,7 @@ impl SchwabMarketDataAccountActivation {
         maximum: usize,
         require_exact_coverage: bool,
     ) -> Result<(), SchwabMarketDataActivationError> {
+        let expected_budget = self.provider_rate_declaration()?;
         if maximum == 0
             || maximum > SCHWAB_QUOTE_MAXIMUM_SYMBOLS
             || !self.account_binding().validates_metadata(metadata)
@@ -406,7 +423,7 @@ impl SchwabMarketDataAccountActivation {
                 SCHWAB_QUOTE_SOURCE_ID | super::schwab_quote_metadata::STREAMER_SOURCE
             )
             || metadata.provider().as_str() != SCHWAB_QUOTE_PROVIDER
-            || metadata.budget_policy() != self.lease().provider_budget_policy()
+            || metadata.budget_policy() != Some(expected_budget.policy())
             || !metadata.is_effective_at(at)
             || validate_exact_schwab_quote_bindings(
                 bindings,
@@ -561,13 +578,14 @@ impl ProviderAdapterActivation {
         }
         let now = system_timestamp()?;
         let metadata = generation.metadata();
+        let expected_budget = activation.provider_rate_declaration()?;
         if generation.profile().as_str() != SCHWAB_MARKET_DATA_SURFACE_ID
             || super::require_runtime_lease(&generation, activation.lease()).is_err()
             || !activation.account_binding().validates_metadata(metadata)
             || metadata.source_id().as_str() != SCHWAB_QUOTE_SOURCE_ID
             || metadata.provider().as_str() != SCHWAB_QUOTE_PROVIDER
             || metadata.quality_ceiling() != DataQuality::DirectUnverified
-            || metadata.budget_policy() != activation.lease().provider_budget_policy()
+            || metadata.budget_policy() != Some(expected_budget.policy())
             || !metadata.is_effective_at(now)
         {
             return Err(SchwabMarketRuntimeStartError::AuthorityMismatch);

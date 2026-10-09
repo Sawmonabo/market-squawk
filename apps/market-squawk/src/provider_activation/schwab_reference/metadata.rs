@@ -96,10 +96,11 @@ pub(super) fn metadata(
         )
         .map_err(|_| ServiceError::InvalidResult)?,
         Some(
-            lease
-                .provider_budget_policy()
-                .cloned()
-                .ok_or(ServiceError::Unauthorized)?,
+            activation
+                .provider_rate_declaration()
+                .map_err(|_| ServiceError::Unauthorized)?
+                .policy()
+                .clone(),
         ),
         SourceCapabilities::new(
             false,

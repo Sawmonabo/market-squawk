@@ -1459,6 +1459,13 @@ impl ProductionSourceLifecycleAuthority {
             .live
             .start_account_group(request, deadline, cancellation)
             .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    stage = "account_group_start",
+                    "source account startup failed"
+                );
+            })
             .map_err(map_live_error)?;
         let generation = validate_account_group_evidence(request, &evidence)?;
         if pending

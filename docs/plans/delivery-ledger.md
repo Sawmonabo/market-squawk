@@ -2,7 +2,7 @@
 
 ## Current execution — 2026-10-09
 
-Current integration base **2ef1d35a** (pushed): selected history windows and default candles;
+Current pushed checkpoint **a8813f68**: SEC contention wait regression; preceding **2ef1d35a** supplies selected history windows and default candles;
 full nine-investment history/financial acceptance remains open. Supervisor10180, stopped watcher10194,
 service29800 and Desktop29820 freshly confirmed; no Cargo/rustc active. Prior goal turn only
 reconfirmed the already-pushed chart setting; next concrete action is contention/startup remediation.
@@ -18,7 +18,7 @@ Goal active: owner reconfirmed resume after the lead mistakenly reapplied the ol
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `ea427974`. Main/release unchanged; no extra branch created.
 
-SEC wait candidate: existing critical taxonomy/restart fixture PASS1/1 (4.25s; compilation1m48s).
+SEC wait checkpoint **a8813f68** pushed: existing critical taxonomy/restart fixture PASS1/1 (4.25s; compilation1m48s).
 This fixes immediate ConcurrencyExhausted rejection but is not final scheduling acceptance:
 read-only concurrency investigation confirms each25ms retry can enter SQLite. Next correction is
 shared event-driven waiting keyed to the existing provider-rate group, with cancellation/deadline
@@ -31,6 +31,19 @@ Schwab metadata producer/consumer correction is frozen; existing protected OAuth
 is compiling in session59552 with one job. Actual metadata constructors now use the same account
 scope as request admission. New native runtime is not yet built; saved authorization was active
 after the previous restart and no new browser sign-in has been requested.
+
+Schwab scope correction critically verified: existing
+`configured_schwab_without_doctor_refreshes_and_survives_restart` PASS1/1 (4.75s;
+single-job compilation4m06s). Genuine reference and market-hours metadata now construct with the
+same account-qualified request declaration, survive restart unchanged and reject template/wrong-
+account budgets. REST/Streamer metadata and all located quote consumer comparisons are aligned.
+No provider quota, OAuth scope, freshness or data-rights validation was loosened. Safe closed-error
+stage diagnostics retain the startup cause. Source closure and diff checks passed; agent ownership
+released to lead. Next barrier: one supervised service replacement, real Source lifecycle recovery,
+then all-nine history/financial verification. Native pre-replacement jobs:14completed/7failed, no
+running entries and no next page; saved OAuth remains active (`oct9-pre-scope-rebuild-runtime.json`,
+`oct9-schwab-current-authorization.json`). SEC checkpoint PR43:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6074191313.
 
 ### Active native verification and next dependency
 

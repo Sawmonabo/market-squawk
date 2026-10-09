@@ -27,6 +27,13 @@ use super::{ProviderAdapterActivation, SchwabMarketDataAccountActivation};
 use crate::application::{ResearchProviderRuntimeGeneration, ResearchRightsAuthority};
 
 impl ProviderAdapterActivation {
+    #[cfg(test)]
+    pub(crate) fn schwab_instrument_reference_metadata_for_test(
+        activation: &SchwabMarketDataAccountActivation,
+    ) -> Result<market_squawk_sources::SourceMetadata, ServiceError> {
+        metadata::metadata(activation)
+    }
+
     /// Acquires one exact selected issuer reference and commits it through the existing catalog
     /// identity owner. The account is borrowed so the same sole owner can later start quotes.
     #[allow(

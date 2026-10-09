@@ -23,7 +23,7 @@ use market_squawk_data::{ListingReferenceGenerationReceipt, ListingReferenceRead
 use market_squawk_domain::{ConnectionGeneration, InstrumentId, SourceId, Timestamp, VenueId};
 use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetReservationDecision, BudgetUnavailableReason,
-    ProviderRateAuthority, ProviderRateDeclaration, SharedProviderBudget, SourceMetadata,
+    ProviderRateAuthority, SharedProviderBudget, SourceMetadata,
     apply_http_retry_after,
 };
 use tokio_util::sync::CancellationToken;
@@ -460,7 +460,8 @@ impl SchwabRestQuoteProducer {
         telemetry: SchwabTransportTelemetry,
         sink: Arc<dyn SchwabRestQuoteEventSink>,
     ) -> Result<Self, SchwabRestQuoteRuntimeError> {
-        if activation.lease().provider_budget_policy() != evidence.metadata().budget_policy()
+        let declaration = activation.provider_rate_declaration()?;
+        if Some(declaration.policy()) != evidence.metadata().budget_policy()
             || bindings.is_empty()
             || bindings.len() > bounds.request_admission.max_items()
             || nasdaq_generation.is_some()
@@ -481,14 +482,6 @@ impl SchwabRestQuoteProducer {
             vec![QuoteField::Quote],
             None,
             bounds.request_admission,
-        )?;
-        let declaration = ProviderRateDeclaration::try_for_authorization_subject(
-            activation
-                .lease()
-                .provider_budget_policy()
-                .cloned()
-                .ok_or(SchwabRestQuoteRuntimeError::Authority)?,
-            activation.account_binding().subject(),
         )?;
         let budget = provider_rate.register_budget(declaration)?;
         let executor = SchwabRestExecutor::try_production(

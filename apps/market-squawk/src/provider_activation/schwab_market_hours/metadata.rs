@@ -88,10 +88,11 @@ pub(super) fn metadata(
         )
         .map_err(|_| ServiceError::InvalidResult)?,
         Some(
-            lease
-                .provider_budget_policy()
-                .cloned()
-                .ok_or(ServiceError::Unauthorized)?,
+            activation
+                .provider_rate_declaration()
+                .map_err(|_| ServiceError::Unauthorized)?
+                .policy()
+                .clone(),
         ),
         SourceCapabilities::new(
             false,
@@ -110,6 +111,15 @@ pub(super) fn metadata(
         return Err(ServiceError::Unauthorized);
     }
     Ok(source)
+}
+
+#[cfg(test)]
+impl super::super::ProviderAdapterActivation {
+    pub(crate) fn schwab_market_hours_metadata_for_test(
+        activation: &SchwabMarketDataAccountActivation,
+    ) -> Result<SourceMetadata, ServiceError> {
+        metadata(activation)
+    }
 }
 
 pub(super) fn timestamp() -> Result<Timestamp, ServiceError> {

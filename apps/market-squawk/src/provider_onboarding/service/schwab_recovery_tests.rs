@@ -13,13 +13,16 @@ use market_squawk_data::{
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, LocalPaths,
 };
-use market_squawk_sources::AuthoritativeSourceRegistry;
+use market_squawk_sources::{
+    AuthoritativeSourceRegistry, BudgetScope, ProviderBudgetPolicy, ProviderRateDeclaration,
+    SourceMetadata, SourceMetadataError, SourceMetadataInput,
+};
 
 use super::*;
 use crate::ResearchService;
 use crate::application::company_security_resolution::CompanySecurityResolutionAuthority;
 use crate::application::{ProductionResearchIngestCoordinator, ResearchExtractionLimits};
-use crate::provider_activation::ProviderAdapterActivation;
+use crate::provider_activation::{ProviderAdapterActivation, SchwabMarketDataAccountActivation};
 use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
 use crate::provider_onboarding::SchwabOAuthMarketAuthority;
 
@@ -145,6 +148,12 @@ async fn configured_schwab_without_doctor_refreshes_and_survives_restart() -> Te
             CancellationToken::new(),
         )
         .await?;
+    // Exercise the same metadata constructor that precedes reference bootstrap network access.
+    let metadata =
+        ProviderAdapterActivation::schwab_instrument_reference_metadata_for_test(&account)?;
+    assert_account_source_budget(&account, &metadata)?;
+    let market_hours = ProviderAdapterActivation::schwab_market_hours_metadata_for_test(&account)?;
+    assert_account_source_budget(&account, &market_hours)?;
     let (token, epoch) = account.acquire_runtime_publication_attempt().await?;
     let refreshed = epoch.receipt();
     assert_eq!(refreshed.generation().get(), 2);
@@ -258,6 +267,14 @@ async fn configured_schwab_without_doctor_refreshes_and_survives_restart() -> Te
         .activate_schwab_market_data_account(restored, oauth, CancellationToken::new())
         .await?;
     account.require_current().await?;
+    let restored_metadata =
+        ProviderAdapterActivation::schwab_instrument_reference_metadata_for_test(&account)?;
+    assert_account_source_budget(&account, &restored_metadata)?;
+    assert_eq!(restored_metadata, metadata);
+    let restored_hours =
+        ProviderAdapterActivation::schwab_market_hours_metadata_for_test(&account)?;
+    assert_account_source_budget(&account, &restored_hours)?;
+    assert_eq!(restored_hours, market_hours);
     let (token, epoch) = account.acquire_publication_attempt().await?;
     assert_eq!(epoch.receipt(), refreshed);
     epoch.validate_current(refreshed)?;
@@ -271,6 +288,63 @@ async fn configured_schwab_without_doctor_refreshes_and_survives_restart() -> Te
         active_sequence
     );
     Ok(())
+}
+
+fn assert_account_source_budget(
+    account: &SchwabMarketDataAccountActivation,
+    metadata: &SourceMetadata,
+) -> TestResult {
+    let template = account
+        .lease()
+        .provider_budget_policy()
+        .ok_or("missing Schwab request budget")?;
+    // Reference and quote dispatch already use this exact account-qualified declaration.
+    let request = ProviderRateDeclaration::try_for_authorization_subject(
+        template.clone(),
+        account.account_binding().subject(),
+    )?;
+    assert_eq!(account.provider_rate_declaration()?, request);
+    assert_eq!(metadata.budget_policy(), Some(request.policy()));
+    assert_eq!(
+        request.policy().scope(),
+        &BudgetScope::for_authorization(metadata.provider().clone(), metadata.authorization())?
+    );
+    assert_eq!(
+        metadata.authorization().basis().as_source_identifier(),
+        account.account_binding().subject()
+    );
+    let wrong_account = ProviderRateDeclaration::try_for_authorization_subject(
+        template.clone(),
+        &SourceIdentifier::try_from("another-schwab-application")?,
+    )?;
+    for mismatched in [template, wrong_account.policy()] {
+        assert_eq!(
+            metadata_with_budget(metadata, mismatched.clone()),
+            Err(SourceMetadataError::BudgetAuthorizationMismatch)
+        );
+    }
+    Ok(())
+}
+
+fn metadata_with_budget(
+    metadata: &SourceMetadata,
+    budget: ProviderBudgetPolicy,
+) -> Result<SourceMetadata, SourceMetadataError> {
+    SourceMetadata::try_new(SourceMetadataInput::new(
+        metadata.schema_version(),
+        metadata.source_id().clone(),
+        metadata.revision_evidence().clone(),
+        metadata.source_class(),
+        metadata.provider().clone(),
+        metadata.authorization().clone(),
+        metadata.coverage().clone(),
+        metadata.quality_ceiling(),
+        metadata.network_policy().clone(),
+        metadata.freshness_policy(),
+        Some(budget),
+        metadata.capabilities(),
+        metadata.protocol_profile().clone(),
+    ))
 }
 
 fn assert_no_doctor(lease: &ProviderActivationLease) {
