@@ -1,4 +1,4 @@
-//! Snapshot-only display authority over the existing immutable manifest graph.
+//! Snapshot-only display and local-analysis authority over the immutable manifest graph.
 
 use std::time::{Duration, Instant};
 
@@ -16,10 +16,11 @@ use super::{
 };
 use crate::catalog::CatalogReadSnapshot;
 
-/// Process-local display authority for an exact transitive manifest graph.
+/// Process-local read authority for an exact transitive manifest graph.
 ///
-/// This receipt grants no publication or calculation permit and records no durable decision.
-/// Recheck through the owning analytical service before returning the selected display data.
+/// Display and transient local calculations use independently scoped grants. This receipt
+/// grants no durable publication or training permit and records no durable decision.
+/// Recheck through the owning analytical service before returning data or calculated values.
 /// It cannot be cloned, serialized, or reused after the catalog session changes.
 #[derive(Debug)]
 pub struct AuthorizedResearchRead {
@@ -31,12 +32,12 @@ pub struct AuthorizedResearchRead {
 }
 
 impl AuthorizedResearchRead {
-    /// Returns the exact transitive graph admitted for display.
+    /// Returns the exact transitive graph admitted for this read.
     pub const fn graph(&self) -> &ResearchUseGraph {
         &self.graph
     }
 
-    /// Returns the independently authorized downstream use, which is always display.
+    /// Returns the independently authorized display or local-analysis use.
     pub const fn research_use(&self) -> ResearchUse {
         self.decision.requested_use()
     }
@@ -60,7 +61,10 @@ pub(crate) fn authorize_current_research_use_in_snapshot(
     if session_id.is_nil() {
         return Err(ResearchUseCatalogError::InvalidPermitSession);
     }
-    if request.requested_use != ResearchUse::Display {
+    if !matches!(
+        request.requested_use,
+        ResearchUse::Display | ResearchUse::LocalAnalysis
+    ) {
         return Err(ResearchUseCatalogError::InvalidGrant);
     }
     let started = Instant::now();

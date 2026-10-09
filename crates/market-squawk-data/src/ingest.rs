@@ -3147,7 +3147,7 @@ impl AnalyticalDataService {
             .authorize_research_use(request, cancellation)
     }
 
-    /// Authorizes display of exact retained manifests without taking the publication gate.
+    /// Authorizes display or transient local analysis without taking the publication gate.
     /// Missing or expired grants require policy renewal; other failures remain errors.
     pub fn authorize_current_research_use(
         &self,
@@ -3174,7 +3174,7 @@ impl AnalyticalDataService {
         })
     }
 
-    /// Revalidates display authority after reading without granting derived publication rights.
+    /// Revalidates read authority after processing without granting derived publication rights.
     pub fn recheck_research_use(
         &self,
         authorization: &crate::AuthorizedResearchRead,

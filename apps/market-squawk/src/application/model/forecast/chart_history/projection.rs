@@ -257,7 +257,7 @@ pub(crate) async fn authorize_projection_parents(
     let request = ResearchUseRequest::try_new(parents.to_vec(), ResearchUse::Display, limits)
         .map_err(|_| ServiceError::InvalidResult)?;
     let authorized = research
-        .authorize_research_display(request, context.deadline(), context.cancellation())
+        .authorize_research_read(request, context.deadline(), context.cancellation())
         .await
         .map_err(crate::application::research::corporate_actions::map_research_error)?
         .map_err(crate::application::research::map_research_use_error)?;
@@ -288,7 +288,7 @@ pub(crate) async fn recheck_projection_parents(
 ) -> Result<(), ServiceError> {
     check(context)?;
     research
-        .recheck_research_display(receipt, context.deadline(), context.cancellation())
+        .recheck_research_read(receipt, context.deadline(), context.cancellation())
         .await
         .map_err(crate::application::research::corporate_actions::map_research_error)?
         .map_err(crate::application::research::map_research_use_error)?;

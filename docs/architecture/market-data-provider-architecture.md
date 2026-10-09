@@ -701,6 +701,15 @@ This follows Tokio's [blocking task lifetime guidance](https://docs.rs/tokio/lat
 the original work. Full selected-history validation remains; no repeated-read cache or throughput
 claim is implied. Live screen acceptance remains in the delivery ledger.
 
+Financial page reads use process-local authorization receipts over exact retained manifest graphs.
+Display and transient LocalAnalysis each require their own current grant; neither receipt can
+publish a derived dataset or authorize training. One page operation retains its receipts through
+indexing and projection, then rechecks the same grants, expiry and catalog session in fresh read
+snapshots before returning values. Continuations authorize their original manifests independently.
+Only missing or expired renewable grants enter the existing policy-write path. Saved-analysis
+publication keeps its separate durable authorization and consumed publication permit. This avoids
+writing calculation decisions for every displayed ratio without bypassing permission changes.
+
 Macro origin discovery, dataset paging and exact analytical generation reads use the same
 endpoint-bound snapshots. Published logical-original lookup no longer needs the catalog writer;
 pending-original retention, publication and actual rights changes keep their existing authority.

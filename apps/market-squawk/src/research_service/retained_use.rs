@@ -72,9 +72,9 @@ pub(crate) fn research_source_operations(
 }
 
 impl ResearchService {
-    /// Displays retained manifests through current catalog snapshots. Only missing or expired
-    /// grants use existing policy renewal; display receipts carry no publication authority.
-    pub(crate) async fn authorize_research_display(
+    /// Reads retained manifests for display or transient local analysis through catalog snapshots.
+    /// Only missing or expired grants need renewal; read receipts carry no publication authority.
+    pub(crate) async fn authorize_research_read(
         &self,
         request: market_squawk_data::ResearchUseRequest,
         deadline: Instant,
@@ -139,7 +139,7 @@ impl ResearchService {
         }))
     }
 
-    pub(crate) async fn recheck_research_display(
+    pub(crate) async fn recheck_research_read(
         &self,
         receipt: Arc<market_squawk_data::AuthorizedResearchRead>,
         deadline: Instant,

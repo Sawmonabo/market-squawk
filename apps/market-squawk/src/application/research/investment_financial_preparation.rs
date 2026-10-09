@@ -189,7 +189,7 @@ impl InvestmentFinancialPreparation {
                 .map_err(super::investment_financials::canonical_error)?;
             let state = match resolved.outcome() {
                 SecResearchResolvedOutcome::Exact(exact) => {
-                    if !authorize_financial_manifest(
+                    if authorize_financial_manifest(
                         &self.research,
                         exact.manifest(),
                         false,
@@ -197,6 +197,7 @@ impl InvestmentFinancialPreparation {
                         cancellation,
                     )
                     .await?
+                    .is_none()
                     {
                         "rights_unavailable"
                     } else {
@@ -263,14 +264,9 @@ impl InvestmentFinancialPreparation {
                 .map_err(|_| ServiceError::Unavailable)?;
         }
         for manifest in &outcome.manifests {
-            if !authorize_financial_manifest(
-                &self.research,
-                manifest,
-                false,
-                deadline,
-                cancellation,
-            )
-            .await?
+            if authorize_financial_manifest(&self.research, manifest, false, deadline, cancellation)
+                .await?
+                .is_none()
             {
                 return Err(ServiceError::Unavailable);
             }

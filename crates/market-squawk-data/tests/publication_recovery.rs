@@ -5023,11 +5023,35 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
         ),
         Err(market_squawk_data::ResearchUseCatalogError::UnknownGeneration)
     ));
+    let analysis_request = ResearchUseRequest::try_new(
+        display_request.roots().to_vec(),
+        ResearchUse::LocalAnalysis,
+        display_request.limits(),
+    )?;
+    let analysis = service
+        .authorize_current_research_use(
+            analysis_request.clone(),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )?
+        .ok_or("transient analysis waited for unrelated writer renewal")?;
+    assert_eq!(analysis.graph().roots(), display.graph().roots());
+    assert_eq!(analysis.research_use(), ResearchUse::LocalAnalysis);
+    service.recheck_research_use(
+        &analysis,
+        Instant::now() + Duration::from_secs(5),
+        &cancellation,
+    )?;
+    let after_analysis: i64 =
+        proof.query_row("SELECT COUNT(*) FROM research_use_decisions", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(durable_decisions, after_analysis);
     assert!(matches!(
         service.authorize_current_research_use(
             ResearchUseRequest::try_new(
                 display_request.roots().to_vec(),
-                ResearchUse::LocalAnalysis,
+                ResearchUse::Train,
                 display_request.limits(),
             )?,
             Instant::now() + Duration::from_secs(5),
@@ -5247,6 +5271,23 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
             )?
             .is_some()
     );
+    assert!(matches!(
+        restarted.recheck_research_use(
+            &analysis,
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::InvalidPermitSession)
+    ));
+    assert!(
+        restarted
+            .authorize_current_research_use(
+                analysis_request.clone(),
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )?
+            .is_some()
+    );
     drop(replayed);
     drop(restarted);
     let authority = CatalogAuthority::open(catalog_config.clone())?;
@@ -5267,7 +5308,7 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
     )?)?;
     drop(authority);
     let revoked = Arc::new(AnalyticalDataService::open(
-        CatalogAuthority::open(catalog_config)?,
+        CatalogAuthority::open(catalog_config.clone())?,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         store_config,
@@ -5281,7 +5322,52 @@ async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_clo
         ),
         Err(market_squawk_data::ResearchUseCatalogError::Revoked)
     ));
+    // Display revocation does not silently revoke the independently scoped calculation grant.
+    let current_analysis = revoked
+        .authorize_current_research_use(
+            analysis_request.clone(),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )?
+        .ok_or("independent local-analysis grant was lost")?;
     drop(writer);
+    revoked.recheck_research_use(
+        &current_analysis,
+        Instant::now() + Duration::from_secs(5),
+        &cancellation,
+    )?;
+    drop(revoked);
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    let analysis_grant = authority.admit_research_use_grant(ResearchUseGrantInput::try_new(
+        rights.rights_id(),
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        digest(33),
+        Some(Timestamp::from_unix_nanos(i64::MAX)),
+    )?)?;
+    authority.revoke_research_use(market_squawk_data::ResearchUseRevocationInput::try_new(
+        &analysis_grant,
+        ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+        market_squawk_data::ResearchUseRevocationReason::AuthorizationWithdrawn,
+        digest(96),
+        Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?),
+    )?)?;
+    drop(authority);
+    let revoked = AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    assert!(matches!(
+        revoked.authorize_current_research_use(
+            analysis_request,
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ),
+        Err(market_squawk_data::ResearchUseCatalogError::Revoked)
+    ));
     Ok(())
 }
 

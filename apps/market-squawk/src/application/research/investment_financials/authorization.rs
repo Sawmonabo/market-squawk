@@ -1,5 +1,42 @@
-//! Fresh original-manifest permission checks shared by financial preparation and page reads.
+//! Operation-owned original-manifest read receipts for financial pages and preparation.
 use super::*;
+use market_squawk_data::AuthorizedResearchRead;
+
+/// Each receipt authorizes one use of the same original manifest for this operation only.
+/// These read receipts cannot authorize durable derived publication.
+#[derive(Debug)]
+pub(crate) struct FinancialReadAuthorization {
+    receipts: Vec<Arc<AuthorizedResearchRead>>,
+}
+
+impl FinancialReadAuthorization {
+    pub(super) fn no_selected_rows() -> Self {
+        Self {
+            receipts: Vec::new(),
+        }
+    }
+
+    pub(super) async fn recheck(
+        &self,
+        research: &ResearchService,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        check(deadline, cancellation)?;
+        for receipt in &self.receipts {
+            research
+                .recheck_research_read(Arc::clone(receipt), deadline, cancellation)
+                .await
+                .map_err(map_research_error)?
+                .map_err(|error| match error {
+                    ResearchUseCatalogError::Cancelled => ServiceError::Cancelled,
+                    ResearchUseCatalogError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+                    _ => ServiceError::Unavailable,
+                })?;
+        }
+        check(deadline, cancellation)
+    }
+}
 
 pub(crate) async fn authorize_financial_manifest(
     research: &ResearchService,
@@ -7,14 +44,14 @@ pub(crate) async fn authorize_financial_manifest(
     local_analysis: bool,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<bool, ServiceError> {
+) -> Result<Option<FinancialReadAuthorization>, ServiceError> {
     let roots: Vec<DatasetManifestRef> = vec![manifest.clone()];
     let uses: &[ResearchUse] = if local_analysis {
         &[ResearchUse::Display, ResearchUse::LocalAnalysis]
     } else {
         &[ResearchUse::Display]
     };
-    let mut admitted = true;
+    let mut receipts = Vec::new();
     for use_kind in uses {
         check(deadline, cancellation)?;
         let duration = deadline
@@ -37,54 +74,30 @@ pub(crate) async fn authorize_financial_manifest(
             .map_err(|_| ServiceError::InvalidResult)?,
         )
         .map_err(|_| ServiceError::InvalidResult)?;
-        // Page reads check the original manifests again before returning. Display needs no
-        // durable decision or writer lease when its retained grant is already current.
-        // Ratio calculation still uses the separate durable LocalAnalysis authorization.
-        let authorization = if *use_kind == ResearchUse::Display {
-            research
-                .authorize_research_display(request, deadline, cancellation)
-                .await
-                .map_err(map_research_error)?
-                .map(|authorization| {
-                    (
-                        authorization.research_use(),
-                        authorization.graph().roots() == roots.as_slice(),
-                        authorization.expires_at(),
-                    )
-                })
-        } else {
-            research
-                .authorize_research_use(request, deadline, cancellation)
-                .await
-                .map_err(map_research_error)?
-                .map(|authorization| {
-                    (
-                        authorization.research_use(),
-                        authorization.graph().roots() == roots.as_slice(),
-                        authorization.expires_at(),
-                    )
-                })
-        };
+        // Both display and transient ratio calculation retain snapshot-only authority.
+        // The final page rechecks these exact receipts rather than authorizing again.
+        let authorization = research
+            .authorize_research_read(request, deadline, cancellation)
+            .await
+            .map_err(map_research_error)?;
         let authorization = match authorization {
             Ok(authorization) => authorization,
             Err(ResearchUseCatalogError::Cancelled) => return Err(ServiceError::Cancelled),
             Err(ResearchUseCatalogError::DeadlineExceeded) => {
                 return Err(ServiceError::DeadlineExceeded);
             }
-            Err(_) => {
-                admitted = false;
-                break;
-            }
+            Err(_) => return Ok(None),
         };
-        let (authorized_use, exact_roots, expires_at) = authorization;
-        if authorized_use != *use_kind
-            || !exact_roots
+        if authorization.research_use() != *use_kind
+            || authorization.graph().roots() != roots.as_slice()
             || Utc::now()
                 .timestamp_nanos_opt()
-                .is_none_or(|now| now >= expires_at.unix_nanos())
+                .is_none_or(|now| now >= authorization.expires_at().unix_nanos())
         {
             return Err(ServiceError::InvalidResult);
         }
+        receipts.push(authorization);
     }
-    Ok(admitted)
+    check(deadline, cancellation)?;
+    Ok(Some(FinancialReadAuthorization { receipts }))
 }

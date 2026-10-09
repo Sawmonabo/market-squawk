@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod authorization;
+use authorization::FinancialReadAuthorization;
 pub(super) use authorization::authorize_financial_manifest;
 mod page;
 mod projection;
@@ -193,7 +194,7 @@ impl InvestmentFinancialReadCapability {
             return Err(ServiceError::InvalidRequest);
         }
         self.cache.prune();
-        let (id, snapshot, position, fresh) = if let Some(cursor) = cursor {
+        let (id, snapshot, position, fresh, authorizations) = if let Some(cursor) = cursor {
             if cursor.len() > 1024 {
                 return Err(ServiceError::InvalidRequest);
             }
@@ -216,7 +217,17 @@ impl InvestmentFinancialReadCapability {
             if snapshot.selection_token != selection_token || snapshot.section != section {
                 return Err(ServiceError::InvalidRequest);
             }
-            (position.read_token, snapshot, position, false)
+            // A continuation owns fresh use receipts for the original immutable selection.
+            let authorizations = self
+                .authorize(&snapshot.selections, section, deadline, cancellation)
+                .await?;
+            (
+                position.read_token,
+                snapshot,
+                position,
+                false,
+                authorizations,
+            )
         } else {
             let now = Utc::now();
             let cutoff = now
@@ -276,9 +287,10 @@ impl InvestmentFinancialReadCapability {
                 }
             }
             // Authorize the original manifests before deriving even the grouping index.
-            let authorized = self
+            let authorizations = self
                 .authorize(&selections, section, deadline, cancellation)
                 .await?;
+            let authorized: Vec<_> = authorizations.iter().map(Option::is_some).collect();
             for (selected, allowed) in selections.iter().zip(&authorized) {
                 if !allowed {
                     if let Some(family) = families
@@ -325,14 +337,12 @@ impl InvestmentFinancialReadCapability {
                     item: 0,
                 },
                 true,
+                authorizations,
             )
         };
-        // Each continuation re-authorizes every contributing immutable manifest. Retained source
-        // row/relationship receipts are the original verified objects, not caller cursor fields.
-        let authorized = self
-            .authorize(&snapshot.selections, section, deadline, cancellation)
-            .await?;
-        let admitted_before_page = authorized.clone();
+        // Fresh reads reuse their pre-snapshot receipts. Neither receipts nor authority masks
+        // are cached with cursors; each request retains them until its final recheck.
+        let authorized: Vec<_> = authorizations.iter().map(Option::is_some).collect();
         let owned = Arc::clone(&snapshot);
         let result = self
             .research
@@ -350,17 +360,12 @@ impl InvestmentFinancialReadCapability {
             .await
             .map_err(map_research_error)??;
         check(deadline, cancellation)?;
-        // Queueing and projection may outlive a permit. Obtain fresh original-manifest
-        // authorization after all blocking work before exposing any derived payload.
-        let admitted_at_return = self
-            .authorize(&snapshot.selections, section, deadline, cancellation)
-            .await?;
-        if admitted_before_page
-            .iter()
-            .zip(&admitted_at_return)
-            .any(|(before, after)| *before && !after)
-        {
-            return Err(ServiceError::Unavailable);
+        // Queueing and projection may outlive a receipt or grant. Recheck the exact original
+        // grants and catalog session before exposing data, without minting another decision.
+        for authorization in authorizations.iter().flatten() {
+            authorization
+                .recheck(&self.research, deadline, cancellation)
+                .await?;
         }
         check(deadline, cancellation)?;
         if fresh {
@@ -432,15 +437,15 @@ impl InvestmentFinancialReadCapability {
         section: InvestmentFinancialSection,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<bool>, ServiceError> {
+    ) -> Result<Vec<Option<FinancialReadAuthorization>>, ServiceError> {
         let mut allowed = Vec::new();
         for selected in selections {
             let SecResearchIdentityOutcome::Exact(exact) = selected.outcome() else {
-                allowed.push(true);
+                allowed.push(Some(FinancialReadAuthorization::no_selected_rows()));
                 continue;
             };
             if exact.disposition() != SecResearchDisposition::Selected {
-                allowed.push(true);
+                allowed.push(Some(FinancialReadAuthorization::no_selected_rows()));
                 continue;
             }
             allowed.push(

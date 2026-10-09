@@ -4118,8 +4118,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/model/forecast/chart_history/projection.rs",
-      "sha256": "0b04a4e113eb692572c6c2ff2637e607f092f519f33fbcc05559729c82a7c7df",
-      "size_bytes": 20511
+      "sha256": "eaeb64c7633ba17c63fcf2d7756ecfb3e624806755072ec41942e2ce9d5346f7",
+      "size_bytes": 20505
     },
     {
       "path": "apps/market-squawk/src/application/model/forecast/current_input.rs",
@@ -4748,18 +4748,18 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financial_preparation.rs",
-      "sha256": "680a1e42aa56aa0ca1ad68712b4d8c16eed57af4dbb83c3e92cc3cbea32e64b7",
-      "size_bytes": 12989
+      "sha256": "abf29675a0d9b5e42b5d4bc0031e0aee2f0620e0c87f8f183f104fea9e6476f9",
+      "size_bytes": 12954
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials.rs",
-      "sha256": "abbf1d862bc9b9c6f6bb583f0feaa3aef07d333a9c0492f8a527b76f27b7d157",
-      "size_bytes": 20482
+      "sha256": "998deaeb9cacc0a755851dd1ad895fe3473169b765712d1e054d3c8c688387a9",
+      "size_bytes": 20886
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/authorization.rs",
-      "sha256": "2fde101a137917a0066afad0c41f7ef680310d7608a57da436ccdc2e13d9bcfc",
-      "size_bytes": 3503
+      "sha256": "737dc29bf1df1069af3eb1d8ad292eeced08aa76ff03315a2e716748f5c195f6",
+      "size_bytes": 3939
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/page.rs",
@@ -6118,8 +6118,8 @@
     },
     {
       "path": "apps/market-squawk/src/research_service/retained_use.rs",
-      "sha256": "7a836a6b484eef3a8fb68c855643e6a10b396a39a0bc9153f95ecc7132194811",
-      "size_bytes": 11834
+      "sha256": "63efeea0bf2a4a9f2be755f00a206dab681a8bdad8ed8a891568b98200743be1",
+      "size_bytes": 11839
     },
     {
       "path": "apps/market-squawk/src/research_service/worker.rs",
@@ -7488,7 +7488,7 @@
     },
     {
       "path": "crates/market-squawk-data/src/ingest.rs",
-      "sha256": "de8a667a50449ba068e7de6dd45491b58971d645cb2f729dc59ab02e39f66e05",
+      "sha256": "5b9311d3470e56b0a624661fa57ff5828144d2daa35bc12c898fbe3d172117f7",
       "size_bytes": 288944
     },
     {
@@ -7858,8 +7858,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/research_use/read.rs",
-      "sha256": "e1975725278a011ef97950d6879795ec25875fc5ad1bd44724583633d6e4dde5",
-      "size_bytes": 8484
+      "sha256": "d426b7d4c9d109e82b7924afbbe3832418efa3880fd6150a7d7246e18db8f7b4",
+      "size_bytes": 8626
     },
     {
       "path": "crates/market-squawk-data/src/research_use/tests.rs",

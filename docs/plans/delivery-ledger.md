@@ -11483,3 +11483,38 @@ Matching managed build PASS5m30s; service62617/Desktop62636 replace the prior pa
 Native product collection returns9/9 in5.439s (`oct9-stream-mapping-native-collection.json`); that is not instant or current-price acceptance. Invalid screener placeholders remain unavailable. Existing authority/postcommit checks and raw-only readiness behavior are unchanged. Next dependencies: shared subscription demand/current last-trade display, financial first-page repeated-work/authorization contention, canonical SEC download concurrency and independent parsing capacity. Full stock/installed/V1 contract remains open.
 
 Repair checkpoint63158f37 pushed; PR43 evidence updated at https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6076023130 . Lead owns next integration barrier; no child writers active. SEC remains one concurrent request, so the proposed two-download/separate parsing configuration is not implemented or live verified.
+
+### Active financial read contention repair — base04aee3b4
+
+Previous question-only turn made no implementation progress. Current branch is clean04aee3b4;
+all prior child writers are complete. Acceptance1/2/5/6: financial tabs must read retained reports
+without competing for repeated durable calculation-authority writes. Source confirms ratios create
+LocalAnalysis decisions repeatedly and discard read receipts; native reads approached the15s
+request deadline. Existing values and original filing envelopes remain authoritative.
+
+| Owner | Exclusive files | Dependency and completion evidence |
+|---|---|---|
+| Lead | data `src/research_use/read.rs`, `src/ingest.rs`, `tests/publication_recovery.rs`; app `research_service/retained_use.rs`, model `forecast/chart_history/projection.rs`; closure/ledger/Git/build/runtime | Extend existing snapshot-only read receipt to Display and transient LocalAnalysis, never Train/publication. Canonical wrapper names become authorize_research_read/recheck_research_read. Extend existing authority/restart fixture for concurrent writer, no durable decision, revocation/session checks. |
+| Astra High nvda_ratio_context | app `application/research/investment_financials.rs`, `investment_financials/authorization.rs`, `investment_financials/page.rs`, `investment_financial_preparation.rs` | Retain exact per-family/use read receipts through each request; authorize once, recheck before return, preserve per-family errors and cursor closure. Update preparation callers in place if signatures change. Existing page/cursor critical fixture, then matching native four-equity/four-tab checks by lead. No builds/Git/runtime. |
+
+Shared contract: authorize_research_read returns Arc<AuthorizedResearchRead> for independently
+authorized Display/LocalAnalysis, with unchanged exact roots, grant expiry, revocation and catalog
+session recheck. No durable publication permit is exposed; durable saved-analysis paths retain
+AuthorizedResearchUse. Grant renewal stays in the existing controlled path only when required.
+No timeout increase, extra worker or legacy wrapper. Full prepared-artifact/index reuse and SEC
+concurrent download/separate parsing policy remain next dependencies, not completed by this slice.
+Pushed commit pending implementation and critical verification.
+
+Financial read consumer frozen and inspected: operation-owned exact Display/LocalAnalysis receipts
+survive snapshot construction and page projection, with final exact recheck; continuation receipts
+are fresh and never persisted in cursors. Preparation callers use the same current API. Shared
+snapshot receipt exposes no publication permit and rejects Train. Existing data authority/restart
+fixture PASS1/1,1.88s after10.21s final test compile. Two initial fixture failures (second writer,
+previous-session revocation handle) were corrected by using the current catalog owner; no production
+guard was weakened. Existing application page/cursor check is running with one compiler. Source
+closure and diff checks pass. Astra ownership released; lead owns integration/native proof.
+
+Existing application page/cursor/close critical fixture PASS1/1,0.40s after5m04s serialized compile.
+Final source-closure verification, formatting of changed code and diff checks pass. This establishes
+critical authority and page integrity, not native latency or all-screen completion. Next barrier:
+one managed matching Desktop/service build, then all-nine/four-section reads and observed timings.
