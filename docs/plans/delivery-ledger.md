@@ -11590,3 +11590,12 @@ compile. Changed-file formatting, diff and source-closure checks pass. This chec
 verified-index reuse and independent parsing capacity; native responsiveness and two-download
 shared-quota correction remain unproven/incomplete. Next: one managed matching native build and
 repeated first-page reads with all-nine coverage states retained honestly.
+
+31bcb86a pushed; PR43 evidence comment6076656853 records critical checks and unverified native
+performance. Previous goal turn advanced authoritative code/evidence. Managed supervisor47522/
+watcher47538 has one build running (Cargo71335), observed live at2m33s; service67204/Desktop67220
+remain the old generation while it compiles. No child writers remain. Do not edit watched source
+or start another compiler before this build reaches a verified terminal result. After successful
+replacement, stop watcher47538 and run repeat/all-nine native financial reads, then record timings
+and remaining field/fund failures. Existing log:oct9-catalog-reentry-native.log. Full V1 is active
+and incomplete; this is a verified build wait, not a pause or installed acceptance.
