@@ -11699,3 +11699,11 @@ changes. Renderer still treats locators as opaque. Matching native build and all
 remain the next barrier; currently running service72655/Desktop72672 are still31bcb86a source.
 SEC concurrency2/shared quota consolidation, fund financial consumers, actual rendered all-screen
 acceptance and complete V1 remain open. Resulting pushed implementation commit recorded next.
+
+f5fadbba pushed; PR43 evidence comment6076656853 updated. The single managed native build is
+confirmed live (Cargo80077, supervisor47522, watcher47538 resumed); service72655/Desktop72672
+continue the prior generation until successful replacement. No active child writers remain.
+Do not edit watched source or launch another compiler. Poll the same supervisor/log
+`oct9-catalog-reentry-native.log`; after verified replacement stop watcher47538 and run actual
+all-nine financial timings plus saved-controller status/reopen. This goal turn made implementation,
+critical-test and pushed integration progress. Full V1 remains active and incomplete.
