@@ -1,4 +1,4 @@
-//! Reviewed official numeric field tables; no fixture-derived field identities.
+//! Reviewed numeric field tables with documented corrections to the published wire contract.
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 
@@ -16,7 +16,7 @@ const OFFICIAL_EVIDENCE_SHA256: [u8; 32] = [
 ];
 
 impl SchwabStreamerFieldDictionary {
-    /// Reviewed field meanings for this service, bound to the retained official evidence.
+    /// Reviewed field meanings, retaining the official source and any named wire correction.
     pub fn official(service: MarketDataService) -> Result<Self, SchwabCanonicalError> {
         let fields: &[(u16, F)] = match service {
             MarketDataService::LevelOneEquities => &[
@@ -61,12 +61,12 @@ impl SchwabStreamerFieldDictionary {
             ],
             MarketDataService::ChartEquity => &[
                 (0, F::Symbol),
-                (1, F::OpenPrice),
-                (2, F::HighPrice),
-                (3, F::LowPrice),
-                (4, F::ClosePrice),
-                (5, F::Volume),
-                (6, F::Sequence),
+                (1, F::Sequence),
+                (2, F::OpenPrice),
+                (3, F::HighPrice),
+                (4, F::LowPrice),
+                (5, F::ClosePrice),
+                (6, F::Volume),
                 (7, F::ChartTime),
                 (8, F::ChartDay),
             ],
@@ -87,9 +87,19 @@ impl SchwabStreamerFieldDictionary {
                 (4, F::Items),
             ],
         };
+        // The retained official CHART_EQUITY table transposes fields 1–6. The fixed wire
+        // order matches native captures and ChartEquityFields in schwab-py, independently
+        // documented at https://schwaby.readthedocs.io/en/stable/streaming.html#equity-charts
+        // and https://github.com/alexgolec/schwab-py/blob/main/schwab/streaming.py .
+        // Keep the original document digest; the version names this reviewed correction.
+        let version = if service == MarketDataService::ChartEquity {
+            "schwab-streamer-chart-equity-wire-20261009"
+        } else {
+            "schwab-streamer-official-20240627"
+        };
         Self::try_new(
             service,
-            SourceIdentifier::try_from("schwab-streamer-official-20240627")
+            SourceIdentifier::try_from(version)
                 .map_err(|_| SchwabCanonicalError::DictionaryInvalid)?,
             EvidenceDigest::new(DigestAlgorithm::Sha256, OFFICIAL_EVIDENCE_SHA256),
             fields.to_vec(),

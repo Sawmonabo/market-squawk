@@ -33,6 +33,7 @@ pub(super) struct Consumer {
     ready: Option<oneshot::Sender<()>>,
     physical_capture_failed: bool,
     failure_reported: bool,
+    mapping_rejection_reported: bool,
 }
 impl Consumer {
     #[allow(
@@ -80,6 +81,7 @@ impl Consumer {
             ready: Some(ready),
             physical_capture_failed: false,
             failure_reported: false,
+            mapping_rejection_reported: false,
         })
     }
     pub(super) fn capture_cleanup(&self) -> Result<(), ServiceError> {
@@ -486,13 +488,22 @@ impl Consumer {
             SchwabStreamerApplicationOutcome::Published(published) => published.dispositions(),
             SchwabStreamerApplicationOutcome::SealedRaw(raw) => raw.dispositions(),
         };
-        if dispositions.iter().any(|item| {
-            matches!(
-                item.reason(),
-                SchwabStreamerRecordDispositionReason::CanonicalMappingRejected
-            )
-        }) {
-            return Err(ServiceError::InvalidResult);
+        let rejected_records = dispositions
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.reason(),
+                    SchwabStreamerRecordDispositionReason::CanonicalMappingRejected
+                )
+            })
+            .count();
+        if rejected_records > 0 && !self.mapping_rejection_reported {
+            self.mapping_rejection_reported = true;
+            tracing::warn!(
+                rejected_records,
+                published = *published,
+                "Schwab Streamer retained rejected records; accepted records continue"
+            );
         }
         // Missing same-family entitlement/identity produces raw-only disposition, never an invented event.
         let durably_published = matches!(&outcome, SchwabStreamerApplicationOutcome::Published(_));

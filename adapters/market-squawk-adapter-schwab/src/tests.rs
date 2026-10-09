@@ -69,16 +69,17 @@ use crate::{
     SchwabRestQuotePublicationRequest, SchwabRestQuoteRecordRequest, SchwabSealedStreamerCapture,
     SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnector, SchwabStreamerExecutor,
-    SchwabStreamerFamilyDoctorAccumulator, SchwabStreamerFieldDictionary,
+    SchwabStreamerFamilyDoctorAccumulator, SchwabStreamerFamilyDoctorHandoff,
+    SchwabStreamerFamilyRecordRequest, SchwabStreamerFieldDictionary,
     SchwabStreamerQuoteMarketDataEvidence, SchwabStreamerQuotePublicationOutcome,
     SchwabStreamerQuotePublicationRequest, SchwabStreamerQuoteRecordRequest,
-    SchwabStreamerSemanticField, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode,
-    StreamerSubscription, StreamerTransportBounds, TokenAuthorityError, TokenDecision,
-    TransientAccessToken, build_instrument_search_request, build_market_hours_request,
-    build_movers_request, canonicalize_option_chain, canonicalize_streamer_batch,
-    parse_option_chain_response, parse_quote_response, parse_streamer_frame, parse_token_response,
-    parse_user_preference,
+    SchwabStreamerRecordDispositionReason, SchwabStreamerSemanticField, SchwabTransportError,
+    SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink, StreamerCaptureSinkError,
+    StreamerMicrobatch, StreamerResponseCode, StreamerSubscription, StreamerTransportBounds,
+    TokenAuthorityError, TokenDecision, TransientAccessToken, build_instrument_search_request,
+    build_market_hours_request, build_movers_request, canonicalize_option_chain,
+    canonicalize_streamer_batch, parse_option_chain_response, parse_quote_response,
+    parse_streamer_frame, parse_token_response, parse_user_preference,
 };
 
 use crate::canonical::{SchwabDailyPriceHistoryCandidateRequest, prepare_price_history_candidate};
@@ -2697,8 +2698,41 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let options_subscribed = Bytes::from_static(
         br#"{"response":[{"service":"LEVELONE_OPTIONS","command":"SUBS","requestid":"3","timestamp":1710000000002,"content":{"code":0,"msg":"OK"}}]}"#,
     );
+    let chart_subscribed = Bytes::from_static(
+        br#"{"response":[{"service":"CHART_EQUITY","command":"SUBS","requestid":"4","timestamp":1710000000003,"content":{"code":0,"msg":"OK"}}]}"#,
+    );
+    let screener_equity_subscribed = Bytes::from_static(
+        br#"{"response":[{"service":"SCREENER_EQUITY","command":"SUBS","requestid":"5","timestamp":1710000000003,"content":{"code":0,"msg":"OK"}}]}"#,
+    );
+    let screener_option_subscribed = Bytes::from_static(
+        br#"{"response":[{"service":"SCREENER_OPTION","command":"SUBS","requestid":"6","timestamp":1710000000003,"content":{"code":0,"msg":"OK"}}]}"#,
+    );
     let mixed_market_data: &'static [u8] =
         br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000004,"content":[{"key":"AAPL","delayed":false,"assetMainType":"EQUITY","assetSubType":"COE","cusip":"TEST00001","1":100.125,"2":100.25,"3":2,"4":3}]},{"service":"LEVELONE_OPTIONS","command":"SUBS","timestamp":1710000000004,"content":[{"key":"AAPL_260116C100","delayed":true,"assetMainType":"OPTION","assetSubType":null,"cusip":null,"1":4.125,"2":4.25,"3":5,"4":6}]}]}"#;
+    let mut mixed: serde_json::Value =
+        serde_json::from_slice(mixed_market_data).expect("mixed quote fixture");
+    let batches = mixed["data"].as_array_mut().expect("data batches");
+    // Original observed chart economics and numeric field order; clocks use the fixture epoch.
+    batches.push(serde_json::json!({
+        "service": "CHART_EQUITY", "command": "SUBS", "timestamp": 1710000000004_u64,
+        "content": [{"seq":2194,"key":"SPY","1":779,"2":774.4599,"3":774.4599,
+            "4":774.4599,"5":774.4599,"6":100,"7":1710000000000_u64,"8":20734}]
+    }));
+    let placeholder = serde_json::json!({
+        "symbol":"N/A","description":"N/A","lastPrice":0,"netChange":0,
+        "netPercentChange":0,"marketShare":0,"totalVolume":0,"volume":0,"trades":0
+    });
+    for (service, key) in [
+        ("SCREENER_EQUITY", "EQUITY_ALL_VOLUME_0"),
+        ("SCREENER_OPTION", "OPTION_ALL_VOLUME_0"),
+    ] {
+        batches.push(serde_json::json!({
+            "service":service,"command":"SUBS","timestamp":1710000000004_u64,
+            "content":[{"key":key,"1":0,"2":"VOLUME","3":0,
+                "4":vec![placeholder.clone(); 10]}]
+        }));
+    }
+    let mixed_market_data = serde_json::to_vec(&mixed).expect("mixed family fixture bytes");
     let malformed_selected_service: &'static [u8] =
         br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","content":[{"key":"AAPL","1":}]}]}"#;
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
@@ -2710,16 +2744,22 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             MockStreamerInbound::FlushBoundary,
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(options_subscribed.clone())),
             MockStreamerInbound::FlushBoundary,
-            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
-                mixed_market_data,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(chart_subscribed)),
+            MockStreamerInbound::FlushBoundary,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(screener_equity_subscribed)),
+            MockStreamerInbound::FlushBoundary,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(screener_option_subscribed)),
+            MockStreamerInbound::FlushBoundary,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::copy_from_slice(
+                &mixed_market_data,
             ))),
             MockStreamerInbound::FlushBoundary,
-            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
-                mixed_market_data,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::copy_from_slice(
+                &mixed_market_data,
             ))),
             MockStreamerInbound::FlushBoundary,
-            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
-                mixed_market_data,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::copy_from_slice(
+                &mixed_market_data,
             ))),
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
                 malformed_selected_service,
@@ -2755,7 +2795,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         Duration::from_millis(1),
     )
     .unwrap_or_else(|error| panic!("stream bounds: {error}"));
-    let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
+    let stream_admission = StreamerAdmission::new(admission(), nonzero(5), nonzero(16));
     let coordinates = capture_coordinates();
     let session_identifier = SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
         .unwrap_or_else(|error| panic!("Streamer authority session: {error}"));
@@ -2812,12 +2852,32 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .unwrap_or_else(|error| panic!("option subscription: {error}")),
         )
         .unwrap_or_else(|error| panic!("option desired state: {error}"));
+    let family_services = [
+        (MarketDataService::ChartEquity, "SPY"),
+        (MarketDataService::ScreenerEquity, "EQUITY_ALL_VOLUME_0"),
+        (MarketDataService::ScreenerOption, "OPTION_ALL_VOLUME_0"),
+    ];
+    for (service, symbol) in family_services {
+        let dictionary =
+            SchwabStreamerFieldDictionary::official(service).expect("family dictionary");
+        streamer
+            .replace_desired(
+                StreamerSubscription::try_new(
+                    service,
+                    vec![ProviderIdentifier::try_new(symbol).expect("family key")],
+                    dictionary.field_ids().collect(),
+                    stream_admission,
+                )
+                .expect("family subscription"),
+            )
+            .expect("family desired state");
+    }
     let cancellation = CancellationToken::new();
     let (handoff_entered, entered) = tokio::sync::oneshot::channel();
     let (resume_handoff, resume) = tokio::sync::oneshot::channel();
     let mut sink = CancellingCaptureSink {
         cancellation: cancellation.clone(),
-        cancel_after: 7,
+        cancel_after: 10,
         microbatches: Vec::new(),
         blocked_handoff: Some((handoff_entered, resume)),
     };
@@ -2846,9 +2906,9 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .expect_err("malformed selected-service frame must close the typed Streamer run")
     };
     assert_eq!(run_error, SchwabTransportError::Adapter);
-    assert_eq!(sink.microbatches.len(), 7);
+    assert_eq!(sink.microbatches.len(), 10);
     assert!(
-        u128::from(sink.microbatches[6].frames()[0].received_at_unix_millis())
+        u128::from(sink.microbatches[9].frames()[0].received_at_unix_millis())
             <= received_before_wait,
         "handoff wait must not advance the original receive timestamp"
     );
@@ -2885,6 +2945,12 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .unwrap_or_else(|| panic!("missing options acknowledgement microbatch")),
         &store,
     );
+    let family_acknowledgements = family_services.map(|_| {
+        seal_stream_microbatch(
+            microbatches.next().expect("missing family acknowledgement"),
+            &store,
+        )
+    });
     let equities_doctor_data = seal_stream_microbatch(
         microbatches
             .next()
@@ -2910,6 +2976,18 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         &store,
     );
     assert!(microbatches.next().is_none());
+    let family_handoffs = family_services
+        .iter()
+        .zip(&family_acknowledgements)
+        .map(|((service, _), acknowledgement)| {
+            SchwabStreamerFamilyDoctorHandoff::try_from_sealed_captures(
+                *service,
+                acknowledgement,
+                &sealed,
+            )
+            .expect("same-family sealed ACK and data")
+        })
+        .collect::<Vec<_>>();
 
     let mut equities_doctor = SchwabStreamerFamilyDoctorAccumulator::try_from_ack_capture(
         MarketDataService::LevelOneEquities,
@@ -3125,10 +3203,121 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         "schwab-us-options",
         51,
     );
-    let publication_request = SchwabStreamerQuotePublicationRequest::new(
-        vec![&equities_streamer_doctor, &options_streamer_doctor],
-        vec![equities_record, options_record],
-    );
+    let family_records = family_handoffs
+        .iter()
+        .enumerate()
+        .map(|(index, handoff)| {
+            let (service, symbol) = family_services[index];
+            let batch_ordinal = u16::try_from(index + 2).expect("family batch ordinal");
+            let dictionary =
+                SchwabStreamerFieldDictionary::official(service).expect("family dictionary");
+            let parsed = sealed.parsed_frames()[0]
+                .as_ref()
+                .expect("parsed family frame");
+            let records = canonicalize_streamer_batch(
+                &parsed.value().data[usize::from(batch_ordinal)],
+                &dictionary,
+            )
+            .expect("canonical family fields");
+            let [record] = records.as_slice() else {
+                panic!("one original record per family");
+            };
+            let qualification = test_streamer_qualification(
+                handoff,
+                received_at,
+                streamer_oauth_authority,
+                session_identifier.clone(),
+            );
+            let reference = (service == MarketDataService::ChartEquity).then(|| {
+                test_streamer_reference(
+                    InstrumentId::try_from(Uuid::new_v4()).expect("chart instrument"),
+                    service,
+                    symbol,
+                    received_at,
+                    61,
+                )
+            });
+            let source_identifier = SourceIdentifier::try_from(symbol).expect("family source key");
+            let basis = AuthorizationBasis::new(
+                SourceIdentifier::try_from("schwab-read-only-oauth").expect("family basis"),
+            );
+            let venue = VenueId::try_from("schwab-us-equities").expect("family venue");
+            let connection =
+                market_squawk_domain::ConnectionGeneration::new(frame_generation.get())
+                    .expect("family connection generation");
+            let payload_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, frame_digest);
+            let state = CanonicalStateDigest::new(
+                payload_digest,
+                CanonicalizationRule::new(
+                    SourceIdentifier::try_from("schwab-streamer-record").expect("family rule"),
+                    RuleVersion::new(1).expect("family rule version"),
+                ),
+            );
+            let binding = if let Some(reference) = &reference {
+                LiveEvidenceBinding::new(
+                    coordinates.source_id().clone(),
+                    stream_identity.clone(),
+                    coordinates.metadata_revision().clone(),
+                    basis,
+                    venue,
+                    reference.instrument_id(),
+                    connection,
+                    qualification.provider_product().clone(),
+                    qualification.provider_channel().clone(),
+                    LiveEventClass::Chart,
+                    source_identifier,
+                    payload_digest,
+                    state,
+                    None,
+                )
+                .expect("chart binding")
+            } else {
+                LiveEvidenceBinding::new_source_cohort(
+                    coordinates.source_id().clone(),
+                    stream_identity.clone(),
+                    coordinates.metadata_revision().clone(),
+                    basis,
+                    venue,
+                    connection,
+                    qualification.provider_product().clone(),
+                    qualification.provider_channel().clone(),
+                    source_identifier,
+                    payload_digest,
+                    state,
+                )
+            };
+            let provenance = LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+                binding,
+                Some(crate::streamer_family_source_timestamp(record).expect("family source clock")),
+                received_at,
+                received_at,
+                received_at,
+                qualification.quality(),
+                CoverageStatus::Unknown,
+                PayloadReference::ContentHash(PayloadHash::new(
+                    DigestAlgorithm::Sha256,
+                    frame_digest,
+                )),
+            ))
+            .expect("family provenance");
+            SchwabStreamerFamilyRecordRequest::try_new(
+                0,
+                batch_ordinal,
+                0,
+                dictionary,
+                reference,
+                vec![],
+                provenance,
+                qualification,
+            )
+            .expect("family publication record")
+        })
+        .collect();
+    let mut handoffs = vec![&equities_streamer_doctor, &options_streamer_doctor];
+    handoffs.extend(&family_handoffs);
+    let publication_request =
+        SchwabStreamerQuotePublicationRequest::new(handoffs, vec![equities_record, options_record])
+            .with_family_records(family_records);
     publication_request
         .validate_current_authority(
             streamer_oauth_authority,
@@ -3166,15 +3355,73 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let SchwabStreamerQuotePublicationOutcome::Published(publication) = outcome else {
         panic!("complete Level-One quote should publish a typed event batch");
     };
-    assert!(publication.dispositions().is_empty());
-    assert_eq!(publication.binding().record_count(), 2);
+    assert_eq!(publication.dispositions().len(), 2);
+    for ((disposition, (service, key)), batch) in publication
+        .dispositions()
+        .iter()
+        .zip(&family_services[1..])
+        .zip(3_u16..)
+    {
+        assert_eq!(
+            disposition.reason(),
+            SchwabStreamerRecordDispositionReason::CanonicalMappingRejected
+        );
+        assert_eq!(disposition.service(), *service);
+        assert_eq!(disposition.provider_identifier().as_str(), *key);
+        assert_eq!(
+            (
+                disposition.frame_ordinal(),
+                disposition.data_batch_ordinal(),
+                disposition.content_ordinal()
+            ),
+            (0, batch, 0)
+        );
+    }
+    assert_eq!(publication.binding().record_count(), 3);
     let [
         MarketEvent::MarketDataQuote(equities),
         MarketEvent::MarketDataQuote(options),
+        MarketEvent::MarketDataChart(chart),
     ] = publication.binding().batch().events()
     else {
         panic!("Streamer prices must retain currency-qualified decimal quote semantics");
     };
+    let chart_input = chart.input();
+    for price in [
+        chart_input.open,
+        chart_input.high,
+        chart_input.low,
+        chart_input.close,
+    ] {
+        assert_eq!(price.amount(), rust_decimal::Decimal::new(7_744_599, 4));
+        assert_eq!(price.currency(), Currency::try_from("USD").expect("USD"));
+    }
+    assert_eq!(chart_input.volume, rust_decimal::Decimal::from(100));
+    assert_eq!(chart_input.provider_sequence.value(), Some(&779));
+    assert_eq!(chart_input.provider_day.value(), Some(&20734));
+    assert_eq!(chart_input.interval_nanos, 60_000_000_000);
+    assert_eq!(
+        chart_input.timestamp_basis,
+        market_squawk_domain::MarketDataChartTimestampBasis::Unspecified
+    );
+    assert_eq!(
+        chart_input.completion,
+        market_squawk_domain::MarketDataChartCompletion::Unknown
+    );
+    assert_eq!(
+        chart_input.volume_unit,
+        market_squawk_domain::MarketDataSizeUnit::Unspecified
+    );
+    assert_eq!(
+        chart.provenance().source_timestamp(),
+        Some(Timestamp::from_unix_nanos(1_710_000_000_000_000_000))
+    );
+    assert_eq!(chart.provenance().received_at(), received_at);
+    assert_eq!(
+        chart.provenance().recorded_quality(),
+        DataQuality::DirectUnverified
+    );
+    assert_eq!(chart.reference().source_symbol().as_str(), "SPY");
     for (quote, symbol, price, size) in [
         (equities, "AAPL", rust_decimal::Decimal::new(100_125, 3), 2),
         (
@@ -3252,13 +3499,35 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .windows(b"AAPL_260116C100".len())
             .any(|value| value == b"AAPL_260116C100")
     );
-    assert!(native_rows.iter().all(|row| {
+    assert!(native_rows[..2].iter().all(|row| {
         row.windows(b"field_id".len())
             .any(|value| value == b"field_id")
             && row
                 .windows(b"streamer_doctor_capture_set_evidence".len())
                 .any(|value| value == b"streamer_doctor_capture_set_evidence")
     }));
+    let native_chart: serde_json::Value =
+        serde_json::from_slice(&native_rows[2]).expect("original chart lineage");
+    assert_eq!(native_chart["service"], "CHART_EQUITY");
+    assert_eq!(
+        native_chart["dictionary_version"],
+        "schwab-streamer-chart-equity-wire-20261009"
+    );
+    assert_eq!(native_chart["data_batch_ordinal"], 2);
+    assert_eq!(native_chart["content_ordinal"], 0);
+    assert_eq!(
+        native_chart["fields"],
+        serde_json::json!([
+            {"field_id":1,"value":{"kind":"number","value":"779"}},
+            {"field_id":2,"value":{"kind":"number","value":"774.4599"}},
+            {"field_id":3,"value":{"kind":"number","value":"774.4599"}},
+            {"field_id":4,"value":{"kind":"number","value":"774.4599"}},
+            {"field_id":5,"value":{"kind":"number","value":"774.4599"}},
+            {"field_id":6,"value":{"kind":"number","value":"100"}},
+            {"field_id":7,"value":{"kind":"number","value":"1710000000000"}},
+            {"field_id":8,"value":{"kind":"number","value":"20734"}}
+        ])
+    );
     let sidecar: serde_json::Value = serde_json::from_slice(
         publication
             .binding()
@@ -3283,7 +3552,26 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     }));
     assert_eq!(
         qualification_services,
-        ["LEVELONE_EQUITIES", "LEVELONE_OPTIONS"]
+        [
+            "LEVELONE_EQUITIES",
+            "LEVELONE_OPTIONS",
+            "CHART_EQUITY",
+            "SCREENER_EQUITY",
+            "SCREENER_OPTION"
+        ]
+    );
+    assert_eq!(
+        sidecar["dispositions"],
+        serde_json::json!([
+            {"frame_ordinal":0,"data_batch_ordinal":3,"content_ordinal":0,"service":"SCREENER_EQUITY",
+                "provider_identifier":"EQUITY_ALL_VOLUME_0","reason":"canonical_mapping_rejected"},
+            {"frame_ordinal":0,"data_batch_ordinal":4,"content_ordinal":0,"service":"SCREENER_OPTION",
+                "provider_identifier":"OPTION_ALL_VOLUME_0","reason":"canonical_mapping_rejected"}
+        ])
+    );
+    assert_eq!(
+        sidecar["frames"][0]["unknown_field_paths"],
+        serde_json::json!(["$.data[].content[].seq"])
     );
     let state = connector_state
         .lock()
@@ -3294,6 +3582,9 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             ("ADMIN".to_owned(), "LOGIN".to_owned()),
             ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
             ("LEVELONE_OPTIONS".to_owned(), "SUBS".to_owned()),
+            ("CHART_EQUITY".to_owned(), "SUBS".to_owned()),
+            ("SCREENER_EQUITY".to_owned(), "SUBS".to_owned()),
+            ("SCREENER_OPTION".to_owned(), "SUBS".to_owned()),
         ]
     );
     drop(state);
@@ -4068,70 +4359,7 @@ fn test_streamer_quote_record_request(
     )
     .unwrap_or_else(|error| panic!("mixed-service dictionary: {error}"));
     let reference =
-        (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
-            use market_squawk_domain::{
-                AssetClass, Currency, EffectiveInterval, ExactPayloadEvidence,
-                MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
-                MarketDataReference, ProviderIdentityEvidence, ProviderIdentityRecord,
-                ProviderIdentityRecordInput, RevisionBoundPayloadEvidence,
-            };
-            let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
-            let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-                instrument_id,
-                source_id: SourceId::try_from("schwab-trader-api-instruments")?,
-                provider_instrument_id: ProviderInstrumentId::try_from(symbol)?,
-                evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
-                    DigestAlgorithm::Sha256,
-                    [evidence_byte.wrapping_add(2); 32],
-                )),
-                source_timestamp: None,
-                observed_at: received_at,
-                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
-                    "schwab-instruments-test-v1",
-                )?),
-                validity: interval,
-                supersedes: None,
-            });
-            let definition =
-                MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
-                    instrument_id,
-                    reference_evidence: RevisionBoundPayloadEvidence::new(
-                        MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?),
-                        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-                            DigestAlgorithm::Sha256,
-                            [evidence_byte.wrapping_add(3); 32],
-                        )),
-                    ),
-                    effective_interval: interval,
-                    asset_class: match service {
-                        MarketDataService::LevelOneEquities => AssetClass::Equity,
-                        MarketDataService::LevelOneOptions => AssetClass::Option,
-                        _ => panic!("focused quote fixture requires an admitted Level-One service"),
-                    },
-                    display_name: None,
-                    quote_currency: Currency::try_from("USD")?,
-                    quote_currency_evidence: ExactPayloadEvidence::from_content_digest(
-                        EvidenceDigest::new(
-                            DigestAlgorithm::Sha256,
-                            [evidence_byte.wrapping_add(4); 32],
-                        ),
-                    ),
-                    venue_mappings: vec![],
-                    provider_identities: vec![identity.clone()],
-                    identifiers: vec![],
-                })?;
-            let digest = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&definition)?).into(),
-            );
-            Ok(MarketDataReference::try_new(
-                &definition,
-                digest,
-                &identity,
-                received_at,
-            )?)
-        })()
-        .unwrap_or_else(|error| panic!("mixed-service quote reference: {error}"));
+        test_streamer_reference(instrument_id, service, symbol, received_at, evidence_byte);
     let market_evidence = SchwabStreamerQuoteMarketDataEvidence::try_new(venue_id, qualification)
         .unwrap_or_else(|error| panic!("mixed-service market evidence: {error}"));
     SchwabStreamerQuoteRecordRequest::new(
@@ -4143,6 +4371,81 @@ fn test_streamer_quote_record_request(
         provenance,
         market_evidence,
     )
+}
+
+fn test_streamer_reference(
+    instrument_id: InstrumentId,
+    service: MarketDataService,
+    symbol: &str,
+    received_at: Timestamp,
+    evidence_byte: u8,
+) -> market_squawk_domain::MarketDataReference {
+    (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
+        use market_squawk_domain::{
+            AssetClass, Currency, EffectiveInterval, ExactPayloadEvidence,
+            MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+            MarketDataReference, ProviderIdentityEvidence, ProviderIdentityRecord,
+            ProviderIdentityRecordInput, RevisionBoundPayloadEvidence,
+        };
+        let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+            instrument_id,
+            source_id: SourceId::try_from("schwab-trader-api-instruments")?,
+            provider_instrument_id: ProviderInstrumentId::try_from(symbol)?,
+            evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [evidence_byte.wrapping_add(2); 32],
+            )),
+            source_timestamp: None,
+            observed_at: received_at,
+            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                "schwab-instruments-test-v1",
+            )?),
+            validity: interval,
+            supersedes: None,
+        });
+        let definition =
+            MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                instrument_id,
+                reference_evidence: RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?),
+                    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        [evidence_byte.wrapping_add(3); 32],
+                    )),
+                ),
+                effective_interval: interval,
+                asset_class: match service {
+                    MarketDataService::LevelOneEquities | MarketDataService::ChartEquity => {
+                        AssetClass::Equity
+                    }
+                    MarketDataService::LevelOneOptions => AssetClass::Option,
+                    _ => panic!("focused fixture requires an admitted instrument service"),
+                },
+                display_name: None,
+                quote_currency: Currency::try_from("USD")?,
+                quote_currency_evidence: ExactPayloadEvidence::from_content_digest(
+                    EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        [evidence_byte.wrapping_add(4); 32],
+                    ),
+                ),
+                venue_mappings: vec![],
+                provider_identities: vec![identity.clone()],
+                identifiers: vec![],
+            })?;
+        let digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&definition)?).into(),
+        );
+        Ok(MarketDataReference::try_new(
+            &definition,
+            digest,
+            &identity,
+            received_at,
+        )?)
+    })()
+    .unwrap_or_else(|error| panic!("mixed-service reference: {error}"))
 }
 
 fn test_rest_qualification(
