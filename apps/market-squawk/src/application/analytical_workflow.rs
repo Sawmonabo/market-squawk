@@ -682,7 +682,7 @@ impl ControllerDocument {
                 || run
                     .target_selection_token
                     .as_deref()
-                    .is_some_and(|token| !valid_market_selection_token(token))
+                    .is_some_and(|token| !valid_identifier(token, 96))
                 || run.checkpoint_journal.len() > MAXIMUM_CHECKPOINTS_PER_RUN
                 || run.child_jobs.len() > MAXIMUM_CHILD_REFERENCES_PER_RUN
                 || run.result_references.len() > MAXIMUM_RESULT_REFERENCES_PER_RUN
@@ -2057,6 +2057,9 @@ fn workflow_presentation(
         ),
         WorkflowRunState::Cancelled => Some("This analysis was cancelled before completion."),
         WorkflowRunState::Paused => Some(match run.last_error.as_deref() {
+            Some("analysis_selection_required") => {
+                "Choose this investment again to start a fresh analysis. Saved results are still available."
+            }
             Some("analysis_preparation_required") => {
                 "Resume to refresh the information needed for this analysis."
             }
@@ -2527,10 +2530,12 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_market_selection_token(value: &str) -> bool {
-    value
-        .strip_prefix("market_")
-        .and_then(|value| value.parse::<Uuid>().ok())
-        .is_some_and(|id| !id.is_nil() && value == format!("market_{}", id.simple()))
+    value.strip_prefix("market_").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn valid_unsigned_decimal(value: &str) -> bool {
@@ -2758,6 +2763,7 @@ pub const WORKFLOW_ERROR_CODES: &[&str] = &[
     "analysis_period_unavailable",
     "analysis_preparation_required",
     "analysis_preview_expired",
+    "analysis_selection_required",
     "analysis_setup_required",
     "analysis_source_actions_unavailable",
     "analysis_source_unavailable",

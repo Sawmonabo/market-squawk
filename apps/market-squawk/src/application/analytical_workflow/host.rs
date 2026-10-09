@@ -96,6 +96,7 @@ struct WorkflowServices {
 
 pub(crate) struct WorkflowHost {
     controller: Arc<AnalyticalWorkflowController>,
+    selections: crate::application::market_selection::product::MarketProductSelectionReadCapability,
     services: OnceLock<WorkflowServices>,
     work_available: tokio::sync::Notify,
     background_failure: std::sync::Mutex<Option<WorkflowError>>,
@@ -104,9 +105,14 @@ pub(crate) struct WorkflowHost {
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), WorkflowError>>>>,
 }
 impl WorkflowHost {
-    pub(crate) fn open(paths: &LocalPaths, workspace: Uuid) -> Result<Arc<Self>, WorkflowError> {
+    pub(crate) fn open(
+        paths: &LocalPaths,
+        workspace: Uuid,
+        selections: crate::application::market_selection::product::MarketProductSelectionReadCapability,
+    ) -> Result<Arc<Self>, WorkflowError> {
         Ok(Arc::new(Self {
             controller: Arc::new(AnalyticalWorkflowController::try_open(paths, workspace)?),
+            selections,
             services: OnceLock::new(),
             work_available: tokio::sync::Notify::new(),
             background_failure: std::sync::Mutex::new(None),
@@ -219,6 +225,32 @@ impl WorkflowGeneration {
     }
     pub(super) fn cancellation(&self) -> CancellationToken {
         self.host.cancellation.child_token()
+    }
+    pub(super) async fn selection_token_for_instrument(
+        &self,
+        instrument_id: Uuid,
+    ) -> Result<String, WorkflowError> {
+        WorkflowState.admit_current(self)?;
+        let instrument_id = market_squawk_domain::InstrumentId::try_from(instrument_id)
+            .map_err(|_| WorkflowError::internal())?;
+        let as_of = super::unix_nanos_now()?
+            .parse::<i64>()
+            .map(market_squawk_domain::Timestamp::from_unix_nanos)
+            .map_err(|_| WorkflowError::internal())?;
+        let cancellation = self.cancellation();
+        let _cancel_on_exit = cancellation.clone().drop_guard();
+        let token = self
+            .host
+            .selections
+            .token_for_instrument(
+                instrument_id,
+                as_of,
+                Instant::now() + Duration::from_secs(15),
+                &cancellation,
+            )
+            .await?;
+        WorkflowState.admit_current(self)?;
+        Ok(token.into_string())
     }
     pub(super) async fn analytical_retirement_fence(&self) -> tokio::sync::OwnedMutexGuard<()> {
         Arc::clone(&self.host.fence).lock_owned().await

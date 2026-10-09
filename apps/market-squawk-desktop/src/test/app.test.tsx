@@ -405,7 +405,7 @@ const emptyRowsResult: ApplicationResult = {
   },
 }
 
-const marketSelectionToken = "market_0123456789abcdef0123456789abcdef"
+const marketSelectionToken = "market_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 const marketObservedAt = "2026-08-09T14:30:00.000000000Z"
 
 const marketOverviewRow = {
@@ -773,7 +773,7 @@ describe("Market Squawk desktop boundary", () => {
     }
     const financialResult = (cursor = financialVersion === 0 ? "financial-first" : `financial-updated-${financialVersion}`): ApplicationResult => ({
       data: {
-        selectionToken: financialMode === "mismatch" ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
+        selectionToken: financialMode === "mismatch" ? "market_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" : marketSelectionToken,
         section: "facts", knowledgeAt: marketObservedAt, effectiveOn: "2026-08-10", revisionPolicy: "allKnown",
         state: "reported", families: [{ family: "company_facts", state: "reported", reason: null }],
         items: [{ ...financialFact, value: cursor === "financial-next" ? "234567.89"
@@ -786,7 +786,7 @@ describe("Market Squawk desktop boundary", () => {
     })
     const profileResult = (): ApplicationResult => ({
       data: {
-        selectionToken: wrongProfileSelection ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
+        selectionToken: wrongProfileSelection ? "market_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" : marketSelectionToken,
         knowledgeAt: marketObservedAt, state: "available", reason: null,
         profile: {
           displayName: "Requested investment", symbol: "MSQ", assetClass: "equity", currency: "USD",
@@ -1206,7 +1206,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(issuedQueries.filter((request) => request.query === "investmentFinancials")).toHaveLength(financialQueriesBefore)
     unsupported.unmount()
 
-    const staleToken = "market_ffffffffffffffffffffffffffffffff"
+    const staleToken = "market_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
     openInvestment(`/investments/${staleToken}`)
     await waitFor(() => expect(screen.getAllByRole("alert").some((alert) => alert.textContent?.includes("This investment could not be opened"))).toBe(true))
     expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: staleToken })

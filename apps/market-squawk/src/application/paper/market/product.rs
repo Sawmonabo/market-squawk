@@ -1303,6 +1303,88 @@ mod tests {
             product_search_page(&reduced, "etf", 1, Some(cursor)),
             Err(ServiceError::Unavailable)
         ));
+
+        // A product locator reads its exact revision, then checks just that instrument at
+        // the requested cutoff. A persisted locator must not select a future or newer revision.
+        use crate::application::market_selection::product::{
+            MarketProductSelectionReadCapability, individual_selection_token,
+        };
+        assert_eq!(token.len(), "market_".len() + 64);
+        let resolve = |reader: &MarketDataInstrumentReadCapability, token: &str, cutoff| {
+            MarketProductSelectionReadCapability::resolve_owned(
+                reader,
+                token,
+                cutoff,
+                deadline,
+                &cancellation,
+            )
+        };
+        assert_eq!(resolve(&reader, token, cutoff)?, selected);
+        assert!(matches!(
+            resolve(
+                &reader,
+                token,
+                Timestamp::from_unix_nanos(records[0].published_at().unix_nanos() - 1)
+            ),
+            Err(ServiceError::Unavailable)
+        ));
+        assert!(matches!(
+            resolve(&reader, token, removed.published_at()),
+            Err(ServiceError::Unavailable)
+        ));
+        let current_token = individual_selection_token(&removed)?;
+        assert_eq!(
+            resolve(&reader, &current_token, removed.published_at())?,
+            selected
+        );
+        assert!(matches!(
+            resolve(&reader, &current_token, cutoff),
+            Err(ServiceError::Unavailable)
+        ));
+        assert!(matches!(
+            resolve(&reader, &format!("market_{}", "f".repeat(64)), cutoff),
+            Err(ServiceError::Unavailable)
+        ));
+        assert!(matches!(
+            resolve(&reader, &format!("market_{}", "A".repeat(64)), cutoff),
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert!(matches!(
+            resolve(&reader, &format!("market_{}", "a".repeat(32)), cutoff),
+            Err(ServiceError::InvalidRequest)
+        ));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            MarketProductSelectionReadCapability::resolve_owned(
+                &reader, token, cutoff, deadline, &cancelled,
+            ),
+            Err(ServiceError::Cancelled)
+        ));
+        assert!(matches!(
+            MarketProductSelectionReadCapability::resolve_owned(
+                &reader,
+                token,
+                cutoff,
+                Instant::now() - Duration::from_millis(1),
+                &cancellation,
+            ),
+            Err(ServiceError::DeadlineExceeded)
+        ));
+        drop(reader);
+        drop(authority);
+        let reopened = Arc::new(Mutex::new(CatalogAuthority::open(CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)?));
+        let reader = MarketDataInstrumentReadCapability::new(reopened, deadline, &cancellation)?;
+        assert_eq!(resolve(&reader, token, cutoff)?, selected);
+        assert_eq!(
+            resolve(&reader, &current_token, removed.published_at())?,
+            selected
+        );
         Ok(())
     }
 }

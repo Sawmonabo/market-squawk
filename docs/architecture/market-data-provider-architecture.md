@@ -856,6 +856,14 @@ they neither substitute another identity nor hide available prices. Reference pu
 the existing Research domain. This reference profile does not establish company financials, fund
 holdings, valuation or an Investment Brief; those require their own governed evidence and consumers.
 
+Single-investment reads use a `market_` locator containing the immutable canonical revision's full
+lowercase digest. The service reads that revision by index and verifies that it is the selected
+definition for that one instrument at the requested knowledge/effective cutoff. It does not scan
+the discovery population or interpret the locator as authorization. Saved workflow request and
+result evidence retains its original text and hashes. An explicitly resumed initial preparation
+may obtain a fresh locator from its receipt-bound canonical instrument; completed analysis cutoffs
+and uncertain job submissions remain unchanged.
+
 
 The logical local layout is:
 

@@ -3398,8 +3398,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/analytical_workflow.rs",
-      "sha256": "c343636ce48df0282e3e3390eb4a4c3a81781d5e82c2bec2f3553e11f2ada26b",
-      "size_bytes": 105610
+      "sha256": "61a280ad83dc350aaf882e0c546ff358a800fd8811ad507c2a5ac92737e51e63",
+      "size_bytes": 105852
     },
     {
       "path": "apps/market-squawk/src/application/analytical_workflow/financial_profiles.rs",
@@ -3408,8 +3408,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/analytical_workflow/host.rs",
-      "sha256": "8bb9c9cb560dd647645506c91ac6553c552bcd040d292dfdee0fe4ec18a2d43b",
-      "size_bytes": 16077
+      "sha256": "89ad82dc20a0919737f04d03961c51d514b8e8774371fdaab8a07dffedcb18de",
+      "size_bytes": 17326
     },
     {
       "path": "apps/market-squawk/src/application/analytical_workflow/prepared_starts.rs",
@@ -3433,8 +3433,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/analytical_workflow/workflow_driver.rs",
-      "sha256": "7b65fe1beb2807cdca8c6661a8a1b996b606cb6aee5f40a98c5aaa14ee70caef",
-      "size_bytes": 174356
+      "sha256": "c8058aeec10f1c1f3175198925a2ac708dca30865fc654e687281913b8641588",
+      "size_bytes": 187246
     },
     {
       "path": "apps/market-squawk/src/application/analytical_workflow/workflow_driver/find.rs",
@@ -3483,8 +3483,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/contracts.rs",
-      "sha256": "ca516ab0811f391686d5062a43e069bff37b728d27544ef2a234e6a8bcf1aedd",
-      "size_bytes": 233070
+      "sha256": "4184372c57651e88663748439074612a04b38853f7ff74ac16ac235af40319dc",
+      "size_bytes": 233482
     },
     {
       "path": "apps/market-squawk/src/application/contracts/historical_study.rs",
@@ -3498,8 +3498,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/contracts/output.rs",
-      "sha256": "91d0e2b440523853d2898273e63d9850711597e6c63dae3deb18d34be985fb20",
-      "size_bytes": 349592
+      "sha256": "77f81c437a5dc61e1d230f2a60e7c8521937482f04f57a67c3c69a80f03aee80",
+      "size_bytes": 349657
     },
     {
       "path": "apps/market-squawk/src/application/contracts/output/analytical_profile.rs",
@@ -3508,8 +3508,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/contracts/output/analytical_workflow.rs",
-      "sha256": "8ebea95cc3a014893e3d2dc998c94934df7ea55a216faa91a25997d87f24a295",
-      "size_bytes": 16894
+      "sha256": "9bb893d12912d90c4c15a69c6742274e2a81e9a83e897db2979af3aebf5fbdcc",
+      "size_bytes": 16908
     },
     {
       "path": "apps/market-squawk/src/application/contracts/output/current_find.rs",
@@ -4068,8 +4068,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_selection/product.rs",
-      "sha256": "f1e52f5cd52a3a1e56bc2201ffb22c5ba15380d796061ccad14ff37fbcce32fe",
-      "size_bytes": 14734
+      "sha256": "2adc6973f7664051153d098569f954ad9703f5132ea373991d1a3088bebaf968",
+      "size_bytes": 17069
     },
     {
       "path": "apps/market-squawk/src/application/market_selection/receipt.rs",
@@ -4298,8 +4298,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/paper/market/product.rs",
-      "sha256": "d07d5f704e570da366b336fff1f4d5e45620b2138cd45bd76c73fabe3d78cd56",
-      "size_bytes": 54060
+      "sha256": "0ba798c2c09abb3f9f677a628d90f616f654e761b4f57b1655107d2c433e5d81",
+      "size_bytes": 57278
     },
     {
       "path": "apps/market-squawk/src/application/paper/market/results.rs",
@@ -6293,8 +6293,8 @@
     },
     {
       "path": "apps/market-squawk/src/service/market_evidence/job.rs",
-      "sha256": "baf7284e230a3d386b8958340b8d30b1c9f471c20de45ddf8301be7fa125880e",
-      "size_bytes": 30878
+      "sha256": "990b9f1345fb374c14f2b39b496fbdc952fdd04766ef6a35120d36def0a9fb4b",
+      "size_bytes": 30910
     },
     {
       "path": "apps/market-squawk/src/service/market_evidence/preparation.rs",
@@ -6423,8 +6423,8 @@
     },
     {
       "path": "apps/market-squawk/src/service/tool_services.rs",
-      "sha256": "6c54fcafdbbd9570f635c8a73a642a3d2dd3a0be27a6f7c20b850981c61e8b51",
-      "size_bytes": 95032
+      "sha256": "49a505594f47ee913b288e3dee8167a532a6a764ff29383fdeff95ab2259c7ef",
+      "size_bytes": 95263
     },
     {
       "path": "apps/market-squawk/src/service/tool_services/current_find.rs",
@@ -9813,8 +9813,8 @@
     },
     {
       "path": "crates/market-squawk-services/src/output_schema.rs",
-      "sha256": "37682c21a7a3086cbdc47a79379b1ccd18bf92a98668e0dbf6b84ee7e796e24f",
-      "size_bytes": 31776
+      "sha256": "668de6660cd86e9474ad832106200e1d4e7a5eb6a996ae22cdd812f402306fd7",
+      "size_bytes": 32245
     },
     {
       "path": "crates/market-squawk-services/src/progress.rs",

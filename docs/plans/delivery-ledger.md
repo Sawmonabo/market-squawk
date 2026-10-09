@@ -11649,3 +11649,53 @@ validation in analytical_workflow.rs and unchanged token replay in workflow_driv
 not build/deploy or tighten persisted-document validation until exact retained workflow identity
 and reopening behavior are reconciled; no live state changed. Sol continues the read-only trace.
 Current native generation remains the verified31bcb86a code; source watcher stays stopped.
+
+### Indexed selection integration: retained evidence and fresh preparation
+
+4522de52 pushed the source-verified NVDA distinction. Previous turn refreshed the exact SEC pooled
+client/one-slot policy evidence; no concurrency completion is claimed. Current branch retains the
+indexed-token WIP, and the native watcher remains stopped pending coherent integration.
+
+The paused original analysis already retains its canonical instrument and original preparation
+cutoff. Resume may derive a new locator only for an admitted fresh preparation; immutable target,
+receipts, request bodies and hashes stay original. Stored evidence is structurally validated;
+new live requests require the canonical full revision digest. No old-token resolution, migration,
+new token registry, reset, or discarded analysis is authorized.
+
+| Owner | Exclusive files | Finishable outcome and critical check |
+|---|---|---|
+| Astra High workflow_locator_resume | app `src/application/analytical_workflow.rs`, `src/application/analytical_workflow/workflow_driver.rs` | Keep retained evidence readable; require canonical live input; derive next preparation locator from receipt-bound identity on admitted resume using lead-supplied generation method. Recheck unchanged state after await; preserve receipts/cutoffs for completed calculations and uncertain jobs. Extend existing publication_action_references_follow_forecast_and_market_admission restart/resume case only. |
+| Lead | app `src/application/analytical_workflow/host.rs`, `src/service/tool_services.rs`, `src/application/market_selection/product.rs`; existing `src/application/paper/market/product.rs` fixture; prior shared token contracts/fixtures/docs | Supply provider-neutral current selection read from canonical instrument through existing research reader; bind capability in host composition. Extend existing identity/PIT fixture for indexed stale/future/reopen checks; integrate all consumers and serialize verification. |
+
+No agents run Git/build/tests or change runtime. No new native deployment until saved-controller
+reopening and current selection semantics pass the existing critical checks. SEC shared quota
+correction remains the following independent provider slice, not a constant-only increase.
+
+Lead consumer trace additionally found the native analytical command schema independently fixed
+market locators at32 hex. Ownership expands to
+`src/application/contracts/output/analytical_workflow.rs` to reuse the shared current market schema.
+The workflow presentation exposes no old selection locator; retained receipts remain internal.
+Existing shared output-schema critical fixture PASS1/1 (12.12s compile,0.00s test), log
+`oct9-indexed-token-schema.log`. Product identity fixture now covers direct exact revision,
+stale/future/forged rejection, cancellation/deadline, and reopen; application check pending.
+
+Renderer review correction: retain its existing opaque locator schema; it already admits the new
+64-hex representation and grants no authority. No format-aware React code or staged UI rollout is
+needed. Native contracts validate current locators; stored evidence is a separate internal concern.
+Lead architecture note records indexed one-instrument reads and immutable workflow evidence.
+
+Indexed-selection checkpoint critically verified (native deployment pending): existing app identity/
+PIT/reopen and saved-workflow publication/restart/resume checks PASS2/2,2.19s after9m48s single-job
+compile (`oct9-indexed-selection-critical.log`). Saved originals include both preparation and
+selection receipts; exact state is checked again after fresh locator lookup. Unknown job delivery
+continues reconciliation before any new submission. The existing Desktop lookup/product destination
+check PASS1/1,3.67s (`oct9-indexed-selection-desktop-contract.log`); initial invocation was rejected
+before testing because shell Node26 differed from pinned24.18, then rerun with installed24.18.
+Shared schema fixture PASS1/1; source closure refresh/verification and diff checks pass. Existing
+warning backlog is not release-gate approval. Astra ownership released; lead retains integration.
+
+One worktree and intended three local branches rechecked. No new build roots or credentials/workspace
+changes. Renderer still treats locators as opaque. Matching native build and all-nine repeated reads
+remain the next barrier; currently running service72655/Desktop72672 are still31bcb86a source.
+SEC concurrency2/shared quota consolidation, fund financial consumers, actual rendered all-screen
+acceptance and complete V1 remain open. Resulting pushed implementation commit recorded next.

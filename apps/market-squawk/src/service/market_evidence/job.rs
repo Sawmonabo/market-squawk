@@ -708,7 +708,7 @@ mod tests {
             schema_version: INPUT.to_owned(),
             operation: PREPARE.to_owned(),
             arguments: json!({
-                "selectionToken": "market_00000000000000000000000000000001",
+                "selectionToken": "market_0000000000000000000000000000000100000000000000000000000000000001",
                 "financialProfile": profile.resolution(),
             }),
             workspace_id: Uuid::from_u128(2),

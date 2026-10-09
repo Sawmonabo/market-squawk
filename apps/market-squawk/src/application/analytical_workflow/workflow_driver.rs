@@ -286,7 +286,7 @@ impl DriverState {
     pub(super) fn valid(&self) -> bool {
         self.selection_token
             .as_deref()
-            .is_none_or(valid_market_selection_token)
+            .is_none_or(|token| super::valid_identifier(token, 96))
             && self.benchmark_instrument_id.is_none_or(|id| !id.is_nil())
             && self.instrument_id.is_none_or(|id| !id.is_nil())
             && self
@@ -566,59 +566,72 @@ impl AnalyticalWorkflowController {
         })
     }
 
-    fn resume_workflow(&self, token: &str) -> Result<AnalyticalControllerResponse, WorkflowError> {
+    fn resume_workflow(
+        &self,
+        token: &str,
+        expected: &WorkflowRun,
+        fresh_selection: Option<String>,
+    ) -> Result<AnalyticalControllerResponse, WorkflowError> {
         self.mutate(|document, now| {
             let run = workflow_control::find_workflow_mut(document, token)?;
-            if run.state != WorkflowRunState::Paused
-                || run
-                    .deadline_at
-                    .as_deref()
-                    .is_some_and(|deadline| now.parse::<u64>().ok() >= deadline.parse::<u64>().ok())
-            {
+            if run != expected {
                 return Err(WorkflowError::invalid_request(
-                    "This analysis can no longer resume. Start a new analysis.",
+                    "This analysis changed. Refresh it before resuming.",
                 ));
             }
-            let refresh_initial = run.last_error.as_deref()
-                == Some("analysis_source_actions_unavailable")
-                && initial_preparation_can_refresh(run)?;
-            if run.last_error.as_deref() == Some("analysis_preparation_required") || refresh_initial
+            let preparation_step = preparation_for_resume(run, &now)?;
+            let driver = run.driver.as_ref().ok_or_else(WorkflowError::internal)?;
+            let refresh_initial = preparation_step == Some(Step::PrepareSelection);
+            if fresh_selection
+                .as_deref()
+                .is_some_and(|token| !valid_market_selection_token(token))
+                || fresh_selection.is_some() && (!refresh_initial || driver.find.is_some())
             {
-                let driver = run.driver.as_ref().ok_or_else(WorkflowError::internal)?;
-                let preparation_step = if refresh_initial {
-                    Step::PrepareSelection
-                } else {
-                    driver.step
-                };
+                return Err(WorkflowError::internal());
+            }
+            if fresh_selection.is_none()
+                && (driver
+                    .selection_token
+                    .as_deref()
+                    .is_some_and(|token| !valid_market_selection_token(token))
+                    || refresh_initial && initial_preparation_instrument(run)?.is_none())
+                && run.pending_invocation.is_none()
+                && driver.active_job.is_none()
+            {
+                run.last_error = Some("analysis_selection_required".to_owned());
+                run.updated_at = now;
+                return Ok(AnalyticalControllerResponse::Workflow {
+                    workflow: workflow_presentation(run)?,
+                });
+            }
+            if let Some(preparation_step) = preparation_step {
+                let driver = run.driver.as_mut().ok_or_else(WorkflowError::internal)?;
                 let receipt = driver.receipt(preparation_step)?.clone();
-                if run.pending_invocation.is_some()
-                    || driver.active_job.is_some()
-                    || (!refresh_initial && !preparation_requires_retry(run, &receipt)?)
+                let selected = refresh_initial
+                    .then(|| {
+                        driver
+                            .receipts
+                            .get(&driver.key(Step::SelectMarket))
+                            .cloned()
+                    })
+                    .flatten();
+                if driver.completed_unavailable_receipts.len() + 1 + usize::from(selected.is_some())
+                    > MAXIMUM_UNAVAILABLE_RECEIPTS
                 {
                     return Err(WorkflowError::internal());
                 }
-                let child = job_from_receipt(&receipt)?;
-                if !run.child_jobs.iter().any(|retained| {
-                    retained.job_id == child.job_id
-                        && retained.generation == child.generation
-                        && retained.terminal_sequence == child.terminal_sequence
-                        && retained.result.as_ref().is_some_and(|result| {
-                            result.operation == PREPARATION_RESULT
-                                && result.content_sha256 == receipt.sha256
-                        })
-                }) {
-                    return Err(WorkflowError::internal());
-                }
-                let driver = run.driver.as_mut().ok_or_else(WorkflowError::internal)?;
-                if driver.completed_unavailable_receipts.len() == MAXIMUM_UNAVAILABLE_RECEIPTS {
-                    return Err(WorkflowError::internal());
-                }
-                // A confirmed resume admits a new attempt; the immutable failed preparation and
-                // its terminal child remain evidence. Earlier analytical cutoffs never change.
+                // Admission above inspects untouched originals. Preserve both exact responses
+                // and their hashes before changing only the next attempt's mutable locator.
                 driver.completed_unavailable_receipts.push(receipt);
                 driver.receipts.remove(&driver.key(preparation_step));
                 if refresh_initial {
+                    if let Some(selected) = selected {
+                        driver.completed_unavailable_receipts.push(selected);
+                    }
                     driver.receipts.remove(&driver.key(Step::SelectMarket));
+                    if let Some(selection) = fresh_selection {
+                        driver.selection_token = Some(selection);
+                    }
                     driver.source_cutoff = None;
                     driver.step = Step::PrepareSelection;
                 }
@@ -954,9 +967,32 @@ pub(super) async fn resume(
     generation: &Arc<WorkflowGeneration>,
     token: &str,
 ) -> Result<AnalyticalControllerResponse, WorkflowError> {
+    state.admit_current(generation)?;
+    let original = {
+        let document = generation.analytical_controller().lock_document()?;
+        workflow_control::find_workflow(&document, token)?.clone()
+    };
+    let fresh_selection = if preparation_for_resume(&original, &unix_nanos_now()?)?
+        == Some(Step::PrepareSelection)
+        && original
+            .driver
+            .as_ref()
+            .is_some_and(|driver| driver.find.is_none())
+    {
+        initial_preparation_instrument(&original)?
+            .map(|instrument| generation.selection_token_for_instrument(instrument))
+    } else {
+        None
+    };
+    let fresh_selection = match fresh_selection {
+        Some(selection) => Some(selection.await?),
+        None => None,
+    };
     let _fence = generation.analytical_retirement_fence().await;
     state.admit_current(generation)?;
-    generation.analytical_controller().resume_workflow(token)
+    generation
+        .analytical_controller()
+        .resume_workflow(token, &original, fresh_selection)
 }
 
 /// One lightweight task uses the installed runtime; its workspace owner retains and joins it.
@@ -1155,6 +1191,19 @@ async fn advance(
         state.admit_current(generation)?;
         finish_or_continue(generation.analytical_controller(), token)?;
         return Ok(AdvanceProgress::Advanced);
+    }
+    if matches!(
+        driver.step,
+        Step::PrepareSelection | Step::SelectMarket | Step::FinalPrepare | Step::FinalEvidence
+    ) && !driver
+        .selection_token
+        .as_deref()
+        .is_some_and(valid_market_selection_token)
+    {
+        return Err(WorkflowError::new(
+            "analysis_selection_required",
+            "Choose this investment again to start a fresh analysis. Saved results are still available.",
+        ));
     }
     let (operation, arguments, mutation) = next_invocation(run)?;
     check_historical_page_budget(generation, run)?;
@@ -2672,6 +2721,66 @@ fn preparation_requires_retry(run: &WorkflowRun, receipt: &Receipt) -> Result<bo
     Ok(true)
 }
 
+/// Decide from the original request and terminal receipt before any fresh locator is selected.
+fn preparation_for_resume(run: &WorkflowRun, now: &str) -> Result<Option<Step>, WorkflowError> {
+    if run.state != WorkflowRunState::Paused
+        || run
+            .deadline_at
+            .as_deref()
+            .is_some_and(|deadline| now.parse::<u64>().ok() >= deadline.parse::<u64>().ok())
+    {
+        return Err(WorkflowError::invalid_request(
+            "This analysis can no longer resume. Start a new analysis.",
+        ));
+    }
+    let refresh_initial = run.last_error.as_deref() == Some("analysis_source_actions_unavailable")
+        && initial_preparation_can_refresh(run)?;
+    if run.last_error.as_deref() != Some("analysis_preparation_required") && !refresh_initial {
+        return Ok(None);
+    }
+    let driver = run.driver.as_ref().ok_or_else(WorkflowError::internal)?;
+    let step = if refresh_initial {
+        Step::PrepareSelection
+    } else {
+        driver.step
+    };
+    let receipt = driver.receipt(step)?;
+    if run.pending_invocation.is_some()
+        || driver.active_job.is_some()
+        || (!refresh_initial && !preparation_requires_retry(run, receipt)?)
+    {
+        return Err(WorkflowError::internal());
+    }
+    let child = job_from_receipt(receipt)?;
+    if !run.child_jobs.iter().any(|retained| {
+        retained.job_id == child.job_id
+            && retained.generation == child.generation
+            && retained.terminal_sequence == child.terminal_sequence
+            && retained.result.as_ref().is_some_and(|result| {
+                result.operation == PREPARATION_RESULT && result.content_sha256 == receipt.sha256
+            })
+    }) {
+        return Err(WorkflowError::internal());
+    }
+    Ok(Some(step))
+}
+
+fn initial_preparation_instrument(run: &WorkflowRun) -> Result<Option<Uuid>, WorkflowError> {
+    let driver = run.driver.as_ref().ok_or_else(WorkflowError::internal)?;
+    let preparation = driver.receipt(Step::PrepareSelection)?.preparation()?;
+    if preparation.get("instrumentId") == Some(&Value::Null) {
+        return Ok(None);
+    }
+    let instrument = uuid_field(preparation, "instrumentId")?;
+    if driver
+        .instrument_id
+        .is_some_and(|retained| retained != instrument)
+    {
+        return Err(WorkflowError::internal());
+    }
+    Ok(Some(instrument))
+}
+
 /// A partial initial acquisition can be retried before any analytical result is admitted.
 /// Unknown job delivery is reconciled first; completed calculations never acquire a new cutoff.
 fn initial_preparation_can_refresh(run: &WorkflowRun) -> Result<bool, WorkflowError> {
@@ -2693,6 +2802,24 @@ fn initial_preparation_can_refresh(run: &WorkflowRun) -> Result<bool, WorkflowEr
     let preparation = receipt.preparation()?;
     if preparation.get("sourceActionReference") != Some(&Value::Null) {
         return Ok(false);
+    }
+    let selected = work.receipt(Step::SelectMarket)?;
+    if !selected.valid()
+        || selected.operation != "Market.SelectInvestmentEvidence"
+        || uuid_field(&selected.body, "instrumentId")?
+            != work.instrument_id.ok_or_else(WorkflowError::internal)?
+        || selected
+            .arguments
+            .get("selectionToken")
+            .and_then(Value::as_str)
+            != work.selection_token.as_deref()
+        || selected
+            .arguments
+            .get("sourceCutoffUnixNanos")
+            .and_then(Value::as_str)
+            != work.source_cutoff.as_deref()
+    {
+        return Err(WorkflowError::internal());
     }
     let mut initial = run.clone();
     initial
@@ -3717,6 +3844,18 @@ mod tests {
         Ok(retained)
     }
 
+    fn resume_retained(
+        controller: &AnalyticalWorkflowController,
+        token: &str,
+        fresh_selection: Option<String>,
+    ) -> Result<AnalyticalControllerResponse, WorkflowError> {
+        let original = {
+            let document = controller.lock_document()?;
+            workflow_control::find_workflow(&document, token)?.clone()
+        };
+        controller.resume_workflow(token, &original, fresh_selection)
+    }
+
     #[test]
     fn publication_action_references_follow_forecast_and_market_admission()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3725,14 +3864,13 @@ mod tests {
         let paths = market_squawk_platform::LocalPaths::prepare(directory.path())?;
         let workspace = Uuid::new_v4();
         let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
-        let selection = crate::application::market_selection::product::token(
-            "market_",
-            b"workflow-publication-regression",
-            &[workspace.as_bytes()],
-        )?;
+        let selection = format!(
+            "market_{}",
+            hex_digest(Sha256::digest(workspace.as_bytes()))
+        );
         controller.begin_workflow(
             WorkflowKind::AnalyzeInvestment,
-            Some(selection.into_string()),
+            Some(selection),
             None,
             super::super::host::WorkflowOrigin::new(
                 market_squawk_services::RequestOrigin::try_new(workspace, Uuid::new_v4())?,
@@ -3819,7 +3957,7 @@ mod tests {
         assert!(apply_receipt(&mut waiting.clone(), tampered, &now).is_err());
         let mut mismatched = stale.clone();
         mismatched.body["arguments"]["selectionToken"] =
-            json!("market_00000000000000000000000000000001");
+            json!("market_0000000000000000000000000000000100000000000000000000000000000001");
         mismatched.body["requestSha256"] = json!(hex_digest(Sha256::digest(serde_json::to_vec(
             &mismatched.body["arguments"]
         )?)));
@@ -3857,8 +3995,8 @@ mod tests {
             assert!(driver.source_cutoff.is_none());
             assert_eq!(driver.receipt(Step::PrepareSelection)?, &stale);
         }
-        reopened.resume_workflow(&token)?;
-        assert!(reopened.resume_workflow(&token).is_err());
+        resume_retained(&reopened, &token, None)?;
+        assert!(resume_retained(&reopened, &token, None).is_err());
         let resumed = reopened.next_run()?.ok_or("missing resumed preparation")?;
         assert_eq!(resumed.run_id, run.run_id);
         let driver = resumed.driver.as_ref().ok_or("missing resumed driver")?;
@@ -3916,11 +4054,31 @@ mod tests {
         // The first dependent dataset pauses without admission, and explicit Resume refreshes
         // only that initial prefix while preserving the completed partial preparation receipt.
         let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
+        // Historical locators are retained evidence, never accepted as a new live selection.
+        let old_selection = format!("market_{}", Uuid::new_v4().simple());
+        assert!(!valid_market_selection_token(&old_selection));
+        assert!(
+            controller
+                .begin_workflow(
+                    WorkflowKind::AnalyzeInvestment,
+                    Some(old_selection.clone()),
+                    None,
+                    run.origin,
+                )
+                .is_err()
+        );
+        let mut retained_input = run.clone();
+        retained_input.target_selection_token = Some(old_selection.clone());
+        retained_input
+            .driver
+            .as_mut()
+            .ok_or("missing retained driver")?
+            .selection_token = Some(old_selection.clone());
         controller.mutate(|document, _| {
-            document.workflow_runs[0] = run.clone();
+            document.workflow_runs[0] = retained_input.clone();
             Ok(())
         })?;
-        let (operation, arguments, _) = next_invocation(&run)?;
+        let (operation, arguments, _) = next_invocation(&retained_input)?;
         let pending = controller.retain_pending(&token, operation, arguments)?;
         controller.retain_response(
             &token,
@@ -3946,12 +4104,13 @@ mod tests {
         controller.mutate(|document, recorded_at| {
             let retained = workflow_control::find_workflow_mut(document, &token)?;
             retain_completed_job(retained, &active, partial_receipt.clone(), 3, &recorded_at)?;
+            let (_, selected_arguments, _) = next_invocation(retained)?;
             apply_receipt(
                 retained,
                 receipt(
                     "Market.SelectInvestmentEvidence",
-                    json!({}),
-                    json!({"instrumentId": instrument}),
+                    Value::Object(selected_arguments),
+                    json!({"instrumentId": instrument, "reference": null}),
                 ),
                 &recorded_at,
             )
@@ -3977,7 +4136,39 @@ mod tests {
         drop(controller);
         let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
         assert!(controller.next_run()?.is_none());
-        controller.resume_workflow(&token)?;
+        let paused = {
+            let document = controller.lock_document()?;
+            workflow_control::find_workflow(&document, &token)?.clone()
+        };
+        assert_eq!(
+            preparation_for_resume(&paused, &unix_nanos_now()?)?,
+            Some(Step::PrepareSelection)
+        );
+        assert_eq!(initial_preparation_instrument(&paused)?, Some(instrument));
+        let selected_receipt = paused
+            .driver
+            .as_ref()
+            .ok_or("missing paused driver")?
+            .receipt(Step::SelectMarket)?
+            .clone();
+        let fresh_selection = format!("market_{}", "a".repeat(64));
+        // The old originals pass admission; changing the locator first would break that binding.
+        let mut changed_locator = paused.clone();
+        changed_locator
+            .driver
+            .as_mut()
+            .ok_or("missing driver")?
+            .selection_token = Some(fresh_selection.clone());
+        assert!(initial_preparation_can_refresh(&changed_locator).is_err());
+        // A cancelled/changed run cannot be resumed by an outstanding locator lookup.
+        let mut changed_state = paused.clone();
+        changed_state.last_error = Some("analysis_source_unavailable".to_owned());
+        assert!(
+            controller
+                .resume_workflow(&token, &changed_state, Some(fresh_selection.clone()))
+                .is_err()
+        );
+        controller.resume_workflow(&token, &paused, Some(fresh_selection.clone()))?;
         let refreshed = controller
             .next_run()?
             .ok_or("missing fresh source attempt")?;
@@ -3986,12 +4177,145 @@ mod tests {
             .as_ref()
             .ok_or("missing refreshed driver")?;
         assert_eq!(refreshed.run_id, run.run_id);
+        assert_eq!(
+            refreshed.target_selection_token,
+            Some(old_selection.clone())
+        );
+        assert_eq!(refreshed.child_jobs, paused.child_jobs);
         assert_eq!(driver.step, Step::PrepareSelection);
         assert_eq!(driver.instrument_id, Some(instrument));
         assert!(driver.source_cutoff.is_none());
-        assert_eq!(driver.completed_unavailable_receipts, vec![partial_receipt]);
+        assert_eq!(driver.selection_token, Some(fresh_selection.clone()));
+        assert_eq!(
+            driver.completed_unavailable_receipts,
+            vec![partial_receipt.clone(), selected_receipt]
+        );
         assert!(driver.receipt(Step::SelectMarket).is_err());
-        assert_eq!(next_invocation(&refreshed)?.1, pending.arguments);
+        let mut fresh_arguments = pending.arguments.clone();
+        fresh_arguments.insert("selectionToken".into(), json!(fresh_selection));
+        assert_eq!(next_invocation(&refreshed)?.1, fresh_arguments);
+        drop(controller);
+        let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
+        {
+            let document = controller.lock_document()?;
+            let restarted = workflow_control::find_workflow(&document, &token)?;
+            assert_eq!(restarted.run_id, paused.run_id);
+            assert_eq!(
+                restarted.target_selection_token,
+                paused.target_selection_token
+            );
+            assert_eq!(
+                restarted
+                    .driver
+                    .as_ref()
+                    .ok_or("missing driver")?
+                    .completed_unavailable_receipts,
+                driver.completed_unavailable_receipts
+            );
+        }
+        // No receipt-bound identity means a stale locator cannot be refreshed or reinterpreted.
+        let mut identity_missing = paused.clone();
+        identity_missing.last_error = Some("analysis_preparation_required".into());
+        let work = identity_missing.driver.as_mut().ok_or("missing driver")?;
+        work.step = Step::PrepareSelection;
+        work.instrument_id = None;
+        work.source_cutoff = None;
+        work.receipts.remove("SelectMarket");
+        let mut absence = unavailable.clone();
+        absence["reason"] = json!("selection_changed");
+        absence["instrumentId"] = Value::Null;
+        let absent_receipt = preparation_receipt(&identity_missing, absence)?;
+        let mut child = job_from_receipt(&absent_receipt)?;
+        child.result = Some(ServiceResultReference {
+            operation: PREPARATION_RESULT.into(),
+            result_id: child.job_id.to_string(),
+            content_sha256: absent_receipt.sha256.clone(),
+        });
+        identity_missing.child_jobs = vec![child];
+        identity_missing
+            .driver
+            .as_mut()
+            .ok_or("missing driver")?
+            .receipts
+            .insert("PrepareSelection".into(), absent_receipt);
+        assert_eq!(initial_preparation_instrument(&identity_missing)?, None);
+        controller.mutate(|document, _| {
+            document.workflow_runs[0] = identity_missing.clone();
+            Ok(())
+        })?;
+        resume_retained(&controller, &token, None)?;
+        assert!(controller.next_run()?.is_none());
+        {
+            let document = controller.lock_document()?;
+            let retained = workflow_control::find_workflow(&document, &token)?;
+            assert_eq!(
+                retained.last_error.as_deref(),
+                Some("analysis_selection_required")
+            );
+            assert_eq!(retained.driver, identity_missing.driver);
+            assert_eq!(retained.child_jobs, identity_missing.child_jobs);
+        }
+        // Completed calculation custody never permits a fresh initial preparation.
+        calculated.state = WorkflowRunState::Paused;
+        calculated.last_error = Some("analysis_source_actions_unavailable".into());
+        assert_eq!(
+            preparation_for_resume(&calculated, &unix_nanos_now()?)?,
+            None
+        );
+        controller.mutate(|document, _| {
+            document.workflow_runs[0] = calculated.clone();
+            Ok(())
+        })?;
+        assert!(
+            resume_retained(
+                &controller,
+                &token,
+                Some(format!("market_{}", "b".repeat(64)))
+            )
+            .is_err()
+        );
+        resume_retained(&controller, &token, None)?;
+        assert!(controller.next_run()?.is_none());
+        {
+            let document = controller.lock_document()?;
+            let retained = workflow_control::find_workflow(&document, &token)?;
+            assert_eq!(retained.driver, calculated.driver);
+            assert_eq!(
+                retained.target_selection_token,
+                calculated.target_selection_token
+            );
+        }
+        uncertain.state = WorkflowRunState::Paused;
+        uncertain.last_error = Some("analysis_source_actions_unavailable".into());
+        assert_eq!(
+            preparation_for_resume(&uncertain, &unix_nanos_now()?)?,
+            None
+        );
+        controller.mutate(|document, _| {
+            document.workflow_runs[0] = uncertain.clone();
+            Ok(())
+        })?;
+        resume_retained(&controller, &token, None)?;
+        let reconcile = controller
+            .next_run()?
+            .ok_or("missing uncertain admission")?;
+        assert_eq!(reconcile.pending_invocation, uncertain.pending_invocation);
+        assert_eq!(
+            reconcile.driver.as_ref().ok_or("missing driver")?.receipts,
+            uncertain.driver.as_ref().ok_or("missing driver")?.receipts
+        );
+        assert_eq!(
+            reconcile
+                .driver
+                .as_ref()
+                .ok_or("missing driver")?
+                .source_cutoff,
+            uncertain
+                .driver
+                .as_ref()
+                .ok_or("missing driver")?
+                .source_cutoff
+        );
         drop(controller);
 
         let prepared = preparation_receipt(
@@ -4100,7 +4424,7 @@ mod tests {
         drop(controller);
         let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
         assert!(controller.next_run()?.is_none());
-        controller.resume_workflow(&token)?;
+        resume_retained(&controller, &token, None)?;
         let final_resumed = controller.next_run()?.ok_or("missing final retry")?;
         let final_driver = final_resumed
             .driver

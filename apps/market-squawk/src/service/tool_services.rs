@@ -314,6 +314,10 @@ impl InstalledToolServices {
             crate::application::analytical_workflow::host::WorkflowHost::open(
                 product.paths(),
                 runtime.workspace_id().as_uuid(),
+                crate::application::market_selection::product::MarketProductSelectionReadCapability::new(
+                    product.research(),
+                    product.research().market_data_instruments(),
+                ),
             )
             .map_err(|_| ServiceError::Unavailable)?;
         Ok(Self {

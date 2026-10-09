@@ -512,10 +512,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             enumeration(&["feature_contract", "feature_dataset"]),
         )]))),
         "Analysis.GetFeatureDatasetPreparationOptions" => closed(
-            vec![
-                ("catalogGeneration", text()),
-                ("datasets", array(record())),
-            ],
+            vec![("catalogGeneration", text()), ("datasets", array(record()))],
             &["catalogGeneration", "datasets"],
         ),
         "Analysis.PreviewFeatureDatasetBuild" => closed(
@@ -2307,6 +2304,9 @@ fn market_search_page() -> Value {
 }
 
 pub(super) fn market_token(prefix: &str) -> Value {
+    if prefix == "market" {
+        return json!({"type": "string", "pattern": "^market_[0-9a-f]{64}$"});
+    }
     json!({
         "type": "string",
         "minLength": prefix.len() + 33,

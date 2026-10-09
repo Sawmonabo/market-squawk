@@ -1,12 +1,13 @@
 //! Shared canonical identities for the existing Markets product tokens.
 
-use std::{sync::Arc, time::Instant};
+use std::{fmt::Write as _, sync::Arc, time::Instant};
 
 use market_squawk_data::{
-    MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS, MarketDataInstrumentReadCapability,
+    MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS, MarketDataInstrumentPopulationDisposition,
+    MarketDataInstrumentPopulationQuery, MarketDataInstrumentReadCapability,
     MarketDataInstrumentRecord,
 };
-use market_squawk_domain::{AssetClass, InstrumentId, Timestamp};
+use market_squawk_domain::{AssetClass, DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
 use market_squawk_services::ServiceError;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -57,6 +58,31 @@ impl MarketProductSelectionReadCapability {
                     deadline,
                     &operation_cancellation,
                 )
+            })
+            .await
+            .map_err(map_owned_read_error)?
+    }
+
+    /// Creates a fresh product locator from a canonical identity, without interpreting an
+    /// earlier display token. Historical analysis receipts keep their original locator.
+    pub(crate) async fn token_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<str>, ServiceError> {
+        let reader = self.market_definitions.clone();
+        self.research
+            .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
+                let record = selected_record(
+                    &reader,
+                    instrument_id,
+                    as_of,
+                    deadline,
+                    &operation_cancellation,
+                )?;
+                individual_selection_token(&record)
             })
             .await
             .map_err(map_owned_read_error)?
@@ -129,7 +155,7 @@ impl MarketProductSelectionReadCapability {
             .map_err(map_owned_read_error)?
     }
 
-    fn resolve_owned(
+    pub(crate) fn resolve_owned(
         market_definitions: &MarketDataInstrumentReadCapability,
         selection_token: &str,
         as_of: Timestamp,
@@ -139,49 +165,59 @@ impl MarketProductSelectionReadCapability {
         if selection_token.len() > MAXIMUM_TOKEN_BYTES || as_of.unix_nanos() <= 0 {
             return Err(ServiceError::InvalidRequest);
         }
-        let mut cursor = None;
-        let mut scanned = 0usize;
-        let mut selected = None;
-        loop {
-            let page = market_definitions
-                .enumerate_as_of(
-                    as_of,
-                    as_of,
-                    cursor.as_ref(),
-                    MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
-                    deadline,
-                    cancellation,
-                )
-                .map_err(map_market_definition_read_error)?;
-            scanned = scanned
-                .checked_add(page.instrument_ids().len())
-                .ok_or(ServiceError::ResourceExhausted)?;
-            if scanned > MAXIMUM_PRODUCT_MARKET_POPULATION {
-                return Err(ServiceError::ResourceExhausted);
-            }
-            for record in page.records() {
-                if individual_selection_token(record)?.as_ref() == selection_token {
-                    if selected
-                        .replace(record.definition().instrument_id())
-                        .is_some()
-                    {
-                        return Err(ServiceError::InvalidResult);
-                    }
-                }
-            }
-            if page.complete() {
-                break;
-            }
-            if scanned == MAXIMUM_PRODUCT_MARKET_POPULATION {
-                return Err(ServiceError::ResourceExhausted);
-            }
-            cursor = page.next_cursor().cloned();
+        let revision = selection_revision(selection_token)?;
+        let record = market_definitions
+            .read_revision(revision, deadline, cancellation)
+            .map_err(map_market_definition_read_error)?
+            .ok_or(ServiceError::Unavailable)?;
+        let instrument_id = record.definition().instrument_id();
+        // The digest is only a locator. Its original revision must still be the unique
+        // knowable and effective selection for this instrument at the caller's cutoff.
+        let current = selected_record(
+            market_definitions,
+            instrument_id,
+            as_of,
+            deadline,
+            cancellation,
+        )?;
+        if current != record {
+            return Err(ServiceError::Unavailable);
         }
-        selected.ok_or(ServiceError::Unavailable)
+        Ok(instrument_id)
     }
 }
 
-const MARKET_TOKEN_DOMAIN: &[u8] = b"market-squawk/market-selection/v1\0";
+fn selected_record(
+    reader: &MarketDataInstrumentReadCapability,
+    instrument_id: InstrumentId,
+    as_of: Timestamp,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<MarketDataInstrumentRecord, ServiceError> {
+    if as_of.unix_nanos() <= 0 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let population = reader
+        .pin_population_as_of(
+            MarketDataInstrumentPopulationQuery::try_new(vec![instrument_id], as_of, as_of)
+                .map_err(map_market_definition_read_error)?,
+            deadline,
+            cancellation,
+        )
+        .map_err(map_market_definition_read_error)?;
+    if population.disposition() != MarketDataInstrumentPopulationDisposition::Complete
+        || !population.exclusions().is_empty()
+    {
+        return Err(ServiceError::Unavailable);
+    }
+    let [record] = population.records() else {
+        return Err(ServiceError::InvalidResult);
+    };
+    Ok(record.clone())
+}
+
+const MARKET_TOKEN_PREFIX: &str = "market_";
+const MARKET_REVISION_HEX_BYTES: usize = 64;
 const HISTORY_TOKEN_DOMAIN: &[u8] = b"market-squawk/market-history/v1\0";
 const MAXIMUM_TOKEN_BYTES: usize = 96;
 const MAXIMUM_PRODUCT_POPULATION_BYTES: usize = 64 * 1024 * 1024;
@@ -302,19 +338,38 @@ pub(crate) fn product_market_identities(
     Ok(identities)
 }
 
-/// The ordinary product token binds its original immutable canonical definition and evidence.
-/// Population coverage is independent of active feeds and executable sizing permissions.
+/// The ordinary product token locates its original immutable canonical definition and evidence.
+/// It grants no currentness or financial authority; readers validate the exact selected revision.
 pub(crate) fn individual_selection_token(
     record: &MarketDataInstrumentRecord,
 ) -> Result<Box<str>, ServiceError> {
-    token(
-        "market_",
-        MARKET_TOKEN_DOMAIN,
-        &[
-            &record.revision_digest().bytes(),
-            record.definition().instrument_id().as_uuid().as_bytes(),
-        ],
-    )
+    let mut token = String::new();
+    token
+        .try_reserve_exact(MARKET_TOKEN_PREFIX.len() + MARKET_REVISION_HEX_BYTES)
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    token.push_str(MARKET_TOKEN_PREFIX);
+    for byte in record.revision_digest().bytes() {
+        write!(token, "{byte:02x}").map_err(|_| ServiceError::ResourceExhausted)?;
+    }
+    Ok(token.into_boxed_str())
+}
+
+fn selection_revision(selection_token: &str) -> Result<EvidenceDigest, ServiceError> {
+    let encoded = selection_token
+        .strip_prefix(MARKET_TOKEN_PREFIX)
+        .filter(|encoded| {
+            encoded.len() == MARKET_REVISION_HEX_BYTES
+                && encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or(ServiceError::InvalidRequest)?;
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+    }
+    Ok(EvidenceDigest::new(DigestAlgorithm::Sha256, bytes))
 }
 
 pub(crate) fn resolve_selection_token(

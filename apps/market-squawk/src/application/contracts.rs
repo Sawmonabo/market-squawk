@@ -4544,6 +4544,9 @@ fn argument_schema(kind: ArgumentKind) -> Value {
 }
 
 fn market_token_schema(prefix: &str) -> Value {
+    if prefix == "market" {
+        return json!({"type": "string", "pattern": "^market_[0-9a-f]{64}$"});
+    }
     json!({
         "type": "string",
         "minLength": prefix.len() + 33,
@@ -4558,6 +4561,17 @@ fn admit_market_token(value: &Value, prefix: &str) -> Result<(), ToolInputError>
         .strip_prefix(prefix)
         .and_then(|value| value.strip_prefix('_'))
         .ok_or(ToolInputError::Invalid)?;
+    if prefix == "market" {
+        return if payload.len() == 64
+            && payload
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            Ok(())
+        } else {
+            Err(ToolInputError::Invalid)
+        };
+    }
     if (32..=86).contains(&payload.len())
         && payload
             .bytes()
