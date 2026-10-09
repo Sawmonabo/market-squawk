@@ -11599,3 +11599,33 @@ or start another compiler before this build reaches a verified terminal result. 
 replacement, stop watcher47538 and run repeat/all-nine native financial reads, then record timings
 and remaining field/fund failures. Existing log:oct9-catalog-reentry-native.log. Full V1 is active
 and incomplete; this is a verified build wait, not a pause or installed acceptance.
+
+### Prepared-report cache native result and next indexed-selection slice
+
+Native build for31bcb86a PASS6m40s. Supervisor replaced service67204/Desktop67220 with
+service72655/Desktop72672 in generation-qCNl2w; watcher47538 stopped. All44 native transport
+queries (all9/four sections plus repeated equity facts/ratios) passed the Desktop financial parser
+without request/schema errors; close calls completed. Evidence:oct9-prepared-cache-native-all-nine.json.
+Four equities return32 rows per first page. AAPL/MSFT/TSLA first32 ratios all report values; NVDA
+has31 reported plus1 missing_input net margin for2025-01-27..2026-01-25 (net income present,
+revenue absent from that exact envelope). This is not confirmed upstream absence. All five ETFs
+still report identity_missing across all4 sections: fund consumer work remains incomplete.
+
+Repeated reads still take3.584–7.169s for equity facts/ratios; improvement is inconsistent and no
+responsiveness acceptance is claimed. Native collection9/9 took2.820s. Source inspection identifies
+an independent concrete bottleneck: MarketProductSelectionReadCapability::resolve_owned scans the
+complete admitted catalog for every individual token. Next correction uses existing indexed
+revision lookup and one-instrument cutoff validation, preserving exact revision-bound selection.
+Crypto reference startup failures remain open. These are native transport checks, not full rendered
+screen or installed-workflow acceptance. Prior goal turn advanced code and critical evidence; this
+turn adds actual native evidence and identifies the next required dependency.
+
+| Next owner | Exclusive files | Outcome/dependency and critical evidence |
+|---|---|---|
+| Sol High market_selection_direct_read | app `src/application/market_selection/product.rs` only | Replace full-catalog single-token resolution with existing indexed revision read and exact one-instrument knowledge/effective cutoff selection. Canonical greenfield market token is market_ plus64 lowercase hex chars of original revision digest (same96-byte bound); no registry/migration/legacy fallback. Preserve stale/future/missing rejection and cancellation; identify closest existing critical fixture for lead extension. |
+| Astra High nvda_ratio_context | `.agents/tmp/v1-first-stock/oct9-nvda-net-margin.md` only | Trace the captured NVDA missing-input envelope to exact retained source data and source semantics. Determine real absence versus selection/projection loss; propose bounded correction with source evidence. Read-only runtime/catalog/files, no source mutation, provider setup or builds. |
+| Lead | shared services `src/output_schema.rs`, Desktop market-product schema and affected existing fixtures; shared contracts/docs/Git/build/runtime | Synchronize token format in all Desktop/CLI/MCP producers/validators, inspect persistent consumers before integration, and run exact existing identity/restart/page checks. No raw provider identifiers or financial authorization introduced by a product locator. Lead retains full SEC shared-quota/concurrency correction as independent next provider dependency. |
+
+No compiler or new native generation until these dependent producer/consumer changes are frozen.
+Current cache checkpoint complete as implemented/critically verified/native-read verified; instant
+loading, missing NVDA input and fund workflows remain open. Pushed native-evidence commit pending.
