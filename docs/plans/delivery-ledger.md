@@ -8,42 +8,46 @@ pause is authorized. One worktree on `feature/v1-installed-product-experience`; 
 
 ### Active native verification and next dependency
 
-Current continuation: prior conversational clarification produced no implementation progress;
-native import now supplies new evidence. The configured bundle import completed but skipped Schwab
-as `profile_unavailable`: `credential_bundle_delegation.rs` still requires revision4 while the
-current built-in Schwab profile is revision1. Lead owns that exact caller correction and the existing
-`selected_profile_mapping_and_omissions_are_exact` check, then supervised native rebuild/reimport.
-No new test harness. Watchexec PID10194 is temporarily SIGSTOP for serialized critical checking;
-supervisor10180, service11743, native11760 and Vite remain running. Resume this same watcher after
-checks. The public-crypto diagnosis is frozen; no source writer is active on it. Next dependency is
-actual Schwab sign-in/start, then shared canonical demand. Resulting pushed commit pending.
+Current code `457151e6` pushed; native service16617/Desktop16646 replaced the previous generation
+through the same supervisor after successful single-job build. Reimport now creates Schwab session
+and reuses Alpaca/SEC setup. Native Schwab OAuth begin returned awaiting_authorization, then callback arrival advanced to
+exchanging_authorization; exchange returned reauthorization_required. Current runtime waits for
+Continue before exchanging a received code; fix this demonstrated delayed handoff after integrating
+the financial-read checkpoint. Do not claim token acceptance or API success. PR evidence comment6073379917 records importer verification.
+Previous clarification turn: no implementation progress; current continuation verifies replacement,
+fixed native import and a real financial post-preparation read failure.
 
-Previous goal turn: progress (code `3e8f8a4d`, evidence `141e3682` pushed; critical checks passed).
-Initial refresh was clean at `141e3682`; the native supervisor is now running as recorded below. Acceptance 1/5/7:
-launch the existing supervised development command into the already authorized fresh
-`.market-squawk/v1-owner-test/{data,installation}`, preserve the prior corrected workspace, verify
-native launch/settings and actual configured connection start, then clean shutdown/restart.
-Lead owns runtime, credentials, all source/shared contracts, builds, ledger and Git. No whole-app
-RAM gate or installed-package claim. One root target, one compiler job, nonincremental builds.
+Acceptance1/5/6: financial preparation completed, but GetInvestmentFinancials timed out in retained
+use authorization. Lead owns `application/research/investment_financials/authorization.rs`, Desktop
+`features/markets/investment-financials.tsx`, affected existing critical fixture, source closure and
+this ledger. Use existing snapshot-only Display authorization; preserve durable LocalAnalysis for
+ratios and exact source/root/expiry/revocation checks. Correct stale preparation-required fallback
+text after refresh failure. Existing retained-reader authority test and existing financial UI journey
+supply critical checks; live financial reopen remains required. Watchexec10194 was stopped
+for serialized edits/checks and resumed below; current app/service/Vite remain running. No parallel compiler.
+Critical checks passed: retained-reader authority1/1 (1.75s), existing Desktop lookup/financial
+journey1/1 (2.53s), TypeScript and source-closure verification. Host shell selected wrong pnpm/Node
+on first two attempts; rerun used pinned Node24.18.0/pnpm10.31.0, without changing dependencies.
+Watcher10194 resumed and owns the single matching service build (Cargo18188); Desktop16646 stays open and source is frozen. The
+post-restart baseline native Facts read returned32 actual MSFT facts in13.62s and its read was closed.
+This proves stored acquisition/reopen, not adequate responsiveness or the new code's live behavior.
+Matching service build passed (5m11s); supervisor replaced service16617 with19062 without restarting
+Desktop16646. Current VTI route survived and reports Ready; its existing history error remains open.
+Actual native MSFT reads on new service: Facts32/3602ms, Statements32/3403ms, Ratios32/3370ms,
+Filings32/715ms, every selected family reported, all four read handles closed. This is live native
+read/reconnect evidence, not instant-load, all-field, all-watchlist or installed-package acceptance.
+Captured `oct8-financial-fix-native-sections.json` and `oct8-financial-fix-reconnected-ui.json`.
+Resulting implementation/pushed commit follows. No new schema, migration, wrapper service or test harness.
 
-While the native build runs, Sol6.1High `shared_subscription_boundary` owns ONLY the existing
-`.agents/tmp/v1-first-stock/oct8-shared-market-demand.md` refresh: check the prior report against
-`141e3682`, specify the smallest producer-to-consumer implementation boundaries and existing
-critical test for canonical overlapping watchlist/detail/holding demand. No source edits, tools
-that launch providers, builds, Git, new architecture or competing task queue. This refresh resolves
-changed signatures before the lead writes shared contracts; existing sender/catalog/current actor
-paths must be reused. Resulting next implementation commit is pending native proof and that refresh.
-
-Native observation: fresh Desktop is visible, Home reports Ready and all nine watchlist symbols
-render without an app-password prompt. Credential import has not run, so equity prices are absent;
-this is not live quote verification. Native startup also exposed a public Kraken freshness rejection
-(`CurrentHealthUnqualification causes=4096`) followed by failed shutdown barriers/reconnect. The UI
-remained Ready, but this source failure requires correction. AstraHigh `shutdown_source_diagnosis`
-owns ONLY `.agents/tmp/v1-first-stock/oct8-fresh-crypto-startup.md`: diagnose this exact captured
-failure from current source and the native log, identify the smallest fix and existing critical test.
-No source edits/builds/Git/runtime/provider calls. Lead keeps the one supervisor alive and owns
-all changes; CLI credential-import binary is next in the serialized build queue. Sol demand refresh
-is completed/frozen; its supporting report changes no implementation status.
+Read-only Astra `financial_load_diagnosis` and Sol6.1 `background_chart_diagnosis` completed/released;
+reports are `.agents/tmp/v1-first-stock/oct8-financial-load.md` and `oct8-background-chart.md`.
+The hidden native screenshot does not prove chart paint; existing throttling policy is already
+Disabled and earlier export automation used private React internals. No artificial visual pass.
+A live service stack sample locates concurrent archive SQL in load_market_event_commit; it does not
+identify the precise financial wait holder or justify a schema change. Host SQLite EXPLAIN uses
+indexed lookups, but is not bundled-runtime planner evidence. Archive/public crypto failures and
+shared canonical multi-consumer demand remain open dependencies; their supporting diagnoses are
+frozen rather than another task queue. One worktree/target; no whole-app RAM acceptance claim.
 
 ### Current native evidence after configured import
 

@@ -226,6 +226,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
   const retainedPage = checkedPage && !page.isPlaceholderData && checkedPage.readToken !== null
     && checkedPage.readToken === snapshot.current?.readToken
   const showingPrior = !retainedPage || page.isError || releasing
+  const missingPreparation = result?.state === "preparation_required"
 
   return <section aria-label={sectionLabels[section]}>
     <div className="flex items-start justify-between gap-4">
@@ -237,7 +238,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
       : "The update finished. Refresh to see the available reports."}</p> : null}
     {releaseFailed ? <p role="alert" className="text-destructive">Could not update this financial view. Try refreshing it again.</p>
       : page.isError ? <div className="flex items-start justify-between gap-3">
-      <p role="alert" className="text-destructive">{result
+      <p role="alert" className="text-destructive">{result && !missingPreparation
         ? "Could not update financial information. Showing the saved page."
         : "This financial information could not be loaded. Try again."}</p>
       <Button variant="outline" size="sm" disabled={busy} onClick={() => void page.refetch()}>Retry</Button>
@@ -247,7 +248,7 @@ function FinancialSectionRead({ selectionToken, section, bootstrap, transport, p
     {result ? <>
       {result.knowledgeAt !== null && result.effectiveOn !== null ? <p className="text-xs leading-5 text-muted-foreground">{showingPrior ? "Saved information as of" : "Information as of"} <time dateTime={result.knowledgeAt} title={result.knowledgeAt}>{formatProductTimestamp(result.knowledgeAt)}</time>
         {" · Reports through "}<time dateTime={result.effectiveOn} title={result.effectiveOn}>{formatCalendarDate(result.effectiveOn)}</time></p> : null}
-      {result.state !== "reported" ? <p role="status" className="mt-3 text-sm text-muted-foreground">{sectionAvailability(result.state)}</p> : null}
+      {result.state !== "reported" && !(page.isError && missingPreparation) ? <p role="status" className="mt-3 text-sm text-muted-foreground">{sectionAvailability(result.state)}</p> : null}
       <FinancialFamilies families={result.families} />
       <FinancialLimitations result={result} />
       <FinancialItems result={result} />

@@ -4758,8 +4758,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/authorization.rs",
-      "sha256": "43fb232711be18f857249571f82519a3f81506a074bac7352bc2bac03e5fe389",
-      "size_bytes": 2406
+      "sha256": "2fde101a137917a0066afad0c41f7ef680310d7608a57da436ccdc2e13d9bcfc",
+      "size_bytes": 3503
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/page.rs",

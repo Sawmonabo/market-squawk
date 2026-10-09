@@ -37,10 +37,34 @@ pub(crate) async fn authorize_financial_manifest(
             .map_err(|_| ServiceError::InvalidResult)?,
         )
         .map_err(|_| ServiceError::InvalidResult)?;
-        let authorization = research
-            .authorize_research_use(request, deadline, cancellation)
-            .await
-            .map_err(map_research_error)?;
+        // Page reads check the original manifests again before returning. Display needs no
+        // durable decision or writer lease when its retained grant is already current.
+        // Ratio calculation still uses the separate durable LocalAnalysis authorization.
+        let authorization = if *use_kind == ResearchUse::Display {
+            research
+                .authorize_research_display(request, deadline, cancellation)
+                .await
+                .map_err(map_research_error)?
+                .map(|authorization| {
+                    (
+                        authorization.research_use(),
+                        authorization.graph().roots() == roots.as_slice(),
+                        authorization.expires_at(),
+                    )
+                })
+        } else {
+            research
+                .authorize_research_use(request, deadline, cancellation)
+                .await
+                .map_err(map_research_error)?
+                .map(|authorization| {
+                    (
+                        authorization.research_use(),
+                        authorization.graph().roots() == roots.as_slice(),
+                        authorization.expires_at(),
+                    )
+                })
+        };
         let authorization = match authorization {
             Ok(authorization) => authorization,
             Err(ResearchUseCatalogError::Cancelled) => return Err(ServiceError::Cancelled),
@@ -52,11 +76,12 @@ pub(crate) async fn authorize_financial_manifest(
                 break;
             }
         };
-        if authorization.research_use() != *use_kind
-            || authorization.graph().roots() != roots.as_slice()
+        let (authorized_use, exact_roots, expires_at) = authorization;
+        if authorized_use != *use_kind
+            || !exact_roots
             || Utc::now()
                 .timestamp_nanos_opt()
-                .is_none_or(|now| now >= authorization.expires_at().unix_nanos())
+                .is_none_or(|now| now >= expires_at.unix_nanos())
         {
             return Err(ServiceError::InvalidResult);
         }
