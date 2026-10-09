@@ -11518,3 +11518,26 @@ Existing application page/cursor/close critical fixture PASS1/1,0.40s after5m04s
 Final source-closure verification, formatting of changed code and diff checks pass. This establishes
 critical authority and page integrity, not native latency or all-screen completion. Next barrier:
 one managed matching Desktop/service build, then all-nine/four-section reads and observed timings.
+
+### Financial read authority checkpoint — native result
+
+38f079e9 pushed. Matching managed Desktop/service build PASS6m21s; supervisor normally replaced
+service62617/Desktop62636 with service67204/Desktop67220 in generation-ANMchv. Watcher47538 stopped
+after replacement; original credentials/workspace preserved, no parallel compiler/new worktree.
+All36 native full-transport first-page reads completed with no request errors and all read handles
+released: AAPL/MSFT/NVDA/TSLA report32 rows with continuation for each of four sections; SPY/QQQ/DIA/
+IWM/VTI still report identity_missing for all four sections. This does not establish upstream fund
+absence or completeness of individual financial fields. Evidence:
+`oct9-financial-read-native-all-nine.json` in `.agents/tmp/v1-first-stock`.
+
+Reported equity pages take1.958–7.197s (facts/statements/ratios4.510–7.197s). Concurrent AAPL/MSFT
+ratio first-pages both return reported32 in8.733/8.874s and release their reads; evidence
+`oct9-financial-read-native-concurrent.json`. Fresh native collection9/9 takes5.580s in
+`oct9-financial-read-native-collection.json`. These are actual backend calls through the native
+Desktop transport after restart, not screenshot/full-screen acceptance or a statistical benchmark.
+Read independence from a held publication writer and absence of durable decisions are critically
+verified by the existing fixture; live overlap above is verified. Instant/cached responsiveness,
+SEC two-download/separate parsing implementation, fund financial consumers and full V1 acceptance
+remain incomplete. Lead retains next integration ownership; no active child writers. Next
+financial dependency is repeated prepared-artifact verification/index construction; next provider
+dependency is the already diagnosed canonical SEC concurrency correction.
