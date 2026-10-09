@@ -27,11 +27,11 @@ use market_squawk_platform::{
     SealedResearchJournalStore,
 };
 use market_squawk_sources::{
-    AuthorizationMode, ExtractionAuthority, ExtractionAuthorityError, ExtractionRedirectPermit,
-    HttpRequestBounds, InFlightExtractionRequest, MAX_PROVIDER_CAPTURE_PAGE_BYTES,
-    NetworkAccessPolicy, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, SourceMetadata, SourceMetadataProvider,
-    TlsProviderCapability,
+    AuthorizationMode, BudgetUnavailableReason, ExtractionAuthority, ExtractionAuthorityError,
+    ExtractionRedirectPermit, HttpRequestBounds, InFlightExtractionRequest,
+    MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy, ProviderCapturePageReceipt,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceMetadata,
+    SourceMetadataProvider, TlsProviderCapability,
 };
 use reqwest::header::{
     ACCEPT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
@@ -61,6 +61,7 @@ const MAX_NPORT_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_NCEN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BULK_README_BYTES: u64 = 16 * 1024 * 1024;
 const STREAM_CHANNEL_CHUNKS: usize = 8;
+const CONCURRENCY_RECHECK: Duration = Duration::from_millis(25);
 
 /// Production SEC source bound to exact metadata and local persistence.
 #[derive(Debug)]
@@ -1386,14 +1387,20 @@ pub(crate) async fn acquire_sec_request(
             }
             permit.authorize_send(target).map_err(SecClientError::from)
         })();
-        let wait_until = match admission {
+        let wait = match admission {
             Ok(in_flight) => return Ok(in_flight),
             Err(SecClientError::Authority(ExtractionAuthorityError::BudgetWaitUntil {
                 deadline,
-            })) => deadline,
+            })) => authority.remaining_budget_wait(deadline)?,
+            Err(SecClientError::Authority(ExtractionAuthorityError::BudgetUnavailable {
+                reason: BudgetUnavailableReason::ConcurrencyExhausted,
+            })) => {
+                // Reservation and dispatch failures release their slot before this wait.
+                // Recheck the same authority and target without consuming a provider request.
+                CONCURRENCY_RECHECK
+            }
             Err(error) => return Err(error),
         };
-        let wait = authority.remaining_budget_wait(wait_until)?;
         let wait = match deadline {
             Some(deadline) => wait.min(remaining_until(deadline)?),
             None => wait,

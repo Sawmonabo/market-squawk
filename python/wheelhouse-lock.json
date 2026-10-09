@@ -2758,8 +2758,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/client.rs",
-      "sha256": "d69ffd9b5894e166174143ba47cc5ddeb78abcb1dde34742e893edc554d3aea1",
-      "size_bytes": 67946
+      "sha256": "af293f6444be67bc59eccbcd89b47c271719b08bee15b6c46b09581a5f52b28d",
+      "size_bytes": 68414
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/client/company_directory.rs",
@@ -2848,8 +2848,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/xbrl/model.rs",
-      "sha256": "c0f5c87ce0641985552b282fd9f05eafd9fe7ccbf956abae9304d72eff005a33",
-      "size_bytes": 184109
+      "sha256": "4761b6a9c73f0265493629df3247015429255208c817db202185858e895e2580",
+      "size_bytes": 185804
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/xbrl/normalize.rs",

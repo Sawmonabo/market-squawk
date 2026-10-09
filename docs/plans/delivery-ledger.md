@@ -1,10 +1,36 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-08
+## Current execution — 2026-10-09
+
+Current integration base **2ef1d35a** (pushed): selected history windows and default candles;
+full nine-investment history/financial acceptance remains open. Supervisor10180, stopped watcher10194,
+service29800 and Desktop29820 freshly confirmed; no Cargo/rustc active. Prior goal turn only
+reconfirmed the already-pushed chart setting; next concrete action is contention/startup remediation.
+
+| Owner | Concrete outcome and exact files | Evidence / next dependency |
+| --- | --- | --- |
+| Lead | Integrate frozen SEC wait repair: adapter `src/client.rs`, `src/xbrl/model.rs`; all builds/Git/ledger/source closure | Actual AAPL acquisition failed with ConcurrencyExhausted. Existing taxonomy fixture extended for occupied slot, cancellation, deadline and release; PASS1/1 (4.25s; compile1m48s). Shared event-driven admission remains next to remove repeated durable-store polling. |
+| GPT-6.1 Sol High schwab_metadata_scope | Correct Schwab reference/quote metadata account scope: `provider_activation/schwab_reference/metadata.rs`, `provider_activation/schwab_quote_metadata.rs`, existing `provider_onboarding/service/schwab_recovery_tests.rs`, `provider_activation/schwab.rs`, `provider_activation/schwab_market_hours/metadata.rs`, `application/market_runtime/schwab.rs` budget comparison only, and parent module internal test access only if required | Saved OAuth reopened active; startup fails at reference_bootstrap InvalidResult. Check account-bound authorization versus template budget before changing. Next: fixture then real source recovery; no new browser sign-in. |
+| GPT-6 Astra High sec_concurrency_policy | Read-only SEC concurrency/pooling/request-rate ownership and rationale; report only `.agents/tmp/v1-first-stock/oct9-sec-concurrency-policy.md` | Owner questions one-slot bottleneck. Compare actual client pooling, application policy, global scope and request lifetime. Recommend smallest justified correction and affected critical fixture; no builds/Git/runtime/code edits. |
+
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `ea427974`. Main/release unchanged; no extra branch created.
+
+SEC wait candidate: existing critical taxonomy/restart fixture PASS1/1 (4.25s; compilation1m48s).
+This fixes immediate ConcurrencyExhausted rejection but is not final scheduling acceptance:
+read-only concurrency investigation confirms each25ms retry can enter SQLite. Next correction is
+shared event-driven waiting keyed to the existing provider-rate group, with cancellation/deadline
+and no second rate authority. Reqwest already pools connections; one-slot SEC serialization is an
+application choice, not the SEC's published10requests/s ceiling. Two-slot policy remains a separate
+coherent correction because onboarding duplicates the descriptor, persisted policy must retain
+window/cooldown state, and blocking-work capacity is currently coupled. Report:
+`.agents/tmp/v1-first-stock/oct9-sec-concurrency-policy.md`. No all-watchlist completion claim.
+Schwab metadata producer/consumer correction is frozen; existing protected OAuth/restart fixture
+is compiling in session59552 with one job. Actual metadata constructors now use the same account
+scope as request admission. New native runtime is not yet built; saved authorization was active
+after the previous restart and no new browser sign-in has been requested.
 
 ### Active native verification and next dependency
 
@@ -165,6 +191,36 @@ Lead owns next bounded diagnostics in `local_product/{source_lifecycle,schwab_ma
 for the failed authorized Schwab Source.Start: retain original closed ServiceError and stage;
 no payload/secrets, authority change, reset or repeated sign-in. Matching build and existing Retry
 with a freshly read lifecycle revision must identify the failure before behavioral remediation.
+Pushed chart checkpoint **2ef1d35a**, PR43 evidence
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6074018656.
+Actual native TSLA DOM confirms candles checked/line unchecked/no range inputs. Hidden WebView
+still prevents a native pixel-acceptance claim. Single supervised matching both-target build
+Cargo28655 is running; source diagnostic edits are frozen, current app remains available.
+New all-watchlist finding: AAPL displays history and financial acquisition errors. Service log64398
+records selected financial acquisition failing with BudgetUnavailable/ConcurrencyExhausted. This is
+local request contention, not evidence that SEC lacks the company's reports.
+Astra `stock_pause_cause` next read-only bounded diagnosis: trace SEC financial extraction's shared
+budget admission and existing cancellable wait/retry facilities; recommend smallest correction
+that waits for temporary concurrency without raising limits, retrying terminal errors, or holding
+publication locks. Own only `.agents/tmp/v1-first-stock/oct9-sec-concurrency-failure.md`; no code,
+build/runtime/Git changes. Identify existing critical contention/cancellation test. Lead retains
+shared authority and implementation ownership after the current build is terminal.
+All36 financial-tab visits are recorded in `oct9-all-watchlist-financial-tabs.json`; each captures
+actual selected tab and three-second observation, not a completion/timeout claim. AAPL has explicit
+history and financial errors; the others include loading, empty fund reports and retained TSLA
+facts. Native screenshot `oct9-tsla-current-native.png` was captured and viewed: checked candles,
+no slider, blank hidden-WebView plot (known paint-verification limit). This is one viewport, not
+a completed full-page/all-screen visual audit. No unsupported competitor-quality claim.
+Matching diagnostic build passed5m23s; supervisor started service29800. Previous jobs were all
+terminal (12completed/6failed, no next page), so no running financial job was interrupted by this
+replacement. Watcher10194 stopped for the next bounded fix after compiler exit.
+Astra confirmed SEC filing/taxonomy permits are released before dependent requests; temporary
+concurrency wait will not self-deadlock that chain. Implement now: `stock_pause_cause` owns ONLY
+`adapters/market-squawk-adapter-sec/src/client.rs` and its existing `src/xbrl/model.rs` critical
+fixture. Extend existing exact-request cancellable wait to temporary ConcurrencyExhausted, using
+existing bounded concurrency recheck pattern; preserve original deadline/authority and all terminal
+errors. Existing held-permit release/cancel/deadline fixture provides the critical check. Lead owns
+shared rate authority, closure, build/test scheduling and integration; no new runtime or queue.
 Read-only Astra `financial_load_diagnosis` and Sol6.1 `background_chart_diagnosis` completed/released;
 reports are `.agents/tmp/v1-first-stock/oct8-financial-load.md` and `oct8-background-chart.md`.
 The hidden native screenshot does not prove chart paint; existing throttling policy is already

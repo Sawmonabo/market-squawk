@@ -2484,16 +2484,56 @@ mod tests {
             // Complete submissions needs at least three HTTP admissions for MSFT. Exercise the
             // actual SEC admission helper without sending requests or restarting the shared budget.
             let target = crate::SecObjectLocator::submissions("0000789019")?;
-            for _ in 0..2 {
+            let held = crate::client::acquire_sec_request(
+                &extraction_authority,
+                target.url(),
+                None,
+                &cancellation,
+            )
+            .await?;
+            assert!(matches!(
+                extraction_authority.try_network_request(target.url()),
+                Err(market_squawk_sources::ExtractionAuthorityError::BudgetUnavailable {
+                    reason: market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+                })
+            ));
+            let cancelled = CancellationToken::new();
+            let waiting = crate::client::acquire_sec_request(
+                &extraction_authority,
+                target.url(),
+                None,
+                &cancelled,
+            );
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            cancelled.cancel();
+            assert!(matches!(
+                waiting.await,
+                Err(crate::SecClientError::Cancelled)
+            ));
+            let short_deadline =
+                crate::client::system_timestamp()?.checked_add_nanos(10_000_000)?;
+            assert!(matches!(
                 crate::client::acquire_sec_request(
                     &extraction_authority,
                     target.url(),
-                    None,
+                    Some(short_deadline),
                     &cancellation,
                 )
-                .await?
-                .record_success()?;
-            }
+                .await,
+                Err(crate::SecClientError::DeadlineExceeded)
+            ));
+            let deadline = crate::client::system_timestamp()?.checked_add_nanos(5_000_000_000)?;
+            let next = crate::client::acquire_sec_request(
+                &extraction_authority,
+                target.url(),
+                Some(deadline),
+                &cancellation,
+            );
+            tokio::pin!(next);
+            assert!(futures_util::poll!(&mut next).is_pending());
+            held.record_success()?;
+            next.await?.record_success()?;
             assert!(matches!(
                 extraction_authority.try_network_request(target.url()),
                 Err(market_squawk_sources::ExtractionAuthorityError::BudgetWaitUntil { .. })
