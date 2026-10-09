@@ -4,11 +4,12 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`f1a30127`. Main/release unchanged; no extra branch created.
+`2906fa5d`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
 
-Grant-refresh correction implemented and critically verified; native verification remains open.
+Grant-refresh correction pushed as2906fa5d, implemented and critically verified; native verification remains open.
+PR43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6072405940 .
 All helper ownership is released; lead owns integration and the next native deployment. Protected
 state retains authorization identity and original/effective scope; one adapter receipt comparison
 is reused across activation, REST/Streamer qualification and publication. Removed the permanent
@@ -30,7 +31,8 @@ Critical evidence (existing checks, single-job/nonincremental compilation):
 - Existing actual adapter REST/Streamer qualification: PASS1/1,0.03s.
   `oct8-grant-streamer-critical.log`. Source closure refresh and diff whitespace check pass.
 
-No native rebuild yet; watcher remains stopped and the running service remains f1a30127. The
+No native rebuild yet; supervisor60780 and service88033 remain running atf1a30127; watcher60793
+is stopped. Prior DesktopPID88040 is no longer present at final process check. The
 real Start constructor and automatic all-nine Desktop updates are not proved by these fixture
 checks. Greenfield persisted shape changed: old OAuth/doctor records are not silently converted.
 Next dependency: fresh authorized V1 state and normal native setup/Start/restart proof, retaining
