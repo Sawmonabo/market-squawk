@@ -3263,10 +3263,12 @@ fn selected_provider_market_event_commit(
         }
         return Ok(Some(retained));
     }
+    // Keep the ordered commit lookup outside run validation. Reordering this join can scan
+    // every ingest run, repeat publication completeness checks, and sort before LIMIT 1.
     let sequence: Option<i64> = connection
         .query_row(
             "SELECT committed.commit_sequence FROM market_event_complete_commits AS committed
-         JOIN ingest_runs AS run ON run.run_id=committed.run_id
+         CROSS JOIN ingest_runs AS run ON run.run_id=committed.run_id
           AND run.state='succeeded' AND run.completed_at_ns=committed.available_at_ns
          WHERE committed.dataset_id=?1 AND committed.available_at_ns<=?2
          ORDER BY committed.commit_sequence DESC LIMIT 1",

@@ -965,12 +965,6 @@ impl SchwabRestQuoteSealFirstSink {
         let payload_digest = evidence_digest(sealed.receipt().body_sha256());
         let sealed_receipt_digest = sealed.persisted_receipt().receipt_digest();
         let oauth = oauth_epoch.receipt();
-        let observed_at = match wall_timestamp() {
-            Ok(observed_at) => observed_at,
-            Err(error) => {
-                return self.accepted_failure(payload_digest, Some(sealed_receipt_digest), error);
-            }
-        };
         if oauth_epoch.validate_current(oauth).is_err() {
             return self.accepted_failure(
                 payload_digest,
@@ -1064,12 +1058,24 @@ impl SchwabRestQuoteSealFirstSink {
                         );
                     }
                 };
+                // Qualification records the current lease's health lower bound. Publication
+                // admission must follow it; canonical source/receive clocks remain unchanged.
+                let publication_at = match wall_timestamp() {
+                    Ok(at) => at,
+                    Err(error) => {
+                        return self.accepted_failure(
+                            payload_digest,
+                            Some(sealed_receipt_digest),
+                            error,
+                        );
+                    }
+                };
                 let selection = match SchwabQuotePublicationSelection::try_new(
                     qualified.source_lease().clone(),
                     qualified.selected_provider_identities().to_vec(),
                     bindings.iter().map(|binding| binding.binding()),
                     evidence.venue_id(),
-                    observed_at,
+                    publication_at,
                 ) {
                     Ok(selection) => selection,
                     Err(_) => {
@@ -1085,7 +1091,7 @@ impl SchwabRestQuoteSealFirstSink {
                     qualified,
                     selection,
                     oauth_epoch,
-                    observed_at,
+                    publication_at,
                     connection_generation,
                     accounting,
                     payload_digest,

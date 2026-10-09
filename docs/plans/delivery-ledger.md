@@ -2,25 +2,47 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed implementation **de1bcff7** adds single-authority provider quota enforcement and
-two concurrent SEC downloads to f3f59d2c's indexed reads/original-option-reference correction.
-All17 selected SEC integration checks pass, but matching native startup failed: immutable SEC
-capability identity changed with scheduling concurrency. Native build completed7m52s; service36397
-exited1 and Desktop36430 remains under supervisor30620. Watcher30632 is stopped.
-Lead correction preserves all four saved capability identities while applying operational concurrency2;
-focused source regression passes1/1 (14.24s compilation). Financial display-reader implementation
-is integrated and frozen. Data recovery check passes1/1 (141.28s; compile1m10s). Application
-saved-SEC/restart plus cursor/close checks pass2/2 (2.60s). All writers are released and no compiler
-remains. Retained workspace/live proof still pending; lead commits/pushes then schedules matching native replacement.
-Full V1 remains active/incomplete. Older entries below are chronological evidence only.
+Current pushed base **5a53cbd8**. Integration candidate fixes retained market horizon query order
+and Schwab REST publication-admission clock ordering. Data publication/current selection/restart
+critical1/1 PASS (53.14s compile,12.03s test); application real-bridge quote publication and revoked
+OAuth epoch critical1/1 PASS (5m24s compile,9.63s test). Source closure refresh/verify and diff checks
+pass; only source identities changed in the lock. No schema, credentials or financial clocks changed.
+Lead inspected affected consumers. Commit/push this candidate, then let the existing supervisor
+build once and verify its matching native generation before claiming the timeout/publication fixed.
+Full V1 remains active/incomplete; previous turn produced implementation and direct/native evidence.
 
 | Current owner | Outcome and exact scope | Verification / next dependency |
 | --- | --- | --- |
-| Lead | Integrated correction, closure, Git/build/runtime | Four critical checks pass: retained identity, publication/recovery, saved SEC restart and financial cursor/close. Next commit/push and matching native startup/read proof. |
-| Astra High financial_read_cost | Implementation complete and ownership released | Lead inspected producer/consumer/caller changes. Data recovery and application checks pass; native latency proof remains. |
-| Astra High stream_publication_time | Diagnosis complete and ownership released; `.agents/tmp/v1-first-stock/oct9-stream-publication-time.md` | REST admission-clock inversion confirmed; stream consumer self-refresh mismatch reachable, exact native Unauthorized branch not yet classified. No production changes or live acceptance. |
-| Astra screen_indexed_reads | Completed, ownership released | Direct detail/history and indexed collection wiring critically verified. Post-restart collection returns9 entries but takes4.02s; instant-cache acceptance remains open. |
-| Astra evidence_preparation_invalid | Completed, ownership released | Retained-original link and compositional origin/publication checks pass. Full renewed native publication remains unproven. |
+| Lead | Integration, matching native verification, shared contracts/schema/composition and Git/build scheduling | Both critical checks PASS. Supervisor30620/watcher30632 retained; watcher stopped for frozen checks. Current runtime43557/43594 is5a53cbd8, not the candidate. |
+| Astra High market_read_timeout | Completed; source frozen in `data/src/manifest/catalog.rs` | JOIN ordering correction; same horizon in read-only probe2214ms→<1ms. Bundled critical passes, native latency still unproven. Report `oct9-market-read-timeout.md`. |
+| Astra High stream_publication_time | Completed; source frozen in app `market_runtime/schwab_sink.rs` and existing `research/ingest/provider_runtime.rs` fixture | Admission clock sampled after qualification; original source/receive clocks preserved. Positive real bridge plus revoke/refresh fixture passes. Streamer OAuth self-refresh defect remains separate. |
+| Astra High financial_read_cost | Read-only SEC recovery diagnosis complete | Saved metadata1/current2 concurrency changes activation/runtime identity. Report `oct9-sec-recovery-budget.md` identifies operational-policy separation and existing blocked-session recovery; no state edits. |
+| Sol High investment_metric_mapping | Read-only source-to-screen audit complete | Report `oct9-investment-metric-mapping.md` maps all9 symbols and applicable fields; request/normalization/selector/UI gaps explicit. No all-source direct coverage claim. |
+
+Native5a evidence: `oct9-financial-reopen-native-{status,collection,connections,all-nine,summary}.json`.
+Nine details and all16 stock first financial pages returned successfully; all16 read handles closed.
+Stock pages0.36–3.75s; details3.77–12.66s. Not full pagination, rendered-screen or responsiveness proof.
+NVDA first ratio page has1 missing-input item; all other first32 ratio rows forAAPL/MSFT/TSLA report.
+Five ETF company-only financial routing gaps remain. Collection withoutmarket returns9 in8ms;
+withmarket still hits15s deadlines. Schwab saved session active, SEC session blocked, credentials kept.
+
+Direct read-only Alpaca probe returns HTTP200 for all9 stock snapshots (quote/trade/minute/daily/
+previous-day objects) and MSFT indicative option first page (1snapshot,next page present). Receipt
+`oct9-direct-alpaca-coverage.json` stores safe field presence/body digests, no credentials. This proves
+these endpoints respond, not complete pagination/all-source/field-value coverage. Normal saved stock
+workflow resumed once, advanced5→8 completed steps, then paused on chain.acquire categoryNetwork.
+Adapter also maps budget failures to Network; cause remains unclassified. No blind repeated resume.
+
+Metric audit confirms active Schwab request asks onlyQuote; Fundamental block is not requested.
+Day/52week/volume are parsed but unconsumed. Next product slice must connect actual selected responses,
+normalized provider-neutral summaries and asset-aware UI, alongside existing fund-publication work.
+Immediate next dependency after native gate: SEC stable source identity versus operational quota
+separation/recovery, option failure classification, and Streamer self-refresh correction. No required
+provider, screen, analytical workflow or final installed gate is dropped.
+
+Removed stale session-3LVOKI's six unopened generated binaries,1,440,257,680bytes; current runtime,
+workspace/recovery and compiler outputs retained. `oct9-stale-build-cleanup.json` updated.
+All evidence above is under `.agents/tmp/v1-first-stock/`; no final installed acceptance claimed.
 
 Offline canonical correction completed after clean managed shutdown. The catalog backup is
 `.market-squawk/recovery/pre-indexed-options-f3f59d2c/catalog.sqlite3`. Exactly two guards and schema21

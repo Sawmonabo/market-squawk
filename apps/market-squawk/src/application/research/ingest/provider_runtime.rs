@@ -3104,7 +3104,7 @@ mod tests {
         let (token, epoch) =
             SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth).await?;
         let oauth_receipt = epoch.receipt();
-        let (durable, evidence, binding, _) = quote_publication_fixture(
+        let (durable, evidence, binding, _, research) = quote_publication_fixture(
             directory.path(),
             session_id,
             secret_reference,
@@ -3112,6 +3112,58 @@ mod tests {
             oauth_receipt,
         )?;
         let generation = market_squawk_domain::ConnectionGeneration::new(1)?;
+        // The real bridge records health after the sink entered publication. Selecting with
+        // that earlier sink timestamp rejects this otherwise valid, newly qualified response.
+        let (current, display) =
+            quote_current_bridge(&research, evidence.metadata(), &binding, session_id).await?;
+        let current = Arc::new(current);
+        let positive_sink =
+            SchwabRestQuoteSealFirstSink::new(Arc::clone(&durable), current.clone());
+        let source_at = timestamp_seconds(oauth_receipt.access_issued_at_unix_seconds())?;
+        let completed =
+            executed_quote(token, oauth_receipt.access_issued_at_unix_seconds()).await?;
+        let original_digest = completed.capture().receipt().body_sha256();
+        let receipt = SchwabRestQuoteProducer::publish_test_completed_response(
+            &positive_sink,
+            completed,
+            evidence.clone(),
+            vec![binding.clone()],
+            epoch,
+            generation,
+        )
+        .await?;
+        assert_eq!(receipt.published(), 1);
+        let snapshots = display
+            .snapshots_for_instrument(
+                binding.instrument_id(),
+                NonZeroUsize::MIN,
+                crate::live_source::display_market::DisplayMarketReadTime::LatestDisplay,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+        let quote = snapshots
+            .first()
+            .and_then(|snapshot| snapshot.quote())
+            .ok_or("qualified quote did not reach the display")?;
+        assert_eq!(
+            quote.observation().provenance().source_at(),
+            Some(source_at)
+        );
+        assert_eq!(
+            quote.observation().provenance().payload_digest().bytes(),
+            original_digest
+        );
+        drop(snapshots);
+        drop(positive_sink);
+        Arc::try_unwrap(current)
+            .map_err(|_| "current bridge remains borrowed")?
+            .shutdown()
+            .await
+            .map_err(|error| format!("current bridge shutdown failed: {error:?}"))?;
+
+        let (token, epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth).await?;
         let bridge_calls = Arc::new(AtomicUsize::new(0));
         let sink = SchwabRestQuoteSealFirstSink::new(
             Arc::clone(&durable),
@@ -3152,7 +3204,7 @@ mod tests {
         )
         .await?;
         let original_rotation_receipt = rotating.current_receipt().await?;
-        let (rotating_durable, rotating_evidence, rotating_binding, rotating_generation) =
+        let (rotating_durable, rotating_evidence, rotating_binding, rotating_generation, _) =
             quote_publication_fixture(
                 &directory.path().join("rotating-publication"),
                 session_id,
@@ -3282,6 +3334,166 @@ mod tests {
         current_epoch.validate_current(refreshed)?;
         assert_eq!(expired_wire.exchange_count(), 2);
         Ok(())
+    }
+
+    async fn quote_current_bridge(
+        research: &ResearchService,
+        metadata: &SourceMetadata,
+        binding: &SchwabRestQuoteInstrumentBinding,
+        session_id: Uuid,
+    ) -> Result<
+        (
+            crate::live_source::SchwabRestQuoteCurrentSessionBridge,
+            crate::live_source::display_market::DisplayMarketDirectory,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use crate::live_source::display_market::{
+            DisplayMarketActorLimits, DisplayMarketDirectory, DisplayMarketKey,
+            DisplayMarketReadAdmission,
+        };
+        use market_squawk_platform::{
+            CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureWriterPolicy,
+            MemoryCaptureSink, initialize_capture_process_infrastructure, raw_capture_channel,
+            spawn_capture_writer,
+        };
+        use market_squawk_sources::{
+            AuthoritativeSourceRegistry, ProviderNativeIdentityRequest, SessionId,
+        };
+
+        let at = Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?);
+        let mut registry =
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+                Arc::new(QuoteAuthorizationSubject),
+            )?
+            .with_provider_identity_authority(Arc::new(research.market_data_instruments()))?;
+        let registered = registry.register(metadata.clone(), at)?;
+        let reference = binding.binding();
+        let venue = VenueId::try_from("schwab")?;
+        registry.record_provider_identities(
+            &registered,
+            &[ProviderNativeIdentityRequest {
+                namespace: reference.provider_identity().source_id().clone(),
+                provider_instrument_id: reference
+                    .provider_identity()
+                    .provider_instrument_id()
+                    .clone(),
+                instrument: binding.instrument_id(),
+                venue: venue.clone(),
+                venue_symbol: market_squawk_domain::VenueSymbol::try_from(
+                    binding.provider_symbol(),
+                )?,
+                knowledge_at: reference.canonical_record().published_at(),
+                effective_at: reference.canonical_record().published_at(),
+            }],
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )?;
+        let session_id = SourceIdentifier::try_from(session_id.to_string())?;
+        let session =
+            registry.begin_next_session(&registered, SessionId::new(session_id.clone()), at)?;
+        let generation = session.generation();
+        let capabilities = registry.take_capture_generation_capabilities(&session)?;
+        let health = registry.take_current_health_reporter(&session)?;
+        let frames = registry.take_raw_frame_factory(&session)?;
+        let process = initialize_capture_process_infrastructure(
+            CaptureProcessInfrastructureLimits::new(nonzero(1024 * 1024)),
+        )?;
+        let (capture, control, writer) = raw_capture_channel(
+            &process,
+            CaptureChannelLimits::new(nonzero(8), nonzero(16 * 1024 * 1024)),
+            capabilities,
+        )?;
+        let writer = spawn_capture_writer(
+            writer,
+            MemoryCaptureSink::try_new(nonzero(64), nonzero(16 * 1024 * 1024))?,
+            CaptureWriterPolicy::default(),
+        )?;
+        let display = DisplayMarketDirectory::try_new(
+            NonZeroUsize::MIN,
+            CancellationToken::new(),
+            market_squawk_runtime::ApplicationChanges::default(),
+        )?;
+        let mut current = crate::live_source::SchwabRestQuoteCurrentSessionInput::new(
+            registry,
+            session,
+            frames,
+            capture,
+            control,
+            writer,
+            health,
+            display.clone(),
+            Vec::new(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        current
+            .activate_capture_initial()
+            .map_err(|error| format!("current capture activation failed: {error:?}"))?;
+        let bytes = NonZeroU32::new(1024 * 1024).ok_or("invalid display bound")?;
+        let _monitor = current
+            .register_display_route(
+                DisplayMarketKey::try_new(
+                    metadata.source_id(),
+                    &venue,
+                    binding.instrument_id(),
+                    generation,
+                )?,
+                DisplayMarketActorLimits::try_new(
+                    nonzero(8),
+                    bytes,
+                    bytes,
+                    nonzero(8),
+                    bytes,
+                    bytes,
+                )?,
+                DisplayMarketReadAdmission::open(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .map_err(|error| format!("current display registration failed: {error:?}"))?;
+        let instrument = crate::live_source::SchwabRestQuoteCurrentInstrument::try_new(
+            ProviderIdentifier::try_new(binding.provider_symbol().to_owned())?,
+            SourceIdentifier::try_from(binding.provider_symbol())?,
+            binding.instrument_id(),
+            reference.quote_reference(at)?,
+        )
+        .map_err(|error| format!("current instrument binding failed: {error:?}"))?;
+        let bridge = crate::live_source::SchwabRestQuoteCurrentSessionBridge::try_new(
+            current,
+            metadata,
+            &session_id,
+            generation,
+            &venue,
+            &[instrument],
+        )
+        .await
+        .map_err(|error| format!("current bridge construction failed: {error:?}"))?;
+        Ok((bridge, display))
+    }
+
+    #[derive(Debug)]
+    struct QuoteAuthorizationSubject;
+
+    impl market_squawk_sources::AuthorizationSubjectResolver for QuoteAuthorizationSubject {
+        fn resolve_subject_record(
+            &self,
+            mode: AuthorizationMode,
+            evidence: EvidenceDigest,
+        ) -> Result<SourceIdentifier, market_squawk_sources::AuthorizationSubjectResolutionError>
+        {
+            if mode == AuthorizationMode::UserAuthorized && evidence == digest(2) {
+                SourceIdentifier::try_from("schwab-test-account").map_err(|_| {
+                    market_squawk_sources::AuthorizationSubjectResolutionError::EvidenceUnresolved
+                })
+            } else {
+                Err(market_squawk_sources::AuthorizationSubjectResolutionError::EvidenceUnresolved)
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -3553,6 +3765,7 @@ mod tests {
             SchwabRestQuoteSourceEvidence,
             SchwabRestQuoteInstrumentBinding,
             ResearchProviderRuntimeGeneration,
+            Arc<ResearchService>,
         ),
         Box<dyn std::error::Error>,
     > {
@@ -3609,7 +3822,7 @@ mod tests {
             effective,
         )?;
         let durable = super::super::schwab_market::SchwabRestQuoteGenerationAuthority::bind_test_rest_quote_sink(
-            research,
+            Arc::clone(&research),
             generation.clone(),
             rights,
             oauth,
@@ -3618,7 +3831,7 @@ mod tests {
         )?;
         let evidence =
             SchwabRestQuoteSourceEvidence::try_new(metadata, VenueId::try_from("schwab")?)?;
-        Ok((durable, evidence, binding, generation))
+        Ok((durable, evidence, binding, generation, research))
     }
 
     fn quote_metadata(
