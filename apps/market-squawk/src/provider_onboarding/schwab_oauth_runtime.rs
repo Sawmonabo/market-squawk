@@ -1749,7 +1749,7 @@ fn lifecycle_view(
         SchwabOAuthAuthorityStatus::AwaitingAuthorization => Ok(SchwabOAuthLifecycleView::new(
             session_id,
             action,
-            SchwabOAuthLifecycleState::AwaitingAuthorization,
+            SchwabOAuthLifecycleState::AuthorizationRequired,
             None,
             None,
             None,
@@ -1941,6 +1941,14 @@ mod tests {
             .map_err(Box::<dyn std::error::Error>::from)
         };
         let session_id = Uuid::new_v4();
+        assert_eq!(
+            serde_json::to_value(lifecycle_view(
+                session_id,
+                SchwabOAuthLifecycleAction::Continue,
+                SchwabOAuthAuthorityStatus::AwaitingAuthorization,
+            )?)?["state"],
+            "authorization_required",
+        );
         let (delivered, callback) = tokio::sync::oneshot::channel();
         let (entered, admission) = tokio::sync::oneshot::channel();
         let (release, completion) = tokio::sync::oneshot::channel();

@@ -172,7 +172,7 @@ export const providerActivationSchema = z
 export const providerOAuthSchema = z.object({
   session_id: z.string().uuid(),
   action: z.enum(["begin", "continue", "cancel", "unlink"]),
-  state: z.enum(["awaiting_authorization", "exchanging_authorization", "active", "reauthorization_required", "cancelled", "unlinked"]),
+  state: z.enum(["authorization_required", "awaiting_authorization", "exchanging_authorization", "active", "reauthorization_required", "cancelled", "unlinked"]),
   access_token_generation: z.union([z.number().int().positive(), z.string().regex(/^[1-9][0-9]*$/)]).nullable(),
   access_expires_at: z.union([z.number().int(), z.string()]).nullable(),
   refresh_expires_at: z.union([z.number().int(), z.string()]).nullable(),

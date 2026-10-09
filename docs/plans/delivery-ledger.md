@@ -4,11 +4,11 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`603eb306`. Main/release unchanged; no extra branch created.
+`ea427974`. Main/release unchanged; no extra branch created.
 
 ### Active native verification and next dependency
 
-Current pushed head `d491e785` records code `603eb306`. The existing supervisor keeps
+Current pushed code `ea427974` includes automatic OAuth completion. The existing supervisor keeps
 Desktop16646 and service19062 running; source edits for automatic OAuth completion are below.
 Fresh-workspace credential import now creates Schwab setup and reuses Alpaca/SEC setup. The prior
 native callback reached exchanging_authorization only after Continue and then returned
@@ -83,6 +83,50 @@ No new endpoint, scheduler, schema migration or compatibility path. Test source 
 lead owns matching runtime replacement and real consent/API proof. Actual current stock controller
 status reports the recommended profile available with no workflow yet (`oct8-stock-workflow-current-status.json`).
 Next after replacement: start real MSFT analysis independently of supplementary Schwab completion.
+
+Pushed **ea427974**; PR43 evidence https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6073813533.
+Supervisor10180/watcher10194 now own the one matching both-target build (Cargo23543); old
+Desktop16646/service19062 stay available until successful replacement. No other compiler scheduled.
+The lead used the already-approved native previews to create the fresh workspace practice account
+with100000USD and0.25% costs, then committed allocation revision1:2–5% position weight,
+10000USD reserve,1% downside limit,365days. No paper session/order was started. Evidence:
+`oct8-paper-account-{choices,preview,created}.json`, `oct8-stock-allocation-{current-status,preview,committed}.json`.
+Reopen after this supervised replacement is the next check before starting actual MSFT analysis.
+Worktree remains singular; three local product branches. One existing open Dependabot branch/PR55
+(crc32fast1.5.0→1.5.2) is unintegrated and preserved under the dependency/WIP rule, not silently deleted.
+No agent-created branch/worktree. Active runtime stages and the original recovery workspace remain needed;
+whole-app RAM acceptance remains deferred.
+
+Native replacement completed: service24541/Desktop24556 share the new runtime generation;
+build passed5m20s. Saved practice account/allocation revision1 reopens Ready in the same workspace
+(`oct8-stock-allocation-restarted.json`). Read-only Inspect returns the new authorization field.
+Native inspection exposed a blocking presentation ambiguity: protected AwaitingAuthorization with
+no pending receiver was returned as awaiting_authorization, disabling Begin and polling without a
+browser flow. **ea427974 is not accepted as the complete native sign-in journey.** Lead owns a
+coherent correction in `provider_onboarding/{contracts,schwab_oauth_runtime}.rs`, Desktop schema
+and the existing Settings test: distinct authorization_required before Begin, awaiting_authorization
+only for the owned receiver. Extend the existing runtime regression for this exact state boundary.
+Watcher10194 stopped for that correction; app stays running. No retry/consent success claimed.
+
+Authorization state correction is critically verified: existing lifecycle regression1/1 (0.10s),
+existing Settings regression1/1 (2.66s), TypeScript and source-closure verification pass. Only the
+two changed Rust source digests changed in the closure. No new harness or compatibility path.
+Owner reports current visible chart-range, streaming-startup and financial-tab failures; these
+remain open product defects regardless of earlier successful direct backend reads. Native MSFT
+page capture (`oct8-msft-visible-failure.json`) shows retained history but a pending financial read;
+it does not prove rendered chart pixels or complete financial tabs.
+
+Current follow-up: real read-only Schwab Inspect now returns active access/refresh authorization
+(`oct8-oauth-current-inspect.json`). No Continue mutation or repeated sign-in was used to complete
+this callback. Actual API and restart reuse remain pending. The authorization-required state
+regression PASS1/1, Settings regression PASS1/1 and TypeScript pass; closure refresh is running.
+The real MSFT workflow `workflow_a7b953ce6fa9534cab0fb758e5a56b3c` is paused after five
+steps in gathering_evidence; do not duplicate it or claim completion.
+- Astra High `stock_pause_cause`: read-only diagnosis of this exact workflow using current
+  analytical controller/service/preparation source and non-secret runtime/job evidence. Own only
+  `.agents/tmp/v1-first-stock/oct8-stock-pause-cause.md`; no source edits, Git, builds, provider
+  calls, restarts or workflow mutations. Identify the actual terminal cause and smallest next
+  repair/recovery with an existing critical check. Lead retains all shared files/runtime.
 
 Read-only Astra `financial_load_diagnosis` and Sol6.1 `background_chart_diagnosis` completed/released;
 reports are `.agents/tmp/v1-first-stock/oct8-financial-load.md` and `oct8-background-chart.md`.

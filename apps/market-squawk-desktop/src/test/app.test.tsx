@@ -2591,7 +2591,7 @@ describe("Market Squawk desktop boundary", () => {
       next_action: "complete_oauth_authorization",
       credential_stored: true,
     }
-    let authorizationState = "reauthorization_required"
+    let authorizationState = "authorization_required"
     let authorizationObservations = 0
     const boundaryTransport = transport(
       blockedBootstrap,

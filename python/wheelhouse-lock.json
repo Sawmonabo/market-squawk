@@ -5928,8 +5928,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/contracts.rs",
-      "sha256": "ca5e645a6c49ba00ce41142482d03b3453995a749160738ea58e9f368eafb5aa",
-      "size_bytes": 41374
+      "sha256": "5e0ec8f550fcb64d27e5056ccb47627ac063f1f238db55b5a7de17718329a561",
+      "size_bytes": 41401
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/credential_bundle.rs",
@@ -5953,8 +5953,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_oauth_runtime.rs",
-      "sha256": "7e772cf3f36ebede79f42537ff14e0ba8e70af11d23d4486874b96e75f4fe599",
-      "size_bytes": 80257
+      "sha256": "9fdd43fb105b11e2297e5ee322982f86bc13e10ade92cf7e88102897c5242cea",
+      "size_bytes": 80551
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service.rs",
