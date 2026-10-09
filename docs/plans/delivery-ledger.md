@@ -4,9 +4,19 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`32208b4e`. Main/release unchanged; no extra branch created.
+`4dcf22ba`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
+
+Pushed `4dcf22ba`; PR43 evidence:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6072573411 .
+No compiler/native/watcher remains running. Lead is the sole active implementation owner.
+Next shared edit ownership: `provider_onboarding/contracts.rs`, source onboarding lifecycle/runtime
+verification, catalog capability producers, market-runtime configuration/generation/group, and
+persisted source lifecycle coordinates. Written contract: lease runtime evidence/digest and runtime
+request/allocation verification digest are optional; Schwab uses None, existing other-provider
+requirements stay explicit. No zero/placeholder evidence or replacement OAuth attestation. Adapter
+qualification and app consumer writers may start only once those shared signatures are written.
 
 Shutdown checkpoint implemented and critically verified: pending Schwab Start/Retry/Resynchronize/
 Reconfigure can complete ProcessShutdown through the existing actual predecessor/successor drain
