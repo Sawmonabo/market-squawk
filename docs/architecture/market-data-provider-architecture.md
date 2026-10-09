@@ -91,16 +91,22 @@ account-number scoped. See the
 [Streamer guide](https://www.schwab.com/content/how-to-use-streaming-data), and official API
 contracts linked below.
 
-**APPLICATION POLICY (2026-10-08):** capability verification is bound to the saved OAuth
-authorization, application credentials and effective scope, not the rotating access token.
-Routine refresh reuses that verification without repeating REST/Streamer probes. Its lifetime
-ends at the provider's refresh-grant deadline; sign-out, changed credentials/grant/scope and
-provider rejection still require connection recovery. Each request and Streamer handoff retains
-its actual token generation, expiry and revocation checks. The original probe token and timestamps
-remain historical evidence. This follows OAuth refresh semantics in
-[RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6) and
-[refresh-token protection in RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14).
-Implementation and live-verification status remain in the delivery ledger.
+**APPLICATION POLICY (owner correction, 2026-10-08):** saved capability probes are diagnostics,
+not an independent authorization gate. Configured credentials and current protected OAuth access
+permit requests to supported read-only routes. Actual provider responses and Streamer
+acknowledgements determine availability for the requested family; no all-family preflight is
+required. Keep original response provenance and explicit delay/depth/quality. A success in one
+family does not prove availability or real-time delivery in another.
+
+Routine refresh continues the authorization without a new probe. Each request and Streamer
+handoff still uses its actual current token, with expiry/revocation and disconnect cleanup.
+Handle invalid tokens separately from insufficient permission for a requested operation, as
+described by [RFC 6750 section 3.1](https://www.rfc-editor.org/rfc/rfc6750#section-3.1).
+Refresh handling follows [RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6)
+and [RFC 9700 section 4.14](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14).
+This is the target design: the token-refresh mismatch is corrected, but complete removal of
+saved-probe admission remains pending. Current implementation and live evidence are in the ledger;
+older doctor-gated diagrams below describe the implementation being replaced, not this correction.
 
 **RUNTIME-MEASURED VALUE:** this approved app/account returned equities, ETFs, indexes, mutual
 funds, forex, futures, options, history, hours, movers, and fundamentals; accepted 500/500 symbols

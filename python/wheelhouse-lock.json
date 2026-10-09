@@ -5323,8 +5323,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/cli_provider.rs",
-      "sha256": "0590083fcad2c168165b81faef9578a0a095d5d53790eb177d74f5017ad36eaf",
-      "size_bytes": 252484
+      "sha256": "824c0f9656cbc79110774379c10d671771f53d7f76fc5ea8a4d30d89d56e6ec5",
+      "size_bytes": 258824
     },
     {
       "path": "apps/market-squawk/src/local_product/cli_provider/ephemeral.rs",
@@ -5383,8 +5383,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/mod.rs",
-      "sha256": "5e6db56a3b9a572922feb47abdadbfcaf5d838917170c0b1a52c4bbdf67aedb7",
-      "size_bytes": 97971
+      "sha256": "9e1ac28cb6a23f3a42f7ad7d06a36d02f804935ed4292ee2f87d1a31428f1913",
+      "size_bytes": 98102
     },
     {
       "path": "apps/market-squawk/src/local_product/operations/backup.rs",
@@ -5503,8 +5503,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/source_lifecycle.rs",
-      "sha256": "38c9f37e47c126fe0af2ba4062a6bbd1a740d6b7d1051e7d602856a88f254e45",
-      "size_bytes": 145712
+      "sha256": "1c462c76695378307921342abd393977e4f9ee37f59bcf06f62e455f26dd2b87",
+      "size_bytes": 147399
     },
     {
       "path": "apps/market-squawk/src/local_product/source_lifecycle/credential_access.rs",

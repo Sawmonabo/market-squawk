@@ -41,6 +41,20 @@ focus or screen. Use the optional development-only embedded WebDriver path docum
 service. Do not resume global keystrokes or foreground automation while the owner works. Native
 dialog and external OAuth interaction require separate evidence; WebView checks do not prove them.
 
+## Owner correction: connection verification is diagnostic — 2026-10-08
+
+Saved Schwab connection probes must not independently reject an otherwise usable OAuth connection.
+Use configured application credentials and the current protected OAuth authorization for access;
+refresh automatically and handle actual provider expiry, revocation or permission failures at the
+affected connection or data family. Do not require every optional REST/Streamer family to pass a
+probe before serving a requested family. Retain diagnostics as observations, not another permission
+system, and do not replace the removed gate with fabricated verification receipts.
+
+Preserve exact response provenance, real delay/depth/quality semantics, bounded shared provider use
+and disconnect cleanup. A successful request does not prove another family's availability or make
+delayed data real-time. The delivery ledger distinguishes this required simplification from the
+narrower token-refresh correction already implemented and from pending live proof.
+
 ## Owner correction: trusted source development — 2026-10-03
 
 Ordinary local development uses the managed editable source environment. Do not require a signed

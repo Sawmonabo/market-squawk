@@ -212,7 +212,10 @@ impl SchwabOAuthMarketDrain for RegistryBackedSchwabMarketDrain {
             lifecycle
                 .drain_schwab_oauth(session_id, current, purpose, &cancellation)
                 .await
-                .map_err(|_error| SchwabOAuthMarketDrainError)
+                .map_err(|error| {
+                    tracing::warn!(?purpose, ?error, "Schwab market runtime drain failed");
+                    SchwabOAuthMarketDrainError
+                })
         })
     }
 }

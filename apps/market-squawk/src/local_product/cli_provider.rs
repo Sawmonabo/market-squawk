@@ -5344,6 +5344,176 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[tokio::test]
+    async fn schwab_process_shutdown_preserves_failed_start_and_requires_owned_cleanup()
+    -> TestResult {
+        use crate::application::{
+            AccountMarketSurface, MarketRuntimeGroupGeneration,
+            PreparedMarketProviderConfigurationRequest, SourceLifecycleAuthority,
+            SourceLifecycleError,
+        };
+        use crate::local_product::{
+            RegistryBackedSchwabMarketDrain,
+            provider_activation_state::{
+                AccountAllocationCoordinates, AccountLifecycleAction, AccountStopDisposition,
+                PendingAccountLifecycle,
+            },
+        };
+        use crate::provider_onboarding::{SchwabOAuthMarketDrain, SchwabOAuthMarketDrainPurpose};
+
+        let temporary = tempfile::tempdir()?;
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("data")),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let product = crate::LocalProduct::try_new(config).await?;
+        let state = product.provider_activation_state();
+        let surface = AccountMarketSurface::SchwabMarketData;
+        let session = Uuid::new_v4();
+        let configuration = EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]);
+        let command = EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]);
+        // This is the durable state left when Start's constructor fails before admitting
+        // a runtime. Exercise its real lifecycle and OAuth drain, not a mock drain result.
+        let before = state.source_lifecycle_record(surface.surface_id())?;
+        let pending = PendingAccountLifecycle {
+            action: AccountLifecycleAction::Start,
+            predecessor: None,
+            disposition: AccountStopDisposition::NoPredecessor,
+            target_session_id: Some(session),
+            target_configuration_sha256: Some(lower_hex(&configuration.bytes())),
+            successor: None,
+            retired_successor: None,
+            successor_retirement: None,
+            finished: false,
+            oauth_restore_active: false,
+        };
+        let failed_start = {
+            let _gate = state.try_acquire_source_lifecycle()?;
+            state.begin_account_lifecycle(
+                surface.surface_id(),
+                &before,
+                SourceIdentifier::try_from("failed-schwab-start")?,
+                command,
+                pending.clone(),
+            )?
+        };
+        let drain = RegistryBackedSchwabMarketDrain::default();
+        drain.bind(&product.source_lifecycle)?;
+        let cancellation = CancellationToken::new();
+        assert!(
+            drain
+                .drain(
+                    Uuid::new_v4(),
+                    None,
+                    SchwabOAuthMarketDrainPurpose::ProcessShutdown,
+                    cancellation.clone(),
+                )
+                .await
+                .is_err()
+        );
+        product
+            .source_lifecycle
+            .finish_shutdown(Instant::now() + Duration::from_secs(5))
+            .await?;
+        for _ in 0..2 {
+            drain
+                .drain(
+                    session,
+                    None,
+                    SchwabOAuthMarketDrainPurpose::ProcessShutdown,
+                    cancellation.clone(),
+                )
+                .await?;
+            assert_eq!(
+                state.source_lifecycle_record(surface.surface_id())?,
+                failed_start
+            );
+        }
+        assert!(
+            drain
+                .drain(
+                    session,
+                    None,
+                    SchwabOAuthMarketDrainPurpose::Unlink,
+                    cancellation.clone(),
+                )
+                .await
+                .is_err()
+        );
+
+        // Saved successor coordinates without their real allocation do not prove cleanup.
+        // These expected coordinates are inert and must never mint a runtime drain receipt.
+        let request = PreparedMarketProviderConfigurationRequest::try_new(
+            surface,
+            session,
+            configuration,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
+            market_squawk_platform::SecretGeneration::new(1)?,
+        )?;
+        let generation = MarketRuntimeGroupGeneration::try_from_expected_digest(
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [4; 32]),
+        )?;
+        let mut missing_successor = pending.clone();
+        missing_successor.successor = Some(AccountAllocationCoordinates::from_observed(
+            request, generation,
+        ));
+        let unresolved = {
+            let _gate = state.try_acquire_source_lifecycle()?;
+            state.update_account_lifecycle(
+                surface.surface_id(),
+                &failed_start,
+                missing_successor,
+                DurableSourceLifecyclePhase::Applying,
+                None,
+            )?
+        };
+        assert_eq!(
+            product
+                .source_lifecycle
+                .finish_shutdown(Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(SourceLifecycleError::ReconciliationRequired)
+        );
+        assert!(
+            drain
+                .drain(
+                    session,
+                    None,
+                    SchwabOAuthMarketDrainPurpose::ProcessShutdown,
+                    cancellation,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.source_lifecycle_record(surface.surface_id())?,
+            unresolved
+        );
+        // Restore only the synthetic fixture before draining the remaining local owners.
+        {
+            let _gate = state.try_acquire_source_lifecycle()?;
+            state.update_account_lifecycle(
+                surface.surface_id(),
+                &unresolved,
+                pending,
+                DurableSourceLifecyclePhase::Applying,
+                None,
+            )?;
+        }
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn schwab_doctor_scheduler_coalesces_replacement_and_unlink_drain() -> TestResult {
         let tasks = SchwabMarketDoctorTaskAuthority::new();
         let session_id = Uuid::new_v4();

@@ -796,6 +796,45 @@ impl ProductionSourceLifecycleAuthority {
             .durable
             .source_lifecycle_record(surface.surface_id())
             .map_err(map_durable_error)?;
+        if action == AccountLifecycleAction::OAuthProcessShutdown
+            && let Some(pending) = current.account().filter(|pending| {
+                !pending.finished
+                    && matches!(
+                        pending.action,
+                        AccountLifecycleAction::Start
+                            | AccountLifecycleAction::Retry
+                            | AccountLifecycleAction::Resynchronize
+                            | AccountLifecycleAction::Reconfigure
+                    )
+            })
+        {
+            let owns_session = pending.target_session_id == Some(session)
+                || [
+                    pending.predecessor.as_ref(),
+                    pending.successor.as_ref(),
+                    pending.retired_successor.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|allocation| allocation.session_id() == session);
+            if !owns_session {
+                return Err(SourceLifecycleError::ReconciliationRequired);
+            }
+            // A failed Start remains retryable after its actual runtime has drained. OAuth
+            // process shutdown must join that same intent without replacing it with Stop.
+            // Let the continuation distinguish the original from any successor; the OAuth
+            // preparation above validates the current session, not its predecessor role.
+            self.continue_account_transition(
+                current,
+                surface,
+                deadline,
+                cancellation,
+                false,
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
         let record = if let Some(pending) = current.account().filter(|pending| !pending.finished) {
             if !matches!(
                 pending.action,

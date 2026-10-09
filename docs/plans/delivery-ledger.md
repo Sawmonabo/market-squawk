@@ -4,9 +4,83 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`2906fa5d`. Main/release unchanged; no extra branch created.
+`32208b4e`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
+
+Shutdown checkpoint implemented and critically verified: pending Schwab Start/Retry/Resynchronize/
+Reconfigure can complete ProcessShutdown through the existing actual predecessor/successor drain
+without erasing restart intent. Foreign-session/unlink rejection and missing-successor failures
+remain. Registry bridge reports closed error/purpose before mapping, without secrets.
+Focused existing library target: new real LocalProduct/registry shutdown regression PASS1/1,1.36s;
+single-job nonincremental compilation3m47s. Existing suspended-constructor/original-cleanup regression
+PASS1/1,1.23s on the same binary without recompilation. Logs `oct8-pending-start-shutdown-critical.log`
+and `oct8-retained-start-cleanup-critical.log`. Source closure refreshed and diff whitespace passed.
+Both helper assignments are complete/released. Lead owns final integration/Git and next shared
+contract edits. This is not native shutdown/restart proof: old native failed and remains preserved.
+Resulting pushed commit is recorded below after push; no native rebuild or second test target needed.
+
+Gate-removal diagnosis is complete at32208b4e. Required next coherent change: configured Schwab
+lease + actual protected OAuth owner authorize requests; saved doctor evidence becomes absent from
+activation/runtime generation identity. Existing optional source receipt fields must preserve exact
+None, not fake digests. REST qualification derives from its actual sealed response/current epoch;
+Streamer uses its actual bootstrap/ACK/data. Remove automatic full-family doctor scheduler and its
+orphan producers; keep configured rights, actual delay/quality and disconnect/publication barriers.
+Lead first owns shared source/catalog/lease and persisted lifecycle coordinate changes; disjoint
+adapter and app consumer ownership follows written contracts. Existing recovery test must become
+no-doctor actual-constructor/request/stop/reopen proof; revoked-epoch publication remains checked.
+Do not launch another native build before this integrated removal is coherent. Fresh native setup,
+all-nine shared demand and complete financial/Desktop journeys remain subsequent dependencies.
+
+Read-only old-workspace evidence confirms both lifecycle slot payloads (SHA-256 checked) retain
+revision2, phaseApplying, actionStart, finished=false, NoPredecessor and no predecessor/successor/
+retired-successor. This matches the diagnosed shutdown-rejection precondition; old generic log
+still cannot prove the erased inner error. No workspace write. Lead added closed purpose/error
+logging at the registry drain bridge (no tokens/session data) for the next native lifecycle check.
+
+Shutdown implementation ownership: AstraHigh shutdown_source_diagnosis now owns ONLY
+`apps/market-squawk/src/local_product/source_lifecycle.rs` and its existing local tests for the
+pending Start -> ProcessShutdown rejection. Reuse actual predecessor/successor drain, validate
+session association, preserve unfinished intent, never start on shutdown or skip retained cleanup.
+Agent may additionally edit existing local-product test harness in cli_provider.rs ONLY if a
+real fixture is needed (no production scheduler edits). Lead reserves mod.rs bridge diagnostics,
+shared contracts, ledger, builds/Git. Critical gap is the actual pending-intent/OAuth drain edge,
+not just enum matching; prove idempotence and retained failure using existing runtime fixtures.
+No new runtime/provider calls. Integration waits for frozen patch and smallest relevant check.
+
+Owner clarification: saved diagnostic verification must not independently reject a usable OAuth
+connection. Previous conversational turn clarified the design but made no implementation progress.
+Current base32208b4e; prior2906fa5d only fixes routine token-refresh identity, not the complete gate.
+Acceptance1/5/7: remove redundant saved-probe admission machinery while retaining genuine provider
+permission, current credentials/revocation, data semantics and stop/drain correctness.
+AstraHigh schwab_start_epoch owns ONLY `.agents/tmp/v1-first-stock/oct8-verification-gate-removal.md`:
+refresh exact gate callers and propose one coherent in-place removal with existing critical checks.
+Do not change source/build/Git/runtime; lead reserves all shared contracts and implementation.
+Shutdown diagnosis remains separate and active; its existing report owner stays unchanged.
+Next dependency: inspect both diagnoses, fix shutdown in its existing lifecycle path, then integrate
+probe-gate removal in producer/consumers. Pushed result pending; native completion still unproved.
+
+Native transition finding: owned supervisor/service processes are terminal and Vite1420 is closed.
+Service88033 exited1: application domain Source shutdown returned ServiceError::Unavailable;
+transport/admission/jobs/audit/rendezvous stopped successfully, application=false. Launcher refused
+replacement as designed and removed unreferenced staged binaries. No force kill or database mutation.
+AstraHigh shutdown_source_diagnosis owns ONLY `.agents/tmp/v1-first-stock/oct8-source-shutdown.md`:
+trace this specific failure from service/mod.rs1452 and existing Source shutdown ownership. Read-only
+source/log inspection; no builds/Git/processes/provider actions. Return exact candidate cause and
+smallest relevant existing check; lead owns code/runtime/fresh setup. This failed lifecycle check
+must be resolved, not waived by fresh workspace. Independent native compilation may proceed only
+without starting a replacement until diagnosis establishes a safe next action.
+
+Native deployment checkpoint (lead only, no new agent assignments): use the existing supervised
+single build/watch command with fresh `.market-squawk/v1-owner-test/{data,installation}`. The
+previous `.market-squawk/v1-owner-test-corrected-2026-10-03` remains untouched recovery evidence.
+This follows the owner's explicit fresh-workspace/no-migrations decision. No credential state is
+converted or copied as trusted authorization. Reimport the owner's credential configuration through
+the existing protected workflow; genuine Schwab consent may need the owner. Critical outcome is
+fresh native admission, real Start, retained authorization after refresh/restart, then all-nine
+canonical demand. Continue independent product work if provider consent waits; never claim it passed.
+Shutdown only supervisor60780 and its owned children; leave unrelated sessions/processes alone.
+
 
 Grant-refresh correction pushed as2906fa5d, implemented and critically verified; native verification remains open.
 PR43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6072405940 .
@@ -31,8 +105,8 @@ Critical evidence (existing checks, single-job/nonincremental compilation):
 - Existing actual adapter REST/Streamer qualification: PASS1/1,0.03s.
   `oct8-grant-streamer-critical.log`. Source closure refresh and diff whitespace check pass.
 
-No native rebuild yet; supervisor60780 and service88033 remain running atf1a30127; watcher60793
-is stopped. Prior DesktopPID88040 is no longer present at final process check. The
+Historical pre-transition observation: supervisor60780/service88033 were atf1a30127 and
+watcher60793 stopped; Desktop88040 had exited. All are now terminal as recorded above. The
 real Start constructor and automatic all-nine Desktop updates are not proved by these fixture
 checks. Greenfield persisted shape changed: old OAuth/doctor records are not silently converted.
 Next dependency: fresh authorized V1 state and normal native setup/Start/restart proof, retaining
