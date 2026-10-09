@@ -11629,3 +11629,23 @@ turn adds actual native evidence and identifies the next required dependency.
 No compiler or new native generation until these dependent producer/consumer changes are frozen.
 Current cache checkpoint complete as implemented/critically verified/native-read verified; instant
 loading, missing NVDA input and fund workflows remain open. Pushed native-evidence commit pending.
+
+Lead token-consumer scope is explicit: app `src/application/contracts.rs`,
+`src/application/contracts/output.rs`, services `src/output_schema.rs`, and existing fixtures
+Desktop `src/test/app.test.tsx`, app `src/service/market_evidence/job.rs` and
+`src/application/analytical_workflow/workflow_driver.rs`. Desktop's existing opaque-token validator
+already accepts64 hex characters; tightening it is deferred until the matching backend replaces
+the live32-character producer, avoiding new UI/old-native failures during this development build.
+
+NVDA diagnosis closed as source-honest incomplete proxy context, not a missing annual ratio.
+Lead independently rehashed/read the exact4,092,966-byte original CompanyFacts payload:27,281
+occurrences,40 for proxy accession0001045810-26-000036, net income and ECD compensation/return
+concepts but no revenue. Native row25 reports annual net margin0.556025340607026090822365679;
+row21 is the separate later proxy. Evidence:oct9-nvda-net-margin.md. Astra ownership released.
+Display of existing filedOn beside period is the bounded remaining clarity improvement.
+
+Indexed-token implementation is WIP, NOT deployed or verified. Sol found UUID-only saved-token
+validation in analytical_workflow.rs and unchanged token replay in workflow_driver.rs. Lead will
+not build/deploy or tighten persisted-document validation until exact retained workflow identity
+and reopening behavior are reconciled; no live state changed. Sol continues the read-only trace.
+Current native generation remains the verified31bcb86a code; source watcher stays stopped.
