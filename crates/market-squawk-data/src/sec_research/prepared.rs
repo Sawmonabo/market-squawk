@@ -1189,7 +1189,6 @@ pub trait SecResearchDisplayProjector: Send + Sync {
 #[derive(Clone, Debug)]
 pub(super) struct SecResearchDisplayRows {
     artifact: Arc<PreparedArtifact>,
-    connection: Arc<Mutex<Connection>>,
     projector: EvidenceDigest,
 }
 impl PartialEq for SecResearchDisplayRows {
@@ -1199,46 +1198,66 @@ impl PartialEq for SecResearchDisplayRows {
 }
 impl Eq for SecResearchDisplayRows {}
 impl SecResearchSelection {
-    /// Positions refer to selected(), while each lookup retains the original source ordinal.
-    /// Omitted display rows remain fully present in the source and selection evidence.
-    pub fn selected_display_coordinates(
+    /// Streams display coordinates in selected-position order on an operation-owned reader.
+    /// NULL coordinates are intentional omissions; absent ordinal/state rows are corrupt.
+    /// The inner result preserves the visitor's error independently of source read failures.
+    pub fn visit_selected_display_coordinates<E>(
         &self,
-    ) -> Result<
-        impl Iterator<
-            Item = Result<(usize, Option<SecResearchDisplayCoordinate>), SecResearchReadError>,
-        > + '_,
-        SecResearchReadError,
-    > {
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        mut visit: impl FnMut(usize, Option<SecResearchDisplayCoordinate>) -> Result<(), E>,
+    ) -> Result<Result<(), E>, SecResearchReadError> {
+        check_operation(deadline, cancellation)?;
         let display = self
             .display
             .as_ref()
             .ok_or(SecResearchReadError::PreparationRequired)?;
+        let connection = display.artifact.connection(deadline, cancellation)?;
+        let result: Result<Result<(), E>, SecResearchReadError> = (|| {
+            let mut statement = connection
+                .prepare("SELECT ordinal,state,payload FROM display_rows ORDER BY ordinal,state")?;
+            let mut rows = statement.query([])?;
+            let mut previous = None;
+            for (position, selected) in self.selected.iter().enumerate() {
+                check_operation(deadline, cancellation)?;
+                let ordinal = selected.row.row_ordinal;
+                if previous.is_some_and(|previous| previous >= ordinal) {
+                    return Err(SecResearchReadError::PreparedIntegrity);
+                }
+                previous = Some(ordinal);
+                let target = (ordinal, state_tag(selected.point_in_time.revision_state));
+                let coordinate = loop {
+                    check_operation(deadline, cancellation)?;
+                    let row = rows
+                        .next()?
+                        .ok_or(SecResearchReadError::PreparedIntegrity)?;
+                    let key = (row.get::<_, u32>(0)?, row.get::<_, u8>(1)?);
+                    match key.cmp(&target) {
+                        std::cmp::Ordering::Less => continue,
+                        std::cmp::Ordering::Greater => {
+                            return Err(SecResearchReadError::PreparedIntegrity);
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let bytes: Option<Vec<u8>> = row.get(2)?;
+                            break bytes
+                                .map(|bytes| {
+                                    serde_json::from_slice(&bytes)
+                                        .map_err(|_| SecResearchReadError::PreparedIntegrity)
+                                })
+                                .transpose()?;
+                        }
+                    }
+                };
+                if let Err(error) = visit(position, coordinate) {
+                    return Ok(Err(error));
+                }
+            }
+            Ok(Ok(()))
+        })();
+        // SQLite interruption must retain the operation's cancellation/deadline outcome.
+        check_operation(deadline, cancellation)?;
         display.artifact.validate_endpoint()?;
-        Ok(self
-            .selected
-            .iter()
-            .enumerate()
-            .map(move |(position, selected)| {
-                let connection = display
-                    .connection
-                    .lock()
-                    .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
-                let payload: Option<Vec<u8>> = connection.query_row(
-                    "SELECT payload FROM display_rows WHERE ordinal=?1 AND state=?2",
-                    params![
-                        selected.row.row_ordinal,
-                        state_tag(selected.point_in_time.revision_state)
-                    ],
-                    |row| row.get(0),
-                )?;
-                let coordinate = payload
-                    .map(|bytes| {
-                        serde_json::from_slice(&bytes)
-                            .map_err(|_| SecResearchReadError::PreparedIntegrity)
-                    })
-                    .transpose()?;
-                Ok((position, coordinate))
-            }))
+        result
     }
 }
 impl SecResearchReadCapability {
@@ -1435,10 +1454,8 @@ impl SecResearchReadCapability {
         }
         artifact.validate_endpoint()?;
         check_operation(deadline, cancellation)?;
-        connection.progress_handler(0, None::<fn() -> bool>)?;
         let display = SecResearchDisplayRows {
             artifact,
-            connection: Arc::new(Mutex::new(connection)),
             projector,
         };
         self.prepared_reads.insert_display(key, display.clone())?;

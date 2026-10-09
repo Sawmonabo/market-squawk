@@ -690,6 +690,10 @@ impl CandidateStore {
         {
             let mut read = self.connection.prepare("SELECT c.id,c.family,c.revision,c.payload FROM candidates c INDEXED BY canonical_order JOIN states s ON s.id=c.id WHERE s.reasons=0 ORDER BY c.family,c.revision,c.payload,c.evidence,c.id").map_err(storage)?;
             let mut rows = read.query([]).map_err(storage)?;
+            let mut insert = self
+                .connection
+                .prepare("INSERT INTO groups VALUES(?,?,?,?,?)")
+                .map_err(storage)?;
             let mut group: Option<Group> = None;
             while let Some(row) = rows.next().map_err(storage)? {
                 control.observe()?;
@@ -700,7 +704,10 @@ impl CandidateStore {
                     .as_ref()
                     .is_some_and(|g| g.family != family || g.revision != revision)
                 {
-                    self.insert_group(group.take().ok_or(PointInTimeError::CanonicalEncoding)?)?;
+                    Self::insert_group(
+                        &mut insert,
+                        group.take().ok_or(PointInTimeError::CanonicalEncoding)?,
+                    )?;
                 }
                 if let Some(group) = &mut group {
                     group.eligible = group
@@ -726,7 +733,7 @@ impl CandidateStore {
                 }
             }
             if let Some(group) = group {
-                self.insert_group(group)?;
+                Self::insert_group(&mut insert, group)?;
             }
         }
         let families: usize = self
@@ -907,18 +914,15 @@ impl CandidateStore {
         })
     }
 
-    fn insert_group(&self, group: Group) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO groups VALUES(?,?,?,?,?)",
-                params![
-                    group.family,
-                    group.revision,
-                    sql_integer(group.variants)?,
-                    sql_integer(group.eligible)?,
-                    group.first_id
-                ],
-            )
+    fn insert_group(insert: &mut rusqlite::Statement<'_>, group: Group) -> Result<()> {
+        insert
+            .execute(params![
+                group.family,
+                group.revision,
+                sql_integer(group.variants)?,
+                sql_integer(group.eligible)?,
+                group.first_id
+            ])
             .map_err(storage)?;
         Ok(())
     }

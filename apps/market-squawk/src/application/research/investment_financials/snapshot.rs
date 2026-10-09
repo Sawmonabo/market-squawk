@@ -26,6 +26,15 @@ pub(super) fn build_snapshot(
     let mut ordinal = 0_i64;
     let mut omitted_facts = 0_usize;
     let mut issuer = None;
+    let mut insert_coordinate = connection.prepare(
+        "INSERT INTO source_coordinates(ordinal,family,position,envelope,effective_day,effective_time,published_day,published_time) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    ).map_err(sql_error)?;
+    let mut insert_nonnumeric = connection
+        .prepare(
+            "INSERT INTO nonnumeric_inputs(family,context,inputs) VALUES(?1,?2,?3)
+         ON CONFLICT(family,context) DO UPDATE SET inputs=inputs|excluded.inputs",
+        )
+        .map_err(sql_error)?;
     for (family, selected) in selections.iter().enumerate() {
         check(deadline, cancellation)?;
         if !authorized[family] {
@@ -78,45 +87,44 @@ pub(super) fn build_snapshot(
                         .map_err(canonical_error)?;
                     let inputs = financial_input_bit(occurrence.concept().local_name().as_str());
                     if inputs != 0 {
-                        connection.execute(
-                            "INSERT INTO nonnumeric_inputs(family,context,inputs) VALUES(?1,?2,?3)
-                             ON CONFLICT(family,context) DO UPDATE SET inputs=inputs|excluded.inputs",
-                            params![family as i64, occurrence.context_id().as_str(), i64::from(inputs)],
-                        ).map_err(sql_error)?;
+                        insert_nonnumeric
+                            .execute(params![
+                                family as i64,
+                                occurrence.context_id().as_str(),
+                                i64::from(inputs)
+                            ])
+                            .map_err(sql_error)?;
                     }
                 }
             }
         }
-        for coordinate in exact
-            .selected_display_coordinates()
-            .map_err(map_company_data_error)
-            .map_err(canonical_error)?
-        {
-            check(deadline, cancellation)?;
-            let (position, coordinate) = coordinate
-                .map_err(map_company_data_error)
-                .map_err(canonical_error)?;
-            let Some(coordinate) = coordinate else {
-                omitted_facts = omitted_facts
+        exact
+            .visit_selected_display_coordinates(deadline, cancellation, |position, coordinate| -> Result<(), ServiceError> {
+                check(deadline, cancellation)?;
+                let Some(coordinate) = coordinate else {
+                    omitted_facts = omitted_facts
+                        .checked_add(1)
+                        .ok_or(ServiceError::ResourceExhausted)?;
+                    return Ok(());
+                };
+                // Positions address the original immutable selection, not source ordinals.
+                // Page reads still decode and validate only the requested original evidence.
+                insert_coordinate
+                    .execute(params![ordinal, family as i64, position as i64, coordinate.envelope(),
+                        coordinate.effective_day(), coordinate.effective_time(),
+                        coordinate.published_day(), coordinate.published_time()])
+                    .map_err(sql_error)?;
+                ordinal = ordinal
                     .checked_add(1)
                     .ok_or(ServiceError::ResourceExhausted)?;
-                continue;
-            };
-            // The data iterator yields selected positions, not original source ordinals.
-            // Page reads still decode and validate only the requested original evidence.
-            connection
-                .execute(
-                    "INSERT INTO source_coordinates(ordinal,family,position,envelope,effective_day,effective_time,published_day,published_time) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![ordinal, family as i64, position as i64, coordinate.envelope(),
-                        coordinate.effective_day(), coordinate.effective_time(),
-                        coordinate.published_day(), coordinate.published_time()],
-                )
-                .map_err(sql_error)?;
-            ordinal = ordinal
-                .checked_add(1)
-                .ok_or(ServiceError::ResourceExhausted)?;
-        }
+                Ok(())
+            })
+            // Source errors and the visitor's original service errors remain distinct.
+            .map_err(map_company_data_error)
+            .map_err(canonical_error)??;
     }
+    drop(insert_coordinate);
+    drop(insert_nonnumeric);
     check(deadline, cancellation)?;
     finish_coordinates(&connection)?;
     check(deadline, cancellation)?;

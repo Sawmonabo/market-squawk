@@ -4773,8 +4773,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/snapshot.rs",
-      "sha256": "442697da939056c961b27a090c5416653670e7a20a091ce0a70ecb6754725a3e",
-      "size_bytes": 7751
+      "sha256": "85b0f355f6b3c6cf2fb641ffe5694e44803367c54a5aebb58897a7a58ff5bae0",
+      "size_bytes": 8134
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_profile.rs",
@@ -7673,8 +7673,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/pit/disk.rs",
-      "sha256": "4a5aaf5ab0b269ef99f67f1a89a885e5da945151ec2640d47c63cf8c713b31b1",
-      "size_bytes": 45066
+      "sha256": "c1df7c05d5000127c275b65f7dc45613d7efc22f8bcd098be4e31eae07fc3e78",
+      "size_bytes": 45239
     },
     {
       "path": "crates/market-squawk-data/src/pit/model.rs",
@@ -7903,8 +7903,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/sec_research/prepared.rs",
-      "sha256": "1351a55a8ee2c22edb6c9091af86b2015ef993c4f5f54d1b9e67b89e24aa28c7",
-      "size_bytes": 59984
+      "sha256": "2f7731bdd9194c5fe539a3b1e65fdf845c86c6516c9eba7fd9b07bbb5191b8a8",
+      "size_bytes": 61290
     },
     {
       "path": "crates/market-squawk-data/src/sec_research/prepared/cache.rs",
@@ -10043,8 +10043,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/built_in_profiles.rs",
-      "sha256": "11b621b7dd71327a59642ff454c1ce4f53f8ac97d5a529240677041a58e532bd",
-      "size_bytes": 130926
+      "sha256": "fc0489598f27cd59e5beb781212f2a261a165f62d6a6ae00de5e6c4342b7ad51",
+      "size_bytes": 131726
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/capability.rs",
@@ -10058,8 +10058,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/profile.rs",
-      "sha256": "9c9383b4b03ca0954f45c4f7634ce2c81cf9d67e5a05eea7dad0b8053d986015",
-      "size_bytes": 30880
+      "sha256": "dff97e687e6ff19099d2e484f1fb9119aacd26c9bd0ef3c0600f7ca748ebdb44",
+      "size_bytes": 31287
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/public_configuration.rs",
@@ -10078,8 +10078,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/tests.rs",
-      "sha256": "1f1e43b657741f2f6b1e4318ff97d26698db4e3d585bb227e4ea354cb7213861",
-      "size_bytes": 89882
+      "sha256": "edb76619d8eacae172a3d1f346d9c25d38e5fc6087d253c32f09c4ca353f4a57",
+      "size_bytes": 90934
     },
     {
       "path": "crates/market-squawk-sources/src/order.rs",

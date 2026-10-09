@@ -1275,7 +1275,24 @@ fn finish_profile(
     capability: ProviderCapability,
 ) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
-    let operational_rate_policy = capability.rate_policy().clone();
+    // Scheduling capacity is not saved consent. Keep the admitted capability stable while
+    // applying the current aggregate SEC ceiling through the existing operational policy.
+    let operational_rate_policy = if spec.id == SEC_EDGAR_PROFILE_ID {
+        RatePolicyDescriptor::try_new_enforced(
+            SourceIdentifier::try_from(spec.rate_policy)?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            true,
+            ProviderCapabilityRevision::new(3)?,
+            SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            SEC_EDGAR_AUTHORITY
+                .budget_policy()
+                .map_err(|_| ProviderProfileError::InvalidProfile)?,
+            true,
+        )?
+    } else {
+        capability.rate_policy().clone()
+    };
     ProviderOnboardingProfile::try_new(ProviderOnboardingProfileInput {
         id: spec.id,
         display_name: spec.display_name,
@@ -1519,9 +1536,8 @@ fn built_in_budget(
     let backoff =
         BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?;
     match spec.id {
-        SEC_EDGAR_PROFILE_ID => SEC_EDGAR_AUTHORITY
-            .budget_policy()
-            .map_err(|_| ProviderProfileError::InvalidProfile),
+        // These bytes identify retained admission evidence, not current scheduling capacity.
+        SEC_EDGAR_PROFILE_ID => simple_budget("us-sec-edgar", None, 2, SECOND_NANOS, 1, backoff),
         "bls.v1-unregistered" => bls_budget(None, 25, backoff),
         "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 400, backoff),
         FRED_PROFILE => fred_budget(backoff, "fred.onboarding-api-key"),

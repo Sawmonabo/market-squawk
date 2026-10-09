@@ -2894,12 +2894,27 @@ async fn exercise_prepared_sec_backup(
         }
         fn project(
             &self,
-            _row: &market_squawk_data::SecResearchSourceRow<'_>,
-            _state: market_squawk_data::PointInTimeRevisionState,
+            row: &market_squawk_data::SecResearchSourceRow<'_>,
+            state: market_squawk_data::PointInTimeRevisionState,
         ) -> Result<Option<market_squawk_data::SecResearchDisplayCoordinate>, SecResearchReadError>
         {
+            let ResearchObservation::Fundamental(fact) = row.observation() else {
+                return Err(SecResearchReadError::OriginMismatch);
+            };
+            if fact.concept().as_str().ends_with("NetIncomeLoss") {
+                return Ok(None);
+            }
+            let state = match state {
+                market_squawk_data::PointInTimeRevisionState::Current => 1,
+                market_squawk_data::PointInTimeRevisionState::Superseded => 2,
+                market_squawk_data::PointInTimeRevisionState::SupersessionIncomparable => 3,
+            };
             Ok(Some(market_squawk_data::SecResearchDisplayCoordinate::new(
-                None, 0, None, None, None,
+                Some(fact.concept().as_str().as_bytes().to_vec()),
+                state,
+                None,
+                None,
+                None,
             )))
         }
     }
@@ -2948,13 +2963,57 @@ async fn exercise_prepared_sec_backup(
     };
     assert_eq!(warm_facts.receipt(), exact.receipt());
     assert_eq!(warm_facts.selected(), exact.selected());
+    let mut visited = 0;
+    let mut omitted = 0;
+    warm_facts.visit_selected_display_coordinates(
+        deadline(),
+        cancellation,
+        |position, coordinate| -> TestResult {
+            assert_eq!(position, visited);
+            let selected = &exact.selected()[position];
+            let observation = exact
+                .decoded_rows()
+                .get(selected.row().row_ordinal() as usize)?
+                .ok_or("missing original display row")?;
+            let ResearchObservation::Fundamental(fact) = observation else {
+                return Err("unexpected display source family".into());
+            };
+            if fact.concept().as_str().ends_with("NetIncomeLoss") {
+                assert!(coordinate.is_none());
+                omitted += 1;
+            } else {
+                let coordinate = coordinate.ok_or("lost selected display coordinate")?;
+                assert_eq!(
+                    coordinate.envelope(),
+                    Some(fact.concept().as_str().as_bytes())
+                );
+                let expected_state = match selected.point_in_time().revision_state() {
+                    market_squawk_data::PointInTimeRevisionState::Current => 1,
+                    market_squawk_data::PointInTimeRevisionState::Superseded => 2,
+                    market_squawk_data::PointInTimeRevisionState::SupersessionIncomparable => 3,
+                };
+                assert_eq!(coordinate.effective_day(), expected_state);
+            }
+            visited += 1;
+            Ok(())
+        },
+    )??;
+    assert_eq!(visited, exact.selected().len());
+    assert_eq!(omitted, 1);
+    // Consumer errors and cancellation do not become successful partial scans.
     assert_eq!(
         warm_facts
-            .selected_display_coordinates()?
-            .collect::<Result<Vec<_>, _>>()?
-            .len(),
-        exact.selected().len(),
+            .visit_selected_display_coordinates(deadline(), cancellation, |_, _| Err(7_u8))?,
+        Err(7)
     );
+    let scan_cancellation = CancellationToken::new();
+    assert!(matches!(
+        warm_facts.visit_selected_display_coordinates(deadline(), &scan_cancellation, |_, _| {
+            scan_cancellation.cancel();
+            Ok::<_, SecResearchReadError>(())
+        }),
+        Err(SecResearchReadError::Cancelled)
+    ));
     let restricted = market_squawk_data::SecResearchIdentityReadRequest::try_new(
         source_request.instrument_id(),
         source_request.family(),
@@ -3010,7 +3069,12 @@ async fn exercise_prepared_sec_backup(
         assert_eq!(file.metadata()?.len(), before.len());
     }
     assert!(matches!(
-        warm_facts.selected_display_coordinates(),
+        warm_facts.visit_selected_display_coordinates(deadline(), cancellation, |_, _| Ok::<
+            _,
+            SecResearchReadError,
+        >(
+            ()
+        )),
         Err(SecResearchReadError::PreparedIntegrity)
     ));
     assert!(matches!(

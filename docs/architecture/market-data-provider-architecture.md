@@ -144,9 +144,10 @@ from handoff. Sustained processing lag still requires actual throughput and cont
 
 Current rate enforcement belongs to the onboarding profile, independently of the immutable
 capability used to bind saved consent and credential identity. Scheduling, Settings disclosure and
-activation leases consume that one descriptor. This request-window correction preserves the
-admitted evidence, account collision scope, concurrency, backoff and refusal behavior; full
-policy comparisons still reject stale operational authority. `admitted_rights_duties` preserves the
+activation leases consume that one descriptor. A concurrency-only correction preserves every
+request window, scope, backoff and refusal rule; removal of an unsupported numeric request quota
+preserves concurrency. Neither correction rewrites saved admission evidence. Full policy comparisons
+still reject stale operational authority. `admitted_rights_duties` preserves the
 original authorization evidence, including its former rate-policy description; it does not describe
 current scheduling. The separately exposed `rate_policy` is the current operational authority.
 This rate correction does not require provider reconsent.

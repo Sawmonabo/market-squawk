@@ -801,8 +801,8 @@ pub enum ProviderProfileError {
     Identity(#[from] market_squawk_domain::IdentityError),
 }
 
-// Rate corrections do not change saved consent or credential identity. Only removal of an
-// unsupported numeric request quota may differ from the immutable admission descriptor.
+// Scheduling corrections do not change saved consent or credential identity. A concurrency-only
+// change retains every request window; removing an unsupported numeric quota retains capacity.
 fn operational_rate_policy_valid(
     admitted: &RatePolicyDescriptor,
     current: &RatePolicyDescriptor,
@@ -822,10 +822,15 @@ fn operational_rate_policy_valid(
         && admitted.refresh_on_http_429() == current.refresh_on_http_429()
         && current.enforcement_revision() > admitted.enforcement_revision()
         && old.scope() == new.scope()
-        && old.max_concurrent() == new.max_concurrent()
         && old.backoff() == new.backoff()
-        && old.weighted_window_count() == 0
-        && new.weighted_window_count() == 0
-        && old.window_count() > 0
-        && new.window_count() == 0
+        && ((old.window_count() == new.window_count()
+            && old.weighted_window_count() == new.weighted_window_count()
+            && (0..old.window_count()).all(|index| old.window(index) == new.window(index))
+            && (0..old.weighted_window_count())
+                .all(|index| old.weighted_window(index) == new.weighted_window(index)))
+            || (old.max_concurrent() == new.max_concurrent()
+                && old.weighted_window_count() == 0
+                && new.weighted_window_count() == 0
+                && old.window_count() > 0
+                && new.window_count() == 0))
 }

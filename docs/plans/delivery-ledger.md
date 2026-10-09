@@ -2,17 +2,23 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed implementation **f3f59d2c** uses indexed investment/history/watchlist reads and
-corrects option publication schema plus original-reference retention. Required focused checks pass;
-matching native build passed (8m45s). Fresh process inspection found service1935 and supervisor1661
-exited; the startup receipt records `stopped`. Desktop1952/Vite1714 remain, watcher1673 is stopped.
-Lead is running serialized SEC integration checks before restoring the managed runtime.
-Same workspace and saved credentials retained; no current live-service claim.
+Current pushed implementation **de1bcff7** adds single-authority provider quota enforcement and
+two concurrent SEC downloads to f3f59d2c's indexed reads/original-option-reference correction.
+All17 selected SEC integration checks pass, but matching native startup failed: immutable SEC
+capability identity changed with scheduling concurrency. Native build completed7m52s; service36397
+exited1 and Desktop36430 remains under supervisor30620. Watcher30632 is stopped.
+Lead correction preserves all four saved capability identities while applying operational concurrency2;
+focused source regression passes1/1 (14.24s compilation). Financial display-reader implementation
+is integrated and frozen. Data recovery check passes1/1 (141.28s; compile1m10s). Application
+saved-SEC/restart plus cursor/close checks pass2/2 (2.60s). All writers are released and no compiler
+remains. Retained workspace/live proof still pending; lead commits/pushes then schedules matching native replacement.
 Full V1 remains active/incomplete. Older entries below are chronological evidence only.
 
 | Current owner | Outcome and exact scope | Verification / next dependency |
 | --- | --- | --- |
-| Lead | All integration, shared contracts/schema, Git/build/runtime and native verification; active SEC core writer listed below | Pushed f3f59d2c. App checks2/2; data option publication/restart1/1; source origin1/1; shared schema1/1; renderer lookup1/1; source closure/diff pass. Native restart preserved both original workflow records; new stock journey and all-nine reads completed with gaps listed below. |
+| Lead | Integrated correction, closure, Git/build/runtime | Four critical checks pass: retained identity, publication/recovery, saved SEC restart and financial cursor/close. Next commit/push and matching native startup/read proof. |
+| Astra High financial_read_cost | Implementation complete and ownership released | Lead inspected producer/consumer/caller changes. Data recovery and application checks pass; native latency proof remains. |
+| Astra High stream_publication_time | Diagnosis complete and ownership released; `.agents/tmp/v1-first-stock/oct9-stream-publication-time.md` | REST admission-clock inversion confirmed; stream consumer self-refresh mismatch reachable, exact native Unauthorized branch not yet classified. No production changes or live acceptance. |
 | Astra screen_indexed_reads | Completed, ownership released | Direct detail/history and indexed collection wiring critically verified. Post-restart collection returns9 entries but takes4.02s; instant-cache acceptance remains open. |
 | Astra evidence_preparation_invalid | Completed, ownership released | Retained-original link and compositional origin/publication checks pass. Full renewed native publication remains unproven. |
 
@@ -31,11 +37,9 @@ Evidence: `.agents/tmp/v1-first-stock/oct9-indexed-option-native-reopen.json`.
 An initial automation call used the wrong callback result envelope; HTTP500 was an audit-script
 failure, not product failure. The corrected native call above completed successfully.
 
-Next dependency: all-nine detail/history/financial reads through current native transport, then one
-normal new stock analysis to prove option publication and locate the next actual failing edge.
-SEC two-download/single-quota correction remains pending per
-`.agents/tmp/v1-first-stock/oct9-sec-concurrency-policy.md`; no constant-only limit patch or new pool.
-PR43 comment6076656853 records f3f59d2c; add the newly completed native deployment evidence.
+Next dependency: matching de1bcff7 native startup/concurrent acquisition, then all-nine affected
+reads and normal workflow recovery. SEC source/store correction is pushed and critically verified;
+native proof remains pending. PR43 comment6090800500 records de1bcff7 and current gaps.
 Three stale test executables removed after open-owner checks (2.39GiB reclaimed); active runtime,
 current tests and recovery retained. Full financial/fund coverage, streaming, positive completed
 Brief, all-screen audit, installed workflows and final gates remain open.
@@ -52,14 +56,14 @@ failure. Original workflows retained; no completed Brief or full native option p
 Evidence `oct9-indexed-option-native-analysis-{start,status}.json`. Do not restart that workflow
 blindly; inspect the retained job/failure and resume only through its normal recovery operation.
 
-### Active SEC quota ownership correction — acceptance1/5/6
+### SEC quota checkpoint evidence — acceptance1/5/6
 
-Dependency: f3f59d2c integrated/pushed, matching runtime alive, watcher1673 stopped, compiler idle.
+Original implementation dependency: f3f59d2c integrated/pushed and native evidence captured.
 Outcome: provider-backed request admission uses the existing aggregate quota authority once;
 capacity waiting, cached reads and independent requests cannot fail from a second local quota.
 Canonical SEC two-download setting follows this prerequisite with retained rate/cooldown state.
-Already works: pooled HTTP, event-driven waiting, independent blocking capacity1. Missing:
-single quota enforcement/source persistence and safe current-owner concurrency configuration.
+Implemented and critically verified: pooled HTTP, event-driven waiting, independent blocking
+capacity1, single quota enforcement and current-owner concurrency configuration. Native proof open.
 
 - Astra High `sec_single_quota`: ONLY sources `src/policy/budget/runtime.rs`,
   `runtime_types.rs`, `runtime/failure.rs`, `coordinator.rs`, `coordinator/durability.rs`,
@@ -83,8 +87,7 @@ single quota enforcement/source persistence and safe current-owner concurrency c
   `oct9-sec-concurrency-policy.md`. Extend only uncovered ownership/retained-state cases.
   No agent builds, tests, Git, provider calls or runtime actions. All-nine native checks on frozen
   f3f59d2c continue under lead while source work proceeds.
-- Next barrier: agreed shared interface → coherent core/store/SEC integration → focused serialized
-  checks → push → native concurrent acquisition. No resulting commit yet.
+- Implementation owners above are released; resulting pushed commit de1bcff7. Next: native proof.
 
 Both SEC implementation lanes are now frozen. Shared source critical checks pass8/8 after
 correcting the existing fixtures' request-window policy and live identity setup; no production
@@ -92,9 +95,9 @@ identity checks were relaxed. The checks cover waiting/cancellation without poll
 availability invalidation, clean shutdown, registration rollback and source restart. Evidence:
 `.agents/tmp/v1-first-stock/oct9-single-quota-sources-critical.log` (single-job compile25.71s).
 Actual SEC state contains two compatible endpoint declarations (onboarding and acquisition), so
-startup configuration preserves both in the same aggregate quota group. Durable-store, adapter,
-application and native concurrent-acquisition checks remain pending. This WIP is not deployed;
-f3f59d2c remains the last deployed/pushed candidate. Stored financial read deadlines are a separate defect.
+startup configuration preserves both in the same aggregate quota group. Durable-store, adapter and
+application checks pass as recorded below; native concurrent-acquisition proof remains pending.
+Stored financial read deadlines are a separate defect.
 
 Durable-store checks pass4/4 (compile1m39s); allocation/retained-owner checks pass3/3. SEC mixed-source
 taxonomy check passes1/1 (rerun compile9.85s, execution5.41s), now using a genuine durable registry
@@ -106,10 +109,35 @@ Application saved-SEC-connection/restart check passes1/1 (compile6m23s, executio
 All17 selected critical checks pass; source-closure refresh/verification and diff check pass.
 Dependencies/artifact locks are unchanged apart from source identities. Compiler warnings remain
 visible in the logs; this is focused correctness evidence, not final clean-candidate approval.
-Lead is committing this coherent checkpoint; native deployment remains pending.
+Checkpoint de1bcff7 is committed and pushed; native deployment remains pending. No active agent
+writers remain. Supervisor30620 is detached from the transient tool session and owns the only
+development build queue; current build receipt is `oct9-single-quota-supervisor.json` and log is
+`oct9-single-quota-native.log`. The next action is to observe this exact supervisor/build to completion,
+not start another build. PR43 updated with the critical checks and unresolved native gaps.
 Nine superseded build executables were removed after confirming each had no open process owner
 and no additional hard links (2.83GiB reclaimed). Current test outputs, staged runtime, workspace
 and recovery were retained. Exact paths/sizes: `oct9-stale-build-cleanup.json`.
+
+### Active corrective dependency — retained capability and display reads
+
+Native build de1bcff7 completed (7m52s), supervisor30620 started service36397/Desktop36430.
+Service startup failed with `catalog provider capability revision conflicts`; no live acceptance.
+Watcher30632 is stopped and no compiler remains. Lead traced code-owned SEC capability construction:
+the scheduling concurrency change also changed immutable saved admission descriptors. Use the
+existing operational-rate-policy separation: retain saved capability identity and configure the
+current two-request concurrency independently, with exact scope/window/backoff checks. No migration,
+workspace reset, credential change or historical evidence rewrite. Critical gap: pin retained SEC
+admission identity while asserting current scheduling2; then existing saved-connection/restart check.
+
+| Current corrective owner | Exact writable files | Outcome / barrier |
+| --- | --- | --- |
+| Lead | sources `onboarding/built_in_profiles.rs`, `onboarding/profile.rs`, `onboarding/tests.rs`; shared contracts, closure, ledger and build/runtime | Correct existing operational scheduling separation without invalidating retained consent; focused source and app restart checks, then native startup. |
+| Astra High financial_read_cost | data `src/sec_research/prepared.rs`, `src/pit/disk.rs`, existing `tests/publication_recovery.rs`; app `src/application/research/investment_financials/snapshot.rs` only | Stream selected coordinates through one operation-owned reader; reuse prepared inserts; preserve selection positions, omissions, integrity, cancellation and stable page ordering. Existing publication/recovery and cursor/close checks; lead integrates/runs. No builds/Git/runtime. |
+| Astra High stream_publication_time | Diagnosis frozen and released | Report confirms REST clock-order bug and reachable Streamer refresh mismatch; exact native Unauthorized branch remains unproven. No code writer assigned. |
+
+Financial correction integrated: operation-owned ordered display scan replaces per-row shared lock/query preparation; snapshot INSERT/UPSERT and PIT group INSERT are prepared once. Existing fixture now checks original selected positions, revision-state coordinates, NULL omission, callback failure, cancellation and file-integrity/restart behavior. Data critical1/1 PASS in141.28s after1m10s compile (`oct9-streamed-financial-data-critical.log`). Source retained-capability regression1/1 PASS (14.24s compile; `oct9-retained-capability-critical.log`). Source closure refresh/verify passes; only source identities change in the lock. Application two-check compilation is session98875 (`oct9-financial-reopen-app-critical.log`), with every source writer frozen and watcher30632 stopped. Removed one superseded unopened recovery-test executable, reclaiming388.3MiB; current executable and evidence retained. No further implementation lane until this coherent correction is verified/pushed.
+
+Final correction checks PASS: application saved-SEC connection/restart and financial cursor/close2/2 in2.60s (`oct9-financial-reopen-app-critical.log`). Source/data checks above also pass; four critical checks total. No runtime data or credentials changed. Source closure verifies, dependency/artifact definitions unchanged, diff checks pass. Lead inspected all changed producers/consumers and commits/pushes this correction before any further lane. Native matching build/reopen remains next, not completed acceptance.
 
 ## Historical execution evidence
 

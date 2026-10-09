@@ -1641,6 +1641,12 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             assert_eq!(profile.capability().revision().get(), 1);
             assert_eq!(descriptor, profile.capability().rate_policy());
             assert_eq!(profile.capability_history().count(), 1);
+        } else if profile.id() == SEC_EDGAR_PROFILE_ID {
+            assert_eq!(policy.max_concurrent(), 2);
+            assert!(
+                descriptor.enforcement_revision()
+                    > profile.capability().rate_policy().enforcement_revision()
+            );
         } else {
             assert_eq!(descriptor, profile.capability().rate_policy());
             assert!(policy.window_count() >= 1);
@@ -1813,7 +1819,6 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     assert_eq!(SEC_EDGAR_AUTHORITY.source_id(), SEC_EDGAR_SOURCE_ID);
     assert_eq!(SEC_EDGAR_AUTHORITY.rate_scope(), SEC_EDGAR_RATE_SCOPE);
     let sec_budget = sec
-        .capability()
         .rate_policy()
         .enforcement_policy()
         .ok_or("SEC profile omitted aggregate rate enforcement")?;
@@ -1825,6 +1830,23 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     assert_eq!(sec_budget.window_nanos(), Some(1_000_000_000));
     assert_eq!(sec_budget.max_concurrent(), 2);
     assert_eq!(sec_budget.weighted_window_count(), 0);
+    // Retained public capability identities must survive a scheduling-only change.
+    // These are the exact descriptors present before the concurrency correction.
+    let retained = [
+        "7dc8c62415c6c5c44ed07a0efc8a7398cc4e34d7a759605f9d1c5ace6c3d7c32",
+        "73f7cb37820e2891de8438a4c34aa752d739616e4d26672bcbac3cb670575e01",
+        "8b345e9308c856d1bcb61cbc258c2336887f9318676c6f026f9c6af56a0bc7f5",
+        "90022e727cc27aec7eff0a3e73b6690976c314da35b6c0fe2bfa33cf782017b3",
+    ];
+    for (capability, expected) in sec.capability_history().zip(retained) {
+        let actual: String = capability
+            .content_digest()
+            .bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(actual, expected);
+    }
     let hidden_source_ids = [
         FASB_XBRL_TAXONOMY_SOURCE_ID,
         XBRL_US_LEGACY_TAXONOMY_SOURCE_ID,
