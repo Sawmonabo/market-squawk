@@ -1234,7 +1234,9 @@ impl BudgetPermitLease {
                 self.allocation.transport_generation.load(Ordering::Acquire)
                     == self.availability_generation
             } else {
-                self.allocation.availability_generation.load(Ordering::Acquire)
+                self.allocation
+                    .availability_generation
+                    .load(Ordering::Acquire)
                     == self.availability_generation
             }
             && self.active.load(Ordering::Acquire)
@@ -1264,6 +1266,9 @@ impl BudgetPermitLease {
                     .and_then(|dynamic| bytes.checked_add(dynamic))
             })
             .and_then(|bytes| bytes.checked_add(state_dynamic))
+            .and_then(|bytes| {
+                bytes.checked_add(self.allocation.admission.shared_allocation_charge()?)
+            })
             .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<AtomicBool>()))
             .and_then(|bytes| {
@@ -1322,7 +1327,9 @@ impl BudgetPermit {
             availability_generation: if self.released {
                 self.transport_generation
             } else {
-                self.allocation.availability_generation.load(Ordering::Acquire)
+                self.allocation
+                    .availability_generation
+                    .load(Ordering::Acquire)
             },
             established_transport: self.released,
             active: Arc::clone(&self.active),
@@ -1353,8 +1360,7 @@ impl BudgetPermit {
         if self.allocation.terminal.load(Ordering::Acquire) {
             return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
         }
-        if self.allocation.transport_generation.load(Ordering::Acquire)
-            != self.transport_generation
+        if self.allocation.transport_generation.load(Ordering::Acquire) != self.transport_generation
         {
             return Err(BudgetUnavailableReason::AvailabilityChanged);
         }
@@ -1381,6 +1387,8 @@ impl BudgetPermit {
         mut self,
         settlement: crate::ProviderRateResponseSettlement,
     ) -> Result<crate::ProviderRateResponseSettlementReceipt, BudgetUnavailableReason> {
+        let admission = Arc::clone(&self.allocation.admission);
+        let _changed = admission.notify_on_drop();
         if self.released
             || !self.active.load(Ordering::Acquire)
             || self.allocation.terminal.load(Ordering::Acquire)
@@ -1492,6 +1500,8 @@ impl BudgetPermit {
         if self.released {
             return;
         }
+        let admission = Arc::clone(&self.allocation.admission);
+        let _changed = admission.notify_on_drop();
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };

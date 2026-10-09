@@ -91,6 +91,15 @@ pub(crate) enum PreparedSchwabMarketRuntimeStart {
     Streamer(super::schwab_streamer::PreparedSchwabStreamerMarketRuntimeStart),
 }
 impl PreparedSchwabMarketRuntimeStart {
+    /// Account lifecycle identity is shared; each transport retains its own source profile.
+    pub(crate) fn has_expected_generation_profile(&self) -> bool {
+        let expected = match self {
+            Self::Rest(_) => super::schwab_quote_metadata::PROFILE,
+            Self::Streamer(_) => super::schwab_quote_metadata::STREAMER_PROFILE,
+        };
+        self.generation().profile().as_str() == expected
+    }
+
     pub(crate) fn account_owner(&self) -> Arc<SchwabMarketDataAccountActivation> {
         match self {
             Self::Rest(value) => value.account_owner(),

@@ -769,7 +769,11 @@ mod tests {
             deadline,
             &cancellation,
         )?;
-        let reader = MarketDataInstrumentReadCapability::new(authority, deadline, &cancellation)?;
+        let reader = MarketDataInstrumentReadCapability::new(
+            Arc::clone(&authority),
+            deadline,
+            &cancellation,
+        )?;
         let mut records = Vec::new();
         for id in [
             "00000000-0000-0000-0000-000000000101",
@@ -897,6 +901,94 @@ mod tests {
                 ));
             }
         }
+
+        // Reference enrichment must not erase an original retained quote. Reopen its exact
+        // definition, then verify the current assignment independently; current marks stay strict.
+        use crate::application::market_selection::validate_retained_native_reference;
+        let original = reader
+            .read_revision(reference.definition_digest(), deadline, &cancellation)?
+            .ok_or("missing original reference")?;
+        assert_eq!(&original, definition);
+        let mut enriched = serde_json::to_value(definition.definition())?;
+        enriched["reference_evidence"]["metadata_revision"] = json!("enriched-listing-v2");
+        enriched["effective_interval"]["starts_at"] = json!(120);
+        enriched["identifiers"][0]["source_id"] = json!("native-corroboration");
+        MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority)).synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![serde_json::from_value(enriched.clone())?],
+                1,
+            )?,
+            deadline,
+            &cancellation,
+        )?;
+        let enriched_record = reader
+            .latest(reference.instrument_id(), deadline, &cancellation)?
+            .ok_or("missing enriched reference")?;
+        validate_retained_native_reference(
+            &reference,
+            &original,
+            &enriched_record,
+            &closing_quote,
+            enriched_record.published_at(),
+        )?;
+        assert!(
+            validate_native_reference(
+                &reference,
+                &enriched_record,
+                &current_quote,
+                enriched_record.published_at(),
+                NativeReferenceUse::CurrentMark,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_retained_native_reference(
+                &wrong_digest,
+                &original,
+                &enriched_record,
+                &current_quote,
+                enriched_record.published_at(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_retained_native_reference(
+                &reference,
+                &original,
+                &enriched_record,
+                &wrong_instrument,
+                enriched_record.published_at(),
+            )
+            .is_err()
+        );
+        enriched["reference_evidence"]["metadata_revision"] = json!("removed-assignment-v3");
+        enriched["effective_interval"]["starts_at"] = json!(130);
+        enriched["identifiers"] = json!([]);
+        MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority)).synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![serde_json::from_value(enriched)?],
+                1,
+            )?,
+            deadline,
+            &cancellation,
+        )?;
+        let removed = reader
+            .latest(reference.instrument_id(), deadline, &cancellation)?
+            .ok_or("missing removed assignment")?;
+        assert!(
+            validate_retained_native_reference(
+                &reference,
+                &original,
+                &removed,
+                &closing_quote,
+                removed.published_at(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reader.read_revision(reference.definition_digest(), deadline, &cancellation)?,
+            Some(original)
+        );
 
         let crypto = product_market_identities(&records, cutoff, Some("BTC"))?;
         let (crypto_page, count, _) = product_search_page(&crypto, "BTC", 100, None)?;

@@ -52,6 +52,9 @@ impl BudgetAvailabilityLease {
                     .and_then(|dynamic| bytes.checked_add(dynamic))
             })
             .and_then(|bytes| bytes.checked_add(state_dynamic))
+            .and_then(|bytes| {
+                bytes.checked_add(self.allocation.admission.shared_allocation_charge()?)
+            })
             .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
     }
 }

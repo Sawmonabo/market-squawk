@@ -186,6 +186,7 @@ fn preallocated_sliding_releases(window: ProviderBudgetWindow) -> VecDeque<Monot
 }
 
 pub(in crate::policy) struct BudgetAllocation {
+    pub(in crate::policy) admission: Arc<crate::policy::provider_rate::admission::RequestAdmission>,
     pub(in crate::policy) policy: ProviderBudgetPolicy,
     pub(in crate::policy) state: Mutex<BudgetState>,
     pub(in crate::policy) clock: Arc<dyn BudgetClock>,

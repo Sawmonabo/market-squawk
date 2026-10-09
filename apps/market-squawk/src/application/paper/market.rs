@@ -1396,6 +1396,7 @@ async fn load_retained_display_evidence(
         components: Vec<(usize, LiveEventClass)>,
     }
     let mut use_groups: Vec<DisplayUseGroup> = Vec::new();
+    let mut original_definitions: Vec<MarketDataInstrumentRecord> = Vec::new();
     for (route, instrument, record, count) in pending {
         ensure_live(context)?;
         let mut selections = Vec::new();
@@ -1475,20 +1476,48 @@ async fn load_retained_display_evidence(
                     _ => None,
                 };
                 if let Some(reference) = native_reference {
-                    if reference.definition_digest() != record.revision_digest() {
-                        tracing::warn!(source_id = %route.source_surface(), %instrument,
-                            event_kind = ?candidate.coordinate().event_kind(),
-                            "retained market component reference revision does not match the selected instrument");
-                        denied = true;
-                        break;
-                    }
-                    crate::application::market_selection::validate_native_reference(
+                    let original = if reference.definition_digest() == record.revision_digest() {
+                        record
+                    } else {
+                        let index = original_definitions.iter().position(|definition| {
+                            definition.revision_digest() == reference.definition_digest()
+                        });
+                        let index = match index {
+                            Some(index) => index,
+                            None => {
+                                let Some(original) = research
+                                    .market_data_instruments()
+                                    .read_revision(
+                                        reference.definition_digest(),
+                                        context.deadline(),
+                                        context.cancellation(),
+                                    )
+                                    .map_err(|_| ServiceError::Unavailable)?
+                                else {
+                                    denied = true;
+                                    break;
+                                };
+                                original_definitions.push(original);
+                                original_definitions.len() - 1
+                            }
+                        };
+                        &original_definitions[index]
+                    };
+                    if crate::application::market_selection::validate_retained_native_reference(
                         reference,
+                        original,
                         record,
                         provenance,
                         reference_at,
-                        crate::application::market_selection::NativeReferenceUse::RetainedDisplay,
-                    )?;
+                    )
+                    .is_err()
+                    {
+                        tracing::warn!(source_id = %route.source_surface(), %instrument,
+                            event_kind = ?candidate.coordinate().event_kind(),
+                            "retained market component original identity is no longer valid");
+                        denied = true;
+                        break;
+                    }
                 }
             }
             if !denied {

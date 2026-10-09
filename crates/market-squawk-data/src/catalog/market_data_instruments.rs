@@ -154,7 +154,7 @@ impl MarketDataInstrumentCurrentExpectation {
 /// supplied for creation; an existing record is only an exact compare-and-set expectation.
 #[derive(Debug)]
 pub struct MarketDataInstrumentSourceReferenceInput {
-    /// Exact already registered provider source metadata.
+    /// Exact provider source metadata admitted by this writer before reference publication.
     pub source: SourceMetadata,
     /// Existing scoped owner authorization bound to the exact captured body.
     pub rights: RightsDecisionInput,
@@ -1674,6 +1674,29 @@ impl MarketDataInstrumentReadCapability {
         })
     }
 
+    /// Reopens one immutable definition by its original digest for retained evidence reads.
+    /// This does not grant current identity or execution authority.
+    pub fn read_revision(
+        &self,
+        revision: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MarketDataInstrumentRecord>, MarketDataInstrumentCatalogError> {
+        if revision.algorithm() != DigestAlgorithm::Sha256 || revision.bytes() == [0; 32] {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+        self.read_snapshot(deadline, cancellation, |connection, limits| {
+            let row = connection.query_row(
+                &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_revisions AS revisions WHERE revisions.revision_digest=?1"),
+                [revision.bytes()], decode_stored_row,
+            ).optional()?;
+            row.map(|row| {
+                charge_row(&row, &mut ResultBudget::new(limits))?;
+                rebuild_record(row)
+            }).transpose()
+        })
+    }
+
     /// Revalidates a retained definition against the already borrowed publication catalog.
     ///
     /// This fixed indexed read never reenters the writer mutex or replaces an outer SQL progress
@@ -2180,6 +2203,9 @@ impl CatalogAuthority {
                 cancellation,
             )?;
             if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
+                self.catalog().register_source(&input.source, received_at)?;
+            }
+            if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
                 return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
             }
             let transaction = connection.unchecked_transaction()?;
@@ -2282,13 +2308,31 @@ impl CatalogAuthority {
             let mut identifiers = current.as_ref().map_or_else(Vec::new, |record| {
                 record.definition().identifiers().to_vec()
             });
-            identifiers.retain(|identifier| {
-                !matches!(
-                    identifier.identifier(),
-                    ExternalIdentifier::Cusip(_) | ExternalIdentifier::Ticker(_)
-                )
-            });
-            identifiers.extend(input.identifiers);
+            for incoming in input.identifiers {
+                // Corroboration from another provider does not replace the original assignment
+                // consumed by an existing route. The new source assertion remains in its native
+                // identity and captured response above.
+                if identifiers
+                    .iter()
+                    .any(|existing| existing.identifier() == incoming.identifier())
+                {
+                    continue;
+                }
+                match incoming.identifier() {
+                    ExternalIdentifier::Cusip(_)
+                        if identifiers.iter().any(|existing| {
+                            matches!(existing.identifier(), ExternalIdentifier::Cusip(_))
+                        }) =>
+                    {
+                        return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+                    }
+                    ExternalIdentifier::Ticker(_) => identifiers.retain(|existing| {
+                        !matches!(existing.identifier(), ExternalIdentifier::Ticker(_))
+                    }),
+                    _ => {}
+                }
+                identifiers.push(incoming);
+            }
             let definition =
                 MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
                     instrument_id,

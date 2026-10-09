@@ -2,17 +2,23 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed checkpoint **a8813f68**: SEC contention wait regression; preceding **2ef1d35a** supplies selected history windows and default candles;
-full nine-investment history/financial acceptance remains open. Supervisor10180, stopped watcher10194,
-service29800 and Desktop29820 freshly confirmed; no Cargo/rustc active. Prior goal turn only
-reconfirmed the already-pushed chart setting; next concrete action is contention/startup remediation.
+Current pushed checkpoint **04df1a20**; next checkpoint is critically verified and being committed. It removes provider-capacity polling,
+repairs canonical reference publication, distinguishes prepared Streamer/REST profiles and keeps
+saved quotes usable across corroborating reference updates. Full V1 and all-nine acceptance remain
+open. Supervisor10180 runs service39932/Desktop39946 while Cargo43034 builds the matching runtime.
+Retained-reference and native-rebind critical checks passed. One compiler job; no competing build.
 
 | Owner | Concrete outcome and exact files | Evidence / next dependency |
 | --- | --- | --- |
-| Lead | Integrate frozen SEC wait repair: adapter `src/client.rs`, `src/xbrl/model.rs`; all builds/Git/ledger/source closure | Actual AAPL acquisition failed with ConcurrencyExhausted. Existing taxonomy fixture extended for occupied slot, cancellation, deadline and release; PASS1/1 (4.25s; compile1m48s). Shared event-driven admission remains next to remove repeated durable-store polling. |
-| GPT-6.1 Sol High schwab_metadata_scope | Correct Schwab reference/quote metadata account scope: `provider_activation/schwab_reference/metadata.rs`, `provider_activation/schwab_quote_metadata.rs`, existing `provider_onboarding/service/schwab_recovery_tests.rs`, `provider_activation/schwab.rs`, `provider_activation/schwab_market_hours/metadata.rs`, `application/market_runtime/schwab.rs` budget comparison only, and parent module internal test access only if required | Saved OAuth reopened active; startup fails at reference_bootstrap InvalidResult. Check account-bound authorization versus template budget before changing. Next: fixture then real source recovery; no new browser sign-in. |
-| GPT-6 Astra High sec_concurrency_policy | Read-only SEC concurrency/pooling/request-rate ownership and rationale; report only `.agents/tmp/v1-first-stock/oct9-sec-concurrency-policy.md` | Owner questions one-slot bottleneck. Compare actual client pooling, application policy, global scope and request lifetime. Recommend smallest justified correction and affected critical fixture; no builds/Git/runtime/code edits. |
+| Lead | Frozen shared admission, reference producer/consumers, shared contracts/manifests/closure, Git/runtime; exact ownership recorded below | Shared admission, allocation, SEC taxonomy and adjacent catalog checks passed. Matching pre-follow-on build passed7m33s. Real SPY/VTI reference publication proven in catalog. Follow-on retained-reference/native-rebind checks passed; coherent checkpoint commit/push, matching native replacement next. |
+| GPT-6 Astra High sec_concurrency_policy | Completed shared event-driven admission handoff; ownership released to lead | Queue critical check passed; one→two SEC policy correction remains separate and open. |
+| GPT-6.1 Sol High schwab_metadata_scope | Completed reference integration diagnosis; report frozen, all source ownership lead-held | Located exact Streamer-profile rejection, independent-source ticker constraint and invalid restart revision comparison. Native startup remains unverified after their current corrections. |
 
+
+Housekeeping refreshed: one primary worktree and only feature/main/release local branches. The
+remote also has open Dependabot PR55 (`crc32fast-1.5.2`); this is unrelated active work, preserved
+under the no-discard rule. No extra agent branch/worktree created. Existing target27GB, scratch729MB
+and managed runtime1.4GB measured for cleanup awareness; no whole-app RAM gate performed.
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
@@ -32,7 +38,7 @@ is compiling in session59552 with one job. Actual metadata constructors now use 
 scope as request admission. New native runtime is not yet built; saved authorization was active
 after the previous restart and no new browser sign-in has been requested.
 
-Schwab scope correction critically verified: existing
+Schwab scope correction **04df1a20** pushed and critically verified: existing
 `configured_schwab_without_doctor_refreshes_and_survives_restart` PASS1/1 (4.75s;
 single-job compilation4m06s). Genuine reference and market-hours metadata now construct with the
 same account-qualified request declaration, survive restart unchanged and reject template/wrong-
@@ -44,6 +50,170 @@ then all-nine history/financial verification. Native pre-replacement jobs:14comp
 running entries and no next page; saved OAuth remains active (`oct9-pre-scope-rebuild-runtime.json`,
 `oct9-schwab-current-authorization.json`). SEC checkpoint PR43:
 https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6074191313.
+
+Supervisor10180/watcher10194 now own matching service build Cargo33511; prior service29800 and
+Desktop29820 remain available. Source frozen during this one-job build. Native post-replacement
+barrier: current OAuth/refresh, source reconciliation and actual API/Streamer evidence; then resume
+financial/history recovery. Next code assignment begins only after compiler terminal and watcher
+is stopped: event-driven shared SEC admission per the audited concurrency report. No new thread
+pool or independent rate budget. Current turn is progress (04df1a20 pushed), not a goal pause.
+
+Matching runtime build PASS5m26s at04df1a20; old service29800/Desktop29820 exited and supervisor
+is preparing generation-G93zVB. Watcher10194 stopped after compiler exit for the next owned edits;
+no second runtime/build. Latest nine-investment stored-facts baseline returned32items for each
+AAPL/MSFT/NVDA/TSLA and identity_missing for the five funds; all read handles closed. During
+compilation these requests took~2–11seconds, so neither cached responsiveness nor fund coverage is
+accepted (`oct9-watchlist-stored-facts-baseline.json`).
+
+Runtime refresh: matching service34595/Desktop34608 are running; watcher10194 remains stopped and
+no Cargo/rustc is active. Native source status remains blocked/reconciliation at revision2. The
+new startup reached reference_bootstrap Unavailable instead of the previous InvalidResult; that is
+not a live pass. Saved sign-in is retained. GPT-6.1 Sol High `schwab_metadata_scope` now owns a
+read-only diagnosis of this exact remaining reference bootstrap failure and may write only
+`.agents/tmp/v1-first-stock/oct9-schwab-reference-unavailable.md`; no code, builds, Git or runtime
+operations. Lead owns any resulting narrow diagnostics and provider recovery. Native evidence:
+`oct9-schwab-scope-native-status.json`.
+
+Native ratio first-page audit on current runtime completed for all9 investments; every returned
+read handle closed using its own registered Desktop request. AAPL/MSFT/TSLA each32/32reported;
+NVDA30reported/2missing_input; all5ETFs0items/identity_missing. Times~1.5–7.3seconds, so response
+presence is not instant-cache or all-field acceptance. Evidence `oct9-all-watchlist-ratio-values.json`.
+NVDA's two missing inputs concern the same annual period ending2026-01-25 but different filing
+contexts: the2026-05-12 group has net income without revenue; the2026-02-25 group has revenue
+without net income. This is an observed grouping/selection gap, not confirmed SEC absence; retain
+report context and verify selected source facts before any financial calculation change.
+Evidence `oct9-nvda-ratio-missing-inputs.json` (read closed).
+Initial audit incorrectly reused one-use request identities for closing and was discarded/rerun;
+its request_interrupted results are not product failure evidence. Missing NVDA inputs and ETF
+family routing remain to trace before claiming upstream absence. Source retry using actual UI
+arguments reproduced reference_bootstrap Unavailable; OAuth remains active at accessgeneration2.
+
+### Schwab reference publication correction — acceptance1/7
+
+Live Retry retained a CRC-valid SPY Instruments response while the runtime registry contains the
+correct metadata and the canonical catalog lacks that source. The publisher currently requires
+catalog equality without registering metadata; Alpaca's existing publisher already performs that
+registration. OAuth refresh is active; no sign-in reset is authorized or needed by this evidence.
+- SolHigh `schwab_metadata_scope` owns ONLY `crates/market-squawk-data/src/catalog/market_data_instruments.rs`
+  for the canonical registration omission and input-doc alignment, plus
+  `apps/market-squawk/src/provider_activation/schwab_reference.rs` for narrow safe typed boundary
+  diagnostics, `apps/market-squawk/src/application/research/ingest/schwab_instrument_reference.rs` for one static closed diagnostic_code method on the existing error, and its already assigned diagnosis report. No schema/manifest/contract redesign.
+- Reuse existing Catalog::register_source at the checked capture observation, preserve precommit,
+  official listing, exact metadata equality, currentness and all rights checks. No bypass.
+- Lead owns closest existing catalog critical check and actual native source recovery. If a focused
+  existing publication fixture can directly cover this exact producer, propose its exact extension
+  before editing. Constructor tests do not prove publication; no large new harness.
+- Freeze these files before serial compilation; source/durable publication verification and live
+  retry remain required. Shared request-queue files stay exclusively with Astra.
+
+### Active shared-admission checkpoint — acceptance1/5/6
+
+Outcome: concurrent financial requests wait without repeated durable-store polling, retaining the
+same request authority, cancellation/deadline and provider ceilings. Immediate error correction
+is pushed; final scheduling remains missing. Dependency:04df1a20 build terminal, watcher stopped.
+- Astra High `sec_concurrency_policy` owns sources `src/policy/provider_rate.rs`, new cohesive
+  child `src/policy/provider_rate/admission.rs` if needed, `src/policy/budget/{runtime.rs,runtime_types.rs,runtime/failure.rs}`,
+  `src/policy/budget/coordinator/durability.rs`, `src/policy/budget/coordinator.rs` (shared allocation accounting only), `src/registry/authority.rs`, `src/registry.rs` (registration revocation wake only), and existing
+  `src/policy/budget/coordinator/tests.rs`; adapter SEC `src/client.rs` and existing
+  `src/xbrl/model.rs` consumer after shared API established. Request any additional exact file.
+  One shared admission turn/notification per real provider-rate group, equivalent ephemeral
+  allocation state; no second quota/counter, timer polling, worker pool, compatibility path or
+  policy increase. Audit release/cancel/settlement/terminal wake paths and arm-before-check.
+- Lead reserves sources Cargo.toml, Cargo.lock if changed, public re-exports/shared contracts,
+  closure, ledger, Git/build/runtime. Proposed additive ExtractionAuthority async exact-request
+  admission uses existing result/error types; keep caller cancellation/deadline outside the future
+  if that avoids unrelated error-contract changes. Freeze interface with lead before consumers.
+- Critical gap/check: existing shared-budget fixture must demonstrate no repeated store admission
+  while occupied, no lost wakeup, head cancellation/next progress and release/terminal cleanup;
+  existing SEC taxonomy regression must still pass. No broad harness. Lead schedules after freeze.
+- Shared API approved: inherent async `ExtractionAuthority::acquire_network_request(&self, target: &str)` returns existing `InFlightExtractionRequest` / `ExtractionAuthorityError`; SEC retains original cancellation/deadline select, with dropped futures releasing reservation and FIFO turn. No new error variants or public re-export.
+- Next dependency: inspected producer/consumer handoff → focused checks → coherent push → native
+  concurrent financial reload. One→two SEC policy correction is separate and still required to
+  resolve unjustified serialization; preserve durable window/cooldown state when scheduled.
+
+Shared-admission handoff frozen and inspected. First compilation found a module-path error caused
+by the existing path-attributed parent module; lead added the explicit child path. Focused shared
+queue regression PASS1/1 (0.14s; compile13.31s), exact allocation-accounting regression PASS1/1.
+The queue case covers group sharing across separate registrations, no periodic store retries,
+FIFO/head cancellation, reservation/dispatched cleanup, revocation/terminal wake and failed-dispatch
+self-wakeup avoidance. FIFO applies only to this async admission API. Existing SEC taxonomy
+regression is compiling serially in session17710; no other compiler/watcher build. Source closure
+refresh/verification passed after final Rust edits. Schwab three-file catalog/diagnostic patch is
+frozen; existing catalog fixture and matching runtime/native publication remain next barriers.
+This goal turn is progress, not a pause or completion claim.
+
+SEC existing taxonomy acquisition/cancellation/deadline/release regression PASS1/1 (4.64s;
+compile1m26s). Existing catalog Alpaca first-publication/replay/reopen regression PASS1/1 (1.56s;
+compile1m04s), adjacent catalog coverage only, not proof of Schwab source-reference publication.
+Native jobs22total:14completed/8failed, none running and no next page. Supervisor10180 now owns
+matching application build Cargo38458 after watcher10194 resumed; old service34595/Desktop34608
+remain available. Candidate source is frozen; no second compiler. After build, stop watcher before
+new edits, inspect safe Schwab response/seal/publish result and current source status, then integrate
+and push. Real unchanged-reference restart reuse remains explicitly unverified.
+
+### Post-build reference integration — 2026-10-09
+
+Matching application build PASS7m33s. Supervisor10180 now runs service39932/Desktop39946 in
+`generation-E6HRSM`; watcher10194 stopped after compiler terminal. Native sourceStatus remains
+blocked/reconciliation revision2. Live logs show accepted HTTP200 SPY and VTI Instruments responses
+without reference seal/publication failure, then account_group_start InvalidRequest. Catalog
+revision changes also cause retained Alpaca reference-revision mismatch for these two instruments;
+this new producer/consumer edge must be resolved before accepting reference integration.
+Native status: `oct9-admission-reference-native-status.json`. No streaming/installed acceptance.
+
+- SolHigh `schwab_metadata_scope`: read-only next-stage diagnosis of account_group_start
+  InvalidRequest and reference-revision reuse/consumer mismatch; write only existing
+  `oct9-schwab-reference-unavailable.md`. Trace actual callers and affected consumers; identify
+  smallest coherent correction and existing critical check. No source edits, Git, builds, provider
+  calls or runtime operations until exact implementation ownership is granted.
+- Lead retains all candidate source ownership, runtime/catalog read-only verification, critical
+  checks, ledger, Git and source closure. Shared-admission candidate is frozen and critically
+  verified; do not dispatch replacement work over its files before integration.
+- Next dependency: verify durable reference publication, resolve resulting live startup/retained
+  read conflict, then coherent commit/push. Two-slot SEC policy remains explicitly required next.
+
+Lead implementation ownership extended only to
+`application/market_runtime/configuration.rs`, `provider_activation/schwab.rs` and
+`provider_activation/schwab_quote_metadata.rs`: actual prepared Streamer profile differs from the
+account lifecycle surface, so the shared validator deterministically rejects successful preparation.
+Keep exact variant profile in provider activation; account/session/configuration checks stay intact.
+Native real start exercises the corrected shared boundary; no duplicate fixture harness.
+
+Lead additionally owns `crates/market-squawk-data/src/catalog/market_data_instruments.rs`,
+`application/paper/market.rs`, `application/market_selection/investment.rs`, existing export in
+`application/market_selection/mod.rs`, and `application/paper/market/product.rs` existing fixture:
+reopen an original retained quote's exact indexed definition, then require unchanged current
+instrument/asset/currency and retained provider/assigned identity. CurrentMark stays strict.
+Cache distinct original definitions within the bounded read; no whole-history scan. Critical gap:
+existing ticker/reference fixture lacks a newer compatible definition and revoked-identity rejection.
+
+Reference integration also exposed an unnecessary source-name constraint in
+`provider_activation/market_config.rs` (lead-owned): authenticated Nasdaq membership and a genuine
+canonical ticker assertion are independent evidence. A matching ticker from another source must
+not be impersonated as Nasdaq or rejected merely for its source name. Preserve listing membership,
+assigned-identifier rights/validity, canonical instrument/asset/currency and native-provider checks.
+Original retained quotes keep their exact original assertion; current display continuity may use a
+new genuine assignment of the same identifier. Changed ticker or removed assignment still rejects.
+Source publication now preserves identical existing assignments and rejects conflicting CUSIPs.
+No migration, database rewrite or fresh workspace is needed.
+
+The follow-on source audit confirmed Streamer profile mismatch and independent-source ticker
+corroboration. Lead fixes are frozen for focused checks. Restart reuse now retains the unique
+catalog-owned source/symbol assertion without comparing its captured-reference revision to the
+unrelated HTTP metadata revision; current OAuth and exact issuer/current-record checks remain.
+Existing real catalog native-rebind fixture now exercises independently sourced ticker evidence;
+existing retained-reference fixture extends compatible revision/corroboration plus original-digest,
+wrong-instrument and removed-assignment rejection. No new harness or migration.
+
+Follow-on critical checks PASS: retained-reference/catalog fixture1/1 (0.38s, one-job compile6m11s),
+including original-digest replay, compatible independent-source corroboration and wrong/removed
+identity rejection; native-rebind fixture1/1 (0.32s, cached compile1.21s), including independent
+canonical ticker provenance and changed-authority rejection. Source-closure verification and diff
+check passed. Evidence: `oct9-reference-enrichment-critical.log`, `oct9-native-rebind-critical.log`.
+Lead now resumes the existing supervisor watcher for one matching build; current runtime remains
+available until successful compilation. Native Streamer start, retained quote display and unchanged
+reference restart reuse remain unverified. Previous question-only turn was no implementation
+progress; this continuation completed the concrete critical-check barrier.
 
 ### Active native verification and next dependency
 

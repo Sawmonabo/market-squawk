@@ -60,6 +60,9 @@ impl ProviderAdapterActivation {
         let source = metadata::metadata(activation)?;
         // A restart of the same configured lease reuses the catalog-minted reference. Re-fetching
         // would mint another revision and break the unchanged exact quote generation unnecessarily.
+        // The catalog identity has a captured-reference revision, not the HTTP metadata revision.
+        // Current OAuth was validated above; it authorizes new acquisition independently of these
+        // already published, source-qualified instrument facts.
         if let Some(expected) = expected_current.as_ref() {
             let at = metadata::timestamp()?;
             let definition = expected.definition();
@@ -68,7 +71,6 @@ impl ProviderAdapterActivation {
                 .iter()
                 .filter(|identity| {
                     identity.source_id() == source.source_id()
-                        && identity.metadata_revision() == source.revision()
                         && identity.provider_instrument_id().as_str() == issuer.symbol().as_str()
                         && definition.provider_identity_at(
                             identity.source_id(),
@@ -260,12 +262,23 @@ impl ProviderAdapterActivation {
             else if Instant::now() >= deadline { ServiceError::DeadlineExceeded } else { ServiceError::Unavailable })?
         };
         drop(token);
-        let receipt = match &outcome {
-            RestExecutionOutcome::Accepted(response) => response.capture().receipt(),
-            RestExecutionOutcome::ProviderRejected(capture)
-            | RestExecutionOutcome::InvalidPayload { capture, .. } => capture.receipt(),
+        let (response_kind, receipt) = match &outcome {
+            RestExecutionOutcome::Accepted(response) => ("accepted", response.capture().receipt()),
+            RestExecutionOutcome::ProviderRejected(capture) => {
+                ("provider_rejected", capture.receipt())
+            }
+            RestExecutionOutcome::InvalidPayload { capture, .. } => {
+                ("invalid_payload", capture.receipt())
+            }
             _ => return Err(ServiceError::InvalidResult),
         };
+        tracing::info!(
+            stage = "reference_response",
+            symbol = issuer.symbol().as_str(),
+            response_kind,
+            status = receipt.status(),
+            "Schwab instrument reference response received"
+        );
         let rate_ok = if receipt.status() == 429 {
             backoff_recorded(apply_http_retry_after(
                 &budget,
@@ -288,7 +301,15 @@ impl ProviderAdapterActivation {
             .seal_detail_outcome(outcome, issuer.cusip(), cleanup_deadline)
             .await;
         permit.release();
-        let reference = reference.map_err(|_| ServiceError::Unavailable)?;
+        let reference = reference.map_err(|error| {
+            tracing::warn!(
+                stage = "reference_seal",
+                symbol = issuer.symbol().as_str(),
+                error_code = error.diagnostic_code(),
+                "Schwab instrument reference sealing failed"
+            );
+            ServiceError::Unavailable
+        })?;
         check_operation(deadline, cancellation)?;
         if !rate_ok {
             return Err(ServiceError::Unavailable);
@@ -305,7 +326,15 @@ impl ProviderAdapterActivation {
                 cancellation.child_token(),
             )
             .await
-            .map_err(|_| ServiceError::Unavailable)
+            .map_err(|error| {
+                tracing::warn!(
+                    stage = "reference_publish",
+                    symbol = issuer.symbol().as_str(),
+                    error_code = error.diagnostic_code(),
+                    "Schwab instrument reference publication failed"
+                );
+                ServiceError::Unavailable
+            })
     }
 }
 

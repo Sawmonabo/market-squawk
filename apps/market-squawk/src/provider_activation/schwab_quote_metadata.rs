@@ -38,7 +38,7 @@ struct QuoteSourceContract<'a> {
 
 const SOURCE: &str = "schwab-trader-api";
 const DATASET: &str = "schwab.quotes";
-const PROFILE: &str = "schwab.trader-api-market-data";
+pub(super) const PROFILE: &str = "schwab.trader-api-market-data";
 const LOCAL_FRESHNESS_NANOS: u64 = 120_000_000_000;
 
 impl ProviderAdapterActivation {

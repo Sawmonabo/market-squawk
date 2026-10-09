@@ -191,7 +191,7 @@ pub(super) fn validate_resolved_schwab_configuration(
         || lease.generation() != Some(request.expected_credential_generation())
         || generation.session_id() != request.onboarding_session_id()
         || generation.credential_generation() != Some(request.expected_credential_generation())
-        || generation.profile().as_str() != request.surface().surface_id()
+        || !prepared.has_expected_generation_profile()
     {
         return Err(ServiceError::InvalidRequest);
     }

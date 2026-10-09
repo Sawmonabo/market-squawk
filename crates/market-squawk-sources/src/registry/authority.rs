@@ -298,16 +298,7 @@ impl ExtractionAuthority {
         &self,
         target: &str,
     ) -> Result<crate::ExtractionRequestPermit, crate::ExtractionAuthorityError> {
-        self.validate_current()?;
-        let endpoint_policy = match self.metadata.network_policy() {
-            crate::NetworkAccessPolicy::Allowlisted(policy) => policy,
-            crate::NetworkAccessPolicy::Denied => {
-                return Err(crate::ExtractionAuthorityError::NetworkDenied);
-            }
-        };
-        let authorization = endpoint_policy
-            .authorize_request(target)
-            .map_err(crate::ExtractionAuthorityError::NetworkPolicy)?;
+        let authorization = self.authorize_network_target(target)?;
         let budget = self
             .budget
             .as_ref()
@@ -327,6 +318,124 @@ impl ExtractionAuthority {
             authorization,
             budget_reservation,
         ))
+    }
+
+    fn authorize_network_target(
+        &self,
+        target: &str,
+    ) -> Result<crate::AuthorizedRequest, crate::ExtractionAuthorityError> {
+        self.validate_current()?;
+        let endpoint_policy = match self.metadata.network_policy() {
+            crate::NetworkAccessPolicy::Allowlisted(policy) => policy,
+            crate::NetworkAccessPolicy::Denied => {
+                return Err(crate::ExtractionAuthorityError::NetworkDenied);
+            }
+        };
+        endpoint_policy
+            .authorize_request(target)
+            .map_err(crate::ExtractionAuthorityError::NetworkPolicy)
+    }
+
+    /// Admits one exact request, waiting cooperatively for shared provider capacity.
+    ///
+    /// Async callers sharing the provider group acquire admission turns in FIFO order. Existing
+    /// synchronous `try_network_request` callers remain nonblocking and do not join that queue.
+    /// The turn spans admission only; the returned permit owns the request's full lifetime.
+    /// Callers must retain their original cancellation and operation deadline around this future.
+    /// Dropping it releases the turn and any uncommitted reservation without a background task.
+    ///
+    /// # Errors
+    ///
+    /// Preserves exact-target/current-authority validation and terminal budget failures. Only
+    /// temporary concurrency and the existing rate/cooldown deadline cause a wait.
+    pub async fn acquire_network_request(
+        &self,
+        target: &str,
+    ) -> Result<crate::InFlightExtractionRequest, crate::ExtractionAuthorityError> {
+        let invalidated = self.lease.invalidated.notified();
+        tokio::pin!(invalidated);
+        invalidated.as_mut().enable();
+        self.authorize_network_target(target)?;
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
+        let admission = budget.request_admission();
+        let expired = self.wait_until_ineffective();
+        tokio::pin!(expired);
+        let _turn = tokio::select! {
+            biased;
+            () = &mut invalidated => return Err(crate::ExtractionAuthorityError::NotCurrent),
+            error = &mut expired => return Err(error),
+            turn = admission.turn() => turn,
+        };
+        loop {
+            // Arm before checking capacity: a release between the check and suspension must
+            // remain visible even though no task was polling this notification yet.
+            let changed = admission.changed();
+            let availability_changed = admission.availability_changed();
+            tokio::pin!(changed);
+            tokio::pin!(availability_changed);
+            changed.as_mut().enable();
+            availability_changed.as_mut().enable();
+            let attempt = self
+                .try_network_request(target)
+                .and_then(|permit| permit.authorize_send(target));
+            match attempt {
+                Ok(in_flight) => return Ok(in_flight),
+                Err(crate::ExtractionAuthorityError::BudgetUnavailable {
+                    reason: crate::BudgetUnavailableReason::ConcurrencyExhausted,
+                }) => {
+                    tokio::select! {
+                        biased;
+                        () = &mut invalidated => return Err(crate::ExtractionAuthorityError::NotCurrent),
+                        error = &mut expired => return Err(error),
+                        () = changed => {},
+                    }
+                }
+                Err(crate::ExtractionAuthorityError::BudgetWaitUntil { deadline }) => {
+                    let remaining = self.remaining_budget_wait(deadline)?;
+                    // An unsuccessful dispatch releases its own uncharged reservation. That
+                    // capacity-only notification must not spin a claim-dependent rate wait.
+                    // Response settlement/cooldown/terminal changes were armed before admission.
+                    tokio::select! {
+                        biased;
+                        () = &mut invalidated => return Err(crate::ExtractionAuthorityError::NotCurrent),
+                        error = &mut expired => return Err(error),
+                        () = availability_changed => {},
+                        () = tokio::time::sleep(remaining) => {},
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn wait_until_ineffective(&self) -> crate::ExtractionAuthorityError {
+        let end = [
+            self.metadata.authorization().effective_interval().ends_at(),
+            self.metadata.coverage().effective_interval().ends_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(end) = end else {
+            return std::future::pending().await;
+        };
+        let observed = match self.clock.observe() {
+            Ok(observed) => observed,
+            Err(RegistryError::TrustedClockUnavailable) => {
+                return crate::ExtractionAuthorityError::TrustedTimeUnavailable;
+            }
+            Err(_) => return crate::ExtractionAuthorityError::TrustedTimeDiscontinuous,
+        };
+        let remaining = end.unix_nanos().checked_sub(observed.wall().unix_nanos());
+        if let Some(remaining) = remaining.filter(|remaining| *remaining > 0) {
+            tokio::time::sleep(std::time::Duration::from_nanos(remaining.unsigned_abs())).await;
+        }
+        self.validate_current()
+            .err()
+            .unwrap_or(crate::ExtractionAuthorityError::NotEffective)
     }
 
     /// Converts a budget deadline returned by this exact authority into a remaining duration.

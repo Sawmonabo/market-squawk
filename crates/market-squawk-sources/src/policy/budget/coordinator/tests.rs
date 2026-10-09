@@ -2,7 +2,7 @@
 mod coordinator_tests {
     use std::error::Error;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use market_squawk_domain::{
@@ -52,6 +52,11 @@ mod coordinator_tests {
     struct TrackingProviderRateStore {
         commits: Arc<AtomicUsize>,
         rollbacks: Arc<AtomicUsize>,
+        admission_enabled: bool,
+        reserve_calls: AtomicUsize,
+        request_active: AtomicBool,
+        disabled: AtomicBool,
+        dispatch_wait: AtomicBool,
     }
 
     #[derive(Debug)]
@@ -119,7 +124,23 @@ mod coordinator_tests {
             _registration: ProviderRateRegistration,
             _now: Timestamp,
         ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
-            Err(ProviderRateStoreError::Unavailable)
+            self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.admission_enabled {
+                return Err(ProviderRateStoreError::Unavailable);
+            }
+            if self.disabled.load(Ordering::SeqCst) {
+                return Ok(ProviderRateReservationDecision::Unavailable(
+                    BudgetUnavailableReason::Disabled,
+                ));
+            }
+            if self.request_active.swap(true, Ordering::SeqCst) {
+                return Ok(ProviderRateReservationDecision::Unavailable(
+                    BudgetUnavailableReason::ConcurrencyExhausted,
+                ));
+            }
+            Ok(ProviderRateReservationDecision::Ready(
+                ProviderRateReservationId::from_bytes([3; 16]),
+            ))
         }
 
         fn commit_dispatch(
@@ -127,9 +148,21 @@ mod coordinator_tests {
             _run_id: ProviderRateRunId,
             _registration: ProviderRateRegistration,
             _reservation_id: ProviderRateReservationId,
-            _now: Timestamp,
+            now: Timestamp,
         ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
-            Err(ProviderRateStoreError::Unavailable)
+            if !self.admission_enabled {
+                return Err(ProviderRateStoreError::Unavailable);
+            }
+            if self.dispatch_wait.load(Ordering::SeqCst) {
+                self.request_active.store(false, Ordering::SeqCst);
+                return Ok(ProviderRateDispatchDecision::WaitUntil(
+                    now.checked_add_nanos(1_000_000_000)
+                        .map_err(|_| ProviderRateStoreError::Clock)?,
+                ));
+            }
+            Ok(ProviderRateDispatchDecision::Ready(
+                ProviderRatePermitId::from_bytes([4; 16]),
+            ))
         }
 
         fn cancel_reservation(
@@ -138,6 +171,7 @@ mod coordinator_tests {
             _registration: ProviderRateRegistration,
             _reservation_id: ProviderRateReservationId,
         ) -> Result<(), ProviderRateStoreError> {
+            self.request_active.store(false, Ordering::SeqCst);
             Ok(())
         }
 
@@ -147,6 +181,7 @@ mod coordinator_tests {
             _registration: ProviderRateRegistration,
             _permit_id: ProviderRatePermitId,
         ) -> Result<(), ProviderRateStoreError> {
+            self.request_active.store(false, Ordering::SeqCst);
             Ok(())
         }
 
@@ -157,7 +192,13 @@ mod coordinator_tests {
             _now: Timestamp,
             _retry_after: RetryAfter,
         ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
-            Err(ProviderRateStoreError::Unavailable)
+            if !self.admission_enabled {
+                return Err(ProviderRateStoreError::Unavailable);
+            }
+            self.disabled.store(true, Ordering::SeqCst);
+            Ok(ProviderRateReservationDecision::Unavailable(
+                BudgetUnavailableReason::Disabled,
+            ))
         }
 
         fn apply_refusal(
@@ -263,6 +304,180 @@ mod coordinator_tests {
     fn register_fresh(policy: ResolvedProviderBudgetPolicy) -> TestResult<SharedProviderBudget> {
         let mut pool = ProviderBudgetPool::new()?;
         Ok(pool.register(policy)?)
+    }
+
+    #[tokio::test]
+    async fn shared_request_admission_waits_without_polling_and_releases_cancelled_turns()
+    -> TestResult {
+        struct Adapter(crate::SourceMetadata);
+        impl crate::SourceMetadataProvider for Adapter {
+            fn metadata(&self) -> &crate::SourceMetadata {
+                &self.0
+            }
+        }
+
+        let store = Arc::new(TrackingProviderRateStore {
+            admission_enabled: true,
+            ..TrackingProviderRateStore::default()
+        });
+        let rate = ProviderRateAuthority::try_new(store.clone())?;
+        let publisher = crate::FASB_XBRL_TAXONOMY_AUTHORITY;
+        let policy = test_policy(publisher.rate_scope(), 20)?;
+        let mut metadata = serde_json::to_value(publisher.dependency_source_metadata()?)?;
+        metadata["budget"] = serde_json::to_value(&policy)?;
+        let adapter = Adapter(serde_json::from_value(metadata)?);
+        let mut registry =
+            crate::AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
+                Arc::new(NoAccountSubjects),
+                rate.clone(),
+            )?;
+        let at = SystemBudgetClock::new()
+            .observation()
+            .map_err(|reason| format!("clock: {reason:?}"))?
+            .wall_clock;
+        let registered = registry.register(adapter.0.clone(), at)?;
+        let authority = registry.extraction_authority(&registered, &adapter)?;
+        let target = "https://xbrl.fasb.org/test.xsd";
+
+        // Separate handles for the same durable group share waiting state even when their local
+        // allocations differ. This is the source-registry/onboarding composition boundary.
+        let declaration =
+            ProviderRateDeclaration::try_for_endpoint(policy, &publisher.endpoint_policy()?)?;
+        let first_budget = rate.register_budget(declaration.clone())?;
+        let second_budget = rate.register_budget(declaration)?;
+        assert!(!first_budget.shares_allocation_with(&second_budget));
+        assert!(Arc::ptr_eq(
+            &first_budget.request_admission(),
+            &second_budget.request_admission(),
+        ));
+
+        let held = authority.acquire_network_request(target).await?;
+        let mut first = Box::pin(authority.acquire_network_request(target));
+        let mut second = Box::pin(authority.acquire_network_request(target));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let after_first = store.reserve_calls.load(Ordering::SeqCst);
+        assert!(futures_util::poll!(&mut second).is_pending());
+        // Longer than the removed SEC 25 ms recheck: neither waiter may call the store again.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        assert_eq!(store.reserve_calls.load(Ordering::SeqCst), after_first);
+
+        // Cancelling the head transfers admission ownership without freeing the active request.
+        drop(first);
+        assert!(futures_util::poll!(&mut second).is_pending());
+        assert_eq!(store.reserve_calls.load(Ordering::SeqCst), after_first + 1);
+        held.release();
+        let second = tokio::time::timeout(Duration::from_secs(1), second).await??;
+
+        // New work cannot overtake an already queued caller, even if it is polled first on wake.
+        let mut earlier = Box::pin(authority.acquire_network_request(target));
+        let mut later = Box::pin(authority.acquire_network_request(target));
+        assert!(futures_util::poll!(&mut earlier).is_pending());
+        assert!(futures_util::poll!(&mut later).is_pending());
+        second.release();
+        assert!(futures_util::poll!(&mut later).is_pending());
+        let earlier = tokio::time::timeout(Duration::from_secs(1), earlier).await??;
+        assert!(futures_util::poll!(&mut later).is_pending());
+        earlier.release();
+        tokio::time::timeout(Duration::from_secs(1), later)
+            .await??
+            .release();
+
+        // A release after arming but before polling the notification is not lost. Reservation
+        // cancellation must signal too, although it has never charged a provider request.
+        let admission = first_budget.request_admission();
+        let reserved = authority.try_network_request(target)?;
+        let changed = admission.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        reserved.release();
+        tokio::time::timeout(Duration::from_secs(1), changed).await?;
+
+        // Durable reservation cleanup also wakes another binding when local admission failed
+        // before an outer BudgetReservation could own it.
+        let binding = first_budget
+            .allocation
+            .provider_rate
+            .clone()
+            .ok_or("missing binding")?;
+        let (_, decision) = binding
+            .try_reserve_decision()
+            .map_err(|reason| format!("reservation: {reason:?}"))?;
+        let ProviderRateReservationDecision::Ready(reservation_id) = decision else {
+            return Err("expected durable reservation".into());
+        };
+        let reservation =
+            crate::policy::provider_rate::ProviderRateReservation::new(binding, reservation_id);
+        let changed = admission.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        drop(reservation);
+        tokio::time::timeout(Duration::from_secs(1), changed).await?;
+
+        // Weighted/claim-dependent windows may reject dispatch even when reservation was ready.
+        // Its own reservation release cannot repeatedly wake the unchanged rate deadline.
+        store.dispatch_wait.store(true, Ordering::SeqCst);
+        let mut delayed = Box::pin(authority.acquire_network_request(target));
+        assert!(futures_util::poll!(&mut delayed).is_pending());
+        let after_dispatch_wait = store.reserve_calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(futures_util::poll!(&mut delayed).is_pending());
+        assert_eq!(
+            store.reserve_calls.load(Ordering::SeqCst),
+            after_dispatch_wait
+        );
+        store.dispatch_wait.store(false, Ordering::SeqCst);
+        // A response/cooldown change after arming must still wake immediately, before the old
+        // one-second deadline. This is the same signal fired after those durable transitions.
+        drop(admission.notify_on_drop());
+        tokio::time::timeout(Duration::from_millis(100), delayed)
+            .await??
+            .release();
+
+        // Revocation wakes both the capacity waiter and its FIFO successor while capacity is
+        // still held; neither needs a release or timer recheck to discover lost authority.
+        let held = authority.acquire_network_request(target).await?;
+        let mut head = Box::pin(authority.acquire_network_request(target));
+        let mut queued = Box::pin(authority.acquire_network_request(target));
+        assert!(futures_util::poll!(&mut head).is_pending());
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        registry.revoke(&registered, at)?;
+        for waiting in [head, queued] {
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), waiting).await?,
+                Err(crate::ExtractionAuthorityError::NotCurrent)
+            ));
+        }
+        held.release();
+
+        // Revocation is permanent within a registry; use a new owner for the terminal case.
+        let mut registry =
+            crate::AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
+                Arc::new(NoAccountSubjects),
+                rate.clone(),
+            )?;
+        let registered = registry.register(adapter.0.clone(), at)?;
+        let authority = registry.extraction_authority(&registered, &adapter)?;
+
+        // An independent handle can make the durable group terminal while a request still owns
+        // capacity; the blocked caller must wake and fail without waiting for that request's Drop.
+        let held = authority.acquire_network_request(target).await?;
+        let mut waiting = Box::pin(authority.acquire_network_request(target));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        assert!(matches!(
+            second_budget.apply_retry_after(RetryAfter::Delay(NonZeroU64::MIN)),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), waiting).await?,
+            Err(crate::ExtractionAuthorityError::BudgetUnavailable {
+                reason: BudgetUnavailableReason::Disabled,
+            })
+        ));
+        held.release();
+        assert!(!store.request_active.load(Ordering::SeqCst));
+        Ok(())
     }
 
     #[test]
@@ -406,6 +621,17 @@ mod coordinator_tests {
             >())
             .and_then(|bytes| bytes.checked_add(expected_dynamic))
             .and_then(|bytes| bytes.checked_add(expected_window_storage))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<crate::policy::provider_rate::admission::RequestAdmission>(
+                    )
+                    .checked_add(
+                        crate::conservative_arc_control_block_charge::<
+                            crate::policy::provider_rate::admission::RequestAdmission,
+                        >(),
+                    )?,
+                )
+            })
             .and_then(|bytes| bytes.checked_add(clock.shared_allocation_charge()))
             .ok_or("shared budget allocation charge overflow")?;
 

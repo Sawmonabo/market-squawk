@@ -295,6 +295,12 @@ impl std::fmt::Debug for SharedProviderBudget {
 }
 
 impl SharedProviderBudget {
+    pub(crate) fn request_admission(
+        &self,
+    ) -> Arc<crate::policy::provider_rate::admission::RequestAdmission> {
+        Arc::clone(&self.allocation.admission)
+    }
+
     /// Projects the exact persisted provider/account admission state without reserving or charging
     /// a request. Budgets without the shared provider-rate binding fail closed.
     pub fn provider_rate_availability(
@@ -358,6 +364,7 @@ impl SharedProviderBudget {
                 terminal: AtomicBool::new(false),
                 durability: None,
                 provider_rate: None,
+                admission: Arc::default(),
             }),
         }
     }
@@ -391,6 +398,7 @@ impl SharedProviderBudget {
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
+                admission: Arc::clone(&binding.admission),
                 provider_rate: Some(binding),
             }),
         }
@@ -414,6 +422,7 @@ impl SharedProviderBudget {
                 terminal: AtomicBool::new(false),
                 durability: Some(binding),
                 provider_rate: None,
+                admission: Arc::default(),
             }),
         }
     }
@@ -436,6 +445,7 @@ impl SharedProviderBudget {
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(durability),
+                admission: Arc::clone(&provider_rate.admission),
                 provider_rate: Some(provider_rate),
             }),
         }
@@ -462,6 +472,7 @@ impl SharedProviderBudget {
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(binding),
                 provider_rate: None,
+                admission: Arc::default(),
             }),
         })
     }
@@ -487,6 +498,7 @@ impl SharedProviderBudget {
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(durability),
+                admission: Arc::clone(&provider_rate.admission),
                 provider_rate: Some(provider_rate),
             }),
         })
@@ -535,6 +547,7 @@ impl SharedProviderBudget {
                 Ok(Some(token))
             }
             (binding, token) => {
+                let _changed = self.allocation.admission.notify_on_drop();
                 if let Some(binding) = binding {
                     binding.session.invalidate();
                 }
@@ -899,6 +912,7 @@ impl SharedProviderBudget {
 
     /// Applies a bounded provider retry instruction to every worker sharing this budget.
     pub fn apply_retry_after(&self, retry_after: RetryAfter) -> BudgetDecision {
+        let _changed = self.allocation.admission.notify_on_drop();
         let operation = match self.admit_runtime_operation() {
             Ok(operation) => operation,
             Err(reason) => return BudgetDecision::Unavailable(reason),
@@ -1024,6 +1038,7 @@ impl SharedProviderBudget {
     /// The sample is capped by the configured jitter ceiling and cannot select an alternate
     /// identity, endpoint, proxy, or request shard.
     pub fn apply_refusal(&self, jitter_sample_basis_points: u16) -> BudgetDecision {
+        let _changed = self.allocation.admission.notify_on_drop();
         let operation = match self.admit_runtime_operation() {
             Ok(operation) => operation,
             Err(reason) => return BudgetDecision::Unavailable(reason),
@@ -1130,6 +1145,7 @@ impl SharedProviderBudget {
 
     /// Permanently disables dispatch until a new budget instance is explicitly configured.
     pub fn disable(&self) -> BudgetDecision {
+        let _changed = self.allocation.admission.notify_on_drop();
         let operation = match self.admit_runtime_operation() {
             Ok(operation) => operation,
             Err(reason) => return BudgetDecision::Unavailable(reason),
@@ -1372,9 +1388,11 @@ impl BudgetReservation {
     }
 
     fn release_inner(&mut self) {
+        let admission = Arc::clone(&self.allocation.admission);
         if self.released {
             return;
         }
+        let _changed = admission.notify_capacity_on_drop();
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };

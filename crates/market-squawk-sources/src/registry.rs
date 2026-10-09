@@ -74,17 +74,20 @@ struct SessionHealthQualification {
 #[derive(Debug)]
 struct RegistrationLeaseState {
     current: AtomicBool,
+    invalidated: tokio::sync::Notify,
 }
 
 impl RegistrationLeaseState {
     fn new() -> Self {
         Self {
             current: AtomicBool::new(true),
+            invalidated: tokio::sync::Notify::new(),
         }
     }
 
     fn invalidate(&self) {
         self.current.store(false, Ordering::Release);
+        self.invalidated.notify_waiters();
     }
 
     fn is_current(&self) -> bool {

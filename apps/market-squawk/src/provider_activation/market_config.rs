@@ -506,7 +506,6 @@ impl MarketDataInstrumentBinding {
                 .map_err(|_| MarketProviderConfigurationError::LeaseBinding)?
             }
             MarketDataSubscriptionSymbolEvidenceKind::NasdaqSessionListing {
-                source_id,
                 source_payload_evidence,
                 source_timestamp,
                 observed_at,
@@ -518,8 +517,8 @@ impl MarketDataInstrumentBinding {
             } => {
                 // The opaque listing and catalog approval corroborate current venue-symbol
                 // membership. The pinned definition independently retains the original verified
-                // ticker assignment. Its normalized row evidence is not the whole-directory
-                // payload, and a later directory observation must not replace that original.
+                // ticker assignment, which can come from another corroborating source. Its
+                // genuine provenance is retained; it is never relabeled as Nasdaq evidence.
                 if symbol != &self.subscription_symbol
                     || *asset_class != self.asset_class
                     || definition.asset_class() != *asset_class
@@ -537,8 +536,7 @@ impl MarketDataInstrumentBinding {
                 }
                 let mut accepted = None;
                 for identifier in definition.identifiers() {
-                    if identifier.source_id() != source_id
-                        || !matches!(identifier.identifier(), ExternalIdentifier::Ticker(ticker)
+                    if !matches!(identifier.identifier(), ExternalIdentifier::Ticker(ticker)
                             if ticker.as_str() == symbol.as_str())
                     {
                         continue;
@@ -2901,7 +2899,7 @@ mod tests {
             ProviderInstrumentId::try_from("SPY")?,
             MarketDataSubscriptionSymbolEvidence {
                 kind: MarketDataSubscriptionSymbolEvidenceKind::NasdaqSessionListing {
-                    source_id: identifier.source_id().clone(),
+                    source_id: SourceId::try_from("nasdaq-trader-symbol-directory-reference")?,
                     metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
                         "listing-v1",
                     )?),
@@ -2978,7 +2976,7 @@ mod tests {
                     ExternalIdentifierRecordInput {
                         identifier: ExternalIdentifier::Ticker(Ticker::try_from("SPY")?),
                         assignment_verification: AssignmentVerification::VerifiedAssigned,
-                        source_id: SourceId::try_from("nasdaq-trader-symbol-directory-reference")?,
+                        source_id: SourceId::try_from("independent-native-reference")?,
                         source_evidence: evidence,
                         source_timestamp: Some(Timestamp::from_unix_nanos(1)),
                         observed_at: Timestamp::from_unix_nanos(10),

@@ -435,6 +435,66 @@ pub(crate) enum SchwabInstrumentReferencePublicationError {
     Catalog(#[from] MarketDataInstrumentCatalogError),
 }
 
+impl SchwabInstrumentReferencePublicationError {
+    /// Closed diagnostic categories contain no provider payload, credential or arbitrary text.
+    pub(crate) fn diagnostic_code(&self) -> &'static str {
+        use market_squawk_adapter_schwab::SchwabInstrumentReferenceError as ReferenceError;
+        match self {
+            Self::Service(error) => match error {
+                ServiceError::Unavailable => "service_unavailable",
+                ServiceError::Unauthorized => "service_unauthorized",
+                ServiceError::InvalidResult => "service_invalid_result",
+                ServiceError::Cancelled => "service_cancelled",
+                ServiceError::DeadlineExceeded => "service_deadline_exceeded",
+                _ => "service_failure",
+            },
+            Self::Composition(_) => "publication_composition",
+            Self::Transport(_) => "capture_transport",
+            Self::Reference(error) => match error {
+                ReferenceError::ScopeMismatch => "reference_scope_mismatch",
+                ReferenceError::EvidenceMismatch => "reference_evidence_mismatch",
+                ReferenceError::InvalidClock => "reference_invalid_clock",
+                ReferenceError::Canonical(_) => "reference_decode",
+            },
+            Self::Research(error) => match error {
+                crate::ResearchServiceError::ProviderCaptureStore(_) => "capture_store",
+                crate::ResearchServiceError::ProviderCaptureSealWorkerUnavailable => {
+                    "capture_worker"
+                }
+                _ => "capture_research_service",
+            },
+            Self::Ingest(error) => match error {
+                IngestError::ProviderCapture(_) => "capture_receipt",
+                IngestError::SealedProviderCapture(_) => "capture_verification",
+                IngestError::Cancelled => "ingest_cancelled",
+                IngestError::DeadlineExceeded => "ingest_deadline_exceeded",
+                _ => "capture_ingest",
+            },
+            Self::Catalog(error) => match error {
+                MarketDataInstrumentCatalogError::SourceIdentityConflict => {
+                    "catalog_source_identity_conflict"
+                }
+                MarketDataInstrumentCatalogError::SourceAuthority(_) => "catalog_source_authority",
+                MarketDataInstrumentCatalogError::ListingAuthority(_) => {
+                    "catalog_listing_authority"
+                }
+                MarketDataInstrumentCatalogError::ReferencePositionConflict => {
+                    "catalog_reference_position_conflict"
+                }
+                MarketDataInstrumentCatalogError::PublicationAuthority(_) => {
+                    "catalog_publication_authority"
+                }
+                MarketDataInstrumentCatalogError::BlockingIo(_) => "catalog_blocking_io",
+                MarketDataInstrumentCatalogError::Storage(_) => "catalog_storage",
+                MarketDataInstrumentCatalogError::InvalidInput => "catalog_invalid_input",
+                MarketDataInstrumentCatalogError::Cancelled => "catalog_cancelled",
+                MarketDataInstrumentCatalogError::DeadlineExceeded => "catalog_deadline_exceeded",
+                _ => "catalog_publication",
+            },
+        }
+    }
+}
+
 fn trusted_now() -> Result<Timestamp, ServiceError> {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

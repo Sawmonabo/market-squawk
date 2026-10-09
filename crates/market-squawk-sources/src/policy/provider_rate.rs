@@ -1,7 +1,7 @@
 //! Product-wide durable provider request and connection admission.
 
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 #[cfg(debug_assertions)]
 use std::time::Duration;
 
@@ -23,6 +23,9 @@ use super::{
 };
 
 const MAX_RATE_COLLISION_IDENTITIES: usize = 64;
+
+#[path = "provider_rate/admission.rs"]
+pub(in crate::policy) mod admission;
 
 /// Collision namespace for one product-wide provider rate allocation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -800,6 +803,7 @@ struct ProviderRateAuthorityInner {
     run_id: ProviderRateRunId,
     clock: Arc<dyn BudgetClock>,
     operation_gate: Mutex<()>,
+    admissions: Mutex<Vec<(ProviderRateGroupId, Weak<admission::RequestAdmission>)>>,
     #[cfg(debug_assertions)]
     manual_clock: Option<Arc<ManualProviderRateClock>>,
 }
@@ -948,6 +952,7 @@ impl ProviderRateAuthority {
                 run_id,
                 clock,
                 operation_gate: Mutex::new(()),
+                admissions: Mutex::new(Vec::new()),
                 #[cfg(debug_assertions)]
                 manual_clock,
             }),
@@ -986,10 +991,7 @@ impl ProviderRateAuthority {
         {
             return Err(BudgetPoolError::Persistence);
         }
-        let binding = ProviderRateBinding {
-            authority: self.clone(),
-            registration,
-        };
+        let binding = self.binding_for_registration(registration)?;
         SharedProviderBudget::new_with_provider_rate(declaration.policy, binding)
     }
 
@@ -1079,9 +1081,38 @@ impl ProviderRateAuthority {
         {
             return Err(BudgetPoolError::Persistence);
         }
+        self.binding_for_registration(registration)
+    }
+
+    fn binding_for_registration(
+        &self,
+        registration: ProviderRateRegistration,
+    ) -> Result<ProviderRateBinding, BudgetPoolError> {
+        let mut admissions = self
+            .inner
+            .admissions
+            .lock()
+            .map_err(|_| BudgetPoolError::Persistence)?;
+        admissions.retain(|(_, admission)| admission.strong_count() != 0);
+        let admission = admissions
+            .iter()
+            .find(|(group, _)| *group == registration.group_id())
+            .and_then(|(_, admission)| admission.upgrade());
+        let admission = match admission {
+            Some(admission) => admission,
+            None => {
+                admissions
+                    .try_reserve(1)
+                    .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+                let admission = Arc::new(admission::RequestAdmission::default());
+                admissions.push((registration.group_id(), Arc::downgrade(&admission)));
+                admission
+            }
+        };
         Ok(ProviderRateBinding {
             authority: self.clone(),
             registration,
+            admission,
         })
     }
 
@@ -1125,10 +1156,7 @@ impl ProviderRateAuthority {
             {
                 return Err(BudgetPoolError::Persistence);
             }
-            bindings.push(ProviderRateBinding {
-                authority: self.clone(),
-                registration: *registration,
-            });
+            bindings.push(self.binding_for_registration(*registration)?);
         }
         let result = operation(&bindings, observation)?;
         prepared.commit().map_err(map_store_registration_error)?;
@@ -1214,6 +1242,7 @@ impl AuthorizationSubjectResolver for ProviderRateAuthority {
 pub(in crate::policy) struct ProviderRateBinding {
     authority: ProviderRateAuthority,
     registration: ProviderRateRegistration,
+    pub(in crate::policy) admission: Arc<admission::RequestAdmission>,
 }
 
 impl std::fmt::Debug for ProviderRateBinding {
@@ -1369,6 +1398,9 @@ impl ProviderRateReservation {
         if self.released {
             return Ok(());
         }
+        // Local admission can fail before this reservation acquires an outer budget owner.
+        let admission = Arc::clone(&self.binding.admission);
+        let _changed = admission.notify_capacity_on_drop();
         self.binding
             .authority
             .serialized_store_operation(|store, run_id| {
@@ -1426,6 +1458,8 @@ impl ProviderRatePermit {
         if self.released {
             return Err(BudgetUnavailableReason::StateCorrupt);
         }
+        let admission = Arc::clone(&self.binding.admission);
+        let _changed = admission.notify_on_drop();
         let receipt = self
             .binding
             .authority
@@ -1462,6 +1496,8 @@ impl ProviderRatePermit {
         if self.released {
             return Ok(());
         }
+        let admission = Arc::clone(&self.binding.admission);
+        let _changed = admission.notify_on_drop();
         if self.claim.is_request_only() {
             self.binding
                 .authority

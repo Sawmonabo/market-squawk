@@ -1374,6 +1374,58 @@ pub(crate) fn validate_native_reference(
     Ok(())
 }
 
+/// Validates original display evidence across reference enrichment. A changed native identity,
+/// removed assigned identifier, currency or instrument family cannot inherit the retained quote.
+pub(crate) fn validate_retained_native_reference(
+    reference: &market_squawk_domain::MarketDataReference,
+    original: &market_squawk_data::MarketDataInstrumentRecord,
+    selected: &market_squawk_data::MarketDataInstrumentRecord,
+    provenance: &LiveProvenance,
+    knowledge_at: Timestamp,
+) -> Result<(), ServiceError> {
+    validate_native_reference(
+        reference,
+        original,
+        provenance,
+        knowledge_at,
+        NativeReferenceUse::RetainedDisplay,
+    )?;
+    let current = selected.definition();
+    if selected.published_at() > knowledge_at
+        || current.instrument_id() != reference.instrument_id()
+        || current.asset_class() != reference.asset_class()
+        || current.quote_currency() != reference.currency()
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    match reference.identity() {
+        market_squawk_domain::MarketDataReferenceIdentity::Provider(identity) => {
+            market_squawk_domain::MarketDataReference::try_new(
+                current,
+                selected.revision_digest(),
+                identity,
+                knowledge_at,
+            )
+        }
+        market_squawk_domain::MarketDataReferenceIdentity::Assigned(original_identifier) => {
+            let identifier = current
+                .identifiers()
+                .iter()
+                .find(|identifier| identifier.identifier() == original_identifier.identifier())
+                .ok_or(ServiceError::InvalidResult)?;
+            market_squawk_domain::MarketDataReference::try_from_assigned_identifier(
+                current,
+                selected.revision_digest(),
+                identifier,
+                reference.source_symbol().clone(),
+                knowledge_at,
+            )
+        }
+    }
+    .map(|_| ())
+    .map_err(|_| ServiceError::InvalidResult)
+}
+
 fn market_mark(
     event: &MarketEvent,
     terms: Option<InstrumentExecutionTerms>,
