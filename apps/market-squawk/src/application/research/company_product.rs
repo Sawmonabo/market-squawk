@@ -2055,8 +2055,9 @@ fn map_product_text_error(error: ProductTextCopyError) -> CompanyProductProjecti
 mod tests {
     use super::*;
 
-    #[test]
-    fn statement_and_ratio_projection_requires_one_exact_filing_envelope() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn statement_and_ratio_projection_requires_one_exact_filing_envelope()
+    -> anyhow::Result<()> {
         let year_start = CalendarDate::new(2025, 1, 1)?;
         let year_end = CalendarDate::new(2025, 12, 31)?;
         let duration = FundamentalPeriod::duration(year_start, year_end)?;
@@ -2474,6 +2475,271 @@ mod tests {
                     .all(|input| input.fact().metric()
                         == CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests)
             );
+        }
+
+        // A proxy filing repeats NVDA's annual income without revenue. Display history
+        // must retain the complete original 10-K, not join its revenue to the proxy.
+        {
+            use market_squawk_data::{
+                DatasetId, DatasetManifestRef, DatasetSchemaRegistry, PointInTimeCandidate,
+                PointInTimeLimits, PointInTimePolicy, PointInTimeRequest, PointInTimeRevisionMode,
+                PointInTimeRevisionState, PointInTimeService, SecResearchFamily, Sha256Digest,
+            };
+            use market_squawk_domain::{
+                AvailabilityEvidence, CompanyIdentityObservation, CompanyIdentityObservationInput,
+                CompanyIdentitySurface, CompanyObservationSubject, DataQuality, DigestAlgorithm,
+                EvidenceDigest, ExactPayloadEvidence, FilingForm, FundamentalDimensionContext,
+                FundamentalFactContext, FundamentalFactContextInput, FundamentalObservation,
+                FundamentalRestatementStatus, FundamentalRevisionOrder, PayloadHash,
+                PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+                ResearchProvenanceInput, ResearchTime, SchemaVersion, SourceId,
+            };
+            use std::{
+                num::NonZeroU32,
+                time::{Duration, Instant},
+            };
+            use tokio_util::sync::CancellationToken;
+
+            let source = SourceId::try_from("sec-edgar")?;
+            let issuer = SourceIdentifier::try_from("0001045810")?;
+            let publication = EvidenceDigest::new(DigestAlgorithm::Sha256, [11; 32]);
+            let observed_at = Timestamp::from_unix_nanos(1_791_515_336_128_582_000);
+            let nvda_end = CalendarDate::new(2026, 1, 25)?;
+            let nvda_period =
+                FundamentalPeriod::duration(CalendarDate::new(2025, 1, 27)?, nvda_end)?;
+            let annual_filed = CalendarDate::new(2026, 2, 25)?;
+            let proxy_filed = CalendarDate::new(2026, 5, 12)?;
+            let company = CompanyIdentityObservation::try_new(CompanyIdentityObservationInput {
+                schema_version: SchemaVersion::CURRENT,
+                source_id: source.clone(),
+                provider_company_id: issuer.clone(),
+                surface: CompanyIdentitySurface::SecCompanyFacts,
+                conformed_name: "NVIDIA CORP".to_owned(),
+                former_names: Vec::new(),
+                entity_type: None,
+                sic: None,
+                sic_description: None,
+                associations: Vec::new(),
+                parent_ingest_payload_evidence: ExactPayloadEvidence::from_content_digest(
+                    publication,
+                ),
+                identity_payload_evidence: ExactPayloadEvidence::from_content_digest(publication),
+                received_at: observed_at,
+                availability: AvailabilityEvidence::local_first_observed(observed_at),
+                ingested_at: observed_at,
+                quality: DataQuality::OfficialDelayed,
+            })?;
+            let manifest = DatasetManifestRef::try_new_with_schema(
+                DatasetId::try_from("nvda-annual-report-history")?,
+                1,
+                DatasetSchemaRegistry::local().canonical_research_observations()?,
+                Sha256Digest::new([11; 32]),
+            )?;
+            let mut candidates = Vec::new();
+            for (concept, value, ordinal, accession, form, filed_on, annual) in [
+                (
+                    "NetIncomeLoss",
+                    120_067_000_000_i64,
+                    1,
+                    "0001045810-26-000021",
+                    "10-K",
+                    annual_filed,
+                    true,
+                ),
+                (
+                    "Revenues",
+                    215_938_000_000,
+                    1,
+                    "0001045810-26-000021",
+                    "10-K",
+                    annual_filed,
+                    true,
+                ),
+                (
+                    "NetIncomeLoss",
+                    120_067_000_000,
+                    2,
+                    "0001045810-26-000036",
+                    "DEF 14A",
+                    proxy_filed,
+                    false,
+                ),
+            ] {
+                let revision = RevisionNumber::new(ordinal)?;
+                let context = ResearchContext::new(
+                    ResearchProvenance::try_new(ResearchProvenanceInput {
+                        source_id: source.clone(),
+                        instrument_id: None,
+                        venue_id: None,
+                        source_identifier: SourceIdentifier::try_from(format!(
+                            "{accession}:{concept}"
+                        ))?,
+                        source_timestamp: None,
+                        received_at: observed_at,
+                        ingested_at: observed_at,
+                        quality: DataQuality::OfficialDelayed,
+                        payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                            DigestAlgorithm::Sha256,
+                            [11; 32],
+                        )),
+                        availability: AvailabilityEvidence::local_first_observed(observed_at),
+                    })?,
+                    ResearchTime::try_new_with_coordinates(
+                        ResearchTemporalCoordinate::calendar_date(nvda_end),
+                        Some(ResearchTemporalCoordinate::calendar_date(filed_on)),
+                        revision,
+                        None,
+                    )?,
+                )?;
+                let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+                    schema_version: SchemaVersion::CURRENT,
+                    period: nvda_period,
+                    unit: SourceIdentifier::try_from("USD")?,
+                    accession: SourceIdentifier::try_from(accession)?,
+                    filing_form: Some(FilingForm::try_from(form)?),
+                    amendment_status: FundamentalAmendmentStatus::Original,
+                    filed_on: Some(filed_on),
+                    frame: None,
+                    fiscal_year: annual.then_some(2026),
+                    fiscal_period: annual
+                        .then(|| SourceIdentifier::try_from("FY"))
+                        .transpose()?,
+                    cadence: if annual {
+                        FundamentalCadence::Annual
+                    } else {
+                        FundamentalCadence::Unavailable
+                    },
+                    xbrl_context_id: None,
+                    dimensions: FundamentalDimensionContext::unavailable(),
+                    consolidation: FundamentalConsolidation::Unavailable,
+                    revision_order: FundamentalRevisionOrder::new(
+                        revision,
+                        SourceIdentifier::try_from("sec-companyfacts-revision-order-v1")?,
+                    ),
+                    restatement_status: FundamentalRestatementStatus::Unavailable,
+                })?;
+                candidates.push(PointInTimeCandidate::new(
+                    ResearchObservation::Fundamental(FundamentalObservation::new(
+                        context,
+                        CompanyObservationSubject::Issuer(issuer.clone()),
+                        SourceIdentifier::try_from(format!("us-gaap:{concept}"))?,
+                        Decimal::from(value),
+                        fact_context,
+                    )?),
+                    manifest.clone(),
+                ));
+            }
+            for (mode, cutoff, expected_rows) in [
+                (PointInTimeRevisionMode::LatestKnown, observed_at, 2),
+                (PointInTimeRevisionMode::AllKnown, observed_at, 3),
+                (
+                    PointInTimeRevisionMode::AllKnown,
+                    Timestamp::from_unix_nanos(observed_at.unix_nanos() - 1),
+                    0,
+                ),
+            ] {
+                let request = PointInTimeRequest::try_new(
+                    PointInTimePolicy::try_new(NonZeroU32::MIN, mode)?,
+                    cutoff,
+                    None,
+                    ResearchTemporalCoordinate::calendar_date(nvda_end),
+                    None,
+                    PointInTimeLimits::try_new(3, 2, 2, 3, 1024 * 1024)?,
+                )?;
+                let selected = PointInTimeService::new()
+                    .select(
+                        &request,
+                        &candidates,
+                        &CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(10),
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                assert_eq!(selected.records().len(), expected_rows);
+                if expected_rows == 0 {
+                    assert_eq!(selected.exclusion_counts().availability_after_as_of(), 3);
+                    continue;
+                }
+                let mut selected_facts = Vec::new();
+                for record in selected.records() {
+                    // No explicit supersession is recorded in either original filing.
+                    assert_eq!(record.revision_state(), PointInTimeRevisionState::Current);
+                    let (fact, filing) = super::super::company_research::company_source_row(
+                        SecResearchFamily::CompanyFacts,
+                        &company,
+                        publication,
+                        record.revision_state(),
+                        record.candidate().observation().clone(),
+                        cutoff,
+                    )?;
+                    assert!(filing.is_none());
+                    selected_facts.push(
+                        project_fact(
+                            &fact.ok_or_else(|| anyhow::anyhow!("missing selected fact"))?,
+                            cutoff,
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("unsupported selected fact"))?,
+                    );
+                }
+                let ratios = project_basis(&selected_facts)?;
+                let margins: Vec<_> = ratios
+                    .items()
+                    .iter()
+                    .filter(|ratio| ratio.metric() == CompanyRatioMetric::NetMargin)
+                    .collect();
+                assert_eq!(margins.len(), 2);
+                let annual = margins
+                    .iter()
+                    .find(|ratio| {
+                        ratio
+                            .envelope()
+                            .is_some_and(|envelope| envelope.filed_on == Some(annual_filed))
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("missing annual envelope"))?;
+                let proxy = margins
+                    .iter()
+                    .find(|ratio| {
+                        ratio
+                            .envelope()
+                            .is_some_and(|envelope| envelope.filed_on == Some(proxy_filed))
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("missing proxy envelope"))?;
+                assert_eq!(proxy.state(), CompanyRatioState::MissingInput);
+                assert_eq!(proxy.inputs().len(), 1);
+                assert_eq!(
+                    proxy.inputs()[0].fact().lineage.filing_identity.as_ref(),
+                    "0001045810-26-000036"
+                );
+                if mode == PointInTimeRevisionMode::LatestKnown {
+                    assert_eq!(selected.exclusion_counts().lower_revision(), 1);
+                    assert_eq!(annual.state(), CompanyRatioState::MissingInput);
+                    continue;
+                }
+                assert_eq!(annual.state(), CompanyRatioState::Reported);
+                assert_eq!(
+                    annual.value(),
+                    Some(Decimal::from(120067) / Decimal::from(215938))
+                );
+                assert_eq!(annual.inputs().len(), 2);
+                let annual_facts: Vec<_> = annual
+                    .inputs()
+                    .iter()
+                    .map(|input| input.fact().clone())
+                    .collect();
+                assert!(
+                    annual_facts
+                        .iter()
+                        .all(|fact| fact.lineage.filing_identity.as_ref()
+                            == "0001045810-26-000021"
+                            && fact.lineage.publication_identity == publication.bytes()
+                            && fact.reporting_context.occurrence.get() == 1
+                            && fact.revision == CompanyProductRevisionState::Current)
+                );
+                assert!(
+                    project_financial_envelope(&annual_facts, true)?
+                        .contains(&serde_json::to_value(annual)?)
+                );
+            }
         }
 
         // TSLA's comparative quarter has three net-income occurrences but only two

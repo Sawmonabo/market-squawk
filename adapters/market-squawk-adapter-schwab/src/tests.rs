@@ -2721,7 +2721,6 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
                 mixed_market_data,
             ))),
-            MockStreamerInbound::FlushBoundary,
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
                 malformed_selected_service,
             ))),
@@ -2751,7 +2750,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         Duration::from_millis(1),
         0,
         nonzero(64 * 1024),
-        nonzero(65),
+        nonzero(1),
         nonzero(64 * 1024),
         Duration::from_millis(1),
     )
@@ -2814,17 +2813,45 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         )
         .unwrap_or_else(|error| panic!("option desired state: {error}"));
     let cancellation = CancellationToken::new();
+    let (handoff_entered, entered) = tokio::sync::oneshot::channel();
+    let (resume_handoff, resume) = tokio::sync::oneshot::channel();
     let mut sink = CancellingCaptureSink {
         cancellation: cancellation.clone(),
         cancel_after: 7,
         microbatches: Vec::new(),
+        blocked_handoff: Some((handoff_entered, resume)),
     };
-    let run_error = streamer
-        .run(bootstrap.value(), &mut sink, cancellation)
-        .await
-        .expect_err("malformed selected-service frame must close the typed Streamer run");
+    let received_before_wait;
+    let run_error = {
+        let run = streamer.run(bootstrap.value(), &mut sink, cancellation.clone());
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("transport ended while capture waited: {result:?}"),
+            result = entered => result.expect("capture handoff reached"),
+        }
+        received_before_wait = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("wall clock")
+            .as_millis();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Temporary capture pressure suspends the producer; it must not reject the batch.
+        assert!(futures_util::poll!(&mut run).is_pending());
+        cancellation.cancel();
+        // Cancellation stops new reads, but cannot abandon an already received frame.
+        assert!(futures_util::poll!(&mut run).is_pending());
+        resume_handoff
+            .send(())
+            .expect("capture owner still waiting");
+        run.await
+            .expect_err("malformed selected-service frame must close the typed Streamer run")
+    };
     assert_eq!(run_error, SchwabTransportError::Adapter);
     assert_eq!(sink.microbatches.len(), 7);
+    assert!(
+        u128::from(sink.microbatches[6].frames()[0].received_at_unix_millis())
+            <= received_before_wait,
+        "handoff wait must not advance the original receive timestamp"
+    );
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path().join("stream-raw-publication"))
         .unwrap_or_else(|error| panic!("Streamer publication paths: {error}"));
@@ -3347,6 +3374,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         cancellation: reconnect_cancellation.clone(),
         cancel_after: usize::MAX,
         microbatches: Vec::new(),
+        blocked_handoff: None,
     };
     assert_eq!(
         reconnecting_streamer
@@ -3768,18 +3796,30 @@ struct CancellingCaptureSink {
     cancellation: CancellationToken,
     cancel_after: usize,
     microbatches: Vec<StreamerMicrobatch>,
+    blocked_handoff: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 impl StreamerCaptureSink for CancellingCaptureSink {
-    fn try_publish(
+    fn publish(
         &mut self,
         microbatch: StreamerMicrobatch,
-    ) -> Result<(), StreamerCaptureSinkError> {
-        self.microbatches.push(microbatch);
-        if self.microbatches.len() >= self.cancel_after {
-            self.cancellation.cancel();
-        }
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamerCaptureSinkError>> + Send + '_>> {
+        Box::pin(async move {
+            if self.microbatches.len() + 2 == self.cancel_after
+                && let Some((entered, resume)) = self.blocked_handoff.take()
+            {
+                entered.send(()).expect("capture waiter exists");
+                resume.await.expect("capture owner releases capacity");
+            }
+            self.microbatches.push(microbatch);
+            if self.microbatches.len() >= self.cancel_after {
+                self.cancellation.cancel();
+            }
+            Ok(())
+        })
     }
 }
 

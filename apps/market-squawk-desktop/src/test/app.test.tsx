@@ -774,7 +774,7 @@ describe("Market Squawk desktop boundary", () => {
     const financialResult = (cursor = financialVersion === 0 ? "financial-first" : `financial-updated-${financialVersion}`): ApplicationResult => ({
       data: {
         selectionToken: financialMode === "mismatch" ? "market_ffffffffffffffffffffffffffffffff" : marketSelectionToken,
-        section: "facts", knowledgeAt: marketObservedAt, effectiveOn: "2026-08-10", revisionPolicy: "latestKnown",
+        section: "facts", knowledgeAt: marketObservedAt, effectiveOn: "2026-08-10", revisionPolicy: "allKnown",
         state: "reported", families: [{ family: "company_facts", state: "reported", reason: null }],
         items: [{ ...financialFact, value: cursor === "financial-next" ? "234567.89"
           : cursor === "financial-updated-1" ? "345678.90" : cursor === "financial-updated-2" ? "456789.01" : financialFact.value }],

@@ -131,6 +131,17 @@ code-owned policy correction can remove obsolete request windows only after the 
 scope drains; cooldown, disable decisions and stale-handle rejection survive the correction.
 This admission policy does not establish successful Streamer service coverage or screen delivery;
 those require separate live producer-to-consumer evidence.
+
+The native capture handoff uses a bounded asynchronous channel. Temporary queue pressure waits
+for the consumer rather than terminating the connection or expanding resident queues. The transport
+owner is joined on cancellation; already received microbatches finish handoff and raw sealing before
+retirement. A closed consumer retains the undelivered batch for cleanup. This follows Tokio's
+[bounded-channel backpressure](https://docs.rs/tokio/1.53.1/tokio/sync/mpsc/index.html) and
+[send cancellation semantics](https://docs.rs/tokio/1.53.1/tokio/sync/mpsc/struct.Sender.html#method.send)
+(reviewed 2026-10-09): cancelling a send future can lose its value, so the owned drain does not race
+that send against cancellation. Durable publication and current-display qualification remain separate
+from handoff. Sustained processing lag still requires actual throughput and continuity evidence.
+
 Current rate enforcement belongs to the onboarding profile, independently of the immutable
 capability used to bind saved consent and credential identity. Scheduling, Settings disclosure and
 activation leases consume that one descriptor. This request-window correction preserves the

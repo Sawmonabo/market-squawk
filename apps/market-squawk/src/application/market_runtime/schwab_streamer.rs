@@ -176,12 +176,15 @@ struct CaptureSink {
     overflow: Arc<Mutex<Option<StreamerMicrobatch>>>,
 }
 impl StreamerCaptureSink for CaptureSink {
-    fn try_publish(&mut self, batch: StreamerMicrobatch) -> Result<(), StreamerCaptureSinkError> {
-        match self.sender.try_send(batch) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let closed = matches!(error, mpsc::error::TrySendError::Closed(_));
-                let batch = error.into_inner();
+    fn publish(
+        &mut self,
+        batch: StreamerMicrobatch,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamerCaptureSinkError>> + Send + '_>> {
+        Box::pin(async move {
+            // This owner is joined, never aborted: cancellation stops further network reads
+            // while the consumer keeps draining and sealing already received frames.
+            // Do not select cancellation against send; dropping it would discard the batch.
+            if let Err(error) = self.sender.send(batch).await {
                 let mut overflow = self
                     .overflow
                     .lock()
@@ -189,14 +192,11 @@ impl StreamerCaptureSink for CaptureSink {
                 if overflow.is_some() {
                     return Err(StreamerCaptureSinkError::Integrity);
                 }
-                *overflow = Some(batch);
-                Err(if closed {
-                    StreamerCaptureSinkError::Closed
-                } else {
-                    StreamerCaptureSinkError::Saturated
-                })
+                *overflow = Some(error.0);
+                return Err(StreamerCaptureSinkError::Closed);
             }
-        }
+            Ok(())
+        })
     }
 }
 

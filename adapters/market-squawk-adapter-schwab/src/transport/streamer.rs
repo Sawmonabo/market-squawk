@@ -95,6 +95,7 @@ impl RawStreamerFrame {
         kind: RawStreamerFrameKind,
         payload: Bytes,
         maximum: usize,
+        received_at_unix_millis: u64,
     ) -> Result<Self, SchwabTransportError> {
         if payload.len() > maximum {
             return Err(SchwabTransportError::PayloadTooLarge);
@@ -103,7 +104,7 @@ impl RawStreamerFrame {
             generation,
             ordinal,
             kind,
-            received_at_unix_millis: unix_millis()?,
+            received_at_unix_millis,
             payload_sha256: Sha256::digest(&payload).into(),
             payload,
         })
@@ -895,20 +896,23 @@ fn hash_streamer_authority_observation(
     Ok(())
 }
 
-/// Fail-closed nonblocking sink failure.
+/// Terminal capture handoff failure. Temporary capacity pressure waits in the sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamerCaptureSinkError {
-    Saturated,
     Closed,
     Integrity,
 }
 
-/// Application-owned nonblocking bridge to the pre-seal Streamer microbatch seam.
+/// Application-owned bounded bridge to the pre-seal Streamer microbatch seam.
+///
+/// The executor awaits each handoff before reading more frames, including during cancellation
+/// drain. Implementations must retain custody of received frames on failure; callers must not
+/// abandon the returned future when cancelling the connection.
 pub trait StreamerCaptureSink: Send {
-    fn try_publish(
+    fn publish(
         &mut self,
         microbatch: StreamerMicrobatch,
-    ) -> Result<(), StreamerCaptureSinkError>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamerCaptureSinkError>> + Send + '_>>;
 }
 
 /// Provider frame delivered by an injectable connection boundary.
@@ -1813,15 +1817,15 @@ impl SchwabStreamerExecutor {
                 {
                     Ok(incoming) => incoming,
                     Err(SchwabTransportError::Cancelled) => {
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                         return Ok(ConnectionExit::Cancelled);
                     }
                     Err(error) if retryable(error) => {
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                         return Ok(ConnectionExit::Retry);
                     }
                     Err(error) => {
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                         return Err(error);
                     }
                 };
@@ -1869,7 +1873,7 @@ impl SchwabStreamerExecutor {
                     }
                     ProcessedFrame::Control => {}
                     ProcessedFrame::Closed => {
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                         return Ok(ConnectionExit::Retry);
                     }
                 }
@@ -2000,7 +2004,7 @@ impl SchwabStreamerExecutor {
                                     }
                                 }
                                 if let Some(error) = response_error {
-                                    flush_batch(&mut batch, sink, &self.telemetry)?;
+                                    flush_batch(&mut batch, sink, &self.telemetry).await?;
                                     return Err(error);
                                 }
                                 observed_desired_data |= frame.value().data.iter().any(|data| {
@@ -2013,7 +2017,7 @@ impl SchwabStreamerExecutor {
                             }
                             ProcessedFrame::Control => {}
                             ProcessedFrame::Closed => {
-                                flush_batch(&mut batch, sink, &self.telemetry)?;
+                                flush_batch(&mut batch, sink, &self.telemetry).await?;
                                 return Ok(ConnectionExit::Retry);
                             }
                         }
@@ -2057,17 +2061,17 @@ impl SchwabStreamerExecutor {
                             || now >= idle_deadline
                             || acknowledgement_expired
                         {
-                            flush_batch(&mut batch, sink, &self.telemetry)?;
+                            flush_batch(&mut batch, sink, &self.telemetry).await?;
                             return Ok(ConnectionExit::Retry);
                         }
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                     }
                     Err(SchwabTransportError::Cancelled) => {
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                         return Ok(ConnectionExit::Cancelled);
                     }
                     Err(error) if retryable(error) => {
-                        flush_batch(&mut batch, sink, &self.telemetry)?;
+                        flush_batch(&mut batch, sink, &self.telemetry).await?;
                         return Ok(ConnectionExit::Retry);
                     }
                     Err(error) => return Err(error),
@@ -2077,7 +2081,7 @@ impl SchwabStreamerExecutor {
         .await;
         // Any early error still hands accumulated native frames to the capture owner before
         // the outer connection owner closes the socket and releases command ownership.
-        let flushed = flush_batch(&mut batch, sink, &self.telemetry);
+        let flushed = flush_batch(&mut batch, sink, &self.telemetry).await;
         match (outcome, flushed) {
             (_, Err(error)) => Err(error),
             (outcome, Ok(())) => outcome,
@@ -2097,6 +2101,8 @@ impl SchwabStreamerExecutor {
         sink: &mut dyn StreamerCaptureSink,
         cancellation: &CancellationToken,
     ) -> Result<ProcessedFrame, SchwabTransportError> {
+        // Capture receipt time before any awaited handoff of an earlier batch.
+        let received_at_unix_millis = unix_millis()?;
         let payload = match incoming {
             InboundStreamerFrame::Text(payload) => payload,
             InboundStreamerFrame::Ping(payload) => {
@@ -2123,19 +2129,20 @@ impl SchwabStreamerExecutor {
                 )?;
                 if contains_account_activity(&payload) {
                     self.telemetry.record_validation_failure()?;
-                    flush_batch(batch, sink, &self.telemetry)?;
+                    flush_batch(batch, sink, &self.telemetry).await?;
                     return Err(SchwabTransportError::Protocol);
                 }
                 append_frame(
-                    generation,
+                    received_at_unix_millis,
                     RawStreamerFrameKind::Binary,
                     payload,
                     batch,
                     sink,
                     &self.telemetry,
-                )?;
+                )
+                .await?;
                 self.telemetry.record_validation_failure()?;
-                flush_batch(batch, sink, &self.telemetry)?;
+                flush_batch(batch, sink, &self.telemetry).await?;
                 return Err(SchwabTransportError::Protocol);
             }
             InboundStreamerFrame::Close => return Ok(ProcessedFrame::Closed),
@@ -2145,7 +2152,7 @@ impl SchwabStreamerExecutor {
         )?;
         if contains_account_activity(&payload) {
             self.telemetry.record_validation_failure()?;
-            flush_batch(batch, sink, &self.telemetry)?;
+            flush_batch(batch, sink, &self.telemetry).await?;
             return Err(SchwabTransportError::Protocol);
         }
         let parsed = match parse_streamer_frame(&payload, self.parse_bounds) {
@@ -2153,14 +2160,15 @@ impl SchwabStreamerExecutor {
             Err(error) => {
                 self.telemetry.record_validation_failure()?;
                 append_frame(
-                    generation,
+                    received_at_unix_millis,
                     RawStreamerFrameKind::Text,
                     payload,
                     batch,
                     sink,
                     &self.telemetry,
-                )?;
-                flush_batch(batch, sink, &self.telemetry)?;
+                )
+                .await?;
+                flush_batch(batch, sink, &self.telemetry).await?;
                 return Err(error.into());
             }
         };
@@ -2181,7 +2189,7 @@ impl SchwabStreamerExecutor {
             && !parsed.value().data.is_empty()
             && batch.has_service_responses()
         {
-            flush_batch(batch, sink, &self.telemetry)?;
+            flush_batch(batch, sink, &self.telemetry).await?;
         }
         let frame_bytes =
             u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?;
@@ -2189,14 +2197,17 @@ impl SchwabStreamerExecutor {
             || !parsed.value().data.is_empty()
             || !parsed.value().notifications.is_empty()
         {
-            Some(append_frame(
-                generation,
-                RawStreamerFrameKind::Text,
-                payload,
-                batch,
-                sink,
-                &self.telemetry,
-            )?)
+            Some(
+                append_frame(
+                    received_at_unix_millis,
+                    RawStreamerFrameKind::Text,
+                    payload,
+                    batch,
+                    sink,
+                    &self.telemetry,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -2305,6 +2316,7 @@ impl MicrobatchBuilder {
         &mut self,
         kind: RawStreamerFrameKind,
         payload: Bytes,
+        received_at_unix_millis: u64,
     ) -> Result<NonZeroU64, SchwabTransportError> {
         if payload.len() > self.bounds.max_frame_bytes()
             || payload.len() > self.bounds.max_microbatch_bytes()
@@ -2318,6 +2330,7 @@ impl MicrobatchBuilder {
             kind,
             payload,
             self.bounds.max_frame_bytes(),
+            received_at_unix_millis,
         )?;
         self.payload_bytes = self
             .payload_bytes
@@ -2441,8 +2454,8 @@ impl MicrobatchBuilder {
     }
 }
 
-fn append_frame(
-    _generation: ConnectionGeneration,
+async fn append_frame(
+    received_at_unix_millis: u64,
     kind: RawStreamerFrameKind,
     payload: Bytes,
     batch: &mut MicrobatchBuilder,
@@ -2450,9 +2463,9 @@ fn append_frame(
     telemetry: &SchwabTransportTelemetry,
 ) -> Result<NonZeroU64, SchwabTransportError> {
     if batch.would_exceed(payload.len())? {
-        flush_batch(batch, sink, telemetry)?;
+        flush_batch(batch, sink, telemetry).await?;
     }
-    batch.push(kind, payload)
+    batch.push(kind, payload, received_at_unix_millis)
 }
 
 fn contains_account_activity(payload: &[u8]) -> bool {
@@ -2462,7 +2475,7 @@ fn contains_account_activity(payload: &[u8]) -> bool {
         .any(|window| window == FORBIDDEN_SERVICE)
 }
 
-fn flush_batch(
+async fn flush_batch(
     batch: &mut MicrobatchBuilder,
     sink: &mut dyn StreamerCaptureSink,
     telemetry: &SchwabTransportTelemetry,
@@ -2472,7 +2485,8 @@ fn flush_batch(
     };
     let frames = microbatch.receipt().frame_count();
     let bytes = microbatch.receipt().payload_bytes();
-    sink.try_publish(microbatch)
+    sink.publish(microbatch)
+        .await
         .map_err(|_| SchwabTransportError::CaptureRejected)?;
     telemetry.record_stream_microbatch(frames, bytes)
 }

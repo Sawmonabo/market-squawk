@@ -19,7 +19,7 @@ pub(super) fn page() -> Value {
                     "effectiveOn",
                     nullable(json!({"type":"string", "format":"date"})),
                 ),
-                ("revisionPolicy", constant("latestKnown")),
+                ("revisionPolicy", constant("allKnown")),
                 (
                     "state",
                     enumeration(&[

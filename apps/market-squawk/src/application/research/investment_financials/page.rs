@@ -27,7 +27,7 @@ pub(super) fn page(
         section: snapshot.section,
         knowledge_at: Some(timestamp_text(snapshot.request.knowledge_at())),
         effective_on: Some(snapshot.effective_on.clone()),
-        revision_policy: "latestKnown",
+        revision_policy: "allKnown",
         state: empty_state(&snapshot.families),
         families: snapshot.families.clone(),
         items: Vec::new(),
@@ -329,7 +329,7 @@ mod tests {
             InstrumentId::try_from(Uuid::new_v4())?,
             cutoff,
             ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 10, 2)?),
-            ResearchRevisionPolicy::LatestKnown,
+            ResearchRevisionPolicy::AllKnown,
         )?;
         let (generation_entered, entered) = tokio::sync::oneshot::channel();
         let (release_generation, generation_release) = std::sync::mpsc::channel();
@@ -436,6 +436,7 @@ mod tests {
             )
             .await?;
         assert_eq!(page.state, InvestmentFinancialState::Missing);
+        assert_eq!(page.revision_policy, "allKnown");
         assert_eq!(
             page.knowledge_at.as_deref(),
             Some(timestamp_text(cutoff).as_str())
@@ -483,6 +484,7 @@ mod tests {
             )
             .await?;
         assert_eq!(expired.state, InvestmentFinancialState::Expired);
+        assert_eq!(expired.revision_policy, "allKnown");
         assert!(expired.knowledge_at.is_none() && expired.read_token.is_none());
         assert!(!generation_finished.load(Ordering::Acquire));
         release_generation.send(())?;
@@ -503,6 +505,7 @@ mod tests {
             &cancellation,
         )?;
         assert_eq!(owned.knowledge_at, page.knowledge_at);
+        assert_eq!(owned.revision_policy, page.revision_policy);
         // The same disk snapshot assigns recent-first display ordinals while retaining
         // every original family/position and every complete envelope across page boundaries.
         let ordered = Connection::open(directory.path().join("display-order.sqlite"))?;

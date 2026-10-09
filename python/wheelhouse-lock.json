@@ -2693,8 +2693,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/tests.rs",
-      "sha256": "fce6e5b59ba90ad697db6a7145269150c225f435cffde5a28b66636447a93fdb",
-      "size_bytes": 167304
+      "sha256": "78a85027295585eb45fec25a06be6fafadaaf6c3b27c0e551a646ae78590cd7c",
+      "size_bytes": 169149
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/transport/http.rs",
@@ -2708,8 +2708,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/transport/streamer.rs",
-      "sha256": "00bff312217f0c7af80a72d40b92fe49c6b7019367035d74aa2c7005e83ed3e6",
-      "size_bytes": 104259
+      "sha256": "f74972ddb18de94039c6d7b5e42dd16791e484e1f6a28950d6999792cb1d1291",
+      "size_bytes": 105123
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/vertical.rs",
@@ -3533,8 +3533,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/contracts/output/investment_financials.rs",
-      "sha256": "8c9a84c8816d7fdf2e3ed2c81d1b0bf2e193e3447abfa421c870cba3a8cda466",
-      "size_bytes": 9323
+      "sha256": "7d7d5d678f635c214bfd8a73fb7d6c2bc4d84750d2675f7a57c28e12d51a0b06",
+      "size_bytes": 9320
     },
     {
       "path": "apps/market-squawk/src/application/contracts/output/market_evidence.rs",
@@ -4033,8 +4033,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer.rs",
-      "sha256": "6131ba56e97791ea270adf9224991879892a906e74839b9184f2978f26624adb",
-      "size_bytes": 14969
+      "sha256": "54ada91a89d2b55c2f48d5a12512d510599cc3950ae5667cc5ec7cf9c582e0f5",
+      "size_bytes": 15062
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer/families.rs",
@@ -4358,8 +4358,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/company_product.rs",
-      "sha256": "8ec265eade9a16e6127f3aaf9721b8161528dde980c9b5358d7eb5fe3eb0ae49",
-      "size_bytes": 110513
+      "sha256": "1a4bde7a97fd33be1daf3864f4b7d540f93087d47bb66b790602cddfa6a60395",
+      "size_bytes": 123445
     },
     {
       "path": "apps/market-squawk/src/application/research/company_research.rs",
@@ -4753,8 +4753,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials.rs",
-      "sha256": "7cd3928630e3a2dcfcd76650216a933bcbf1b0e5784aac75f782e721b392c28d",
-      "size_bytes": 20316
+      "sha256": "abbf1d862bc9b9c6f6bb583f0feaa3aef07d333a9c0492f8a527b76f27b7d157",
+      "size_bytes": 20482
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/authorization.rs",
@@ -4763,8 +4763,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/page.rs",
-      "sha256": "82fede4f909bba5253667eab7f85a5e0bafab673ae35a7a495bc775a585c3fa7",
-      "size_bytes": 22410
+      "sha256": "087c692a28c80ea5fc5af0b07c19cb33de6ed776f66ec8c11423bd555bb95b1d",
+      "size_bytes": 22580
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/projection.rs",
@@ -4773,8 +4773,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/snapshot.rs",
-      "sha256": "1dde88f06fa0ec75132a457f9874d20ceba6515769d65d8653964e4129a5e115",
-      "size_bytes": 7754
+      "sha256": "442697da939056c961b27a090c5416653670e7a20a091ce0a70ecb6754725a3e",
+      "size_bytes": 7751
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_profile.rs",

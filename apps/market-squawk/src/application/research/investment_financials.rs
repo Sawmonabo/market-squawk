@@ -235,7 +235,9 @@ impl InvestmentFinancialReadCapability {
                 instrument,
                 cutoff,
                 ResearchTemporalCoordinate::calendar_date(date),
-                ResearchRevisionPolicy::LatestKnown,
+                // Financial history preserves complete original filing envelopes even
+                // when a later filing repeats only one of their financial concepts.
+                ResearchRevisionPolicy::AllKnown,
             )
             .map_err(canonical_error)?;
             let reader = CompanyResearchReadCapability::new(Arc::clone(&self.research));
@@ -518,7 +520,7 @@ fn expired(
         section,
         knowledge_at: None,
         effective_on: None,
-        revision_policy: "latestKnown",
+        revision_policy: "allKnown",
         state: InvestmentFinancialState::Expired,
         families: Vec::new(),
         items: Vec::new(),

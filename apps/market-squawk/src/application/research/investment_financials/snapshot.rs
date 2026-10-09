@@ -44,7 +44,7 @@ pub(super) fn build_snapshot(
             || selected.request().knowledge_at() != request.knowledge_at()
             || selected.request().effective_cutoff() != request.fact_effective_cutoff()
             || selected.request().revision_mode()
-                != market_squawk_data::PointInTimeRevisionMode::LatestKnown
+                != market_squawk_data::PointInTimeRevisionMode::AllKnown
         {
             return Err(ServiceError::InvalidResult);
         }

@@ -57,7 +57,7 @@ export function InvestmentFinancials(props: FinancialProps) {
   if (!hasProductCapability(props.bootstrap, "investment_financials")
     || !hasProductCapability(props.bootstrap, "investment_financials_close")) {
     return <section className="space-y-3" aria-label="Investment financial information">
-      <h2 className="text-lg font-semibold">Financial information</h2>
+      <h2 className="text-lg font-semibold">Financial report history</h2>
       <p role="status" className="text-sm text-muted-foreground">Financial details are not available in this app session.</p>
     </section>
   }
@@ -82,8 +82,8 @@ function SelectedFinancials(props: FinancialProps) {
     setPreparedRevision((value) => value + 1)
   }, [])
   return <section className="rounded-xl border border-border bg-card/30 p-4" aria-label="Investment financial information">
-    <h2 className="text-base font-semibold">Financial information</h2>
-    <p className="mt-1 text-xs text-muted-foreground">Company reports, financial statements and ratios.</p>
+    <h2 className="text-base font-semibold">Financial report history</h2>
+    <p className="mt-1 text-xs text-muted-foreground">Reports as filed, including earlier versions.</p>
     <div className="mt-4"><FinancialPreparation {...props} needsData={props.preparationEligible && needsData} onPrepared={onPrepared} onSettled={onSettled} /></div>
     <Tabs.Root defaultValue="facts" activationMode="manual" className="mt-4">
       <Tabs.List aria-label="Financial sections" className="flex flex-wrap gap-1 border-b border-border pb-2">
@@ -444,8 +444,8 @@ function FinancialInstant({ value }: { value: string }) {
 }
 
 function revisionLabel(revision: InvestmentFinancialFact["revision"]): string {
-  return revision === "current" ? "Latest report as of this date"
-    : revision === "superseded" ? "Earlier report" : "Report versions cannot be compared"
+  return revision === "current" ? "Reported"
+    : revision === "superseded" ? "Replaced report" : "Report versions cannot be compared"
 }
 
 function sectionAvailability(state: InvestmentFinancialsResult["state"]): string {

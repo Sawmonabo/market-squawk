@@ -104,7 +104,7 @@ const pageFields = {
   selectionToken: marketSelectionTokenSchema,
   knowledgeAt: z.iso.datetime({ offset: true }).nullable(),
   effectiveOn: z.iso.date().nullable(),
-  revisionPolicy: z.literal("latestKnown"),
+  revisionPolicy: z.literal("allKnown"),
   state: z.enum(["reported", "missing", "conflict", "unavailable", "preparation_required", "expired"]),
   families: z.array(z.object({
     family: z.enum(["company_facts", "filing_details", "filings"]),
