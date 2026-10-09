@@ -43,20 +43,19 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    CompanyFactsDocument, RawEvidenceStore, SEC_APPLICATION_MAX_CONCURRENT_REQUESTS,
-    SEC_APPLICATION_REQUESTS_PER_SECOND, SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND,
-    SEC_PROVIDER_RATE_SCOPE, SecAuthoritativeIdentifierNamespace, SecBulkCapture, SecBulkCoverage,
-    SecBulkDoctorReport, SecBulkDoctorState, SecBulkFamily, SecBulkLayoutManifest,
-    SecBulkMediaKind, SecBulkParseLimits, SecBulkSelection, SecBulkTransportEvidence,
-    SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPendingLogicalRows,
-    SecFundPublicationScope, SecGovernedIdentityReceipt, SecHttpValidators, SecParserLimits,
+    CompanyFactsDocument, RawEvidenceStore, SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND,
+    SecAuthoritativeIdentifierNamespace, SecBulkCapture, SecBulkCoverage, SecBulkDoctorReport,
+    SecBulkDoctorState, SecBulkFamily, SecBulkLayoutManifest, SecBulkMediaKind, SecBulkParseLimits,
+    SecBulkSelection, SecBulkTransportEvidence, SecFundIdentityAuthority,
+    SecFundPartitionAdmissions, SecFundPendingLogicalRows, SecFundPublicationScope,
+    SecGovernedIdentityReceipt, SecHttpValidators, SecParserLimits,
     SecPendingBulkLogicalPublication, SecPreparedFundLogicalPublication, SecRepresentation,
     SecRepresentationRegistry, SubmissionsArchive, SubmissionsDocument, XbrlDocumentContext,
-    XbrlDocumentParser, inspect_bulk_archive, recover_bulk_archive,
+    XbrlDocumentParser, inspect_bulk_archive, recover_bulk_archive, sec_application_budget_policy,
 };
 
-const ONE_SECOND_NANOS: u64 = 1_000_000_000;
-const MAX_BLOCKING_WORKERS: usize = 4;
+// Local parsing and persistence capacity is independent of the shared network request budget.
+const MAX_BLOCKING_WORKERS: usize = 1;
 const MAX_NPORT_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_NCEN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BULK_README_BYTES: u64 = 16 * 1024 * 1024;
@@ -111,13 +110,8 @@ impl SecEdgarSource {
         let budget_policy = metadata
             .budget_policy()
             .ok_or(SecClientError::MissingSharedBudget)?;
-        if budget_policy.requests_per_window() != Some(SEC_APPLICATION_REQUESTS_PER_SECOND)
+        if budget_policy != &sec_application_budget_policy()?
             || budget_policy.requests_per_window() > Some(SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND)
-            || budget_policy.window_nanos() != Some(ONE_SECOND_NANOS)
-            || budget_policy.window_count() != 1
-            || budget_policy.max_concurrent() != SEC_APPLICATION_MAX_CONCURRENT_REQUESTS
-            || budget_policy.scope().as_source_identifier().as_str() != SEC_PROVIDER_RATE_SCOPE
-            || budget_policy.scope().authorization_account().is_some()
         {
             return Err(SecClientError::UnsafeBudgetPolicy);
         }
@@ -162,15 +156,13 @@ impl SecEdgarSource {
             .timeout(Duration::from_nanos(bounds.total_timeout_nanos()))
             .user_agent(contact.user_agent())
             .build()?;
-        let blocking_workers =
-            usize::from(budget_policy.max_concurrent()).min(MAX_BLOCKING_WORKERS);
         Ok(Self {
             metadata,
             client,
             raw_store: Arc::new(raw_store),
             representation_registry: Arc::new(representation_registry),
             identities: Arc::new(identities),
-            blocking_admission: Arc::new(Semaphore::new(blocking_workers)),
+            blocking_admission: Arc::new(Semaphore::new(MAX_BLOCKING_WORKERS)),
             extraction_health: Mutex::new(SecExtractionHealth {
                 state: SecExtractionHealthState::Ready,
                 observed_at: system_timestamp()?,

@@ -59,9 +59,7 @@ pub use normalize::{
     normalize_filings, normalize_filings_with_cancellation,
 };
 pub use policy::{
-    SEC_APPLICATION_MAX_CONCURRENT_REQUESTS, SEC_APPLICATION_REQUESTS_PER_SECOND,
-    SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND, SEC_PROVIDER_RATE_SCOPE,
-    sec_application_budget_policy,
+    SEC_OFFICIAL_REQUEST_CEILING_PER_SECOND, SEC_PROVIDER_RATE_SCOPE, sec_application_budget_policy,
 };
 pub use product::{
     SEC_COMPANY_FACTS_DATASET_PREFIX, SEC_SUBMISSIONS_DATASET_PREFIX, SecResearchDataset,

@@ -11541,3 +11541,52 @@ SEC two-download/separate parsing implementation, fund financial consumers and f
 remain incomplete. Lead retains next integration ownership; no active child writers. Next
 financial dependency is repeated prepared-artifact verification/index construction; next provider
 dependency is the already diagnosed canonical SEC concurrency correction.
+
+### Active prepared-report reuse and SEC capacity prerequisites — baseca574e14
+
+Prior turn made progress:38f079e9/ca574e14 pushed and native36-read/concurrent-read evidence recorded.
+Current tree clean; service67204/Desktop67220 live, watcher47538 stopped. Acceptance1/2/5/6:
+retained report tabs still repeat complete prepared-database verification. A6s/10ms process sample
+during a real MSFT ratio read observes open_generation/open_display verification and PIT work;
+sampling perturbs timings and is not a benchmark. Exact source confirms every fresh tab reopens,
+hashes and integrity-checks the same immutable registered source/display databases.
+
+| Owner | Exclusive files | Required dependency and smallest critical evidence |
+|---|---|---|
+| Lead | data `src/ingest.rs`, `src/sec_research.rs` internal cache composition; docs/closure/Git/build/runtime | One service-owned Arc<SecPreparedReadCache>, shared by fresh readers; no cached grants, identity selection or PIT results. Integrate constructor contract before dependent checks. |
+| Astra High nvda_ratio_context | data `src/sec_research/prepared.rs`, new cohesive `src/sec_research/prepared/cache.rs` if needed; existing prepared fixture within `tests/publication_recovery.rs` | Reuse verified immutable opened source/display indexes in bounded resident cache. Validate registered artifact identity and file identity/size/modification metadata on hits; changed artifacts must reverify or fail, never reuse stale bytes. Current issuer selection, request limits/cutoffs and per-operation cancellation remain fresh. Existing prepared/restart/tamper fixture extended only for uncovered cache-integrity gap. |
+| Sol High sec_capacity_prerequisite | adapter-sec `src/policy.rs`, `src/client.rs`, existing `src/xbrl/model.rs` test only if needed | Remove duplicated SEC budget construction using current shared SEC_EDGAR_AUTHORITY; decouple local blocking-work bound from network concurrency, keeping current effective1 worker. This prerequisite preserves current network limit1; full aggregate-authority concurrency correction remains required. Existing adapter taxonomy/admission fixture and source policy agreement checks. No new framework or quota reset. |
+
+Cache contract: pub(crate) SecPreparedReadCache: Default+Debug, passed as Arc into
+SecResearchReadCapability::new and available as self.prepared_reads. Cache contains only verified
+immutable generation/display owners; never current authorization, temporal selection or caller
+control tokens. Limit resident entries through eviction without limiting usable history/symbols.
+No builds/tests/Git/runtime actions by agents. Lead serializes checks and commits independent
+coherent slices; no new branch/worktree or migration. Native cached-read/restart/cancellation proof
+follows the integrated code. Pushed result pending; SEC shared quota store correction and snapshot
+ordering reuse remain explicit next dependencies, not silently waived.
+
+Prior sec_concurrency_policy helper identified its retained Astra role before edits; this ordinary
+adapter assignment transfers to fresh GPT-6.1 Sol High sec_capacity_prerequisite. No work discarded.
+
+Lead integration expanded to adapter-sec `src/lib.rs` to remove exports of duplicated numeric
+constants (no external callers), and data `src/ingest/market_event_read.rs` to clone the new
+service-owned cache in its two worker readers. First data compile identified those two missing
+field initializers; no test executed. This is constructor composition, not an additional cache.
+
+Prepared-index cache and SEC prerequisite handoffs inspected and frozen. The cache holds16
+immutable source/display owners, evicts outside its mutex, checks registered identity plus held/
+named file metadata, and leaves coordinate/PIT scans on a per-operation connection. First data
+compile failed on two omitted worker-reader fields; corrected with shared Arc clones. Existing
+publication/recovery fixture PASS1/1,142.21s after48.94s successful compile, including warmed
+read integrity, exact cancellation, changed request limits, same-size mutation and file replacement.
+Source-closure verification and diff checks pass. SEC adapter now delegates policy construction
+and validation to the shared descriptor; independent parsing capacity remains1. No network
+concurrency increase claimed. Existing SEC taxonomy/admission/cancellation fixture is next.
+Both agents released ownership; lead owns integration and one matching native build.
+
+Existing SEC mixed-taxonomy/admission/cancellation fixture PASS1/1,4.35s after1m00s serialized
+compile. Changed-file formatting, diff and source-closure checks pass. This checkpoint implements
+verified-index reuse and independent parsing capacity; native responsiveness and two-download
+shared-quota correction remain unproven/incomplete. Next: one managed matching native build and
+repeated first-page reads with all-nine coverage states retained honestly.

@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, Write};
 use std::sync::Mutex;
 
+mod cache;
+use cache::PreparedFileStamp;
+pub(crate) use cache::SecPreparedReadCache;
+
 const FORMAT: &[u8] = b"market-squawk/sec-prepared-generation/v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,7 +122,7 @@ pub(super) struct AuthenticatedGeneration {
     pub(super) filing_xbrl: Option<SecVerifiedFilingXbrl>,
     pub(super) coordinates: Vec<ProviderCaptureRowCoordinate>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Header {
     origin: EvidenceDigest,
     binding: EvidenceDigest,
@@ -135,6 +139,7 @@ pub(super) struct PreparedArtifact {
     path: ResolvedArtifactPath,
     file: std::fs::File,
     record: crate::ArtifactRecord,
+    verified_stamp: PreparedFileStamp,
 }
 impl PreparedArtifact {
     fn open(
@@ -149,11 +154,13 @@ impl PreparedArtifact {
         let file = path
             .open_read()
             .map_err(|_| SecResearchReadError::PreparedIo)?;
+        let verified_stamp = PreparedFileStamp::read(&file)?;
         let value = Arc::new(Self {
             root,
             path,
             file,
             record,
+            verified_stamp,
         });
         value.verify(deadline, cancellation)?;
         Ok(value)
@@ -196,23 +203,12 @@ impl PreparedArtifact {
         check_operation(deadline, cancellation)
     }
     fn validate_endpoint(&self) -> Result<(), SecResearchReadError> {
-        use cap_fs_ext::MetadataExt as _;
         let named = self
             .path
             .open_read()
             .map_err(|_| SecResearchReadError::PreparedIo)?;
-        let held = cap_std::fs::File::from_std(
-            self.file
-                .try_clone()
-                .map_err(|_| SecResearchReadError::PreparedIo)?,
-        )
-        .metadata()
-        .map_err(|_| SecResearchReadError::PreparedIo)?;
-        let named = cap_std::fs::File::from_std(named)
-            .metadata()
-            .map_err(|_| SecResearchReadError::PreparedIo)?;
-        if (held.dev(), held.ino(), held.len()) != (named.dev(), named.ino(), named.len())
-            || !held.is_file()
+        if PreparedFileStamp::read(&self.file)? != self.verified_stamp
+            || PreparedFileStamp::read(&named)? != self.verified_stamp
         {
             return Err(SecResearchReadError::PreparedIntegrity);
         }
@@ -472,6 +468,19 @@ impl SecResearchReadCapability {
         else {
             return Ok(None);
         };
+        // Catalog identity and caller limits are checked even when the immutable owner is warm.
+        let row_count = usize::try_from(origin.object_row_count())
+            .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?;
+        if row_count > request.point_in_time_limits().max_candidates() {
+            return Err(SecResearchReadError::ObjectBudgetExceeded);
+        }
+        if let Some(mut generation) = self.prepared_reads.generation(key, &record)? {
+            generation.artifact.validate_endpoint()?;
+            check_operation(deadline, cancellation)?;
+            generation.origin = origin;
+            generation.company = company;
+            return Ok(Some(generation));
+        }
         let artifact = PreparedArtifact::open(
             self.objects.try_clone_artifact_root()?,
             record.clone(),
@@ -491,11 +500,6 @@ impl SecResearchReadCapability {
         if check != "ok" {
             return Err(SecResearchReadError::PreparedIntegrity);
         }
-        let row_count = usize::try_from(origin.object_row_count())
-            .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?;
-        if row_count > request.point_in_time_limits().max_candidates() {
-            return Err(SecResearchReadError::ObjectBudgetExceeded);
-        }
         // Read receipts can outlive this operation (cursor pages reauthorize separately).
         // Only bounded indexed row gets use this shared connection; PIT receives a fresh one.
         connection.progress_handler(0, None::<fn() -> bool>)?;
@@ -512,21 +516,24 @@ impl SecResearchReadCapability {
         if filing.is_some() != (request.family() == SecResearchFamily::FilingXbrl) {
             return Err(SecResearchReadError::PreparedIntegrity);
         }
+        artifact.validate_endpoint()?;
         check_operation(deadline, cancellation)?;
-        Ok(Some(OpenedGeneration {
+        let generation = OpenedGeneration {
             receipt: SecPreparedGenerationReceipt {
                 generation_key: key,
                 artifact: record,
                 row_count,
             },
             artifact,
-            connection,
             header,
             origin,
             company,
             observations,
             filing,
-        }))
+        };
+        self.prepared_reads
+            .insert_generation(key, generation.clone())?;
+        Ok(Some(generation))
     }
     async fn ensure_generation(
         &self,
@@ -819,10 +826,10 @@ fn decode_metadata<T: serde::de::DeserializeOwned>(
     )?;
     serde_json::from_slice(&bytes).map_err(|_| SecResearchReadError::PreparedIntegrity)
 }
+#[derive(Clone, Debug)]
 struct OpenedGeneration {
     receipt: SecPreparedGenerationReceipt,
     artifact: Arc<PreparedArtifact>,
-    connection: Arc<Mutex<Connection>>,
     header: Header,
     origin: SecResearchOrigin,
     company: CompanyIdentityExactRecord,
@@ -840,7 +847,6 @@ impl SecResearchReadCapability {
     ) -> Result<SecResearchSelection, SecResearchReadError> {
         let OpenedGeneration {
             artifact,
-            connection,
             header,
             origin,
             company: company_identity,
@@ -865,10 +871,10 @@ impl SecResearchReadCapability {
         let mut eligible = aggregate.reserve_exact::<bool>(observations.len())?;
         let mut exclusions =
             aggregate.reserve_exact::<SecResearchExcludedRow>(observations.len())?;
+        // Keep the full coordinate scan and PIT work operation-owned. Sharing this scan's
+        // mutex would serialize fresh readers and defer their cancellation while waiting.
+        let connection = artifact.connection(deadline, cancellation)?;
         {
-            let connection = connection
-                .lock()
-                .map_err(|_| SecResearchReadError::AuthorityUnavailable)?;
             let mut statement=connection.prepare("SELECT ordinal,canonical_digest,observation_digest,available_at,received_at,ingested_at FROM coordinates ORDER BY ordinal")?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -919,7 +925,7 @@ impl SecResearchReadCapability {
             return Err(SecResearchReadError::PreparedIntegrity);
         }
         let mut candidates = crate::pit::disk::CandidateStore::open_prepared(
-            artifact.connection(deadline, cancellation)?,
+            connection,
             vec![request.manifest().clone()],
             observations.len(),
             request.maximum_object_bytes(),
@@ -1091,6 +1097,8 @@ impl SecResearchReadCapability {
             selection_digest,
             result_digest,
         };
+        artifact.validate_endpoint()?;
+        check_operation(deadline, cancellation)?;
         Ok(SecResearchSelection {
             request,
             origin,
@@ -1393,6 +1401,11 @@ impl SecResearchReadCapability {
         else {
             return Ok(None);
         };
+        if let Some(display) = self.prepared_reads.display(key, &record)? {
+            display.artifact.validate_endpoint()?;
+            check_operation(deadline, cancellation)?;
+            return Ok(Some(display));
+        }
         let artifact = PreparedArtifact::open(
             self.objects.try_clone_artifact_root()?,
             record,
@@ -1420,13 +1433,16 @@ impl SecResearchReadCapability {
         {
             return Err(SecResearchReadError::PreparedIntegrity);
         }
+        artifact.validate_endpoint()?;
         check_operation(deadline, cancellation)?;
         connection.progress_handler(0, None::<fn() -> bool>)?;
-        Ok(Some(SecResearchDisplayRows {
+        let display = SecResearchDisplayRows {
             artifact,
             connection: Arc::new(Mutex::new(connection)),
             projector,
-        }))
+        };
+        self.prepared_reads.insert_display(key, display.clone())?;
+        Ok(Some(display))
     }
 }
 fn display_key(generation: EvidenceDigest, projector: EvidenceDigest) -> EvidenceDigest {

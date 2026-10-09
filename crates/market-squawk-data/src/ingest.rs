@@ -1821,6 +1821,7 @@ pub struct AnalyticalDataService {
     catalog_read_location: market_squawk_platform::CatalogLocation,
     catalog_read_binding: [u8; 32],
     market_data_instrument_reader: crate::MarketDataInstrumentReadCapability,
+    sec_prepared_reads: Arc<crate::sec_research::SecPreparedReadCache>,
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
     operation_gate: AnalyticalOperationGate,
@@ -2946,6 +2947,7 @@ impl AnalyticalDataService {
             catalog_read_location,
             catalog_read_binding,
             market_data_instrument_reader,
+            sec_prepared_reads: Arc::new(crate::sec_research::SecPreparedReadCache::default()),
             manifests: Arc::new(manifests),
             objects: Arc::new(objects),
             operation_gate: AnalyticalOperationGate::default(),
@@ -3279,6 +3281,7 @@ impl AnalyticalDataService {
                 self.catalog_read_binding,
                 self.catalog_read_limits,
             ),
+            Arc::clone(&self.sec_prepared_reads),
         )
     }
 

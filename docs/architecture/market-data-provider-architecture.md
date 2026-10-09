@@ -710,6 +710,13 @@ Only missing or expired renewable grants enter the existing policy-write path. S
 publication keeps its separate durable authorization and consumed publication permit. This avoids
 writing calculation decisions for every displayed ratio without bypassing permission changes.
 
+The analytical service reuses verified immutable SEC source and display indexes in a bounded
+resident cache. A warm read still resolves its exact registered source, checks the held and named
+file against the verified identity and modification baseline, and applies current request limits.
+Changed files are rejected. Authorization and point-in-time selection are never cached; full
+coordinate scans use each operation's own SQLite connection and cancellation controls. Eviction
+releases idle owners without limiting retained history. Cold opens retain full verification.
+
 Macro origin discovery, dataset paging and exact analytical generation reads use the same
 endpoint-bound snapshots. Published logical-original lookup no longer needs the catalog writer;
 pending-original retention, publication and actual rights changes keep their existing authority.

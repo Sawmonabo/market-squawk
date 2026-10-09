@@ -9,6 +9,7 @@ pub use filing_xbrl::{
     SecVerifiedFilingXbrl,
 };
 pub use indexed::SecResearchRows;
+pub(crate) use prepared::SecPreparedReadCache;
 pub use prepared::{
     SecPreparedGenerationReceipt, SecResearchDisplayCoordinate, SecResearchDisplayProjector,
     SecResearchIdentityPreparation, SecResearchIdentityResolution, SecResearchPreparationOutcome,
@@ -640,6 +641,7 @@ pub struct SecResearchReadCapability {
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
     prepared: crate::catalog::sec_prepared::SecPreparedIndexRegistry,
+    prepared_reads: Arc<SecPreparedReadCache>,
 }
 
 impl fmt::Debug for SecResearchReadCapability {
@@ -679,12 +681,14 @@ impl SecResearchReadCapability {
         objects: Arc<ParquetObjectStore>,
         identities: CompanySecurityIdentityReadCapability,
         prepared: crate::catalog::sec_prepared::SecPreparedIndexRegistry,
+        prepared_reads: Arc<SecPreparedReadCache>,
     ) -> Self {
         Self {
             identities,
             manifests,
             objects,
             prepared,
+            prepared_reads,
         }
     }
 

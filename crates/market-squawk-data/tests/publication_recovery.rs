@@ -2884,6 +2884,167 @@ async fn exercise_prepared_sec_backup(
             .collect::<Result<Vec<_>, _>>()?,
         exact.decoded_rows().iter().collect::<Result<Vec<_>, _>>()?
     );
+
+    // Fresh readers share only immutable opened owners. Warm both indexes, retaining a
+    // display handle so mutation must also invalidate the existing endpoint check.
+    struct DisplayCoordinates;
+    impl market_squawk_data::SecResearchDisplayProjector for DisplayCoordinates {
+        fn identity(&self) -> EvidenceDigest {
+            digest(246)
+        }
+        fn project(
+            &self,
+            _row: &market_squawk_data::SecResearchSourceRow<'_>,
+            _state: market_squawk_data::PointInTimeRevisionState,
+        ) -> Result<Option<market_squawk_data::SecResearchDisplayCoordinate>, SecResearchReadError>
+        {
+            Ok(Some(market_squawk_data::SecResearchDisplayCoordinate::new(
+                None, 0, None, None, None,
+            )))
+        }
+    }
+    let deadline = || Instant::now() + Duration::from_secs(60);
+    let raw = restored_paths.sealed_research_journal_store()?;
+    let source_preparation = restored
+        .sec_research_reader()
+        .prepare_by_identity(
+            source_request.clone(),
+            &raw,
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    let market_squawk_data::SecResearchPreparationOutcome::Prepared(source_receipt) =
+        source_preparation.outcome()
+    else {
+        return Err("restored source preparation disappeared".into());
+    };
+    let display_preparation = restored
+        .sec_research_reader()
+        .prepare_display_by_identity(
+            source_request.clone(),
+            &raw,
+            &DisplayCoordinates,
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    let market_squawk_data::SecResearchPreparationOutcome::Prepared(display_receipt) =
+        display_preparation.outcome()
+    else {
+        return Err("restored display preparation disappeared".into());
+    };
+    let warm = restored
+        .sec_research_reader()
+        .select_prepared_display_by_identity(
+            source_request.clone(),
+            digest(246),
+            deadline(),
+            cancellation.clone(),
+        )
+        .await?;
+    let market_squawk_data::SecResearchIdentityOutcome::Exact(warm_facts) = warm.outcome() else {
+        return Err("cached source/display selection disappeared".into());
+    };
+    assert_eq!(warm_facts.receipt(), exact.receipt());
+    assert_eq!(warm_facts.selected(), exact.selected());
+    assert_eq!(
+        warm_facts
+            .selected_display_coordinates()?
+            .collect::<Result<Vec<_>, _>>()?
+            .len(),
+        exact.selected().len(),
+    );
+    let restricted = market_squawk_data::SecResearchIdentityReadRequest::try_new(
+        source_request.instrument_id(),
+        source_request.family(),
+        source_request.knowledge_at(),
+        source_request.effective_cutoff().clone(),
+        source_request.revision_mode(),
+        PointInTimeLimits::try_new(1, 1, 1, 1, 1024 * 1024)?,
+        source_request.maximum_object_bytes(),
+    )?;
+    assert!(matches!(
+        restored
+            .sec_research_reader()
+            .select_prepared_by_identity(restricted, deadline(), cancellation.clone(),)
+            .await,
+        Err(SecResearchReadError::ObjectBudgetExceeded),
+    ));
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        restored
+            .sec_research_reader()
+            .select_prepared_display_by_identity(
+                source_request.clone(),
+                digest(246),
+                deadline(),
+                cancelled,
+            )
+            .await,
+        Err(SecResearchReadError::Cancelled)
+    ));
+
+    let display_path = restored_paths
+        .artifacts()?
+        .root()
+        .join(display_receipt.artifact().relative_reference());
+    {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&display_path)?;
+        let before = file.metadata()?;
+        file.seek(SeekFrom::End(-1))?;
+        let mut byte = [0u8];
+        file.read_exact(&mut byte)?;
+        file.seek(SeekFrom::End(-1))?;
+        file.write_all(&[byte[0] ^ 1])?;
+        // Make this deterministic on filesystems with coarse timestamp resolution.
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(before.modified()? + Duration::from_secs(2)),
+        )?;
+        file.sync_all()?;
+        assert_eq!(file.metadata()?.len(), before.len());
+    }
+    assert!(matches!(
+        warm_facts.selected_display_coordinates(),
+        Err(SecResearchReadError::PreparedIntegrity)
+    ));
+    assert!(matches!(
+        restored
+            .sec_research_reader()
+            .select_prepared_display_by_identity(
+                source_request.clone(),
+                digest(246),
+                deadline(),
+                cancellation.clone(),
+            )
+            .await,
+        Err(SecResearchReadError::PreparedIntegrity),
+    ));
+    let source_path = restored_paths
+        .artifacts()?
+        .root()
+        .join(source_receipt.artifact().relative_reference());
+    let replacement = source_path.with_extension("replacement");
+    std::fs::copy(&source_path, &replacement)?;
+    // Identical bytes and size still cannot replace a retained owner's exact file endpoint.
+    assert_eq!(
+        std::fs::metadata(&replacement)?.len(),
+        source_receipt.artifact().size_bytes()
+    );
+    std::fs::rename(&replacement, &source_path)?;
+    assert!(matches!(
+        restored
+            .sec_research_reader()
+            .select_prepared_by_identity(source_request, deadline(), cancellation.clone(),)
+            .await,
+        Err(SecResearchReadError::PreparedIntegrity),
+    ));
+    drop(warm);
     drop(restored_selection);
     drop(restored);
     Ok(())
