@@ -2,17 +2,22 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed checkpoint **ac32f267**. It removes provider-capacity polling,
-repairs canonical reference publication, distinguishes prepared Streamer/REST profiles and keeps
-saved quotes usable across corroborating reference updates. Full V1 and all-nine acceptance remain
-open. Matching build passed6m50s; supervisor10180 runs service44399/Desktop44423. Watcher10194 is stopped; no compiler.
-Retained-reference and native-rebind critical checks passed. One compiler job; no competing build.
+Current pushed implementation checkpoint **1148dd81** repairs the confirmed recursive catalog
+lock in Schwab quote/Streamer precommit. Earlier **ac32f267** added event-driven capacity waiting
+and repaired reference/retained-quote handling. Full V1 and all-nine acceptance remain open.
 
 | Owner | Concrete outcome and exact files | Evidence / next dependency |
 | --- | --- | --- |
-| Lead | Frozen shared admission, reference producer/consumers, shared contracts/manifests/closure, Git/runtime; exact ownership recorded below | Shared admission, allocation, SEC taxonomy and adjacent catalog checks passed. Matching pre-follow-on build passed7m33s. Real SPY/VTI reference publication proven in catalog. Follow-on retained-reference/native-rebind checks passed; coherent checkpoint commit/push, matching native replacement next. |
-| GPT-6 Astra High sec_concurrency_policy | Completed two-slot design and reentry diagnosis; report frozen, ownership released | Confirmed base defect and unused history path; actual chart path uses Alpaca. Native publication must close base reentry evidence gap. |
-| GPT-6.1 Sol High schwab_metadata_scope | Completed reference integration diagnosis; report frozen, all source ownership lead-held | Located exact Streamer-profile rejection, independent-source ticker constraint and invalid restart revision comparison. Native startup remains unverified after their current corrections. |
+| Lead | Integrated `application/research/ingest/schwab_market.rs`, closure and ledger; Git/build/runtime ownership | Exact OAuth revocation fixture PASS1/1 (8.60s), matching build PASS5m01s. Native first Schwab publication2rows/sequence11132 and sourceStatus1.07s prove catalog progress. Watchlist still fails2.65s on multi-channel display metadata; next producer/consumer checkpoint. |
+| GPT-6 Astra High sec_concurrency_policy | Read-only multi-channel reader diagnosis; only `oct9-multichannel-display.md` writable | Exact provider-neutral reader correction and existing critical fixture seam; no source/build/Git/runtime. Earlier two-slot and reentry reports frozen. |
+
+Supervisor47522 owns service47657/Desktop47675 on the same workspace; watcher47538 stopped,
+no compiler. Old deadlocked service44399 failed graceful shutdown60s and required targeted process
+termination before restart; this is not shutdown acceptance. SQLite quick_check=ok. Credentials
+were preserved. Schwab subsequently reports blocked/provider_availability after stream disconnect;
+first committed rows do not prove continuous streaming or all-nine coverage.
+PR43 implementation evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6074987041.
+Actual chart history uses Alpaca; separately defective Schwab history scaffolding has no caller.
 
 
 Housekeeping refreshed: one primary worktree and only feature/main/release local branches. The
@@ -239,6 +244,11 @@ identification, closure/ledger/runtime. Split catalog-independent lease checks f
 use existing require_catalog_current inside catalog callbacks, normal require_current before lock.
 Retain OAuth, generation, selection, currentness, expiry and revocation checks. Astra read-only
 fixture diagnosis owns `oct9-schwab-catalog-reentry.md`; no source/build/runtime authority.
+
+### Native reentry result and next display barrier
+
+`1148dd81` matching build PASS5m01s. Old service44399 failed graceful EOF shutdown60s due the already sampled deadlock; lead terminated only that stuck process and stopped its supervisor/native/Vite. New supervisor started with the same workspace and credentials (cached build1.38s), service47657/Desktop47675; watcher47538 stopped. SQLite quick_check=ok. Native sourceStatus returned1.07s; first genuine Schwab event_microbatch committed2rows at sequence11132 (baseline0). This proves catalog progress, not all-nine streaming/freshness or shutdown acceptance.
+New source rows exposed `component_live_coverage_missing` in `application/paper/market.rs`: retained reader uses coverage.live(), which intentionally rejects multi-channel sources. Market.GetCollection consequently fails globally. Lead owns integration and the production reader. Astra High sec_concurrency_policy read-only assignment: trace all related single-channel assumptions in `application/paper/market.rs` and `market/unified.rs`, exact selector/context fix and smallest existing critical regression seam; writable report only `.agents/tmp/v1-first-stock/oct9-multichannel-display.md`. No source/build/Git/runtime. Next required evidence: all-nine retained watchlist returns with genuine Schwab rows present and per-channel identity preserved.
 
 ### Catalog publication reentry correction — acceptance1/5/6
 
