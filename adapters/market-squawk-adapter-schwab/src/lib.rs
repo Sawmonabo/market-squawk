@@ -101,10 +101,10 @@ pub use rest_quote_publication::{
 pub use streamer::{
     ConnectionGeneration, ConnectionState, DesiredStateController, MarketDataService,
     StreamerAdmission, StreamerBootstrap, StreamerBootstrapResponse, StreamerCommand,
-    StreamerDataBatch, StreamerFieldEvidence, StreamerFrame, StreamerNativeValue,
-    StreamerNestedField, StreamerNotification, StreamerNotificationField, StreamerResponse,
-    StreamerResponseCode, StreamerSubscription, TransientStreamerRequest, parse_streamer_frame,
-    parse_user_preference,
+    StreamerDataBatch, StreamerFieldEvidence, StreamerFrame, StreamerMetadataField,
+    StreamerNativeValue, StreamerNestedField, StreamerNotification, StreamerNotificationField,
+    StreamerResponse, StreamerResponseCode, StreamerSubscription, TransientStreamerRequest,
+    parse_streamer_frame, parse_user_preference,
 };
 pub use streamer_family_publication::{
     SchwabStreamerFamilyRecordRequest, streamer_family_source_timestamp,

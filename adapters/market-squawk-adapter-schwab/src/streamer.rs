@@ -789,7 +789,47 @@ pub struct StreamerNestedField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamerContent {
     pub key: ProviderIdentifier,
+    pub metadata: Box<[NativeFieldEntry<StreamerMetadataField>]>,
     pub fields: Box<[StreamerFieldEvidence]>,
+}
+/// Closed named metadata supplied alongside numeric Streamer fields.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StreamerMetadataField {
+    Delayed,
+    AssetMainType,
+    AssetSubType,
+    Cusip,
+}
+impl StreamerMetadataField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delayed => "delayed",
+            Self::AssetMainType => "assetMainType",
+            Self::AssetSubType => "assetSubType",
+            Self::Cusip => "cusip",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "delayed" => Self::Delayed,
+            "assetMainType" => Self::AssetMainType,
+            "assetSubType" => Self::AssetSubType,
+            "cusip" => Self::Cusip,
+            _ => return None,
+        })
+    }
+
+    fn parse_value(self, value: Value) -> Result<NativeScalar, SchwabAdapterError> {
+        match (self, &value) {
+            (_, Value::Null)
+            | (Self::Delayed, Value::Bool(_))
+            | (Self::AssetMainType | Self::AssetSubType | Self::Cusip, Value::String(_)) => {
+                NativeScalar::try_from_json(value)
+            }
+            _ => Err(SchwabAdapterError::SchemaViolation),
+        }
+    }
 }
 /// One selected-service data batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -929,7 +969,22 @@ fn parse_data(
                 return Err(SchwabAdapterError::SchemaViolation);
             }
             let mut fields = Vec::new();
+            let mut metadata = Vec::new();
             for (field, value) in content {
+                if let Some(name) = StreamerMetadataField::parse(&field) {
+                    metadata.push(NativeFieldEntry::new(name, name.parse_value(value)?));
+                    continue;
+                }
+                if !field.bytes().all(|byte| byte.is_ascii_digit()) {
+                    // A malformed numeric ID must not be admitted as an unknown named field.
+                    if field.trim_start().starts_with(|character: char| {
+                        character.is_ascii_digit() || matches!(character, '+' | '-' | '.')
+                    }) {
+                        return Err(SchwabAdapterError::SchemaViolation);
+                    }
+                    context.record_unknown("$.data[].content[]", &field, &value)?;
+                    continue;
+                }
                 let field_id = field
                     .parse::<u16>()
                     .map_err(|_| SchwabAdapterError::SchemaViolation)?;
@@ -949,6 +1004,7 @@ fn parse_data(
             }
             parsed.push(StreamerContent {
                 key,
+                metadata: metadata.into_boxed_slice(),
                 fields: fields.into_boxed_slice(),
             });
         }

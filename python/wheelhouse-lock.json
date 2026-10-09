@@ -2593,8 +2593,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/canonical.rs",
-      "sha256": "337a8f2574b29c2ee76bd3539b49dd0466b317dc0d92209d917f29ffe5e49c60",
-      "size_bytes": 42111
+      "sha256": "b435287c6075dbc7b7756101497c4b9efe1f8c3dd08faf7ef8fefcdc3f564959",
+      "size_bytes": 42256
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/canonical/streamer_dictionary.rs",
@@ -2618,8 +2618,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/lib.rs",
-      "sha256": "6f3d7cbc498b68cdae2a0b6f920144090d7bc655015aacb7e41478b69ef9c5c2",
-      "size_bytes": 9185
+      "sha256": "7a3191c7b76c4fa6b129aa647414a52e0a520255d2e12acb8601153d897a19de",
+      "size_bytes": 9208
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/market_hours_publication.rs",
@@ -2673,8 +2673,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/streamer.rs",
-      "sha256": "467dd5de7ed18fabc0b9e65aa6e17ad4c8be534b90ad04a5ad7dc09b0e244d4b",
-      "size_bytes": 38834
+      "sha256": "ffe969ffa5169700afa82075595d89433915c7bdd5e36b058212ca2c4809d9f0",
+      "size_bytes": 41034
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/streamer_family_publication.rs",
@@ -2683,8 +2683,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/streamer_publication.rs",
-      "sha256": "f752caf486816a80426f54f4e7db8b4615a479347103920f3db1444033c2a3ee",
-      "size_bytes": 52656
+      "sha256": "db00638260d726e943f0a8f47fcdd9437fe88f201fe5a384458e9f210bccb90f",
+      "size_bytes": 52667
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/streamer_screener.rs",
@@ -2693,8 +2693,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/tests.rs",
-      "sha256": "044499ba37aa6bbf35b8654d5585c5efb0f898056a906709546bbb43b24775a5",
-      "size_bytes": 159245
+      "sha256": "a6efa5fde5f46346eef88f35ba99c248fd51114e311d5f60661bda12268d9d8c",
+      "size_bytes": 164580
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/transport/http.rs",

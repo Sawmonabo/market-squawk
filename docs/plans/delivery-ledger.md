@@ -4,9 +4,62 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`b88567da`. Main/release unchanged; no extra branch created.
+`333d0dd0`. Main/release unchanged; no extra branch created.
+
+### Latest checkpoint and active verification
+
+Pushed `333d0dd0`; PR43 evidence:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6071404225 .
+Supervised native replacement Cargo83735 completed successfully in5m36s. Service84442/Desktop84450
+run source333d0dd0; watcher60793 is stopped and no replacement compilation is scheduled.
+Saved native OAuth Continue succeeds, but the ensuing doctor fails: successful LevelOneEquities
+SUBS code0 matches the retained request/receipt exactly; one captured data frame fails parsing.
+Retained source shape includes delayed, assetMainType, assetSubType and cusip alongside numeric
+fields. Adapter parse_data currently requires every non-key field name to parse as u16. This is
+the confirmed parsing defect; preserve metadata and delay semantics rather than weaken validation.
+Evidence: oct8-corrected-native.log, oct8-streamer-data-shape.json. Lead owns the next integrated
+adapter/canonical-publication correction and critical check; no active helper source edits.
+After repair, actual Source.Start, full consumer demand and quote-to-screen updates/restart remain
+required. Native WebDriver currently reaches the real Home/Watchlist; visibility is hidden, so
+this DOM observation does not prove visible paint or a live price change. Streaming is not accepted.
+
+Completed read-only assignment, ownership released: Sol6.1High schwab_activation_path owned ONLY
+`.agents/tmp/v1-first-stock/oct8-shared-market-demand.md`: read-only trace of existing provider-neutral
+consumer subscription/demand through watchlist, investment detail, portfolio and analysis to account
+stream selection. Identify why Schwab initial bindings currently cover predeclared benchmark funds,
+existing reusable multi-consumer mechanism, exact missing producer/consumer edge, and one smallest
+complete all-watchlist outcome. No source/Git/build/runtime/provider/DB actions or extra agents.
+This is dependency diagnosis, not another execution plan; lead retains all source and native checks.
+The report confirms a second integration gap: current source bindings cover predeclared SPY/VTI,
+and consumer demand does not drive the existing desired-state sender. All-nine watchlist, detail,
+holding and active-analysis demand still requires provider-neutral producer-to-consumer integration.
 
 ### Current integration — Schwab first activation
+
+Current bounded fix ownership (after333d0dd0): Sol6.1High streamer_metadata owns ONLY
+adapter-schwab/src/streamer.rs and src/tests.rs under adapters/market-squawk-adapter-schwab.
+Accept typed named content metadata alongside numeric fields, reuse NativeFieldEntry/NativeScalar
+and ParseContext unknown-field retention. Extend existing parser and physical microbatch regression
+with the observed envelope shape; malformed known types remain rejected. No builds/Git/runtime.
+Lead owns exports, canonical records, native publication rows and delay semantics plus shared
+contracts/check scheduling. Outcome: successful subscription and real first quote survive parsing
+and retain original metadata through publication. Critical gap: existing fixtures omit actual named
+content metadata. Native doctor retry follows frozen critical checks and one supervised build;
+full consumer-demand integration remains next. Resulting pushed commit pending.
+
+Metadata source frozen; helper ownership released. Lead integrated metadata into canonical records
+and both quote/family durable native rows, sharing existing scalar encoding. Stream qualification
+remains Unknown/DirectUnverified; neither delayed=false nor absent delta metadata invents verified
+real-time coverage. Critical parser test is compiling serially in session62293, root target reused,
+log oct8-streamer-metadata-critical.log. Existing physical microbatch/publication case follows on
+the same test binary. Current native processes stay running; watcher remains stopped.
+
+Critical result: session62293 terminal0; compile1m11s, parser case PASS1/1,0.02s. Same compiled
+binary physical microbatch→sealed originals→canonical events/native metadata case PASS1/1,0.28s
+(oct8-streamer-metadata-publication.log). Unrelated rustfmt-only changes outside the two regression
+cases removed. No application schema or timing-qualification change. Source closure refresh and
+diff check precede commit/push; one supervised native build/retry follows. This is critically
+verified adapter publication, not native streaming acceptance; no other source owners active.
 
 Previous turn yielded new native evidence: b88567da native build passed7m52s; service81947
 and Desktop81948 run the replacement. Native inspection still reports pending initial activation.

@@ -482,7 +482,9 @@ async fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
 
 #[test]
 fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semantics() {
-    use crate::{NativeField, NativeScalar, OptionContractField};
+    use crate::{
+        NativeField, NativeFieldEntry, NativeScalar, OptionContractField, StreamerMetadataField,
+    };
 
     let quote = br#"{
       "AAPL": {
@@ -642,7 +644,7 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
 
     let stream = br#"{
       "response":[{"service":"LEVELONE_EQUITIES","command":"SUBS","requestid":"2","timestamp":1710000000000,"content":{"code":0,"msg":"OK"}}],
-      "data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000001,"content":[{"key":"AAPL","1":100.125,"2":100.25}]}]
+      "data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000001,"content":[{"key":"AAPL","delayed":false,"assetMainType":"EQUITY","assetSubType":"COE","cusip":"TEST00001","futureMetadata":{"retained":"only-in-raw"},"1":100.125,"2":100.25}]}]
     }"#;
     let frame = parse_streamer_frame(stream, bounds())
         .unwrap_or_else(|error| panic!("stream frame: {error}"));
@@ -651,6 +653,40 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
         StreamerResponseCode::Success
     );
     assert_eq!(frame.value().data[0].content[0].fields.len(), 2);
+    let expected_metadata = [
+        NativeFieldEntry::new(
+            StreamerMetadataField::AssetMainType,
+            NativeScalar::Text("EQUITY".into()),
+        ),
+        NativeFieldEntry::new(
+            StreamerMetadataField::AssetSubType,
+            NativeScalar::Text("COE".into()),
+        ),
+        NativeFieldEntry::new(
+            StreamerMetadataField::Cusip,
+            NativeScalar::Text("TEST00001".into()),
+        ),
+        NativeFieldEntry::new(StreamerMetadataField::Delayed, NativeScalar::Bool(false)),
+    ];
+    assert_eq!(
+        frame.value().data[0].content[0].metadata.as_ref(),
+        expected_metadata.as_slice()
+    );
+    assert_eq!(
+        frame.raw_sha256(),
+        <[u8; 32]>::from(sha2::Sha256::digest(stream))
+    );
+    assert_eq!(frame.unknown_fields().field_count(), 1);
+    assert_eq!(
+        frame.unknown_fields().paths()[0].as_ref(),
+        "$.data[].content[].futureMetadata"
+    );
+    assert!(frame.unknown_fields().encoded_bytes() > 0);
+    assert_ne!(frame.unknown_fields().digest(), [0; 32]);
+    assert_eq!(
+        expected_metadata.map(|entry| entry.name().as_str()),
+        ["assetMainType", "assetSubType", "cusip", "delayed"]
+    );
     let dictionary = SchwabStreamerFieldDictionary::official(MarketDataService::LevelOneEquities)
         .unwrap_or_else(|error| panic!("official dictionary: {error}"));
     assert_eq!(
@@ -672,6 +708,10 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
     assert_eq!(mapped.len(), 1);
     assert_eq!(mapped[0].fields.len(), 2);
     assert_eq!(
+        mapped[0].metadata,
+        frame.value().data[0].content[0].metadata
+    );
+    assert_eq!(
         mapped[0].fields[0].meaning,
         SchwabStreamerSemanticField::BidPrice
     );
@@ -690,6 +730,63 @@ fn rest_and_streamer_native_parsing_preserve_evidence_and_one_connection_semanti
     assert_eq!(
         canonicalize_streamer_batch(&frame.value().data[0], &incomplete_dictionary),
         Err(SchwabCanonicalError::UnknownStreamerField { field_id: 2 })
+    );
+
+    let mut metadata_fixture: serde_json::Value =
+        serde_json::from_slice(stream).expect("named Streamer metadata fixture");
+    for field in ["delayed", "assetMainType", "assetSubType", "cusip"] {
+        metadata_fixture["data"][0]["content"][0][field] = serde_json::Value::Null;
+    }
+    let null_metadata = parse_streamer_frame(
+        &serde_json::to_vec(&metadata_fixture).expect("null metadata encoding"),
+        bounds(),
+    )
+    .expect("explicit null metadata remains distinct from absence");
+    assert_eq!(null_metadata.value().data[0].content[0].metadata.len(), 4);
+    assert!(
+        null_metadata.value().data[0].content[0]
+            .metadata
+            .iter()
+            .all(|entry| entry.value() == &NativeScalar::Null)
+    );
+    for (field, invalid) in [
+        ("delayed", serde_json::json!("false")),
+        ("assetMainType", serde_json::json!(true)),
+        ("assetSubType", serde_json::json!(1)),
+        ("cusip", serde_json::json!({"value": "TEST00001"})),
+    ] {
+        let mut invalid_fixture = metadata_fixture.clone();
+        invalid_fixture["data"][0]["content"][0][field] = invalid;
+        assert!(matches!(
+            parse_streamer_frame(
+                &serde_json::to_vec(&invalid_fixture).expect("invalid metadata encoding"),
+                bounds(),
+            ),
+            Err(SchwabAdapterError::SchemaViolation)
+        ));
+    }
+    for malformed_id in ["1x", "65536"] {
+        let mut invalid_fixture = metadata_fixture.clone();
+        invalid_fixture["data"][0]["content"][0][malformed_id] = serde_json::json!(1);
+        assert!(matches!(
+            parse_streamer_frame(
+                &serde_json::to_vec(&invalid_fixture).expect("invalid field ID encoding"),
+                bounds(),
+            ),
+            Err(SchwabAdapterError::SchemaViolation)
+        ));
+    }
+    let delta = parse_streamer_frame(
+        br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"ADD","content":[{"key":"AAPL","1":100.5}]}]}"#,
+        bounds(),
+    )
+    .expect("delta may omit named metadata");
+    assert!(delta.value().data[0].content[0].metadata.is_empty());
+    assert!(
+        canonicalize_streamer_batch(&delta.value().data[0], &dictionary)
+            .expect("canonical delta retains absent metadata")[0]
+            .metadata
+            .is_empty()
     );
 
     let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
@@ -2399,7 +2496,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         br#"{"response":[{"service":"LEVELONE_OPTIONS","command":"SUBS","requestid":"3","timestamp":1710000000002,"content":{"code":0,"msg":"OK"}}]}"#,
     );
     let mixed_market_data: &'static [u8] =
-        br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000004,"content":[{"key":"AAPL","1":100.125,"2":100.25,"3":2,"4":3}]},{"service":"LEVELONE_OPTIONS","command":"SUBS","timestamp":1710000000004,"content":[{"key":"AAPL_260116C100","1":4.125,"2":4.25,"3":5,"4":6}]}]}"#;
+        br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000004,"content":[{"key":"AAPL","delayed":false,"assetMainType":"EQUITY","assetSubType":"COE","cusip":"TEST00001","1":100.125,"2":100.25,"3":2,"4":3}]},{"service":"LEVELONE_OPTIONS","command":"SUBS","timestamp":1710000000004,"content":[{"key":"AAPL_260116C100","delayed":true,"assetMainType":"OPTION","assetSubType":null,"cusip":null,"1":4.125,"2":4.25,"3":5,"4":6}]}]}"#;
     let malformed_selected_service: &'static [u8] =
         br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","content":[{"key":"AAPL","1":}]}]}"#;
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
@@ -2823,21 +2920,41 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     };
     assert!(publication.dispositions().is_empty());
     assert_eq!(publication.binding().record_count(), 2);
-    let [MarketEvent::MarketDataQuote(equities), MarketEvent::MarketDataQuote(options)] =
-        publication.binding().batch().events()
+    let [
+        MarketEvent::MarketDataQuote(equities),
+        MarketEvent::MarketDataQuote(options),
+    ] = publication.binding().batch().events()
     else {
         panic!("Streamer prices must retain currency-qualified decimal quote semantics");
     };
     for (quote, symbol, price, size) in [
         (equities, "AAPL", rust_decimal::Decimal::new(100_125, 3), 2),
-        (options, "AAPL_260116C100", rust_decimal::Decimal::new(4_125, 3), 5),
+        (
+            options,
+            "AAPL_260116C100",
+            rust_decimal::Decimal::new(4_125, 3),
+            5,
+        ),
     ] {
         assert_eq!(quote.provenance().source_timestamp(), None);
         assert_eq!(quote.provenance().received_at(), received_at);
-        assert_eq!(quote.reference().provider_identity().expect("native provider reference").provider_instrument_id().as_str(), symbol);
+        assert_eq!(
+            quote
+                .reference()
+                .provider_identity()
+                .expect("native provider reference")
+                .provider_instrument_id()
+                .as_str(),
+            symbol
+        );
         let bid = quote.bid().expect("fixture bid is present");
         assert_eq!(bid.price().amount(), price);
-        assert_eq!(bid.size(), &market_squawk_domain::MarketDataQuoteSize::UnresolvedUnit(rust_decimal::Decimal::from(size)));
+        assert_eq!(
+            bid.size(),
+            &market_squawk_domain::MarketDataQuoteSize::UnresolvedUnit(
+                rust_decimal::Decimal::from(size)
+            )
+        );
     }
     assert!(
         publication
@@ -2847,6 +2964,36 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .all(|row| row.event_frame_ordinal() == 0)
     );
     let native_rows = publication.binding().native_lineage().rows();
+    for (row, delayed, main_type, sub_type, cusip) in [
+        (
+            &native_rows[0],
+            false,
+            "EQUITY",
+            serde_json::json!({"kind":"text","value":"COE"}),
+            serde_json::json!({"kind":"text","value":"TEST00001"}),
+        ),
+        (
+            &native_rows[1],
+            true,
+            "OPTION",
+            serde_json::json!({"kind":"null"}),
+            serde_json::json!({"kind":"null"}),
+        ),
+    ] {
+        let native: serde_json::Value =
+            serde_json::from_slice(row).expect("sealed native Streamer row");
+        assert_eq!(
+            native["metadata"],
+            serde_json::json!([
+                {"name":"assetMainType","value":{"kind":"text","value":main_type}},
+                {"name":"assetSubType","value":sub_type},
+                {"name":"cusip","value":cusip},
+                {"name":"delayed","value":{"kind":"bool","value":delayed}},
+            ])
+        );
+        assert_eq!(native["delay"]["kind"], "unknown");
+        assert_eq!(native["quality"], "direct_unverified");
+    }
     assert!(
         native_rows[0]
             .windows(b"100.125".len())

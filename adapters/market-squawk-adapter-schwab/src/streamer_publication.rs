@@ -780,6 +780,7 @@ struct SchwabStreamerFamilyNativeRowV1<'a> {
     dictionary_evidence: EvidenceDigest,
     dictionary_version: &'a str,
     fields: Vec<SchwabStreamerFieldV1<'a>>,
+    metadata: Vec<SchwabStreamerNamedFieldV1<'a>>,
     reference: Option<&'a MarketDataReference>,
     item_references: Vec<&'a MarketDataReference>,
     qualification_family: market_squawk_sources::SchwabMarketDataFamily,
@@ -816,6 +817,7 @@ fn encode_family_native_row(
         dictionary_evidence: record.dictionary_evidence,
         dictionary_version: record.dictionary_version.as_str(),
         fields,
+        metadata: native_metadata(content),
         reference: input.reference.as_ref(),
         item_references: input.item_references.values().collect(),
         qualification_family: input.qualification.family(),
@@ -880,6 +882,7 @@ struct SchwabStreamerQuoteNativeRowV1<'a> {
     provider_envelope_timestamp: Option<Timestamp>,
     provider_identifier: &'a str,
     fields: Vec<SchwabStreamerFieldV1<'a>>,
+    metadata: Vec<SchwabStreamerNamedFieldV1<'a>>,
     dictionary_version: &'a str,
     dictionary_evidence: EvidenceDigest,
     instrument_id: InstrumentId,
@@ -920,12 +923,12 @@ enum SchwabStreamerNativeValueV1<'a> {
     Text(&'a str),
     Sequence(Vec<SchwabStreamerNativeValueV1<'a>>),
     Fields(Vec<SchwabStreamerNestedFieldV1<'a>>),
-    ScreenerItems(Vec<Vec<SchwabStreamerScreenerFieldV1<'a>>>),
+    ScreenerItems(Vec<Vec<SchwabStreamerNamedFieldV1<'a>>>),
 }
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct SchwabStreamerScreenerFieldV1<'a> {
+struct SchwabStreamerNamedFieldV1<'a> {
     name: &'static str,
     value: SchwabStreamerNativeValueV1<'a>,
 }
@@ -969,6 +972,7 @@ fn encode_native_row(
         provider_envelope_timestamp: record.provider_envelope_timestamp,
         provider_identifier: record.provider_identifier.as_str(),
         fields,
+        metadata: native_metadata(content),
         dictionary_version: record.dictionary_version.as_str(),
         dictionary_evidence: record.dictionary_evidence,
         instrument_id: input.reference.instrument_id(),
@@ -1019,20 +1023,31 @@ fn encode_native_row(
     .map_err(|_| SchwabStreamerPublicationError::NativeEncoding)
 }
 
+fn native_metadata(content: &StreamerContent) -> Vec<SchwabStreamerNamedFieldV1<'_>> {
+    content
+        .metadata
+        .iter()
+        .map(|field| SchwabStreamerNamedFieldV1 {
+            name: field.name().as_str(),
+            value: native_scalar(field.value()),
+        })
+        .collect()
+}
+
+fn native_scalar(value: &NativeScalar) -> SchwabStreamerNativeValueV1<'_> {
+    match value {
+        NativeScalar::Null => SchwabStreamerNativeValueV1::Null,
+        NativeScalar::Bool(value) => SchwabStreamerNativeValueV1::Bool(*value),
+        NativeScalar::Number(value) => SchwabStreamerNativeValueV1::Number(value.as_str()),
+        NativeScalar::Text(value) => SchwabStreamerNativeValueV1::Text(value),
+    }
+}
+
 fn native_value(
     value: &StreamerNativeValue,
 ) -> Result<SchwabStreamerNativeValueV1<'_>, SchwabStreamerPublicationError> {
     match value {
-        StreamerNativeValue::Scalar(NativeScalar::Null) => Ok(SchwabStreamerNativeValueV1::Null),
-        StreamerNativeValue::Scalar(NativeScalar::Bool(value)) => {
-            Ok(SchwabStreamerNativeValueV1::Bool(*value))
-        }
-        StreamerNativeValue::Scalar(NativeScalar::Number(value)) => {
-            Ok(SchwabStreamerNativeValueV1::Number(value.as_str()))
-        }
-        StreamerNativeValue::Scalar(NativeScalar::Text(value)) => {
-            Ok(SchwabStreamerNativeValueV1::Text(value))
-        }
+        StreamerNativeValue::Scalar(value) => Ok(native_scalar(value)),
         StreamerNativeValue::Sequence(values) => {
             let mut encoded = Vec::new();
             encoded
@@ -1054,15 +1069,8 @@ fn native_value(
                     .try_reserve_exact(item.fields().len())
                     .map_err(|_| SchwabStreamerPublicationError::NativeEncoding)?;
                 for field in item.fields() {
-                    let value = match field.value() {
-                        NativeScalar::Null => SchwabStreamerNativeValueV1::Null,
-                        NativeScalar::Bool(value) => SchwabStreamerNativeValueV1::Bool(*value),
-                        NativeScalar::Number(value) => {
-                            SchwabStreamerNativeValueV1::Number(value.as_str())
-                        }
-                        NativeScalar::Text(value) => SchwabStreamerNativeValueV1::Text(value),
-                    };
-                    fields.push(SchwabStreamerScreenerFieldV1 {
+                    let value = native_scalar(field.value());
+                    fields.push(SchwabStreamerNamedFieldV1 {
                         name: field.name().as_str(),
                         value,
                     });

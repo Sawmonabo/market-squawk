@@ -27,7 +27,8 @@ use crate::{
     NativeNumber, NativeScalar, OptionChain, OptionContract, OptionContractField, OptionSide,
     ParsedNative, ProviderIdentifier, QuoteComponentField, SchwabCapabilityCurrentness,
     SchwabInstrument, SchwabOAuthAuthorityReceipt, SchwabPriceHistoryCapabilityObservation,
-    SchwabQuote, SchwabUserPreferenceEvidence, StreamerDataBatch, StreamerNativeValue,
+    SchwabQuote, SchwabUserPreferenceEvidence, StreamerDataBatch, StreamerMetadataField,
+    StreamerNativeValue,
 };
 
 /// Exact Schwab symbol bound to a shared provider-instrument identity by external registry proof.
@@ -985,6 +986,7 @@ pub struct SchwabCanonicalStreamerRecord {
     pub provider_envelope_timestamp: Option<Timestamp>,
     pub dictionary_version: SourceIdentifier,
     pub dictionary_evidence: EvidenceDigest,
+    pub metadata: Box<[NativeFieldEntry<StreamerMetadataField>]>,
     pub fields: Box<[SchwabCanonicalStreamerField]>,
 }
 
@@ -1028,6 +1030,7 @@ pub fn canonicalize_streamer_batch(
                 provider_envelope_timestamp,
                 dictionary_version: dictionary.version.clone(),
                 dictionary_evidence: dictionary.evidence,
+                metadata: content.metadata.clone(),
                 fields: fields.into_boxed_slice(),
             })
         })
