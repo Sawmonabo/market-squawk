@@ -151,9 +151,40 @@ impl InstalledProviderSetup {
                     () = tokio::time::sleep_until(context.deadline().into()) => return Err(ServiceError::DeadlineExceeded),
                     result = self.activation.setup_publication_pending(input.session_id) => result,
                 };
+                let authorization = if session.surface_id() == "schwab.trader-api-market-data"
+                    && session.credential_stored()
+                    && self
+                        .access
+                        .status()
+                        .map_err(|_| ServiceError::Unavailable)?
+                        .access
+                        == market_squawk_platform::SecretAccessState::Ready
+                {
+                    // Callback reception and token exchange are service-owned. Inspect only
+                    // observes their retained result; it must not submit a setup mutation.
+                    let outcome = tokio::select! {
+                        biased;
+                        () = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+                        () = tokio::time::sleep_until(context.deadline().into()) => return Err(ServiceError::DeadlineExceeded),
+                        result = self.activation.schwab_oauth(
+                            input.session_id,
+                            crate::provider_onboarding::SchwabOAuthLifecycleAction::Continue,
+                            context.cancellation().child_token(),
+                        ) => result,
+                    };
+                    Some(match outcome {
+                        Ok(value) => json!({"outcome": "completed", "value": value}),
+                        Err(error) => {
+                            let failure = SetupFailure::from(error);
+                            json!({"outcome": "rejected", "message": failure.message})
+                        }
+                    })
+                } else {
+                    None
+                };
                 ensure_live(context)?;
                 return TypedToolResult::try_new(
-                    json!({"session":session,"publicationPending":pending}),
+                    json!({"session":session,"publicationPending":pending,"authorization":authorization}),
                     1,
                     ToolResultMetadata::complete_not_applicable(),
                     context.limits(),
@@ -364,7 +395,11 @@ impl InstalledProviderSetup {
                     .map(|secret| SecretValue::new(std::mem::take(&mut **secret)))
                     .transpose()
                     .map_err(|_| SetupFailure::invalid())?;
-                serialize(self.access.configure(policy, unlock, deadline, cancellation).await?)
+                serialize(
+                    self.access
+                        .configure(policy, unlock, deadline, cancellation)
+                        .await?,
+                )
             }
             ProviderOnboardingRequest::UnlockAccess { mut secret } => serialize(
                 self.access

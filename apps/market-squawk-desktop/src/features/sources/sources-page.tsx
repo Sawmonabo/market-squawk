@@ -95,14 +95,21 @@ export function ConnectionsWorkspace({
     queryFn: async () => {
       if (selectedSessionId === null) throw new Error("No saved connection selected.")
       const result = await transport.onboard({ action: "inspect", sessionId: selectedSessionId })
-      if (result.session.session_id !== selectedSessionId || result.session.surface_id !== selectedProvider) {
+      if (result.session.session_id !== selectedSessionId || result.session.surface_id !== selectedProvider
+        || (result.authorization?.outcome === "completed" && result.authorization.value.session_id !== selectedSessionId)) {
         throw new Error("The saved connection state changed. Refresh before continuing.")
       }
       return result
     },
-    refetchInterval: (query) => tab === "setup" && visible
-      && (verificationPending || query.state.data?.publicationPending === true)
-      ? 5_000 : false,
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: (query) => {
+      if (tab !== "setup" || !visible || query.state.status === "error") return false
+      const authorization = query.state.data?.authorization
+      if (authorization?.outcome === "completed"
+        && ["awaiting_authorization", "exchanging_authorization"].includes(authorization.value.state)) return 1_000
+      return verificationPending || query.state.data?.publicationPending === true ? 5_000 : false
+    },
     refetchIntervalInBackground: false,
   })
   const pendingSelectedWork = tab === "setup" && visible
@@ -312,6 +319,9 @@ export function ConnectionsWorkspace({
           transport={transport}
           onActivity={setActivity}
           publicationPending={inspection.data?.publicationPending === true}
+          authorization={inspection.data?.authorization?.outcome === "completed" ? inspection.data.authorization.value : undefined}
+          authorizationError={inspection.isError ? messageFrom(inspection.error)
+            : inspection.data?.authorization?.outcome === "rejected" ? inspection.data.authorization.message : null}
           onChanged={async () => {
             await refreshLifecycleAuthorities()
             await connections.refetch()

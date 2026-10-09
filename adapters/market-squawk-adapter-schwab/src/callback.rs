@@ -216,7 +216,7 @@ fn callback_page(outcome: &CallbackOutcome) -> String {
     let (heading, detail) = match outcome {
         CallbackOutcome::Authorized(_) => (
             "Authorization received",
-            "Return to Market Squawk to finish connecting Schwab.",
+            "Market Squawk is completing the connection. You can close this tab and return to the app.",
         ),
         CallbackOutcome::Denied { .. } => (
             "Authorization not completed",

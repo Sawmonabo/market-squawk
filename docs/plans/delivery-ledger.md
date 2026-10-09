@@ -8,17 +8,15 @@ pause is authorized. One worktree on `feature/v1-installed-product-experience`; 
 
 ### Active native verification and next dependency
 
-Current code `457151e6` pushed; native service16617/Desktop16646 replaced the previous generation
-through the same supervisor after successful single-job build. Reimport now creates Schwab session
-and reuses Alpaca/SEC setup. Native Schwab OAuth begin returned awaiting_authorization, then callback arrival advanced to
-exchanging_authorization; exchange returned reauthorization_required. Current runtime waits for
-Continue before exchanging a received code; fix this demonstrated delayed handoff after integrating
-the financial-read checkpoint. Do not claim token acceptance or API success. PR evidence comment6073379917 records importer verification.
-Previous clarification turn: no implementation progress; current continuation verifies replacement,
-fixed native import and a real financial post-preparation read failure.
+Current pushed head `d491e785` records code `603eb306`. The existing supervisor keeps
+Desktop16646 and service19062 running; source edits for automatic OAuth completion are below.
+Fresh-workspace credential import now creates Schwab setup and reuses Alpaca/SEC setup. The prior
+native callback reached exchanging_authorization only after Continue and then returned
+reauthorization_required. That failure does not establish the provider's precise cause. The
+current correction exchanges callback codes automatically; real token/API acceptance is pending.
 
 Acceptance1/5/6: financial preparation completed, but GetInvestmentFinancials timed out in retained
-use authorization. Lead owns `application/research/investment_financials/authorization.rs`, Desktop
+use authorization. The completed checkpoint changed `application/research/investment_financials/authorization.rs`, Desktop
 `features/markets/investment-financials.tsx`, affected existing critical fixture, source closure and
 this ledger. Use existing snapshot-only Display authorization; preserve durable LocalAnalysis for
 ratios and exact source/root/expiry/revocation checks. Correct stale preparation-required fallback
@@ -57,6 +55,35 @@ https://www.rfc-editor.org/rfc/rfc6749#section-4.1.3 .
   after the worker handoff is inspected. No new polling service, compatibility layer or secret
   exposure. Resulting next commit pending; no provider/API success claimed.
 
+Lead integration (2026-10-08): callback worker handoff is frozen for inspection. Lead additionally
+owns `features/sources/{connection-setup,sources-page}.tsx` and adapter `src/callback.rs` for
+removing the manual completion button, observing backend-owned authorization status through the
+existing query client, and updating callback acknowledgement copy. No new workflow/polling service. Lead also owns `service/provider_setup.rs` and Desktop
+`src/lib/schemas.ts`: expose authorization in existing read-only Inspect, avoiding mutation
+requests merely to observe automatic completion. Existing callers/fixture update together.
+Lead also owns the existing `src/test/app.test.tsx` Settings boundary fixture: extend it for
+automatic status completion without a manual button, not a separate component harness.
+Critical gap: callback delivery must start exchange without a subsequent client action while
+cancel/shutdown retain the admitted worker; extend the existing inline lifecycle test and reuse
+protected-authority recovery coverage. Typecheck verifies the affected presentation contracts.
+Watcher10194 remains stopped during integration; supervisor10180/Desktop16646/service19062 are live.
+Lead VTI investigation: the already requested90-day retry now returns Jul10–Oct7 retained history
+and OHLC in the actual Desktop (`oct8-vti-history-retry-state.json`). The earlier RawSeal deadline
+failure is retained evidence; this successful retry does not prove its general cause is removed,
+all ranges work, or hidden chart pixels paint. No history source edit made. Next barrier is the
+integrated OAuth critical check, then one supervised build and real authorization/API verification.
+
+Automatic OAuth candidate critically verified: existing callback lifecycle regression PASS1/1
+(0.09s; rerun against the final compiled library PASS1/1), existing protected-token/account/restart
+regression PASS1/1 (4.77s), extended Settings boundary journey PASS1/1 (2.61s), TypeScript and
+shipping source-closure verification passed. Runtime and service compilation serialized at one
+job; watcher remains stopped until the checkpoint push. The service exposes authorization through
+existing read-only Inspect; the renderer no longer sends Continue mutations to observe progress.
+No new endpoint, scheduler, schema migration or compatibility path. Test source ownership released;
+lead owns matching runtime replacement and real consent/API proof. Actual current stock controller
+status reports the recommended profile available with no workflow yet (`oct8-stock-workflow-current-status.json`).
+Next after replacement: start real MSFT analysis independently of supplementary Schwab completion.
+
 Read-only Astra `financial_load_diagnosis` and Sol6.1 `background_chart_diagnosis` completed/released;
 reports are `.agents/tmp/v1-first-stock/oct8-financial-load.md` and `oct8-background-chart.md`.
 The hidden native screenshot does not prove chart paint; existing throttling policy is already
@@ -67,7 +94,7 @@ indexed lookups, but is not bundled-runtime planner evidence. Archive/public cry
 shared canonical multi-consumer demand remain open dependencies; their supporting diagnoses are
 frozen rather than another task queue. One worktree/target; no whole-app RAM acceptance claim.
 
-### Current native evidence after configured import
+### Earlier native evidence before financial-read correction
 
 Schwab import correction: the existing selected-profile mapping test PASS1/1 (0.01s after7m43s
 single-job compilation); source closure verification and the existing closure-refresh test PASS1/1.

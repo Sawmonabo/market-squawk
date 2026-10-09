@@ -2584,10 +2584,36 @@ describe("Market Squawk desktop boundary", () => {
   it("keeps provider plumbing behind Settings onboarding", async () => {
     const providerSentinel = "Privileged provider sentinel"
     const onboardingRequests: Parameters<SystemTransport["onboard"]>[0][] = []
+    const schwabSession = {
+      session_id: "6f190c0f-cc7b-47c3-9eb8-a396bb8a7e15",
+      surface_id: "schwab.trader-api-market-data",
+      state: "credential_stored_unverified",
+      next_action: "complete_oauth_authorization",
+      credential_stored: true,
+    }
+    let authorizationState = "reauthorization_required"
+    let authorizationObservations = 0
     const boundaryTransport = transport(
       blockedBootstrap,
       (async (request) => {
         onboardingRequests.push(request)
+        const authorization = (action: "begin" | "continue") => ({
+          session_id: schwabSession.session_id,
+          action,
+          state: authorizationState,
+          access_token_generation: authorizationState === "active" ? 1 : null,
+          access_expires_at: null,
+          refresh_expires_at: null,
+        })
+        if (request.action === "inspect") {
+          if (authorizationState === "awaiting_authorization" && ++authorizationObservations === 2) authorizationState = "active"
+          return { session: schwabSession, publicationPending: false,
+            authorization: { outcome: "completed", value: authorization("continue") } }
+        }
+        if (request.action === "schwabOAuth" && request.lifecycleAction === "begin") {
+          authorizationState = "awaiting_authorization"
+          return authorization("begin")
+        }
         if (request.action !== "bootstrap") {
           throw new Error("Unexpected provider onboarding request")
         }
@@ -2605,10 +2631,22 @@ describe("Market Squawk desktop boundary", () => {
               coverage: "Protected connection evidence",
               quality_ceiling: "official_delayed",
             },
+            {
+              id: schwabSession.surface_id,
+              display_name: "Schwab",
+              official_handoff_url: "https://example.com",
+              handoff_instruction: "Sign in on the provider page.",
+              zero_fee: "No fee",
+              account_requirement: "Required",
+              credential_requirement: "required",
+              release_state: "available",
+              coverage: "Read-only market data",
+              quality_ceiling: "real_time",
+            },
           ],
-          sessions: [],
+          sessions: [schwabSession],
           setup: [],
-          credentialAccess: { enabled: true, rememberInKeychain: false, reauthenticateAfterSeconds: null, access: "locked", rememberedAccessAvailable: false, reauthenticateAtUnixSeconds: null },
+          credentialAccess: { enabled: false, rememberInKeychain: false, reauthenticateAfterSeconds: null, access: "ready", rememberedAccessAvailable: false, reauthenticateAtUnixSeconds: null },
           capabilities: {
             credentialImport: false,
             health: false,
@@ -2663,6 +2701,13 @@ describe("Market Squawk desktop boundary", () => {
     fireEvent.click(await screen.findByRole("link", { name: "Onboarding" }))
     expect(await screen.findByText(providerSentinel)).toBeTruthy()
     expect(onboardingRequests).toEqual([{ action: "bootstrap" }])
+
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: schwabSession.surface_id } })
+    fireEvent.click(await screen.findByRole("button", { name: "Authorize with Schwab" }))
+    // Receiving consent is backend-owned. The page observes completion without another click.
+    expect(await screen.findByText("Schwab authorization saved.", {}, { timeout: 3_000 })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "I finished authorization" })).toBeNull()
+    expect(onboardingRequests.filter((request) => request.action === "schwabOAuth")).toEqual([{ action: "schwabOAuth", sessionId: schwabSession.session_id, lifecycleAction: "begin" }])
   })
 
   it("keeps installation evidence out of the ordinary workspace", async () => {

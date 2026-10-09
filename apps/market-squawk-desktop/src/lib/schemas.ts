@@ -161,11 +161,6 @@ export const providerSessionSchema = z
   })
   .loose()
 
-export const providerSetupInspectionSchema = z.strictObject({
-  session: providerSessionSchema,
-  publicationPending: z.boolean(),
-})
-
 export const providerActivationSchema = z
   .object({
     profile: z.string(),
@@ -182,6 +177,15 @@ export const providerOAuthSchema = z.object({
   access_expires_at: z.union([z.number().int(), z.string()]).nullable(),
   refresh_expires_at: z.union([z.number().int(), z.string()]).nullable(),
 }).strict()
+
+export const providerSetupInspectionSchema = z.strictObject({
+  session: providerSessionSchema,
+  publicationPending: z.boolean(),
+  authorization: z.discriminatedUnion("outcome", [
+    z.strictObject({ outcome: z.literal("completed"), value: providerOAuthSchema }),
+    z.strictObject({ outcome: z.literal("rejected"), message: z.string() }),
+  ]).nullable(),
+})
 
 export const secretAccessPolicySchema = z.object({
   enabled: z.boolean(),

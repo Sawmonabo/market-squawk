@@ -16,7 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 
-import type { ProviderBootstrap, ProviderProfile, ProviderSession } from "@/lib/schemas"
+import type { ProviderBootstrap, ProviderOAuth, ProviderProfile, ProviderSession } from "@/lib/schemas"
 import type { ProviderOnboardingRequest, SystemTransport } from "@/lib/transport"
 import {
   lifecycleControls,
@@ -42,6 +42,8 @@ type Props = {
   onChanged: () => Promise<void>
   onActivity: (activity: ConnectionActivity | null) => void
   publicationPending: boolean
+  authorization: ProviderOAuth | undefined
+  authorizationError: string | null
 }
 
 export function ConnectionSetup({
@@ -53,6 +55,8 @@ export function ConnectionSetup({
   onChanged,
   onActivity,
   publicationPending,
+  authorization,
+  authorizationError,
 }: Props) {
   const profile = connections.profiles.find((profile) => profile.id === selectedProvider)
   const setup = connections.setup.find((setup) => setup.surfaceId === selectedProvider)
@@ -106,6 +110,8 @@ export function ConnectionSetup({
         onChanged={onChanged}
         onActivity={onActivity}
         publicationPending={publicationPending}
+        authorization={authorization}
+        authorizationError={authorizationError}
       /> : null}
     </section>
   )
@@ -121,6 +127,8 @@ function SelectedConnection({
   onChanged,
   onActivity,
   publicationPending,
+  authorization,
+  authorizationError,
 }: {
   profile: ProviderProfile
   session?: ProviderSession
@@ -131,12 +139,14 @@ function SelectedConnection({
   onChanged: () => Promise<void>
   onActivity: (activity: ConnectionActivity | null) => void
   publicationPending: boolean
+  authorization: ProviderOAuth | undefined
+  authorizationError: string | null
 }) {
   const [pending, setPending] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [confirmation, setConfirmation] = React.useState<"cancel" | "renew" | "unlink" | LifecycleControl | null>(null)
-  const [oauth, setOAuth] = React.useState<string | null>(null)
+  const oauth = authorization?.session_id === session?.session_id ? authorization?.state : undefined
   const [cancelling, setCancelling] = React.useState(false)
   const alive = React.useRef(true)
   React.useEffect(() => {
@@ -189,13 +199,6 @@ function SelectedConnection({
         } : null)
       }
       if (alive.current) {
-        if (request.action === "schwabOAuth"
-          && typeof result === "object"
-          && result !== null
-          && "state" in result
-          && typeof result.state === "string") {
-          setOAuth(result.state)
-        }
         if (publicationPending) setNotice("Connection saved. Review data import progress below; saved progress remains available when you return.")
         else setNotice("Saved connection state refreshed.")
       }
@@ -317,32 +320,23 @@ function SelectedConnection({
         pending={pending !== null || cancelling}
         onSubmit={(secret) => run("Saving credential securely", { action: "submitSecret", sessionId: session.session_id, secret })}
       /> : null}
-      {session && next === "complete_oauth_authorization" ? <div className="mt-5 space-y-3">
+      {session && profile.id === "schwab.trader-api-market-data" && saved ? <div className="mt-5 space-y-3">
         <p className="text-sm">
-          Authorize read-only market data on Schwab's official page, then return here. Your saved application credential stays protected.
+          {oauth === "active" ? "Schwab authorization saved." : "Sign in on Schwab’s official page to authorize read-only market data."}
         </p>
-        {oauth ? <p role="status" className="text-xs text-muted-foreground">
-          {oauth === "active"
-            ? "Authorization saved. Connection verification can continue."
-            : oauth === "exchanging_authorization"
-              ? "Completing authorization…"
-              : "Return here after completing the official authorization."}
+        {!authorizationError && (oauth === "awaiting_authorization" || oauth === "exchanging_authorization") ? <p role="status" className="text-xs text-muted-foreground">
+          {oauth === "exchanging_authorization" ? "Completing authorization…" : "Waiting for Schwab sign-in…"}
         </p> : null}
+        {authorizationError ? <p role="alert" className="text-sm text-red-400">{authorizationError}</p> : null}
+        {oauth !== "active" || authorizationError ?
         <div className="flex flex-wrap gap-2">
           <Button
-            disabled={pending !== null}
+            disabled={pending !== null || (!authorizationError && (oauth === "awaiting_authorization" || oauth === "exchanging_authorization"))}
             onClick={() => void run("Opening official authorization", { action: "schwabOAuth", sessionId: session.session_id, lifecycleAction: "begin" })}
           >
             Authorize with Schwab
           </Button>
-          <Button
-            variant="outline"
-            disabled={pending !== null}
-            onClick={() => void run("Checking authorization", { action: "schwabOAuth", sessionId: session.session_id, lifecycleAction: "continue" })}
-          >
-            I finished authorization
-          </Button>
-        </div>
+        </div> : null}
       </div> : null}
       {session && savedConfigurationSessionId ? <div className="mt-5 space-y-3">
         <p className="text-sm text-muted-foreground">
