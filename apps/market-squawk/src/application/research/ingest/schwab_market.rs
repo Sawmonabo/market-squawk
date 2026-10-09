@@ -1119,6 +1119,11 @@ impl SchwabMarketPublicationLease {
                 .require_current()
                 .map_err(|_| SchwabMarketPublicationError::AuthorityRevoked)?;
         }
+        self.validate_retained_authorities()
+    }
+
+    /// Checks retained leases without reacquiring the publication catalog.
+    fn validate_retained_authorities(&self) -> Result<(), SchwabMarketPublicationError> {
         if let Some(selected) = &self.selected {
             selected
                 .validate_at(trusted_now()?)
@@ -1150,7 +1155,10 @@ impl IngestPrecommitAuthority for SchwabMarketPublicationLease {
         &self,
         catalog: &market_squawk_data::CatalogAuthority,
     ) -> Result<(), IngestError> {
-        self.validate_precommit()?;
+        // Publication already owns this catalog. The account check below must borrow it,
+        // rather than reentering its mutex through the ordinary precommit path.
+        self.validate_retained_authorities()
+            .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
         self.generation.validate_catalog_precommit(catalog)?;
         if let Some(references) = &self.references {
             references.validate_catalog(catalog)?;

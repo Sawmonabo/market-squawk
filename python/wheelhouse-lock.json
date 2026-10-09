@@ -4668,8 +4668,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/schwab_market.rs",
-      "sha256": "7c2da1fd5882465b4eeb3effec2891e556e02362114ddb2eecc02a398b5bcfa4",
-      "size_bytes": 77204
+      "sha256": "568cdb99f1e03cd49bf32f25107a1d180cac99dcd1a547549d6ca446957001d9",
+      "size_bytes": 77671
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/schwab_market/history.rs",

@@ -2,16 +2,16 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed checkpoint **04df1a20**; next checkpoint is critically verified and being committed. It removes provider-capacity polling,
+Current pushed checkpoint **ac32f267**. It removes provider-capacity polling,
 repairs canonical reference publication, distinguishes prepared Streamer/REST profiles and keeps
 saved quotes usable across corroborating reference updates. Full V1 and all-nine acceptance remain
-open. Supervisor10180 runs service39932/Desktop39946 while Cargo43034 builds the matching runtime.
+open. Matching build passed6m50s; supervisor10180 runs service44399/Desktop44423. Watcher10194 is stopped; no compiler.
 Retained-reference and native-rebind critical checks passed. One compiler job; no competing build.
 
 | Owner | Concrete outcome and exact files | Evidence / next dependency |
 | --- | --- | --- |
 | Lead | Frozen shared admission, reference producer/consumers, shared contracts/manifests/closure, Git/runtime; exact ownership recorded below | Shared admission, allocation, SEC taxonomy and adjacent catalog checks passed. Matching pre-follow-on build passed7m33s. Real SPY/VTI reference publication proven in catalog. Follow-on retained-reference/native-rebind checks passed; coherent checkpoint commit/push, matching native replacement next. |
-| GPT-6 Astra High sec_concurrency_policy | Completed shared event-driven admission handoff; ownership released to lead | Queue critical check passed; one→two SEC policy correction remains separate and open. |
+| GPT-6 Astra High sec_concurrency_policy | Completed two-slot design and reentry diagnosis; report frozen, ownership released | Confirmed base defect and unused history path; actual chart path uses Alpaca. Native publication must close base reentry evidence gap. |
 | GPT-6.1 Sol High schwab_metadata_scope | Completed reference integration diagnosis; report frozen, all source ownership lead-held | Located exact Streamer-profile rejection, independent-source ticker constraint and invalid restart revision comparison. Native startup remains unverified after their current corrections. |
 
 
@@ -214,6 +214,39 @@ Lead now resumes the existing supervisor watcher for one matching build; current
 available until successful compilation. Native Streamer start, retained quote display and unchanged
 reference restart reuse remain unverified. Previous question-only turn was no implementation
 progress; this continuation completed the concrete critical-check barrier.
+
+Checkpoint **ac32f267** pushed; PR43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6074771578. All six focused critical checks passed within their scopes;
+matching native build Cargo43034 is active under supervisor10180. Source ownership is frozen until
+compiler terminal. The SEC design follow-up is independent read-only work: Astra owns only the
+existing concurrency report, traces actual policy registration and shutdown/restart callers, and
+must propose exact files plus one existing durable/adapter regression. No schema migration, rate
+history reset, new quota authority or fresh workspace. This design does not authorize implementation
+or claim the one-slot limitation fixed. Lead owns next source assignment after build/native evidence.
+
+Native ac32f267 replacement PASS build6m50s, service44399/Desktop44423. All9 watchlist entries
+returned after restart (2.7s, not instant/cache acceptance); SPY/VTI retained quote display recovered
+and their six exact reference revision rows/digests are unchanged. Files:
+`oct9-reference-{pre,post}-replacement-watchlist.json`, `oct9-reference-{pre,post}-replacement-revisions.json`.
+Alpaca startup resolved9routes. Initial SourceStatus timed out; subsequent probe returned WebDriver500.
+Schwab startup later exceeded deadline. Process sample `oct9-post-reference-service.sample.txt`
+shows actual Streamer Consumer→publish_market_events→SchwabMarketPublicationLease::validate_catalog_precommit
+calling validate_precommit→account.require_current→OnboardingCatalogCapability.lock while already
+inside catalog publication. This is confirmed self-reentry, not upstream absence. Other status,
+currentness and chart publication threads wait on that mutex. Next blocking repair supersedes SEC
+policy implementation until fixed; retain the completed SEC design for the following checkpoint.
+Lead owns ONLY `application/research/ingest/schwab_market.rs` plus adjacent existing fixture after
+identification, closure/ledger/runtime. Split catalog-independent lease checks from account lookup;
+use existing require_catalog_current inside catalog callbacks, normal require_current before lock.
+Retain OAuth, generation, selection, currentness, expiry and revocation checks. Astra read-only
+fixture diagnosis owns `oct9-schwab-catalog-reentry.md`; no source/build/runtime authority.
+
+### Catalog publication reentry correction — acceptance1/5/6
+
+- Lead owns `apps/market-squawk/src/application/research/ingest/schwab_market.rs`, closure record and this ledger. Concrete outcome: Streamer publication and independent catalog reads make progress while preserving account/OAuth/generation revocation.
+- Runtime sample `oct9-post-reference-service.sample.txt` proves the normal account lookup reenters the catalog mutex already held by publication. Existing borrowed-catalog account validation is the correct commit boundary; split only the shared retained-lease checks.
+- Smallest check: existing `schwab_quote_attempt_rejects_revoked_epoch_before_current_qualification`, followed by genuine native account publication/status and all-nine retained reads after managed replacement. Existing fixture has no real account; it proves revocation only, and native evidence is required for this defect. Avoid adding a duplicate OAuth/publication harness.
+- Separate discovered HistoryPrecommit reentry is in unused Schwab history scaffolding (whole-app search found no caller). Active chart acquisition runs display_history → preflight/history → Alpaca registered discovery/IngestSource; existing Alpaca calendar publication already has borrowed-catalog account validation. Do not build new calendar hooks for the unused path or claim this quote correction fixes charts. Astra read-only report owns diagnosis, no source.
+- Current service44399 is deadlocked; no repeated source retries or credential resets. Matching replacement and observed old-service termination are required. Existing exact revocation check PASS1/1 (8.60s; initial compilation3m47s). An initial short-name exact filter ran0tests and was not accepted; rerun used the full test path. Source closure and diff checks passed. Pushed commit pending; native genuine-account publication remains required.
 
 ### Active native verification and next dependency
 
