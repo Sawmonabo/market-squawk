@@ -132,6 +132,13 @@ export function MarketHistoryRead({ historyToken, bootstrap, transport, refreshR
     setViewport(days === "all" ? { pointLimit: 512 } : recentHistoryWindow(Number(days), result))
     if (days !== "all") preparation.start(Number(days))
   }
+  React.useEffect(() => {
+    // A first publication supplies the precision needed for the selected range.
+    // Resolve that deferred read without starting the durable loading job again.
+    if (windowDays === "all" || !result?.data || viewport.startDate !== undefined || viewport.endDate !== undefined
+      || viewport.startUnixNanos !== undefined || viewport.endUnixNanos !== undefined) return
+    setViewport(recentHistoryWindow(Number(windowDays), result))
+  }, [windowDays, result, viewport])
   const busy = history.isFetching || refreshing
   const temporarilyUnavailable = observed?.unavailableReason === "temporarily_unavailable"
   const showPreparationStatus = !history.isError && !temporarilyUnavailable && Boolean(preparation.active || preparation.unresolved || preparation.busy

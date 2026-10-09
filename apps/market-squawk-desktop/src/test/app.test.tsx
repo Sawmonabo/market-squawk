@@ -1149,6 +1149,14 @@ describe("Market Squawk desktop boundary", () => {
       historyAvailability = "available"
       await act(async () => { publishHistory("market") })
       const arrivedChart = await screen.findByRole("img", { name: /Daily investment prices in USD/ })
+      // First publication supplies time precision: honor the selected year without
+      // repeating acquisition, then keep the exact snapshot on later price events.
+      await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({
+        query: "marketHistory", historyToken, pointLimit: 512, generationToken: initialHistoryGeneration,
+        startDate: new Date(selectedAt + 86_400_000 - 365 * 86_400_000).toISOString().slice(0, 10),
+        endDate: new Date(selectedAt + 86_400_000).toISOString().slice(0, 10),
+      }))
+      expect(preparationRequests.filter(({ request }) => request.action === "start")).toHaveLength(2)
       const pinnedReads = issuedQueries.filter((request) => request.query === "marketHistory").length
       await act(async () => { publishHistory("market") })
       expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(pinnedReads)

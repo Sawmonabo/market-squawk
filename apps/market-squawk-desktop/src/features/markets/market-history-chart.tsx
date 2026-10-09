@@ -65,14 +65,14 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
   const closeRef = useRef<ISeriesApi<"Line">[]>([])
   const originalByTime = useRef(new Map<string, string>())
   const viewportBounds = useRef(history.viewport)
-  const layerVisibility = useRef({ candles: false, close: true })
+  const layerVisibility = useRef({ candles: true, close: false })
   const lastRange = useRef<{ from: Time; to: Time } | null>(null)
   const interacting = useRef(false)
   const [pendingViewport, setPendingViewport] = useState<MarketHistoryViewportInput | null>(null)
   useDebouncedChartCallback(pendingViewport === null ? null : JSON.stringify(pendingViewport), pendingViewport, onViewportChange)
   const [drawingIssue, setDrawingIssue] = useState<string | null>(null)
-  const [showClose, setShowClose] = useState(true)
-  const [showCandles, setShowCandles] = useState(false)
+  const [showClose, setShowClose] = useState(false)
+  const [showCandles, setShowCandles] = useState(true)
   const [selectedCoordinate, setSelectedCoordinate] = useState<string | null>(null)
   const visibleBars = bars
   useEffect(() => {
@@ -211,30 +211,35 @@ function PriceSeries({ history, nominal, onViewportChange, onObservationSelect, 
     candles.setData(data)
     if (lastRange.current) chart.timeScale().setVisibleRange(lastRange.current)
     else chart.timeScale().fitContent()
-  }, [visibleBars, nominal])
+  }, [visibleBars, nominal, windowDays])
   return <figure className="mt-4">
     <div className="flex flex-wrap items-center gap-4 text-xs">
       <label className="flex items-center gap-2"><input type="checkbox" className="accent-primary" checked={showClose} onChange={(event) => setShowClose(event.target.checked)} />Closing-price line</label>
       <label className="flex items-center gap-2"><input type="checkbox" className="accent-primary" checked={showCandles} onChange={(event) => setShowCandles(event.target.checked)} />Candlesticks</label>
     </div>
-    <div ref={container} className="mt-3 h-[330px] w-full" role="img"
+    <div ref={container} className="mt-3 h-[330px] w-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring" role="img" tabIndex={0}
       onPointerDown={() => { interacting.current = true }} onWheel={() => { interacting.current = true }}
-      aria-label={`${nominal ? "Daily" : "Dated period"} investment prices in ${currency}. Hover to inspect; exact values are also available using the date slider below.`} />
+      aria-keyshortcuts="ArrowLeft ArrowRight Home End"
+      onKeyDown={(event) => {
+        let next: number
+        if (event.key === "ArrowLeft") next = Math.max(0, index - 1)
+        else if (event.key === "ArrowRight") next = Math.min(visibleBars.length - 1, index + 1)
+        else if (event.key === "Home") next = 0
+        else if (event.key === "End") next = visibleBars.length - 1
+        else return
+        event.preventDefault()
+        const bar = visibleBars[next]
+        if (bar) setSelectedCoordinate(coordinate(bar))
+      }}
+      aria-label={`${nominal ? "Daily" : "Dated period"} investment prices in ${currency}. Hover to inspect, or focus the chart and use Left and Right arrow keys. Home and End select the first and last recorded dates.`} />
     {drawingIssue ? <p role="status" className="mt-3 text-xs text-muted-foreground">{drawingIssue}</p> : null}
     <figcaption className="mt-2 text-xs leading-5 text-muted-foreground">
       {nominal ? "Daily prices by trading date; no intraday time is implied" : "Prices by recorded period"} · {currency}.
-      Drag to pan or scroll to zoom. Select a date to inspect its recorded prices.
+      Drag to pan or scroll to zoom. Hover or use Left and Right arrow keys to inspect recorded prices.
     </figcaption>
-    {selected ? <div className="mt-4 rounded-lg border border-border bg-background/25 p-3">
-      <label className="grid gap-2 text-xs">Inspect a recorded date
-        <input type="range" min={0} max={visibleBars.length - 1} step={1} value={index}
-          aria-valuetext={periodLabel(selected)} onChange={(event) => {
-            const bar = visibleBars[Number(event.target.value)]
-            if (bar) setSelectedCoordinate(coordinate(bar))
-          }} />
-      </label>
-      <p className="mt-3 text-xs" title={selected.time.precision === "nominal_date" ? selected.time.date : `${selected.time.startsAt} – ${selected.time.endsAt}`}>{periodLabel(selected)}</p>
-      <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4" aria-live="polite" aria-atomic="true">
+    {selected ? <div className="mt-4 rounded-lg border border-border bg-background/25 p-3" aria-live="polite" aria-atomic="true">
+      <p className="text-xs" title={selected.time.precision === "nominal_date" ? selected.time.date : `${selected.time.startsAt} – ${selected.time.endsAt}`}>{periodLabel(selected)}</p>
+      <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
         {([['Open', selected.open], ['High', selected.high], ['Low', selected.low], ['Close', selected.close]] as const).map(([label, value]) => <div key={label}>
           <dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 break-all font-mono text-xs">{value} {currency}</dd>
         </div>)}

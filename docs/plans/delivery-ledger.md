@@ -128,6 +128,43 @@ steps in gathering_evidence; do not duplicate it or claim completion.
   calls, restarts or workflow mutations. Identify the actual terminal cause and smallest next
   repair/recovery with an existing critical check. Lead retains all shared files/runtime.
 
+Pushed **633eaa96**. Lead native observations: Schwab authorization active but Source.Start
+returns operation_failed/internal; this is an app activation failure, not grounds to repeat sign-in.
+MSFT Facts and Ratios render actual data; Statements rendered153 rows after5.39s. Filings check
+must use its list structure rather than a table-row count. These do not establish instant cached
+loads or all-watchlist coverage. The first synthetic tab click lacked Radix's mousedown activation;
+that invalid observation was replaced by evidence checking aria-selected and the actual panel.
+- Sol6.1 High `chart_window_repair` owns ONLY Desktop
+  `features/markets/{market-history-read,market-history-chart,history-preparation}.tsx`.
+  Trace selected-range → retained read → acquisition/reset → rendered range; repair a proven
+  source-level cause of the owner's years/range failure, preserving caching, cancellation and
+  backend authority. Read previous background-chart diagnosis; do not add private React access,
+  fake chart data or force Mac focus. No Git/build/runtime/manifest/test edits; propose existing
+  critical check to lead. Lead owns native reproduction and integration. No new arbitrary limits.
+Owner correction: native QA must cover all nine starter/watchlist investments (SPY, QQQ, DIA,
+IWM, VTI, AAPL, MSFT, NVDA, TSLA), distinguishing fund and stock family availability. Sol chart
+owner also removes the redundant visible date slider while retaining keyboard inspection.
+Astra `stock_pause_cause` completed its read-only diagnosis: missing source-action reference paused
+price_dataset; no model job started. Lead owns eventual existing Resume after provider recovery.
+Next bounded Astra task: diagnose Source.Start internal failure with active Schwab OAuth, using
+`local_product/source_lifecycle*`, `schwab_market_runtime.rs`, existing account/runtime callers
+and current non-secret status/log evidence. Own only
+`.agents/tmp/v1-first-stock/oct8-schwab-start-failure.md`; no source/runtime/build/Git changes.
+Lead owns all-watchlist native QA, source-start fix/integration and restart-token proof.
+Chart checkpoint: source inspected, existing lookup/recovery and provider-neutral market journeys
+PASS2/2 (3.99s), with one existing first-publication assertion extended for bounded365-day read
+and no repeated Start. The visible slider is removed; chart keyboard inspection remains. Candles
+are default and closing-price line optional. Missing-data selection now binds the requested range
+when precision arrives, and unchanged bars refit when selected window changes. Native pixel and
+all-range acquisition acceptance remain open. Chart source owner released to lead.
+All nine native routes were read on the current Desktop with exact heading/route checks
+(`oct9-all-watchlist-native-reads.json`): all five funds show empty company facts; AAPL/TSLA have
+pending financial acquisition; MSFT/NVDA still show financial loading at10–11s observation. These
+observations substantiate the owner's delay/empty-panel report; absence is not declared upstream.
+Lead owns next bounded diagnostics in `local_product/{source_lifecycle,schwab_market_runtime}.rs`
+for the failed authorized Schwab Source.Start: retain original closed ServiceError and stage;
+no payload/secrets, authority change, reset or repeated sign-in. Matching build and existing Retry
+with a freshly read lifecycle revision must identify the failure before behavioral remediation.
 Read-only Astra `financial_load_diagnosis` and Sol6.1 `background_chart_diagnosis` completed/released;
 reports are `.agents/tmp/v1-first-stock/oct8-financial-load.md` and `oct8-background-chart.md`.
 The hidden native screenshot does not prove chart paint; existing throttling policy is already
