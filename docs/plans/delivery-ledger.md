@@ -4,9 +4,76 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`333d0dd0`. Main/release unchanged; no extra branch created.
+`8738356f`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
+
+Current integration ownership: lead owns the complete handed-off change, tests, build and Git.
+Sol6.1High schwab_probe_selection completed and released its sole file:
+apps/market-squawk/src/provider_onboarding/schwab_market_doctor_probe.rs: production selection,
+request fields/keys, digest binding and a focused adjacent cfg-test for those actual plans.
+Contract: required trait method streamer_selection(family) -> Result<SchwabMarketDoctorStreamerSelection,
+SchwabMarketDataDoctorError>, enum Selected/RequiresInstrument. Production must explicitly represent
+missing futures-option selection and never send /ES to that service; configured Exact subscriptions
+remain supported. Lead records the existing NotProbed receipt without invented response/time,
+preserving successful families. Real attempted invalid evidence still fails; no blanket error catch.
+Critical gap: startup plan used invalid futures-option symbol and generic fields0..4 for every
+service. Verify actual fields/keys against retained official specification, use maintained dictionary,
+and run targeted plan/receipt check before one native rebuild. Native activation then remains next.
+No schema migration, additional worktree/branch, unrelated source changes or extra helper builds.
+Lead also owns service/schwab_recovery_tests.rs: extend the existing real service/catalog/reopen
+case to construct an unselected-family receipt through the production disposition function and
+assert no fabricated provider observation/time, preserved quote start and durable restart.
+Retained spec confirms screener keys require prefix/sort/frequency; helper is correcting those
+requests and deriving production field admission from the largest actual dictionary (ChartEquity9).
+
+Probe-selection correction implemented and critically verified. Existing real service/catalog/reopen
+case PASS1/1 (3.65s; serialized nonincremental compile4m14s), retaining valid quote admission and
+NotProbed/no observation/no timestamp for an unselected futures-option contract. Adjacent actual
+production-plan regression PASS1/1 on the same test binary, verifying official fields, corrected
+screener keys, complete family inventory and digest distinction for a concrete selection.
+Evidence: oct8-probe-selection-critical.log and oct8-probe-selection-plan.log. Source closure
+refresh and diff whitespace check pass. Lead inspected the helper diff and affected receipt/admission
+consumers. No blanket request-error suppression, new schema, migration or claimed entitlement.
+Native rebuild/retry is next; current running Desktop remains8738356f until replacement succeeds.
+All-nine consumer demand and last-trade snapshot publication remain separate required dependencies;
+this checkpoint does not establish Desktop streaming. Resulting push recorded at integration.
+
+Pushed metadata correction8738356f, PR43:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6071623861 .
+Supervised native Cargo85574 completed successfully5m39s. Current service86458/Desktop86468 run
+8738356f; watcher60793 stopped. Saved native Continue succeeds. Retained live captures prove code0
+SUBS plus actual data for LevelOneEquities, LevelOneOptions and LevelOneFutures. Original parser
+failure is no longer observed. Evidence: oct8-streamer-metadata-native-continue.json and
+oct8-streamer-metadata-live-responses.json (only whitelisted response facts, no secrets).
+
+New exact blocker: LevelOneFuturesOptions SUBS receives code0 but no data, then transport reports
+ReconnectExhausted and doctor aborts the entire connection verification. Source sends `/ES` to
+this options family, although retained official docs specify a concrete ./root+expiry+side+strike
+contract. No claim of missing entitlement follows. Correct representative selection and preserve
+the existing NotProbed disposition for a genuinely unselected family rather than fake a contract
+or drop the capability. Receipt already supports NotProbed without observation and forbids start
+for that family; successful other-family evidence must not be erased by absent optional selection.
+Next action is correcting the production probe plan/selection and shared doctor orchestration,
+then native activation; all-nine demand and snapshot semantics remain required. No native live
+watchlist/restart acceptance. Last source push8738356f; no active helper source ownership.
+
+Additional confirmed next-journey gap: the official LevelOneEquities subscription dictionary currently
+selects only symbol/bid/ask/sizes/quote time. Although LastPrice/TradeTime semantic names exist, this
+dictionary and quote-only canonical publication do not produce last-trade events. Product price
+selection prioritizes last_trade before bid_ask_midpoint (application/paper/market/product.rs).
+Shared demand integration must include last-trade observation publication plus correct quote deltas;
+MarketDataTradeEvent requires a provider trade ID and quantity and may not represent a conflated
+LevelOne last-trade snapshot correctly. Do not invent transaction IDs or trade-tape completeness.
+Successful bid/ask updates alone cannot prove the
+watchlist's last-trade display. No claim of streamed last-price coverage or automatic Desktop pass.
+
+Completed read-only assignment, ownership released: AstraHigh streamer_price_semantics owned ONLY
+`.agents/tmp/v1-first-stock/oct8-streamer-price-semantics.md`: bounded read-only diagnosis of actual
+Schwab LevelOne last-price/time/size vs trade-tape semantics, existing neutral snapshot/event
+contracts and delta handling. Ground in retained official docs and existing consumers; identify
+smallest correct producer-to-watchlist patch, exact owners and one critical test. No source edits,
+Git/build/runtime/provider actions or extra agents. Lead owns native retry and shared contracts.
 
 Pushed `333d0dd0`; PR43 evidence:
 https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6071404225 .

@@ -78,7 +78,7 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
         return Err("initial Schwab doctor was not ready".into());
     };
     let initial_binding = service.schwab_market_doctor_authority_binding(&initial_lease)?;
-    let initial_observation = doctor_observation(1, Duration::from_secs(2))?;
+    let initial_observation = doctor_observation(1, Duration::from_secs(2), &initial_binding)?;
     let initial_expiry = initial_observation.access_expires_at;
     service
         .record_schwab_market_data_doctor_observation(
@@ -91,6 +91,19 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
     assert_eq!(prior.exclusive_expires_at(), initial_expiry);
     assert_eq!(prior.predecessor_digest(), None);
     assert_eq!(initial_binding, receipt_binding(&prior, session_id, None)?);
+    assert!(prior.admits_source_start());
+    let unselected = prior
+        .observation()
+        .families
+        .iter()
+        .find(|family| family.family == SchwabMarketDataFamily::LevelOneFuturesOptions)
+        .ok_or("missing futures-options disposition")?;
+    assert_eq!(
+        unselected.disposition,
+        RuntimeCapabilityDisposition::NotProbed
+    );
+    assert_eq!(unselected.observation_sha256, None);
+    assert_eq!(unselected.observed_at, None);
     assert!(matches!(
         service
             .prepare_schwab_market_doctor_run(session_id, 1, CancellationToken::new())
@@ -143,7 +156,11 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
     service
         .record_schwab_market_data_doctor_observation(
             &renewal_lease,
-            doctor_observation(2, Duration::from_secs(30 * 60))?,
+            doctor_observation(
+                2,
+                Duration::from_secs(30 * 60),
+                &service.schwab_market_doctor_authority_binding(&renewal_lease)?,
+            )?,
             CancellationToken::new(),
         )
         .await?;
@@ -163,8 +180,11 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
             8,
             ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
         )?;
-    let recovered =
-        ProviderOnboardingService::try_new_with_provider_rate(catalog, secrets, provider_rate.clone())?;
+    let recovered = ProviderOnboardingService::try_new_with_provider_rate(
+        catalog,
+        secrets,
+        provider_rate.clone(),
+    )?;
     let resumed = recovered.catalog.resume_provider_onboarding(session_id)?;
     let lifecycle = resumed.lifecycle();
     assert_eq!(resumed.reservation().session_id(), session_id);
@@ -198,17 +218,23 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
             .await?,
         SchwabMarketDoctorRunPreparation::Current
     ));
-    let config = market_squawk_platform::AppConfig::load(market_squawk_platform::ConfigSources::new(
-        None, &std::collections::BTreeMap::<std::ffi::OsString, std::ffi::OsString>::new(),
-        market_squawk_platform::ConfigOverrides {
-            data_dir: Some(directory.path().join("account-runtime")),
-            ..Default::default()
-        },
-    ))?;
+    let config =
+        market_squawk_platform::AppConfig::load(market_squawk_platform::ConfigSources::new(
+            None,
+            &std::collections::BTreeMap::<std::ffi::OsString, std::ffi::OsString>::new(),
+            market_squawk_platform::ConfigOverrides {
+                data_dir: Some(directory.path().join("account-runtime")),
+                ..Default::default()
+            },
+        ))?;
     let lease = recovered.prepared_activation_lease(session_id)?;
     crate::provider_activation::assert_schwab_prepared_publication_transition(
-        Arc::new(recovered), lease, &config, provider_rate,
-    ).await?;
+        Arc::new(recovered),
+        lease,
+        &config,
+        provider_rate,
+    )
+    .await?;
     Ok(())
 }
 
@@ -249,12 +275,13 @@ fn receipt_binding(
 fn doctor_observation(
     token_generation: u64,
     access_lifetime: Duration,
+    binding: &SchwabMarketDoctorAuthorityBinding,
 ) -> TestResult<SchwabMarketDataDoctorObservation> {
     use SchwabMarketDataFamily::*;
 
     let completed_at = system_timestamp()?;
     let digest = |value| EvidenceDigest::new(DigestAlgorithm::Sha256, [value; 32]);
-    let families = [
+    let mut families = [
         Quotes,
         PriceHistory,
         OptionChains,
@@ -292,6 +319,18 @@ fn doctor_observation(
     })
     .collect::<Vec<_>>()
     .into_boxed_slice();
+    // Use the real disposition constructor: unselected is neither a fabricated response nor
+    // an unavailable entitlement, and must coexist with verified quote access after reopen.
+    *families
+        .iter_mut()
+        .find(|family| family.family == LevelOneFuturesOptions)
+        .ok_or("missing futures-options fixture")? =
+        crate::provider_onboarding::schwab_market_doctor::family_receipt_evidence(
+            binding,
+            digest(21),
+            LevelOneFuturesOptions,
+            None,
+        )?;
     Ok(SchwabMarketDataDoctorObservation {
         provider_observation_origin: SchwabMarketDataDoctorObservation::provider_observed_origin()?,
         access_token_generation: token_generation,

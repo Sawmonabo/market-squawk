@@ -5948,13 +5948,13 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_market_doctor.rs",
-      "sha256": "3365c6adb6cec5d0727285ec337cb62f68cfe9e41b1e5d7a44cdd19b43c2299c",
-      "size_bytes": 58037
+      "sha256": "a788bf92a6e56736f81f4348c23cc669f66d9d452d7ab2c81f48e0fc540f051e",
+      "size_bytes": 59172
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_market_doctor_probe.rs",
-      "sha256": "4c5bf9d14b41be2d8389c7304793582993553f7688714aad4dda0478cfaba4d3",
-      "size_bytes": 79434
+      "sha256": "0c0c616c82d48ea8aaecc49d950f9972a9b80dd23fbb11bc97b44cc22da72c24",
+      "size_bytes": 87988
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_market_doctor_runtime.rs",
@@ -6003,8 +6003,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service/schwab_recovery_tests.rs",
-      "sha256": "fa8f020907cff7cc67f508eb348719371fe18cef215f4ad93b0274f4bf70c127",
-      "size_bytes": 12487
+      "sha256": "3e7451f7f9eac9aac7d2e932d8a2636aaceba2ed73ad4fd9283f8269da477345",
+      "size_bytes": 13787
     },
     {
       "path": "apps/market-squawk/src/provider_rate.rs",

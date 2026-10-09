@@ -3,8 +3,8 @@
 //! This module composes four authorities without taking ownership away from them: the protected
 //! OAuth market authority, the shared provider-rate authority, the sole physical raw sealer, and
 //! the bounded provider-native probe executor. Every REST and Streamer family must return exact
-//! attempted evidence. A missing, unsealed, or family-ambiguous result fails closed rather than
-//! being presented as unavailable.
+//! attempted evidence, or an explicit unselected-instrument disposition. A missing, unsealed,
+//! or family-ambiguous attempted result fails closed rather than being presented as unavailable.
 
 use std::fmt;
 use std::future::Future;
@@ -538,10 +538,21 @@ impl SchwabMarketDoctorFamilyProbeEvidence {
     }
 }
 
-/// Bounded provider-native probes. The production implementation owns exact requests,
-/// subscriptions, and adapter executors but receives neither rate nor physical-seal authority.
+/// Whether the native plan has an actual instrument to verify for this family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchwabMarketDoctorStreamerSelection {
+    Selected,
+    RequiresInstrument,
+}
+
+/// Bounded provider-native probes with shared rate and physical-seal authority supplied by callers.
 pub(crate) trait SchwabMarketDoctorProbeExecutor: fmt::Debug + Send + Sync {
     fn probe_contract_digest(&self) -> EvidenceDigest;
+
+    fn streamer_selection(
+        &self,
+        family: SchwabMarketDataFamily,
+    ) -> Result<SchwabMarketDoctorStreamerSelection, SchwabMarketDataDoctorError>;
 
     fn user_preference<'a>(
         &'a self,
@@ -748,11 +759,23 @@ impl SchwabMarketDataDoctorExecutor {
             families.push(family_receipt_evidence(
                 &binding,
                 probe_contract_digest,
-                &evidence,
+                family,
+                Some(&evidence),
             )?);
             detailed.push(evidence);
         }
         for family in STREAMER_FAMILIES {
+            if self.probes.streamer_selection(family)?
+                == SchwabMarketDoctorStreamerSelection::RequiresInstrument
+            {
+                families.push(family_receipt_evidence(
+                    &binding,
+                    probe_contract_digest,
+                    family,
+                    None,
+                )?);
+                continue;
+            }
             let evidence = self
                 .run_family(
                     family,
@@ -767,7 +790,8 @@ impl SchwabMarketDataDoctorExecutor {
             families.push(family_receipt_evidence(
                 &binding,
                 probe_contract_digest,
-                &evidence,
+                family,
+                Some(&evidence),
             )?);
             detailed.push(evidence);
         }
@@ -1230,10 +1254,11 @@ fn map_streamer_rate_error(error: SchwabMarketDataDoctorError) -> SchwabTranspor
     }
 }
 
-fn family_receipt_evidence(
+pub(super) fn family_receipt_evidence(
     binding: &SchwabMarketDoctorAuthorityBinding,
     probe_contract_digest: EvidenceDigest,
-    evidence: &SchwabMarketDoctorFamilyProbeEvidence,
+    family: SchwabMarketDataFamily,
+    evidence: Option<&SchwabMarketDoctorFamilyProbeEvidence>,
 ) -> Result<SchwabMarketDataFamilyEvidence, SchwabMarketDataDoctorError> {
     #[derive(Serialize)]
     #[serde(deny_unknown_fields)]
@@ -1248,11 +1273,19 @@ fn family_receipt_evidence(
         rights_decision_digest: EvidenceDigest,
         rate_policy_digest: EvidenceDigest,
         probe_contract_digest: EvidenceDigest,
-        observation_sha256: EvidenceDigest,
+        observation_sha256: Option<EvidenceDigest>,
         family: SchwabMarketDataFamily,
         disposition: RuntimeCapabilityDisposition,
     }
-    let observation_sha256 = evidence.observation_sha256()?;
+    if evidence.is_some_and(|evidence| evidence.family != family) {
+        return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence);
+    }
+    let observation_sha256 = evidence
+        .map(SchwabMarketDoctorFamilyProbeEvidence::observation_sha256)
+        .transpose()?;
+    let disposition = evidence.map_or(RuntimeCapabilityDisposition::NotProbed, |evidence| {
+        evidence.disposition
+    });
     let material = DispositionMaterial {
         surface_id: &binding.surface_id,
         session_id: binding.session_id,
@@ -1265,18 +1298,18 @@ fn family_receipt_evidence(
         rate_policy_digest: binding.rate_policy_digest,
         probe_contract_digest,
         observation_sha256,
-        family: evidence.family,
-        disposition: evidence.disposition,
+        family,
+        disposition,
     };
     Ok(SchwabMarketDataFamilyEvidence {
-        family: evidence.family,
-        disposition: evidence.disposition,
+        family,
+        disposition,
         disposition_evidence_sha256: digest_serialized(
             FAMILY_DISPOSITION_DIGEST_DOMAIN,
             &material,
         )?,
-        observation_sha256: Some(observation_sha256),
-        observed_at: Some(evidence.observed_at),
+        observation_sha256,
+        observed_at: evidence.map(|evidence| evidence.observed_at),
     })
 }
 

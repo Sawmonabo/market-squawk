@@ -25,11 +25,12 @@ use market_squawk_adapter_schwab::{
     SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
     SchwabStreamerConnectionControl, SchwabStreamerConnectionControlSource,
     SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFamilyDoctorAccumulator,
-    SchwabStreamerFamilyDoctorHandoff, SchwabStreamerRuntimeAuthority, SchwabTransportError,
-    SchwabTransportTelemetry, SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription,
-    StreamerTransportBounds, TokenAuthorityError, build_instrument_search_request,
-    build_market_hours_request, build_movers_request,
+    SchwabStreamerFamilyDoctorHandoff, SchwabStreamerFieldDictionary,
+    SchwabStreamerRuntimeAuthority, SchwabTransportError, SchwabTransportTelemetry,
+    SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission, StreamerCaptureSink,
+    StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription, StreamerTransportBounds,
+    TokenAuthorityError, build_instrument_search_request, build_market_hours_request,
+    build_movers_request,
 };
 use market_squawk_domain::{
     CoverageDelay, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
@@ -47,8 +48,9 @@ use super::schwab_market_doctor::{
     SchwabMarketDoctorFamilyProbeEvidence, SchwabMarketDoctorFamilyProbeInput,
     SchwabMarketDoctorProbeExecutor, SchwabMarketDoctorProbeScope, SchwabMarketDoctorProbeStatus,
     SchwabMarketDoctorRateObservation, SchwabMarketDoctorSetupRequiredEvidence,
-    SchwabMarketDoctorUserPreferenceAvailable, SchwabMarketDoctorUserPreferenceOutcome,
-    adapter_rest_family, streamer_service, user_preference_endpoint_contract_sha256,
+    SchwabMarketDoctorStreamerSelection, SchwabMarketDoctorUserPreferenceAvailable,
+    SchwabMarketDoctorUserPreferenceOutcome, adapter_rest_family, streamer_service,
+    user_preference_endpoint_contract_sha256,
 };
 use super::schwab_oauth_runtime::SchwabOAuthMarketAuthority;
 
@@ -131,6 +133,10 @@ enum SchwabMarketDoctorStreamerTarget {
         service: MarketDataService,
         field_ids: BTreeSet<u16>,
     },
+    RequiresInstrument {
+        service: MarketDataService,
+        field_ids: BTreeSet<u16>,
+    },
 }
 
 impl SchwabMarketDoctorStreamerProbe {
@@ -170,17 +176,49 @@ impl SchwabMarketDoctorStreamerProbe {
         })
     }
 
+    fn try_requires_instrument(
+        family: SchwabMarketDataFamily,
+        field_ids: Vec<u16>,
+        admission: StreamerAdmission,
+    ) -> Result<Self, SchwabMarketDataDoctorError> {
+        let service = streamer_service(family)
+            .filter(|service| *service == MarketDataService::LevelOneFuturesOptions)
+            .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        let field_ids = field_ids.into_iter().collect::<BTreeSet<_>>();
+        if field_ids.is_empty() || field_ids.len() > admission.max_fields_per_service() {
+            return Err(SchwabMarketDataDoctorError::InvalidProbeContract);
+        }
+        Ok(Self {
+            family,
+            target: SchwabMarketDoctorStreamerTarget::RequiresInstrument { service, field_ids },
+        })
+    }
+
+    const fn selection(&self) -> SchwabMarketDoctorStreamerSelection {
+        match &self.target {
+            SchwabMarketDoctorStreamerTarget::RequiresInstrument { .. } => {
+                SchwabMarketDoctorStreamerSelection::RequiresInstrument
+            }
+            SchwabMarketDoctorStreamerTarget::Exact(_)
+            | SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { .. } => {
+                SchwabMarketDoctorStreamerSelection::Selected
+            }
+        }
+    }
+
     const fn service(&self) -> MarketDataService {
         match &self.target {
             SchwabMarketDoctorStreamerTarget::Exact(subscription) => subscription.service(),
-            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { service, .. } => *service,
+            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { service, .. }
+            | SchwabMarketDoctorStreamerTarget::RequiresInstrument { service, .. } => *service,
         }
     }
 
     fn field_ids(&self) -> &BTreeSet<u16> {
         match &self.target {
             SchwabMarketDoctorStreamerTarget::Exact(subscription) => subscription.field_ids(),
-            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { field_ids, .. } => field_ids,
+            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { field_ids, .. }
+            | SchwabMarketDoctorStreamerTarget::RequiresInstrument { field_ids, .. } => field_ids,
         }
     }
 }
@@ -364,11 +402,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             )
             .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?,
         );
-        let streamer_admission = StreamerAdmission::new(
-            request_admission,
-            nonzero(STREAMER_FAMILIES.len())?,
-            nonzero(8)?,
-        );
+        let streamer_admission = production_streamer_admission(request_admission)?;
         let streamer_bounds = StreamerTransportBounds::try_new(
             Duration::from_secs(5),
             Duration::from_secs(10),
@@ -702,6 +736,9 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             .streamer
             .get(&family)
             .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        if probe.selection() == SchwabMarketDoctorStreamerSelection::RequiresInstrument {
+            return Err(SchwabMarketDataDoctorError::InvalidProbeContract);
+        }
         let service =
             streamer_service(family).ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
         let retained = self.user_preference.lock().await;
@@ -744,6 +781,9 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                     self.streamer_admission,
                 )
                 .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?
+            }
+            SchwabMarketDoctorStreamerTarget::RequiresInstrument { .. } => {
+                return Err(SchwabMarketDataDoctorError::InvalidProbeContract);
             }
         };
         executor
@@ -865,6 +905,16 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
 impl SchwabMarketDoctorProbeExecutor for ProviderNativeSchwabMarketDoctorProbeExecutor {
     fn probe_contract_digest(&self) -> EvidenceDigest {
         self.probe_contract_digest
+    }
+
+    fn streamer_selection(
+        &self,
+        family: SchwabMarketDataFamily,
+    ) -> Result<SchwabMarketDoctorStreamerSelection, SchwabMarketDataDoctorError> {
+        self.streamer
+            .get(&family)
+            .map(SchwabMarketDoctorStreamerProbe::selection)
+            .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)
     }
 
     fn user_preference<'a>(
@@ -992,6 +1042,24 @@ fn production_rest_probes(
     .collect()
 }
 
+fn production_streamer_admission(
+    request: RequestAdmission,
+) -> Result<StreamerAdmission, SchwabMarketDataDoctorError> {
+    let mut max_fields = 0;
+    for family in STREAMER_FAMILIES {
+        let service =
+            streamer_service(family).ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        let dictionary = SchwabStreamerFieldDictionary::official(service)
+            .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        max_fields = max_fields.max(dictionary.field_ids().count());
+    }
+    Ok(StreamerAdmission::new(
+        request,
+        nonzero(STREAMER_FAMILIES.len())?,
+        nonzero(max_fields)?,
+    ))
+}
+
 fn production_streamer_probes(
     admission: StreamerAdmission,
 ) -> Result<Vec<SchwabMarketDoctorStreamerProbe>, SchwabMarketDataDoctorError> {
@@ -1000,7 +1068,17 @@ fn production_streamer_probes(
         .map(|family| {
             let service = streamer_service(family)
                 .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
-            let fields = vec![0, 1, 2, 3, 4];
+            let fields = SchwabStreamerFieldDictionary::official(service)
+                .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?
+                .field_ids()
+                .collect();
+            if service == MarketDataService::LevelOneFuturesOptions {
+                // A futures root is not a futures-option contract. No initial contract has been
+                // selected; retain this family without inventing an expiry, side, or strike.
+                return SchwabMarketDoctorStreamerProbe::try_requires_instrument(
+                    family, fields, admission,
+                );
+            }
             if matches!(
                 service,
                 MarketDataService::LevelOneOptions | MarketDataService::OptionsBook
@@ -1031,11 +1109,13 @@ const fn production_streamer_key(service: MarketDataService) -> Option<&'static 
         | MarketDataService::NasdaqBook
         | MarketDataService::ChartEquity => "SPY",
         MarketDataService::LevelOneFutures | MarketDataService::ChartFutures => "/ES",
-        MarketDataService::LevelOneFuturesOptions => "/ES",
         MarketDataService::LevelOneForex => "EUR/USD",
-        MarketDataService::ScreenerEquity => "$SPX",
-        MarketDataService::ScreenerOption => "SPY",
-        MarketDataService::LevelOneOptions | MarketDataService::OptionsBook => {
+        // Official screener keys use (PREFIX)_(SORTFIELD)_(FREQUENCY), not instrument symbols.
+        MarketDataService::ScreenerEquity => "$SPX_PERCENT_CHANGE_UP_5",
+        MarketDataService::ScreenerOption => "OPTION_ALL_VOLUME_5",
+        MarketDataService::LevelOneOptions
+        | MarketDataService::OptionsBook
+        | MarketDataService::LevelOneFuturesOptions => {
             return None;
         }
     })
@@ -1212,6 +1292,9 @@ fn probe_contract_digest(
             SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { .. } => {
                 hasher.update([1]);
                 hasher.update(PRODUCTION_OPTION_STREAMER_SELECTION_DOMAIN);
+            }
+            SchwabMarketDoctorStreamerTarget::RequiresInstrument { .. } => {
+                hasher.update([2]);
             }
         }
         for field in probe.field_ids() {
@@ -2004,4 +2087,122 @@ fn hash_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), SchwabMarketDataD
     );
     hasher.update(value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_probe_plan_requires_real_selection_and_uses_official_fields() {
+        let request = RequestAdmission::new(
+            NonZeroUsize::new(16 * 1024).expect("request bytes"),
+            NonZeroUsize::MIN,
+        );
+        let admission = production_streamer_admission(request).expect("production admission");
+        let mut streamer = exact_streamer_plan(
+            production_streamer_probes(admission).expect("production streamer probes"),
+        )
+        .expect("complete production streamer plan");
+        assert_eq!(streamer.len(), STREAMER_FAMILIES.len());
+        assert_eq!(admission.max_fields_per_service(), 9);
+        for family in STREAMER_FAMILIES {
+            let probe = streamer.get(&family).expect("retained family");
+            let expected = SchwabStreamerFieldDictionary::official(probe.service())
+                .expect("official dictionary")
+                .field_ids()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(probe.field_ids(), &expected);
+            assert_eq!(
+                probe.selection(),
+                if family == SchwabMarketDataFamily::LevelOneFuturesOptions {
+                    SchwabMarketDoctorStreamerSelection::RequiresInstrument
+                } else {
+                    SchwabMarketDoctorStreamerSelection::Selected
+                }
+            );
+        }
+        for (family, fields) in [
+            (
+                SchwabMarketDataFamily::LevelOneOptions,
+                vec![0, 2, 3, 16, 17, 38],
+            ),
+            (SchwabMarketDataFamily::NyseBook, vec![0, 1, 2, 3]),
+            (SchwabMarketDataFamily::ChartEquity, (0..=8).collect()),
+            (SchwabMarketDataFamily::ChartFutures, (0..=6).collect()),
+        ] {
+            assert_eq!(
+                streamer.get(&family).expect("family").field_ids(),
+                &fields.into_iter().collect::<BTreeSet<_>>()
+            );
+        }
+        for (family, key) in [
+            (
+                SchwabMarketDataFamily::ScreenerEquity,
+                "$SPX_PERCENT_CHANGE_UP_5",
+            ),
+            (
+                SchwabMarketDataFamily::ScreenerOption,
+                "OPTION_ALL_VOLUME_5",
+            ),
+            (SchwabMarketDataFamily::LevelOneForex, "EUR/USD"),
+        ] {
+            let SchwabMarketDoctorStreamerTarget::Exact(subscription) =
+                &streamer.get(&family).expect("family").target
+            else {
+                panic!("expected exact provider-native screener or forex key");
+            };
+            assert_eq!(
+                subscription
+                    .keys()
+                    .iter()
+                    .map(ProviderIdentifier::as_str)
+                    .collect::<Vec<_>>(),
+                vec![key]
+            );
+        }
+        assert_eq!(
+            production_streamer_key(MarketDataService::LevelOneFuturesOptions),
+            None
+        );
+        let rest =
+            exact_rest_plan(production_rest_probes(request).expect("production REST probes"))
+                .expect("complete production REST plan");
+        let preference = ReadOnlyRequest::user_preference(request).expect("preference request");
+        let missing_digest = probe_contract_digest(&preference, &rest, &streamer, admission)
+            .expect("missing-selection digest");
+
+        // The retained specification's concrete symbol is a syntax fixture, not a live contract
+        // or entitlement claim. Configured Exact subscriptions still take the selected path.
+        let family = SchwabMarketDataFamily::LevelOneFuturesOptions;
+        let configured = SchwabMarketDoctorStreamerProbe::try_new(
+            family,
+            StreamerSubscription::try_new(
+                MarketDataService::LevelOneFuturesOptions,
+                vec![provider_identifier("./OZCZ23C565").expect("documented native symbol")],
+                streamer
+                    .get(&family)
+                    .expect("family")
+                    .field_ids()
+                    .iter()
+                    .copied()
+                    .collect(),
+                admission,
+            )
+            .expect("configured exact subscription"),
+        )
+        .expect("configured futures-option probe");
+        assert_eq!(
+            configured.selection(),
+            SchwabMarketDoctorStreamerSelection::Selected
+        );
+        streamer.insert(family, configured);
+        assert_ne!(
+            missing_digest,
+            probe_contract_digest(&preference, &rest, &streamer, admission)
+                .expect("configured-selection digest")
+        );
+        streamer.remove(&family);
+        assert!(exact_streamer_plan(streamer.into_values().collect()).is_err());
+    }
 }
