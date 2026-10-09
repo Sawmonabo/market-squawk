@@ -91,6 +91,17 @@ account-number scoped. See the
 [Streamer guide](https://www.schwab.com/content/how-to-use-streaming-data), and official API
 contracts linked below.
 
+**APPLICATION POLICY (2026-10-08):** capability verification is bound to the saved OAuth
+authorization, application credentials and effective scope, not the rotating access token.
+Routine refresh reuses that verification without repeating REST/Streamer probes. Its lifetime
+ends at the provider's refresh-grant deadline; sign-out, changed credentials/grant/scope and
+provider rejection still require connection recovery. Each request and Streamer handoff retains
+its actual token generation, expiry and revocation checks. The original probe token and timestamps
+remain historical evidence. This follows OAuth refresh semantics in
+[RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6) and
+[refresh-token protection in RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14).
+Implementation and live-verification status remain in the delivery ledger.
+
 **RUNTIME-MEASURED VALUE:** this approved app/account returned equities, ETFs, indexes, mutual
 funds, forex, futures, options, history, hours, movers, and fundamentals; accepted 500/500 symbols
 in one quote call; and accepted five tested Streamer services.

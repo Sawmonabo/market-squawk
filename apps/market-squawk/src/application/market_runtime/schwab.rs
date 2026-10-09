@@ -578,8 +578,7 @@ impl SchwabRestQuoteProducer {
             .validate_current(oauth)
             .map_err(|_error| SchwabRestQuoteRuntimeError::RefreshRequired)?;
         if token.generation() != oauth.generation()
-            || oauth.generation().get()
-                != self.activation.doctor_receipt().access_token_generation()
+            || !oauth.matches_market_data_authorization(self.activation.doctor_receipt())
         {
             return Err(SchwabRestQuoteRuntimeError::RefreshRequired);
         }

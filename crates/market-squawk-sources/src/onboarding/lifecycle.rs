@@ -1284,7 +1284,10 @@ impl OnboardingLifecycle {
                 if self.state != OnboardingState::ActiveScoped
                     || self.active_generation != Some(generation)
                     || currentness_deadline != Some(expires_at)
-                    || observed_at < expires_at
+                    || (observed_at < expires_at
+                        && self
+                            .generation_schwab_market_data_doctor_receipt(generation)
+                            .is_none())
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -2131,11 +2134,29 @@ impl OnboardingLifecycle {
                     .as_ref()
                     .and_then(RuntimeVerificationEvidence::schwab_market_data_receipt)
                     .ok_or(OnboardingStateError::EvidenceMismatch)?;
+                let same_grant =
+                    next.authorization_generation() == prior.authorization_generation();
+                let same_scope =
+                    next.authorization_scope_sha256() == prior.authorization_scope_sha256();
+                // Routine token rotation needs no new capability observation. Changed consent or
+                // scope may be verified immediately without waiting for the old grant to expire.
                 if pending_renewal
+                    && same_grant
+                    && same_scope
                     && (observed_at < prior.exclusive_expires_at()
                         || next.verified_at() < prior.exclusive_expires_at())
                 {
                     return Err(OnboardingStateError::InvalidEvidence);
+                }
+                if next.authorization_generation() < prior.authorization_generation()
+                    || next.access_token_generation() < prior.access_token_generation()
+                    || (same_grant
+                        && (next.observation().refresh_authorized_at
+                            != prior.observation().refresh_authorized_at
+                            || next.observation().refresh_expires_at
+                                != prior.observation().refresh_expires_at))
+                {
+                    return Err(OnboardingStateError::EvidenceMismatch);
                 }
                 if next.predecessor_digest() != Some(prior.receipt_sha256())
                     || next.verified_at() <= prior.verified_at()

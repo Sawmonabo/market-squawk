@@ -199,7 +199,19 @@ impl Drop for TemporaryDirectory {
 }
 
 #[derive(Debug)]
-struct ShortLivedOAuthWire;
+struct ShortLivedOAuthWire {
+    expires_in: u64,
+    scope: Option<&'static str>,
+}
+
+impl Default for ShortLivedOAuthWire {
+    fn default() -> Self {
+        Self {
+            expires_in: 30,
+            scope: Some("market-data Quotes Market-Data"),
+        }
+    }
+}
 
 impl SchwabOAuthWire for ShortLivedOAuthWire {
     fn exchange(
@@ -208,10 +220,19 @@ impl SchwabOAuthWire for ShortLivedOAuthWire {
     ) -> Pin<
         Box<dyn Future<Output = Result<SchwabOAuthWireResponse, SchwabOAuthWireError>> + Send + '_>,
     > {
-        Box::pin(async {
+        Box::pin(async move {
+            let mut response = serde_json::json!({
+                "access_token": "short-access",
+                "refresh_token": "short-refresh",
+                "token_type": "Bearer",
+                "expires_in": self.expires_in,
+            });
+            if let Some(scope) = self.scope {
+                response["scope"] = serde_json::json!(scope);
+            }
             SchwabOAuthWireResponse::try_new(
                 200,
-                br#"{"access_token":"short-access","refresh_token":"short-refresh","token_type":"Bearer","expires_in":30,"scope":"market-data"}"#.to_vec(),
+                serde_json::to_vec(&response).expect("bounded OAuth fixture response"),
                 nonzero(4 * 1024),
             )
         })
@@ -439,9 +460,10 @@ async fn oauth_lifecycle_and_read_only_route_allowlist_fail_closed() {
             .unwrap_or_else(|| panic!("missing acknowledgement header boundary"));
         assert!(headers.contains("Content-Type: text/html; charset=utf-8\r\n"));
         assert!(headers.contains("Cache-Control: no-store\r\n"));
-        assert!(headers.contains(
-            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'"
-        ));
+        assert!(
+            headers
+                .contains("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'")
+        );
         assert!(headers.contains("Referrer-Policy: no-referrer\r\n"));
         let content_length = headers
             .split("\r\n")
@@ -1059,7 +1081,7 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
     let token_admission = AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1));
     let oauth_configuration = SchwabOAuthAuthorityConfiguration::try_new(
         Arc::clone(&secret_authority),
-        Arc::new(ShortLivedOAuthWire),
+        Arc::new(ShortLivedOAuthWire::default()),
         application_credential.clone(),
         SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
             .unwrap_or_else(|error| panic!("OAuth secret policy: {error}")),
@@ -1546,34 +1568,64 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         EvidenceDigest::new(DigestAlgorithm::Sha256, [46; 32]),
     )
     .unwrap_or_else(|error| panic!("quote identity: {error}"));
-    let quote_reference = (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
-        use market_squawk_domain::{EffectiveInterval, MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput, RevisionBoundPayloadEvidence};
-        let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
-        let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-            instrument_id: quote_instrument,
-            source_id: SourceId::try_from("schwab-trader-api-instruments")?,
-            provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
-            evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256, [46;32])),
-            source_timestamp: None,
-            observed_at: quote_received_at,
-            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("schwab-instruments-test-v1")?),
-            validity: interval,
-            supersedes: None,
-        });
-        let definition = MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
-            instrument_id: quote_instrument,
-            reference_evidence: RevisionBoundPayloadEvidence::new(MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?), market_squawk_domain::ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256,[47;32]))),
-            effective_interval: interval,
-            asset_class: market_squawk_domain::AssetClass::Equity,
-            display_name: None,
-            quote_currency: market_squawk_domain::Currency::try_from("USD")?,
-            quote_currency_evidence: market_squawk_domain::ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256,[48;32])),
-            venue_mappings: vec![], provider_identities: vec![identity.clone()], identifiers: vec![],
-        })?;
-        let json = serde_json::to_vec(&definition)?;
-        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, <sha2::Sha256 as sha2::Digest>::digest(json).into());
-        Ok(market_squawk_domain::MarketDataReference::try_new(&definition,digest,&identity,quote_received_at)?)
-    })().unwrap_or_else(|error| panic!("quote reference: {error}"));
+    let quote_reference =
+        (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
+            use market_squawk_domain::{
+                EffectiveInterval, MarketDataInstrumentDefinition,
+                MarketDataInstrumentDefinitionInput, ProviderIdentityEvidence,
+                ProviderIdentityRecord, ProviderIdentityRecordInput, RevisionBoundPayloadEvidence,
+            };
+            let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+            let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: quote_instrument,
+                source_id: SourceId::try_from("schwab-trader-api-instruments")?,
+                provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+                evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    [46; 32],
+                )),
+                source_timestamp: None,
+                observed_at: quote_received_at,
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                    "schwab-instruments-test-v1",
+                )?),
+                validity: interval,
+                supersedes: None,
+            });
+            let definition =
+                MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                    instrument_id: quote_instrument,
+                    reference_evidence: RevisionBoundPayloadEvidence::new(
+                        MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?),
+                        market_squawk_domain::ExactPayloadEvidence::from_content_digest(
+                            EvidenceDigest::new(DigestAlgorithm::Sha256, [47; 32]),
+                        ),
+                    ),
+                    effective_interval: interval,
+                    asset_class: market_squawk_domain::AssetClass::Equity,
+                    display_name: None,
+                    quote_currency: market_squawk_domain::Currency::try_from("USD")?,
+                    quote_currency_evidence:
+                        market_squawk_domain::ExactPayloadEvidence::from_content_digest(
+                            EvidenceDigest::new(DigestAlgorithm::Sha256, [48; 32]),
+                        ),
+                    venue_mappings: vec![],
+                    provider_identities: vec![identity.clone()],
+                    identifiers: vec![],
+                })?;
+            let json = serde_json::to_vec(&definition)?;
+            let digest = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                <sha2::Sha256 as sha2::Digest>::digest(json).into(),
+            );
+            Ok(market_squawk_domain::MarketDataReference::try_new(
+                &definition,
+                digest,
+                &identity,
+                quote_received_at,
+            )?)
+        })()
+        .unwrap_or_else(|error| panic!("quote reference: {error}"));
     let mismatched_quote_session = SourceIdentifier::try_from("schwab-rest-session-mismatch")
         .unwrap_or_else(|error| panic!("mismatched quote session: {error}"));
     assert!(matches!(
@@ -1924,7 +1976,7 @@ async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semanti
         temporary.path().join("oauth-authority"),
         SchwabOAuthAuthorityConfiguration::try_new(
             secret_authority,
-            Arc::new(ShortLivedOAuthWire),
+            Arc::new(ShortLivedOAuthWire::default()),
             replacement_credential,
             SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
                 .unwrap_or_else(|error| panic!("restart OAuth secret policy: {error}")),
@@ -2028,7 +2080,11 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
     drop(expired.authority);
     let restarted = ProtectedSchwabOAuthAuthority::try_open(
         expired_root,
-        test_oauth_configuration(expired_secrets, expired_application),
+        test_oauth_configuration(
+            expired_secrets,
+            expired_application,
+            Arc::new(ShortLivedOAuthWire::default()),
+        ),
     )
     .await
     .unwrap_or_else(|error| panic!("restart expired OAuth authority: {error}"));
@@ -2057,6 +2113,193 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
             .unwrap_or_else(|error| panic!("missing token OAuth status: {error}")),
         SchwabOAuthAuthorityStatus::ReauthorizationRequired
     ));
+
+    let grant_issued_at = now.checked_sub(30).expect("refresh issue time");
+    let refreshed =
+        authorized_oauth_fixture(temporary.path().join("refreshed"), grant_issued_at).await;
+    let initial = match refreshed
+        .authority
+        .status()
+        .await
+        .expect("initial grant status")
+    {
+        SchwabOAuthAuthorityStatus::Active(receipt) => receipt,
+        status => panic!("initial grant must be active: {status:?}"),
+    };
+    assert_eq!(
+        initial.authorization_generation(),
+        initial.generation().get()
+    );
+    let observed_at = Timestamp::from_unix_nanos(
+        i64::try_from(now)
+            .expect("doctor observation seconds")
+            .checked_mul(1_000_000_000)
+            .expect("doctor observation nanoseconds"),
+    );
+    let original_doctor = test_market_data_doctor_for_authority(
+        SchwabMarketDataFamily::Quotes,
+        observed_at,
+        initial,
+        SourceIdentifier::try_from("018f76a0-3d3b-7d62-a60b-0242ac120002").expect("doctor test session"),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [82; 32]),
+    );
+    assert!(initial.matches_market_data_authorization(&original_doctor));
+    drop(refreshed.authority);
+    let authority = ProtectedSchwabOAuthAuthority::try_open(
+        &refreshed.state_root,
+        test_oauth_configuration(
+            refreshed.secrets.clone(),
+            refreshed.application_ref.clone(),
+            Arc::new(ShortLivedOAuthWire {
+                expires_in: 1,
+                scope: Some(" Market-Data market-data Market-Data "),
+            }),
+        ),
+    )
+    .await
+    .expect("reopen grant for explicit refresh scope");
+    let token = authority.acquire().await.expect("refresh access token");
+    let narrowed = match authority.status().await.expect("refreshed grant status") {
+        SchwabOAuthAuthorityStatus::Active(receipt) => receipt,
+        status => panic!("refreshed grant must be active: {status:?}"),
+    };
+    assert!(narrowed.generation() > initial.generation());
+    assert_eq!(token.generation(), narrowed.generation());
+    assert_eq!(
+        narrowed.authorization_generation(),
+        initial.authorization_generation()
+    );
+    assert_eq!(
+        narrowed.credential_authority(),
+        initial.credential_authority()
+    );
+    assert_eq!(
+        narrowed.refresh_authorized_at_unix_seconds(),
+        grant_issued_at
+    );
+    assert_ne!(
+        narrowed.authorization_scope_sha256(),
+        initial.authorization_scope_sha256()
+    );
+    assert!(!narrowed.matches_market_data_authorization(&original_doctor));
+    let mut normalized_scope_hash = sha2::Sha256::new();
+    normalized_scope_hash.update(b"market-squawk.schwab.oauth-authorization-scope/v1\0");
+    normalized_scope_hash.update([1]);
+    normalized_scope_hash.update(b"Market-Data market-data");
+    assert_eq!(
+        narrowed.authorization_scope_sha256(),
+        EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            normalized_scope_hash.finalize().into()
+        ),
+    );
+    drop(authority);
+
+    let authority = ProtectedSchwabOAuthAuthority::try_open(
+        &refreshed.state_root,
+        test_oauth_configuration(
+            refreshed.secrets.clone(),
+            refreshed.application_ref.clone(),
+            Arc::new(ShortLivedOAuthWire {
+                expires_in: 1_800,
+                scope: None,
+            }),
+        ),
+    )
+    .await
+    .expect("reopen refreshed grant");
+    assert_eq!(
+        authority.status().await.expect("reopened grant status"),
+        SchwabOAuthAuthorityStatus::Active(narrowed)
+    );
+    authority
+        .acquire()
+        .await
+        .expect("refresh with omitted scope");
+    let restored = match authority
+        .status()
+        .await
+        .expect("omitted scope grant status")
+    {
+        SchwabOAuthAuthorityStatus::Active(receipt) => receipt,
+        status => panic!("omitted scope grant must be active: {status:?}"),
+    };
+    assert!(restored.generation() > narrowed.generation());
+    assert_eq!(
+        restored.authorization_generation(),
+        initial.authorization_generation()
+    );
+    assert_eq!(
+        restored.authorization_scope_sha256(),
+        initial.authorization_scope_sha256()
+    );
+    assert!(restored.matches_market_data_authorization(&original_doctor));
+    let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
+        &original_doctor,
+        SchwabMarketDataFamily::Quotes,
+        observed_at,
+        restored,
+    )
+    .expect("original capability doctor survives access refresh");
+    assert_eq!(qualification.token_generation(), restored.generation());
+    drop(authority);
+
+    let authority = ProtectedSchwabOAuthAuthority::try_open(
+        &refreshed.state_root,
+        test_oauth_configuration(
+            refreshed.secrets,
+            refreshed.application_ref,
+            Arc::new(ShortLivedOAuthWire {
+                expires_in: 1_800,
+                scope: Some("Market-Data Quotes market-data"),
+            }),
+        ),
+    )
+    .await
+    .expect("reopen original grant scope");
+    assert_eq!(
+        authority
+            .status()
+            .await
+            .expect("reopened original scope status"),
+        SchwabOAuthAuthorityStatus::Active(restored)
+    );
+    authority
+        .revoke(SchwabOAuthInteraction::Background)
+        .await
+        .expect("revoke grant");
+    let callback = match OAuthCallback::parse(
+        "https://127.0.0.1:8182/?code=new-code&state=new-grant",
+        "new-grant",
+        admission(),
+    )
+    .expect("new code callback")
+    {
+        CallbackOutcome::Authorized(callback) => callback,
+        outcome => panic!("new code callback must authorize: {outcome:?}"),
+    };
+    let new_grant = authority
+        .complete_authorization(
+            &callback,
+            grant_issued_at,
+            SchwabOAuthInteraction::Background,
+        )
+        .await
+        .expect("new code authorization at the same timestamp");
+    assert!(new_grant.authorization_generation() > restored.generation().get());
+    assert_eq!(
+        new_grant.authorization_generation(),
+        new_grant.generation().get()
+    );
+    assert_eq!(
+        new_grant.refresh_authorized_at_unix_seconds(),
+        initial.refresh_authorized_at_unix_seconds()
+    );
+    assert_eq!(
+        new_grant.authorization_scope_sha256(),
+        initial.authorization_scope_sha256()
+    );
+    assert!(!new_grant.matches_market_data_authorization(&original_doctor));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3649,7 +3892,11 @@ async fn authorized_oauth_fixture(root: PathBuf, issued_at: u64) -> AuthorizedOA
     let state_root = root.join("state");
     let authority = ProtectedSchwabOAuthAuthority::try_open(
         &state_root,
-        test_oauth_configuration(secrets.clone(), application_ref.clone()),
+        test_oauth_configuration(
+            secrets.clone(),
+            application_ref.clone(),
+            Arc::new(ShortLivedOAuthWire::default()),
+        ),
     )
     .await
     .unwrap_or_else(|error| panic!("lifecycle OAuth authority: {error}"));
@@ -3695,11 +3942,12 @@ async fn authorized_oauth_fixture(root: PathBuf, issued_at: u64) -> AuthorizedOA
 fn test_oauth_configuration(
     secrets: Arc<EncryptedFileSecretStore>,
     application_ref: SecretRef,
+    wire: Arc<dyn SchwabOAuthWire>,
 ) -> SchwabOAuthAuthorityConfiguration {
     let secret_authority: Arc<dyn SecretStore> = secrets;
     SchwabOAuthAuthorityConfiguration::try_new(
         secret_authority,
-        Arc::new(ShortLivedOAuthWire),
+        wire,
         application_ref,
         SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
             .unwrap_or_else(|error| panic!("lifecycle OAuth secret policy: {error}")),
@@ -3813,54 +4061,71 @@ fn test_streamer_quote_record_request(
         ],
     )
     .unwrap_or_else(|error| panic!("mixed-service dictionary: {error}"));
-    let reference = (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
-        use market_squawk_domain::{
-            AssetClass, Currency, EffectiveInterval, ExactPayloadEvidence,
-            MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
-            MarketDataReference, ProviderIdentityEvidence, ProviderIdentityRecord,
-            ProviderIdentityRecordInput, RevisionBoundPayloadEvidence,
-        };
-        let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
-        let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-            instrument_id,
-            source_id: SourceId::try_from("schwab-trader-api-instruments")?,
-            provider_instrument_id: ProviderInstrumentId::try_from(symbol)?,
-            evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
-                DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(2); 32],
-            )),
-            source_timestamp: None,
-            observed_at: received_at,
-            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("schwab-instruments-test-v1")?),
-            validity: interval,
-            supersedes: None,
-        });
-        let definition = MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
-            instrument_id,
-            reference_evidence: RevisionBoundPayloadEvidence::new(
-                MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?),
-                ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-                    DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(3); 32],
+    let reference =
+        (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
+            use market_squawk_domain::{
+                AssetClass, Currency, EffectiveInterval, ExactPayloadEvidence,
+                MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+                MarketDataReference, ProviderIdentityEvidence, ProviderIdentityRecord,
+                ProviderIdentityRecordInput, RevisionBoundPayloadEvidence,
+            };
+            let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+            let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id,
+                source_id: SourceId::try_from("schwab-trader-api-instruments")?,
+                provider_instrument_id: ProviderInstrumentId::try_from(symbol)?,
+                evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    [evidence_byte.wrapping_add(2); 32],
                 )),
-            ),
-            effective_interval: interval,
-            asset_class: match service {
-                MarketDataService::LevelOneEquities => AssetClass::Equity,
-                MarketDataService::LevelOneOptions => AssetClass::Option,
-                _ => panic!("focused quote fixture requires an admitted Level-One service"),
-            },
-            display_name: None,
-            quote_currency: Currency::try_from("USD")?,
-            quote_currency_evidence: ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-                DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(4); 32],
-            )),
-            venue_mappings: vec![],
-            provider_identities: vec![identity.clone()],
-            identifiers: vec![],
-        })?;
-        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256,
-            <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&definition)?).into());
-        Ok(MarketDataReference::try_new(&definition, digest, &identity, received_at)?)
-    })().unwrap_or_else(|error| panic!("mixed-service quote reference: {error}"));
+                source_timestamp: None,
+                observed_at: received_at,
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                    "schwab-instruments-test-v1",
+                )?),
+                validity: interval,
+                supersedes: None,
+            });
+            let definition =
+                MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                    instrument_id,
+                    reference_evidence: RevisionBoundPayloadEvidence::new(
+                        MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?),
+                        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                            DigestAlgorithm::Sha256,
+                            [evidence_byte.wrapping_add(3); 32],
+                        )),
+                    ),
+                    effective_interval: interval,
+                    asset_class: match service {
+                        MarketDataService::LevelOneEquities => AssetClass::Equity,
+                        MarketDataService::LevelOneOptions => AssetClass::Option,
+                        _ => panic!("focused quote fixture requires an admitted Level-One service"),
+                    },
+                    display_name: None,
+                    quote_currency: Currency::try_from("USD")?,
+                    quote_currency_evidence: ExactPayloadEvidence::from_content_digest(
+                        EvidenceDigest::new(
+                            DigestAlgorithm::Sha256,
+                            [evidence_byte.wrapping_add(4); 32],
+                        ),
+                    ),
+                    venue_mappings: vec![],
+                    provider_identities: vec![identity.clone()],
+                    identifiers: vec![],
+                })?;
+            let digest = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&definition)?).into(),
+            );
+            Ok(MarketDataReference::try_new(
+                &definition,
+                digest,
+                &identity,
+                received_at,
+            )?)
+        })()
+        .unwrap_or_else(|error| panic!("mixed-service quote reference: {error}"));
     let market_evidence = SchwabStreamerQuoteMarketDataEvidence::try_new(venue_id, qualification)
         .unwrap_or_else(|error| panic!("mixed-service market evidence: {error}"));
     SchwabStreamerQuoteRecordRequest::new(
@@ -3881,6 +4146,29 @@ fn test_market_data_qualification_for_authority(
     session_identifier: SourceIdentifier,
     market_data_principal_sha256: EvidenceDigest,
 ) -> SchwabMarketDataQualification {
+    let receipt = test_market_data_doctor_for_authority(
+        family,
+        response_observed_at,
+        oauth_authority,
+        session_identifier,
+        market_data_principal_sha256,
+    );
+    SchwabMarketDataQualification::try_from_doctor_receipt(
+        &receipt,
+        family,
+        response_observed_at,
+        oauth_authority,
+    )
+    .unwrap_or_else(|error| panic!("test market-data qualification: {error}"))
+}
+
+fn test_market_data_doctor_for_authority(
+    family: SchwabMarketDataFamily,
+    response_observed_at: Timestamp,
+    oauth_authority: SchwabOAuthAuthorityReceipt,
+    session_identifier: SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
+) -> SchwabMarketDataDoctorReceiptV1 {
     let token_generation = oauth_authority.generation();
     let issued_at = Timestamp::from_unix_nanos(
         response_observed_at
@@ -3900,7 +4188,7 @@ fn test_market_data_qualification_for_authority(
             .checked_add(604_800_000_000_000)
             .unwrap_or_else(|| panic!("test qualification refresh expiry overflow")),
     );
-    let exclusive_expires_at = access_expires_at;
+    let exclusive_expires_at = refresh_expires_at;
     let digest = |byte| EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
     let families = schwab_market_data_families()
         .into_iter()
@@ -3920,7 +4208,7 @@ fn test_market_data_qualification_for_authority(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let receipt = SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
+    SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
         surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)
             .unwrap_or_else(|error| panic!("test qualification surface: {error}")),
         session_identifier,
@@ -3942,6 +4230,8 @@ fn test_market_data_qualification_for_authority(
                 SchwabMarketDataDoctorObservation::provider_observed_origin()
                     .unwrap_or_else(|error| panic!("test provider observation origin: {error}")),
             access_token_generation: token_generation.get(),
+            authorization_generation: oauth_authority.authorization_generation(),
+            authorization_scope_sha256: oauth_authority.authorization_scope_sha256(),
             access_issued_at: issued_at,
             access_expires_at,
             refresh_authorized_at: issued_at,
@@ -3966,14 +4256,7 @@ fn test_market_data_qualification_for_authority(
         exclusive_expires_at,
         predecessor_digest: None,
     })
-    .unwrap_or_else(|error| panic!("test market-data doctor receipt: {error}"));
-    SchwabMarketDataQualification::try_from_doctor_receipt(
-        &receipt,
-        family,
-        response_observed_at,
-        oauth_authority,
-    )
-    .unwrap_or_else(|error| panic!("test market-data qualification: {error}"))
+    .unwrap_or_else(|error| panic!("test market-data doctor receipt: {error}"))
 }
 
 fn schwab_market_data_families() -> [SchwabMarketDataFamily; 19] {

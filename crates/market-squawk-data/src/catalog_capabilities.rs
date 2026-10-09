@@ -676,17 +676,7 @@ impl OnboardingCatalogCapability {
         let context = lifecycle
             .runtime_verification_context()
             .ok_or(CatalogError::InvalidRecord)?;
-        let exclusive_expires_at = observation
-            .completed_at()
-            .unix_nanos()
-            .checked_add(SchwabMarketDataDoctorReceiptV1::VALIDITY_NANOS)
-            .map(|expires_at| {
-                expires_at
-                    .min(observation.access_expires_at.unix_nanos())
-                    .min(observation.refresh_expires_at.unix_nanos())
-            })
-            .map(Timestamp::from_unix_nanos)
-            .ok_or(CatalogError::InvalidRecord)?;
+        let exclusive_expires_at = observation.refresh_expires_at;
         let receipt =
             SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
                 surface_id: lifecycle.surface_id().clone(),

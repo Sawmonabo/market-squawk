@@ -14,16 +14,19 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt as _;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalSecretStoreError,
     SecretCancellation, SecretDeletionDisposition, SecretGeneration, SecretInteractionPolicy,
     SecretKey, SecretMutationKind, SecretMutationPlan, SecretOperationControl,
     SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
 };
+use market_squawk_sources::SchwabMarketDataDoctorReceiptV1;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -467,6 +470,9 @@ struct TokenMetadata {
     reference: SecretRef,
     plan: SecretMutationPlan,
     generation: u64,
+    authorization_generation: u64,
+    authorization_scope: Option<Box<str>>,
+    access_scope: Option<Box<str>>,
     access_issued_at_unix_seconds: u64,
     access_expires_at_unix_seconds: u64,
     refresh_authorized_at_unix_seconds: u64,
@@ -476,6 +482,10 @@ struct TokenMetadata {
 impl TokenMetadata {
     fn validate(&self) -> Result<(), SchwabOAuthAuthorityError> {
         if self.generation == 0
+            || self.authorization_generation == 0
+            || self.authorization_generation > self.generation
+            || normalize_scope(self.authorization_scope.as_deref()) != self.authorization_scope
+            || normalize_scope(self.access_scope.as_deref()) != self.access_scope
             || self.reference.generation().get() != self.generation
             || self.plan.target() != &self.reference
             || self.access_expires_at_unix_seconds <= self.access_issued_at_unix_seconds
@@ -615,6 +625,8 @@ pub enum SchwabOAuthAuthorityStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchwabOAuthAuthorityReceipt {
     generation: AccessTokenGeneration,
+    authorization_generation: u64,
+    authorization_scope_sha256: EvidenceDigest,
     credential_authority: SchwabCredentialAuthorityBinding,
     access_issued_at_unix_seconds: u64,
     access_expires_at_unix_seconds: u64,
@@ -625,6 +637,30 @@ pub struct SchwabOAuthAuthorityReceipt {
 impl SchwabOAuthAuthorityReceipt {
     pub const fn generation(self) -> AccessTokenGeneration {
         self.generation
+    }
+    /// Code-authorization identity, retained across routine access-token refreshes.
+    pub const fn authorization_generation(self) -> u64 {
+        self.authorization_generation
+    }
+    /// Effective access scope identity; it does not establish market-data entitlements.
+    pub const fn authorization_scope_sha256(self) -> EvidenceDigest {
+        self.authorization_scope_sha256
+    }
+    /// Matches retained capability evidence to the current grant and application credential.
+    pub fn matches_market_data_authorization(
+        self,
+        doctor: &SchwabMarketDataDoctorReceiptV1,
+    ) -> bool {
+        self.authorization_generation == doctor.authorization_generation()
+            && self.authorization_scope_sha256 == doctor.authorization_scope_sha256()
+            && self
+                .credential_authority
+                .application_credential_generation()
+                == doctor.application_credential_generation()
+            && self
+                .credential_authority
+                .application_credential_reference_sha256()
+                == doctor.application_credential_reference_sha256()
     }
     pub const fn credential_authority(self) -> SchwabCredentialAuthorityBinding {
         self.credential_authority
@@ -643,12 +679,14 @@ impl SchwabOAuthAuthorityReceipt {
     }
 
     #[cfg(test)]
-    pub(crate) const fn for_test(
+    pub(crate) fn for_test(
         generation: AccessTokenGeneration,
         credential_authority: SchwabCredentialAuthorityBinding,
     ) -> Self {
         Self {
             generation,
+            authorization_generation: generation.get(),
+            authorization_scope_sha256: authorization_scope_digest(None),
             credential_authority,
             access_issued_at_unix_seconds: 1,
             access_expires_at_unix_seconds: u64::MAX - 1,
@@ -668,6 +706,8 @@ impl SchwabOAuthAuthorityReceipt {
             generation: AccessTokenGeneration::new(
                 NonZeroU64::new(value.generation).ok_or(SchwabOAuthAuthorityError::InvalidState)?,
             ),
+            authorization_generation: value.authorization_generation,
+            authorization_scope_sha256: authorization_scope_digest(value.access_scope.as_deref()),
             credential_authority:
                 SchwabCredentialAuthorityBinding::try_from_application_credential(
                     application_credential,
@@ -1129,7 +1169,14 @@ impl ProtectedSchwabOAuthAuthority {
         let plan = self
             .plan_create(secret_generation, interaction.policy())
             .await?;
-        let candidate = token_metadata(plan.clone(), lifecycle);
+        let scope = normalize_scope(tokens.scope());
+        let candidate = token_metadata(
+            plan.clone(),
+            lifecycle,
+            generation.get(),
+            scope.clone(),
+            scope,
+        );
         self.store_state(DurablePhase::Rotating {
             application: application.clone(),
             kind: RotationKind::Authorization,
@@ -1344,7 +1391,17 @@ impl ProtectedSchwabOAuthAuthority {
                 SecretInteractionPolicy::Forbid,
             )
             .await?;
-        let candidate = token_metadata(plan.clone(), lifecycle);
+        // RFC 6749 section 6: an omitted refresh scope retains the original grant's scope,
+        // rather than a scope explicitly narrowed by an earlier access-token response.
+        let access_scope =
+            normalize_scope(tokens.scope()).or_else(|| prior.authorization_scope.clone());
+        let candidate = token_metadata(
+            plan.clone(),
+            lifecycle,
+            prior.authorization_generation,
+            prior.authorization_scope.clone(),
+            access_scope,
+        );
         self.store_state(DurablePhase::Rotating {
             application: application.clone(),
             kind: RotationKind::Refresh,
@@ -1983,11 +2040,42 @@ fn terminal_credential_rejection(error: &SchwabOAuthAuthorityError) -> bool {
     matches!(error, SchwabOAuthAuthorityError::ReauthorizationRequired)
 }
 
-fn token_metadata(plan: SecretMutationPlan, lifecycle: crate::TokenLifecycle) -> TokenMetadata {
+fn normalize_scope(scope: Option<&str>) -> Option<Box<str>> {
+    scope.map(|scope| {
+        let mut tokens = scope.split_ascii_whitespace().collect::<Vec<_>>();
+        tokens.sort_unstable();
+        tokens.dedup();
+        tokens.join(" ").into_boxed_str()
+    })
+}
+
+fn authorization_scope_digest(scope: Option<&str>) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk.schwab.oauth-authorization-scope/v1\0");
+    match scope {
+        None => hash.update([0]),
+        Some(scope) => {
+            hash.update([1]);
+            hash.update(scope.as_bytes());
+        }
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn token_metadata(
+    plan: SecretMutationPlan,
+    lifecycle: crate::TokenLifecycle,
+    authorization_generation: u64,
+    authorization_scope: Option<Box<str>>,
+    access_scope: Option<Box<str>>,
+) -> TokenMetadata {
     let refresh = lifecycle.refresh_generation();
     let reference = plan.target().clone();
     TokenMetadata {
         generation: reference.generation().get(),
+        authorization_generation,
+        authorization_scope,
+        access_scope,
         reference,
         plan,
         access_issued_at_unix_seconds: lifecycle.access_issued_at_unix_seconds(),
@@ -2015,11 +2103,17 @@ fn validate_phase(state: &DurablePhase) -> Result<(), SchwabOAuthAuthorityError>
                 return Err(SchwabOAuthAuthorityError::InvalidState);
             }
             match (kind, prior, plan.kind()) {
-                (RotationKind::Authorization, None, SecretMutationKind::Create) => {}
+                (RotationKind::Authorization, None, SecretMutationKind::Create)
+                    if candidate.authorization_generation == candidate.generation
+                        && candidate.authorization_scope == candidate.access_scope => {}
                 (RotationKind::Refresh, Some(prior), SecretMutationKind::Replace { current }) => {
                     prior.validate()?;
                     if current != &prior.reference
                         || prior.generation.checked_add(1) != Some(candidate.generation)
+                        || prior.authorization_generation != candidate.authorization_generation
+                        || prior.authorization_scope != candidate.authorization_scope
+                        || prior.refresh_authorized_at_unix_seconds
+                            != candidate.refresh_authorized_at_unix_seconds
                     {
                         return Err(SchwabOAuthAuthorityError::InvalidState);
                     }
@@ -2038,6 +2132,10 @@ fn validate_phase(state: &DurablePhase) -> Result<(), SchwabOAuthAuthorityError>
                 retired.validate()?;
                 if retired.reference == current.reference
                     || retired.generation >= current.generation
+                    || retired.authorization_generation != current.authorization_generation
+                    || retired.authorization_scope != current.authorization_scope
+                    || retired.refresh_authorized_at_unix_seconds
+                        != current.refresh_authorized_at_unix_seconds
                     || !matches!(
                         current.plan.kind(),
                         SecretMutationKind::Replace { current } if current == &retired.reference

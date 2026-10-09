@@ -1642,16 +1642,7 @@ fn validate_doctor_oauth_binding(
     observed_at: Timestamp,
 ) -> Result<(), SchwabMarketPublicationError> {
     validate_current_doctor(generation, doctor, observed_at)?;
-    let observation = doctor.observation();
-    if doctor.access_token_generation() != oauth.generation().get()
-        || observation.access_issued_at
-            != timestamp_from_unix_seconds(oauth.access_issued_at_unix_seconds())?
-        || observation.access_expires_at
-            != timestamp_from_unix_seconds(oauth.access_expires_at_unix_seconds())?
-        || observation.refresh_authorized_at
-            != timestamp_from_unix_seconds(oauth.refresh_authorized_at_unix_seconds())?
-        || observation.refresh_expires_at
-            != timestamp_from_unix_seconds(oauth.refresh_expires_at_unix_seconds())?
+    if !oauth.matches_market_data_authorization(doctor)
         || observed_at >= exact_exclusive_expiry(generation, doctor, oauth)?
     {
         return Err(SchwabMarketPublicationError::AuthorityInvalid);

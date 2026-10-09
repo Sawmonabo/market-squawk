@@ -813,6 +813,8 @@ impl SchwabMarketDataDoctorExecutor {
                 SchwabMarketDataDoctorObservation::provider_observed_origin()
                     .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeEvidence)?,
             access_token_generation: oauth.generation().get(),
+            authorization_generation: oauth.authorization_generation(),
+            authorization_scope_sha256: oauth.authorization_scope_sha256(),
             access_issued_at,
             access_expires_at,
             refresh_authorized_at,
@@ -825,12 +827,6 @@ impl SchwabMarketDataDoctorExecutor {
             families: families.into_boxed_slice(),
             completed_at,
         };
-        let maximum_expiry = completed_at
-            .unix_nanos()
-            .checked_add(SchwabMarketDataDoctorReceiptV1::VALIDITY_NANOS)
-            .ok_or(SchwabMarketDataDoctorError::Clock)?
-            .min(access_expires_at.unix_nanos())
-            .min(refresh_expires_at.unix_nanos());
         let receipt =
             SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
                 surface_id: binding.surface_id,
@@ -846,7 +842,7 @@ impl SchwabMarketDataDoctorExecutor {
                 rate_policy_digest: binding.rate_policy_digest,
                 data_quality: DataQuality::DirectUnverified,
                 observation,
-                exclusive_expires_at: Timestamp::from_unix_nanos(maximum_expiry),
+                exclusive_expires_at: refresh_expires_at,
                 predecessor_digest: binding.predecessor_digest,
             })
             .map_err(|error| {

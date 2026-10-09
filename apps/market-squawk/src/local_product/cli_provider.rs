@@ -1292,7 +1292,8 @@ impl ProviderActivationTaskAuthority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SchwabMarketDoctorTaskKey {
     session_id: Uuid,
-    access_token_generation: u64,
+    authorization_generation: u64,
+    authorization_scope_sha256: EvidenceDigest,
 }
 
 struct RetainedSchwabMarketDoctorTask {
@@ -1301,10 +1302,10 @@ struct RetainedSchwabMarketDoctorTask {
     task: JoinHandle<()>,
 }
 
-/// One application-owned supervisor for immediate and delayed Schwab doctor work.
+/// One application-owned supervisor for Schwab doctor work.
 ///
-/// The retained key coalesces repeated Connections requests for the same exact OAuth generation.
-/// A replacement generation cancels and joins its predecessor before it can start, while unlink
+/// The retained key coalesces repeated Connections requests for the same OAuth grant and scope.
+/// A changed grant or scope cancels and joins its predecessor before it can start, while unlink
 /// and shutdown retain the same drain authority.
 struct SchwabMarketDoctorTaskAuthority {
     accepting: AtomicBool,
@@ -2486,7 +2487,11 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .await
             .map_err(|error| {
                 let failure = map_schwab_oauth_error(error);
-                tracing::warn!(stage = "oauth_lifecycle", ?failure, "Schwab connection recovery rejected");
+                tracing::warn!(
+                    stage = "oauth_lifecycle",
+                    ?failure,
+                    "Schwab connection recovery rejected"
+                );
                 failure
             })?;
         if !matches!(
@@ -2506,30 +2511,39 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             ) => return Ok(view),
             Err(error) => {
                 let failure = map_schwab_oauth_error(error);
-                tracing::warn!(stage = "market_authority", ?failure, "Schwab connection recovery rejected");
+                tracing::warn!(
+                    stage = "market_authority",
+                    ?failure,
+                    "Schwab connection recovery rejected"
+                );
                 return Err(failure);
             }
         };
-        let current = authority
-            .current_receipt()
-            .await
-            .map_err(|_error| {
-                tracing::warn!(stage = "current_token_receipt", "Schwab connection recovery rejected");
-                ProviderPortalActivationError::Unavailable
-            })?;
+        let current = authority.current_receipt().await.map_err(|_error| {
+            tracing::warn!(
+                stage = "current_token_receipt",
+                "Schwab connection recovery rejected"
+            );
+            ProviderPortalActivationError::Unavailable
+        })?;
         let view = SchwabOAuthLifecycleView::active(session_id, action, current)
             .map_err(map_schwab_oauth_error)?;
         let preparation = self
             .onboarding
             .prepare_schwab_market_doctor_run(
                 session_id,
-                current.generation().get(),
+                current.authorization_generation(),
+                current.authorization_scope_sha256(),
                 CancellationToken::new(),
             )
             .await
             .map_err(|error| {
                 let failure = map_schwab_doctor_onboarding_error(error);
-                tracing::warn!(stage = "market_verification_preparation", ?failure, "Schwab connection recovery rejected");
+                tracing::warn!(
+                    stage = "market_verification_preparation",
+                    ?failure,
+                    "Schwab connection recovery rejected"
+                );
                 failure
             })?;
         if matches!(&preparation, SchwabMarketDoctorRunPreparation::Current) {
@@ -2540,22 +2554,15 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .as_ref()
             .cloned()
             .ok_or(ProviderPortalActivationError::Unavailable)?;
-        let onboarding = Arc::clone(&self.onboarding);
         let key = SchwabMarketDoctorTaskKey {
             session_id,
-            access_token_generation: current.generation().get(),
+            authorization_generation: current.authorization_generation(),
+            authorization_scope_sha256: current.authorization_scope_sha256(),
         };
         self.schwab_doctor_tasks
             .schedule(key, move |completion| async move {
-                run_schwab_market_doctor_task(
-                    onboarding,
-                    doctor,
-                    authority,
-                    key,
-                    preparation,
-                    completion,
-                )
-                .await;
+                run_schwab_market_doctor_task(doctor, authority, key, preparation, completion)
+                    .await;
             })
             .await
             .map_err(map_portal_activation_error)?;
@@ -2612,26 +2619,12 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
 }
 
 async fn run_schwab_market_doctor_task(
-    onboarding: Arc<ProviderOnboardingService>,
     doctor: Arc<SchwabMarketDoctorRuntimeCoordinator>,
     authority: SchwabOAuthMarketAuthority,
     key: SchwabMarketDoctorTaskKey,
-    mut preparation: SchwabMarketDoctorRunPreparation,
+    preparation: SchwabMarketDoctorRunPreparation,
     cancellation: CancellationToken,
 ) {
-    let deferred_wait = match &preparation {
-        SchwabMarketDoctorRunPreparation::Deferred { wait } => Some(*wait),
-        SchwabMarketDoctorRunPreparation::Current | SchwabMarketDoctorRunPreparation::Ready(_) => {
-            None
-        }
-    };
-    if let Some(wait) = deferred_wait {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return,
-            () = tokio::time::sleep(wait) => {}
-        }
-    }
     let current = tokio::select! {
         biased;
         () = cancellation.cancelled() => return,
@@ -2643,37 +2636,17 @@ async fn run_schwab_market_doctor_task(
             }
         }
     };
-    if current.generation().get() != key.access_token_generation {
+    if current.authorization_generation() != key.authorization_generation
+        || current.authorization_scope_sha256() != key.authorization_scope_sha256
+    {
         tracing::warn!(
-            "Schwab market-data verification was superseded by a newer authorization generation"
+            "Schwab market-data verification was superseded by a changed authorization grant or scope"
         );
         return;
-    }
-    if deferred_wait.is_some() {
-        preparation = match onboarding
-            .prepare_schwab_market_doctor_run(
-                key.session_id,
-                key.access_token_generation,
-                cancellation.child_token(),
-            )
-            .await
-        {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                tracing::warn!(%error, "Schwab market-data verification renewal was not admitted");
-                return;
-            }
-        };
     }
     let lease = match preparation {
         SchwabMarketDoctorRunPreparation::Ready(lease) => lease,
         SchwabMarketDoctorRunPreparation::Current => return,
-        SchwabMarketDoctorRunPreparation::Deferred { .. } => {
-            tracing::warn!(
-                "Schwab market-data verification renewal did not reach its retained boundary"
-            );
-            return;
-        }
     };
     match doctor
         .run(
@@ -5376,7 +5349,8 @@ mod tests {
         let session_id = Uuid::new_v4();
         let first_key = SchwabMarketDoctorTaskKey {
             session_id,
-            access_token_generation: 1,
+            authorization_generation: 1,
+            authorization_scope_sha256: EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
         };
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_starts = Arc::clone(&starts);
@@ -5400,7 +5374,8 @@ mod tests {
 
         let replacement_key = SchwabMarketDoctorTaskKey {
             session_id,
-            access_token_generation: 2,
+            authorization_generation: 1,
+            authorization_scope_sha256: EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
         };
         let replacement_starts = Arc::clone(&starts);
         let (replacement_started_tx, replacement_started_rx) = oneshot::channel();

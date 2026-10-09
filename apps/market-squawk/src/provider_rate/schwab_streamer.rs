@@ -353,13 +353,8 @@ impl SchwabStreamerAccountRateAuthority {
             i64::try_from(nanos).map_err(|_| SchwabTransportError::Overflow)?,
         );
         let doctor = self.activation.doctor_receipt();
-        let credential = self.oauth_receipt.credential_authority();
         if !doctor.is_current_at(now)
-            || doctor.access_token_generation() != self.oauth_receipt.generation().get()
-            || doctor.application_credential_generation()
-                != credential.application_credential_generation()
-            || doctor.application_credential_reference_sha256()
-                != credential.application_credential_reference_sha256()
+            || !self.oauth_receipt.matches_market_data_authorization(doctor)
             || self.admitted_services.is_empty()
             || self.admitted_services.len() > 12
             || self.admitted_services.iter().any(|service| {

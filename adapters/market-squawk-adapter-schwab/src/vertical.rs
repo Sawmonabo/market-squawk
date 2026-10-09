@@ -130,11 +130,7 @@ impl SchwabMarketDataQualification {
             require_qualification_digest(digest)?;
         }
         if !doctor.is_current_at(response_observed_at)
-            || doctor.access_token_generation() != token_generation.get()
-            || doctor.application_credential_generation()
-                != credential_authority.application_credential_generation()
-            || doctor.application_credential_reference_sha256()
-                != credential_authority.application_credential_reference_sha256()
+            || !oauth_authority.matches_market_data_authorization(doctor)
             || family_observed_at > doctor.verified_at()
             || family_observed_at > response_observed_at
             || !matches!(
@@ -221,11 +217,7 @@ impl SchwabMarketDataQualification {
         };
         let credential_authority = oauth_authority.credential_authority();
         if !doctor.is_current_at(response_observed_at)
-            || doctor.access_token_generation() != oauth_authority.generation().get()
-            || doctor.application_credential_generation()
-                != credential_authority.application_credential_generation()
-            || doctor.application_credential_reference_sha256()
-                != credential_authority.application_credential_reference_sha256()
+            || !oauth_authority.matches_market_data_authorization(doctor)
             || handoff.token_generation() != oauth_authority.generation()
             || handoff.credential_authority() != credential_authority
             || handoff.session_identifier() != doctor.session_identifier()

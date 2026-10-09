@@ -2947,7 +2947,7 @@ mod tests {
     };
     use crate::provider_activation::{
         MarketInstrumentReferenceBinding, MarketSubscriptionPriority,
-        SchwabMarketDataAccountActivation, SchwabMarketDataActivationError,
+        SchwabMarketDataAccountActivation,
     };
     use crate::provider_onboarding::SchwabOAuthMarketAuthority;
 
@@ -2963,9 +2963,13 @@ mod tests {
         let (oauth, _, reference) =
             scripted_market_authority(directory.path().join("renewal"), session, 1_800, 60, 0)
                 .await?;
-        let (_, epoch) =
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
-        let prior_doctor = doctor_receipt(session, digest(31), digest(32), epoch.receipt())?;
+        let prior_doctor = doctor_receipt(session, digest(31), digest(32), oauth.issued_receipt())?;
+        let (_, epoch) = SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
+            &oauth,
+            &prior_doctor,
+        )
+        .await?;
+        epoch.validate_current(epoch.receipt())?;
         let mut renewed_input: SchwabMarketDataDoctorReceiptInput =
             serde_json::from_value(serde_json::to_value(&prior_doctor)?["input"].clone())?;
         let renewed_at = prior_doctor
@@ -2978,9 +2982,6 @@ mod tests {
                 family.observed_at = Some(renewed_at);
             }
         }
-        renewed_input.exclusive_expires_at = prior_doctor
-            .exclusive_expires_at()
-            .checked_add_nanos(1_000_000_000)?;
         // A publication slot may skip intermediate doctor renewals. The current lease, not
         // adjacency to the last used slot, proves the durable verification chain.
         renewed_input.predecessor_digest = Some(digest(35));
@@ -3142,8 +3143,13 @@ mod tests {
             0,
         )
         .await?;
-        let (token, epoch) =
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
+        let original_doctor =
+            doctor_receipt(session_id, digest(31), digest(32), oauth.issued_receipt())?;
+        let (token, epoch) = SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
+            &oauth,
+            &original_doctor,
+        )
+        .await?;
         let oauth_receipt = epoch.receipt();
         let (durable, evidence, binding) = quote_publication_fixture(
             directory.path(),
@@ -3151,6 +3157,7 @@ mod tests {
             secret_reference,
             oauth.clone(),
             oauth_receipt,
+            original_doctor,
         )?;
         let generation = market_squawk_domain::ConnectionGeneration::new(1)?;
         let bridge_calls = Arc::new(AtomicUsize::new(0));
@@ -3184,7 +3191,7 @@ mod tests {
             })
         ));
 
-        let (rotating, rotating_wire, _secret_reference) = scripted_market_authority(
+        let (rotating, rotating_wire, rotating_reference) = scripted_market_authority(
             directory.path().join("rotating-oauth"),
             session_id,
             30,
@@ -3192,18 +3199,72 @@ mod tests {
             0,
         )
         .await?;
-        let mut quote_dispatches = 0_u8;
-        let attempt =
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&rotating, 1).await;
-        if attempt.is_ok() {
-            quote_dispatches += 1;
-        }
-        assert!(matches!(
-            attempt,
-            Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
-        ));
+        let original_rotation_receipt = rotating.issued_receipt();
+        let original_rotation_doctor = doctor_receipt(
+            session_id,
+            digest(31),
+            digest(32),
+            original_rotation_receipt,
+        )?;
+        let (rotated_token, rotated_epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
+                &rotating,
+                &original_rotation_doctor,
+            )
+            .await?;
         assert_eq!(rotating_wire.exchange_count(), 2);
-        assert_eq!(quote_dispatches, 0);
+        assert_eq!(rotated_epoch.receipt().generation().get(), 2);
+        assert_eq!(
+            rotated_token.generation(),
+            rotated_epoch.receipt().generation()
+        );
+        assert_eq!(original_rotation_doctor.access_token_generation(), 1);
+        assert!(
+            rotated_epoch
+                .receipt()
+                .matches_market_data_authorization(&original_rotation_doctor)
+        );
+        assert!(
+            rotating
+                .receipt_currentness()
+                .validate_current_receipt(original_rotation_receipt)
+                .is_err()
+        );
+        rotated_epoch.validate_current(rotated_epoch.receipt())?;
+        let (rotating_durable, rotating_evidence, rotating_binding) = quote_publication_fixture(
+            &directory.path().join("rotating-publication"),
+            session_id,
+            rotating_reference,
+            rotating.clone(),
+            rotated_epoch.receipt(),
+            original_rotation_doctor,
+        )?;
+        let rotating_bridge_calls = Arc::new(AtomicUsize::new(0));
+        let rotating_sink = SchwabRestQuoteSealFirstSink::new(
+            Arc::clone(&rotating_durable),
+            Arc::new(CountingUnavailableCurrentBridge(Arc::clone(
+                &rotating_bridge_calls,
+            ))),
+        );
+        let rotated_response = executed_quote(
+            rotated_token,
+            rotated_epoch.receipt().access_issued_at_unix_seconds(),
+        )
+        .await?;
+        let _ = SchwabRestQuoteProducer::publish_test_completed_response(
+            &rotating_sink,
+            rotated_response,
+            rotating_evidence,
+            vec![rotating_binding],
+            rotated_epoch,
+            generation,
+        )
+        .await;
+        assert_eq!(
+            rotating_bridge_calls.load(Ordering::SeqCst),
+            1,
+            "same-grant refresh was rejected before current quote qualification"
+        );
 
         // Restored access expiry must reach the sole writer's refresh path before doctor
         // admission. Pure receipt inspection remains read-only and rejects the expired epoch.
@@ -3256,10 +3317,15 @@ mod tests {
                 .validate_current_receipt(prior)
                 .is_err()
         );
-        assert!(matches!(
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&expired, 1).await,
-            Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
-        ));
+        let expired_token_doctor = doctor_receipt(session_id, digest(31), digest(32), prior)?;
+        let (_, current_epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(
+                &expired,
+                &expired_token_doctor,
+            )
+            .await?;
+        assert_eq!(current_epoch.receipt(), refreshed);
+        current_epoch.validate_current(refreshed)?;
         assert_eq!(expired_wire.exchange_count(), 2);
         Ok(())
     }
@@ -3527,6 +3593,7 @@ mod tests {
         secret_reference: SecretRef,
         oauth: SchwabOAuthMarketAuthority,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
+        doctor: SchwabMarketDataDoctorReceiptV1,
     ) -> Result<
         (
             Arc<super::super::schwab_market::SchwabRestQuoteGenerationAuthority>,
@@ -3569,7 +3636,6 @@ mod tests {
             metadata.clone(),
             rights.clone(),
         )?;
-        let doctor = doctor_receipt(session_id, capability_digest, parent_rights, oauth_receipt)?;
         let paths = LocalPaths::prepare(root.join("research"))?;
         let research = Arc::new(ResearchService::open_or_initialize(
             &paths,
@@ -3826,6 +3892,8 @@ mod tests {
                     provider_observation_origin:
                         SchwabMarketDataDoctorObservation::provider_observed_origin()?,
                     access_token_generation: oauth.generation().get(),
+                    authorization_generation: oauth.authorization_generation(),
+                    authorization_scope_sha256: oauth.authorization_scope_sha256(),
                     access_issued_at: completed_at,
                     access_expires_at,
                     refresh_authorized_at: timestamp_seconds(
@@ -3848,14 +3916,7 @@ mod tests {
                     families,
                     completed_at,
                 },
-                exclusive_expires_at: Timestamp::from_unix_nanos(
-                    completed_at
-                        .unix_nanos()
-                        .checked_add(SchwabMarketDataDoctorReceiptV1::VALIDITY_NANOS)
-                        .ok_or("doctor expiry overflow")?
-                        .min(access_expires_at.unix_nanos())
-                        .min(refresh_expires_at.unix_nanos()),
-                ),
+                exclusive_expires_at: refresh_expires_at,
                 predecessor_digest: None,
             },
         )?)

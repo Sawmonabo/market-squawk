@@ -238,17 +238,13 @@ pub(crate) struct RetainedRuntimeVerificationEvidence {
     onboarding_state: OnboardingState,
 }
 
-/// Serialized disposition for one exact OAuth generation's market-doctor admission.
+/// Serialized disposition for one exact OAuth grant and scope's market-doctor admission.
 #[derive(Debug)]
 pub(crate) enum SchwabMarketDoctorRunPreparation {
-    /// The retained doctor receipt already covers the exact current OAuth generation.
+    /// The retained doctor receipt already covers the current OAuth grant and scope.
     Current,
     /// The doctor may run immediately under this exact bootstrap authority.
     Ready(SchwabOAuthBootstrapLease),
-    /// OAuth rotated before the predecessor receipt's exclusive currentness horizon elapsed.
-    /// One application-owned task waits this exact remaining duration, then revalidates every
-    /// authority before it can issue a provider request.
-    Deferred { wait: Duration },
 }
 
 impl RetainedRuntimeVerificationEvidence {
@@ -730,17 +726,18 @@ impl ProviderOnboardingService {
 
     /// Serializes initial Schwab doctor admission and exact active-generation renewal.
     ///
-    /// A current receipt for the same OAuth token generation needs no provider call. Once an
-    /// active receipt expires, this method records `RenewalRequired` before issuing its successor
-    /// lease. An expired initial candidate can renew the same evidence chain while remaining
-    /// pending; only the separate activation operation may start its market runtime.
+    /// A current receipt for the same OAuth grant and scope needs no provider call. An expired
+    /// receipt or changed grant/scope records `RenewalRequired` before issuing an active successor
+    /// lease. An initial candidate renews the same evidence chain while remaining pending; only
+    /// the separate activation operation may start its market runtime.
     pub(crate) async fn prepare_schwab_market_doctor_run(
         &self,
         session_id: Uuid,
-        access_token_generation: u64,
+        authorization_generation: u64,
+        authorization_scope_sha256: EvidenceDigest,
         cancellation: CancellationToken,
     ) -> Result<SchwabMarketDoctorRunPreparation, ProviderOnboardingError> {
-        if access_token_generation == 0 {
+        if authorization_generation == 0 {
             return Err(ProviderOnboardingError::InvalidRequest);
         }
         let _activation = tokio::select! {
@@ -782,7 +779,8 @@ impl ProviderOnboardingService {
                 .map(SchwabMarketDoctorRunPreparation::Ready);
         };
         let now = system_timestamp()?;
-        if retained.access_token_generation() == access_token_generation
+        if retained.authorization_generation() == authorization_generation
+            && retained.authorization_scope_sha256() == authorization_scope_sha256
             && retained.is_current_at(now)
         {
             return Ok(SchwabMarketDoctorRunPreparation::Current);
@@ -795,17 +793,6 @@ impl ProviderOnboardingService {
                 || lifecycle.candidate_generation().is_some())
         {
             return Err(ProviderOnboardingError::ActivationUnavailable);
-        }
-        if now < retained.exclusive_expires_at() {
-            let wait_nanos = retained
-                .exclusive_expires_at()
-                .unix_nanos()
-                .checked_sub(now.unix_nanos())
-                .and_then(|nanos| u64::try_from(nanos).ok())
-                .ok_or(ProviderOnboardingError::Clock)?;
-            return Ok(SchwabMarketDoctorRunPreparation::Deferred {
-                wait: Duration::from_nanos(wait_nanos),
-            });
         }
         let renewal = match lifecycle.state() {
             OnboardingState::ActiveScoped => {
@@ -3367,9 +3354,12 @@ impl ProviderOnboardingOwnedReadAuthority {
         expected: &ProviderActivationLease,
         previous: Option<&Arc<ResumedProviderOnboarding>>,
     ) -> Result<Arc<ResumedProviderOnboarding>, ProviderOnboardingError> {
-        let resumed = self.service.catalog
+        let resumed = self
+            .service
+            .catalog
             .resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
-        self.service.require_prepared_or_active_from_resumed(&resumed, expected)?;
+        self.service
+            .require_prepared_or_active_from_resumed(&resumed, expected)?;
         Ok(resumed)
     }
 
@@ -3379,8 +3369,10 @@ impl ProviderOnboardingOwnedReadAuthority {
         expected: &ProviderActivationLease,
         previous: Option<&Arc<ResumedProviderOnboarding>>,
     ) -> Result<(), ProviderOnboardingError> {
-        let resumed = catalog.resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
-        self.service.require_prepared_or_active_from_resumed(&resumed, expected)
+        let resumed =
+            catalog.resume_provider_onboarding_with_snapshot(expected.session_id(), previous)?;
+        self.service
+            .require_prepared_or_active_from_resumed(&resumed, expected)
     }
 
     pub(crate) fn require_active_with_snapshot(

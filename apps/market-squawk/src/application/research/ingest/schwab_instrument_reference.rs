@@ -9,8 +9,8 @@ use market_squawk_adapter_schwab::{
 use market_squawk_data::{
     CatalogAuthority, IngestError, IngestPrecommitAuthority, ListingReferenceRecord,
     MarketDataInstrumentCatalogError, MarketDataInstrumentRecord,
-    MarketDataInstrumentSourceReferenceInput, SourceOperation,
-    OfficialIssuerInstrumentReference as IssuerInstrumentReference,
+    MarketDataInstrumentSourceReferenceInput,
+    OfficialIssuerInstrumentReference as IssuerInstrumentReference, SourceOperation,
 };
 use market_squawk_domain::{
     AssignmentVerification, DigestAlgorithm, EffectiveInterval, ExternalIdentifier,
@@ -128,24 +128,10 @@ impl SchwabInstrumentReferencePublicationAuthority {
             .validate_current_receipt(self.receipt)
             .map_err(|_| ServiceError::Unauthorized)?;
         let observation = self.doctor.observation();
-        let seconds = |value: u64| {
-            value
-                .checked_mul(1_000_000_000)
-                .and_then(|nanos| i64::try_from(nanos).ok())
-                .map(Timestamp::from_unix_nanos)
-        };
         if !self.doctor.admits_source_start()
             || !self.doctor.is_current_at(now)
             || !self.metadata().is_effective_at(now)
-            || self.doctor.access_token_generation() != self.receipt.generation().get()
-            || Some(observation.access_issued_at)
-                != seconds(self.receipt.access_issued_at_unix_seconds())
-            || Some(observation.access_expires_at)
-                != seconds(self.receipt.access_expires_at_unix_seconds())
-            || Some(observation.refresh_authorized_at)
-                != seconds(self.receipt.refresh_authorized_at_unix_seconds())
-            || Some(observation.refresh_expires_at)
-                != seconds(self.receipt.refresh_expires_at_unix_seconds())
+            || !self.receipt.matches_market_data_authorization(&self.doctor)
             || !observation.families.iter().any(|family| {
                 family.family == SchwabMarketDataFamily::Instruments
                     && matches!(
@@ -240,7 +226,9 @@ impl SchwabInstrumentReferencePublicationAuthority {
         self.operation
             .rights()
             .validate_subject(Some(self.coordinates.dataset()))?;
-        issuer.validate_listing(&official_listing, observed_at).map_err(|_| ServiceError::Unavailable)?;
+        issuer
+            .validate_listing(&official_listing, observed_at)
+            .map_err(|_| ServiceError::Unavailable)?;
 
         let native = reference.candidate();
         if reference.requested_cusip() != issuer.cusip()

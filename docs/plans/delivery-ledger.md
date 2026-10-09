@@ -4,9 +4,108 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`8738356f`. Main/release unchanged; no extra branch created.
+`f1a30127`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
+
+Grant-refresh correction implemented and critically verified; native verification remains open.
+All helper ownership is released; lead owns integration and the next native deployment. Protected
+state retains authorization identity and original/effective scope; one adapter receipt comparison
+is reused across activation, REST/Streamer qualification and publication. Removed the permanent
+doctor-generation latch, arbitrary15-minute/access-expiry cap, and Deferred wait/re-probe path.
+Actual request/socket token epochs, grant expiry and revocation checks remain exact.
+
+Critical evidence (existing checks, single-job/nonincremental compilation):
+- OAuth refresh/reopen/scope/new-grant: PASS1/1,11.15s. First run found an invalid fixture UUID;
+  corrected before the passing run. `oct8-grant-adapter-critical.log`.
+- Source pending renewal/activation: PASS1/1,0.03s. `oct8-grant-source-critical.log`.
+- Final application quote publication/revocation: PASS1/1,8.94s; compile3m58s after the test was
+  extended to use a refreshed token with its original doctor through actual quote qualification.
+  This retains a deliberately unavailable current bridge; it does not prove a displayed live quote.
+  `oct8-grant-application-final.log`.
+- Service expired access/current grant, expired grant, immediate scope/grant replacement and
+  catalog reopen/publication: PASS1/1,3.69s. `oct8-grant-recovery-critical.log`.
+- Retained doctor task coalescing/unlink drain: PASS1/1,0.00s; publication epoch revocation/drain:
+  PASS1/1,1.39s. `oct8-grant-{scheduler,epoch}-critical.log`.
+- Existing actual adapter REST/Streamer qualification: PASS1/1,0.03s.
+  `oct8-grant-streamer-critical.log`. Source closure refresh and diff whitespace check pass.
+
+No native rebuild yet; watcher remains stopped and the running service remains f1a30127. The
+real Start constructor and automatic all-nine Desktop updates are not proved by these fixture
+checks. Greenfield persisted shape changed: old OAuth/doctor records are not silently converted.
+Next dependency: fresh authorized V1 state and normal native setup/Start/restart proof, retaining
+the current workspace as recovery until replacement is verified. No retained credentials/data
+have been deleted or rewritten. Shared multi-consumer demand and last-price/delta publication
+remain required after activation; full V1 acceptance and installed-workflow completion remain open.
+Disk check: root target22GB, agent scratch714MB, supervised dev-runtime1.4GB. One primary worktree,
+no new target/output root, branch or duplicate native process. Whole-app RAM not measured.
+
+Native result for pushed f1a30127: supervised Cargo87772 completed5m34s; service88033 and
+Desktop88040 run generation-txplVI. Watcher60793 stopped. Native saved OAuth Continue completed;
+service logs now report Schwab market-data verification completed. Actual existing Desktop Start
+control was exercised next and rejected: activate_schwab_market_data_account reports AuthorityMismatch.
+No source was started and no automatic price update is proven. Evidence: oct8-probe-selection-native-
+continue.json, oct8-probe-selection-native-start.json and oct8-corrected-native.log after196259.
+PR43 checkpoint: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6071896157 .
+
+Confirmed rotation boundary from read-only catalog: prior doctor used token generation9,
+completed322.2235s before access expiry; configured early refresh begins300s before expiry.
+The next token generation10 was issued123s before the prior expiry. Native Start holds the prior
+lease before acquiring the current token. A subsequent Continue recorded generation10 verification.
+This is app coupling, not rejected provider consent. Owner questions the machinery; correction must
+remove full capability re-probing on routine refresh while retaining configured grant/credential,
+scope/revocation and exact per-request token provenance. Do not merely automate repeated full probes.
+Primary sources checked: RFC6749 section6 and RFC9700 section4.14; refreshed tokens continue the
+same authorization grant, with scope restrictions and protected refresh handling. Astra's same
+bounded diagnosis now covers exact removal sites and existing grant/scope evidence. No code change
+to that coupling has landed. Native control after the failed Start no longer offers Start; resolve
+fresh lifecycle recovery state before invoking another action (do not replay stale controls).
+
+Refresh correction implementation ownership (acceptance1/5/7, confirmed Start failure):
+- Sol6.1High oauth_grant_identity owns ONLY adapters/market-squawk-adapter-schwab/src/authority.rs and src/tests.rs.
+  Retain stable authorization-generation and original/effective normalized scope in existing protected
+  state; expose authorization_generation() and authorization_scope_sha256() on existing Copy receipt.
+  Authorization generation is the monotonic access generation at authorization-code success and
+  stays unchanged on refresh. Missing refresh scope uses original grant scope; no inferred family rights.
+  No new store, backward compatibility, migration, builds, Git or runtime actions.
+- Lead owns source doctor observation/shared schema and all shared callers, receipt lifetime,
+  onboarding selection and integration/tests. Stable observation fields: authorization_generation:u64
+  and authorization_scope_sha256:EvidenceDigest. Keep original observed access generation/clocks as
+  historical provenance, not current-token identity. Doctor expires at existing provider grant deadline;
+  current token expiry remains checked per request. Current scope mismatch requires capability recovery.
+- Astra diagnosis remains report-only until handoff. Next disjoint app implementation is assigned only
+  after the helper contract is written. Existing epoch/capture checks remain; remove only cross-doctor
+  access-generation/timestamp equality and permanent renewal latch.
+- Sol6.1High grant_consumers owns ONLY app provider_activation/{schwab.rs,schwab_quote_metadata.rs},
+  application/market_runtime/schwab.rs, provider_rate/schwab_streamer.rs,
+  application/research/ingest/{schwab_market.rs,schwab_instrument_reference.rs}.
+  Uses written shared provider_onboarding::schwab_doctor_matches_oauth_authorization(doctor, oauth)
+  bool; removes access-generation doctor latch, preserving exact request epochs/socket credentials.
+  Lead owns producer schema, onboarding service/lifecycle/CLI callers, provider_runtime.rs critical test.
+  Dependencies: receipt APIs and helper now written; no helper builds or runtime/Git actions.
+- Sol6.1High grant_onboarding owns ONLY app provider_onboarding/service.rs,
+  provider_onboarding/service/schwab_recovery_tests.rs and local_product/cli_provider.rs.
+  Replace prepare-run access generation with authorization generation and scope digest; remove
+  Deferred/token-expiry wait and key doctor jobs by grant/scope. Extend existing recovery check
+  for unchanged grant and changed grant/scope. Lead updates source lifecycle admission accordingly.
+- Adapter owner oauth_grant_identity extends ownership to adapter src/vertical.rs for the
+  two remaining REST/Streamer qualification comparisons. Canonical comparison moves onto existing
+  SchwabOAuthAuthorityReceipt::matches_market_data_authorization(&doctor); no app wrapper.
+  It compares credential, stable grant and effective scope; grant clocks are already immutable
+  within protected refresh state and each request retains its actual token expiry/epoch checks.
+Critical check: existing real OAuth refresh/persistence plus app activation/publication sequence must
+accept same-grant refreshed token without doctor rerun and reject changed grant/credential/scope or
+revocation. Native retry follows; schema update is greenfield, no silent conversion of saved states.
+
+Next bounded diagnosis: AstraHigh schwab_start_epoch owns ONLY
+.agents/tmp/v1-first-stock/oct8-schwab-start-epoch.md; read-only trace of actual Start's lease -> OAuth
+market_authority -> account activation mismatch after successful doctor. Identify exact mismatch
+predicates, possible token refresh ordering and existing narrow regression seam. No source edits,
+Git/builds/runtime/provider actions or additional agents. Lead owns retry, shared source and integration.
+Outcome is startup over the verified saved authorization, retaining current credential/receipt checks;
+no weakening of authorization or unrelated capabilities. All-nine shared demand and snapshot fields
+remain mandatory next dependencies after activation.
+
 
 Current integration ownership: lead owns the complete handed-off change, tests, build and Git.
 Sol6.1High schwab_probe_selection completed and released its sole file:

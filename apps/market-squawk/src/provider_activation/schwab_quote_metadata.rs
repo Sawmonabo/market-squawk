@@ -77,15 +77,14 @@ impl ProviderAdapterActivation {
             .runtime_oauth_receipt()
             .await
             .map_err(|_| ServiceError::Unauthorized)?;
-        activation.require_runtime_current().await.map_err(|_| ServiceError::Unauthorized)?;
-        let observed_at = super::schwab::system_timestamp().map_err(|_| ServiceError::Unavailable)?;
+        activation
+            .require_runtime_current()
+            .await
+            .map_err(|_| ServiceError::Unauthorized)?;
+        let observed_at =
+            super::schwab::system_timestamp().map_err(|_| ServiceError::Unavailable)?;
         let doctor = activation.doctor_receipt();
-        let credential = oauth.credential_authority();
-        if !doctor.is_current_at(observed_at)
-            || doctor.access_token_generation() != oauth.generation().get()
-            || doctor.application_credential_generation() != credential.application_credential_generation()
-            || doctor.application_credential_reference_sha256() != credential.application_credential_reference_sha256()
-        {
+        if !doctor.is_current_at(observed_at) || !oauth.matches_market_data_authorization(doctor) {
             return Err(ServiceError::Unauthorized);
         }
         if bootstrap.market_data_principal_sha256()
@@ -100,7 +99,9 @@ impl ProviderAdapterActivation {
         // Same-service sealed ACK/data later supplies the actual publication qualification.
         let selections = schwab_streamer_selections(instruments.iter())?;
         let mut channels = Vec::new();
-        channels.try_reserve_exact(selections.len()).map_err(|_| ServiceError::ResourceExhausted)?;
+        channels
+            .try_reserve_exact(selections.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
         for (service, keys) in selections {
             channels.push(streamer_channel(service, &keys)?);
         }
@@ -212,7 +213,8 @@ fn metadata(
         hash.update((value.len() as u64).to_be_bytes());
         hash.update(value.as_bytes());
     }
-    let channel_bytes = serde_json::to_vec(&contract.channels).map_err(|_| ServiceError::Internal)?;
+    let channel_bytes =
+        serde_json::to_vec(&contract.channels).map_err(|_| ServiceError::Internal)?;
     hash.update((channel_bytes.len() as u64).to_be_bytes());
     hash.update(channel_bytes);
     hash.update(activation.doctor_receipt().receipt_sha256().bytes());
@@ -341,25 +343,45 @@ fn rule(value: &str) -> Result<IntegrityRule, ServiceError> {
 
 fn quote_channel(product: &str, channel: &str) -> Result<LiveCoverageDeclaration, ServiceError> {
     LiveCoverageDeclaration::try_new(
-        ProviderProduct::new(identifier(product)?), ProviderChannel::new(identifier(channel)?),
-        vec![LiveCoverageRule::try_new(LiveEventClass::Quote, None,
-            SnapshotApplicability::NotApplicable { metadata_rule: rule("schwab-quote-no-snapshot")? })
-            .map_err(|_| ServiceError::InvalidResult)?],
-    ).map_err(|_| ServiceError::InvalidResult)
+        ProviderProduct::new(identifier(product)?),
+        ProviderChannel::new(identifier(channel)?),
+        vec![
+            LiveCoverageRule::try_new(
+                LiveEventClass::Quote,
+                None,
+                SnapshotApplicability::NotApplicable {
+                    metadata_rule: rule("schwab-quote-no-snapshot")?,
+                },
+            )
+            .map_err(|_| ServiceError::InvalidResult)?,
+        ],
+    )
+    .map_err(|_| ServiceError::InvalidResult)
 }
 
 /// One code-owned desired selection supplies both registered coverage and native requests.
 /// Cohort keys are source scope and never receive a fabricated canonical instrument.
 pub(crate) fn schwab_streamer_selections<'a>(
     bindings: impl IntoIterator<Item = &'a SchwabQuoteReferenceBinding>,
-) -> Result<std::collections::BTreeMap<market_squawk_adapter_schwab::MarketDataService,
-    Vec<market_squawk_adapter_schwab::ProviderIdentifier>>, ServiceError> {
+) -> Result<
+    std::collections::BTreeMap<
+        market_squawk_adapter_schwab::MarketDataService,
+        Vec<market_squawk_adapter_schwab::ProviderIdentifier>,
+    >,
+    ServiceError,
+> {
     use market_squawk_adapter_schwab::{MarketDataService as S, ProviderIdentifier};
     use market_squawk_domain::AssetClass;
-    let mut selected: std::collections::BTreeMap<S, Vec<ProviderIdentifier>> = std::collections::BTreeMap::new();
+    let mut selected: std::collections::BTreeMap<S, Vec<ProviderIdentifier>> =
+        std::collections::BTreeMap::new();
     for binding in bindings {
         let services: &[S] = match binding.definition().asset_class() {
-            AssetClass::Equity | AssetClass::Fund => &[S::LevelOneEquities, S::NyseBook, S::NasdaqBook, S::ChartEquity],
+            AssetClass::Equity | AssetClass::Fund => &[
+                S::LevelOneEquities,
+                S::NyseBook,
+                S::NasdaqBook,
+                S::ChartEquity,
+            ],
             AssetClass::Option => &[S::LevelOneOptions, S::OptionsBook],
             AssetClass::Future => &[S::LevelOneFutures, S::ChartFutures],
             AssetClass::ForeignExchange => &[S::LevelOneForex],
@@ -367,14 +389,28 @@ pub(crate) fn schwab_streamer_selections<'a>(
         };
         for service in services {
             let keys = selected.entry(*service).or_default();
-            if keys.len() >= 50 { return Err(ServiceError::InvalidRequest); }
-            let key = ProviderIdentifier::try_new(binding.provider_symbol().to_owned()).map_err(|_| ServiceError::InvalidResult)?;
-            if keys.contains(&key) { return Err(ServiceError::InvalidRequest); }
+            if keys.len() >= 50 {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let key = ProviderIdentifier::try_new(binding.provider_symbol().to_owned())
+                .map_err(|_| ServiceError::InvalidResult)?;
+            if keys.contains(&key) {
+                return Err(ServiceError::InvalidRequest);
+            }
             keys.push(key);
         }
     }
-    for (service, key) in [(S::ScreenerEquity, "EQUITY_ALL_VOLUME_0"), (S::ScreenerOption, "OPTION_ALL_VOLUME_0")] {
-        selected.insert(service, vec![ProviderIdentifier::try_new(key.to_owned()).map_err(|_| ServiceError::InvalidResult)?]);
+    for (service, key) in [
+        (S::ScreenerEquity, "EQUITY_ALL_VOLUME_0"),
+        (S::ScreenerOption, "OPTION_ALL_VOLUME_0"),
+    ] {
+        selected.insert(
+            service,
+            vec![
+                ProviderIdentifier::try_new(key.to_owned())
+                    .map_err(|_| ServiceError::InvalidResult)?,
+            ],
+        );
     }
     Ok(selected)
 }
@@ -399,14 +435,33 @@ fn streamer_channel(
         S::ScreenerEquity => ("screener-equity", LiveEventClass::Screener),
         S::ScreenerOption => ("screener-option", LiveEventClass::Screener),
     };
-    if class == LiveEventClass::Quote { return quote_channel("schwab-streamer", &format!("schwab-streamer-{suffix}")); }
-    let snapshot = SnapshotApplicability::NotApplicable { metadata_rule: rule("schwab-observation-no-snapshot")? };
+    if class == LiveEventClass::Quote {
+        return quote_channel("schwab-streamer", &format!("schwab-streamer-{suffix}"));
+    }
+    let snapshot = SnapshotApplicability::NotApplicable {
+        metadata_rule: rule("schwab-observation-no-snapshot")?,
+    };
     let rule = if class == LiveEventClass::Screener {
-        LiveCoverageRule::try_source_cohorts(keys.iter().map(|key| identifier(key.as_str())).collect::<Result<Vec<_>, _>>()?, snapshot)
+        LiveCoverageRule::try_source_cohorts(
+            keys.iter()
+                .map(|key| identifier(key.as_str()))
+                .collect::<Result<Vec<_>, _>>()?,
+            snapshot,
+        )
     } else if class == LiveEventClass::BookSnapshot {
-        LiveCoverageRule::try_new(class, Some(MarketDepth::PriceLevel), SnapshotApplicability::Required)
-    } else { LiveCoverageRule::try_new(class, None, snapshot) }.map_err(|_| ServiceError::InvalidResult)?;
-    LiveCoverageDeclaration::try_new(ProviderProduct::new(identifier("schwab-streamer")?),
-        ProviderChannel::new(identifier(&format!("schwab-streamer-{suffix}"))?), vec![rule])
-        .map_err(|_| ServiceError::InvalidResult)
+        LiveCoverageRule::try_new(
+            class,
+            Some(MarketDepth::PriceLevel),
+            SnapshotApplicability::Required,
+        )
+    } else {
+        LiveCoverageRule::try_new(class, None, snapshot)
+    }
+    .map_err(|_| ServiceError::InvalidResult)?;
+    LiveCoverageDeclaration::try_new(
+        ProviderProduct::new(identifier("schwab-streamer")?),
+        ProviderChannel::new(identifier(&format!("schwab-streamer-{suffix}"))?),
+        vec![rule],
+    )
+    .map_err(|_| ServiceError::InvalidResult)
 }

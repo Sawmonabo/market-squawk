@@ -60,7 +60,6 @@ const SCHWAB_MARKET_DATA_DOCTOR_CONTRACT_DOMAIN: &[u8] =
     b"market-squawk/schwab-market-data-doctor-contract/v1\0";
 const SCHWAB_MARKET_DATA_PROVIDER_OBSERVATION_ORIGIN: &str =
     "market-squawk.schwab-market-data-doctor.provider-observed.v1";
-const SCHWAB_MARKET_DATA_DOCTOR_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
 const SCHWAB_ACCESS_TOKEN_MAX_LIFETIME_NANOS: i64 = 30 * 60 * 1_000_000_000;
 const SCHWAB_REFRESH_TOKEN_LIFETIME_NANOS: i64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 const MAX_SCHWAB_USER_PREFERENCE_BYTES: u64 = 8 * 1024 * 1024;
@@ -1032,6 +1031,8 @@ impl SchwabMarketDataFamilyEvidence {
 pub struct SchwabMarketDataDoctorObservation {
     pub provider_observation_origin: SourceIdentifier,
     pub access_token_generation: u64,
+    pub authorization_generation: u64,
+    pub authorization_scope_sha256: EvidenceDigest,
     pub access_issued_at: Timestamp,
     pub access_expires_at: Timestamp,
     pub refresh_authorized_at: Timestamp,
@@ -1072,13 +1073,15 @@ impl SchwabMarketDataDoctorObservation {
 
     fn validate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
         if self.provider_observation_origin != Self::provider_observed_origin()?
-            || self.access_token_generation == 0
+            || self.authorization_generation == 0
+            || self.authorization_generation > self.access_token_generation
             || self.access_issued_at >= self.access_expires_at
             || self.refresh_authorized_at >= self.refresh_expires_at
             || self.access_issued_at < self.refresh_authorized_at
             || self.access_issued_at >= self.refresh_expires_at
             || self.completed_at < self.user_preference.received_at
             || self.completed_at < self.access_issued_at
+            || self.completed_at >= self.access_expires_at
         {
             return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
@@ -1098,6 +1101,7 @@ impl SchwabMarketDataDoctorObservation {
         {
             return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
+        require_sha256(self.authorization_scope_sha256)?;
         self.user_preference.validate()?;
         if matches!(
             self.quote_delay,
@@ -1168,9 +1172,6 @@ struct SchwabMarketDataDoctorReceiptWire {
 }
 
 impl SchwabMarketDataDoctorReceiptV1 {
-    /// Exact maximum currentness window; token deadlines can shorten it.
-    pub const VALIDITY_NANOS: i64 = SCHWAB_MARKET_DATA_DOCTOR_VALIDITY_NANOS;
-
     pub fn try_new(
         input: SchwabMarketDataDoctorReceiptInput,
     ) -> Result<Self, RuntimeVerificationEvidenceError> {
@@ -1213,6 +1214,12 @@ impl SchwabMarketDataDoctorReceiptV1 {
     }
     pub const fn application_credential_reference_sha256(&self) -> EvidenceDigest {
         self.input.application_credential_reference_sha256
+    }
+    pub const fn authorization_generation(&self) -> u64 {
+        self.input.observation.authorization_generation
+    }
+    pub const fn authorization_scope_sha256(&self) -> EvidenceDigest {
+        self.input.observation.authorization_scope_sha256
     }
     pub const fn access_token_generation(&self) -> u64 {
         self.input.observation.access_token_generation
@@ -1381,12 +1388,7 @@ fn validate_schwab_receipt_input(
     if let Some(digest) = input.predecessor_digest {
         require_sha256(digest)?;
     }
-    let verified_at = input.observation.completed_at.unix_nanos();
-    let maximum_receipt_expiry = verified_at
-        .checked_add(SCHWAB_MARKET_DATA_DOCTOR_VALIDITY_NANOS)
-        .ok_or(RuntimeVerificationEvidenceError::InvalidEvidence)?
-        .min(input.observation.access_expires_at.unix_nanos())
-        .min(input.observation.refresh_expires_at.unix_nanos());
+    let maximum_receipt_expiry = input.observation.refresh_expires_at.unix_nanos();
     if input.exclusive_expires_at.unix_nanos() != maximum_receipt_expiry
         || input.exclusive_expires_at <= input.observation.completed_at
     {

@@ -71,15 +71,24 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
         .prepare_schwab_oauth_bootstrap(session_id, CancellationToken::new())
         .await?;
     let credential = service.retained_credential_coordinate(session_id)?;
+    let initial_scope = EvidenceDigest::new(DigestAlgorithm::Sha256, [31; 32]);
     let SchwabMarketDoctorRunPreparation::Ready(initial_lease) = service
-        .prepare_schwab_market_doctor_run(session_id, 1, CancellationToken::new())
+        .prepare_schwab_market_doctor_run(session_id, 1, initial_scope, CancellationToken::new())
         .await?
     else {
         return Err("initial Schwab doctor was not ready".into());
     };
     let initial_binding = service.schwab_market_doctor_authority_binding(&initial_lease)?;
-    let initial_observation = doctor_observation(1, Duration::from_secs(2), &initial_binding)?;
-    let initial_expiry = initial_observation.access_expires_at;
+    let initial_observation = doctor_observation(
+        1,
+        1,
+        initial_scope,
+        Duration::from_secs(1),
+        wall_deadline(Duration::from_secs(2))?,
+        &initial_binding,
+    )?;
+    let initial_expiry = initial_observation.refresh_expires_at;
+    let initial_access_expiry = initial_observation.access_expires_at;
     service
         .record_schwab_market_data_doctor_observation(
             &initial_lease,
@@ -89,6 +98,7 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
         .await?;
     let prior = retained_receipt(&service, session_id, credential.0)?;
     assert_eq!(prior.exclusive_expires_at(), initial_expiry);
+    assert!(prior.exclusive_expires_at() > initial_access_expiry);
     assert_eq!(prior.predecessor_digest(), None);
     assert_eq!(initial_binding, receipt_binding(&prior, session_id, None)?);
     assert!(prior.admits_source_start());
@@ -106,17 +116,35 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
     assert_eq!(unselected.observed_at, None);
     assert!(matches!(
         service
-            .prepare_schwab_market_doctor_run(session_id, 1, CancellationToken::new())
+            .prepare_schwab_market_doctor_run(
+                session_id,
+                1,
+                initial_scope,
+                CancellationToken::new()
+            )
             .await?,
         SchwabMarketDoctorRunPreparation::Current
     ));
-    let SchwabMarketDoctorRunPreparation::Deferred { wait } = service
-        .prepare_schwab_market_doctor_run(session_id, 2, CancellationToken::new())
-        .await?
-    else {
-        return Err("different OAuth token renewed a current pending doctor".into());
-    };
-    assert!(!wait.is_zero() && wait <= Duration::from_secs(2));
+    // Access-token expiry does not expire capability evidence for the same authorization grant.
+    let remaining = initial_access_expiry
+        .unix_nanos()
+        .saturating_sub(system_timestamp()?.unix_nanos());
+    if remaining >= 0 {
+        tokio::time::sleep(Duration::from_nanos(u64::try_from(remaining)? + 1_000_000)).await;
+    }
+    let now = system_timestamp()?;
+    assert!(now >= initial_access_expiry && prior.is_current_at(now));
+    assert!(matches!(
+        service
+            .prepare_schwab_market_doctor_run(
+                session_id,
+                1,
+                initial_scope,
+                CancellationToken::new()
+            )
+            .await?,
+        SchwabMarketDoctorRunPreparation::Current
+    ));
 
     // Expire both the receipt and operation reservation; retained setup intent must survive.
     let expiry = setup_deadline.max(prior.exclusive_expires_at());
@@ -141,7 +169,7 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
     assert!(pending.lifecycle().active_generation().is_none());
 
     let SchwabMarketDoctorRunPreparation::Ready(renewal_lease) = service
-        .prepare_schwab_market_doctor_run(session_id, 2, CancellationToken::new())
+        .prepare_schwab_market_doctor_run(session_id, 2, initial_scope, CancellationToken::new())
         .await?
     else {
         return Err("expired pending Schwab doctor was not ready for renewal".into());
@@ -158,7 +186,10 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
             &renewal_lease,
             doctor_observation(
                 2,
+                2,
+                initial_scope,
                 Duration::from_secs(30 * 60),
+                wall_deadline(Duration::from_secs(30 * 60))?,
                 &service.schwab_market_doctor_authority_binding(&renewal_lease)?,
             )?,
             CancellationToken::new(),
@@ -168,7 +199,94 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
     assert_eq!(renewed.predecessor_digest(), Some(prior.receipt_sha256()));
     assert_ne!(renewed.receipt_sha256(), prior.receipt_sha256());
     assert_eq!(renewed.access_token_generation(), 2);
+    assert_eq!(renewed.authorization_generation(), 2);
     assert!(renewed.verified_at() >= prior.exclusive_expires_at());
+
+    // A changed effective scope renews immediately while the prior grant receipt is current.
+    let replacement_scope = EvidenceDigest::new(DigestAlgorithm::Sha256, [32; 32]);
+    let SchwabMarketDoctorRunPreparation::Ready(scope_lease) = service
+        .prepare_schwab_market_doctor_run(
+            session_id,
+            2,
+            replacement_scope,
+            CancellationToken::new(),
+        )
+        .await?
+    else {
+        return Err("changed scope did not renew the current pending doctor immediately".into());
+    };
+    let scope_binding = service.schwab_market_doctor_authority_binding(&scope_lease)?;
+    assert_eq!(
+        scope_binding,
+        receipt_binding(&renewed, session_id, Some(renewed.receipt_sha256()))?
+    );
+    service
+        .record_schwab_market_data_doctor_observation(
+            &scope_lease,
+            doctor_observation(
+                3,
+                2,
+                replacement_scope,
+                Duration::from_secs(30 * 60),
+                renewed.exclusive_expires_at(),
+                &scope_binding,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let scope_renewed = retained_receipt(&service, session_id, credential.0)?;
+    assert_eq!(
+        scope_renewed.predecessor_digest(),
+        Some(renewed.receipt_sha256())
+    );
+    assert_eq!(
+        scope_renewed.authorization_scope_sha256(),
+        replacement_scope
+    );
+    assert!(scope_renewed.verified_at() < renewed.exclusive_expires_at());
+
+    // A fresh consent grant also renews immediately without waiting for the old grant deadline.
+    let SchwabMarketDoctorRunPreparation::Ready(grant_lease) = service
+        .prepare_schwab_market_doctor_run(
+            session_id,
+            4,
+            replacement_scope,
+            CancellationToken::new(),
+        )
+        .await?
+    else {
+        return Err("changed grant did not renew the current pending doctor immediately".into());
+    };
+    let grant_binding = service.schwab_market_doctor_authority_binding(&grant_lease)?;
+    assert_eq!(
+        grant_binding,
+        receipt_binding(
+            &scope_renewed,
+            session_id,
+            Some(scope_renewed.receipt_sha256())
+        )?
+    );
+    service
+        .record_schwab_market_data_doctor_observation(
+            &grant_lease,
+            doctor_observation(
+                4,
+                4,
+                replacement_scope,
+                Duration::from_secs(30 * 60),
+                wall_deadline(Duration::from_secs(30 * 60))?,
+                &grant_binding,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let grant_renewed = retained_receipt(&service, session_id, credential.0)?;
+    assert_eq!(
+        grant_renewed.predecessor_digest(),
+        Some(scope_renewed.receipt_sha256())
+    );
+    assert_eq!(grant_renewed.authorization_generation(), 4);
+    assert!(grant_renewed.verified_at() < scope_renewed.exclusive_expires_at());
 
     drop(service);
     drop(publisher);
@@ -199,14 +317,14 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
         Some(CredentialGenerationState::VerifiedLeastPrivilege)
     );
     assert!(lifecycle.active_generation().is_none());
-    assert_eq!(resumed.next_sequence(), sequence_before_renewal + 1);
+    assert_eq!(resumed.next_sequence(), sequence_before_renewal + 3);
     assert_eq!(
         recovered.retained_credential_coordinate(session_id)?,
         credential
     );
     assert_eq!(
         retained_receipt(&recovered, session_id, credential.0)?,
-        renewed
+        grant_renewed
     );
     assert_eq!(
         recovered.resume(session_id)?.next_action(),
@@ -214,7 +332,12 @@ async fn expired_pending_schwab_doctor_renews_same_candidate_and_survives_restar
     );
     assert!(matches!(
         recovered
-            .prepare_schwab_market_doctor_run(session_id, 2, CancellationToken::new())
+            .prepare_schwab_market_doctor_run(
+                session_id,
+                4,
+                replacement_scope,
+                CancellationToken::new(),
+            )
             .await?,
         SchwabMarketDoctorRunPreparation::Current
     ));
@@ -274,7 +397,10 @@ fn receipt_binding(
 
 fn doctor_observation(
     token_generation: u64,
+    authorization_generation: u64,
+    authorization_scope_sha256: EvidenceDigest,
     access_lifetime: Duration,
+    refresh_expires_at: Timestamp,
     binding: &SchwabMarketDoctorAuthorityBinding,
 ) -> TestResult<SchwabMarketDataDoctorObservation> {
     use SchwabMarketDataFamily::*;
@@ -334,14 +460,16 @@ fn doctor_observation(
     Ok(SchwabMarketDataDoctorObservation {
         provider_observation_origin: SchwabMarketDataDoctorObservation::provider_observed_origin()?,
         access_token_generation: token_generation,
+        authorization_generation,
+        authorization_scope_sha256,
         access_issued_at: completed_at,
         access_expires_at: Timestamp::from_unix_nanos(
             completed_at.unix_nanos() + i64::try_from(access_lifetime.as_nanos())?,
         ),
-        refresh_authorized_at: completed_at,
-        refresh_expires_at: Timestamp::from_unix_nanos(
-            completed_at.unix_nanos() + 7 * 24 * 60 * 60 * 1_000_000_000,
+        refresh_authorized_at: Timestamp::from_unix_nanos(
+            refresh_expires_at.unix_nanos() - 7 * 24 * 60 * 60 * 1_000_000_000,
         ),
+        refresh_expires_at,
         user_preference: SchwabUserPreferenceDoctorEvidence {
             endpoint_contract_sha256: crate::provider_onboarding::schwab_market_doctor::user_preference_endpoint_contract_sha256(),
             request_sha256: digest(3),

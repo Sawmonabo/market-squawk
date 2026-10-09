@@ -897,6 +897,10 @@ fn schwab_pending_doctor_renewal_preserves_candidate_until_explicit_activation()
     let mut renewed_input = initial_input.clone();
     renewed_input.predecessor_digest = Some(initial_digest);
     renewed_input.observation.access_token_generation = 2;
+    renewed_input.observation.authorization_generation = 2;
+    renewed_input.observation.refresh_authorized_at =
+        Timestamp::from_unix_nanos(3_100 - 604_800_000_000_000);
+    renewed_input.observation.refresh_expires_at = Timestamp::from_unix_nanos(3_100);
     renewed_input.observation.access_issued_at = Timestamp::from_unix_nanos(2_000);
     renewed_input.observation.access_expires_at = Timestamp::from_unix_nanos(3_100);
     renewed_input.observation.completed_at = renewal_time;
@@ -911,8 +915,8 @@ fn schwab_pending_doctor_renewal_preserves_candidate_until_explicit_activation()
     early_input.predecessor_digest = Some(initial_digest);
     early_input.observation.completed_at = Timestamp::from_unix_nanos(1_200);
     early_input.observation.access_expires_at = Timestamp::from_unix_nanos(2_200);
-    early_input.exclusive_expires_at = Timestamp::from_unix_nanos(2_200);
-    for observed_at in [Timestamp::from_unix_nanos(1_300), renewal_time] {
+    // The grant deadline remains unchanged when only an access token rotates.
+    for observed_at in [Timestamp::from_unix_nanos(1_300), Timestamp::from_unix_nanos(1_400)] {
         let early = SchwabMarketDataDoctorReceiptV1::try_new(early_input.clone())?;
         assert!(matches!(
             lifecycle.apply(
@@ -1070,10 +1074,12 @@ fn schwab_pending_doctor_input(
             provider_observation_origin:
                 SchwabMarketDataDoctorObservation::provider_observed_origin()?,
             access_token_generation: 1,
+            authorization_generation: 1,
+            authorization_scope_sha256: digest(89),
             access_issued_at: Timestamp::from_unix_nanos(100),
             access_expires_at: expires_at,
-            refresh_authorized_at: Timestamp::from_unix_nanos(0),
-            refresh_expires_at: Timestamp::from_unix_nanos(604_800_000_000_000),
+            refresh_authorized_at: Timestamp::from_unix_nanos(2_000 - 604_800_000_000_000),
+            refresh_expires_at: expires_at,
             user_preference: SchwabUserPreferenceDoctorEvidence {
                 endpoint_contract_sha256: digest(84),
                 request_sha256: digest(85),

@@ -4,7 +4,7 @@ use std::{
     collections::BTreeSet,
     num::NonZeroUsize,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -79,7 +79,6 @@ pub struct SchwabMarketDataAccountActivation {
     authority: Arc<ProviderAccountRuntimeAuthority>,
     oauth: SchwabOAuthMarketAuthority,
     doctor: SchwabMarketDataDoctorReceiptV1,
-    doctor_generation: Mutex<SchwabDoctorGenerationDisposition>,
     market_hours_demand: tokio::sync::Mutex<()>,
     streamer_owner: Arc<tokio::sync::Mutex<()>>,
     preparation_complete: Arc<AtomicBool>,
@@ -262,15 +261,6 @@ impl std::fmt::Debug for PreparedSchwabRestMarketRuntimeStart {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SchwabDoctorGenerationDisposition {
-    Current(u64),
-    RenewalRequired {
-        doctor_generation: u64,
-        observed_generation: u64,
-    },
-}
-
 impl SchwabMarketDataAccountActivation {
     /// One actual account owns all family demands; this is not a copied account proof.
     pub(crate) fn market_hours_demand(&self) -> &tokio::sync::Mutex<()> {
@@ -303,7 +293,9 @@ impl SchwabMarketDataAccountActivation {
     ) -> Result<SchwabOAuthAuthorityReceipt, SchwabMarketDataActivationError> {
         self.authority.require_current().await?;
         let receipt = self.oauth.current_receipt().await?;
-        self.require_doctor_generation(receipt.generation().get())?;
+        if !receipt.matches_market_data_authorization(&self.doctor) {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
         self.authority.require_current().await?;
         Ok(receipt)
     }
@@ -335,14 +327,18 @@ impl SchwabMarketDataAccountActivation {
             .acquire_publication_authority()
             .await?;
         let receipt = self.oauth.current_receipt().await?;
-        self.require_doctor_generation(receipt.generation().get())?;
+        if !receipt.matches_market_data_authorization(&self.doctor) {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
         self.runtime_currentness()
             .acquire_publication_authority()
             .await?;
         Ok(receipt)
     }
 
-    pub(crate) async fn require_runtime_current(&self) -> Result<(), SchwabMarketDataActivationError> {
+    pub(crate) async fn require_runtime_current(
+        &self,
+    ) -> Result<(), SchwabMarketDataActivationError> {
         self.runtime_oauth_receipt().await.map(|_| ())
     }
 
@@ -355,7 +351,12 @@ impl SchwabMarketDataAccountActivation {
             .acquire_publication_authority()
             .await?;
         let (token, epoch) = self.oauth.acquire_publication_attempt().await?;
-        self.require_doctor_generation(epoch.receipt().generation().get())?;
+        if !epoch
+            .receipt()
+            .matches_market_data_authorization(&self.doctor)
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
         self.runtime_currentness()
             .acquire_publication_authority()
             .await?;
@@ -368,24 +369,22 @@ impl SchwabMarketDataAccountActivation {
 
     /// Acquires one exact token/publication attempt behind the serialized OAuth barrier.
     ///
-    /// A protected refresh may legitimately advance the token generation. That observation is
-    /// latched as `DoctorRenewalRequired`; no request using the rotated token can proceed until
-    /// onboarding publishes a fresh doctor receipt and constructs a successor activation.
+    /// A protected refresh may advance the access-token generation within the same authorization.
+    /// The retained doctor must still match the grant, scope, and application credentials; the
+    /// returned epoch binds the exact current token for dispatch and publication.
     pub(crate) async fn acquire_publication_attempt(
         &self,
     ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabMarketDataActivationError>
     {
         self.authority.require_current().await?;
         let (token, epoch) = self.oauth.acquire_publication_attempt().await?;
-        self.require_doctor_generation(epoch.receipt().generation().get())?;
+        if !epoch
+            .receipt()
+            .matches_market_data_authorization(&self.doctor)
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
         Ok((token, epoch))
-    }
-
-    fn require_doctor_generation(
-        &self,
-        observed_generation: u64,
-    ) -> Result<(), SchwabMarketDataActivationError> {
-        require_doctor_generation(&self.doctor_generation, observed_generation)
     }
 
     /// Revalidates the exact current source, definition, reference, and provider-symbol binding.
@@ -435,41 +434,14 @@ impl SchwabMarketDataAccountActivation {
     #[cfg(test)]
     pub(crate) async fn acquire_test_publication_attempt(
         oauth: &SchwabOAuthMarketAuthority,
-        doctor_generation: u64,
+        doctor: &SchwabMarketDataDoctorReceiptV1,
     ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabMarketDataActivationError>
     {
         let (token, epoch) = oauth.acquire_publication_attempt().await?;
-        let disposition = Mutex::new(SchwabDoctorGenerationDisposition::Current(
-            doctor_generation,
-        ));
-        require_doctor_generation(&disposition, epoch.receipt().generation().get())?;
+        if !epoch.receipt().matches_market_data_authorization(doctor) {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
         Ok((token, epoch))
-    }
-}
-
-fn require_doctor_generation(
-    authority: &Mutex<SchwabDoctorGenerationDisposition>,
-    observed_generation: u64,
-) -> Result<(), SchwabMarketDataActivationError> {
-    let mut disposition = authority
-        .lock()
-        .map_err(|_poisoned| SchwabMarketDataActivationError::AuthorityMismatch)?;
-    match *disposition {
-        SchwabDoctorGenerationDisposition::Current(doctor_generation)
-            if doctor_generation == observed_generation =>
-        {
-            Ok(())
-        }
-        SchwabDoctorGenerationDisposition::Current(doctor_generation) => {
-            *disposition = SchwabDoctorGenerationDisposition::RenewalRequired {
-                doctor_generation,
-                observed_generation,
-            };
-            Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
-        }
-        SchwabDoctorGenerationDisposition::RenewalRequired { .. } => {
-            Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
-        }
     }
 }
 
@@ -518,7 +490,7 @@ impl ProviderAdapterActivation {
         .await
     }
 
-    /// Activates the exact OAuth epoch proven by the retained durable Schwab doctor receipt.
+    /// Activates the OAuth authorization proven by the retained durable Schwab doctor receipt.
     pub(crate) async fn activate_schwab_market_data_account(
         &self,
         lease: ProviderActivationLease,
@@ -545,7 +517,7 @@ impl ProviderAdapterActivation {
             return Err(SchwabMarketDataActivationError::Cancelled);
         }
         if doctor.receipt_sha256() != binding.verification_evidence()
-            || doctor.access_token_generation() != current.generation().get()
+            || !current.matches_market_data_authorization(&doctor)
             || doctor.market_data_principal_sha256()
                 != lease
                     .account_digest()
@@ -553,13 +525,15 @@ impl ProviderAdapterActivation {
         {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
-        let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
-            ProviderMarketAccount::SchwabMarketData,
-            lease,
-            Arc::clone(&self.onboarding),
-            &self.app_config,
-            self.provider_rate.clone(),
-        )?);
+        let authority = Arc::new(
+            ProviderAccountRuntimeAuthority::try_acquire_prepared_or_active(
+                ProviderMarketAccount::SchwabMarketData,
+                lease,
+                Arc::clone(&self.onboarding),
+                &self.app_config,
+                self.provider_rate.clone(),
+            )?,
+        );
         let activation = SchwabMarketDataAccountActivation {
             authority,
             oauth,
@@ -567,9 +541,6 @@ impl ProviderAdapterActivation {
             market_hours_demand: tokio::sync::Mutex::new(()),
             streamer_owner: Arc::new(tokio::sync::Mutex::new(())),
             preparation_complete: Arc::new(AtomicBool::new(false)),
-            doctor_generation: Mutex::new(SchwabDoctorGenerationDisposition::Current(
-                current.generation().get(),
-            )),
         };
         activation.require_runtime_current().await?;
         Ok(activation)
@@ -679,16 +650,7 @@ impl ProviderAdapterActivation {
             }
             receipt = activation.runtime_oauth_receipt() => receipt?,
         };
-        if oauth_receipt.generation().get() != doctor.access_token_generation()
-            || oauth_receipt
-                .credential_authority()
-                .application_credential_generation()
-                != doctor.application_credential_generation()
-            || oauth_receipt
-                .credential_authority()
-                .application_credential_reference_sha256()
-                != doctor.application_credential_reference_sha256()
-        {
+        if !oauth_receipt.matches_market_data_authorization(&doctor) {
             return Err(SchwabMarketRuntimeStartError::AuthorityMismatch);
         }
         let evidence =
@@ -1027,7 +989,9 @@ pub(super) fn system_timestamp() -> Result<Timestamp, SchwabMarketRuntimeStartEr
 pub(crate) enum SchwabMarketRuntimeStartError {
     #[error("Schwab market runtime preparation was cancelled")]
     Cancelled,
-    #[error("Schwab market runtime authority does not match the active OAuth and doctor epoch")]
+    #[error(
+        "Schwab market runtime authority does not match the active OAuth authorization and doctor"
+    )]
     AuthorityMismatch,
     #[error("the exact registered Schwab publication generation is unavailable")]
     GenerationUnavailable,
@@ -1062,8 +1026,6 @@ pub enum SchwabMarketDataActivationError {
     Cancelled,
     #[error("Schwab OAuth, doctor, account, or onboarding authority does not match")]
     AuthorityMismatch,
-    #[error("Schwab OAuth token rotation requires a serialized doctor renewal")]
-    DoctorRenewalRequired,
     #[error(transparent)]
     Account(#[from] ProviderAccountActivationError),
     #[error(transparent)]
