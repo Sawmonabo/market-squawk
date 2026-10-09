@@ -4,7 +4,7 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`3e8f8a4d`. Main/release unchanged; no extra branch created.
+`603eb306`. Main/release unchanged; no extra branch created.
 
 ### Active native verification and next dependency
 
@@ -37,7 +37,25 @@ Actual native MSFT reads on new service: Facts32/3602ms, Statements32/3403ms, Ra
 Filings32/715ms, every selected family reported, all four read handles closed. This is live native
 read/reconnect evidence, not instant-load, all-field, all-watchlist or installed-package acceptance.
 Captured `oct8-financial-fix-native-sections.json` and `oct8-financial-fix-reconnected-ui.json`.
-Resulting implementation/pushed commit follows. No new schema, migration, wrapper service or test harness.
+Pushed **603eb306**; PR43 evidence https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6073602979.
+No new schema, migration, wrapper service or test harness. Source ownership for this checkpoint released.
+
+Next finite checkpoint (acceptance1/7): receiving an authorized Schwab callback must initiate its
+protected token exchange without waiting for a second UI/CLI Continue action. Preserve provider
+consent, exact state validation, private credentials and callback/exchange join ownership. Current
+failure is reauthorization_required after delayed handoff; provider error alone does not prove its
+precise cause. OAuth4.1 exchanges the received code for tokens; primary reference:
+https://www.rfc-editor.org/rfc/rfc6749#section-4.1.3 .
+- AstraHigh `oauth_callback_completion` owns ONLY
+  `apps/market-squawk/src/provider_onboarding/schwab_oauth_runtime.rs`, including its existing test
+  module. Implement automatic callback-to-exchange on the existing supervised owner, preserving
+  Begin/Continue/Cancel/Unlink/Shutdown behavior and safe failure/retry. Extend existing critical
+  lifecycle regression for no-Continue completion and interrupted cleanup; request lead before any
+  additional file/signature. No Git, build, provider or native runtime calls.
+- Lead owns UI/native/transport composition, all shared contracts, closure manifest, tests/build
+  scheduling/Git and real verification. UI presentation follows the unchanged lifecycle states
+  after the worker handoff is inspected. No new polling service, compatibility layer or secret
+  exposure. Resulting next commit pending; no provider/API success claimed.
 
 Read-only Astra `financial_load_diagnosis` and Sol6.1 `background_chart_diagnosis` completed/released;
 reports are `.agents/tmp/v1-first-stock/oct8-financial-load.md` and `oct8-background-chart.md`.
