@@ -43,6 +43,19 @@ impl MarketProductSelectionReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<InstrumentId, ServiceError> {
+        self.selection_record(selection_token, as_of, deadline, cancellation)
+            .await
+            .map(|record| record.definition().instrument_id())
+    }
+
+    /// Reopens only the selected investment, retaining the original cutoff checks.
+    pub(crate) async fn selection_record(
+        &self,
+        selection_token: &str,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, ServiceError> {
         if selection_token.len() > MAXIMUM_TOKEN_BYTES {
             return Err(ServiceError::InvalidRequest);
         }
@@ -51,7 +64,35 @@ impl MarketProductSelectionReadCapability {
         let market_definitions = self.market_definitions.clone();
         self.research
             .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
-                Self::resolve_owned(
+                Self::selection_record_owned(
+                    &market_definitions,
+                    &token,
+                    as_of,
+                    deadline,
+                    &operation_cancellation,
+                )
+            })
+            .await
+            .map_err(map_owned_read_error)?
+    }
+
+    /// History locators bind the same immutable definition as the investment selection.
+    pub(crate) async fn history_record(
+        &self,
+        history_token: &str,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, ServiceError> {
+        if history_token.len() > MAXIMUM_TOKEN_BYTES {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let token = try_boxed_product_text(history_token, MAXIMUM_TOKEN_BYTES)
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        let market_definitions = self.market_definitions.clone();
+        self.research
+            .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
+                Self::history_record_owned(
                     &market_definitions,
                     &token,
                     as_of,
@@ -83,6 +124,59 @@ impl MarketProductSelectionReadCapability {
                     &operation_cancellation,
                 )?;
                 individual_selection_token(&record)
+            })
+            .await
+            .map_err(map_owned_read_error)?
+    }
+
+    /// Collection symbols are display preferences, never a substitute for unique catalog identity.
+    pub(crate) async fn collection_records(
+        &self,
+        symbols: Vec<String>,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<MarketDataInstrumentRecord>, ServiceError> {
+        if as_of.unix_nanos() <= 0
+            || symbols.len() > crate::application::market_collection::STARTER_MARKET_SYMBOLS.len()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let reader = self.market_definitions.clone();
+        self.research
+            .run_owned_research_read(deadline, cancellation, move |operation_cancellation| {
+                let mut records = Vec::new();
+                records
+                    .try_reserve_exact(symbols.len())
+                    .map_err(|_| ServiceError::ResourceExhausted)?;
+                let mut retained = 0usize;
+                for symbol in symbols {
+                    if let Some(record) = reader
+                        .unique_display_symbol_as_of(
+                            &symbol,
+                            as_of,
+                            as_of,
+                            deadline,
+                            &operation_cancellation,
+                        )
+                        .map_err(map_market_definition_read_error)?
+                    {
+                        retained = retained
+                            .checked_add(
+                                record
+                                    .retained_bytes()
+                                    .map_err(map_market_definition_read_error)?
+                                    .checked_add(1024)
+                                    .ok_or(ServiceError::ResourceExhausted)?,
+                            )
+                            .filter(|bytes| *bytes <= MAXIMUM_PRODUCT_POPULATION_BYTES)
+                            .ok_or(ServiceError::ResourceExhausted)?;
+                        records.push(record);
+                    }
+                }
+                records.sort_unstable_by_key(|record| record.definition().instrument_id());
+                records.dedup_by_key(|record| record.definition().instrument_id());
+                Ok(records)
             })
             .await
             .map_err(map_owned_read_error)?
@@ -155,36 +249,70 @@ impl MarketProductSelectionReadCapability {
             .map_err(map_owned_read_error)?
     }
 
-    pub(crate) fn resolve_owned(
+    pub(crate) fn selection_record_owned(
         market_definitions: &MarketDataInstrumentReadCapability,
         selection_token: &str,
         as_of: Timestamp,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<InstrumentId, ServiceError> {
-        if selection_token.len() > MAXIMUM_TOKEN_BYTES || as_of.unix_nanos() <= 0 {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let revision = selection_revision(selection_token)?;
-        let record = market_definitions
-            .read_revision(revision, deadline, cancellation)
-            .map_err(map_market_definition_read_error)?
-            .ok_or(ServiceError::Unavailable)?;
-        let instrument_id = record.definition().instrument_id();
-        // The digest is only a locator. Its original revision must still be the unique
-        // knowable and effective selection for this instrument at the caller's cutoff.
-        let current = selected_record(
+    ) -> Result<MarketDataInstrumentRecord, ServiceError> {
+        record_for_token_owned(
             market_definitions,
-            instrument_id,
+            selection_token,
+            MARKET_TOKEN_PREFIX,
             as_of,
             deadline,
             cancellation,
-        )?;
-        if current != record {
-            return Err(ServiceError::Unavailable);
-        }
-        Ok(instrument_id)
+        )
     }
+
+    pub(crate) fn history_record_owned(
+        market_definitions: &MarketDataInstrumentReadCapability,
+        history_token: &str,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, ServiceError> {
+        record_for_token_owned(
+            market_definitions,
+            history_token,
+            HISTORY_TOKEN_PREFIX,
+            as_of,
+            deadline,
+            cancellation,
+        )
+    }
+}
+
+fn record_for_token_owned(
+    market_definitions: &MarketDataInstrumentReadCapability,
+    token: &str,
+    prefix: &str,
+    as_of: Timestamp,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<MarketDataInstrumentRecord, ServiceError> {
+    if token.len() > MAXIMUM_TOKEN_BYTES || as_of.unix_nanos() <= 0 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let revision = token_revision(token, prefix)?;
+    let record = market_definitions
+        .read_revision(revision, deadline, cancellation)
+        .map_err(map_market_definition_read_error)?
+        .ok_or(ServiceError::Unavailable)?;
+    // The digest is only a locator. Its original revision must still be the unique
+    // knowable and effective selection for this instrument at the caller's cutoff.
+    let current = selected_record(
+        market_definitions,
+        record.definition().instrument_id(),
+        as_of,
+        deadline,
+        cancellation,
+    )?;
+    if current != record {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok(record)
 }
 
 fn selected_record(
@@ -217,8 +345,8 @@ fn selected_record(
 }
 
 const MARKET_TOKEN_PREFIX: &str = "market_";
+const HISTORY_TOKEN_PREFIX: &str = "history_";
 const MARKET_REVISION_HEX_BYTES: usize = 64;
-const HISTORY_TOKEN_DOMAIN: &[u8] = b"market-squawk/market-history/v1\0";
 const MAXIMUM_TOKEN_BYTES: usize = 96;
 const MAXIMUM_PRODUCT_POPULATION_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAXIMUM_PRODUCT_MARKET_POPULATION: usize =
@@ -293,13 +421,8 @@ pub(crate) fn product_market_identities(
     for record in market_data {
         let definition = record.definition();
         let symbol = record.display_symbol_at(effective_at);
-        let instrument_bytes = definition.instrument_id().as_uuid().into_bytes();
         let selection_token = individual_selection_token(record)?;
-        let history_token = token(
-            "history_",
-            HISTORY_TOKEN_DOMAIN,
-            &[&record.revision_digest().bytes(), &instrument_bytes],
-        )?;
+        let history_token = revision_token(HISTORY_TOKEN_PREFIX, record)?;
         if !selection_tokens.insert(selection_token.clone())
             || !history_tokens.insert(history_token.clone())
         {
@@ -343,20 +466,27 @@ pub(crate) fn product_market_identities(
 pub(crate) fn individual_selection_token(
     record: &MarketDataInstrumentRecord,
 ) -> Result<Box<str>, ServiceError> {
+    revision_token(MARKET_TOKEN_PREFIX, record)
+}
+
+fn revision_token(
+    prefix: &str,
+    record: &MarketDataInstrumentRecord,
+) -> Result<Box<str>, ServiceError> {
     let mut token = String::new();
     token
-        .try_reserve_exact(MARKET_TOKEN_PREFIX.len() + MARKET_REVISION_HEX_BYTES)
+        .try_reserve_exact(prefix.len() + MARKET_REVISION_HEX_BYTES)
         .map_err(|_| ServiceError::ResourceExhausted)?;
-    token.push_str(MARKET_TOKEN_PREFIX);
+    token.push_str(prefix);
     for byte in record.revision_digest().bytes() {
         write!(token, "{byte:02x}").map_err(|_| ServiceError::ResourceExhausted)?;
     }
     Ok(token.into_boxed_str())
 }
 
-fn selection_revision(selection_token: &str) -> Result<EvidenceDigest, ServiceError> {
+fn token_revision(selection_token: &str, prefix: &str) -> Result<EvidenceDigest, ServiceError> {
     let encoded = selection_token
-        .strip_prefix(MARKET_TOKEN_PREFIX)
+        .strip_prefix(prefix)
         .filter(|encoded| {
             encoded.len() == MARKET_REVISION_HEX_BYTES
                 && encoded
@@ -370,31 +500,6 @@ fn selection_revision(selection_token: &str) -> Result<EvidenceDigest, ServiceEr
             .map_err(|_| ServiceError::InvalidRequest)?;
     }
     Ok(EvidenceDigest::new(DigestAlgorithm::Sha256, bytes))
-}
-
-pub(crate) fn resolve_selection_token(
-    identities: &[ProductMarketIdentity],
-    token: &str,
-) -> Result<InstrumentId, ServiceError> {
-    resolve_token(identities, token, |identity| identity.selection_token())
-}
-
-pub(crate) fn resolve_token(
-    identities: &[ProductMarketIdentity],
-    token: &str,
-    field: impl Fn(&ProductMarketIdentity) -> &str,
-) -> Result<InstrumentId, ServiceError> {
-    let mut matches = identities
-        .iter()
-        .filter(|identity| field(identity) == token);
-    let instrument_id = matches
-        .next()
-        .map(ProductMarketIdentity::instrument_id)
-        .ok_or(ServiceError::Unavailable)?;
-    if matches.next().is_some() {
-        return Err(ServiceError::InvalidResult);
-    }
-    Ok(instrument_id)
 }
 
 pub(crate) fn token(

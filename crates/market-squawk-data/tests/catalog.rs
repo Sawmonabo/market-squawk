@@ -3555,6 +3555,255 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
     assert_eq!(read_after_restart.checks.load(Ordering::SeqCst), 3);
     assert_eq!(replayed.into_records(), vec![option.clone()]);
 
+    // Publish a real sealed offline snapshot against the same retained acquisition revision.
+    // Doctor renewal is exercised by the source fixture; this proves catalog dependency custody.
+    use market_squawk_data::provider_option_market_publication_digest;
+    use market_squawk_domain::{
+        Money, OptionComponent, OptionComponentState, OptionContractTerms,
+        OptionContractTermsInput, OptionSnapshotObservation, OptionSnapshotObservationInput,
+        OptionUnderlyingObservation, ProviderChannel, ProviderProduct,
+    };
+    use market_squawk_sources::{
+        OptionMarketBatchDisposition, OptionMarketCompleteness, OptionMarketCompletenessInput,
+        OptionMarketCursorState, OptionMarketRequestFilter, OptionMarketRequestScope,
+        OptionMarketRequestScopeInput, ProviderNativeLineageImplementation,
+        ProviderOptionMarketBatch, ProviderOptionMarketNativeLineageBatch,
+        SealedProviderOptionMarketBinding,
+    };
+    let snapshot_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let snapshot_body =
+        Bytes::from_static(br#"{"snapshots":{"AAPL270115C00200000":{}},"next_page_token":null}"#);
+    let snapshot_body_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(&snapshot_body).into(),
+    );
+    let snapshot_request = digest(156);
+    let snapshot_capture = ProviderCaptureSetReceipt::try_new(
+        option_source.source_id().clone(),
+        option_source.revision().clone(),
+        SourceIdentifier::try_from("alpaca:option-snapshots:AAPL")?,
+        snapshot_request,
+        ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
+        vec![ProviderCapturePageReceipt::try_new(
+            0,
+            snapshot_request,
+            None,
+            None,
+            200,
+            u64::try_from(snapshot_body.len())?,
+            snapshot_body_digest,
+            snapshot_at,
+        )?],
+    )?;
+    let snapshot_connection = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        &snapshot_capture.observation_digest().bytes(),
+    );
+    let snapshot_record = RawCaptureRecord::try_new_live(
+        uuid::Uuid::new_v5(&snapshot_connection, &snapshot_body_digest.bytes()),
+        Arc::from(option_source.source_id().as_str()),
+        snapshot_connection,
+        Some(0),
+        None,
+        DateTime::<Utc>::from_timestamp_nanos(snapshot_at.unix_nanos()),
+        snapshot_body.clone(),
+    )?;
+    let material =
+        ProviderCaptureMaterial::try_new(snapshot_capture.clone(), vec![snapshot_record])?;
+    let (expectation, seal) = material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal.seal(&raw_store)?)?
+        .try_into_whole()?;
+    let original_contract = contracts
+        .contracts()
+        .next()
+        .ok_or("missing original contract")?;
+    let terms = OptionContractTerms::try_new(OptionContractTermsInput {
+        option_instrument_id: option.definition().instrument_id(),
+        underlying_instrument_id: created.definition().instrument_id(),
+        option_definition_revision: option.revision_digest(),
+        underlying_definition_revision: created.revision_digest(),
+        provider_instrument_id: ProviderInstrumentId::try_from(original_contract.symbol())?,
+        occ_identity: Some(original_contract.occ_identity().clone()),
+        expiration: original_contract.expiration(),
+        strike: Money::new(
+            original_contract.strike(),
+            original_contract.quote_currency()?,
+        ),
+        kind: original_contract.kind(),
+        multiplier: original_contract.multiplier(),
+        exercise_style: OptionComponent::observed(original_contract.exercise_style().clone(), None),
+        settlement: OptionComponent::unavailable(OptionComponentState::ProviderAbsent, None),
+    })?;
+    fn absent<T>() -> OptionComponent<T> {
+        OptionComponent::unavailable(OptionComponentState::ProviderAbsent, None)
+    }
+    let snapshot = OptionSnapshotObservation::try_new(OptionSnapshotObservationInput {
+        terms,
+        bid_price: absent(),
+        bid_size: absent(),
+        ask_price: absent(),
+        ask_size: absent(),
+        last_price: absent(),
+        last_size: absent(),
+        mark_price: absent(),
+        trade_conditions: absent(),
+        volume: absent(),
+        open_interest: absent(),
+        implied_volatility: absent(),
+        delta: absent(),
+        gamma: absent(),
+        theta: absent(),
+        vega: absent(),
+        rho: absent(),
+        underlying: OptionUnderlyingObservation::try_new(absent(), snapshot_body_digest)?,
+    })?;
+    let scope = OptionMarketRequestScope::try_new(OptionMarketRequestScopeInput {
+        source_id: option_source.source_id().clone(),
+        metadata_revision: option_source.revision().clone(),
+        dataset: snapshot_capture.dataset().clone(),
+        provider_product: ProviderProduct::new(SourceIdentifier::try_from(
+            "alpaca-indicative-options",
+        )?),
+        provider_channel: ProviderChannel::new(SourceIdentifier::try_from("rest")?),
+        venue_id: Some(VenueId::try_from("alpaca-indicative-options")?),
+        underlying_instrument_id: created.definition().instrument_id(),
+        underlying_definition_revision: created.revision_digest(),
+        provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+        request_identity: snapshot_request,
+        observation_identity: snapshot_capture.observation_digest(),
+        entitlement_evidence: digest(157),
+        capability_evidence: digest(158),
+        available_at: snapshot_at,
+        received_at: snapshot_at,
+        ingested_at: snapshot_at,
+        filter: OptionMarketRequestFilter::try_new(
+            Some(market_squawk_sources::OptionExpirationRange::try_new(
+                expiration, expiration,
+            )?),
+            None,
+            None,
+            vec![],
+        )?,
+    })?;
+    let batch = ProviderOptionMarketBatch::try_snapshots(
+        scope,
+        OptionMarketCompleteness::try_new(OptionMarketCompletenessInput {
+            expected_records: Some(1),
+            returned_records: 1,
+            missing_records: 0,
+            unexpected_records: 0,
+            provider_reported_records: None,
+            page_count: NonZeroU16::new(1).ok_or("page count")?,
+            cursor: OptionMarketCursorState::Exhausted,
+            disposition: OptionMarketBatchDisposition::Complete,
+        })?,
+        vec![snapshot],
+    )?;
+    let dependencies = contracts.dependencies_for(&batch)?;
+    let native = ProviderOptionMarketNativeLineageBatch::try_new(
+        ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1,
+        &batch,
+        vec![Bytes::from_static(
+            br#"{"symbol":"AAPL270115C00200000","snapshot":{}}"#,
+        )],
+        snapshot_body,
+    )?;
+    let binding =
+        SealedProviderOptionMarketBinding::try_new(token, batch, native, vec![0], dependencies)?;
+    let publication_digest = provider_option_market_publication_digest(&binding)?;
+    let identity = IngestIdentity::try_new(
+        option_source.source_id().clone(),
+        publication_digest,
+        SourceOperation::Persist,
+        "alpaca:option-snapshots:retained-original:v1",
+    )?;
+    let mut snapshot_rights = option_rights.clone();
+    snapshot_rights.payload_digest = publication_digest;
+    snapshot_rights.retrieved_at = snapshot_at;
+    let snapshot_reservation = service
+        .reserve_source_ingest(
+            &option_source,
+            snapshot_at,
+            snapshot_rights,
+            &identity,
+            &cancellation,
+        )
+        .await?;
+    let snapshot_run = snapshot_reservation.run_id();
+    let committed = service
+        .ingest_provider_option_market(
+            snapshot_reservation,
+            DatasetId::try_from("market_squawk.option_snapshots")?,
+            binding,
+            cancellation.clone(),
+            Arc::new(Precommit {
+                checks: AtomicUsize::new(0),
+                revoke_on: usize::MAX,
+            }),
+        )
+        .await?;
+    let published_original = service
+        .provider_capture_original(
+            originals[0].session(),
+            originals[0].ordinal(),
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or("published original missing")?;
+    assert_eq!(
+        published_original.published_binding(),
+        Some(publication_digest)
+    );
+    assert_eq!(published_original.digest(), originals[0].digest());
+    assert_eq!(published_original.capture(), originals[0].capture());
+    assert_eq!(published_original.physical(), originals[0].physical());
+    assert!(
+        service
+            .pending_provider_capture_original(
+                option_source.source_id(),
+                deadline(),
+                &cancellation,
+            )?
+            .is_none()
+    );
+    drop(onboarding);
+    drop(service);
+    let catalog = CatalogAuthority::open(config.clone())?;
+    let retained_binding = catalog
+        .catalog()
+        .provider_option_market_binding_evidence(publication_digest)?
+        .ok_or("option binding missing after restart")?;
+    assert_eq!(retained_binding.capture(), &snapshot_capture);
+    assert_eq!(retained_binding.canonical_row_count(), 1);
+    let [dependency] = retained_binding.reference_dependencies() else {
+        return Err("expected one retained original dependency".into());
+    };
+    assert_eq!(dependency.capture(), originals[0].capture());
+    assert_eq!(dependency.physical(), originals[0].physical());
+    assert_eq!(dependency.rows().len(), 1);
+    assert!(dependency.origin().is_none());
+    assert_eq!(
+        AnalyticalManifestCatalog::open(paths.catalog()?, 8)?
+            .for_run(snapshot_run)?
+            .ok_or("snapshot manifest missing after restart")?
+            .manifest(),
+        committed.manifest(),
+    );
+    drop(catalog);
+    let (service, _onboarding) = reopen()?;
+    assert_eq!(
+        service.provider_capture_original(
+            originals[0].session(),
+            originals[0].ordinal(),
+            deadline(),
+            &cancellation,
+        )?,
+        Some(published_original.clone())
+    );
+
     // This synthetic source cannot manufacture a doctor-renewal origin. Current metadata is
     // admitted at current knowledge time, but unchanged originals still need that typed proof.
     let current_at = Timestamp::from_unix_nanos(i64::try_from(
@@ -3636,13 +3885,16 @@ async fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identit
         Some(option_source.clone()),
     );
     assert_eq!(
-        service.reopen_provider_capture_original(
-            &originals[0],
-            &raw_store,
-            deadline(),
-            &cancellation,
-        )?.original(),
-        &originals[0],
+        service
+            .reopen_option_contract_reference_original(
+                &published_original,
+                publication_digest,
+                &raw_store,
+                deadline(),
+                &cancellation,
+            )?
+            .original(),
+        &published_original,
     );
     assert_eq!(
         service.market_data_instruments().latest(

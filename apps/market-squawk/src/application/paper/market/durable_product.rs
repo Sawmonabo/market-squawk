@@ -64,6 +64,8 @@ impl<'a> ProductReadProgress<'a> {
         if !matches!(
             self.stage,
             "population"
+                | "selected_definition"
+                | "collection_definitions"
                 | "display_read"
                 | "retained_display_read"
                 | "previous_close"
@@ -157,27 +159,67 @@ impl MarketDomainService {
             Arc::clone(&self.product_research),
             self.market_data_instruments.clone(),
         );
-        progress.enter("population", None);
-        let records = selections
-            .population(reference_at, context.deadline(), context.cancellation())
-            .await?;
-        progress.enter("identity_selection", None);
         let argument = |name: &str| request.arguments().get(name).and_then(Value::as_str);
-        let mut identities =
-            product::product_market_identities(&records, reference_at, argument("query"))?;
-        if let Some(collection) = &collection {
-            identities.retain(|identity| {
-                let choice = matches!(identity.asset_class(), "equity" | "fund")
-                    .then(|| {
-                        collection
-                            .choices
-                            .iter()
-                            .find(|choice| Some(choice.symbol.as_str()) == identity.symbol())
-                    })
-                    .flatten();
-                choice.is_some()
-            });
+        if request.name() == MARKET_GET_HISTORY {
+            let token = argument("historyToken").ok_or(ServiceError::InvalidRequest)?;
+            progress.enter("selected_definition", None);
+            let record = selections
+                .history_record(
+                    token,
+                    reference_at,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?;
+            let instrument_id = record.definition().instrument_id();
+            progress.enter("history_read", Some(instrument_id));
+            let result = history::build_product_market_history_result(
+                &self.market_history,
+                &self.product_research,
+                instrument_id,
+                token,
+                request,
+                limits,
+                context,
+            )
+            .await;
+            return progress.finish(result);
         }
+        let records = if request.name() == MARKET_GET_INSTRUMENT {
+            progress.enter("selected_definition", None);
+            vec![
+                selections
+                    .selection_record(
+                        argument("selectionToken").ok_or(ServiceError::InvalidRequest)?,
+                        reference_at,
+                        context.deadline(),
+                        context.cancellation(),
+                    )
+                    .await?,
+            ]
+        } else if let Some(collection) = &collection {
+            progress.enter("collection_definitions", None);
+            selections
+                .collection_records(
+                    collection
+                        .choices
+                        .iter()
+                        .map(|choice| choice.symbol.clone())
+                        .collect(),
+                    reference_at,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?
+        } else {
+            progress.enter("population", None);
+            selections
+                .population(reference_at, context.deadline(), context.cancellation())
+                .await?
+        };
+        progress.enter("identity_selection", None);
+        let identities =
+            product::product_market_identities(&records, reference_at, argument("query"))?;
         let maximum_rows = limits
             .maximum_result_items()
             .min(product::MAXIMUM_PRODUCT_MARKET_ROWS);
@@ -194,33 +236,9 @@ impl MarketDomainService {
                 content, available, has_more, limits,
             ));
         }
-        if request.name() == MARKET_GET_HISTORY {
-            let token = argument("historyToken").ok_or(ServiceError::InvalidRequest)?;
-            let instrument_id = product::resolve_history_token(&identities, token)?;
-            progress.enter("history_read", Some(instrument_id));
-            let result = history::build_product_market_history_result(
-                &self.market_history,
-                &self.product_research,
-                instrument_id,
-                token,
-                request,
-                limits,
-                context,
-            )
-            .await;
-            return progress.finish(result);
-        }
         progress.enter("page_selection", None);
         let page = if request.name() == MARKET_GET_INSTRUMENT {
-            let instrument_id = product::resolve_selection_token(
-                &identities,
-                argument("selectionToken").ok_or(ServiceError::InvalidRequest)?,
-            )?;
-            let identity = identities
-                .iter()
-                .find(|identity| identity.instrument_id() == instrument_id)
-                .ok_or(ServiceError::InvalidResult)?;
-            product::select_product_page(std::slice::from_ref(identity), None, 1, None)?
+            product::select_product_page(&identities, None, 1, None)?
         } else {
             product::select_product_page(
                 &identities,
@@ -455,7 +473,7 @@ impl MarketDomainService {
                 .choices
                 .iter()
                 .map(|choice| {
-                    // Check the complete selected population, not only its displayed page.
+                    // The indexed collection read has already rejected ambiguous symbols.
                     let unambiguous = identities
                         .iter()
                         .filter(|identity| identity.symbol() == Some(choice.symbol.as_str()))

@@ -20,6 +20,11 @@ WHEN NOT (
         AND NEW.schema_version = 1
         AND NEW.schema_fingerprint =
             X'e0bf8cc9a74c880cc772d3987907b13eb3d4d8fc2dc3ca1a239873d650a151f0'
+    ) OR (
+        NEW.schema_name = 'market_squawk.option_market'
+        AND NEW.schema_version = 1
+        AND NEW.schema_fingerprint =
+            X'e39a6d6bf08532184b59a863dfaa9ff641a1be63e7e76d393d7fd7ef49ddf299'
     )
 ) BEGIN
     SELECT RAISE(ABORT, 'analytical generation schema identity is not registered');
@@ -4616,8 +4621,22 @@ WHEN OLD.published_binding IS NOT NULL OR OLD.published_option_binding IS NOT NU
     AND dependency.raw_claim_digest=NEW.raw_claim_digest
     AND dependency.physical_receipt_digest=NEW.physical_receipt_digest
     AND original_capture.source_id=option_capture.source_id
-    AND original_capture.metadata_revision=option_capture.metadata_revision
-    AND original_capture.source_revision_digest=option_capture.source_revision_digest
+    -- Rust validates the complete typed doctor chain and custody before inserting this
+    -- immutable binding. The first dependency holds the origin shared by all session pages.
+    -- Preserve each page's exact old/current relationship at consumption too.
+    AND ((json_type(binding.reference_dependencies_json,'$[0].origin') IS NULL
+          AND original_capture.metadata_revision=option_capture.metadata_revision
+          AND original_capture.source_revision_digest=option_capture.source_revision_digest)
+      OR (json_type(binding.reference_dependencies_json,'$[0].origin')='object'
+          AND json_extract(binding.reference_dependencies_json,'$[0].origin.source')=original_capture.source_id
+          AND json_extract(binding.reference_dependencies_json,'$[0].origin.original_revision')=original_capture.metadata_revision
+          AND json_extract(binding.reference_dependencies_json,'$[0].origin.current_revision')=option_capture.metadata_revision
+          AND EXISTS(SELECT 1 FROM source_revisions AS original_revision
+            WHERE original_revision.source_id=original_capture.source_id
+             AND original_revision.revision_digest=original_capture.source_revision_digest)
+          AND EXISTS(SELECT 1 FROM source_revisions AS current_revision
+            WHERE current_revision.source_id=option_capture.source_id
+             AND current_revision.revision_digest=option_capture.source_revision_digest)))
     AND NEW.retained_at_ns<=binding.recorded_at_ns)
   OR EXISTS(SELECT 1 FROM ingest_run_provider_publication_bindings AS input
    JOIN ingest_runs AS run ON run.run_id=input.run_id AND run.state='reserved' AND run.operation='persist'

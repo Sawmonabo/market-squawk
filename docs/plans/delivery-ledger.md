@@ -2,9 +2,25 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed implementation **70b0d2aa** fixes retained multi-channel display. It follows
-**1148dd81** (catalog-lock repair) and **ac32f267** (event-driven capacity waiting). Full V1,
-continuous streaming, all data families and installed acceptance remain open.
+Current pushed implementation **37485d3b** adds financial phase and option publication diagnostics.
+Native build passed; three financial reads returned valid pages in5.7–7.9s, not a latency pass.
+Current runtime service88954/Desktop82822, supervisor47522; watcher47538 stopped. The older entries
+below are chronological evidence, not active assignments. Full V1 remains active/incomplete.
+
+Current assignment refresh: lead integrates the demonstrated screen-read population bottleneck and
+option renewed-reference publication defect. Ownership and dependencies are in the final ledger entry.
+
+| Current owner | Outcome and exact scope | Verification / next dependency |
+| --- | --- | --- |
+| Lead | Indexed watchlist/detail/history producer-consumer integration; renewed-option retention/schema; all shared contracts, fixtures, source closure, Git and builds | Source edits frozen. Data publication/restart check PASS1/1 (3.43s); genuine typed renewal-origin check PASS1/1 (0.14s). Indexed identity/cutoff/restart PASS1/1; renderer lookup contract PASS1/1 (4.49s). Application contract check exposed workflow-history 32-hex versus price-history 64-hex pattern collision; validator corrected. Shared-origin SQL guard corrected for all session pages. Final data publication/restart PASS1/1 (3.53s); shared schema PASS1/1; source closure verified. Final application contract/identity checks PASS2/2 (3.69s; 10m48s compile). Source checkpoint ready to commit/push; native/new-schema deployment and actual renewed publication remain pending. |
+| Astra screen_indexed_reads | Completed, ownership released | Direct detail/history locators and indexed collection wiring; existing identity/ambiguity/restart fixture PASS. Ownership released to lead. |
+| Astra evidence_preparation_invalid | Completed, ownership released | Exact retained-original dependency link and same-revision snapshot publication/restart fixture. Genuine renewed end-to-end acceptance still pending; no fake origin/test-support export. |
+
+PR43 evidence comment6076656853 refreshed for37485d3b. Full V1, all-nine complete financials,
+live streaming, new native timings and installed acceptance remain open. Earlier entries below
+are historical snapshots; current ownership is the table above and latest dependency notes.
+
+## Historical execution evidence
 
 | Owner | Concrete outcome and exact files | Evidence / next dependency |
 | --- | --- | --- |
@@ -11846,3 +11862,82 @@ stopped after successful compilation. No second build. The two diagnostics are c
 phase/error evidence is next. No semantic test added to this logging-only checkpoint. Lead commits
 and pushes the four explicitly owned files, then probes AAPL statements/MSFT ratios and performs one
 controlled MSFT analysis reproduction with diagnostics; original failed workflow stays intact.
+
+37485d3b pushed. Native three-request diagnostic probe returned AAPL statements7,751ms, MSFT
+ratios7,895ms, AAPL ratios5,746ms; all parsed32 rows and closed released=true. Timing shows selection
+1.5–1.9s, company prepared reads1.35–2.49s, authorization0.39–1.72s, snapshot0.99–1.26s plus recheck.
+No latency pass or resolved-timeout claim. Controlled new MSFT run workflow_0dc68ba50fef57aa8a1d1c8f6228ed14
+preserves prior failed run; now reproduces exact option publication stage=ingest, category=ingest,
+IngestError::Catalog. Source/native artifacts use oct9-phase-native-*; new failed child6fd269ee.
+
+| Active owner | Exclusive writable scope | Outcome/check |
+|---|---|---|
+| Astra High evidence_preparation_invalid | `.agents/tmp/v1-first-stock/oct9-option-catalog-failure.md` only | Trace current observed IngestError::Catalog in ingest_provider_option_market. Inspect retained safe catalog evidence read-only if useful, no payload/credentials or state edits. Find exact violated invariant/minimal critical repair; if unobservable specify precise safe nested diagnostic rather than guessing. No builds/Git/runtime mutations. |
+| Lead | integration and financial read scheduling/cache trace | Establish why indexed selection and authority checks spend seconds despite retained evidence; use measured phases and exact worker/catalog caller paths before changing concurrency. |
+
+
+### Current corrective slice — indexed screen reads and option origin reuse
+
+Previous question turn confirmed current source/official HTTP pooling guidance but made no code
+progress. Next safe action is implementation of the proven bottlenecks. Baseline37485d3b, only ledger
+WIP; watcher stopped, no new build/root. Stock analysis fails on historical option origins: generic
+metadata retention demands current revision after option-specific validation; SQL consumption also
+requires old=current. Report oct9-option-catalog-failure.md inspected. Original workflow preserved.
+
+| Active owner | Exclusive writable files | Required outcome / smallest critical proof |
+|---|---|---|
+| Astra High screen_indexed_reads | app `application/market_selection/product.rs`, `application/paper/market/durable_product.rs`, `application/paper/market/product.rs` only | Selected detail/history resolve immutable revision locators directly, without population scan; collection uses indexed exact candidate reads with complete ambiguity handling, no invented IDs or silent truncated uniqueness. Existing product identity/continuation fixture extended for relevant changed tokens/selection. If existing data API cannot prove complete exact collection results, report exact required data seam to lead before changing it. Preserve full discovery, cutoffs, cancellation and financial authority. No builds/Git/runtime. |
+| Astra High evidence_preparation_invalid | data `src/catalog/provider_option.rs`, `src/catalog/provider_capture/metadata.rs` only | Replace generic current-revision reinsertion for option reference dependencies with exact already-retained original linkage after existing origin/custody validation. Generic macro retention stays strict. No schema/tests/builds/Git/runtime. Lead owns SQL/schema and critical existing fixture. |
+| Lead | schemas/contracts, existing data catalog fixture, ledger/closure/Git/build/runtime | Align SQL guard with exact existing OptionReferenceOrigin. Prove renewed reference publication, reject unrelated origin and preserve restart evidence. Existing live schema deployment remains separate from fixture success; no ad hoc live DB edits or migration. |
+
+Completed diagnostics released. SEC concurrency2 remains required separate coherent policy change;
+fund identity and streaming repairs remain open. Do not claim all-nine/native/installed acceptance
+from this slice. Resulting commit pending focused checks; then one managed native build as applicable.
+
+Ownership refinement: lead additionally owns `data/src/catalog/market_data_instruments.rs` for an
+indexed, exact, unambiguous equity/fund display-symbol read, and shared history-token validators/
+`app/src/service/tool_services.rs`. Canonical history token will carry full revision digest; no
+compatibility form. Astra evidence_preparation_invalid additionally owns existing
+`data/tests/catalog.rs` only for genuine renewed option snapshot publication/consumption/restart
+coverage; SQL remains lead-owned. No native schema deployment or stored-workspace mutation yet.
+
+Both implementation lanes frozen and released. Lead inspected direct lookup/canonical history
+consumer diffs and retained-original helper. Data fixture extends actual same-revision sealed
+snapshot publication/consumption/restart; constructing a genuine doctor receipt offline is private
+in sources tests, so renewed cross-crate acceptance is explicitly still unproven. No fake origin or
+new test-support API. Existing SQL consumption guard now recognizes exact typed origin source and
+old/current revisions; canonical migration21 checksum updated in place, no new migration. Initial
+app critical compilation59916/Cargo92506 stopped deliberately(exit130) after lead noticed omitted
+checksum update; no failed/pass test claimed. Next build uses corrected frozen schema/checksum.
+Native runtime remains old and available; new schema is not deployed into retained workspace.
+Read-only EXPLAIN proves indexed exact-symbol lookup: 2846 catalog instruments, exactly1candidate
+per each of9symbols, candidate query0.15–0.86ms. This excludes definition/authority/transport work
+and is not Desktop latency acceptance. Evidence oct9-indexed-symbol-query-plan.json.
+
+Critical coverage gap refinement: Astra evidence_preparation_invalid may additionally edit ONLY
+`sources/src/onboarding/tests.rs` existing doctor renewal fixture to construct real
+OptionReferenceOrigin via validated original/current metadata, check capture clocks and reject
+wrong revision/origin using the existing private doctor-input test helper. No public test-support
+API/private digest copy. This complements data snapshot custody/restart coverage without pretending
+the two establish native renewed publication. Lead schedules source fixture after current data check.
+First data fixture compile found incorrect ProviderProduct/ProviderChannel constructor calls;
+lead corrected to their existing new(SourceIdentifier) API. No pass yet; same focused check rerunning.
+
+Data critical fixture reached actual snapshot ingestion, then FAILED on the production SQL schema
+allowlist: option_market was never admitted despite canonical producer/reader support. Corrected
+existing schema guard with canonical v1 fingerprint e39a6d6b...9ddf299, independently read from
+exact failed native Parquet footer; canonical SQL checksum refreshed. This is a third established
+publication defect, not a fixture bypass. Fund schema is also absent from this allowlist; keep it
+with required fund producer-consumer integration (not silently dropped). Focused test must rerun.
+
+Current integration verification refresh: the extended existing catalog fixture now passes actual option publication, retained-original consumption and reopen after restart (1/1,3.43s; `oct9-option-retention-critical.log`). The existing genuine doctor-renewal fixture passes correct origin/capture pairing and wrong-revision/time rejection (1/1,0.14s; Cargo24.10s, session95560). These are separate compositional checks; renewed cross-crate/native acceptance remains open. Prior fixture-only failures were corrected by dropping the standalone catalog owner before service reopen and using the published-original reopen API after consumption. No production ownership or replay protection was relaxed. Lead is running the existing indexed identity/cutoff/restart and schema checks in session1547; all writers remain frozen. Previous user-question turn was no implementation progress; current turn has new critical evidence and continues integration.
+
+Integration inspection found a further defect before commit: `validate_option_reference_closure` and `validate_option_dependencies` deliberately store/read one shared origin on dependency0, but the proposed SQL trigger reads each dependency origin. Multi-page renewed references would therefore still fail after page0. Lead will use the first dependency origin for every guarded page while retaining each page's exact digest/ordinal/source checks; wait for the ongoing app check to finish before schema edits, then rerun the actual data publication fixture. This is a current corrective dependency, not a new lane or accepted behavior.
+
+Integration check results: combined Cargo session1547 compiled the application test binary but stopped on a missing test-only history-pattern import in services. Running that exact completed application binary produced identity/cutoff/restart PASS and a real schema failure for Analysis.ReadWorkflow. Workflow history retains its distinct 32-hex identifier; price history uses the 64-hex catalog locator. Restored support for the workflow pattern in the shared validator, with the missing import fixed; this is two existing domain contracts, not compatibility forms for price history. Corrected canonical SQL to select the origin from dependency0 for every original page and refreshed schema21 checksum. Seven direct evaluations of that production SQL relationship predicate passed (synthetic coordinates, not full authorization/publication proof; `oct9-option-origin-sql-predicate.json`). Desktop existing lookup/product-destination check PASS1/1 in4.49s (7.44s total). Source frozen again; final data publication and service/application contract reruns are required before push.
+
+Final corrected-source results: option publication/custody/restart PASS1/1 in3.53s after1m29s compilation (`oct9-option-retention-critical.log`); services output-schema check PASS1/1 after1.21s compile (`oct9-shared-schema-critical.log`). Shipping source closure refreshed and verified with the existing tool, and diff checks pass. Lead started the final app identity plus all-operation output-contract rerun, log `oct9-indexed-read-final-critical.log`, session99466. No other compiler, source writer or watcher runs; old Desktop/service remain available. Next mandatory event is this check completing; inspect its exact result before commit/push or starting native replacement. Renewed full publication and all-nine native performance remain unproven.
+
+Native deployment preparation (read-only): comparing the live catalog to a fresh in-memory schema assembled from current canonical SQL proves exactly two changed guards (`analytical_generations_registered_schema_insert`, `provider_capture_original_update`) and only schema21 checksum differs; no table/index/layout difference. Evidence `oct9-canonical-schema-deployment-diff.json`. Preserve the existing workspace and protected sign-ins: after critical pass/push and native build, lead will use a backed-up offline canonical guard correction, with all application writers stopped, retaining every data row and original artifact. This is a one-time greenfield development schema update, no shipped migration/compatibility path; the live database has not been modified. Existing supervisor supports graceful whole-session stop via parent EOF and normal restart; no force kill or separate runtime owner is authorized.
+
+Final application rerun PASS2/2 (3.69s, single-job compile10m48s; `oct9-indexed-read-final-critical.log`): canonical selection/history/ambiguity/cutoff/cancellation/restart and every production output descriptor. Both prior failed checks were corrected, not waived. All critical checks for this source slice now pass; no source changes follow them. Removed three unused older root-package test executables after confirming no open owner, reclaiming2.39GiB; retained current test executable, all active runtime generations and recovery evidence. No extra branch/worktree created. Lead proceeds to commit/push, then one native build followed by backed-up offline canonical schema update and actual saved-workflow/all-nine reads. Native, installed and full V1 acceptance remain unproven.

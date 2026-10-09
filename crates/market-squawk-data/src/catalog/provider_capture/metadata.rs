@@ -1,4 +1,4 @@
-//! Original metadata capture dependencies of canonical macro publication inputs.
+//! Original metadata capture dependencies of canonical publication inputs.
 use super::*;
 use market_squawk_sources::SealedProviderCaptureSetReceipt;
 
@@ -138,6 +138,51 @@ pub(in crate::catalog) fn retain(
         "whole_single_segment",
         recorded_at,
     )?;
+    retain_dependency(connection, value)
+}
+
+/// Links an exact pending option original after the caller validates the full dependency
+/// session, target and renewal origin in this same publication transaction. Historical custody
+/// is already durable; neither its raw observation nor its source revision is inserted again.
+pub(in crate::catalog) fn retain_option_original(
+    connection: &rusqlite::Transaction<'_>,
+    value: &ProviderMetadataCaptureEvidence,
+) -> Result<(), CatalogError> {
+    value.validate()?;
+    validate_retained_source_revisions(connection, &value.capture)?;
+    let mut statement = connection.prepare(
+        "SELECT session_digest, ordinal FROM provider_capture_originals
+         WHERE capture_observation_digest=?1 AND raw_claim_digest=?2
+          AND physical_receipt_digest=?3 LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![
+        value.capture.observation_digest().bytes(),
+        value.physical.raw_claim_digest.bytes(),
+        value.physical.claim.physical_receipt_digest().bytes(),
+    ])?;
+    let row = rows.next()?.ok_or(CatalogError::ProviderCaptureMismatch)?;
+    let session = parse_digest(1, &row.get::<_, Vec<u8>>(0)?)?;
+    let ordinal: u16 = row.get(1)?;
+    if rows.next()?.is_some() {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    drop(rows);
+    drop(statement);
+    let original = original::load(connection, session, ordinal)?
+        .ok_or(CatalogError::ProviderCaptureMismatch)?;
+    if original.published_binding().is_some()
+        || original.capture() != &value.capture
+        || original.physical() != &value.physical
+    {
+        return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    retain_dependency(connection, value)
+}
+
+fn retain_dependency(
+    connection: &Connection,
+    value: &ProviderMetadataCaptureEvidence,
+) -> Result<(), CatalogError> {
     connection.execute(
         "INSERT OR IGNORE INTO provider_capture_metadata_dependencies
         (dependency_digest,capture_observation_digest,raw_object_input_ordinal,raw_claim_digest,

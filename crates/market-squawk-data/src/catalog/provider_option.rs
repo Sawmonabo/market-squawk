@@ -517,7 +517,7 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
         false,
     )?;
     for dependency in &evidence.reference_dependencies {
-        metadata::retain(connection, &dependency.metadata, recorded_at)?;
+        metadata::retain_option_original(connection, &dependency.metadata)?;
     }
     insert_option_binding(connection, evidence, recorded_at)?;
     let used: bool = connection.query_row(

@@ -661,7 +661,7 @@ describe("Market Squawk desktop boundary", () => {
     )
     savedScreen.unmount()
 
-    const historyToken = "history_0123456789abcdef0123456789abcdef"
+    const historyToken = "history_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     const historyJobId = "781276a0-33f1-4fb3-8cbb-bb2095acd0cf"
     const jobGeneration = "9007199254740993"
     const initialHistoryGeneration = "a".repeat(64)
@@ -1227,7 +1227,7 @@ describe("Market Squawk desktop boundary", () => {
     let collectionRefreshFails = false
     let collectionChoices = ["SPY", "QQQ", "DIA", "IWM", "VTI", "AAPL", "MSFT", "NVDA", "TSLA"]
       .map((symbol) => ({ symbol, kept: symbol !== "QQQ" }))
-    const historyToken = "history_0123456789abcdef0123456789abcdef"
+    const historyToken = "history_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     const generationToken = "a".repeat(64)
     const historyResult: ApplicationResult = {
       data: { data: {

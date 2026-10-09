@@ -2304,8 +2304,8 @@ fn market_search_page() -> Value {
 }
 
 pub(super) fn market_token(prefix: &str) -> Value {
-    if prefix == "market" {
-        return json!({"type": "string", "pattern": "^market_[0-9a-f]{64}$"});
+    if matches!(prefix, "market" | "history") {
+        return json!({"type": "string", "pattern": format!("^{prefix}_[0-9a-f]{{64}}$")});
     }
     json!({
         "type": "string",
@@ -10586,7 +10586,7 @@ mod tests {
             ),
             (
                 json!({"data": {
-                "historyToken":"history_0123456789abcdef0123456789abcdef",
+                "historyToken":"history_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "currency":"USD", "generationToken":digest, "partial":false,
                 "bars":[{"time":{"precision":"nominal_date","date":"2026-10-01"},
                     "open":"100","high":"102","low":"99","close":"101","volume":"1234",

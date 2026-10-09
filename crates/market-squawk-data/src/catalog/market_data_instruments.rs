@@ -1899,6 +1899,75 @@ impl MarketDataInstrumentReadCapability {
         })
     }
 
+    /// Resolves an unambiguous equity/fund display symbol at the requested cutoffs.
+    ///
+    /// Candidate IDs come from the exact term index. Each candidate is independently selected
+    /// at both cutoffs before checking its display symbol; a retired alias or a name match
+    /// cannot become a ticker match. Missing and ambiguous symbols return no selection.
+    pub fn unique_display_symbol_as_of(
+        &self,
+        symbol: &str,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MarketDataInstrumentRecord>, MarketDataInstrumentCatalogError> {
+        validate_search(symbol, 2)?;
+        check_operation(deadline, cancellation)?;
+        self.read_snapshot(deadline, cancellation, |connection, limits| {
+            let mut candidates = connection.prepare(
+                "SELECT DISTINCT revisions.instrument_id
+                 FROM market_data_instrument_search_terms AS terms
+                 JOIN market_data_instrument_revisions AS revisions
+                   ON revisions.revision_digest=terms.revision_digest
+                 WHERE terms.normalized_term=?1 AND revisions.published_at_ns<=?2",
+            )?;
+            let mut rows =
+                candidates.query(params![normalize(symbol), knowledge_at.unix_nanos()])?;
+            let mut selected = None;
+            while let Some(row) = rows.next()? {
+                check_operation(deadline, cancellation)?;
+                let raw: String = row.get(0)?;
+                let id = raw
+                    .parse::<InstrumentId>()
+                    .map_err(|_| MarketDataInstrumentCatalogError::CorruptCatalog)?;
+                if id.to_string() != raw {
+                    return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+                }
+                // Candidate records are released each iteration. Charge only the resident
+                // selected record plus this candidate, rather than cumulative discarded rows.
+                let mut budget = ResultBudget::new(limits);
+                if let Some(record) = &selected {
+                    budget
+                        .charge([MarketDataInstrumentRecord::retained_bytes(record)?])
+                        .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                }
+                let PopulationMember::Record(record) = select_population_member(
+                    connection,
+                    id,
+                    knowledge_at,
+                    effective_at,
+                    &mut budget,
+                )?
+                else {
+                    continue;
+                };
+                if !matches!(
+                    record.definition().asset_class(),
+                    AssetClass::Equity | AssetClass::Fund
+                ) || record.display_symbol_at(effective_at) != Some(symbol)
+                {
+                    continue;
+                }
+                if selected.is_some() {
+                    return Ok(None);
+                }
+                selected = Some(record);
+            }
+            Ok(selected)
+        })
+    }
+
     /// Resolves one exact provider-native identity inside its explicit source namespace.
     ///
     /// This backend seam never guesses from a ticker or an unqualified symbol. Exact selection is

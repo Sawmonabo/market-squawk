@@ -9,17 +9,8 @@ use serde_json::{Value, json};
 const PAGE_TOKEN_DOMAIN: &[u8] = b"market-squawk/market-page/v1\0";
 pub(super) const MAXIMUM_PRODUCT_MARKET_ROWS: usize = 100;
 
-use crate::application::market_selection::product::{ProductMarketIdentity, resolve_token, token};
-pub(super) use crate::application::market_selection::product::{
-    product_market_identities, resolve_selection_token,
-};
-
-pub(super) fn resolve_history_token(
-    identities: &[ProductMarketIdentity],
-    token: &str,
-) -> Result<InstrumentId, ServiceError> {
-    resolve_token(identities, token, |identity| identity.history_token())
-}
+pub(super) use crate::application::market_selection::product::product_market_identities;
+use crate::application::market_selection::product::{ProductMarketIdentity, token};
 
 pub(super) struct ProductPageSelection {
     instrument_ids: Vec<InstrumentId>,
@@ -999,12 +990,17 @@ mod tests {
         );
         assert!(crypto_page["data"][0]["symbol"].is_null());
         assert_eq!(
-            resolve_selection_token(
-                &crypto,
+            MarketProductSelectionReadCapability::selection_record_owned(
+                &reader,
                 crypto_page["data"][0]["selectionToken"]
                     .as_str()
-                    .ok_or("missing crypto token")?
+                    .ok_or("missing crypto token")?,
+                cutoff,
+                deadline,
+                &cancellation,
             )?
+            .definition()
+            .instrument_id()
             .to_string(),
             "00000000-0000-0000-0000-000000000103"
         );
@@ -1016,13 +1012,29 @@ mod tests {
         let token = ticker_page["data"][0]["selectionToken"]
             .as_str()
             .ok_or("missing token")?;
-        let selected = resolve_selection_token(&ticker, token)?;
+        let selected = MarketProductSelectionReadCapability::selection_record_owned(
+            &reader,
+            token,
+            cutoff,
+            deadline,
+            &cancellation,
+        )?
+        .definition()
+        .instrument_id();
         assert_eq!(selected.to_string(), "00000000-0000-0000-0000-000000000101");
         let named = product_market_identities(&records, cutoff, Some("spdr"))?;
         let (name_page, _, _) = product_search_page(&named, "spdr", 100, None)?;
         assert_eq!(name_page["data"][0]["selectionToken"], token);
         assert_eq!(
-            resolve_history_token(&named, ticker[0].history_token())?,
+            MarketProductSelectionReadCapability::history_record_owned(
+                &reader,
+                ticker[0].history_token(),
+                cutoff,
+                deadline,
+                &cancellation,
+            )?
+            .definition()
+            .instrument_id(),
             ticker[0].instrument_id()
         );
 
@@ -1311,13 +1323,14 @@ mod tests {
         };
         assert_eq!(token.len(), "market_".len() + 64);
         let resolve = |reader: &MarketDataInstrumentReadCapability, token: &str, cutoff| {
-            MarketProductSelectionReadCapability::resolve_owned(
+            MarketProductSelectionReadCapability::selection_record_owned(
                 reader,
                 token,
                 cutoff,
                 deadline,
                 &cancellation,
             )
+            .map(|record| record.definition().instrument_id())
         };
         assert_eq!(resolve(&reader, token, cutoff)?, selected);
         assert!(matches!(
@@ -1356,13 +1369,13 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
-            MarketProductSelectionReadCapability::resolve_owned(
+            MarketProductSelectionReadCapability::selection_record_owned(
                 &reader, token, cutoff, deadline, &cancelled,
             ),
             Err(ServiceError::Cancelled)
         ));
         assert!(matches!(
-            MarketProductSelectionReadCapability::resolve_owned(
+            MarketProductSelectionReadCapability::selection_record_owned(
                 &reader,
                 token,
                 cutoff,
@@ -1371,6 +1384,130 @@ mod tests {
             ),
             Err(ServiceError::DeadlineExceeded)
         ));
+
+        let history_token = identity.history_token();
+        assert_eq!(history_token.len(), "history_".len() + 64);
+        let read_history = |reader: &MarketDataInstrumentReadCapability, token: &str, at| {
+            MarketProductSelectionReadCapability::history_record_owned(
+                reader,
+                token,
+                at,
+                deadline,
+                &cancellation,
+            )
+        };
+        assert_eq!(read_history(&reader, history_token, cutoff)?, records[0]);
+        for at in [
+            Timestamp::from_unix_nanos(records[0].published_at().unix_nanos() - 1),
+            removed.published_at(),
+        ] {
+            assert!(matches!(
+                read_history(&reader, history_token, at),
+                Err(ServiceError::Unavailable)
+            ));
+        }
+        assert!(matches!(
+            read_history(&reader, token, cutoff),
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert!(matches!(
+            resolve(&reader, history_token, cutoff),
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert!(matches!(
+            read_history(&reader, &format!("history_{}", "a".repeat(32)), cutoff),
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert!(matches!(
+            MarketProductSelectionReadCapability::history_record_owned(
+                &reader,
+                history_token,
+                cutoff,
+                deadline,
+                &cancelled,
+            ),
+            Err(ServiceError::Cancelled)
+        ));
+        assert!(matches!(
+            MarketProductSelectionReadCapability::history_record_owned(
+                &reader,
+                history_token,
+                cutoff,
+                Instant::now() - Duration::from_millis(1),
+                &cancellation,
+            ),
+            Err(ServiceError::DeadlineExceeded)
+        ));
+
+        // Broad exact matches can be names rather than display symbols. Two such names
+        // must neither hide the real collection member nor mask a later symbol collision.
+        let mut distractors = Vec::new();
+        for (id, symbol) in [
+            ("00000000-0000-0000-0000-000000000001", "AAA"),
+            ("00000000-0000-0000-0000-000000000002", "BBB"),
+        ] {
+            let mut definition = serde_json::to_value(records[1].definition())?;
+            definition["instrument_id"] = json!(id);
+            definition["display_name"]["value"] = json!("SPY");
+            definition["venue_mappings"][0]["venue_symbol"] = json!(symbol);
+            distractors.push(serde_json::from_value(definition)?);
+        }
+        MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority)).synchronize(
+            MarketDataInstrumentSynchronization::try_new(distractors, 2)?,
+            deadline,
+            &cancellation,
+        )?;
+        let distracting = reader
+            .latest(
+                "00000000-0000-0000-0000-000000000002".parse()?,
+                deadline,
+                &cancellation,
+            )?
+            .ok_or("missing display-name match")?;
+        let collection_cutoff = distracting.published_at();
+        assert!(
+            reader
+                .resolve_exact_as_of(
+                    "SPY",
+                    collection_cutoff,
+                    collection_cutoff,
+                    deadline,
+                    &cancellation,
+                )?
+                .has_more()
+        );
+        let collection_member = |reader: &MarketDataInstrumentReadCapability, symbol, at| {
+            reader.unique_display_symbol_as_of(symbol, at, at, deadline, &cancellation)
+        };
+        assert_eq!(
+            collection_member(&reader, "SPY", collection_cutoff)?,
+            Some(removed.clone())
+        );
+        assert!(collection_member(&reader, "MISSING", collection_cutoff)?.is_none());
+        let mut collision = serde_json::to_value(distracting.definition())?;
+        collision["reference_evidence"]["metadata_revision"] = json!("symbol-collision-v2");
+        collision["effective_interval"]["starts_at"] = json!(140);
+        collision["venue_mappings"][0]["venue_symbol"] = json!("SPY");
+        MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority)).synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![serde_json::from_value(collision)?],
+                1,
+            )?,
+            deadline,
+            &cancellation,
+        )?;
+        let collided = reader
+            .latest(
+                distracting.definition().instrument_id(),
+                deadline,
+                &cancellation,
+            )?
+            .ok_or("missing symbol collision")?;
+        assert!(collection_member(&reader, "SPY", collided.published_at())?.is_none());
+        assert_eq!(
+            collection_member(&reader, "SPY", collection_cutoff)?,
+            Some(removed.clone())
+        );
         drop(reader);
         drop(authority);
         let reopened = Arc::new(Mutex::new(CatalogAuthority::open(CatalogConfig::try_new(
@@ -1384,6 +1521,12 @@ mod tests {
         assert_eq!(
             resolve(&reader, &current_token, removed.published_at())?,
             selected
+        );
+        assert_eq!(read_history(&reader, history_token, cutoff)?, records[0]);
+        assert!(collection_member(&reader, "SPY", collided.published_at())?.is_none());
+        assert_eq!(
+            collection_member(&reader, "SPY", collection_cutoff)?,
+            Some(removed)
         );
         Ok(())
     }

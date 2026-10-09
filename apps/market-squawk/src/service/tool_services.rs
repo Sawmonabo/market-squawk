@@ -578,10 +578,7 @@ impl InstalledToolServices {
                     (admission, JobAdmissionOwner::InvestmentFinancials)
                 }
                 START_HISTORY => {
-                    use crate::application::market_selection::product::{
-                        MarketProductSelectionReadCapability, product_market_identities,
-                        resolve_token,
-                    };
+                    use crate::application::market_selection::product::MarketProductSelectionReadCapability;
                     let input: HistoryPreparationStart = decode(request.arguments())?;
                     let lookback =
                         market_squawk_adapter_alpaca::AlpacaHistoricalLookback::try_from_days(
@@ -592,18 +589,14 @@ impl InstalledToolServices {
                         Arc::clone(&self.profile_research),
                         self.profile_research.market_data_instruments(),
                     );
-                    let records = selection
-                        .population(captured_at, context.deadline(), context.cancellation())
+                    let instrument = selection
+                        .history_record(
+                            &input.history_token,
+                            captured_at,
+                            context.deadline(),
+                            context.cancellation(),
+                        )
                         .await?;
-                    let identities = product_market_identities(&records, captured_at, None)?;
-                    let instrument_id =
-                        resolve_token(&identities, &input.history_token, |identity| {
-                            identity.history_token()
-                        })?;
-                    let instrument = records
-                        .into_iter()
-                        .find(|record| record.definition().instrument_id() == instrument_id)
-                        .ok_or(ServiceError::InvalidResult)?;
                     ensure_live(context)?;
                     let admission = self
                         .runners

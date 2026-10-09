@@ -31,9 +31,11 @@ const ANALYTICAL_TOKEN_PATTERNS: &[(&str, &str)] = &[
     ("^state_[0-9a-f]{32}$", "state_"),
     ("^validation_[0-9a-f]{32}$", "validation_"),
     ("^activation_[0-9a-f]{32}$", "activation_"),
+    // Workflow history entries use their own 32-hex identity; market history uses a revision.
     ("^history_[0-9a-f]{32}$", "history_"),
     ("^workflow_[0-9a-f]{32}$", "workflow_"),
 ];
+const MARKET_HISTORY_TOKEN_PATTERN: &str = "^history_[0-9a-f]{64}$";
 const MARKET_SELECTION_TOKEN_PATTERN: &str = "^market_[0-9a-f]{64}$";
 const MAXIMUM_POSITIONAL_ITEMS: usize = 256;
 
@@ -311,6 +313,7 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                     | INTEGER_PATTERN
                     | MEDIA_TYPE_PATTERN
                     | ARTIFACT_ID_PATTERN
+                    | MARKET_HISTORY_TOKEN_PATTERN
                     | MARKET_SELECTION_TOKEN_PATTERN
             ) || analytical_token_prefix(pattern).is_some()
         }
@@ -467,6 +470,9 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
                 .and_then(|prefix| value.strip_prefix(prefix))
                 .is_some_and(|suffix| lowercase_hex_matches(suffix, 32))
         }
+        Some(MARKET_HISTORY_TOKEN_PATTERN) => value
+            .strip_prefix("history_")
+            .is_some_and(|suffix| lowercase_hex_matches(suffix, 64)),
         Some(MARKET_SELECTION_TOKEN_PATTERN) => value
             .strip_prefix("market_")
             .is_some_and(|suffix| lowercase_hex_matches(suffix, 64)),
@@ -687,9 +693,10 @@ mod tests {
         ANALYTICAL_TOKEN_PATTERNS, ARTIFACT_ID_PATTERN, CALENDAR_DATE_PATTERN,
         CALENDAR_MONTH_PATTERN, CALENDAR_QUARTER_PATTERN, CALENDAR_YEAR_PATTERN,
         CANONICAL_DECIMAL_PATTERN, FORMATTED_PERCENTAGE_PATTERN, INTEGER_PATTERN,
-        LOWERCASE_SHA256_PATTERN, MARKET_SELECTION_TOKEN_PATTERN, NON_WHITESPACE_PATTERN,
-        OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN, POSITIVE_DECIMAL_PATTERN,
-        SCALED_DECIMAL_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
+        LOWERCASE_SHA256_PATTERN, MARKET_HISTORY_TOKEN_PATTERN, MARKET_SELECTION_TOKEN_PATTERN,
+        NON_WHITESPACE_PATTERN, OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN,
+        POSITIVE_DECIMAL_PATTERN, SCALED_DECIMAL_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data,
+        validate_data_schema,
     };
     use serde_json::json;
 
@@ -817,20 +824,35 @@ mod tests {
                 &json!(format!("other_{prefix}0123456789abcdef0123456789abcdef"))
             ));
         }
-        let market_token = json!({"type":"string", "pattern":MARKET_SELECTION_TOKEN_PATTERN});
-        assert!(validate_data_schema(&market_token));
-        assert!(validate_data(
-            &market_token,
-            &json!("market_c127919d654047f89f6b902523578cb5c127919d654047f89f6b902523578cb5")
-        ));
-        assert!(!validate_data(
-            &market_token,
-            &json!("market_C127919D654047F89F6B902523578CB5C127919D654047F89F6B902523578CB5")
-        ));
-        assert!(!validate_data(
-            &market_token,
-            &json!("market_c127919d-6540-47f8-9f6b-902523578cb5")
-        ));
+        for (prefix, pattern) in [
+            ("market", MARKET_SELECTION_TOKEN_PATTERN),
+            ("history", MARKET_HISTORY_TOKEN_PATTERN),
+        ] {
+            let schema = json!({"type":"string", "pattern":pattern});
+            assert!(validate_data_schema(&schema));
+            assert!(validate_data(
+                &schema,
+                &json!(format!(
+                    "{prefix}_{}",
+                    "c127919d654047f89f6b902523578cb5c127919d654047f89f6b902523578cb5"
+                ))
+            ));
+            assert!(!validate_data(
+                &schema,
+                &json!(format!(
+                    "{prefix}_{}",
+                    "C127919D654047F89F6B902523578CB5C127919D654047F89F6B902523578CB5"
+                ))
+            ));
+            assert!(!validate_data(
+                &schema,
+                &json!(format!("{prefix}_c127919d-6540-47f8-9f6b-902523578cb5"))
+            ));
+            assert!(!validate_data(
+                &schema,
+                &json!(format!("{prefix}_c127919d654047f89f6b902523578cb5"))
+            ));
+        }
 
         let unsigned_schema = json!({"type": "string", "pattern": UNSIGNED_INTEGER_PATTERN});
         assert!(validate_data_schema(&unsigned_schema));

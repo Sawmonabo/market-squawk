@@ -1306,6 +1306,177 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
         serde_json::from_slice::<AlpacaDoctorRenewalChain>(&serde_json::to_vec(&historical)?)?,
         historical
     );
+    // A historical doctor chain supplies the actual typed option-reference relationship.
+    // Original captures keep their old revision and clock after current permission renews.
+    use crate::{
+        AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, CoverageTopology,
+        EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
+        NetworkAccessPolicy, OptionReferenceOrigin, ProviderBudgetPolicy,
+        ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+        SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+        SourceProtocolProfile,
+    };
+    use market_squawk_domain::{
+        AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DeliveryEvidence,
+        EffectiveInterval, ExactPayloadEvidence, MetadataRevision, RevisionBoundPayloadEvidence,
+        SchemaVersion, SequenceCapability, SourceId, VenueId,
+    };
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    let option_metadata = |revision: &str,
+                           receipt: &AlpacaPaperIexDoctorReceiptV1,
+                           starts_at: Timestamp|
+     -> TestResult<SourceMetadata> {
+        let effective = EffectiveInterval::new(starts_at, Some(receipt.exclusive_expires_at()))?;
+        let evidence = ExactPayloadEvidence::from_content_digest(receipt.receipt_sha256());
+        let provider = SourceIdentifier::try_from("alpaca-market-data")?;
+        let authorization = AuthorizationGrant::new(
+            AuthorizationMode::UserAuthorized,
+            AuthorizationBasis::new(SourceIdentifier::try_from("alpaca-paper-market-data")?),
+            evidence.clone(),
+            effective,
+        );
+        let budget = ProviderBudgetPolicy::try_new(
+            BudgetScope::for_authorization(provider.clone(), &authorization)?,
+            NonZeroU32::new(10).ok_or("request budget")?,
+            NonZeroU64::new(60_000_000_000).ok_or("budget window")?,
+            NonZeroU16::new(1).ok_or("concurrency budget")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).ok_or("backoff")?,
+                NonZeroU64::new(60_000_000_000).ok_or("backoff cap")?,
+                1_000,
+            )?,
+        )?;
+        Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            SourceId::try_from("alpaca-basic-indicative-option-chain-v1")?,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from(revision)?),
+                evidence.clone(),
+            ),
+            SourceClass::Broker,
+            provider,
+            authorization,
+            SourceCoverage::try_instrument(
+                evidence,
+                effective,
+                vec![AssetClass::Option],
+                CoverageTopology::single_venue(VenueId::try_from("alpaca-indicative-options")?),
+                InstrumentCoverage::partial(),
+                None,
+                CoverageDelay::Delayed(900_000_000_000),
+                DeliveryEvidence::Indirect,
+            )?,
+            DataQuality::DirectUnverified,
+            NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
+                "https://data.alpaca.markets/v1beta1/options/snapshots/AAPL",
+            ])?),
+            FreshnessPolicy::try_new(1, 1, 1, 1, 0)?,
+            Some(budget),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::None,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))?)
+    };
+    let original_metadata = option_metadata(
+        "option-original-v1",
+        historical.original(),
+        historical.original().verified_at(),
+    )?;
+    let current_metadata = option_metadata(
+        "option-renewed-v1",
+        historical.current(),
+        historical.current().verified_at(),
+    )?;
+    let origin =
+        OptionReferenceOrigin::try_new(&original_metadata, &current_metadata, historical.clone())?;
+    origin.validate_metadata(&original_metadata, &current_metadata)?;
+    let option_capture =
+        |metadata: &SourceMetadata, at: Timestamp| -> TestResult<ProviderCaptureSetReceipt> {
+            Ok(ProviderCaptureSetReceipt::try_new(
+                metadata.source_id().clone(),
+                metadata.revision().clone(),
+                SourceIdentifier::try_from("alpaca:option-reference-origin-test")?,
+                digest(80),
+                ProviderCaptureTerminalDisposition::StandaloneResponse,
+                vec![ProviderCapturePageReceipt::try_new(
+                    0,
+                    digest(80),
+                    None,
+                    None,
+                    200,
+                    1,
+                    digest(81),
+                    at,
+                )?],
+            )?)
+        };
+    let original_capture = option_capture(&original_metadata, historical.original().verified_at())?;
+    let current_capture = option_capture(&current_metadata, historical.current().verified_at())?;
+    origin.validate_capture_pair(&original_capture, &current_capture)?;
+    assert!(
+        origin
+            .validate_capture_pair(&current_capture, &original_capture)
+            .is_err()
+    );
+    assert!(
+        origin
+            .validate_capture_pair(&original_capture, &original_capture)
+            .is_err()
+    );
+    for at in [
+        historical.original().verified_at().checked_sub_nanos(1)?,
+        historical.original().exclusive_expires_at(),
+    ] {
+        assert!(
+            origin
+                .validate_capture_pair(&option_capture(&original_metadata, at)?, &current_capture,)
+                .is_err()
+        );
+    }
+    for at in [
+        historical.current().verified_at().checked_sub_nanos(1)?,
+        historical.current().exclusive_expires_at(),
+    ] {
+        assert!(
+            origin
+                .validate_capture_pair(&original_capture, &option_capture(&current_metadata, at)?,)
+                .is_err()
+        );
+    }
+    let wrong_revision = option_metadata(
+        "option-unrelated-v1",
+        historical.current(),
+        historical.current().verified_at(),
+    )?;
+    assert!(
+        origin
+            .validate_metadata(&original_metadata, &wrong_revision)
+            .is_err()
+    );
+    assert!(
+        origin
+            .validate_capture_pair(
+                &original_capture,
+                &option_capture(&wrong_revision, historical.current().verified_at())?,
+            )
+            .is_err()
+    );
+    let wrong_clock = option_metadata(
+        "option-renewed-v1",
+        historical.current(),
+        historical.current().verified_at().checked_add_nanos(1)?,
+    )?;
+    assert!(
+        OptionReferenceOrigin::try_new(&original_metadata, &wrong_clock, historical.clone(),)
+            .is_err()
+    );
+
     assert_eq!(
         pending_renewal.apply(
             capability,
