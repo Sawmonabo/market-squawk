@@ -4598,8 +4598,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/alpaca_historical/market.rs",
-      "sha256": "9a02b449c0f544018e0ba85e86bf621dbd9c25854139a2728f4191cfea836488",
-      "size_bytes": 57747
+      "sha256": "9ab7771177813a529382c84af721a597a57f53180f6b3ed1979372899d43661f",
+      "size_bytes": 59703
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/bea.rs",
@@ -4753,8 +4753,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials.rs",
-      "sha256": "998deaeb9cacc0a755851dd1ad895fe3473169b765712d1e054d3c8c688387a9",
-      "size_bytes": 20886
+      "sha256": "f82ccb164737018ae8c0606d4713aea183eac0e38e0eaf6d0a07b3c000369d8a",
+      "size_bytes": 26219
     },
     {
       "path": "apps/market-squawk/src/application/research/investment_financials/authorization.rs",

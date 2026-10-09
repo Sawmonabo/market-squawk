@@ -62,6 +62,106 @@ pub(crate) enum InvestmentFinancialSection {
     Filings,
 }
 
+/// Scoped diagnostics also retain the active phase when the caller drops the read future.
+struct FinancialReadProgress<'a> {
+    section: InvestmentFinancialSection,
+    deadline: Instant,
+    cancellation: &'a CancellationToken,
+    started: Instant,
+    stage_started: Instant,
+    stage: &'static str,
+    remaining_at_stage_entry_ms: u128,
+    stage_failed: bool,
+    finished: bool,
+}
+
+impl<'a> FinancialReadProgress<'a> {
+    fn new(
+        section: InvestmentFinancialSection,
+        deadline: Instant,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            section,
+            deadline,
+            cancellation,
+            started: now,
+            stage_started: now,
+            stage: "validation",
+            remaining_at_stage_entry_ms: deadline.saturating_duration_since(now).as_millis(),
+            stage_failed: false,
+            finished: false,
+        }
+    }
+
+    fn enter(&mut self, stage: &'static str) {
+        self.record(if self.stage_failed {
+            "failed"
+        } else {
+            "completed"
+        });
+        self.stage = stage;
+        self.stage_started = Instant::now();
+        self.remaining_at_stage_entry_ms = self
+            .deadline
+            .saturating_duration_since(self.stage_started)
+            .as_millis();
+        self.stage_failed = false;
+    }
+
+    fn finish<T>(&mut self, result: Result<T, ServiceError>) -> Result<T, ServiceError> {
+        let outcome = match &result {
+            Ok(_) => "completed",
+            Err(ServiceError::Cancelled) => "cancelled",
+            Err(ServiceError::DeadlineExceeded) => "deadline_exceeded",
+            Err(_) => "failed",
+        };
+        self.record(outcome);
+        self.finished = true;
+        result
+    }
+
+    fn record(&self, outcome: &'static str) {
+        let now = Instant::now();
+        let stage_elapsed = now.duration_since(self.stage_started);
+        // Static fields only: no selection/cursor tokens, identities, payloads or error text.
+        macro_rules! record {
+            ($level:expr) => {
+                tracing::event!(
+                    $level,
+                    section = ?self.section,
+                    stage = self.stage,
+                    outcome,
+                    elapsed_ms = %now.duration_since(self.started).as_millis(),
+                    stage_elapsed_ms = %stage_elapsed.as_millis(),
+                    remaining_at_stage_entry_ms = %self.remaining_at_stage_entry_ms,
+                    remaining_ms = %self.deadline.saturating_duration_since(now).as_millis(),
+                    cancelled = self.cancellation.is_cancelled(),
+                    deadline_elapsed = now >= self.deadline,
+                    "investment financial read phase"
+                );
+            };
+        }
+        if outcome != "completed" {
+            record!(tracing::Level::WARN);
+        } else if stage_elapsed >= Duration::from_millis(250) {
+            // Diagnostic visibility threshold only; this does not change the read deadline.
+            record!(tracing::Level::INFO);
+        } else {
+            record!(tracing::Level::DEBUG);
+        }
+    }
+}
+
+impl Drop for FinancialReadProgress<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record("caller_dropped");
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InvestmentFinancialState {
@@ -189,213 +289,238 @@ impl InvestmentFinancialReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<InvestmentFinancialResult, ServiceError> {
-        check(deadline, cancellation)?;
-        if !(1..=MAX_PAGE_ITEMS).contains(&limit) || limit > limits.maximum_result_items() {
-            return Err(ServiceError::InvalidRequest);
-        }
-        self.cache.prune();
-        let (id, snapshot, position, fresh, authorizations) = if let Some(cursor) = cursor {
-            if cursor.len() > 1024 {
+        let mut progress = FinancialReadProgress::new(section, deadline, cancellation);
+        let result = async {
+            check(deadline, cancellation)?;
+            if !(1..=MAX_PAGE_ITEMS).contains(&limit) || limit > limits.maximum_result_items() {
                 return Err(ServiceError::InvalidRequest);
             }
-            let position: Cursor =
-                serde_json::from_str(cursor).map_err(|_| ServiceError::InvalidRequest)?;
-            let snapshot = {
-                let mut entries = self
-                    .cache
-                    .entries
-                    .lock()
-                    .map_err(|_| ServiceError::Unavailable)?;
-                entries.get_mut(&position.read_token).map(|read| {
-                    read.touched = Instant::now();
-                    Arc::clone(&read.snapshot)
-                })
-            };
-            let Some(snapshot) = snapshot else {
-                return Ok(expired(selection_token, section));
-            };
-            if snapshot.selection_token != selection_token || snapshot.section != section {
-                return Err(ServiceError::InvalidRequest);
-            }
-            // A continuation owns fresh use receipts for the original immutable selection.
-            let authorizations = self
-                .authorize(&snapshot.selections, section, deadline, cancellation)
-                .await?;
-            (
-                position.read_token,
-                snapshot,
-                position,
-                false,
-                authorizations,
-            )
-        } else {
-            let now = Utc::now();
-            let cutoff = now
-                .timestamp_nanos_opt()
-                .filter(|n| *n > 0)
-                .map(Timestamp::from_unix_nanos)
-                .ok_or(ServiceError::Unavailable)?;
-            let instrument = self
-                .selections
-                .resolve(selection_token, cutoff, deadline, cancellation)
-                .await?;
-            let date = cutoff
-                .utc_calendar_date()
-                .map_err(|_| ServiceError::Unavailable)?;
-            let request = CompanyResearchRequest::try_new(
-                instrument,
-                cutoff,
-                ResearchTemporalCoordinate::calendar_date(date),
-                // Financial history preserves complete original filing envelopes even
-                // when a later filing repeats only one of their financial concepts.
-                ResearchRevisionPolicy::AllKnown,
-            )
-            .map_err(canonical_error)?;
-            let reader = CompanyResearchReadCapability::new(Arc::clone(&self.research));
-            let mut selections = Vec::new();
-            let mut families = Vec::new();
-            let requested: &[SecResearchFamily] = if section == InvestmentFinancialSection::Filings
-            {
-                &[SecResearchFamily::Submissions]
+            self.cache.prune();
+            let (id, snapshot, position, fresh, authorizations) = if let Some(cursor) = cursor {
+                progress.enter("cursor_lookup");
+                if cursor.len() > 1024 {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let position: Cursor =
+                    serde_json::from_str(cursor).map_err(|_| ServiceError::InvalidRequest)?;
+                let snapshot = {
+                    let mut entries = self
+                        .cache
+                        .entries
+                        .lock()
+                        .map_err(|_| ServiceError::Unavailable)?;
+                    entries.get_mut(&position.read_token).map(|read| {
+                        read.touched = Instant::now();
+                        Arc::clone(&read.snapshot)
+                    })
+                };
+                let Some(snapshot) = snapshot else {
+                    return Ok(expired(selection_token, section));
+                };
+                if snapshot.selection_token != selection_token || snapshot.section != section {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                // A continuation owns fresh use receipts for the original immutable selection.
+                progress.enter("authorization");
+                let authorizations = self
+                    .authorize(&snapshot.selections, section, deadline, cancellation)
+                    .await?;
+                (
+                    position.read_token,
+                    snapshot,
+                    position,
+                    false,
+                    authorizations,
+                )
             } else {
-                &[
-                    SecResearchFamily::CompanyFacts,
-                    SecResearchFamily::FilingXbrl,
-                ]
-            };
-            for family in requested {
-                check(deadline, cancellation)?;
-                match reader
-                    .select_company_family(&request, *family, deadline, cancellation.child_token())
-                    .await
-                {
-                    Ok(selected) => {
-                        families.push(availability(*family, selected.outcome()));
-                        selections.push(selected);
-                    }
-                    Err(CanonicalResearchReadError::Cancelled) => {
-                        return Err(ServiceError::Cancelled);
-                    }
-                    Err(CanonicalResearchReadError::DeadlineExceeded) => {
-                        return Err(ServiceError::DeadlineExceeded);
-                    }
-                    Err(_) => families.push(FamilyAvailability {
-                        family: family_name(*family),
-                        state: InvestmentFinancialState::Unavailable,
-                        reason: Some("evidence_unavailable"),
-                    }),
-                }
-            }
-            // Authorize the original manifests before deriving even the grouping index.
-            let authorizations = self
-                .authorize(&selections, section, deadline, cancellation)
-                .await?;
-            let authorized: Vec<_> = authorizations.iter().map(Option::is_some).collect();
-            for (selected, allowed) in selections.iter().zip(&authorized) {
-                if !allowed {
-                    if let Some(family) = families
-                        .iter_mut()
-                        .find(|family| family.family == family_name(selected.request().family()))
+                progress.enter("selection");
+                let now = Utc::now();
+                let cutoff = now
+                    .timestamp_nanos_opt()
+                    .filter(|n| *n > 0)
+                    .map(Timestamp::from_unix_nanos)
+                    .ok_or(ServiceError::Unavailable)?;
+                let instrument = self
+                    .selections
+                    .resolve(selection_token, cutoff, deadline, cancellation)
+                    .await?;
+                let date = cutoff
+                    .utc_calendar_date()
+                    .map_err(|_| ServiceError::Unavailable)?;
+                let request = CompanyResearchRequest::try_new(
+                    instrument,
+                    cutoff,
+                    ResearchTemporalCoordinate::calendar_date(date),
+                    // Financial history preserves complete original filing envelopes even
+                    // when a later filing repeats only one of their financial concepts.
+                    ResearchRevisionPolicy::AllKnown,
+                )
+                .map_err(canonical_error)?;
+                let reader = CompanyResearchReadCapability::new(Arc::clone(&self.research));
+                let mut selections = Vec::new();
+                let mut families = Vec::new();
+                let requested: &[SecResearchFamily] =
+                    if section == InvestmentFinancialSection::Filings {
+                        &[SecResearchFamily::Submissions]
+                    } else {
+                        &[
+                            SecResearchFamily::CompanyFacts,
+                            SecResearchFamily::FilingXbrl,
+                        ]
+                    };
+                for family in requested {
+                    progress.enter(match family {
+                        SecResearchFamily::CompanyFacts => "prepared_company_facts_read",
+                        SecResearchFamily::Submissions => "prepared_filings_read",
+                        SecResearchFamily::FilingXbrl => "prepared_filing_details_read",
+                    });
+                    check(deadline, cancellation)?;
+                    match reader
+                        .select_company_family(
+                            &request,
+                            *family,
+                            deadline,
+                            cancellation.child_token(),
+                        )
+                        .await
                     {
-                        family.state = InvestmentFinancialState::Unavailable;
-                        family.reason = Some("rights_unavailable");
+                        Ok(selected) => {
+                            families.push(availability(*family, selected.outcome()));
+                            selections.push(selected);
+                        }
+                        Err(CanonicalResearchReadError::Cancelled) => {
+                            return Err(ServiceError::Cancelled);
+                        }
+                        Err(CanonicalResearchReadError::DeadlineExceeded) => {
+                            return Err(ServiceError::DeadlineExceeded);
+                        }
+                        Err(_) => {
+                            progress.stage_failed = true;
+                            families.push(FamilyAvailability {
+                                family: family_name(*family),
+                                state: InvestmentFinancialState::Unavailable,
+                                reason: Some("evidence_unavailable"),
+                            });
+                        }
                     }
                 }
-            }
-            let scratch = self
-                .research
-                .analytical()
-                .operation_scratch()
-                .map_err(|_| ServiceError::Unavailable)?;
-            let selection_token = selection_token.to_owned();
-            let effective_on = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
-            let snapshot = self
+                // Authorize the original manifests before deriving even the grouping index.
+                progress.enter("authorization");
+                let authorizations = self
+                    .authorize(&selections, section, deadline, cancellation)
+                    .await?;
+                let authorized: Vec<_> = authorizations.iter().map(Option::is_some).collect();
+                for (selected, allowed) in selections.iter().zip(&authorized) {
+                    if !allowed {
+                        if let Some(family) = families.iter_mut().find(|family| {
+                            family.family == family_name(selected.request().family())
+                        }) {
+                            family.state = InvestmentFinancialState::Unavailable;
+                            family.reason = Some("rights_unavailable");
+                        }
+                    }
+                }
+                progress.enter("snapshot_build");
+                let scratch = self
+                    .research
+                    .analytical()
+                    .operation_scratch()
+                    .map_err(|_| ServiceError::Unavailable)?;
+                let selection_token = selection_token.to_owned();
+                let effective_on = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+                let snapshot = self
+                    .research
+                    .run_owned_financial_read(deadline, cancellation, move |control| {
+                        build_snapshot(
+                            request,
+                            selection_token,
+                            section,
+                            effective_on,
+                            families,
+                            selections,
+                            authorized,
+                            scratch,
+                            deadline,
+                            &control,
+                        )
+                    })
+                    .await
+                    .map_err(map_research_error)??;
+                let id = Uuid::new_v4();
+                (
+                    id,
+                    Arc::new(snapshot),
+                    Cursor {
+                        read_token: id,
+                        unit: 0,
+                        item: 0,
+                    },
+                    true,
+                    authorizations,
+                )
+            };
+            // Fresh reads reuse their pre-snapshot receipts. Neither receipts nor authority masks
+            // are cached with cursors; each request retains them until its final recheck.
+            progress.enter("page");
+            let authorized: Vec<_> = authorizations.iter().map(Option::is_some).collect();
+            let owned = Arc::clone(&snapshot);
+            let result = self
                 .research
                 .run_owned_financial_read(deadline, cancellation, move |control| {
-                    build_snapshot(
-                        request,
-                        selection_token,
-                        section,
-                        effective_on,
-                        families,
-                        selections,
-                        authorized,
-                        scratch,
+                    page(
+                        &owned,
+                        &position,
+                        limit,
+                        limits,
+                        &authorized,
                         deadline,
                         &control,
                     )
                 })
                 .await
                 .map_err(map_research_error)??;
-            let id = Uuid::new_v4();
-            (
-                id,
-                Arc::new(snapshot),
-                Cursor {
-                    read_token: id,
-                    unit: 0,
-                    item: 0,
-                },
-                true,
-                authorizations,
-            )
-        };
-        // Fresh reads reuse their pre-snapshot receipts. Neither receipts nor authority masks
-        // are cached with cursors; each request retains them until its final recheck.
-        let authorized: Vec<_> = authorizations.iter().map(Option::is_some).collect();
-        let owned = Arc::clone(&snapshot);
-        let result = self
-            .research
-            .run_owned_financial_read(deadline, cancellation, move |control| {
-                page(
-                    &owned,
-                    &position,
-                    limit,
-                    limits,
-                    &authorized,
-                    deadline,
-                    &control,
-                )
-            })
-            .await
-            .map_err(map_research_error)??;
-        check(deadline, cancellation)?;
-        // Queueing and projection may outlive a receipt or grant. Recheck the exact original
-        // grants and catalog session before exposing data, without minting another decision.
-        for authorization in authorizations.iter().flatten() {
-            authorization
-                .recheck(&self.research, deadline, cancellation)
-                .await?;
-        }
-        check(deadline, cancellation)?;
-        if fresh {
-            let removed = {
-                let mut entries = self
-                    .cache
-                    .entries
-                    .lock()
-                    .map_err(|_| ServiceError::Unavailable)?;
-                let oldest = if entries.len() >= IDLE_HANDLES {
-                    entries
-                        .iter()
-                        .min_by_key(|(_, read)| read.touched)
-                        .map(|(id, _)| *id)
-                } else {
-                    None
+            progress.enter("final_recheck");
+            check(deadline, cancellation)?;
+            // Queueing and projection may outlive a receipt or grant. Recheck the exact original
+            // grants and catalog session before exposing data, without minting another decision.
+            for authorization in authorizations.iter().flatten() {
+                authorization
+                    .recheck(&self.research, deadline, cancellation)
+                    .await?;
+            }
+            check(deadline, cancellation)?;
+            progress.enter("cursor_cache");
+            if fresh {
+                let removed = {
+                    let mut entries = self
+                        .cache
+                        .entries
+                        .lock()
+                        .map_err(|_| ServiceError::Unavailable)?;
+                    let oldest = if entries.len() >= IDLE_HANDLES {
+                        entries
+                            .iter()
+                            .min_by_key(|(_, read)| read.touched)
+                            .map(|(id, _)| *id)
+                    } else {
+                        None
+                    };
+                    let removed = oldest.and_then(|oldest| entries.remove(&oldest));
+                    entries.insert(
+                        id,
+                        IdleRead {
+                            snapshot,
+                            touched: Instant::now(),
+                        },
+                    );
+                    removed
                 };
-                let removed = oldest.and_then(|oldest| entries.remove(&oldest));
-                entries.insert(
-                    id,
-                    IdleRead {
-                        snapshot,
-                        touched: Instant::now(),
-                    },
-                );
-                removed
-            };
-            drop(removed);
+                drop(removed);
+            }
+            Ok(result)
         }
-        Ok(result)
+        .await;
+        progress.finish(result)
     }
 
     pub(crate) fn close(

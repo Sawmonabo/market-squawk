@@ -11707,3 +11707,142 @@ Do not edit watched source or launch another compiler. Poll the same supervisor/
 `oct9-catalog-reentry-native.log`; after verified replacement stop watcher47538 and run actual
 all-nine financial timings plus saved-controller status/reopen. This goal turn made implementation,
 critical-test and pushed integration progress. Full V1 remains active and incomplete.
+
+### Independent fund-consumer diagnosis during the frozen native build
+
+Previous goal turn made pushed implementation/critical-test progress (f5fadbba, aa57df5e).
+Cargo80077 remains the sole live native build; all watched source stays frozen. Lead owns native
+verification and runtime. A disjoint read-only provider lane may establish the five ETF gap:
+
+| Owner | Exclusive writable file | Outcome/dependency/check |
+|---|---|---|
+| Sol High fund_financial_coverage | `.agents/tmp/v1-first-stock/oct9-fund-financial-coverage.md` only | Trace SPY/QQQ/DIA/IWM/VTI identity_missing across current financial sections to actual canonical asset classification, retained identity/source evidence and existing fund/NAV/enrichment consumers. Distinguish wrongly unwired data from nonapplicable equity fields. Use source/provider documentation evidence; propose smallest existing-contract producer-to-consumer correction, no new provider, code edits or builds. |
+
+No private credential output, live-state mutation, provider reconnect, process/window action, or
+new test harness. Report must state what was directly verified versus only source-inferred.
+
+### Indexed-selection native replacement and remaining source gaps
+
+The prior question turn clarified pooled clients versus application concurrency; it made no new
+implementation progress. This continuation verified Cargo80077 live, then its successful terminal
+build (11m11s) and managed replacement: service82806/Desktop82822, generation-QfReA2. Watcher47538
+is stopped after replacement; no second compiler is running. Source is f5fadbba, current head aa57df5e.
+Native controller before/after responses preserve the original paused workflow exactly, including
+identity, progress, timestamps and resumability; after status took62ms. Artifacts:
+`oct9-indexed-selection-controller-before.json` and `oct9-indexed-selection-controller-after.json`.
+Collection returned all9 canonical64-hex locators but took11,603ms during startup; no instant claim.
+All-nine financial read/parser/release verification is running serially, owned by lead.
+
+Fund diagnosis completed and ownership released. Lead inspected the report and exact consumer,
+preparation, activation and call sites: every selected financial read constructs CompanyResearchRequest;
+fund preparation is excluded, SEC activation supplies an empty provider identity registry, and existing
+fund product read/job implementations have no service caller. Catalog/source observations and official
+SEC examples are retained in `oct9-fund-financial-coverage.md`. Funds need actual series/share-class
+identity, publication and typed fund detail; equity ratio absence is not fund-source absence.
+No fund implementation/live completion is claimed.
+
+| Active owner | Exclusive writable scope | Concrete outcome / next dependency / critical evidence |
+|---|---|---|
+| Lead | shared contracts/composition, ledger/Git/build/runtime; source frozen for native verification | Finish all9x4 sections and repeated equity reads, check exact parser and read release; advance original saved stock analysis after this check. |
+| Astra High stream_reconnect_cause | `.agents/tmp/v1-first-stock/oct9-stream-reconnect-cause.md` only | Diagnose repeated ReconnectExhausted/current-qualification failures in current native generation from bounded secret-free logs and source. Identify exact reconnect/token/health/consumer edge and smallest repair; distinguish confirmed cause from missing evidence. No source/runtime mutation, provider calls, credentials, builds or tests. |
+
+SEC shared-quota/concurrent-download correction remains required, not waived by indexed page reads.
+Full V1, all rendered screens, live-stream behavior, fund workflows and installed acceptance remain open.
+
+All44 native financial checks completed at f5fadbba:41 returned valid parsed pages and all41 close
+responses reported released=true. AAPL statements(first), MSFT ratios(first), and AAPL ratios(repeat)
+returned request_interrupted. Successful repeated equity pages took7,731–13,295ms; no latency pass.
+All20 fund pages retain the diagnosed company-identity gap. NVDA retains31 reported ratio rows and
+one source-explained missing-input row. Evidence:`oct9-indexed-selection-native-all-nine.json`.
+Current logs locate a failed recheck_research_read wait at gate_admission; one-second process sample
+`oct9-indexed-native-read-sample.txt` is diagnostic only and does not establish the dominant phase.
+The archived screen-error report's repeated-authorization/full-hash facts are partly superseded;
+current code already reuses original receipts and prepared owners. Do not repeat those fixes.
+
+The original authorized stock workflow was explicitly resumed through native analyticalController,
+not duplicated or reset. Accepted in92ms, same workflow identity, waiting at gathering_evidence.
+Evidence:`oct9-indexed-selection-workflow-resume.json`; lead owns subsequent status and exact blocker.
+
+| Next owner | Exclusive writable files | Bounded outcome / critical check |
+|---|---|---|
+| Sol High financial_read_phases | app `src/application/research/investment_financials.rs` only | Add secret-free scoped phase timing for selection, per-family prepared read, authorization, snapshot, page and final recheck, including failure/caller-drop stage. Reuse existing logging style; change no behavior, deadlines, caches or authority. Existing native request failures need phase attribution before choosing another performance fix. Lead inspects diff and compiles in the single next native build; no new tests/harness for diagnostics. |
+
+Shared contracts/schema/manifest/lockfiles/composition and source closure stay lead-owned. Watcher
+remains stopped. No native build until diagnostic slice is coherent and original stock status read.
+
+### Native preparation failure and financial-read attribution — current continuation
+
+Previous question turn made no implementation progress; source checks confirmed pooled HTTP and
+SEC concurrency1. Native original workflow subsequently failed at completed step7. Its exact new
+job59d79983-bb45-4ac4-a45d-0f2b6bd79bd5 failed operation-terminal-invalid; service log explicitly
+locates InvalidResult inside preparation.prepare, before job result validation. Do not reset saved
+workflow or infer an identifier failure. Financial phase instrumentation handed off; lead owns
+inspection/compilation and integration, no native acceptance claimed.
+
+| Active owner | Exclusive writable scope | Outcome and critical check |
+|---|---|---|
+| Astra High evidence_preparation_invalid | `.agents/tmp/v1-first-stock/oct9-evidence-preparation-invalid.md` only | Trace observed preparation.prepare InvalidResult from current producer/schema and native safe evidence. Identify exact mismatch and minimal existing-fixture repair. Read-only code/runtime; no provider calls, builds, tests, Git or state changes. |
+| Lead | financial diagnostics source, shared integration, ledger/Git/build | Inspect scoped timing diff; repair proven preparation mismatch in canonical producer/consumer; focused existing critical check and one matching native build. |
+
+Watcher47538 remains stopped; no competing compiler or alternate runtime authorized.
+
+Preparation diagnosis narrowed from adjacent native events: option acquisition completed far enough
+for publish_option_market, whose error is discarded at alpaca_option_chain.rs639. No lower cause is
+proven. Extend Astra ownership to exactly app
+`src/application/research/ingest/alpaca_historical/market.rs` for scoped static-stage/error-category
+diagnostics around existing publish_option_market boundaries. Preserve every return/error and
+publication/cancellation behavior. No full nested Debug/Display. IngestError's audited fixed Display
+may be used without sources; all other categories closed literals. Lead includes this with reviewed
+financial timing in one native build. No speculative semantic fix or new routine test.
+
+Both diagnostic handoffs inspected against whitespace-independent diffs: financial phases preserve
+all read/cursor/receipt behavior; option publication returns the identical result while exposing
+static authority/precommit/binding/digest/reservation/ingest stage and closed error category. Exact
+option failure remains unproven below the publisher. Formatting/diff checks pass. No new test was
+added for logging-only changes; matching native compilation and actual failed-path observation
+are the smallest relevant checks. Agent ownership released. Lead is refreshing source closure,
+then will use the existing managed supervisor for one build; current native remains available.
+Current disk inventory: target37GB, scratch756MB, managed generation1.4GB;29GiB filesystem available.
+No new build root or runtime workspace created. Full V1 remains active/incomplete.
+
+Source closure refreshed and verified successfully; only the two changed Rust source entries changed.
+Managed native compilation confirmed live: Cargo87001 (single-job), supervisor47522/watcher47538;
+prior service82806/Desktop82822 remain available until successful replacement. Source is frozen;
+no competing build or native test. Next continuation must poll this exact build/log, not restart it.
+PR43 comment6076656853 now reports current41/44 financial outcomes and the failed original analysis,
+not obsolete pending/native success claims. No new pushed implementation commit yet: diagnostics
+await compilation. After successful build, stop watcher47538, commit/push the coherent diagnostics,
+then observe affected native financial reads and exact option publication failure. All lanes released.
+This goal continuation made concrete diagnostic implementation and cause-localization progress;
+full goal stays active, with no installed/latency/live-stream acceptance claim.
+
+### Diagnostic build verification and independent fund identity evidence
+
+Previous turn made diagnostic implementation/cause-localization progress. Cargo87001 is confirmed
+live under the same supervisor; source stays frozen. Lead owns native verification and integration.
+While compilation runs, reopen the completed Sol High fund lane for one independent prerequisite:
+
+| Owner | Exclusive writable scope | Outcome/dependencies/check |
+|---|---|---|
+| Sol High fund_financial_coverage | `.agents/tmp/v1-first-stock/oct9-fund-identities.md` only | Ground SPY/QQQ/DIA/IWM/VTI SEC registrant/series/share-class identifiers in official SEC or fund-issuer sources; distinguish legal registrant from portfolio and ticker/share class, latest filing family/actual coverage, and map to existing SEC fund identity contract. Read previous coverage report; no app edits, credentials, builds, Git, local runtime/provider operations. Unknown mappings stay explicit; no invented identifiers or company-ratio fallback. |
+
+This is the missing identity prerequisite for the existing fund producer/consumer, not a competing
+execution plan. Keep current runtime/analysis/native compilation untouched.
+
+Fund identity prerequisite report completed and inspected: `oct9-fund-identities.md`. Agent opened
+actual SEC filing pages/documents, verifies all five registrant CIKs and QQQ/IWM/VTI exact series/class
+IDs. DIA N-PORT actually has blank series/class identifiers despite available holdings/net assets;
+our mandatory-series parser/domain/storage path cannot represent that structure. SPY series/class
+and all exact bulk FUND_ID coordinates remain unknown; no fabricated IDs or latest-coverage claim.
+QQQ's documented2025 UIT conversion and VTI's multiple share classes require correct portfolio/class
+scope. No fund publication/consumer implementation or live acceptance yet. Ownership released.
+Lead's next fund barrier is source-backed identity admission plus the existing typed fund reader,
+with explicit registrant-scoped UIT representation where the selected archive supports it.
+
+Cargo87001 completed successfully: compiler-reported10m02s. Host elapsed included a longer wall
+interval; live checks confirmed forward progress, not a dead build. Managed service replacement
+succeeded to PID88954; existing Desktop82822 remains open (service-only source change). Watcher47538
+stopped after successful compilation. No second build. The two diagnostics are compiled; actual
+phase/error evidence is next. No semantic test added to this logging-only checkpoint. Lead commits
+and pushes the four explicitly owned files, then probes AAPL statements/MSFT ratios and performs one
+controlled MSFT analysis reproduction with diagnostics; original failed workflow stays intact.

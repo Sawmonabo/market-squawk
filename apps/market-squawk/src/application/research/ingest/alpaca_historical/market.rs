@@ -224,47 +224,91 @@ impl AlpacaMarketPublicationClosure {
         precommit_authority: Arc<dyn IngestPrecommitAuthority>,
         cancellation: CancellationToken,
     ) -> Result<AlpacaOptionMarketPublicationReceipt, AlpacaMarketPublicationError> {
-        self.validate_current_authority(observed_at)?;
-        precommit_authority.validate_precommit()?;
-        let prepared = self.validate_option_binding(&binding, observed_at)?;
-        let publication_digest = provider_option_market_publication_digest(&binding)?;
-        if publication_digest != binding.evidence_digest().evidence() {
-            return Err(AlpacaMarketPublicationError::FamilyMismatch);
-        }
-        require_digest(publication_digest)?;
-        let reservation = self
-            .reserve(
-                publication_digest,
-                idempotency_key.into(),
-                observed_at,
-                &cancellation,
-            )
-            .await?;
-        let committed = self
-            .research
-            .analytical()
-            .ingest_provider_option_market(
-                reservation,
-                analytical_dataset,
-                binding,
-                cancellation,
-                precommit_authority,
-            )
-            .await?;
-        Ok(AlpacaOptionMarketPublicationReceipt {
-            restart: AlpacaOptionMarketRestartSelector {
+        let mut stage = "authority";
+        let result = async {
+            self.validate_current_authority(observed_at)?;
+            stage = "precommit";
+            precommit_authority.validate_precommit()?;
+            stage = "binding";
+            let prepared = self.validate_option_binding(&binding, observed_at)?;
+            stage = "digest";
+            let publication_digest = provider_option_market_publication_digest(&binding)?;
+            if publication_digest != binding.evidence_digest().evidence() {
+                return Err(AlpacaMarketPublicationError::FamilyMismatch);
+            }
+            require_digest(publication_digest)?;
+            stage = "reservation";
+            let reservation = self
+                .reserve(
+                    publication_digest,
+                    idempotency_key.into(),
+                    observed_at,
+                    &cancellation,
+                )
+                .await?;
+            stage = "ingest";
+            let committed = self
+                .research
+                .analytical()
+                .ingest_provider_option_market(
+                    reservation,
+                    analytical_dataset,
+                    binding,
+                    cancellation,
+                    precommit_authority,
+                )
+                .await?;
+            Ok(AlpacaOptionMarketPublicationReceipt {
+                restart: AlpacaOptionMarketRestartSelector {
+                    manifest: committed.manifest().clone(),
+                    publication_digest,
+                    publication_kind: prepared.publication_kind,
+                    source_id: self.source.source_id().clone(),
+                    provider_dataset: prepared.provider_dataset.clone(),
+                    expected_option_row_count: prepared.option_row_count,
+                },
                 manifest: committed.manifest().clone(),
                 publication_digest,
-                publication_kind: prepared.publication_kind,
-                source_id: self.source.source_id().clone(),
-                provider_dataset: prepared.provider_dataset.clone(),
-                expected_option_row_count: prepared.option_row_count,
-            },
-            manifest: committed.manifest().clone(),
-            publication_digest,
-            provider_dataset: prepared.provider_dataset,
-            option_row_count: prepared.option_row_count,
-        })
+                provider_dataset: prepared.provider_dataset,
+                option_row_count: prepared.option_row_count,
+            })
+        }
+        .await;
+        if let Err(error) = &result {
+            use AlpacaMarketPublicationError as E;
+            let category = match error {
+                E::LocalPublicationDeadline => "local_deadline",
+                E::PublicationCancelled(_) => "publication_cancelled",
+                E::Custody(_) => "custody",
+                E::AuthorityInvalid => "authority",
+                E::PublicationAdmission(_) => "admission",
+                E::FamilyMismatch => "family_mismatch",
+                E::RestartInvalid => "restart",
+                E::PointInTimeInvalid => "point_in_time",
+                E::Capture(_) => "capture",
+                E::Decode(_) => "decode",
+                E::Adapter(_) => "adapter",
+                E::Research(_) => "research",
+                E::Ingest(_) => "ingest",
+                E::Rights(_) => "rights",
+                E::Service(_) => "service",
+                E::Arrow(_) => "arrow",
+                E::MarketEventRead(_) => "market_event_read",
+            };
+            // IngestError's Display is fixed code-owned text. Do not format wrapped sources:
+            // their Debug/Display values can retain provider data or local filesystem paths.
+            let ingest_failure = match error {
+                E::Ingest(error) => Some(error.to_string()),
+                _ => None,
+            };
+            tracing::warn!(
+                stage,
+                category,
+                ingest_failure,
+                "option publication stage failed"
+            );
+        }
+        result
     }
 
     /// Returns an exact-source whole-batch point-in-time selector for option chains.
