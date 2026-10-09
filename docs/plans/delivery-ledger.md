@@ -4,13 +4,15 @@
 
 Goal active: owner reconfirmed resume after the lead mistakenly reapplied the older pause. No new
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
-`166fea9a`. Main/release unchanged; no extra branch created.
+`3e8f8a4d`. Main/release unchanged; no extra branch created.
 
 ### Latest checkpoint and active verification
 
 Acceptance 1/5/7: remove the redundant saved Schwab diagnostic gate so configured credentials and
 actual protected OAuth can serve requested data without a stale probe disabling the connection.
-Integration base `166fea9a`; critical checks passed; resulting pushed commit recorded after integration.
+Integrated from `166fea9a`; pushed code checkpoint **`3e8f8a4d`** is implemented and critically verified.
+PR #43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6073129323 .
+Live and installed Desktop proof remain open. No compiler or native runtime remains running.
 
 Implemented in the current tree: optional runtime probe coordinates (Schwab requires None; other
 providers retain their existing checks); removed full-family doctor scheduler, producer modules,
@@ -44,7 +46,7 @@ registration starting at revision one without historical probe capabilities. The
 single-capability checks. Single-job, nonincremental builds use the existing target directory.
 Logs use `oct8-no-doctor-*` under `.agents/tmp/v1-first-stock`. No live or installed acceptance claim.
 
-Next dependency: push this critically verified checkpoint, then fresh authorized native workspace and actual
+Next dependency: fresh authorized native workspace and actual
 start/shutdown/restart proof. All-nine canonical shared demand, last-trade/partial-field semantics,
 full financial/Desktop/provider journeys, final packages and whole-app RAM remain incomplete.
 
