@@ -28,7 +28,7 @@ const ALPACA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 };
 const SCHWAB_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "schwab.trader-api-market-data",
-    capability_revision: 4,
+    capability_revision: 1,
     release_state: ProfileReleaseState::Available,
 };
 const YAHOO_FINANCE_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {

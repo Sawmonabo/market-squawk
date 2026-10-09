@@ -6,13 +6,78 @@ Goal active: owner reconfirmed resume after the lead mistakenly reapplied the ol
 pause is authorized. One worktree on `feature/v1-installed-product-experience`; integration base
 `3e8f8a4d`. Main/release unchanged; no extra branch created.
 
+### Active native verification and next dependency
+
+Current continuation: prior conversational clarification produced no implementation progress;
+native import now supplies new evidence. The configured bundle import completed but skipped Schwab
+as `profile_unavailable`: `credential_bundle_delegation.rs` still requires revision4 while the
+current built-in Schwab profile is revision1. Lead owns that exact caller correction and the existing
+`selected_profile_mapping_and_omissions_are_exact` check, then supervised native rebuild/reimport.
+No new test harness. Watchexec PID10194 is temporarily SIGSTOP for serialized critical checking;
+supervisor10180, service11743, native11760 and Vite remain running. Resume this same watcher after
+checks. The public-crypto diagnosis is frozen; no source writer is active on it. Next dependency is
+actual Schwab sign-in/start, then shared canonical demand. Resulting pushed commit pending.
+
+Previous goal turn: progress (code `3e8f8a4d`, evidence `141e3682` pushed; critical checks passed).
+Initial refresh was clean at `141e3682`; the native supervisor is now running as recorded below. Acceptance 1/5/7:
+launch the existing supervised development command into the already authorized fresh
+`.market-squawk/v1-owner-test/{data,installation}`, preserve the prior corrected workspace, verify
+native launch/settings and actual configured connection start, then clean shutdown/restart.
+Lead owns runtime, credentials, all source/shared contracts, builds, ledger and Git. No whole-app
+RAM gate or installed-package claim. One root target, one compiler job, nonincremental builds.
+
+While the native build runs, Sol6.1High `shared_subscription_boundary` owns ONLY the existing
+`.agents/tmp/v1-first-stock/oct8-shared-market-demand.md` refresh: check the prior report against
+`141e3682`, specify the smallest producer-to-consumer implementation boundaries and existing
+critical test for canonical overlapping watchlist/detail/holding demand. No source edits, tools
+that launch providers, builds, Git, new architecture or competing task queue. This refresh resolves
+changed signatures before the lead writes shared contracts; existing sender/catalog/current actor
+paths must be reused. Resulting next implementation commit is pending native proof and that refresh.
+
+Native observation: fresh Desktop is visible, Home reports Ready and all nine watchlist symbols
+render without an app-password prompt. Credential import has not run, so equity prices are absent;
+this is not live quote verification. Native startup also exposed a public Kraken freshness rejection
+(`CurrentHealthUnqualification causes=4096`) followed by failed shutdown barriers/reconnect. The UI
+remained Ready, but this source failure requires correction. AstraHigh `shutdown_source_diagnosis`
+owns ONLY `.agents/tmp/v1-first-stock/oct8-fresh-crypto-startup.md`: diagnose this exact captured
+failure from current source and the native log, identify the smallest fix and existing critical test.
+No source edits/builds/Git/runtime/provider calls. Lead keeps the one supervisor alive and owns
+all changes; CLI credential-import binary is next in the serialized build queue. Sol demand refresh
+is completed/frozen; its supporting report changes no implementation status.
+
+### Current native evidence after configured import
+
+Schwab import correction: the existing selected-profile mapping test PASS1/1 (0.01s after7m43s
+single-job compilation); source closure verification and the existing closure-refresh test PASS1/1.
+Only the importer revision and its shipping source digest changed. Native reimport remains pending
+supervised rebuild. Watchexec is still stopped until this checkpoint is recorded, then the same
+watcher resumes and owns the one rebuild. Code commit recorded in the following evidence update.
+
+The running native Home displayed actual prices for all nine starters after native Source.Verify
+and Source.Start activated Alpaca (state revision3, active). MSFT selection opened its dedicated
+page; the automatic one-year history read returned dates/OHLC and its close comparison. This is
+actual Desktop data-read evidence, not proof of live Schwab ticks or every field. Ask/midpoint and
+benchmark choices remain unavailable. SEC was stored but not activated in the fresh workspace;
+native activation succeeded and financial Retry is loading, with completed values not yet verified.
+Two exploratory `activate/source` requests for Nasdaq and Alpaca were rejected SurfaceMismatch;
+those are the wrong operation (public crypto only), not evidence of broken corresponding UI controls.
+Alpaca's actual native lifecycle controls above succeeded.
+
+Captured/viewed actual native PNG `oct8-native-msft-chart.png`; chart paint cannot yet be accepted:
+its canvas retained default intrinsic size and requestAnimationFrame did not run within1s while
+`document.visibilityState` was hidden. Automation already configures Tauri background throttling
+Disabled; do not claim the blank screenshot proves either a working chart or a financial-data loss.
+No global keystrokes/focus automation used. Captured JSON/PNG evidence is under the existing
+`.agents/tmp/v1-first-stock` directory. Public crypto and repeated archive deadline failures remain
+open. Whole-app RAM and full product visual acceptance are not measured or claimed.
+
 ### Latest checkpoint and active verification
 
 Acceptance 1/5/7: remove the redundant saved Schwab diagnostic gate so configured credentials and
 actual protected OAuth can serve requested data without a stale probe disabling the connection.
 Integrated from `166fea9a`; pushed code checkpoint **`3e8f8a4d`** is implemented and critically verified.
 PR #43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-6073129323 .
-Live and installed Desktop proof remain open. No compiler or native runtime remains running.
+Live and installed Desktop proof remain open; current native runtime is described above.
 
 Implemented in the current tree: optional runtime probe coordinates (Schwab requires None; other
 providers retain their existing checks); removed full-family doctor scheduler, producer modules,
