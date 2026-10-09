@@ -164,6 +164,18 @@ impl BudgetState {
         }
     }
 
+    // Provider-backed allocations retain ownership only; no local quota storage is allocated.
+    pub(in crate::policy) fn provider_owned(starts_at: MonotonicInstant) -> Self {
+        Self {
+            windows: Vec::new(),
+            last_observed_at: starts_at,
+            in_flight: 0,
+            unavailable_until: None,
+            disabled: false,
+            consecutive_refusals: 0,
+        }
+    }
+
     pub(in crate::policy) fn dynamic_retained_bytes(&self) -> Option<usize> {
         let windows = self
             .windows
@@ -193,7 +205,6 @@ pub(in crate::policy) struct BudgetAllocation {
     pub(in crate::policy) availability_generation: AtomicU64,
     // Process-local revocation for established transports; request capacity is separate.
     pub(in crate::policy) transport_generation: AtomicU64,
-    pub(in crate::policy) provider_rate_state_version: AtomicU64,
     pub(in crate::policy) terminal: AtomicBool,
     pub(in crate::policy) durability: Option<BudgetDurabilityBinding>,
     pub(in crate::policy) provider_rate: Option<ProviderRateBinding>,
@@ -202,7 +213,7 @@ pub(in crate::policy) struct BudgetAllocation {
 #[derive(Clone)]
 pub(in crate::policy) struct BudgetDurabilityBinding {
     pub(in crate::policy) session: Arc<AuthorityDurabilitySession>,
-    pub(in crate::policy) slot: usize,
+    pub(in crate::policy) slot: Option<usize>,
 }
 
 impl std::fmt::Debug for BudgetDurabilityBinding {

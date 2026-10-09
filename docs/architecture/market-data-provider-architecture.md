@@ -903,6 +903,18 @@ request-admission boundary. Extend them in place where a provider requires more 
 - limits, endpoints, feed meanings, and callback URLs remain code-owned. The credential file may
   contain only the documented operator choices and secrets.
 
+Provider-backed source registries retain request ownership, source history and shutdown state;
+they do not enforce or checkpoint a second copy of the aggregate quota. Restart validates each
+retained declaration against the existing quota group before opening current sources. Construction-time
+concurrency configuration preserves consumed windows, cooldowns and disabled state, and requires
+the complete set of affected endpoint declarations with no active request owners.
+
+The SEC application policy permits two concurrent downloads within its existing two-request/second
+aggregate window. Its reusable HTTP client owns the connection pool; queued requests wait on capacity
+or the rate deadline with cancellation. Parsing/persistence uses an independent one-worker bound.
+These are application settings, not provider limits or measured throughput. Current verification and
+deployment status remain in the delivery ledger.
+
 ### Shared application update delivery
 
 Provider adapters decode their own protocols into canonical observations. Application consumers

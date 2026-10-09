@@ -2,23 +2,114 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed implementation **37485d3b** adds financial phase and option publication diagnostics.
-Native build passed; three financial reads returned valid pages in5.7–7.9s, not a latency pass.
-Current runtime service88954/Desktop82822, supervisor47522; watcher47538 stopped. The older entries
-below are chronological evidence, not active assignments. Full V1 remains active/incomplete.
-
-Current assignment refresh: lead integrates the demonstrated screen-read population bottleneck and
-option renewed-reference publication defect. Ownership and dependencies are in the final ledger entry.
+Current pushed implementation **f3f59d2c** uses indexed investment/history/watchlist reads and
+corrects option publication schema plus original-reference retention. Required focused checks pass;
+matching native build passed (8m45s). Fresh process inspection found service1935 and supervisor1661
+exited; the startup receipt records `stopped`. Desktop1952/Vite1714 remain, watcher1673 is stopped.
+Lead is running serialized SEC integration checks before restoring the managed runtime.
+Same workspace and saved credentials retained; no current live-service claim.
+Full V1 remains active/incomplete. Older entries below are chronological evidence only.
 
 | Current owner | Outcome and exact scope | Verification / next dependency |
 | --- | --- | --- |
-| Lead | Indexed watchlist/detail/history producer-consumer integration; renewed-option retention/schema; all shared contracts, fixtures, source closure, Git and builds | Source edits frozen. Data publication/restart check PASS1/1 (3.43s); genuine typed renewal-origin check PASS1/1 (0.14s). Indexed identity/cutoff/restart PASS1/1; renderer lookup contract PASS1/1 (4.49s). Application contract check exposed workflow-history 32-hex versus price-history 64-hex pattern collision; validator corrected. Shared-origin SQL guard corrected for all session pages. Final data publication/restart PASS1/1 (3.53s); shared schema PASS1/1; source closure verified. Final application contract/identity checks PASS2/2 (3.69s; 10m48s compile). Source checkpoint ready to commit/push; native/new-schema deployment and actual renewed publication remain pending. |
-| Astra screen_indexed_reads | Completed, ownership released | Direct detail/history locators and indexed collection wiring; existing identity/ambiguity/restart fixture PASS. Ownership released to lead. |
-| Astra evidence_preparation_invalid | Completed, ownership released | Exact retained-original dependency link and same-revision snapshot publication/restart fixture. Genuine renewed end-to-end acceptance still pending; no fake origin/test-support export. |
+| Lead | All integration, shared contracts/schema, Git/build/runtime and native verification; active SEC core writer listed below | Pushed f3f59d2c. App checks2/2; data option publication/restart1/1; source origin1/1; shared schema1/1; renderer lookup1/1; source closure/diff pass. Native restart preserved both original workflow records; new stock journey and all-nine reads completed with gaps listed below. |
+| Astra screen_indexed_reads | Completed, ownership released | Direct detail/history and indexed collection wiring critically verified. Post-restart collection returns9 entries but takes4.02s; instant-cache acceptance remains open. |
+| Astra evidence_preparation_invalid | Completed, ownership released | Retained-original link and compositional origin/publication checks pass. Full renewed native publication remains unproven. |
 
-PR43 evidence comment6076656853 refreshed for37485d3b. Full V1, all-nine complete financials,
-live streaming, new native timings and installed acceptance remain open. Earlier entries below
-are historical snapshots; current ownership is the table above and latest dependency notes.
+Offline canonical correction completed after clean managed shutdown. The catalog backup is
+`.market-squawk/recovery/pre-indexed-options-f3f59d2c/catalog.sqlite3`. Exactly two guards and schema21
+checksum changed; all153 data-table row counts unchanged, canonical schema equality and SQLite
+integrity/foreign-key checks passed. No migration program, compatibility path or workspace reset.
+Evidence: `.agents/tmp/v1-first-stock/oct9-canonical-schema-deployment.json`.
+Managed launcher used the same workspace; its development environment caused an additional cached
+Desktop-only23.44s build. Future prebuilds must match launcher TAURI_CONFIG/training-root environment.
+
+Native controller status returns in49ms and preserves both failed workflows with their original
+identities/progress/timestamps; this proves recovery, not completed analysis. Collection returns all9
+stored/last-known prices and changes in4.02s, not live streaming or responsiveness acceptance.
+Evidence: `.agents/tmp/v1-first-stock/oct9-indexed-option-native-reopen.json`.
+An initial automation call used the wrong callback result envelope; HTTP500 was an audit-script
+failure, not product failure. The corrected native call above completed successfully.
+
+Next dependency: all-nine detail/history/financial reads through current native transport, then one
+normal new stock analysis to prove option publication and locate the next actual failing edge.
+SEC two-download/single-quota correction remains pending per
+`.agents/tmp/v1-first-stock/oct9-sec-concurrency-policy.md`; no constant-only limit patch or new pool.
+PR43 comment6076656853 records f3f59d2c; add the newly completed native deployment evidence.
+Three stale test executables removed after open-owner checks (2.39GiB reclaimed); active runtime,
+current tests and recovery retained. Full financial/fund coverage, streaming, positive completed
+Brief, all-screen audit, installed workflows and final gates remain open.
+
+Native all-nine verification completed45 reads:9 detail successes,10 reported stock financial
+pages,20 missing fund pages (identity_missing),6 deadline failures (AAPL facts/statements, MSFT
+statements/ratios, NVDA facts, TSLA facts). Read handles returned by successful financial reads
+were closed through fresh native requests. Evidence `oct9-indexed-option-native-all-nine.json`.
+Logs place stock delays in prepared-source reads and snapshot build before the15s deadline;
+these are separate from SEC network capacity and remain mandatory read-path defects.
+New normal MSFT workflow `workflow_c94cf204f80e5b52a0455d5097767cf9` reached evidence gathering
+(completedSteps5), then paused with resumable state. Logs show option chain network acquisition
+failure. Original workflows retained; no completed Brief or full native option publication proven.
+Evidence `oct9-indexed-option-native-analysis-{start,status}.json`. Do not restart that workflow
+blindly; inspect the retained job/failure and resume only through its normal recovery operation.
+
+### Active SEC quota ownership correction — acceptance1/5/6
+
+Dependency: f3f59d2c integrated/pushed, matching runtime alive, watcher1673 stopped, compiler idle.
+Outcome: provider-backed request admission uses the existing aggregate quota authority once;
+capacity waiting, cached reads and independent requests cannot fail from a second local quota.
+Canonical SEC two-download setting follows this prerequisite with retained rate/cooldown state.
+Already works: pooled HTTP, event-driven waiting, independent blocking capacity1. Missing:
+single quota enforcement/source persistence and safe current-owner concurrency configuration.
+
+- Astra High `sec_single_quota`: ONLY sources `src/policy/budget/runtime.rs`,
+  `runtime_types.rs`, `runtime/failure.rs`, `coordinator.rs`, `coordinator/durability.rs`,
+  `persistence.rs`, `coordinator/tests.rs`; mechanical optional-slot fixture edits only in
+  `policy/budget/persistence/lifecycle.rs` (existing lifecycle idle check only),
+  `policy/budget/persistence/tests/terminalization.rs` and
+  `terminalization/{lifecycle.rs,concurrency.rs,availability_changed.rs,branch_matrix.rs}`;
+  `src/registry/catalog/construction.rs`,
+  `src/registry/catalog.rs`, `src/registry/tests.rs`, `src/policy/tests.rs`.
+  Remove duplicate provider-backed counters/checkpoints while preserving local-only behavior,
+  exact ownership, cancellation, lifecycle, retained quota association and availability revocation.
+  Before editing, propose the minimal shared provider-rate API needed; lead owns that contract.
+- Astra High `sec_durable_quota`: ONLY `crates/market-squawk-data/src/provider_rate.rs` and
+  its existing directly associated test module if separate (request exact path before edits).
+  Implement agreed ProviderRateStore configuration/retained-association/disable methods using
+  existing transactions and digests, preserving all quota history. No schema changes or builds.
+- Lead exclusively owns `policy/provider_rate.rs`, `provider_rate/admission.rs`, application composition, canonical SEC descriptor/adapter checks, manifests,
+  schema, closure, ledger, Git/build/runtime. Shared API/configuration must be agreed first.
+- Critical evidence: existing admission/no-polling, allocation-accounting, clean-close,
+  availability-invalidation and source-restart fixtures listed in
+  `oct9-sec-concurrency-policy.md`. Extend only uncovered ownership/retained-state cases.
+  No agent builds, tests, Git, provider calls or runtime actions. All-nine native checks on frozen
+  f3f59d2c continue under lead while source work proceeds.
+- Next barrier: agreed shared interface → coherent core/store/SEC integration → focused serialized
+  checks → push → native concurrent acquisition. No resulting commit yet.
+
+Both SEC implementation lanes are now frozen. Shared source critical checks pass8/8 after
+correcting the existing fixtures' request-window policy and live identity setup; no production
+identity checks were relaxed. The checks cover waiting/cancellation without polling, shared
+availability invalidation, clean shutdown, registration rollback and source restart. Evidence:
+`.agents/tmp/v1-first-stock/oct9-single-quota-sources-critical.log` (single-job compile25.71s).
+Actual SEC state contains two compatible endpoint declarations (onboarding and acquisition), so
+startup configuration preserves both in the same aggregate quota group. Durable-store, adapter,
+application and native concurrent-acquisition checks remain pending. This WIP is not deployed;
+f3f59d2c remains the last deployed/pushed candidate. Stored financial read deadlines are a separate defect.
+
+Durable-store checks pass4/4 (compile1m39s); allocation/retained-owner checks pass3/3. SEC mixed-source
+taxonomy check passes1/1 (rerun compile9.85s, execution5.41s), now using a genuine durable registry
+with the same SQLite provider quota. Its initial failure exposed an incorrect fixture assumption:
+after two dispatches both capacity and the2/s window are exhausted, so either may block admission.
+Cancellation, deadlines, release and cooldown remain exercised. No production workaround added.
+Evidence: `oct9-single-quota-{data,ownership,sec}-critical.log` under the existing scratch directory.
+Application saved-SEC-connection/restart check passes1/1 (compile6m23s, execution2.66s).
+All17 selected critical checks pass; source-closure refresh/verification and diff check pass.
+Dependencies/artifact locks are unchanged apart from source identities. Compiler warnings remain
+visible in the logs; this is focused correctness evidence, not final clean-candidate approval.
+Lead is committing this coherent checkpoint; native deployment remains pending.
+Nine superseded build executables were removed after confirming each had no open process owner
+and no additional hard links (2.83GiB reclaimed). Current test outputs, staged runtime, workspace
+and recovery were retained. Exact paths/sizes: `oct9-stale-build-cleanup.json`.
 
 ## Historical execution evidence
 
@@ -11941,3 +12032,9 @@ Final corrected-source results: option publication/custody/restart PASS1/1 in3.5
 Native deployment preparation (read-only): comparing the live catalog to a fresh in-memory schema assembled from current canonical SQL proves exactly two changed guards (`analytical_generations_registered_schema_insert`, `provider_capture_original_update`) and only schema21 checksum differs; no table/index/layout difference. Evidence `oct9-canonical-schema-deployment-diff.json`. Preserve the existing workspace and protected sign-ins: after critical pass/push and native build, lead will use a backed-up offline canonical guard correction, with all application writers stopped, retaining every data row and original artifact. This is a one-time greenfield development schema update, no shipped migration/compatibility path; the live database has not been modified. Existing supervisor supports graceful whole-session stop via parent EOF and normal restart; no force kill or separate runtime owner is authorized.
 
 Final application rerun PASS2/2 (3.69s, single-job compile10m48s; `oct9-indexed-read-final-critical.log`): canonical selection/history/ambiguity/cutoff/cancellation/restart and every production output descriptor. Both prior failed checks were corrected, not waived. All critical checks for this source slice now pass; no source changes follow them. Removed three unused older root-package test executables after confirming no open owner, reclaiming2.39GiB; retained current test executable, all active runtime generations and recovery evidence. No extra branch/worktree created. Lead proceeds to commit/push, then one native build followed by backed-up offline canonical schema update and actual saved-workflow/all-nine reads. Native, installed and full V1 acceptance remain unproven.
+
+Pushed checkpoint f3f59d2c and refreshed PR43 comment6076656853. Native build session51711 is the sole compiler; old service/Desktop stay available. This goal turn is progress (pushed integrated fixes plus verified two-trigger deployment delta). No source mutation after the completed critical checks; the only tracked WIP is this ledger status refresh.
+
+Pre-deployment native controller snapshot captured through the real background bridge: `oct9-before-schema-controller.json`; both original failed workflows are retained (7 and4completed steps), and new-analysis availability remains available. No analysis/job was started and no screen focus changed. Native Cargo99432/session51711 remains live; observed current rustc105 confirms continued compilation rather than a stale lock. Preserve this handle and wait; no duplicate build or replacement started.
+
+Native build51711 PASS (compiler8m45s); managed supervisor47522, watcher47538, Desktop82822 and service88954 exited after graceful supervisor stop, with no force kill or open catalog owner. Offline backup `.market-squawk/recovery/pre-indexed-options-f3f59d2c/catalog.sqlite3` completed and passed quick_check. Corrected exactly the two canonical guards plus schema21 checksum in one transaction; 153 data-table row counts unchanged, total data rows changed0, one schema metadata row updated. Canonical full-schema equality, quick_check and foreign_key_check passed; artifacts/sign-ins/workspace IDs unchanged. Evidence `oct9-canonical-schema-deployment.json`. Started the existing managed development command against the same roots; log `oct9-indexed-option-native.log`. No prior recovery removed; native acceptance awaits actual reopen/read checks.

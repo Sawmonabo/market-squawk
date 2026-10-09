@@ -175,7 +175,7 @@ fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     Ok(BlockingBudgetFixture {
@@ -226,7 +226,7 @@ fn admitted_fatal_operation_prevents_clean_write_even_when_terminal_store_fails(
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
 

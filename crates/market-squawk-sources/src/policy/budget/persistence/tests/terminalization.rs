@@ -94,7 +94,7 @@ fn durable_budget(index: u8) -> TestResult<DurableBudgetFixture> {
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     Ok(DurableBudgetFixture {
@@ -331,7 +331,7 @@ fn one_fatal_scope_revokes_alias_peer_future_registration_shutdown_and_restart()
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot: peer_slot,
+            slot: Some(peer_slot),
         },
     );
 
@@ -485,7 +485,7 @@ fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestR
         clock,
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     store.block_next_store();
@@ -551,7 +551,7 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
             clock.clone(),
             BudgetDurabilityBinding {
                 session: session.clone(),
-                slot,
+                slot: Some(slot),
             },
         ))
     };

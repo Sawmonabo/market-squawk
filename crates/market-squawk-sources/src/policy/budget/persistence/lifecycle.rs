@@ -184,6 +184,10 @@ impl<A: LifecycleAtomic> LifecycleWord<A> {
         }
     }
 
+    fn is_idle_and_active(&self) -> bool {
+        self.atomic.load(Ordering::Acquire) == lifecycle_word(AuthorityLifecyclePhase::Active, 0)
+    }
+
     fn phase(&self) -> AuthorityLifecyclePhase {
         lifecycle_phase(self.atomic.load(Ordering::Acquire))
     }
@@ -387,6 +391,10 @@ impl AuthorityDurabilitySession {
             }
             AdmissionTransition::Unavailable => Err(AuthorityPersistenceError::SessionUnavailable),
         }
+    }
+
+    pub(crate) fn is_idle_and_available(&self) -> bool {
+        self.is_available() && self.lifecycle.is_idle_and_active()
     }
 
     pub(super) fn lifecycle_is_active(&self) -> bool {

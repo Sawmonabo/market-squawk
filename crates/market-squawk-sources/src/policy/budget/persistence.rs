@@ -256,16 +256,6 @@ pub(crate) struct DurableBudgetGroup {
     checkpoint: BudgetCheckpointState,
 }
 
-pub(in crate::policy) enum DurableBudgetRegistrationTarget {
-    Existing { slot: usize },
-    New { checkpoint: BudgetCheckpointState },
-}
-
-pub(in crate::policy) struct DurableBudgetRegistrationGroup {
-    pub(in crate::policy) target: DurableBudgetRegistrationTarget,
-    pub(in crate::policy) declarations: Vec<PersistedProviderBudgetPolicy>,
-}
-
 impl DurableBudgetGroup {
     pub(crate) fn try_new(
         declaration: PersistedProviderBudgetPolicy,
@@ -679,63 +669,23 @@ impl AuthorityDurabilitySession {
         })
     }
 
-    pub(in crate::policy) fn register_budget_batch(
+    /// Called only after the provider-backed pool validates every retained aggregate association.
+    /// Provider declarations remain in registry history; only redundant enforcing copies leave.
+    pub(crate) fn discard_redundant_provider_checkpoints(
         self: &Arc<Self>,
-        registry: crate::RegistryAuthorityState,
-        groups: &[DurableBudgetRegistrationGroup],
-        wall: Timestamp,
-    ) -> Result<Box<[usize]>, AuthorityPersistenceError> {
-        if groups.is_empty() || groups.len() > MAX_PROCESS_BUDGET_SCOPES {
-            return Err(AuthorityPersistenceError::InvalidState);
+    ) -> Result<(), AuthorityPersistenceError> {
+        let (empty, wall) = self
+            .envelope
+            .lock()
+            .map(|envelope| (envelope.budgets.is_empty(), envelope.wall_high_water))
+            .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?;
+        if empty {
+            return Ok(());
         }
-        let mut assigned = Vec::new();
-        assigned
-            .try_reserve_exact(groups.len())
-            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
-        self.transact(wall, |envelope, wall_adjustment| {
-            let mut budgets = envelope.budgets.as_slice().to_vec();
-            for group in groups {
-                let (first, remaining) = group
-                    .declarations
-                    .split_first()
-                    .ok_or(AuthorityPersistenceError::InvalidState)?;
-                let slot = match &group.target {
-                    DurableBudgetRegistrationTarget::Existing { slot } => {
-                        if assigned.contains(slot) {
-                            return Err(AuthorityPersistenceError::InvalidState);
-                        }
-                        let retained = budgets
-                            .get_mut(*slot)
-                            .ok_or(AuthorityPersistenceError::InvalidState)?;
-                        retained.add_declaration(first.clone())?;
-                        for declaration in remaining {
-                            retained.add_declaration(declaration.clone())?;
-                        }
-                        *slot
-                    }
-                    DurableBudgetRegistrationTarget::New { checkpoint } => {
-                        if budgets.len() == MAX_PROCESS_BUDGET_SCOPES {
-                            return Err(AuthorityPersistenceError::StateTooLarge);
-                        }
-                        let slot = budgets.len();
-                        let mut anchored = checkpoint.clone();
-                        anchored.shift_wall_anchor(wall_adjustment)?;
-                        let mut retained = DurableBudgetGroup::try_new(first.clone(), anchored)?;
-                        for declaration in remaining {
-                            retained.add_declaration(declaration.clone())?;
-                        }
-                        budgets.push(retained);
-                        slot
-                    }
-                };
-                assigned.push(slot);
-            }
-            envelope.budgets = BoundedVec::try_new(budgets)
-                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
-            envelope.registry = registry;
+        self.transact(wall, |envelope, _wall_adjustment| {
+            envelope.budgets = BoundedVec::empty();
             Ok(())
-        })?;
-        Ok(assigned.into_boxed_slice())
+        })
     }
 
     #[cfg(test)]
@@ -797,7 +747,7 @@ impl AuthorityDurabilitySession {
         registry: crate::RegistryAuthorityState,
         wall: Timestamp,
     ) -> Result<Vec<u8>, AuthorityPersistenceError> {
-        if !proof.belongs_to(self) || !self.is_available() {
+        if !proof.belongs_to(self) || !self.is_idle_and_available() {
             proof.invalidate_bound_session();
             self.invalidate();
             return Err(AuthorityPersistenceError::SessionUnavailable);

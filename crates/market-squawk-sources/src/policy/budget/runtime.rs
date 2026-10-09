@@ -311,11 +311,13 @@ impl SharedProviderBudget {
                 BudgetUnavailableReason::AvailabilityGenerationExhausted,
             ));
         }
+        let operation = self.admit_runtime_operation()?;
         self.allocation
             .provider_rate
             .as_ref()
             .ok_or(BudgetUnavailableReason::PersistenceUnavailable)?
             .inspect_availability()
+            .map_err(|reason| self.terminal_fault(reason, &operation))
     }
 
     #[cfg(test)]
@@ -360,7 +362,6 @@ impl SharedProviderBudget {
                 clock,
                 availability_generation: AtomicU64::new(1),
                 transport_generation: AtomicU64::new(1),
-                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
                 provider_rate: None,
@@ -387,7 +388,7 @@ impl SharedProviderBudget {
         binding: ProviderRateBinding,
     ) -> Self {
         let clock = binding.clock();
-        let state = BudgetState::new(&policy, starts_at);
+        let state = BudgetState::provider_owned(starts_at);
         Self {
             allocation: Arc::new(BudgetAllocation {
                 policy,
@@ -395,7 +396,6 @@ impl SharedProviderBudget {
                 clock,
                 availability_generation: AtomicU64::new(1),
                 transport_generation: AtomicU64::new(1),
-                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
                 admission: Arc::clone(&binding.admission),
@@ -418,7 +418,6 @@ impl SharedProviderBudget {
                 clock,
                 availability_generation: AtomicU64::new(1),
                 transport_generation: AtomicU64::new(1),
-                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(binding),
                 provider_rate: None,
@@ -434,7 +433,7 @@ impl SharedProviderBudget {
         provider_rate: ProviderRateBinding,
     ) -> Self {
         let clock = provider_rate.clock();
-        let state = BudgetState::new(&policy, starts_at);
+        let state = BudgetState::provider_owned(starts_at);
         Self {
             allocation: Arc::new(BudgetAllocation {
                 policy,
@@ -442,7 +441,6 @@ impl SharedProviderBudget {
                 clock,
                 availability_generation: AtomicU64::new(1),
                 transport_generation: AtomicU64::new(1),
-                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(durability),
                 admission: Arc::clone(&provider_rate.admission),
@@ -468,38 +466,10 @@ impl SharedProviderBudget {
                 clock,
                 availability_generation: AtomicU64::new(checkpoint.availability_generation),
                 transport_generation: AtomicU64::new(1),
-                provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(binding),
                 provider_rate: None,
                 admission: Arc::default(),
-            }),
-        })
-    }
-
-    pub(in crate::policy) fn from_checkpoint_with_provider_rate(
-        policy: ProviderBudgetPolicy,
-        checkpoint: &BudgetCheckpointState,
-        durability: BudgetDurabilityBinding,
-        provider_rate: ProviderRateBinding,
-    ) -> Result<Self, AuthorityPersistenceError> {
-        let clock = provider_rate.clock();
-        let observation = clock
-            .observation()
-            .map_err(|_| AuthorityPersistenceError::InvalidState)?;
-        let state = runtime_state_from_checkpoint(&policy, checkpoint, observation)?;
-        Ok(Self {
-            allocation: Arc::new(BudgetAllocation {
-                policy,
-                state: Mutex::new(state),
-                clock,
-                availability_generation: AtomicU64::new(checkpoint.availability_generation),
-                transport_generation: AtomicU64::new(1),
-                provider_rate_state_version: AtomicU64::new(0),
-                terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
-                durability: Some(durability),
-                admission: Arc::clone(&provider_rate.admission),
-                provider_rate: Some(provider_rate),
             }),
         })
     }
@@ -594,17 +564,21 @@ impl SharedProviderBudget {
         let durable_admission = self
             .validated_durable_admission(admission)?
             .ok_or_else(|| self.latch_persistence_failure(admission))?;
+        let Some(slot) = binding.slot else {
+            if self.allocation.provider_rate.is_none() {
+                return Err(self.latch_persistence_failure(admission));
+            }
+            return Ok(());
+        };
+        if self.allocation.provider_rate.is_some() {
+            return Err(self.latch_persistence_failure(admission));
+        }
         let checkpoint = self
             .checkpoint_locked(state, observation)
             .map_err(|_| self.latch_persistence_failure(admission))?;
         binding
             .session
-            .update_budget_admitted(
-                durable_admission,
-                binding.slot,
-                checkpoint,
-                observation.wall_clock,
-            )
+            .update_budget_admitted(durable_admission, slot, checkpoint, observation.wall_clock)
             .map_err(|_| self.latch_persistence_failure(admission))
     }
 
@@ -734,16 +708,20 @@ impl SharedProviderBudget {
                 return self.terminal_fail(BudgetUnavailableReason::ClockUnavailable, &operation);
             }
         };
-        if let Err(reason) = validate_budget_windows(self.policy(), &state, observation.monotonic) {
-            drop(state);
-            return self.terminal_fail(reason, &operation);
-        }
-        if state.in_flight > self.policy().max_concurrent() {
-            drop(state);
-            return self.terminal_fail(BudgetUnavailableReason::StateCorrupt, &operation);
-        }
-        if state.disabled {
-            return Err(BudgetUnavailableReason::Disabled);
+        if self.allocation.provider_rate.is_none() {
+            if let Err(reason) =
+                validate_budget_windows(self.policy(), &state, observation.monotonic)
+            {
+                drop(state);
+                return self.terminal_fail(reason, &operation);
+            }
+            if state.in_flight > self.policy().max_concurrent() {
+                drop(state);
+                return self.terminal_fail(BudgetUnavailableReason::StateCorrupt, &operation);
+            }
+            if state.disabled {
+                return Err(BudgetUnavailableReason::Disabled);
+            }
         }
         let remaining_nanos = deadline
             .as_nanos()
@@ -798,6 +776,28 @@ impl SharedProviderBudget {
                 self.terminal_fault(BudgetUnavailableReason::StatePoisoned, &operation),
             );
         };
+        if let Some(provider_rate) = provider_rate_reservation {
+            if self.allocation.terminal.load(Ordering::Acquire) {
+                return BudgetReservationDecision::Unavailable(
+                    BudgetUnavailableReason::AvailabilityGenerationExhausted,
+                );
+            }
+            let Some(in_flight) = state.in_flight.checked_add(1) else {
+                return BudgetReservationDecision::Unavailable(
+                    self.terminal_fault(BudgetUnavailableReason::StateCorrupt, &operation),
+                );
+            };
+            if let Err(reason) = self.revoke_availability(&operation) {
+                return BudgetReservationDecision::Unavailable(reason);
+            }
+            state.in_flight = in_flight;
+            return BudgetReservationDecision::Ready(BudgetReservation {
+                allocation: Arc::clone(&self.allocation),
+                runtime_admission: Some(operation),
+                provider_rate: Some(provider_rate),
+                released: false,
+            });
+        }
         let Ok(observation) = self.allocation.clock.observation() else {
             return BudgetReservationDecision::Unavailable(
                 self.terminal_fault(BudgetUnavailableReason::ClockUnavailable, &operation),
@@ -905,7 +905,7 @@ impl SharedProviderBudget {
         BudgetReservationDecision::Ready(BudgetReservation {
             allocation: Arc::clone(&self.allocation),
             runtime_admission: Some(operation),
-            provider_rate: provider_rate_reservation,
+            provider_rate: None,
             released: false,
         })
     }
@@ -925,32 +925,33 @@ impl SharedProviderBudget {
         if self.policy().has_weighted_windows() {
             return BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable);
         }
-        let provider_rate_deadline = match &self.allocation.provider_rate {
-            Some(binding) => match binding.apply_retry_after(retry_after) {
+        if let Some(binding) = &self.allocation.provider_rate {
+            if let Err(reason) = self
+                .revoke_transport_authority(&operation)
+                .and_then(|()| self.revoke_availability(&operation))
+            {
+                return BudgetDecision::Unavailable(reason);
+            }
+            return match binding.apply_retry_after(retry_after) {
                 Ok((observation, ProviderRateReservationDecision::WaitUntil(deadline))) => {
                     match wall_deadline_to_monotonic(
                         observation.wall_clock,
                         observation.monotonic,
                         deadline,
                     ) {
-                        Ok(deadline) => Some(deadline),
-                        Err(reason) => return self.terminal_unavailable(reason, &operation),
+                        Ok(deadline) => BudgetDecision::WaitUntil(deadline),
+                        Err(reason) => self.terminal_unavailable(reason, &operation),
                     }
                 }
-                Ok((_observation, ProviderRateReservationDecision::Unavailable(reason))) => {
-                    if let Err(terminal) = self.revoke_transport_authority(&operation) {
-                        return BudgetDecision::Unavailable(terminal);
-                    }
-                    return BudgetDecision::Unavailable(reason);
+                Ok((_, ProviderRateReservationDecision::Unavailable(reason))) => {
+                    BudgetDecision::Unavailable(reason)
                 }
-                Ok((_observation, ProviderRateReservationDecision::Ready(_))) => {
-                    return self
-                        .terminal_unavailable(BudgetUnavailableReason::StateCorrupt, &operation);
+                Ok((_, ProviderRateReservationDecision::Ready(_))) => {
+                    self.terminal_unavailable(BudgetUnavailableReason::StateCorrupt, &operation)
                 }
-                Err(reason) => return self.terminal_unavailable(reason, &operation),
-            },
-            None => None,
-        };
+                Err(reason) => self.terminal_unavailable(reason, &operation),
+            };
+        }
         let Ok(mut state) = self.allocation.state.lock() else {
             return self.terminal_unavailable(BudgetUnavailableReason::StatePoisoned, &operation);
         };
@@ -1019,8 +1020,7 @@ impl SharedProviderBudget {
         };
         let effective = state
             .unavailable_until
-            .map_or(deadline, |current| current.max(deadline))
-            .max(provider_rate_deadline.unwrap_or(deadline));
+            .map_or(deadline, |current| current.max(deadline));
         state.unavailable_until = Some(effective);
         if let Err(reason) = self.revoke_availability(&operation) {
             return BudgetDecision::Unavailable(reason);
@@ -1051,32 +1051,33 @@ impl SharedProviderBudget {
         if self.policy().has_weighted_windows() {
             return BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable);
         }
-        let provider_rate_deadline = match &self.allocation.provider_rate {
-            Some(binding) => match binding.apply_refusal(jitter_sample_basis_points) {
+        if let Some(binding) = &self.allocation.provider_rate {
+            if let Err(reason) = self
+                .revoke_transport_authority(&operation)
+                .and_then(|()| self.revoke_availability(&operation))
+            {
+                return BudgetDecision::Unavailable(reason);
+            }
+            return match binding.apply_refusal(jitter_sample_basis_points) {
                 Ok((observation, ProviderRateReservationDecision::WaitUntil(deadline))) => {
                     match wall_deadline_to_monotonic(
                         observation.wall_clock,
                         observation.monotonic,
                         deadline,
                     ) {
-                        Ok(deadline) => Some(deadline),
-                        Err(reason) => return self.terminal_unavailable(reason, &operation),
+                        Ok(deadline) => BudgetDecision::WaitUntil(deadline),
+                        Err(reason) => self.terminal_unavailable(reason, &operation),
                     }
                 }
-                Ok((_observation, ProviderRateReservationDecision::Unavailable(reason))) => {
-                    if let Err(terminal) = self.revoke_transport_authority(&operation) {
-                        return BudgetDecision::Unavailable(terminal);
-                    }
-                    return BudgetDecision::Unavailable(reason);
+                Ok((_, ProviderRateReservationDecision::Unavailable(reason))) => {
+                    BudgetDecision::Unavailable(reason)
                 }
-                Ok((_observation, ProviderRateReservationDecision::Ready(_))) => {
-                    return self
-                        .terminal_unavailable(BudgetUnavailableReason::StateCorrupt, &operation);
+                Ok((_, ProviderRateReservationDecision::Ready(_))) => {
+                    self.terminal_unavailable(BudgetUnavailableReason::StateCorrupt, &operation)
                 }
-                Err(reason) => return self.terminal_unavailable(reason, &operation),
-            },
-            None => None,
-        };
+                Err(reason) => self.terminal_unavailable(reason, &operation),
+            };
+        }
         let Ok(mut state) = self.allocation.state.lock() else {
             return self.terminal_unavailable(BudgetUnavailableReason::StatePoisoned, &operation);
         };
@@ -1103,8 +1104,7 @@ impl SharedProviderBudget {
         state.consecutive_refusals = next_attempt;
         let effective = state
             .unavailable_until
-            .map_or(deadline, |current| current.max(deadline))
-            .max(provider_rate_deadline.unwrap_or(deadline));
+            .map_or(deadline, |current| current.max(deadline));
         state.unavailable_until = Some(effective);
         if let Err(reason) = self.revoke_availability(&operation) {
             return BudgetDecision::Unavailable(reason);
@@ -1127,9 +1127,9 @@ impl SharedProviderBudget {
             return Err(BudgetUnavailableReason::PersistenceUnavailable);
         }
         if let Some(binding) = &self.allocation.provider_rate {
-            binding
+            return binding
                 .record_success()
-                .map_err(|reason| self.terminal_fault(reason, &operation))?;
+                .map_err(|reason| self.terminal_fault(reason, &operation));
         }
         let mut state =
             self.allocation.state.lock().map_err(|_| {
@@ -1154,6 +1154,16 @@ impl SharedProviderBudget {
             return BudgetDecision::Unavailable(
                 BudgetUnavailableReason::AvailabilityGenerationExhausted,
             );
+        }
+        if let Some(binding) = &self.allocation.provider_rate {
+            return match self
+                .revoke_transport_authority(&operation)
+                .and_then(|()| self.revoke_availability(&operation))
+                .and_then(|()| binding.disable())
+            {
+                Ok(()) => BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled),
+                Err(reason) => self.terminal_unavailable(reason, &operation),
+            };
         }
         let Ok(mut state) = self.allocation.state.lock() else {
             return self.terminal_unavailable(BudgetUnavailableReason::StatePoisoned, &operation);
@@ -1249,42 +1259,55 @@ impl BudgetReservation {
                 budget.terminal_fault(BudgetUnavailableReason::ClockUnavailable, operation),
             );
         };
-        if state.in_flight == 0 || state.in_flight > budget.policy().max_concurrent() {
+        if state.in_flight == 0 {
             return BudgetDispatchDecision::Unavailable(
                 budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, operation),
             );
         }
-        if state.disabled {
-            return BudgetDispatchDecision::Unavailable(BudgetUnavailableReason::Disabled);
-        }
-        if let Some(until) = state.unavailable_until {
-            if pre_dispatch_observation.monotonic < until {
+        let provider_transport_generation = self
+            .allocation
+            .provider_rate
+            .as_ref()
+            .map(ProviderRateBinding::transport_generation);
+        if self.provider_rate.is_none() {
+            if state.in_flight > budget.policy().max_concurrent() {
+                return BudgetDispatchDecision::Unavailable(
+                    budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, operation),
+                );
+            }
+            if state.disabled {
+                return BudgetDispatchDecision::Unavailable(BudgetUnavailableReason::Disabled);
+            }
+            if let Some(until) = state.unavailable_until {
+                if pre_dispatch_observation.monotonic < until {
+                    let persisted =
+                        budget.persist_locked(&state, pre_dispatch_observation, operation);
+                    return match persisted {
+                        Ok(()) => BudgetDispatchDecision::WaitUntil(until),
+                        Err(reason) => BudgetDispatchDecision::Unavailable(reason),
+                    };
+                }
+                state.unavailable_until = None;
+            }
+            let availability = match evaluate_budget_windows(
+                budget.policy(),
+                &mut state,
+                pre_dispatch_observation.monotonic,
+            ) {
+                Ok(availability) => availability,
+                Err(reason) => {
+                    return BudgetDispatchDecision::Unavailable(
+                        budget.terminal_fault(reason, operation),
+                    );
+                }
+            };
+            if let Some(blocker) = availability.blocker {
                 let persisted = budget.persist_locked(&state, pre_dispatch_observation, operation);
                 return match persisted {
-                    Ok(()) => BudgetDispatchDecision::WaitUntil(until),
+                    Ok(()) => BudgetDispatchDecision::WaitUntil(blocker),
                     Err(reason) => BudgetDispatchDecision::Unavailable(reason),
                 };
             }
-            state.unavailable_until = None;
-        }
-        let availability = match evaluate_budget_windows(
-            budget.policy(),
-            &mut state,
-            pre_dispatch_observation.monotonic,
-        ) {
-            Ok(availability) => availability,
-            Err(reason) => {
-                return BudgetDispatchDecision::Unavailable(
-                    budget.terminal_fault(reason, operation),
-                );
-            }
-        };
-        if let Some(blocker) = availability.blocker {
-            let persisted = budget.persist_locked(&state, pre_dispatch_observation, operation);
-            return match persisted {
-                Ok(()) => BudgetDispatchDecision::WaitUntil(blocker),
-                Err(reason) => BudgetDispatchDecision::Unavailable(reason),
-            };
         }
 
         let (dispatch_observation, provider_rate_permit) = match self.provider_rate.take() {
@@ -1325,28 +1348,13 @@ impl BudgetReservation {
             None => (pre_dispatch_observation, None),
         };
 
-        let availability = match evaluate_budget_windows(
-            budget.policy(),
-            &mut state,
-            dispatch_observation.monotonic,
-        ) {
-            Ok(availability) => availability,
-            Err(reason) => {
-                drop(provider_rate_permit);
-                return BudgetDispatchDecision::Unavailable(
-                    budget.terminal_fault(reason, operation),
-                );
-            }
-        };
-        if availability.blocker.is_some() {
-            drop(provider_rate_permit);
-            return BudgetDispatchDecision::Unavailable(
-                budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, operation),
-            );
-        }
-        let windows_exhausted =
-            match admit_budget_windows(budget.policy(), &mut state, availability) {
-                Ok(exhausted) => exhausted,
+        if provider_rate_permit.is_none() {
+            let availability = match evaluate_budget_windows(
+                budget.policy(),
+                &mut state,
+                dispatch_observation.monotonic,
+            ) {
+                Ok(availability) => availability,
                 Err(reason) => {
                     drop(provider_rate_permit);
                     return BudgetDispatchDecision::Unavailable(
@@ -1354,15 +1362,32 @@ impl BudgetReservation {
                     );
                 }
             };
-        if windows_exhausted {
-            if let Err(reason) = budget.revoke_availability(operation) {
+            if availability.blocker.is_some() {
+                drop(provider_rate_permit);
+                return BudgetDispatchDecision::Unavailable(
+                    budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, operation),
+                );
+            }
+            let windows_exhausted =
+                match admit_budget_windows(budget.policy(), &mut state, availability) {
+                    Ok(exhausted) => exhausted,
+                    Err(reason) => {
+                        drop(provider_rate_permit);
+                        return BudgetDispatchDecision::Unavailable(
+                            budget.terminal_fault(reason, operation),
+                        );
+                    }
+                };
+            if windows_exhausted {
+                if let Err(reason) = budget.revoke_availability(operation) {
+                    drop(provider_rate_permit);
+                    return BudgetDispatchDecision::Unavailable(reason);
+                }
+            }
+            if let Err(reason) = budget.persist_locked(&state, dispatch_observation, operation) {
                 drop(provider_rate_permit);
                 return BudgetDispatchDecision::Unavailable(reason);
             }
-        }
-        if let Err(reason) = budget.persist_locked(&state, dispatch_observation, operation) {
-            drop(provider_rate_permit);
-            return BudgetDispatchDecision::Unavailable(reason);
         }
         drop(state);
 
@@ -1378,6 +1403,7 @@ impl BudgetReservation {
             provider_rate: provider_rate_permit,
             active: Arc::new(AtomicBool::new(true)),
             transport_generation,
+            provider_transport_generation,
             released: false,
         })
     }

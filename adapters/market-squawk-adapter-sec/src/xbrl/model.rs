@@ -2375,8 +2375,8 @@ mod tests {
         };
         use market_squawk_sources::{
             AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
-            FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
-            SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+            FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, SourceCapabilities,
+            SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
             SourceProtocolProfile,
         };
         use std::num::{NonZeroU32, NonZeroU64};
@@ -2477,7 +2477,12 @@ mod tests {
             market_squawk_domain::ProviderIdentityRegistry::new(),
             SecParserLimits::production_defaults(),
         )?;
-        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_durable_with_provider_rate(
+            market_squawk_platform::LocalAuthorityStateStore::try_open(
+                root.join("normalized-filing-source-authority"),
+            )?,
+            provider_rate,
+        )?;
         let registered = registry.register(metadata.clone(), at)?;
         let extraction_authority = registry.extraction_authority(&registered, &source)?;
         {
@@ -2491,12 +2496,29 @@ mod tests {
                 &cancellation,
             )
             .await?;
-            assert!(matches!(
-                extraction_authority.try_network_request(target.url()),
-                Err(market_squawk_sources::ExtractionAuthorityError::BudgetUnavailable {
-                    reason: market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
-                })
-            ));
+            let second_held = crate::client::acquire_sec_request(
+                &extraction_authority,
+                target.url(),
+                None,
+                &cancellation,
+            )
+            .await?;
+            // Two dispatched requests also consume the complete 2/s window. Either that
+            // window or occupied slots can block the next request, depending on its clock.
+            let third = extraction_authority.try_network_request(target.url());
+            assert!(
+                matches!(
+                third,
+                Err(market_squawk_sources::ExtractionAuthorityError::BudgetWaitUntil { .. }) |
+                Err(
+                    market_squawk_sources::ExtractionAuthorityError::BudgetUnavailable {
+                        reason:
+                            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+                    }
+                )
+            ),
+                "unexpected third-request admission: {third:?}"
+            );
             let cancelled = CancellationToken::new();
             let waiting = crate::client::acquire_sec_request(
                 &extraction_authority,
@@ -2533,7 +2555,16 @@ mod tests {
             tokio::pin!(next);
             assert!(futures_util::poll!(&mut next).is_pending());
             held.record_success()?;
+            second_held.record_success()?;
             next.await?.record_success()?;
+            crate::client::acquire_sec_request(
+                &extraction_authority,
+                target.url(),
+                Some(deadline),
+                &cancellation,
+            )
+            .await?
+            .record_success()?;
             assert!(matches!(
                 extraction_authority.try_network_request(target.url()),
                 Err(market_squawk_sources::ExtractionAuthorityError::BudgetWaitUntil { .. })
@@ -3326,7 +3357,9 @@ mod tests {
         for row in selected.selected() {
             let observation = &expected_observations[usize::try_from(row.row().row_ordinal())?];
             let revision_family =
-                market_squawk_sources::CanonicalObservationFamily::try_from_observation(observation)?;
+                market_squawk_sources::CanonicalObservationFamily::try_from_observation(
+                    observation,
+                )?;
             assert_eq!(
                 revision_family.identity().bytes(),
                 row.point_in_time().family_identity().bytes(),
@@ -3584,7 +3617,10 @@ mod tests {
         assert_eq!(replay.receipt(), expected_receipt);
         assert_eq!(replay.selected().len(), 4);
         assert_eq!(
-            replay.decoded_rows().iter().collect::<Result<Vec<_>, _>>()?,
+            replay
+                .decoded_rows()
+                .iter()
+                .collect::<Result<Vec<_>, _>>()?,
             expected_observations,
             "restart preserves each occurrence, local revision and complete XBRL evidence"
         );

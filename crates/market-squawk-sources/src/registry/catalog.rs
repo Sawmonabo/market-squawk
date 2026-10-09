@@ -241,7 +241,7 @@ impl AuthoritativeSourceRegistry {
             .last_epoch = epoch;
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
-            |policy| self.budgets.policies_with(policy.persisted()),
+            |policy| self.budgets.policies_with(policy),
         );
         let candidate_state = authority_state_from_history(&candidate_history, policies)?;
         let budget = match resolved_budget {
@@ -361,7 +361,7 @@ impl AuthoritativeSourceRegistry {
         );
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
-            |policy| self.budgets.policies_with(policy.persisted()),
+            |policy| self.budgets.policies_with(policy),
         );
         let candidate_state = authority_state_from_history(&candidate_history, policies)?;
         let budget = match resolved_budget {
@@ -456,7 +456,7 @@ impl AuthoritativeSourceRegistry {
         history.last_epoch = epoch;
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
-            |policy| self.budgets.policies_with(policy.persisted()),
+            |policy| self.budgets.policies_with(policy),
         );
         let candidate_state = authority_state_from_history(&candidate_history, policies)?;
         let budget = match resolved_budget {
@@ -585,11 +585,33 @@ impl AuthoritativeSourceRegistry {
             .entries
             .get(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
-        let needs_identity = entry.metadata.coverage().live_channels().iter().any(|channel|
-            channel.rules().iter().any(|rule| !matches!(rule.event_class(), LiveEventClass::Chart | LiveEventClass::Screener)));
-        if needs_identity && (entry.provider_identities.is_empty()
-            || entry.metadata.coverage().instruments().instruments().iter().any(|instrument|
-                !entry.provider_identities.iter().any(|selected| selected.evidence().native.instrument == *instrument)))
+        let needs_identity = entry
+            .metadata
+            .coverage()
+            .live_channels()
+            .iter()
+            .any(|channel| {
+                channel.rules().iter().any(|rule| {
+                    !matches!(
+                        rule.event_class(),
+                        LiveEventClass::Chart | LiveEventClass::Screener
+                    )
+                })
+            });
+        if needs_identity
+            && (entry.provider_identities.is_empty()
+                || entry
+                    .metadata
+                    .coverage()
+                    .instruments()
+                    .instruments()
+                    .iter()
+                    .any(|instrument| {
+                        !entry
+                            .provider_identities
+                            .iter()
+                            .any(|selected| selected.evidence().native.instrument == *instrument)
+                    }))
         {
             return Err(RegistryError::LiveScopeNotCovered);
         }

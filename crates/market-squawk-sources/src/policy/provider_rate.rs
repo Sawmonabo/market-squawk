@@ -587,6 +587,43 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
     /// Starts one process run and reconciles crash-retained permit ownership.
     fn start_run(&self, now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError>;
 
+    /// Configures concurrency for existing, drained groups before runtime bindings escape.
+    /// All other policy dimensions and retained quota state must remain unchanged. Missing
+    /// groups remain absent; ordinary source registration creates fresh groups later.
+    fn configure_request_concurrency(
+        &self,
+        _run_id: ProviderRateRunId,
+        declarations: &[ProviderRateDeclaration],
+        _now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        if declarations.is_empty() {
+            Ok(())
+        } else {
+            Err(ProviderRateStoreError::Conflict)
+        }
+    }
+
+    /// Validates a retained source declaration against its existing aggregate quota group.
+    /// This never registers a declaration or creates a group. Only concurrency may differ.
+    fn validate_retained_budget(
+        &self,
+        _run_id: ProviderRateRunId,
+        _declaration: &ProviderRateDeclaration,
+        _now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
+
+    /// Durably disables the exact currently registered aggregate group.
+    fn disable(
+        &self,
+        _run_id: ProviderRateRunId,
+        _registration: ProviderRateRegistration,
+        _now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
+
     /// Stages a bounded declaration batch under one retained writer transaction.
     ///
     /// The implementation must validate the complete batch, including declarations staged
@@ -873,6 +910,21 @@ impl std::fmt::Debug for ProviderRateAuthority {
 }
 
 impl ProviderRateAuthority {
+    /// Opens one process run and applies current concurrency configuration before exposing it.
+    ///
+    /// # Errors
+    /// Rejects incompatible configuration or undrained ownership without clearing quota history.
+    pub fn try_new_with_request_configuration(
+        store: Arc<dyn ProviderRateStore>,
+        declarations: &[ProviderRateDeclaration],
+    ) -> Result<Self, ProviderRateStoreError> {
+        let authority = Self::try_new(store)?;
+        authority.serialized_timed_store_operation(|store, run_id, now| {
+            store.configure_request_concurrency(run_id, declarations, now)
+        })?;
+        Ok(authority)
+    }
+
     /// Opens the product-wide authority and starts one crash-reconcilable process run.
     ///
     /// # Errors
@@ -1084,6 +1136,17 @@ impl ProviderRateAuthority {
         self.binding_for_registration(registration)
     }
 
+    pub(in crate::policy) fn validate_retained_budget(
+        &self,
+        declaration: &ProviderRateDeclaration,
+    ) -> Result<(), BudgetPoolError> {
+        self.serialized_timed_store_operation(|store, run_id, now| {
+            store.validate_retained_budget(run_id, declaration, now)
+        })
+        .map(|_| ())
+        .map_err(map_store_registration_error)
+    }
+
     fn binding_for_registration(
         &self,
         registration: ProviderRateRegistration,
@@ -1265,25 +1328,83 @@ impl ProviderRateBinding {
         Arc::clone(&self.authority.inner.clock)
     }
 
+    pub(in crate::policy) fn availability_generation(&self) -> u64 {
+        self.admission.availability_generation()
+    }
+
+    pub(in crate::policy) fn availability_generation_is_current(&self, generation: u64) -> bool {
+        self.admission
+            .availability_generation_is_current(generation)
+    }
+
+    pub(in crate::policy) fn transport_generation(&self) -> u64 {
+        self.admission.transport_generation()
+    }
+
+    pub(in crate::policy) fn transport_generation_is_current(&self, generation: u64) -> bool {
+        self.admission.transport_generation_is_current(generation)
+    }
+
+    fn checked_store_result<T>(
+        &self,
+        result: Result<T, ProviderRateStoreError>,
+    ) -> Result<T, BudgetUnavailableReason> {
+        result.map_err(|error| {
+            self.admission.terminalize();
+            map_store_runtime_error(error)
+        })
+    }
+
+    // The generation changes under the same serialization as the authoritative operation.
+    // No quota state is copied into this process-local group.
+    fn mutate<T>(
+        &self,
+        revoke_transport: bool,
+        operation: impl FnOnce(
+            &dyn ProviderRateStore,
+            ProviderRateRunId,
+            Timestamp,
+        ) -> Result<T, ProviderRateStoreError>,
+    ) -> Result<(ClockObservation, T), BudgetUnavailableReason> {
+        self.checked_store_result(self.authority.serialized_timed_store_operation(
+            |store, run_id, now| {
+                self.admission
+                    .invalidate(revoke_transport)
+                    .map_err(|_| ProviderRateStoreError::Corrupt)?;
+                operation(store, run_id, now)
+            },
+        ))
+    }
+
     pub(in crate::policy) fn try_reserve_decision(
         &self,
     ) -> Result<(ClockObservation, ProviderRateReservationDecision), BudgetUnavailableReason> {
-        self.authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.try_reserve(run_id, self.registration, now)
-            })
-            .map_err(map_store_runtime_error)
+        self.mutate(false, |store, run_id, now| {
+            store.try_reserve(run_id, self.registration, now)
+        })
+    }
+
+    pub(in crate::policy) fn availability_lease_generation(
+        &self,
+    ) -> Result<(ProviderRateAvailability, u64), BudgetUnavailableReason> {
+        self.checked_store_result(self.authority.serialized_timed_store_operation(
+            |store, run_id, now| {
+                let generation = self.availability_generation();
+                if !self.availability_generation_is_current(generation) {
+                    return Err(ProviderRateStoreError::Corrupt);
+                }
+                let availability = store.inspect_availability(run_id, self.registration, now)?;
+                Ok((availability, generation))
+            },
+        ))
+        .map(|(_, result)| result)
     }
 
     pub(in crate::policy) fn inspect_availability(
         &self,
     ) -> Result<ProviderRateAvailability, BudgetUnavailableReason> {
-        self.authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.inspect_availability(run_id, self.registration, now)
-            })
-            .map(|(_observation, availability)| availability)
-            .map_err(map_store_runtime_error)
+        self.availability_lease_generation()
+            .map(|(availability, _)| availability)
     }
 
     pub(in crate::policy) fn commit_dispatch(
@@ -1291,48 +1412,45 @@ impl ProviderRateBinding {
         reservation_id: ProviderRateReservationId,
         claim: ProviderRateDispatchClaim,
     ) -> Result<(ClockObservation, ProviderRateDispatchDecision), BudgetUnavailableReason> {
-        self.authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.commit_dispatch_with_claim(
-                    run_id,
-                    self.registration,
-                    reservation_id,
-                    now,
-                    claim,
-                )
-            })
-            .map_err(map_store_runtime_error)
+        self.mutate(false, |store, run_id, now| {
+            store.commit_dispatch_with_claim(run_id, self.registration, reservation_id, now, claim)
+        })
     }
 
     pub(in crate::policy) fn apply_retry_after(
         &self,
         retry_after: RetryAfter,
     ) -> Result<(ClockObservation, ProviderRateReservationDecision), BudgetUnavailableReason> {
-        self.authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.apply_retry_after(run_id, self.registration, now, retry_after)
-            })
-            .map_err(map_store_runtime_error)
+        let _changed = self.admission.notify_on_drop();
+        self.mutate(true, |store, run_id, now| {
+            store.apply_retry_after(run_id, self.registration, now, retry_after)
+        })
     }
 
     pub(in crate::policy) fn apply_refusal(
         &self,
         jitter_sample_basis_points: u16,
     ) -> Result<(ClockObservation, ProviderRateReservationDecision), BudgetUnavailableReason> {
-        self.authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.apply_refusal(run_id, self.registration, now, jitter_sample_basis_points)
-            })
-            .map_err(map_store_runtime_error)
+        let _changed = self.admission.notify_on_drop();
+        self.mutate(true, |store, run_id, now| {
+            store.apply_refusal(run_id, self.registration, now, jitter_sample_basis_points)
+        })
     }
 
     pub(in crate::policy) fn record_success(&self) -> Result<(), BudgetUnavailableReason> {
-        self.authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.record_success(run_id, self.registration, now)
-            })
-            .map(|(_observation, ())| ())
-            .map_err(map_store_runtime_error)
+        let _changed = self.admission.notify_on_drop();
+        self.mutate(false, |store, run_id, now| {
+            store.record_success(run_id, self.registration, now)
+        })
+        .map(|_| ())
+    }
+
+    pub(in crate::policy) fn disable(&self) -> Result<(), BudgetUnavailableReason> {
+        let _changed = self.admission.notify_on_drop();
+        self.mutate(true, |store, run_id, now| {
+            store.disable(run_id, self.registration, now)
+        })
+        .map(|_| ())
     }
 }
 
@@ -1402,11 +1520,14 @@ impl ProviderRateReservation {
         let admission = Arc::clone(&self.binding.admission);
         let _changed = admission.notify_capacity_on_drop();
         self.binding
-            .authority
-            .serialized_store_operation(|store, run_id| {
-                store.cancel_reservation(run_id, self.binding.registration, self.reservation_id)
-            })
-            .map_err(map_store_runtime_error)?;
+            .checked_store_result(self.binding.authority.serialized_store_operation(
+                |store, run_id| {
+                    // Cleanup remains possible after terminalization; it must release the exact
+                    // outstanding owner even though every previously issued lease is invalid.
+                    let _invalidated = admission.invalidate(false);
+                    store.cancel_reservation(run_id, self.binding.registration, self.reservation_id)
+                },
+            ))?;
         self.released = true;
         Ok(())
     }
@@ -1462,18 +1583,24 @@ impl ProviderRatePermit {
         let _changed = admission.notify_on_drop();
         let receipt = self
             .binding
-            .authority
-            .serialized_timed_store_operation(|store, run_id, now| {
-                store.settle_response(
-                    run_id,
-                    self.binding.registration,
-                    self.permit_id,
-                    now,
-                    settlement,
-                )
-            })
-            .map(|(_observation, receipt)| receipt)
-            .map_err(map_store_runtime_error)?;
+            .checked_store_result(self.binding.authority.serialized_timed_store_operation(
+                |store, run_id, now| {
+                    let revoke_transport = matches!(
+                        settlement.response_class(),
+                        crate::ProviderRateResponseClass::ProviderRefusal
+                            | crate::ProviderRateResponseClass::AbandonedUnknown
+                    ) || settlement.retry_after().retry_after().is_some();
+                    let _invalidated = admission.invalidate(revoke_transport);
+                    store.settle_response(
+                        run_id,
+                        self.binding.registration,
+                        self.permit_id,
+                        now,
+                        settlement,
+                    )
+                },
+            ))?
+            .1;
         // The store has consumed the exact permit even if its returned receipt is malformed.
         self.released = true;
         if receipt.group_id() != self.binding.registration.group_id()
@@ -1487,6 +1614,7 @@ impl ProviderRatePermit {
                 && receipt.charged_response_bytes()
                     != self.claim.maximum_response_bytes().unwrap_or(0))
         {
+            admission.terminalize();
             return Err(BudgetUnavailableReason::StateCorrupt);
         }
         Ok(receipt)
@@ -1499,28 +1627,31 @@ impl ProviderRatePermit {
         let admission = Arc::clone(&self.binding.admission);
         let _changed = admission.notify_on_drop();
         if self.claim.is_request_only() {
-            self.binding
-                .authority
-                .serialized_store_operation(|store, run_id| {
-                    store.release(run_id, self.binding.registration, self.permit_id)
-                })
-                .map_err(map_store_runtime_error)?;
+            self.binding.checked_store_result(
+                self.binding
+                    .authority
+                    .serialized_store_operation(|store, run_id| {
+                        let _invalidated = admission.invalidate(false);
+                        store.release(run_id, self.binding.registration, self.permit_id)
+                    }),
+            )?;
         } else {
             let settlement = ProviderRateResponseSettlement::abandoned_unknown();
             let receipt = self
                 .binding
-                .authority
-                .serialized_timed_store_operation(|store, run_id, now| {
-                    store.settle_response(
-                        run_id,
-                        self.binding.registration,
-                        self.permit_id,
-                        now,
-                        settlement,
-                    )
-                })
-                .map(|(_observation, receipt)| receipt)
-                .map_err(map_store_runtime_error)?;
+                .checked_store_result(self.binding.authority.serialized_timed_store_operation(
+                    |store, run_id, now| {
+                        let _invalidated = admission.invalidate(true);
+                        store.settle_response(
+                            run_id,
+                            self.binding.registration,
+                            self.permit_id,
+                            now,
+                            settlement,
+                        )
+                    },
+                ))?
+                .1;
             // The store has consumed the exact permit even if its returned receipt is malformed.
             self.released = true;
             if receipt.group_id() != self.binding.registration.group_id()
@@ -1529,6 +1660,7 @@ impl ProviderRatePermit {
                 || receipt.charged_response_bytes()
                     != self.claim.maximum_response_bytes().unwrap_or(0)
             {
+                admission.terminalize();
                 return Err(BudgetUnavailableReason::StateCorrupt);
             }
         }

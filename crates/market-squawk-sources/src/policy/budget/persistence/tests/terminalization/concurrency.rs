@@ -39,7 +39,7 @@ fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     Ok(BlockingBudgetFixture {

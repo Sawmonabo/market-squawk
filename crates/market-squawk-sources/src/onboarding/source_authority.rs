@@ -481,7 +481,7 @@ pub const SEC_EDGAR_AUTHORITY: FilingTaxonomySourceAuthority = FilingTaxonomySou
     taxonomy_endpoints: SEC_EDGAR_TAXONOMY_ENDPOINTS,
     request_header_class: FilingTaxonomyRequestHeaderClass::SecIdentifyingContact,
     requests_per_second: 2,
-    max_concurrent: 1,
+    max_concurrent: 2,
     max_response_bytes: 1024 * MEBIBYTE,
     total_timeout_nanos: 15 * MINUTE_NANOS,
     weighted_taxonomy_response_budget: false,

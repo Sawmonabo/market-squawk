@@ -15,8 +15,10 @@ mod coordinator_tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    #[derive(Debug)]
-    struct NoopAuthorityStore;
+    #[derive(Debug, Default)]
+    struct NoopAuthorityStore {
+        writes: AtomicUsize,
+    }
 
     impl AuthorityStateStore for NoopAuthorityStore {
         fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
@@ -24,6 +26,7 @@ mod coordinator_tests {
         }
 
         fn store(&self, _payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -54,7 +57,11 @@ mod coordinator_tests {
         rollbacks: Arc<AtomicUsize>,
         admission_enabled: bool,
         reserve_calls: AtomicUsize,
-        request_active: AtomicBool,
+        active_requests: AtomicUsize,
+        maximum_concurrent: usize,
+        dispatch_calls: AtomicUsize,
+        availability_calls: AtomicUsize,
+        retained_missing: AtomicBool,
         disabled: AtomicBool,
         dispatch_wait: AtomicBool,
     }
@@ -133,14 +140,47 @@ mod coordinator_tests {
                     BudgetUnavailableReason::Disabled,
                 ));
             }
-            if self.request_active.swap(true, Ordering::SeqCst) {
+            if self.active_requests.load(Ordering::SeqCst) >= self.maximum_concurrent.max(1) {
                 return Ok(ProviderRateReservationDecision::Unavailable(
                     BudgetUnavailableReason::ConcurrencyExhausted,
                 ));
             }
+            let previous = self.active_requests.fetch_add(1, Ordering::SeqCst);
             Ok(ProviderRateReservationDecision::Ready(
-                ProviderRateReservationId::from_bytes([3; 16]),
+                ProviderRateReservationId::from_bytes(
+                    [u8::try_from(previous + 3).map_err(|_| ProviderRateStoreError::Corrupt)?; 16],
+                ),
             ))
+        }
+
+        fn inspect_availability(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateAvailability, ProviderRateStoreError> {
+            self.availability_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if self.disabled.load(Ordering::SeqCst) {
+                ProviderRateAvailability::Unavailable(BudgetUnavailableReason::Disabled)
+            } else if self.active_requests.load(Ordering::SeqCst) >= self.maximum_concurrent.max(1)
+            {
+                ProviderRateAvailability::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+            } else {
+                ProviderRateAvailability::Available
+            })
+        }
+
+        fn validate_retained_budget(
+            &self,
+            _run_id: ProviderRateRunId,
+            _declaration: &ProviderRateDeclaration,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            if self.retained_missing.load(Ordering::SeqCst) {
+                Err(ProviderRateStoreError::Corrupt)
+            } else {
+                Ok(())
+            }
         }
 
         fn commit_dispatch(
@@ -150,11 +190,12 @@ mod coordinator_tests {
             _reservation_id: ProviderRateReservationId,
             now: Timestamp,
         ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            self.dispatch_calls.fetch_add(1, Ordering::SeqCst);
             if !self.admission_enabled {
                 return Err(ProviderRateStoreError::Unavailable);
             }
             if self.dispatch_wait.load(Ordering::SeqCst) {
-                self.request_active.store(false, Ordering::SeqCst);
+                self.active_requests.fetch_sub(1, Ordering::SeqCst);
                 return Ok(ProviderRateDispatchDecision::WaitUntil(
                     now.checked_add_nanos(1_000_000_000)
                         .map_err(|_| ProviderRateStoreError::Clock)?,
@@ -171,7 +212,7 @@ mod coordinator_tests {
             _registration: ProviderRateRegistration,
             _reservation_id: ProviderRateReservationId,
         ) -> Result<(), ProviderRateStoreError> {
-            self.request_active.store(false, Ordering::SeqCst);
+            self.active_requests.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -181,7 +222,7 @@ mod coordinator_tests {
             _registration: ProviderRateRegistration,
             _permit_id: ProviderRatePermitId,
         ) -> Result<(), ProviderRateStoreError> {
-            self.request_active.store(false, Ordering::SeqCst);
+            self.active_requests.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -318,11 +359,14 @@ mod coordinator_tests {
 
         let store = Arc::new(TrackingProviderRateStore {
             admission_enabled: true,
+            maximum_concurrent: 2,
             ..TrackingProviderRateStore::default()
         });
         let rate = ProviderRateAuthority::try_new(store.clone())?;
         let publisher = crate::FASB_XBRL_TAXONOMY_AUTHORITY;
-        let policy = test_policy(publisher.rate_scope(), 20)?;
+        let mut policy_wire = serde_json::to_value(test_policy(publisher.rate_scope(), 2)?)?;
+        policy_wire["max_concurrent"] = serde_json::json!(2);
+        let policy: ProviderBudgetPolicy = serde_json::from_value(policy_wire)?;
         let mut metadata = serde_json::to_value(publisher.dependency_source_metadata()?)?;
         metadata["budget"] = serde_json::to_value(&policy)?;
         let adapter = Adapter(serde_json::from_value(metadata)?);
@@ -351,7 +395,32 @@ mod coordinator_tests {
             &second_budget.request_admission(),
         ));
 
+        let mut transport = match second_budget.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("transport dispatch: {other:?}").into()),
+        };
+        transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("transport: {reason:?}"))?;
+        let transport_lease = transport.active_lease();
+        let dispatches_before = store.dispatch_calls.load(Ordering::SeqCst);
+        let prior_lease = second_budget
+            .availability_lease()
+            .map_err(|reason| format!("availability: {reason:?}"))?;
+        let independent = match first_budget.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("independent dispatch: {other:?}").into()),
+        };
         let held = authority.acquire_network_request(target).await?;
+        assert_eq!(store.active_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.dispatch_calls.load(Ordering::SeqCst),
+            dispatches_before + 2
+        );
+        assert!(!prior_lease.is_available());
+        let inspected = store.availability_calls.load(Ordering::SeqCst);
+        assert!(!prior_lease.is_available());
+        assert_eq!(store.availability_calls.load(Ordering::SeqCst), inspected);
         let mut first = Box::pin(authority.acquire_network_request(target));
         let mut second = Box::pin(authority.acquire_network_request(target));
         assert!(futures_util::poll!(&mut first).is_pending());
@@ -465,6 +534,7 @@ mod coordinator_tests {
         let held = authority.acquire_network_request(target).await?;
         let mut waiting = Box::pin(authority.acquire_network_request(target));
         assert!(futures_util::poll!(&mut waiting).is_pending());
+        assert!(transport_lease.is_current());
         assert!(matches!(
             second_budget.apply_retry_after(RetryAfter::Delay(NonZeroU64::MIN)),
             BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
@@ -476,7 +546,10 @@ mod coordinator_tests {
             })
         ));
         held.release();
-        assert!(!store.request_active.load(Ordering::SeqCst));
+        assert!(!transport_lease.is_current());
+        drop(transport);
+        independent.release();
+        assert_eq!(store.active_requests.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -551,7 +624,7 @@ mod coordinator_tests {
         let observation = clock
             .observation()
             .map_err(|reason| format!("test clock unavailable: {reason:?}"))?;
-        let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore);
+        let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore::default());
         let session = AuthorityDurabilitySession::open(store, observation.wall_clock)?;
         let mut pool = ProviderBudgetPool::new_durable(session.clone());
         for index in 0..count {
@@ -993,7 +1066,7 @@ mod coordinator_tests {
             .requests_per_window()
             .ok_or("numeric request window missing")?
             + 1;
-        let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore);
+        let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore::default());
         let session = AuthorityDurabilitySession::open(store, observation.wall_clock)?;
         let mut coordinator = ProcessBudgetCoordinator::new(4);
 
@@ -1049,7 +1122,7 @@ mod coordinator_tests {
             Arc::new(SystemBudgetClock::new()),
             BudgetDurabilityBinding {
                 session: collision_session.clone(),
-                slot: 0,
+                slot: Some(0),
             },
         );
         assert!(matches!(
@@ -1070,6 +1143,119 @@ mod coordinator_tests {
             declaration_pool.validate_clean_shutdown(&declaration_session),
             Err(CleanShutdownValidationError::DeclarationMismatch)
         ));
+        let clock = SystemBudgetClock::new();
+        let observed = clock
+            .observation()
+            .map_err(|reason| format!("clock: {reason:?}"))?;
+        let provider_store = Arc::new(TrackingProviderRateStore {
+            admission_enabled: true,
+            ..TrackingProviderRateStore::default()
+        });
+        let provider_rate = ProviderRateAuthority::try_new(provider_store.clone())?;
+        let source_store = Arc::new(NoopAuthorityStore::default());
+        let session = AuthorityDurabilitySession::open(source_store.clone(), observed.wall_clock)?;
+        let mut pool = ProviderBudgetPool::new_durable_with_provider_rate(
+            session.clone(),
+            provider_rate.clone(),
+        );
+        let resolved = resolved_policy("provider-clean-proof", 1)?;
+        let budget =
+            pool.register_durable(resolved.clone(), &crate::RegistryAuthorityState::empty())?;
+        assert!(session.budget_groups()?.is_empty());
+        assert!(
+            budget
+                .allocation
+                .durability
+                .as_ref()
+                .ok_or("missing session")?
+                .slot
+                .is_none()
+        );
+        let source_writes = source_store.writes.load(Ordering::SeqCst);
+        let mut transport = match budget.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("provider dispatch: {other:?}").into()),
+        };
+        assert!(matches!(
+            pool.validate_clean_shutdown(&session),
+            Err(CleanShutdownValidationError::ActiveRequest)
+        ));
+        transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("handshake: {reason:?}"))?;
+        // The network slot has gone, but the retained transport still owns a lifecycle admission.
+        assert!(
+            !pool
+                .has_active_requests()
+                .map_err(|reason| format!("owned count: {reason:?}"))?
+        );
+        assert!(matches!(
+            pool.validate_clean_shutdown(&session),
+            Err(CleanShutdownValidationError::ActiveRequest)
+        ));
+        drop(transport);
+        assert_eq!(source_store.writes.load(Ordering::SeqCst), source_writes);
+        let proof = pool
+            .validate_clean_shutdown(&session)
+            .map_err(|reason| format!("clean provider: {reason:?}"))?;
+        session.close_clean(
+            proof,
+            crate::RegistryAuthorityState::empty(),
+            clock
+                .observation()
+                .map_err(|reason| format!("clock: {reason:?}"))?
+                .wall_clock,
+        )?;
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+        ));
+        assert!(budget.provider_rate_availability().is_err());
+
+        // A source checkpoint is redundant only after its aggregate collision association exists.
+        let archived = AuthorityDurabilitySession::open(
+            Arc::new(NoopAuthorityStore::default()),
+            observed.wall_clock,
+        )?;
+        let checkpoint = checkpoint_from_runtime(
+            resolved.policy(),
+            &BudgetState::new(resolved.policy(), observed.monotonic),
+            observed,
+            1,
+            false,
+        )?;
+        archived.register_budget_group(
+            crate::RegistryAuthorityState::empty(),
+            resolved.persisted().clone(),
+            checkpoint.clone(),
+            observed.wall_clock,
+        )?;
+        let mut restored =
+            ProviderBudgetPool::new_durable_with_provider_rate(archived.clone(), provider_rate);
+        provider_store
+            .retained_missing
+            .store(true, Ordering::SeqCst);
+        let commits = provider_store.commits.load(Ordering::SeqCst);
+        assert!(
+            restored
+                .restore_provider_associations(
+                    vec![resolved.clone()],
+                    vec![(vec![resolved.clone()], checkpoint.clone())]
+                )
+                .is_err()
+        );
+        assert_eq!(archived.budget_groups()?.len(), 1);
+        provider_store
+            .retained_missing
+            .store(false, Ordering::SeqCst);
+        restored.restore_provider_associations(
+            vec![resolved.clone()],
+            vec![(vec![resolved.clone()], checkpoint)],
+        )?;
+        assert!(archived.budget_groups()?.is_empty());
+        assert_eq!(provider_store.commits.load(Ordering::SeqCst), commits);
+        assert_eq!(restored.policies(), vec![resolved.persisted().clone()]);
+        assert!(restored.budgets.is_empty());
         Ok(())
     }
 }

@@ -49,7 +49,4 @@ pub(crate) use persistence::{
     DurableBudgetGroup,
 };
 pub(crate) use persistence::{AuthorityPersistenceError, AuthorityStateStore};
-pub(in crate::policy) use persistence::{
-    DurableBudgetRegistrationGroup, DurableBudgetRegistrationTarget,
-};
 pub(crate) use persistence::{deserialize_clean_restart_backup, serialize_clean_restart_backup};

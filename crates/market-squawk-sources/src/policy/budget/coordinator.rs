@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct BudgetAvailabilityLease {
     allocation: Arc<BudgetAllocation>,
     generation: u64,
+    provider_generation: Option<u64>,
 }
 
 impl std::fmt::Debug for BudgetAvailabilityLease {
@@ -18,7 +19,12 @@ impl std::fmt::Debug for BudgetAvailabilityLease {
 
 impl BudgetAvailabilityLease {
     pub(crate) fn is_available(&self) -> bool {
-        !self.allocation.terminal.load(Ordering::Acquire)
+        self.provider_generation.is_none_or(|generation| {
+            self.allocation
+                .provider_rate
+                .as_ref()
+                .is_some_and(|binding| binding.availability_generation_is_current(generation))
+        }) && !self.allocation.terminal.load(Ordering::Acquire)
             && !self.allocation.state.is_poisoned()
             && self
                 .allocation
@@ -73,6 +79,36 @@ impl SharedProviderBudget {
                 return self.terminal_fail(BudgetUnavailableReason::StatePoisoned, &operation);
             }
         };
+        if let Some(binding) = &self.allocation.provider_rate {
+            let (availability, provider_generation) = binding
+                .availability_lease_generation()
+                .map_err(|reason| self.terminal_fault(reason, &operation))?;
+            let reason = match availability {
+                ProviderRateAvailability::Available => None,
+                ProviderRateAvailability::WaitUntil(_) => {
+                    Some(BudgetUnavailableReason::AvailabilityChanged)
+                }
+                ProviderRateAvailability::Unavailable(reason) => Some(reason),
+            };
+            if let Some(reason) = reason {
+                self.revoke_availability(&operation)?;
+                return Err(reason);
+            }
+            let lease = BudgetAvailabilityLease {
+                allocation: Arc::clone(&self.allocation),
+                generation: self
+                    .allocation
+                    .availability_generation
+                    .load(Ordering::Acquire),
+                provider_generation: Some(provider_generation),
+            };
+            drop(state);
+            return if lease.is_available() {
+                Ok(lease)
+            } else {
+                Err(BudgetUnavailableReason::AvailabilityChanged)
+            };
+        }
         let observation = match self.allocation.clock.observation() {
             Ok(observation) => observation,
             Err(_reason) => {
@@ -130,6 +166,7 @@ impl SharedProviderBudget {
         let lease = BudgetAvailabilityLease {
             allocation: Arc::clone(&self.allocation),
             generation,
+            provider_generation: None,
         };
         if lease.is_available() {
             Ok(lease)

@@ -82,7 +82,7 @@ fn legitimate_post_mint_generation_change_returns_precise_nonterminal_reason() -
         clock,
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     store.arm(&budget.allocation)?;

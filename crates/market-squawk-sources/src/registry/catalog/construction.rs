@@ -524,7 +524,13 @@ impl AuthoritativeSourceRegistry {
             );
             resolved_groups.push((declarations, group.checkpoint().clone()));
         }
-        if !same_persisted_policy_set(state.budget_policies(), &flattened) {
+        if provider_rate.is_none() {
+            if !same_persisted_policy_set(state.budget_policies(), &flattened) {
+                return Err(RegistryError::InvalidAuthorityState);
+            }
+        } else if flattened.iter().enumerate().any(|(index, policy)| {
+            !state.budget_policies().contains(policy) || flattened[..index].contains(policy)
+        }) {
             return Err(RegistryError::InvalidAuthorityState);
         }
         let instance_id = NEXT_REGISTRY_ID
@@ -532,16 +538,34 @@ impl AuthoritativeSourceRegistry {
                 current.checked_add(1)
             })
             .map_err(|_| RegistryError::RegistryIdentityExhausted)?;
-        let mut budgets = match provider_rate {
-            Some(provider_rate) => ProviderBudgetPool::new_durable_with_provider_rate(
-                Arc::clone(&durability),
-                provider_rate,
-            ),
-            None => ProviderBudgetPool::new_durable(Arc::clone(&durability)),
+        let budgets = match provider_rate {
+            Some(provider_rate) => {
+                let policies = state
+                    .budget_policies()
+                    .iter()
+                    .map(|persisted| {
+                        persisted
+                            .resolve(authorization_subject_resolver.as_ref())
+                            .map_err(map_budget_resolution_error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut budgets = ProviderBudgetPool::new_durable_with_provider_rate(
+                    Arc::clone(&durability),
+                    provider_rate,
+                );
+                budgets
+                    .restore_provider_associations(policies, resolved_groups)
+                    .map_err(map_budget_pool_error)?;
+                budgets
+            }
+            None => {
+                let mut budgets = ProviderBudgetPool::new_durable(Arc::clone(&durability));
+                budgets
+                    .restore_durable(resolved_groups)
+                    .map_err(map_budget_pool_error)?;
+                budgets
+            }
         };
-        budgets
-            .restore_durable(resolved_groups)
-            .map_err(|_| RegistryError::BudgetCoordinator)?;
         let history = history_from_state(&state);
         Ok(Self {
             instance_id,

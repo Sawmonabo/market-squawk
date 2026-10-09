@@ -547,6 +547,161 @@ impl ProviderRateStore for SqliteProviderRateStore {
         }
     }
 
+    fn configure_request_concurrency(
+        &self,
+        run_id: ProviderRateRunId,
+        declarations: &[ProviderRateDeclaration],
+        now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        if declarations.is_empty() {
+            return Ok(());
+        }
+        if i64::try_from(declarations.len()).map_or(true, |count| count > MAXIMUM_DECLARATIONS) {
+            return Err(ProviderRateStoreError::Capacity);
+        }
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        validate_run(&transaction, run_id, now)?;
+        let mut changes = Vec::<(LoadedGroup, Vec<&ProviderRateDeclaration>)>::new();
+        changes
+            .try_reserve_exact(declarations.len())
+            .map_err(|_| ProviderRateStoreError::Capacity)?;
+        // Validate the complete batch against the original configuration before publishing any
+        // replacement. Overlapping desired declarations cannot overwrite each other in order.
+        for (index, declaration) in declarations.iter().enumerate() {
+            declaration
+                .validate()
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+            validate_policy_store_bounds(declaration.policy())?;
+            if declarations[..index].iter().any(|previous| {
+                previous.policy() != declaration.policy()
+                    && previous
+                        .collision_identities()
+                        .iter()
+                        .any(|identity| declaration.collision_identities().contains(identity))
+            }) {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            let Some(group) = retained_configuration_group(&transaction, declaration, now, false)?
+            else {
+                // Source restore must still be able to detect absent aggregate quota history.
+                continue;
+            };
+            if group.policy.as_ref() == declaration.policy() {
+                continue;
+            }
+            if let Some((_, desired)) = changes
+                .iter_mut()
+                .find(|(previous, _)| previous.group_id == group.group_id)
+            {
+                if desired[0].policy() != declaration.policy() {
+                    return Err(ProviderRateStoreError::Conflict);
+                }
+                if !desired.contains(&declaration) {
+                    desired
+                        .try_reserve(1)
+                        .map_err(|_| ProviderRateStoreError::Capacity)?;
+                    desired.push(declaration);
+                }
+            } else {
+                let mut desired = Vec::new();
+                desired
+                    .try_reserve_exact(1)
+                    .map_err(|_| ProviderRateStoreError::Capacity)?;
+                desired.push(declaration);
+                changes.push((group, desired));
+            }
+        }
+        for (group, desired) in &changes {
+            let proposed_keys = desired
+                .iter()
+                .map(|declaration| encode_collision_keys(declaration))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT collision_keys FROM provider_rate_declarations WHERE group_id = ?1",
+                )
+                .map_err(map_sql)?;
+            let mut rows = statement.query([group.group_id]).map_err(map_sql)?;
+            while let Some(row) = rows.next().map_err(map_sql)? {
+                let retained_keys: Vec<u8> = row.get(0).map_err(map_sql)?;
+                if !proposed_keys.contains(&retained_keys) {
+                    return Err(ProviderRateStoreError::Conflict);
+                }
+            }
+            let active: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_rate_requests WHERE group_id = ?1",
+                    [group.group_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_sql)?;
+            let extensions: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_rate_extensions AS e
+                     JOIN provider_rate_declarations AS d USING(declaration_digest)
+                     WHERE d.group_id = ?1",
+                    [group.group_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_sql)?;
+            if active != 0 || extensions != 0 {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+        }
+        for (mut group, desired) in changes {
+            let declaration = desired[0];
+            group.policy = Box::new(declaration.policy().clone());
+            group.policy_digest = sha256_bytes(declaration.policy_digest())?;
+            let json =
+                serde_json::to_vec(&group.policy).map_err(|_| ProviderRateStoreError::Corrupt)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE provider_rate_groups SET policy_digest = ?1, policy_json = ?2
+                     WHERE group_id = ?3 AND state_version = ?4",
+                    params![group.policy_digest, json, group.group_id, group.version],
+                )
+                .map_err(map_sql)?;
+            if updated != 1 {
+                return Err(ProviderRateStoreError::Conflict);
+            }
+            // Keep every window anchor, consumed unit, refusal and restriction unchanged.
+            persist_group(&transaction, &mut group, now)?;
+            for declaration in desired {
+                let registration = register_in_open_transaction(&transaction, declaration, now)?;
+                if registration.group_id().bytes() != group.group_id {
+                    return Err(ProviderRateStoreError::Corrupt);
+                }
+            }
+            transaction
+                .execute(
+                    "DELETE FROM provider_rate_declarations
+                     WHERE group_id = ?1 AND policy_digest != ?2",
+                    params![group.group_id, group.policy_digest],
+                )
+                .map_err(map_sql)?;
+        }
+        transaction.commit().map_err(map_sql)
+    }
+
+    fn validate_retained_budget(
+        &self,
+        run_id: ProviderRateRunId,
+        declaration: &ProviderRateDeclaration,
+        now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        declaration
+            .validate()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        validate_policy_store_bounds(declaration.policy())?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sql)?;
+        validate_run_readonly(&transaction, run_id, now)?;
+        retained_configuration_group(&transaction, declaration, now, true)?
+            .ok_or(ProviderRateStoreError::Conflict)?;
+        transaction.commit().map_err(map_sql)
+    }
+
     fn register_unknown_capacity(
         &self,
         run_id: ProviderRateRunId,
@@ -1151,6 +1306,18 @@ impl ProviderRateStore for SqliteProviderRateStore {
         })
     }
 
+    fn disable(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        now: Timestamp,
+    ) -> Result<(), ProviderRateStoreError> {
+        self.mutate_group(run_id, registration, now, |group| {
+            group.state.disabled = true;
+            Ok(())
+        })
+    }
+
     fn bind_authorization_subject(
         &self,
         run_id: ProviderRateRunId,
@@ -1647,6 +1814,63 @@ fn extension_row_digest_fields(
     digest.update(state_digest);
     digest.update(updated_at_ns.to_be_bytes());
     digest.finalize().into()
+}
+
+fn retained_configuration_group(
+    connection: &Connection,
+    declaration: &ProviderRateDeclaration,
+    now: Timestamp,
+    require_exact_collision: bool,
+) -> Result<Option<LoadedGroup>, ProviderRateStoreError> {
+    let keys = encode_collision_keys(declaration)?;
+    let groups = matching_groups(connection, &keys)?;
+    let group_id = match groups.as_slice() {
+        [] => return Ok(None),
+        [group_id] => *group_id,
+        _ => return Err(ProviderRateStoreError::Conflict),
+    };
+    let group = load_group_by_id(connection, group_id)?;
+    let current = group.policy.as_ref();
+    let retained = declaration.policy();
+    if current.scope() != retained.scope()
+        || current.backoff() != retained.backoff()
+        || current.window_count() != retained.window_count()
+        || current.weighted_window_count() != retained.weighted_window_count()
+        || (0..current.window_count()).any(|index| current.window(index) != retained.window(index))
+        || (0..current.weighted_window_count())
+            .any(|index| current.weighted_window(index) != retained.weighted_window(index))
+    {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    // matching_groups verifies each declaration row's integrity. Source restore requires an
+    // exact retained collision set. Configuration instead validates complete retained-set
+    // coverage against its explicit batch before publishing any supplied current declarations.
+    let (exact, incompatible): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(CASE WHEN collision_keys = ?2 THEN 1 END),
+                    COUNT(CASE WHEN policy_digest != ?3 THEN 1 END)
+             FROM provider_rate_declarations WHERE group_id = ?1",
+            params![group_id, keys, group.policy_digest],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(map_sql)?;
+    if incompatible != 0 {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    if require_exact_collision && exact == 0 {
+        return Err(ProviderRateStoreError::Conflict);
+    }
+    // Validate semantics at the retained observation before considering the current clock, but
+    // do not expire consumption or cooldowns as a side effect of configuration/association.
+    let mut state = group.state.clone();
+    state.advance(
+        current,
+        Timestamp::from_unix_nanos(group.state.last_observed_ns),
+    )?;
+    if now.unix_nanos() < group.state.last_observed_ns {
+        return Err(ProviderRateStoreError::Clock);
+    }
+    Ok(Some(group))
 }
 
 fn register_in_open_transaction(
@@ -4420,6 +4644,235 @@ mod tests {
         Ok(())
     }
 
+    // Unknown-capacity coverage deliberately clears windows; it cannot prove that changing
+    // concurrency retains consumed request/weighted quota and survives source-checkpoint restore.
+    #[test]
+    fn request_concurrency_configuration_preserves_retained_quota_and_rejects_stale_handles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for disabled in [false, true] {
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("provider-rate.sqlite3");
+            let store = SqliteProviderRateStore::try_open(&path)?;
+            let now = Timestamp::from_unix_nanos(1_000_000_000);
+            let run_id = store.start_run(now)?;
+            let endpoint = EndpointPolicy::try_new(["https://concurrency.test/data"])?;
+            let weighted = market_squawk_sources::ProviderRateWeightedWindow::try_new(
+                ProviderRateWeightedDimension::ResponseBytes,
+                NonZeroU64::new(100).ok_or("weighted limit")?,
+                NonZeroU64::new(60_000_000_000).ok_or("weighted duration")?,
+                BudgetWindowSemantics::Sliding,
+            )?;
+            let declaration = |concurrency| -> Result<_, Box<dyn std::error::Error>> {
+                let base = test_declaration_with_concurrency(
+                    "concurrency-configuration",
+                    2,
+                    concurrency,
+                    "https://concurrency.test/data",
+                )?;
+                Ok(ProviderRateDeclaration::try_for_endpoint(
+                    ProviderBudgetPolicy::try_new_weighted_conjunctive(
+                        base.policy().scope().clone(),
+                        &[base.policy().window(0).ok_or("request window")?],
+                        &[weighted],
+                        NonZeroU16::new(concurrency).ok_or("concurrency")?,
+                        base.policy().backoff(),
+                    )?,
+                    &endpoint,
+                )?)
+            };
+            let previous = declaration(1)?;
+            let desired = declaration(2)?;
+            store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), now)?;
+            assert_eq!(
+                store.validate_retained_budget(run_id, &previous, now),
+                Err(ProviderRateStoreError::Conflict),
+            );
+            let old = store.register(run_id, &previous, now)?;
+            let ProviderRateReservationDecision::Ready(reservation) =
+                store.try_reserve(run_id, old, now)?
+            else {
+                return Err("fixture reservation was not admitted".into());
+            };
+            assert_eq!(
+                store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), now),
+                Err(ProviderRateStoreError::Conflict),
+            );
+            let claim = ProviderRateDispatchClaim::try_new(NonZeroU64::new(10), 0)?;
+            let ProviderRateDispatchDecision::Ready(permit) =
+                store.commit_dispatch_with_claim(run_id, old, reservation, now, claim)?
+            else {
+                return Err("fixture dispatch was not admitted".into());
+            };
+            assert_eq!(
+                store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), now),
+                Err(ProviderRateStoreError::Conflict),
+            );
+            let settlement = ProviderRateResponseSettlement::try_new(
+                10,
+                ProviderRateResponseClass::ValidatedSuccess,
+                ProviderRateRetryAfterDisposition::Absent,
+                0,
+            )?;
+            store.settle_response(run_id, old, permit, now, settlement)?;
+            store.apply_refusal(run_id, old, now, 0)?;
+            store.apply_retry_after(
+                run_id,
+                old,
+                now,
+                RetryAfter::Delay(NonZeroU64::new(5_000_000_000).ok_or("cooldown")?),
+            )?;
+            if disabled {
+                store.disable(run_id, old, now)?;
+            }
+            let retained = serde_json::to_vec(&load_group(&store.connection()?, old)?.state)?;
+            let wrong_scope = ProviderRateDeclaration::try_for_endpoint(
+                ProviderBudgetPolicy::try_new_weighted_conjunctive(
+                    BudgetScope::new(market_squawk_domain::SourceIdentifier::try_from("other")?),
+                    &[desired.policy().window(0).ok_or("request window")?],
+                    &[weighted],
+                    NonZeroU16::new(2).ok_or("concurrency")?,
+                    desired.policy().backoff(),
+                )?,
+                &endpoint,
+            )?;
+            let wrong_backoff = ProviderRateDeclaration::try_for_endpoint(
+                ProviderBudgetPolicy::try_new_weighted_conjunctive(
+                    desired.policy().scope().clone(),
+                    &[desired.policy().window(0).ok_or("request window")?],
+                    &[weighted],
+                    NonZeroU16::new(2).ok_or("concurrency")?,
+                    BackoffPolicy::try_new(NonZeroU64::MIN, NonZeroU64::MIN, 0)?,
+                )?,
+                &endpoint,
+            )?;
+            let wrong_origins = ProviderRateDeclaration::try_for_endpoint(
+                desired.policy().clone(),
+                &EndpointPolicy::try_new([
+                    "https://concurrency.test/data",
+                    "https://unrelated.test/data",
+                ])?,
+            )?;
+            let wrong_windows = test_declaration_with_concurrency(
+                "concurrency-configuration",
+                3,
+                2,
+                "https://concurrency.test/data",
+            )?;
+            for invalid in [wrong_scope, wrong_backoff, wrong_origins, wrong_windows] {
+                assert_eq!(
+                    store.configure_request_concurrency(
+                        run_id,
+                        std::slice::from_ref(&invalid),
+                        now
+                    ),
+                    Err(ProviderRateStoreError::Conflict),
+                );
+                assert_eq!(
+                    store.validate_retained_budget(run_id, &invalid, now),
+                    Err(ProviderRateStoreError::Conflict),
+                );
+            }
+            store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), now)?;
+            let current = store.register(run_id, &desired, now)?;
+            assert_eq!(current.group_id(), old.group_id());
+            let configured = load_group(&store.connection()?, current)?;
+            assert_eq!(serde_json::to_vec(&configured.state)?, retained);
+            store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), now)?;
+            assert_eq!(
+                load_group(&store.connection()?, current)?.version,
+                configured.version
+            );
+            store.validate_retained_budget(run_id, &previous, now)?;
+            assert_eq!(
+                load_group(&store.connection()?, current)?.version,
+                configured.version
+            );
+            assert_eq!(
+                store.try_reserve(run_id, old, now),
+                Err(ProviderRateStoreError::Conflict)
+            );
+            assert_eq!(
+                store.disable(run_id, old, now),
+                Err(ProviderRateStoreError::Conflict)
+            );
+            assert_eq!(
+                store.register(run_id, &previous, now),
+                Err(ProviderRateStoreError::Conflict)
+            );
+            let expected = if disabled {
+                ProviderRateAvailability::Unavailable(BudgetUnavailableReason::Disabled)
+            } else {
+                ProviderRateAvailability::WaitUntil(Timestamp::from_unix_nanos(6_000_000_000))
+            };
+            assert_eq!(store.inspect_availability(run_id, current, now)?, expected);
+            drop(store);
+            let store = SqliteProviderRateStore::try_open(path)?;
+            let restart = Timestamp::from_unix_nanos(2_000_000_000);
+            let run_id = store.start_run(restart)?;
+            store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), restart)?;
+            store.validate_retained_budget(run_id, &previous, restart)?;
+            let current = store.register(run_id, &desired, restart)?;
+            assert_eq!(
+                serde_json::to_vec(&load_group(&store.connection()?, current)?.state)?,
+                retained
+            );
+            assert_eq!(
+                store.inspect_availability(run_id, current, restart)?,
+                expected
+            );
+            if disabled {
+                continue;
+            }
+            let ready = Timestamp::from_unix_nanos(6_000_000_000);
+            let ProviderRateReservationDecision::Ready(reservation) =
+                store.try_reserve(run_id, current, ready)?
+            else {
+                return Err("remaining request quota was lost".into());
+            };
+            let ProviderRateDispatchDecision::Ready(permit) =
+                store.commit_dispatch_with_claim(run_id, current, reservation, ready, claim)?
+            else {
+                return Err("remaining dispatch quota was lost".into());
+            };
+            store.settle_response(run_id, current, permit, ready, settlement)?;
+            let next_window = Timestamp::from_unix_nanos(61_000_000_000);
+            assert_eq!(
+                store.try_reserve(run_id, current, ready)?,
+                ProviderRateReservationDecision::WaitUntil(next_window)
+            );
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let ProviderRateReservationDecision::Ready(reservation) =
+                    store.try_reserve(run_id, current, next_window)?
+                else {
+                    return Err("configured two-slot capacity was lost on reopen".into());
+                };
+                held.push(reservation);
+            }
+            assert_eq!(
+                store.try_reserve(run_id, current, next_window)?,
+                ProviderRateReservationDecision::Unavailable(
+                    BudgetUnavailableReason::ConcurrencyExhausted
+                )
+            );
+            for reservation in held {
+                let ProviderRateDispatchDecision::Ready(permit) = store
+                    .commit_dispatch_with_claim(run_id, current, reservation, next_window, claim)?
+                else {
+                    return Err("configured request could not dispatch".into());
+                };
+                store.settle_response(run_id, current, permit, next_window, settlement)?;
+            }
+            assert_eq!(
+                store.try_reserve(run_id, current, next_window)?,
+                ProviderRateReservationDecision::WaitUntil(Timestamp::from_unix_nanos(
+                    121_000_000_000
+                ))
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn rejected_registration_batch_rolls_back_every_declaration()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4453,6 +4906,156 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!((groups, declarations), (1, 1));
+        drop(connection);
+
+        // Configuration is also a batch: a later extension-bound group must not leave an
+        // earlier drained group's concurrency changed after the batch is rejected.
+        let desired = test_declaration_with_concurrency(
+            "atomic-batch-conflict",
+            2,
+            2,
+            "https://atomic-batch.test/second",
+        )?;
+        let extension_previous =
+            test_declaration("atomic-extension", 2, "https://atomic-extension.test/data")?;
+        let extension_desired = test_declaration_with_concurrency(
+            "atomic-extension",
+            2,
+            2,
+            "https://atomic-extension.test/data",
+        )?;
+        store.register(run_id, &extension_previous, now)?;
+        let extension = ProviderRateExtensionKey::try_from_declaration(
+            &extension_previous,
+            market_squawk_domain::SourceIdentifier::try_from("configuration-extension")?,
+            market_squawk_domain::SourceIdentifier::try_from("configuration-extension-v1")?,
+        )?;
+        store.compare_exchange_extension(run_id, &extension, None, b"retained", now)?;
+        let retained = checkpoint_from_connection(&store.connection()?)?.bytes;
+        assert_eq!(
+            store.configure_request_concurrency(run_id, &[desired.clone(), extension_desired], now),
+            Err(ProviderRateStoreError::Conflict),
+        );
+        assert_eq!(
+            checkpoint_from_connection(&store.connection()?)?.bytes,
+            retained
+        );
+        assert_eq!(
+            store.configure_request_concurrency(
+                run_id,
+                &[desired.clone(), conflicting.clone()],
+                now
+            ),
+            Err(ProviderRateStoreError::Conflict),
+        );
+        assert_eq!(
+            checkpoint_from_connection(&store.connection()?)?.bytes,
+            retained
+        );
+        let overlapping = ProviderRateDeclaration::try_for_endpoint(
+            conflicting.policy().clone(),
+            &EndpointPolicy::try_new([
+                "https://atomic-batch.test/second",
+                "https://additional-origin.test/data",
+            ])?,
+        )?;
+        let overlapping_registration = store.register(run_id, &overlapping, now)?;
+        store.validate_retained_budget(run_id, &conflicting, now)?;
+        let retained = checkpoint_from_connection(&store.connection()?)?.bytes;
+        store.configure_request_concurrency(run_id, &[], now)?;
+        assert_eq!(
+            store.configure_request_concurrency(run_id, std::slice::from_ref(&desired), now),
+            Err(ProviderRateStoreError::Conflict),
+        );
+        assert_eq!(
+            checkpoint_from_connection(&store.connection()?)?.bytes,
+            retained
+        );
+        assert_eq!(
+            store.configure_request_concurrency(
+                run_id,
+                &[desired.clone(), overlapping.clone()],
+                now
+            ),
+            Err(ProviderRateStoreError::Conflict),
+        );
+        assert_eq!(
+            checkpoint_from_connection(&store.connection()?)?.bytes,
+            retained
+        );
+        assert_eq!(store.register(run_id, &conflicting, now)?, registration);
+
+        // The onboarding origin and the wider source-origin set explicitly configure the same
+        // existing group together. Neither declaration may silently disappear or stay stale.
+        let overlapping_desired = ProviderRateDeclaration::try_for_endpoint(
+            desired.policy().clone(),
+            &EndpointPolicy::try_new([
+                "https://atomic-batch.test/second",
+                "https://additional-origin.test/data",
+            ])?,
+        )?;
+        let retained_group = load_group(&store.connection()?, registration)?;
+        let desired = [desired, overlapping_desired];
+        store.configure_request_concurrency(run_id, &desired, now)?;
+        for (previous, current) in [(&conflicting, &desired[0]), (&overlapping, &desired[1])] {
+            let current = store.register(run_id, current, now)?;
+            assert_eq!(current.group_id(), registration.group_id());
+            let configured_group = load_group(&store.connection()?, current)?;
+            assert_eq!(configured_group.version, retained_group.version + 1);
+            assert_eq!(
+                serde_json::to_vec(&configured_group.state)?,
+                serde_json::to_vec(&retained_group.state)?
+            );
+            store.validate_retained_budget(run_id, previous, now)?;
+            assert_eq!(
+                store.register(run_id, previous, now),
+                Err(ProviderRateStoreError::Conflict)
+            );
+        }
+        for stale in [registration, overlapping_registration] {
+            assert_eq!(
+                store.try_reserve(run_id, stale, now),
+                Err(ProviderRateStoreError::Conflict)
+            );
+        }
+        let retained = checkpoint_from_connection(&store.connection()?)?.bytes;
+        store.configure_request_concurrency(run_id, &desired, now)?;
+        assert_eq!(
+            checkpoint_from_connection(&store.connection()?)?.bytes,
+            retained
+        );
+        // Startup supplies both canonical declarations even when only onboarding registered
+        // before the preceding shutdown. Explicit coverage still includes every retained set.
+        let partial = test_declaration("atomic-partial", 2, "https://partial.test/data")?;
+        let partial_registration = store.register(run_id, &partial, now)?;
+        let partial_desired =
+            test_declaration_with_concurrency("atomic-partial", 2, 2, "https://partial.test/data")?;
+        let additional_desired = ProviderRateDeclaration::try_for_endpoint(
+            partial_desired.policy().clone(),
+            &EndpointPolicy::try_new([
+                "https://partial.test/data",
+                "https://partial-source.test/data",
+            ])?,
+        )?;
+        assert_eq!(
+            store.validate_retained_budget(run_id, &additional_desired, now),
+            Err(ProviderRateStoreError::Conflict)
+        );
+        store.configure_request_concurrency(
+            run_id,
+            &[partial_desired, additional_desired.clone()],
+            now,
+        )?;
+        let additional_registration = store.register(run_id, &additional_desired, now)?;
+        assert_eq!(
+            additional_registration.group_id(),
+            partial_registration.group_id()
+        );
+        store.validate_retained_budget(run_id, &partial, now)?;
+        assert_eq!(
+            store.register(run_id, &partial, now),
+            Err(ProviderRateStoreError::Conflict)
+        );
         Ok(())
     }
 

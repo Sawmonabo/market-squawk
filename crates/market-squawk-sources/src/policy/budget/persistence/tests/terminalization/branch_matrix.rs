@@ -51,7 +51,7 @@ fn global_fault_fixture() -> TestResult<GlobalFaultFixture> {
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot: peer_slot,
+            slot: Some(peer_slot),
         },
     );
     Ok(GlobalFaultFixture {

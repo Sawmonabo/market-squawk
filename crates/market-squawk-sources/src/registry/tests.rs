@@ -662,8 +662,20 @@ mod tests {
         let at = Timestamp::from_unix_nanos(1_000_000_000);
         let store = Arc::new(FailingAuthorityStore::default());
         let metadata = direct_metadata("restart-resume", "revision-1")?;
-        let mut first = durable_registry_with_test_store(store.clone())?;
+        let [instrument] = metadata.coverage().instruments().instruments() else {
+            return Err("restart fixture requires one covered instrument".into());
+        };
+        let (identity_authority, identity_requests) =
+            fixture_identity_authority(&[(*instrument, "BTC-USD")], at)?;
+        let mut first = durable_registry_with_test_store(store.clone())?
+            .with_provider_identity_authority(identity_authority)?;
         let registered = first.register_or_resume_exact(metadata.clone(), at)?;
+        first.record_provider_identities(
+            &registered,
+            &identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let session = first.begin_session(
             &registered,
             SessionId::new(SourceIdentifier::try_from("session-7")?),
@@ -675,9 +687,27 @@ mod tests {
         drop(registered);
         first.shutdown()?;
 
-        let mut restarted = durable_registry_with_test_store(store.clone())?;
+        let (identity_authority, identity_requests) =
+            fixture_identity_authority(&[(*instrument, "BTC-USD")], at)?;
+        let mut restarted = durable_registry_with_test_store(store.clone())?
+            .with_provider_identity_authority(identity_authority)?;
         let resumed = restarted.register_or_resume_exact(metadata.clone(), at)?;
         assert_eq!(resumed.revision(), metadata.revision());
+        // Revision history survives restart; process-owned identity selections do not.
+        assert!(matches!(
+            restarted.begin_next_session(
+                &resumed,
+                SessionId::new(SourceIdentifier::try_from("unselected-session")?),
+                at,
+            ),
+            Err(RegistryError::LiveScopeNotCovered)
+        ));
+        restarted.record_provider_identities(
+            &resumed,
+            &identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let next = restarted.begin_next_session(
             &resumed,
             SessionId::new(SourceIdentifier::try_from("session-8")?),
@@ -733,11 +763,24 @@ mod tests {
     fn restart_rejects_stale_revision_and_exhausted_generation_without_mutation() -> TestResult {
         let at = Timestamp::from_unix_nanos(1_000_000_000);
         let store = Arc::new(FailingAuthorityStore::default());
-        let mut first = durable_registry_with_test_store(store.clone())?;
         let revision_1 = direct_metadata("restart-stale", "revision-1")?;
+        let [instrument] = revision_1.coverage().instruments().instruments() else {
+            return Err("restart fixture requires one covered instrument".into());
+        };
+        let instrument = *instrument;
+        let (identity_authority, identity_requests) =
+            fixture_identity_authority(&[(instrument, "BTC-USD")], at)?;
+        let mut first = durable_registry_with_test_store(store.clone())?
+            .with_provider_identity_authority(identity_authority)?;
         let registered = first.register_or_resume_exact(revision_1.clone(), at)?;
         let revision_2 = direct_metadata("restart-stale", "revision-2")?;
         let replacement = first.replace_metadata(&registered, revision_2.clone(), at)?;
+        first.record_provider_identities(
+            &replacement,
+            &identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let maximum = first.begin_session(
             &replacement,
             SessionId::new(SourceIdentifier::try_from("maximum-generation")?),
@@ -750,12 +793,21 @@ mod tests {
         drop(registered);
         first.shutdown()?;
 
-        let mut restarted = durable_registry_with_test_store(store.clone())?;
+        let (identity_authority, identity_requests) =
+            fixture_identity_authority(&[(instrument, "BTC-USD")], at)?;
+        let mut restarted = durable_registry_with_test_store(store.clone())?
+            .with_provider_identity_authority(identity_authority)?;
         assert!(matches!(
             restarted.register_or_resume_exact(revision_1, at),
             Err(RegistryError::RevisionNotLatest)
         ));
         let resumed = restarted.register_or_resume_exact(revision_2, at)?;
+        restarted.record_provider_identities(
+            &resumed,
+            &identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let before = restarted.export_authority_state()?;
         let stores_before = store.store_calls.load(Ordering::Acquire);
         assert!(matches!(
