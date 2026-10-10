@@ -2,13 +2,47 @@
 
 ## Current execution — 2026-10-10
 
-Goal active and incomplete. Latest pushed source is **5dfce1f3**. The rejected unpublished inventory
-commit was replaced by **49f2f031**, proper endpoint/object schemas with personal ticker rows removed.
-Lead's captured-publication correction passed its genuine OAuth/bridge critical test1/1 and matching
-managed native build2992. SEC recovery survived restart; financial-page latency and full streaming
-remain unresolved. Current service7503/Desktop7575 are available; watcher30632 is stopped and no
-compiler runs. Exact ownership and verification appear below before the history divider.
-One primary worktree; feature/main/release remain the only local branches. Main/release unchanged.
+Goal active and incomplete. Latest pushed source is **573b5dcc**; provider schemas are pushed as
+**49f2f031**. All 25 schema pages were reviewed, personal ticker rows removed, and ignored originals
+preserved. The current read-cost correction is critically verified and awaiting commit/push.
+
+**Current outcome:** keep market screens responsive and continuously publish received stream data.
+The request-capacity correction passed 42 critical checks. Its matching managed native build passed
+in 11m43s; service34800/Desktop35011 run `generation-WfxAkw`. Workspace composition took 4,341ms.
+Watcher30632 remains stopped under supervisor30620. No compiler or implementation agent is active.
+
+| Owner | Current work / evidence | Next barrier |
+| --- | --- | --- |
+| Lead | Two SQL files: `crates/market-squawk-data/src/manifest/catalog/lineage.rs` and `crates/market-squawk-data/src/catalog/market_recovery.rs`. Three JOIN changes preserve predicates while driving exact ancestry/commit/run lookups from selected rows. All three existing critical fixtures passed. Lead also owns closure, ledger, Git, builds and shared contracts. | Commit/push this correction, then integrate cause-preserving stream diagnostics before the next matching native check. No native latency pass yet. |
+| Astra financial_read_cost — complete, released | `oct10-previous-close-read-cost.md`: unchanged query results and approximately 27.5 times less ancestry VM work; route query plan corrected separately. | No further assignment. Wall-time samples during compilation are diagnostic only. |
+| Astra stream_first_frame — diagnosis complete | `oct10-schwab-first-frame.md`: the first retryable transport exit loses its cause and becomes `ReconnectExhausted`. A later postcommit account failure is a separate episode. | Next bounded implementation must retain the original closed disconnect reason through the existing lifecycle event. Keep the outer account owner responsible for fresh-generation recovery. |
+
+Native573 durably published six Schwab quotes, eight book snapshots, three chart records and ten
+screener records through commit61445. This proves received-data publication, not uninterrupted
+streaming or rendered live updates. The first collection read still failed at previous-close
+selection; background Home subsequently showed nine retained watchlist rows. The viewport screenshot
+is not the full screen audit. SEC's saved session remains active after restart.
+
+Evidence under `.agents/tmp/v1-first-stock/`:
+
+- `oct10-read-cost-history-critical.log`: exact history/cutoff/restart check, 1/1 passed (20.87s).
+- `oct10-read-cost-routes-critical.log`: publication/route/cursor/restart check, 1/1 passed (15.19s).
+- `oct10-read-cost-lineage-critical.log`: derived-parent evidence check, 1/1 passed (0.59s).
+- `oct10-budget-data-native-startup.json`, `oct10-budget-data-native-collection.json`, and
+  `oct10-budget-data-native-durable-stream.json`: scoped native observations.
+- `oct10-budget-data-home.png` and `oct10-budget-data-home-dom.json`: background viewport and DOM.
+
+The SQL correction follows SQLite's documented [join-order control](https://www.sqlite.org/optoverview.html#manual_control_of_query_plans_using_cross_join).
+Existing bounded `PRAGMA optimize` maintenance remains in place. No schema, API, request deadline,
+rights, cancellation or runtime-state changes are part of this correction. Exec97288 completed with
+exit0; source stayed frozen during the serialized checks.
+
+Next dependencies remain the stream disconnect cause, matching native read verification, the ready
+option-reference supersession/retry slice, and remaining analysis/provider/UI journeys. Full V1 and
+installed/resource acceptance remain open. One primary worktree and the intended feature/main/release
+local branches; main/release unchanged. Latest PR43 evidence comment:6092173596.
+
+### Current-wave checkpoint chronology (earlier runtime and ownership entries are superseded)
 
 **Current outcome:** ordinary restart must open the workspace, and option acquisition must wait for
 shared provider capacity rather than turn contention into Network. Native5dd build49663 completed
@@ -219,6 +253,8 @@ New received-data regression PASS1/1 (16.98s compile,0.00s test; `oct10-budget-d
 | Astra High stream_first_frame | sources `src/registry/tests.rs` ONLY named active_live_generation test; `src/registry/tests/time_cases.rs` ONLY two reported failing tests; `src/registry/tests/extraction_authority.rs` ONLY redirect_hops test | Trace exact failures first; repair stale fixture setup/accounting only if established, using existing identity authority and real dispatch. Preserve original assertions and production protections. Report if production cause rather than changing expected failures. No builds/Git/runtime. |
 
 Neutral received-data correction now critically verified: new integration regression1/1; existing registry expiry/capture/revocation/clock and extraction checks39/39; unchanged dispatch refusal/disable/drop fixture1/1; actual retained producer allocation accounting1/1. Four stale fixture failures were corrected by registering genuine existing fixture identities before session start and charging only real redirect sends, with original rejection assertions preserved. Final logs `oct10-budget-data-{authority-final,dispatch-critical,size-critical,regression-final}.log`; all tests serialized, same target, one compiler job, no source changes after final checks. Only pre-existing unrelated warnings remain. All helper lanes frozen/released. Source closure refreshed; lead verifies it and commits/pushes, then runs one managed native build. Streaming is still not live accepted until the native path passes.
+
+Pushed573b5dcc; PR43 comment6092173596 records the42passing critical checks and native limitation. Managed Cargo19450 under existing supervisor30620 is the sole compiler; watcher30632 stopped after dispatch. Existing service7503/Desktop7575 remain available until successful replacement. No new target/root, sign-in reset, migration or foreground automation. Next mandatory barrier: native build completion and actual stream health/publication check before claiming live streaming. Source frozen; no implementation agent active. Read-only previous-close diagnosis runs independently. Options reference recovery is the next ready dependency after integrating this native result.
 
 ### Recent checkpoint history (superseded runtime/assignment states)
 

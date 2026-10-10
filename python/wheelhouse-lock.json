@@ -7148,8 +7148,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog/market_recovery.rs",
-      "sha256": "cbd26aa1df561185dd1c91d239bef36fc0964b8961d39e30f6ec0b0bd33b772a",
-      "size_bytes": 10323
+      "sha256": "62d977b3516ee19362d3cbbcfa49864367c5eb0642ea9d64373e7d2240864236",
+      "size_bytes": 10429
     },
     {
       "path": "crates/market-squawk-data/src/catalog/migration_preflight.rs",
@@ -7568,8 +7568,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/manifest/catalog/lineage.rs",
-      "sha256": "e81660966039d3f4c594b6212e4a9f81011430bce4237dc75f214f9b8549d86e",
-      "size_bytes": 9568
+      "sha256": "eddbb3cab79697b4e571dedd64448b1c121c6eb1d801f3df18756b9ed9440984",
+      "size_bytes": 9721
     },
     {
       "path": "crates/market-squawk-data/src/manifest/fund_nav.rs",

@@ -5,6 +5,8 @@ use super::*;
 /// SQL expressions passed here are fixed source-code identifiers/placeholders, never input data.
 /// The correlated search stops at the requested ancestor, retaining exact parent identities.
 /// Sequence pruning is valid because every parent predates its immutable child.
+/// Keep each recursive lineage row outside its child lookup: reversing those loops
+/// scans unrelated later generations for every ancestry step.
 pub(crate) fn generation_contains_origin_sql(selected: &str, origin: &str) -> String {
     format!(
         "EXISTS (
@@ -14,7 +16,7 @@ pub(crate) fn generation_contains_origin_sql(selected: &str, origin: &str) -> St
              UNION
              SELECT parent.generation_sequence
              FROM exact_ancestry AS lineage
-             JOIN analytical_generations AS child ON child.generation_sequence=lineage.sequence
+             CROSS JOIN analytical_generations AS child ON child.generation_sequence=lineage.sequence
              JOIN analytical_generation_parents AS edge
                ON edge.child_dataset_id=child.dataset_id
               AND edge.child_manifest_version=child.manifest_version

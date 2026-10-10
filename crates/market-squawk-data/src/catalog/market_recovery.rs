@@ -90,6 +90,7 @@ pub(super) fn load_provider_market_event_durable_routes(
     // Discover each route once, then establish that it has at least one complete publication.
     // Joining completeness before DISTINCT repeats publication row counts for every event.
     // EXISTS retains the same admission predicates and stops at the first qualifying event.
+    // Start its exact commit/run lookups from matching indexed events, not every source run.
     let mut statement = connection.prepare(
         "SELECT route.dataset_id, route.source_id, route.venue_id
          FROM (
@@ -104,12 +105,12 @@ pub(super) fn load_provider_market_event_durable_routes(
          ) AS route
          WHERE EXISTS (
            SELECT 1 FROM provider_market_event_selection_index AS indexed
-           JOIN market_event_complete_commits AS committed
+           CROSS JOIN market_event_complete_commits AS committed
              ON committed.dataset_id=indexed.dataset_id
             AND committed.commit_sequence=indexed.commit_sequence
             AND committed.publication_digest=indexed.publication_digest
             AND committed.publication_kind=indexed.publication_kind
-           JOIN ingest_runs AS run ON run.run_id=committed.run_id
+           CROSS JOIN ingest_runs AS run ON run.run_id=committed.run_id
             AND run.source_id=indexed.source_id AND run.state='succeeded'
             AND run.completed_at_ns=committed.available_at_ns
            WHERE indexed.dataset_id=route.dataset_id
